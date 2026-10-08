@@ -896,9 +896,7 @@ void PGM_BASE::PreloadDesignBlockLibraries( KIWAY* aKiway )
     // KICAD_MANAGER_FRAME::OnIdle). Re-enable upstream once the preload path
     // is synchronized with PROJECT lifetime.
     return;
-}
-void PGM_BASE::PreloadDesignBlockLibraries_disabled( KIWAY* aKiway )
-{
+
     // TODO(JE) much of this code can be shared across the 3 preloads
     constexpr static int interval = 150;
     constexpr static int timeLimit = 120000;

@@ -36,6 +36,7 @@ target_include_directories( qa_schematic_utils PUBLIC
     ${CMAKE_SOURCE_DIR}/eeschema
     ${CMAKE_SOURCE_DIR}/pcbnew
     ${CMAKE_SOURCE_DIR}/common
+    ${CMAKE_SOURCE_DIR}/kicadopenapi
     ${INC_AFTER}
 )
 

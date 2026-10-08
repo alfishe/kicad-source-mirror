@@ -4,6 +4,21 @@
 
 #include <wx/log.h>
 
+KICAD_OPENAPI_SERVICE::KICAD_OPENAPI_SERVICE( const std::string& aUtilityName, int aPort ) :
+        m_utilityName( aUtilityName ),
+        m_port( aPort ),
+        m_server( std::make_unique<httplib::Server>() )
+{
+    register_builtin_endpoints();
+}
+
+
+KICAD_OPENAPI_SERVICE::~KICAD_OPENAPI_SERVICE()
+{
+    stop();
+}
+
+
 void KICAD_OPENAPI_SERVICE::add_endpoint( const std::string& aMethod, const std::string& aPath,
                                           const std::string& aSummary, JsonHandler aHandler )
 {

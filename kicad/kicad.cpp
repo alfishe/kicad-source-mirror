@@ -387,19 +387,37 @@ bool PGM_KICAD::OnPgmInit()
     }
     else if( managerFrame )
     {
+        wxString docToLoad;
+
         if( parser.GetParamCount() > 0 )
         {
             wxFileName tmp = parser.GetParam( 0 );
 
-            if( tmp.GetExt() != FILEEXT::ProjectFileExtension && tmp.GetExt() != FILEEXT::LegacyProjectFileExtension )
+            if( tmp.GetExt() == FILEEXT::ProjectFileExtension
+                            || tmp.GetExt() == FILEEXT::LegacyProjectFileExtension )
+            {
+                projToLoad = tmp.GetFullPath();
+            }
+            else if( tmp.GetExt() == FILEEXT::KiCadSchematicFileExtension
+                            || tmp.GetExt() == FILEEXT::KiCadPcbFileExtension )
+            {
+                // alfishe: a document argument opens its enclosing project (if any),
+                // then the document itself in its editor through the same KIWAY API
+                // path the open_document command uses.
+                tmp.MakeAbsolute();
+                docToLoad = tmp.GetFullPath();
+
+                wxFileName proj( tmp );
+                proj.SetExt( FILEEXT::ProjectFileExtension );
+
+                if( proj.FileExists() )
+                    projToLoad = proj.GetFullPath();
+            }
+            else
             {
                 DisplayErrorMessage( nullptr, wxString::Format( _( "File '%s'\n"
                                                                    "does not appear to be a KiCad project file." ),
                                                                 tmp.GetFullPath() ) );
-            }
-            else
-            {
-                projToLoad = tmp.GetFullPath();
             }
         }
 
@@ -436,6 +454,47 @@ bool PGM_KICAD::OnPgmInit()
 
         if( !loaded && appType == KICAD_MAIN_FRAME_T )
             managerFrame->PreloadAllLibraries();
+
+        if( !docToLoad.IsEmpty() )
+        {
+            // alfishe: defer until the project manager frame and the event loop are up,
+            // then open the document in its editor window (KIWAY player path, the same
+            // one the project manager uses when opening a schematic or board).
+            managerFrame->CallAfter(
+                    [docToLoad]()
+                    {
+                        wxFileName fn( docToLoad );
+                        KIWAY::FACE_T face = KIWAY::KIWAY_FACE_COUNT;
+
+                        if( fn.GetExt() == FILEEXT::KiCadSchematicFileExtension )
+                            face = KIWAY::FACE_SCH;
+                        else if( fn.GetExt() == FILEEXT::KiCadPcbFileExtension )
+                            face = KIWAY::FACE_PCB;
+
+                        if( face == KIWAY::KIWAY_FACE_COUNT )
+                            return;
+
+                        FRAME_T frame = ( face == KIWAY::FACE_SCH ) ? FRAME_SCH : FRAME_PCB_EDITOR;
+                        KIWAY_PLAYER* player = Kiway.Player( frame, true );
+
+                        if( !player )
+                            return;
+
+                        fn.MakeAbsolute();
+
+                        if( player->OpenProjectFiles( { fn.GetFullPath() } ) )
+                        {
+                            // Match KICAD_MANAGER_CONTROL::ShowPlayer: the player frame
+                            // is not shown by OpenProjectFiles itself.
+                            player->Iconize( false );
+                            player->Show( true );
+                            player->Raise();
+
+                            if( wxWindow::FindFocus() != player )
+                                player->SetFocus();
+                        }
+                    } );
+        }
     }
 
     if( mergetoolFrame )

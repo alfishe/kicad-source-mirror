@@ -191,83 +191,28 @@ int OKOrCancelDialog( wxWindow* aParent, const wxString& aWarning, const wxStrin
 // DisplayError should be deprecated, use DisplayErrorMessage instead
 void DisplayError( wxWindow* aParent, const wxString& aText )
 {
-    if( !wxTheApp || !wxTheApp->IsMainLoopRunning() )
-    {
-        wxLogError( "%s", aText );
-        return;
-    }
-
-    if( !wxTheApp->IsGUI() )
-    {
-        wxFprintf( stderr, aText );
-        return;
-    }
-
-    KICAD_MESSAGE_DIALOG_BASE* dlg;
-
-    dlg = new KICAD_MESSAGE_DIALOG_BASE( aParent, aText, _( "Error" ),
-                                         wxOK | wxCENTRE | wxRESIZE_BORDER |
-                                         wxICON_ERROR | wxSTAY_ON_TOP );
-
-    dlg->ShowModal();
-    dlg->Destroy();
+    // alfishe: never block the main loop with a modal; an autonomous agent drives
+    // the UI, so errors go to the log only.
+    (void) aParent;
+    wxLogError( "%s", aText );
 }
 
 
 void DisplayErrorMessage( wxWindow* aParent, const wxString& aText, const wxString& aExtraInfo )
 {
-    if( !wxTheApp || !wxTheApp->IsMainLoopRunning() )
-    {
-        wxLogError( "%s %s", aText, aExtraInfo );
-        return;
-    }
-
-    if( !wxTheApp->IsGUI() )
-    {
-        wxFprintf( stderr, aText );
-        return;
-    }
-
-    KICAD_MESSAGE_DIALOG_BASE* dlg;
-
-    dlg = new KICAD_MESSAGE_DIALOG_BASE( aParent, aText, _( "Error" ),
-                                         wxOK | wxCENTRE | wxRESIZE_BORDER |
-                                         wxICON_ERROR | wxSTAY_ON_TOP );
-
-    if( !aExtraInfo.IsEmpty() )
-        dlg->SetExtendedMessage( aExtraInfo );
-
-    dlg->ShowModal();
-    dlg->Destroy();
+    // alfishe: never block the main loop with a modal; an autonomous agent drives
+    // the UI, so errors go to the log only.
+    (void) aParent;
+    wxLogError( "%s %s", aText, aExtraInfo );
 }
 
 
 void DisplayInfoMessage( wxWindow* aParent, const wxString& aMessage, const wxString& aExtraInfo )
 {
-    if( !wxTheApp || !wxTheApp->GetTopWindow() )
-    {
-        wxLogTrace( traceConfirm, wxS( "%s %s" ), aMessage, aExtraInfo );
-        return;
-    }
-
-    if( !wxTheApp->IsGUI() )
-    {
-        wxFprintf( stdout, "%s %s", aMessage, aExtraInfo );
-        return;
-    }
-
-    KICAD_MESSAGE_DIALOG_BASE* dlg;
-    int              icon = wxICON_INFORMATION;
-
-    dlg = new KICAD_MESSAGE_DIALOG_BASE( aParent, aMessage, _( "Information" ),
-                                         wxOK | wxCENTRE | wxRESIZE_BORDER |
-                                         icon | wxSTAY_ON_TOP );
-
-    if( !aExtraInfo.IsEmpty() )
-        dlg->SetExtendedMessage( aExtraInfo );
-
-    dlg->ShowModal();
-    dlg->Destroy();
+    // alfishe: never block the main loop with a modal; an autonomous agent drives
+    // the UI, so info messages go to the log only.
+    (void) aParent;
+    wxLogMessage( "%s %s", aMessage, aExtraInfo );
 }
 
 

@@ -491,6 +491,11 @@ SCH_EDIT_FRAME::SCH_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
     Bind( EDA_EVT_CLOSE_DIALOG_BOOK_REPORTER, &SCH_EDIT_FRAME::onCloseSymbolDiffDialog, this );
     Bind( EDA_EVT_CLOSE_ERC_DIALOG, &SCH_EDIT_FRAME::onCloseErcDialog, this );
     Bind( EDA_EVT_CLOSE_DIALOG_SYMBOL_FIELDS_TABLE, &SCH_EDIT_FRAME::onCloseSymbolFieldsTableDialog, this );
+
+    // kicadopenapi: REST/OpenAPI/webui bound to this frame
+    m_openapi = std::make_unique<KICAD_OPENAPI_SERVICE>( "eeschema", 4242 );
+    m_openapi->set_host( this );
+    m_openapi->start();
 }
 
 void SCH_EDIT_FRAME::StartCrossProbeFlash( const std::vector<SCH_ITEM*>& aItems )
@@ -590,11 +595,6 @@ void SCH_EDIT_FRAME::OnCrossProbeFlashTimer( wxTimerEvent& aEvent )
         wxLogTrace( traceCrossProbeFlash, "Flashing complete. Final selection size=%zu",
                     m_crossProbeFlashItems.size() );
     }
-
-    // kicadopenapi: REST/OpenAPI/webui bound to this frame
-    m_openapi = std::make_unique<KICAD_OPENAPI_SERVICE>( "eeschema", 4242 );
-    m_openapi->set_host( this );
-    m_openapi->start();
 }
 
 
