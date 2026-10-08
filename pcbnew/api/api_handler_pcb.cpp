@@ -1521,7 +1521,24 @@ void API_HANDLER_PCB::onModified()
 {
     pcbContext()->SetContentModified();
 
-    if( frame() )
+    // Refresh ALL open PCB editor frames that show this board, not just the
+    // most recent one — IPC commits must be visible in every window.
+    BOARD* thisBoard = board();
+
+    for( wxWindow* window : wxTopLevelWindows )
+    {
+        if( PCB_EDIT_FRAME* pcbFrame = dynamic_cast<PCB_EDIT_FRAME*>( window ) )
+        {
+            if( thisBoard && pcbFrame->GetBoard() == thisBoard )
+            {
+                pcbFrame->OnModify();
+                pcbFrame->GetCanvas()->Refresh();
+                pcbFrame->UpdateUserInterface();
+            }
+        }
+    }
+
+    if( frame() && ( !thisBoard || frame()->GetBoard() != thisBoard ) )
     {
         frame()->Refresh();
         frame()->OnModify();

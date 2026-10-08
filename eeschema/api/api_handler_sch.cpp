@@ -209,6 +209,30 @@ std::unique_ptr<COMMIT> API_HANDLER_SCH::createCommit()
 }
 
 
+void API_HANDLER_SCH::pushCurrentCommit( const std::string& aClientName, const wxString& aMessage )
+{
+    API_HANDLER_EDITOR::pushCurrentCommit( aClientName, aMessage );
+
+    // The base implementation pushes the commit but never redraws; refresh every
+    // schematic editor frame showing this schematic so IPC mutations are visible
+    // immediately (headless sessions have no frames and skip the loop).
+    if( SCHEMATIC* thisSchematic = schematic() )
+    {
+        for( wxWindow* window : wxTopLevelWindows )
+        {
+            if( SCH_EDIT_FRAME* schFrame = dynamic_cast<SCH_EDIT_FRAME*>( window ) )
+            {
+                if( &schFrame->Schematic() == thisSchematic )
+                {
+                    schFrame->OnModify();
+                    schFrame->GetCanvas()->Refresh();
+                }
+            }
+        }
+    }
+}
+
+
 SCHEMATIC* API_HANDLER_SCH::schematic() const
 {
     wxCHECK( m_context, nullptr );

@@ -54,6 +54,8 @@ protected:
 
     std::unique_ptr<COMMIT> createCommit() override;
 
+    void pushCurrentCommit( const std::string& aClientName, const wxString& aMessage ) override;
+
     kiapi::common::types::DocumentType thisDocumentType() const override
     {
         return kiapi::common::types::DOCTYPE_SCHEMATIC;
