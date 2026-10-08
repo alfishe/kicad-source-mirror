@@ -599,6 +599,8 @@ void IFACE::Reset()
 
 void IFACE::PreloadLibraries( KIWAY* aKiway )
 {
+    // alfishe: disabled — background preload races PROJECT lifetime (see PGM_BASE).
+    return;
     constexpr static int interval = 150;
     constexpr static int timeLimit = 120000;
 

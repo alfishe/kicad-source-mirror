@@ -891,6 +891,14 @@ void PGM_BASE::WritePdfBrowserInfos()
 
 void PGM_BASE::PreloadDesignBlockLibraries( KIWAY* aKiway )
 {
+    // alfishe: disabled. The background preload thread races with main-thread
+    // mutations of PROJECT local state (heap corruption, crash at exit and in
+    // KICAD_MANAGER_FRAME::OnIdle). Re-enable upstream once the preload path
+    // is synchronized with PROJECT lifetime.
+    return;
+}
+void PGM_BASE::PreloadDesignBlockLibraries_disabled( KIWAY* aKiway )
+{
     // TODO(JE) much of this code can be shared across the 3 preloads
     constexpr static int interval = 150;
     constexpr static int timeLimit = 120000;

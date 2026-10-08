@@ -169,6 +169,7 @@ if( UNIX )
 endif()
 
 if( APPLE )
+    include_directories( ${CMAKE_SOURCE_DIR}/kicadopenapi ${CMAKE_SOURCE_DIR}/thirdparty/httplib )
     set_target_properties( kicad PROPERTIES
         MACOSX_BUNDLE_INFO_PLIST ${PROJECT_BINARY_DIR}/kicad/Info.plist
         )
@@ -183,6 +184,7 @@ if( APPLE )
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_BINARY_DIR}/resources/images.tar.gz"
                 "$<TARGET_BUNDLE_DIR:kicad>/Contents/SharedSupport/resources/images.tar.gz"
+        COMMAND codesign --force --deep --sign - "$<TARGET_BUNDLE_DIR:kicad>"
         COMMENT "Copying runtime icon archive into KiCad.app/Contents/SharedSupport/resources"
         )
 
