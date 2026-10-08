@@ -135,7 +135,9 @@ private:
 /**
  * Schematic editor (Eeschema) main window.
  */
-class SCH_EDIT_FRAME : public SCH_BASE_FRAME
+class KICAD_OPENAPI_SERVICE;
+
+class SCH_EDIT_FRAME : public SCH_BASE_FRAME, public KOPENAPI_HOST
 {
 public:
     SCH_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent );
@@ -148,6 +150,10 @@ public:
     SCHEMATIC& Schematic() const;
 
     std::unique_ptr<GRID_HELPER> MakeGridHelper() override;
+
+    // kicadopenapi host surface
+    KIWAY* Ki() const override { return &Kiway(); }
+    wxWindow* Window() const override { return this; }
 
     /**
      * Allow edit frame to show/hide hidden pins.
@@ -1146,6 +1152,7 @@ private:
 
     wxPageSetupDialogData       m_pageSetupData;
     std::vector<std::unique_ptr<SCH_ITEM>> m_items_to_repeat;  ///< For the repeat-last-item cmd
+    std::unique_ptr<class KICAD_OPENAPI_SERVICE> m_openapi;
 
     wxString                    m_netListerCommand;   ///< Command line to call a custom net list
                                                       ///< generator.

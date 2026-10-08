@@ -29,6 +29,7 @@ set_property( SOURCE sim/ngspice.cpp
     )
 
 include_directories( BEFORE ${INC_BEFORE} )
+include_directories( ${CMAKE_SOURCE_DIR}/kicadopenapi ${CMAKE_SOURCE_DIR}/thirdparty/httplib )
 include_directories(
     ${CMAKE_SOURCE_DIR}/common
     ${CMAKE_SOURCE_DIR}/common/dialogs
@@ -485,6 +486,8 @@ set( EESCHEMA_SRCS
     sch_connection.cpp
     sch_draw_panel.cpp
     sch_edit_frame.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_service.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_project.cpp
     sch_field.cpp
     sch_footprint_field_reconciler.cpp
     sch_group.cpp

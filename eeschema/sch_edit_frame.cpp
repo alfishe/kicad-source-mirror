@@ -61,6 +61,7 @@
 #include <project/project_file.h>
 #include <project/net_settings.h>
 #include <sch_edit_frame.h>
+#include <kicadopenapi_service.h>
 #include <symbol_chooser_frame.h>
 #include <sch_painter.h>
 #include <sch_marker.h>
@@ -589,11 +590,21 @@ void SCH_EDIT_FRAME::OnCrossProbeFlashTimer( wxTimerEvent& aEvent )
         wxLogTrace( traceCrossProbeFlash, "Flashing complete. Final selection size=%zu",
                     m_crossProbeFlashItems.size() );
     }
+
+    // kicadopenapi: REST/OpenAPI/webui bound to this frame
+    m_openapi = std::make_unique<KICAD_OPENAPI_SERVICE>( "eeschema", 4242 );
+    m_openapi->set_host( this );
+    m_openapi->start();
 }
 
 
 SCH_EDIT_FRAME::~SCH_EDIT_FRAME()
 {
+    // kicadopenapi must die before the object model it serves
+    if( m_openapi )
+        m_openapi->stop();
+    m_openapi.reset();
+
     m_connectivitySubscription.Reset();
 
     // Ensure that teardowns without doCloseWindow are fully unregistered

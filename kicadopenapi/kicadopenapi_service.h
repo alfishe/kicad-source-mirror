@@ -1,8 +1,10 @@
 /*
- * In-process HTTP service embedded into KiCad utilities (eeschema, pcbnew, PGM).
+ * kicadopenapi — in-process REST/OpenAPI/webui service embedded into KiCad
+ * utilities (eeschema, pcbnew, PGM).
  *
- * Serves a generated OpenAPI spec, a static test webui, and REST endpoints with
- * direct access to the owning frame's object model. Runs on 127.0.0.1 only.
+ * Serves the method registry as OpenAPI + swagger-ui webapp, an MCP-style
+ * /mcp/search and /mcp/invoke/{name} surface, and REST endpoints with direct
+ * access to the owning frame's object model. Runs on 127.0.0.1 only.
  */
 #ifndef KICAD_OPENAPI_SERVICE_H
 #define KICAD_OPENAPI_SERVICE_H
@@ -10,10 +12,14 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <httplib.h>
+
+#include "registry.h"
 
 class KICAD_OPENAPI_SERVICE
 {
@@ -26,6 +32,9 @@ public:
     void add_endpoint( const std::string& aMethod, const std::string& aPath,
                        const std::string& aSummary, Handler aHandler );
 
+    /** Bind the object-model host; handlers receive it on every invoke. */
+    void set_host( KOPENAPI_HOST* aHost );
+
     bool start();
     void stop();
 
@@ -37,6 +46,7 @@ private:
 
     std::string m_utilityName;
     int m_port;
+    KOPENAPI_HOST* m_host = nullptr;
     std::atomic<bool> m_running{ false };
     std::thread m_thread;
     std::unique_ptr<httplib::Server> m_server;
@@ -46,7 +56,6 @@ private:
         std::string method;
         std::string path;
         std::string summary;
-        Handler handler;
     };
     std::vector<EndpointSpec> m_endpoints;
 };
