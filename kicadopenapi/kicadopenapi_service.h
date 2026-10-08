@@ -4,8 +4,8 @@
  * Serves a generated OpenAPI spec, a static test webui, and REST endpoints with
  * direct access to the owning frame's object model. Runs on 127.0.0.1 only.
  */
-#ifndef KICAD_WEB_SERVICE_H
-#define KICAD_WEB_SERVICE_H
+#ifndef KICAD_OPENAPI_SERVICE_H
+#define KICAD_OPENAPI_SERVICE_H
 
 #include <atomic>
 #include <functional>
@@ -15,13 +15,13 @@
 
 #include <httplib.h>
 
-class KICAD_WEB_SERVICE
+class KICAD_OPENAPI_SERVICE
 {
 public:
     using Handler = std::function<std::string( const std::string& aBody )>;
 
-    KICAD_WEB_SERVICE( const std::string& aUtilityName, int aPort );
-    ~KICAD_WEB_SERVICE();
+    KICAD_OPENAPI_SERVICE( const std::string& aUtilityName, int aPort );
+    ~KICAD_OPENAPI_SERVICE();
 
     void add_endpoint( const std::string& aMethod, const std::string& aPath,
                        const std::string& aSummary, Handler aHandler );

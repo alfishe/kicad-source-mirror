@@ -1,8 +1,8 @@
-#include "kicad_web_service.h"
+#include "kicadopenapi_service.h"
 
 #include <wx/log.h>
 
-KICAD_WEB_SERVICE::KICAD_WEB_SERVICE( const std::string& aUtilityName, int aPort ) :
+KICAD_OPENAPI_SERVICE::KICAD_OPENAPI_SERVICE( const std::string& aUtilityName, int aPort ) :
         m_utilityName( aUtilityName ),
         m_port( aPort ),
         m_server( std::make_unique<httplib::Server>() )
@@ -11,13 +11,13 @@ KICAD_WEB_SERVICE::KICAD_WEB_SERVICE( const std::string& aUtilityName, int aPort
 }
 
 
-KICAD_WEB_SERVICE::~KICAD_WEB_SERVICE()
+KICAD_OPENAPI_SERVICE::~KICAD_OPENAPI_SERVICE()
 {
     stop();
 }
 
 
-void KICAD_WEB_SERVICE::add_endpoint( const std::string& aMethod, const std::string& aPath,
+void KICAD_OPENAPI_SERVICE::add_endpoint( const std::string& aMethod, const std::string& aPath,
                                       const std::string& aSummary, Handler aHandler )
 {
     Handler handler = std::move( aHandler );
@@ -35,12 +35,12 @@ void KICAD_WEB_SERVICE::add_endpoint( const std::string& aMethod, const std::str
 }
 
 
-void KICAD_WEB_SERVICE::register_builtin_endpoints()
+void KICAD_OPENAPI_SERVICE::register_builtin_endpoints()
 {
     m_server->Get( "/", []( httplib::Request&, httplib::Response& res ) {
         res.set_content(
-                "<html><head><title>kicadweb</title></head><body>"
-                "<h1>kicadweb</h1><p>See <a href='/openapi.json'>/openapi.json</a></p>"
+                "<html><head><title>kicadopenapi</title></head><body>"
+                "<h1>kicadopenapi</h1><p>See <a href='/openapi.json'>/openapi.json</a></p>"
                 "</body></html>",
                 "text/html" );
     } );
@@ -58,7 +58,7 @@ void KICAD_WEB_SERVICE::register_builtin_endpoints()
 }
 
 
-std::string KICAD_WEB_SERVICE::openapi_json() const
+std::string KICAD_OPENAPI_SERVICE::openapi_json() const
 {
     std::string paths;
 
@@ -70,12 +70,12 @@ std::string KICAD_WEB_SERVICE::openapi_json() const
     if( !paths.empty() )
         paths.pop_back();
 
-    return std::string( "{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"kicadweb " ) + m_utilityName +
+    return std::string( "{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"kicadopenapi " ) + m_utilityName +
            "\",\"version\":\"0.1.0\"},\"paths\":{" + paths + "}}";
 }
 
 
-bool KICAD_WEB_SERVICE::start()
+bool KICAD_OPENAPI_SERVICE::start()
 {
     if( m_running )
         return true;
@@ -90,13 +90,13 @@ bool KICAD_WEB_SERVICE::start()
     for( int i = 0; i < 50 && !m_running; ++i )
         std::this_thread::sleep_for( std::chrono::milliseconds( 20 ) );
 
-    wxLogInfo( "kicadweb(%s): %s", m_utilityName,
+    wxLogInfo( "kicadopenapi(%s): %s", m_utilityName,
                m_running ? "listening" : "failed to bind" );
     return m_running;
 }
 
 
-void KICAD_WEB_SERVICE::stop()
+void KICAD_OPENAPI_SERVICE::stop()
 {
     if( !m_running )
         return;
