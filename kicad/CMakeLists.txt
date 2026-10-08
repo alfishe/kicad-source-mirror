@@ -172,6 +172,20 @@ if( APPLE )
     set_target_properties( kicad PROPERTIES
         MACOSX_BUNDLE_INFO_PLIST ${PROJECT_BINARY_DIR}/kicad/Info.plist
         )
+
+    # Dev builds must ship the runtime icon archive: without it the UI shows
+    # question marks (install() rules only populate an installed bundle, never
+    # the build-dir KiCad.app). bitmap_archive_bundle builds images.tar.gz.
+    add_dependencies( kicad bitmap_archive_bundle )
+    add_custom_command( TARGET kicad POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_BUNDLE_DIR:kicad>/Contents/SharedSupport/resources"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_BINARY_DIR}/resources/images.tar.gz"
+                "$<TARGET_BUNDLE_DIR:kicad>/Contents/SharedSupport/resources/images.tar.gz"
+        COMMENT "Copying runtime icon archive into KiCad.app/Contents/SharedSupport/resources"
+        )
+
     target_link_libraries( kicad
         nlohmann_json
         common
