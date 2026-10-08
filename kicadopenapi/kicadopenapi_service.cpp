@@ -1,13 +1,13 @@
 #include "kicadopenapi_service.h"
 
-#include "registry.h"
+#include "kicadopenapi_registry.h"
 
 #include <wx/log.h>
 
 void KICAD_OPENAPI_SERVICE::add_endpoint( const std::string& aMethod, const std::string& aPath,
-                                          const std::string& aSummary, Handler aHandler )
+                                          const std::string& aSummary, JsonHandler aHandler )
 {
-    Handler handler = std::move( aHandler );
+    JsonHandler handler = std::move( aHandler );
 
     if( aMethod == "GET" )
         m_server->Get( aPath, [handler]( const httplib::Request& req, httplib::Response& res ) {
@@ -18,7 +18,7 @@ void KICAD_OPENAPI_SERVICE::add_endpoint( const std::string& aMethod, const std:
             res.set_content( handler( req.body ), "application/json" );
         } );
 
-    m_endpoints.push_back( { aMethod, aPath, aSummary, nullptr } );
+    m_endpoints.push_back( { aMethod, aPath, aSummary } );
 }
 
 
@@ -30,7 +30,7 @@ void KICAD_OPENAPI_SERVICE::set_host( KOPENAPI_HOST* aHost )
 
 void KICAD_OPENAPI_SERVICE::register_builtin_endpoints()
 {
-    m_server->Get( "/", []( httplib::Request&, httplib::Response& res ) {
+    m_server->Get( "/", []( const httplib::Request&, httplib::Response& res ) {
         // Embedded swagger-ui webapp (static; assets from CDN) over /openapi.json.
         res.set_content(
                 "<!DOCTYPE html><html><head><title>kicadopenapi</title>"
@@ -43,11 +43,11 @@ void KICAD_OPENAPI_SERVICE::register_builtin_endpoints()
                 "text/html" );
     } );
 
-    m_server->Get( "/openapi.json", [&]( httplib::Request&, httplib::Response& res ) {
+    m_server->Get( "/openapi.json", [&]( const httplib::Request&, httplib::Response& res ) {
         res.set_content( openapi_json(), "application/json" );
     } );
 
-    m_server->Get( "/status", [&]( httplib::Request&, httplib::Response& res ) {
+    m_server->Get( "/status", [&]( const httplib::Request&, httplib::Response& res ) {
         res.set_content(
                 std::string( "{\"utility\":\"" ) + m_utilityName + "\",\"port\":" +
                         std::to_string( m_port ) + "}",

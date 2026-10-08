@@ -30,7 +30,7 @@ public:
     virtual ~KOPENAPI_HOST() = default;
 
     virtual KIWAY* Ki() const = 0;
-    virtual wxWindow* Window() const = 0;
+    virtual wxWindow* Window() = 0;
 };
 
 using KOPENAPI_HANDLER = std::function<std::string( KOPENAPI_HOST&, const std::string& aArgs )>;
@@ -104,7 +104,11 @@ private:
  *   static std::string my_handler( KOPENAPI_HOST&, const std::string& );
  *   KOPENAPI_REGISTER( "my_method", "does something", my_handler );
  */
+#define KOPENAPI_REGISTER_IMPL2( aName, aSummary, aFn, line )                            \
+    static bool kopenapi_reg_##line = KOPENAPI_REGISTRY::Add( aName, aSummary, aFn )
+#define KOPENAPI_REGISTER_IMPL( aName, aSummary, aFn, line )                             \
+    KOPENAPI_REGISTER_IMPL2( aName, aSummary, aFn, line )
 #define KOPENAPI_REGISTER( aName, aSummary, aFn )                                        \
-    static bool kopenapi_reg_##aFn = KOPENAPI_REGISTRY::Add( aName, aSummary, aFn )
+    KOPENAPI_REGISTER_IMPL( aName, aSummary, aFn, __LINE__ )
 
 #endif

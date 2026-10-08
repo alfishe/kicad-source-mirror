@@ -19,18 +19,18 @@
 
 #include <httplib.h>
 
-#include "registry.h"
+#include "kicadopenapi_registry.h"
 
 class KICAD_OPENAPI_SERVICE
 {
 public:
-    using Handler = std::function<std::string( const std::string& aBody )>;
+    using JsonHandler = std::function<std::string( const std::string& aBody )>;
 
     KICAD_OPENAPI_SERVICE( const std::string& aUtilityName, int aPort );
     ~KICAD_OPENAPI_SERVICE();
 
     void add_endpoint( const std::string& aMethod, const std::string& aPath,
-                       const std::string& aSummary, Handler aHandler );
+                       const std::string& aSummary, JsonHandler aHandler );
 
     /** Bind the object-model host; handlers receive it on every invoke. */
     void set_host( KOPENAPI_HOST* aHost );

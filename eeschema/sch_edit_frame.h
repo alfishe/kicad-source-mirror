@@ -135,6 +135,8 @@ private:
 /**
  * Schematic editor (Eeschema) main window.
  */
+#include <kicadopenapi_registry.h>
+
 class KICAD_OPENAPI_SERVICE;
 
 class SCH_EDIT_FRAME : public SCH_BASE_FRAME, public KOPENAPI_HOST
@@ -153,7 +155,7 @@ public:
 
     // kicadopenapi host surface
     KIWAY* Ki() const override { return &Kiway(); }
-    wxWindow* Window() const override { return this; }
+    wxWindow* Window() override { return this; }
 
     /**
      * Allow edit frame to show/hide hidden pins.

@@ -4,7 +4,7 @@
  * the same path upstream's OpenDocument command uses — so the GUI opens the
  * proper editor window for the file.
  */
-#include "registry.h"
+#include "kicadopenapi_registry.h"
 
 #include <kiway.h>
 #include <wildcards_and_files_ext.h>
@@ -19,8 +19,8 @@ static KIWAY::FACE_T faceForPath( const wxString& aPath )
         return KIWAY::FACE_SCH;
     if( fn.GetExt() == FILEEXT::KiCadPcbFileExtension )
         return KIWAY::FACE_PCB;
-    if( fn.GetExt() == FILEEXT::KiCadProjectFileExtension )
-        return KIWAY::FACE_KICAD;
+    if( fn.GetExt() == FILEEXT::ProjectFileExtension )
+        return KIWAY::KIWAY_FACE_COUNT;  // .kicad_pro opens via the project manager
 
     return KIWAY::KIWAY_FACE_COUNT;
 }
@@ -85,15 +85,16 @@ static std::string h_close_document( KOPENAPI_HOST& aHost, const std::string& aA
 
 static std::string h_open_project( KOPENAPI_HOST& aHost, const std::string& aArgs )
 {
-    // Opening a project is a PGM-level operation; from a frame we re-dispatch
-    // as opening the project document (loads settings + project tree in PGM).
+    // .kicad_pro has no editor kiface; opening a project switches the PGM.
     (void) aHost;
-    return h_open_document( aHost, aArgs );
+    (void) aArgs;
+    return "{\"error\":\"open .kicad_sch/.kicad_pcb instead; project switch runs in the "
+           "project manager\"}";
 }
 
 
 KOPENAPI_REGISTER( "open_schematic", "Open a .kicad_sch in the schematic editor",
-                   h_open_document )
-KOPENAPI_REGISTER( "open_pcb", "Open a .kicad_pcb in the PCB editor", h_open_document )
-KOPENAPI_REGISTER( "open_project", "Open a .kicad_pro project", h_open_project )
-KOPENAPI_REGISTER( "close_document", "Close an open document by path", h_close_document )
+                   h_open_document );
+KOPENAPI_REGISTER( "open_pcb", "Open a .kicad_pcb in the PCB editor", h_open_document );
+KOPENAPI_REGISTER( "open_project", "Open a .kicad_pro project", h_open_project );
+KOPENAPI_REGISTER( "close_document", "Close an open document by path", h_close_document );

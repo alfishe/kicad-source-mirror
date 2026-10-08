@@ -104,3 +104,14 @@ if( false )     # linker map with cross reference
         LINK_FLAGS "-Wl,--cref,-Map=bitmap2component.map"
         )
 endif()
+
+# Dev builds: the project manager launches Image Converter as a sibling of the
+# kicad binary inside the main bundle (installed layout does this via move_to_main_bundle).
+if( APPLE )
+    add_custom_command( TARGET bitmap2component POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:bitmap2component>"
+                "${OSX_BUNDLE_BUILD_BIN_DIR}/bitmap2component"
+        COMMENT "Copying bitmap2component into KiCad.app/Contents/MacOS"
+        )
+endif()

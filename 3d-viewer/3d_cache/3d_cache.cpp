@@ -130,10 +130,20 @@ S3D_CACHE::S3D_CACHE()
 
 S3D_CACHE::~S3D_CACHE()
 {
-    FlushCache();
+    // This runs during PGM teardown, long after wxWidgets is gone; anything
+    // throwing here (plugin unload, wx logging) lands in std::terminate and
+    // aborts the process at exit. A destructor must not throw.
+    try
+    {
+        FlushCache();
 
-    delete m_FNResolver;
-    delete m_Plugins;
+        delete m_FNResolver;
+        delete m_Plugins;
+    }
+    catch( ... )
+    {
+        // Swallow: cache is being destroyed either way.
+    }
 }
 
 
