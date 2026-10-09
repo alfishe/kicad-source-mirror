@@ -7,6 +7,7 @@
  * netlist exporter uses.  Drawing items (wires, labels, ...) are counted per file.
  */
 #include "kopenapi_sch.h"
+#include "kopenapi_sch_model.h"
 
 #include <advanced_config.h>
 #include <api/sch_context.h>
@@ -28,171 +29,7 @@
 #include <set>
 
 
-static std::string str( const wxString& aText )
-{
-    return aText.ToStdString( wxConvUTF8 );
-}
-
-
-static const char* labelKind( KICAD_T aType )
-{
-    switch( aType )
-    {
-    case SCH_LABEL_T:           return "local";
-    case SCH_GLOBAL_LABEL_T:    return "global";
-    case SCH_HIER_LABEL_T:      return "hierarchical";
-    case SCH_DIRECTIVE_LABEL_T: return "directive";
-    default:                    return nullptr;
-    }
-}
-
-
-static const char* portDirection( const SCH_SHEET_PIN* aPin )
-{
-    switch( aPin->GetShape() )
-    {
-    case LABEL_FLAG_SHAPE::L_INPUT:    return "input";
-    case LABEL_FLAG_SHAPE::L_OUTPUT:   return "output";
-    case LABEL_FLAG_SHAPE::L_BIDI:     return "bidirectional";
-    case LABEL_FLAG_SHAPE::L_TRISTATE: return "tristate";
-    default:                           return "passive";
-    }
-}
-
-
-static std::string sheetPath( const SCH_SHEET_PATH& aPath )
-{
-    return str( aPath.PathHumanReadable( false, true ) );
-}
-
-
-static SCH_SYMBOL* pinSymbol( const SCH_PIN* aPin )
-{
-    return dynamic_cast<SCH_SYMBOL*>( const_cast<SCH_PIN*>( aPin )->GetParentSymbol() );
-}
-
-
-/// One pin of a net as seen on a given sheet instance
-static nlohmann::json pinJson( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath )
-{
-    SCH_SYMBOL*       sym = pinSymbol( aPin );
-    const std::string ref = sym ? str( sym->GetRef( &aPath, false ) ) : std::string();
-
-    return { { "pin", ref + "." + str( aPin->GetNumber() ) },
-             { "ref", ref },
-             { "number", str( aPin->GetNumber() ) },
-             { "name", str( aPin->GetShownName() ) },
-             { "type", str( aPin->GetElectricalTypeName() ) },
-             { "value", sym ? str( sym->GetValue( &aPath, FOR_GUI ) ) : std::string() },
-             { "power_symbol", sym && sym->IsPower() },
-             { "sheet", sheetPath( aPath ) } };
-}
-
-
-/// One sheet instance of a net
-struct NET_INSTANCE
-{
-    SCH_SHEET_PATH         path;
-    std::vector<SCH_ITEM*> items;
-    std::string            localName;
-};
-
-
-/// A net with its instances, from the same source KiCad's netlist exporter uses
-struct NET_ENTRY
-{
-    std::string               name;
-    int                       code = 0;   ///< 1-based, in name order; valid for this model state
-    std::vector<NET_INSTANCE> instances;
-};
-
-
-static std::vector<NET_ENTRY> collectNets( SCHEMATIC* aSchematic )
-{
-    std::vector<NET_ENTRY> nets;
-
-    if( ADVANCED_CFG::GetCfg().m_ConnectivityEngine )
-    {
-        std::map<KIID_PATH, SCH_SHEET_PATH> paths;
-
-        for( const SCH_SHEET_PATH& path : aSchematic->Hierarchy() )
-            paths.emplace( path.Path(), path );
-
-        for( const SCH_CONNECTIVITY::NET_GROUP& group : aSchematic->Connectivity().GetNetMap() )
-        {
-            NET_ENTRY entry;
-            entry.name = str( group.name );
-
-            for( const SCH_CONNECTIVITY::NET_VIEW& view : group.instances )
-            {
-                if( !view.IsNet() )
-                    continue;
-
-                auto path = paths.find( view.Instance() );
-
-                if( path == paths.end() )
-                    continue;
-
-                entry.instances.push_back( { path->second, view.Items(), str( view.Name( true ) ) } );
-            }
-
-            nets.push_back( std::move( entry ) );
-        }
-    }
-    else
-    {
-        for( const auto& [key, subgraphs] : aSchematic->ConnectionGraph()->GetNetMap() )
-        {
-            NET_ENTRY entry;
-            entry.name = str( key.Name );
-
-            for( const CONNECTION_SUBGRAPH* subgraph : subgraphs )
-            {
-                std::vector<SCH_ITEM*> items( subgraph->GetItems().begin(), subgraph->GetItems().end() );
-                entry.instances.push_back( { subgraph->GetSheet(), items, str( subgraph->GetNetName() ) } );
-            }
-
-            nets.push_back( std::move( entry ) );
-        }
-    }
-
-    std::sort( nets.begin(), nets.end(),
-               []( const NET_ENTRY& a, const NET_ENTRY& b ) { return KopenapiNaturalLess( a.name, b.name ); } );
-
-    for( size_t i = 0; i < nets.size(); ++i )
-        nets[i].code = static_cast<int>( i + 1 );
-
-    return nets;
-}
-
-
-static std::string pinId( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath )
-{
-    SCH_SYMBOL* sym = pinSymbol( aPin );
-    return ( sym ? str( sym->GetRef( &aPath, false ) ) : std::string() ) + "." + str( aPin->GetNumber() );
-}
-
-
-/**
- * Pins of a net across all its instances, one per REF.PIN: multi-unit symbols repeat shared
- * (e.g. power) pins in every unit; the netlist exporter lists them once as well.
- */
-static std::vector<std::pair<const SCH_PIN*, SCH_SHEET_PATH>> netPins( const NET_ENTRY& aNet )
-{
-    std::vector<std::pair<const SCH_PIN*, SCH_SHEET_PATH>> pins;
-    std::set<std::string>                                  seen;
-
-    for( const NET_INSTANCE& inst : aNet.instances )
-    {
-        for( SCH_ITEM* item : inst.items )
-        {
-            if( item->Type() == SCH_PIN_T && seen.insert( pinId( static_cast<SCH_PIN*>( item ), inst.path ) ).second )
-                pins.emplace_back( static_cast<SCH_PIN*>( item ), inst.path );
-        }
-    }
-
-    return pins;
-}
+using namespace kopenapi_sch;
 
 
 static KOPENAPI_RESULT h_sch_stats( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
@@ -694,15 +531,6 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 }
 
 
-static nlohmann::json withPaging( nlohmann::json aProperties )
-{
-    for( const auto& [key, value] : KopenapiPageSchema().items() )
-        aProperties[key] = value;
-
-    return { { "type", "object" }, { "properties", aProperties } };
-}
-
-
 KOPENAPI_REGISTER( "sch_stats",
                    "Schematic statistics in one call: sheets (files, instances, depth), symbols (instances, "
                    "components, power, pins, DNP, unannotated, by library), wires, buses, bus entries, "
@@ -712,13 +540,13 @@ KOPENAPI_REGISTER( "sch_stats",
 KOPENAPI_REGISTER( "sch_sheet_list",
                    "List sheet instances of the hierarchy: path, name, file, page, symbol count, ports "
                    "(sheet pins with direction); filter by path glob; paginated",
-                   withPaging( R"json({"path":{"type":"string","description":"glob on the human path, e.g. /CPU*"}})json"_json ),
+                   KopenapiPagedSchema( R"json({"path":{"type":"string","description":"glob on the human path, e.g. /CPU*"}})json"_json ),
                    false, h_sch_sheet_list );
 
 KOPENAPI_REGISTER( "sch_symbol_list",
                    "List schematic symbols per sheet instance: ref, value, lib_id, footprint, unit, sheet, "
                    "DNP/BOM/board flags; filter by ref/value/lib_id/sheet glob, include_power; paginated",
-                   withPaging( R"json({
+                   KopenapiPagedSchema( R"json({
                         "ref":{"type":"string"},"value":{"type":"string"},"lib_id":{"type":"string"},
                         "sheet":{"type":"string","description":"glob on the sheet path"},
                         "include_power":{"type":"boolean","default":false}})json"_json ),
@@ -727,7 +555,7 @@ KOPENAPI_REGISTER( "sch_symbol_list",
 KOPENAPI_REGISTER( "sch_net_list",
                    "List schematic nets: name, code, pin count (without power symbols), sheets spanned, "
                    "labels, power flag; filter by name glob, min_pins, power; paginated",
-                   withPaging( R"json({
+                   KopenapiPagedSchema( R"json({
                         "name":{"type":"string","description":"glob, e.g. /CPU/* or *CLK*"},
                         "min_pins":{"type":"integer","default":0},
                         "power":{"type":"boolean"}})json"_json ),

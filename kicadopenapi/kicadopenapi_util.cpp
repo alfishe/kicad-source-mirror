@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 
 
 static char lowerChar( char aChar )
@@ -156,4 +157,30 @@ nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName )
         basis.push_back( "net name " + bare );
 
     return { { "role", role }, { "basis", basis } };
+}
+
+
+nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties )
+{
+    for( const auto& [key, value] : KopenapiPageSchema().items() )
+        aProperties[key] = value;
+
+    return { { "type", "object" }, { "properties", aProperties } };
+}
+
+
+bool KopenapiIsConnectorRef( const std::string& aRef )
+{
+    for( const char* prefix : { "CON", "CN", "XS", "XP", "J", "P", "X" } )
+    {
+        const size_t n = std::strlen( prefix );
+
+        if( aRef.size() > n && aRef.compare( 0, n, prefix ) == 0
+            && std::isdigit( static_cast<unsigned char>( aRef[n] ) ) )
+        {
+            return true;
+        }
+    }
+
+    return false;
 }

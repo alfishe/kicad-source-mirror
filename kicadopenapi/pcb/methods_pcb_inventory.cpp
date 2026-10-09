@@ -65,21 +65,6 @@ static const char* padAttribute( const PAD* aPad )
 }
 
 
-/// Connector-like reference designators (where nets leave the board)
-static bool isConnectorRef( const std::string& aRef )
-{
-    for( const char* prefix : { "J", "P", "X", "CN", "XS", "XP", "CON" } )
-    {
-        const size_t n = std::strlen( prefix );
-
-        if( aRef.size() > n && aRef.compare( 0, n, prefix ) == 0 && std::isdigit( (unsigned char) aRef[n] ) )
-            return true;
-    }
-
-    return false;
-}
-
-
 static nlohmann::json naturalSorted( const std::set<std::string>& aItems )
 {
     std::vector<std::string> v( aItems.begin(), aItems.end() );
@@ -217,7 +202,7 @@ static nlohmann::json inferRole( BOARD* aBoard, const NETINFO_ITEM* aNet, const 
 
     for( const std::string& ref : aAgg.footprints )
     {
-        if( isConnectorRef( ref ) )
+        if( KopenapiIsConnectorRef( ref ) )
             connectorSet.insert( ref );
     }
 
@@ -597,20 +582,11 @@ static KOPENAPI_RESULT h_pcb_footprint_get( KOPENAPI_CONTEXT& aCtx, const nlohma
 }
 
 
-static nlohmann::json withPaging( nlohmann::json aProperties )
-{
-    for( const auto& [key, value] : KopenapiPageSchema().items() )
-        aProperties[key] = value;
-
-    return { { "type", "object" }, { "properties", aProperties } };
-}
-
-
 KOPENAPI_REGISTER( "pcb_footprint_list",
                    "List board footprints/components (ref, value, footprint, side, position, THT/SMD, DNP, uuid); "
                    "filter by ref/value/footprint glob, side, type; ref '?*' skips unnamed board-only "
                    "items; paginated, natural ref order",
-                   withPaging( R"json({
+                   KopenapiPagedSchema( R"json({
                         "ref":{"type":"string","description":"glob, e.g. U* or R1?"},
                         "value":{"type":"string","description":"glob"},
                         "footprint":{"type":"string","description":"library id glob"},
@@ -621,7 +597,7 @@ KOPENAPI_REGISTER( "pcb_footprint_list",
 KOPENAPI_REGISTER( "pcb_net_list",
                    "List board nets with pad/footprint counts, routed length, vias, zones, unrouted "
                    "connections, net class; filter by name/class glob, min_pads, unrouted_only; paginated",
-                   withPaging( R"json({
+                   KopenapiPagedSchema( R"json({
                         "name":{"type":"string","description":"glob, e.g. *CLK* or /CPU/D?"},
                         "class":{"type":"string","description":"net class glob"},
                         "min_pads":{"type":"integer","default":0},

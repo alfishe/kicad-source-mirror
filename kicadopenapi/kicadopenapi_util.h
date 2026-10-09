@@ -29,7 +29,13 @@ KICOMMON_API nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nl
  */
 KICOMMON_API nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName );
 
+/// Connector-like reference designator (J1, P2, X3, CN4, XS1, XP1, CON5): where nets leave the board
+KICOMMON_API bool KopenapiIsConnectorRef( const std::string& aRef );
+
 /// JSON schema properties shared by all paginated methods (limit, cursor)
 KICOMMON_API nlohmann::json KopenapiPageSchema();
+
+/// Object schema with aProperties plus limit/cursor
+KICOMMON_API nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties );
 
 #endif
