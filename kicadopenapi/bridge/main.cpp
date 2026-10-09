@@ -325,7 +325,7 @@ json InstanceJson(const bridge::Instance& inst)
 
 // Instance management methods, owned by the bridge. They are not MCP tools: like every KiCad
 // method they are found with `search` and called with `invoke`.
-const json kBridgeMethods = json::parse(R"([
+const json kBridgeMethods = json::parse(R"json([
   {"name": "instance_list", "gui_only": false,
    "summary": "List running KiCad instances (GUI and headless) this MCP session can talk to; marks the current one. Check it before mutating after an instance change.",
    "inputSchema": {"type": "object", "properties": {}}},
@@ -339,7 +339,7 @@ const json kBridgeMethods = json::parse(R"([
        "mode": {"type": "string", "enum": ["headless", "gui"]},
        "path": {"type": "string", "description": "Optional .kicad_pro/.kicad_sch/.kicad_pcb to open"},
        "select": {"type": "boolean", "default": true}}}}
-])");
+])json");
 
 bool IsBridgeMethod(const std::string& name)
 {

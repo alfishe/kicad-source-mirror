@@ -17,7 +17,7 @@ inline constexpr const char* kSearchTool = "search";
 inline constexpr const char* kInvokeTool = "invoke";
 
 /// tools/list result "tools" array
-inline constexpr const char* kToolsJson = R"([
+inline constexpr const char* kToolsJson = R"json([
   {
     "name": "search",
     "description": "Find KiCad methods by keywords (e.g. 'open pcb', 'symbol', 'drc', 'instance'). Returns each method's name, summary, inputSchema and whether it needs the GUI. Empty query lists all methods. Call invoke with a returned name.",
@@ -41,6 +41,6 @@ inline constexpr const char* kToolsJson = R"([
       }
     }
   }
-])";
+])json";
 
 } // namespace kopenapi::mcp

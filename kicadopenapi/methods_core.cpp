@@ -15,7 +15,7 @@ static KOPENAPI_RESULT h_ping( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
 
 
 KOPENAPI_REGISTER( "ping", "Round trip through the main thread (liveness and latency check)",
-                   R"({"type":"object","properties":{}})"_json, false, h_ping );
+                   R"json({"type":"object","properties":{}})json"_json, false, h_ping );
 
 
 static KOPENAPI_RESULT h_documents( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
@@ -25,7 +25,7 @@ static KOPENAPI_RESULT h_documents( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
 
 KOPENAPI_REGISTER( "documents", "List open documents (schematic, PCB) with path, project and unsaved state",
-                   R"({"type":"object","properties":{}})"_json, false, h_documents );
+                   R"json({"type":"object","properties":{}})json"_json, false, h_documents );
 
 
 static KOPENAPI_RESULT h_errors( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
@@ -47,10 +47,10 @@ static KOPENAPI_RESULT h_errors( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs 
 KOPENAPI_REGISTER( "errors",
                    "Errors and warnings KiCad reported (never shown as dialogs): operation that caused "
                    "them, message, time, source location; poll with since=last_seq",
-                   R"({"type":"object","properties":{
+                   R"json({"type":"object","properties":{
                         "since":{"type":"integer","default":0,"description":"Only records with seq greater than this"},
                         "limit":{"type":"integer","default":100,"minimum":1,"maximum":1000},
                         "level":{"type":"string","enum":["warning","error"],"default":"warning",
                                  "description":"Minimum severity"},
-                        "clear":{"type":"boolean","default":false,"description":"Drop collected records after reading"}}})"_json,
+                        "clear":{"type":"boolean","default":false,"description":"Drop collected records after reading"}}})json"_json,
                    false, h_errors );

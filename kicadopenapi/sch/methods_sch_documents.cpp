@@ -288,19 +288,19 @@ KOPENAPI_REGISTER_DOCUMENTS( "sch", documentStatus, releaseHeadless );
 
 KOPENAPI_REGISTER( "sch_open",
                    "Open a schematic (.kicad_sch or its .kicad_pro): editor window in the GUI, in memory headless",
-                   R"({"type":"object","required":["path"],"properties":{
+                   R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
-                                   "description":"Drop unsaved changes of the currently open schematic"}}})"_json,
+                                   "description":"Drop unsaved changes of the currently open schematic"}}})json"_json,
                    false, h_sch_open );
 
 KOPENAPI_REGISTER( "sch_close", "Close the open schematic (refuses with unsaved changes unless discard)",
-                   R"({"type":"object","properties":{"discard":{"type":"boolean","default":false}}})"_json,
+                   R"json({"type":"object","properties":{"discard":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_close );
 
 KOPENAPI_REGISTER( "sch_save",
                    "Save the open schematic; with 'path' save as (headless switches to it, GUI writes a copy)",
-                   R"({"type":"object","properties":{"path":{"type":"string"}}})"_json, false, h_sch_save );
+                   R"json({"type":"object","properties":{"path":{"type":"string"}}})json"_json, false, h_sch_save );
 
 KOPENAPI_REGISTER( "sch_revert", "Reload the open schematic from disk, dropping unsaved changes",
-                   R"({"type":"object","properties":{}})"_json, false, h_sch_revert );
+                   R"json({"type":"object","properties":{}})json"_json, false, h_sch_revert );

@@ -271,19 +271,19 @@ KOPENAPI_REGISTER_DOCUMENTS( "pcb", documentStatus, []() { s_headless.reset(); }
 
 KOPENAPI_REGISTER( "pcb_open",
                    "Open a board (.kicad_pcb or its .kicad_pro): editor window in the GUI, in memory headless",
-                   R"({"type":"object","required":["path"],"properties":{
+                   R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
-                                   "description":"Drop unsaved changes of the currently open board"}}})"_json,
+                                   "description":"Drop unsaved changes of the currently open board"}}})json"_json,
                    false, h_pcb_open );
 
 KOPENAPI_REGISTER( "pcb_close", "Close the open board (refuses with unsaved changes unless discard)",
-                   R"({"type":"object","properties":{"discard":{"type":"boolean","default":false}}})"_json,
+                   R"json({"type":"object","properties":{"discard":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_close );
 
 KOPENAPI_REGISTER( "pcb_save",
                    "Save the open board; with 'path' save as (headless switches to it, GUI writes a copy)",
-                   R"({"type":"object","properties":{"path":{"type":"string"}}})"_json, false, h_pcb_save );
+                   R"json({"type":"object","properties":{"path":{"type":"string"}}})json"_json, false, h_pcb_save );
 
 KOPENAPI_REGISTER( "pcb_revert", "Reload the open board from disk, dropping unsaved changes",
-                   R"({"type":"object","properties":{}})"_json, false, h_pcb_revert );
+                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_revert );

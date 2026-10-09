@@ -7,8 +7,8 @@
  *   static KOPENAPI_RESULT h_open_pcb( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs );
  *
  *   KOPENAPI_REGISTER( "open_pcb", "Open a .kicad_pcb in the PCB editor window",
- *                      R"({"type":"object","required":["path"],
- *                          "properties":{"path":{"type":"string"}}})"_json,
+ *                      R"json({"type":"object","required":["path"],
+ *                          "properties":{"path":{"type":"string"}}})json"_json,
  *                      true, h_open_pcb );
  *
  * The registry is the single source of truth: the service routes POST /api/v1/{name}

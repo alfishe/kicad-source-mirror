@@ -379,9 +379,9 @@ static KOPENAPI_RESULT h_pcb_clearance_stats( KOPENAPI_CONTEXT& aCtx, const nloh
 KOPENAPI_REGISTER( "pcb_stats",
                    "Board statistics in one call (milliseconds): outline size/area, layers, footprints "
                    "(THT/SMD/side/DNP), pads, tracks per layer, vias, zones, nets, unrouted connections",
-                   R"({"type":"object","properties":{}})"_json, false, h_pcb_stats );
+                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_stats );
 
 KOPENAPI_REGISTER( "pcb_clearance_stats",
                    "Slow board metrics: copper areas, minimum track-to-track clearance, minimum drill; "
                    "O(n^2) in track count, can take tens of seconds on large boards",
-                   R"({"type":"object","properties":{}})"_json, false, h_pcb_clearance_stats, 600 );
+                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_clearance_stats, 600 );
