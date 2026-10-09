@@ -1,6 +1,7 @@
 /*
  * kicadopenapi schematic traversal (DESIGN-ANALYSIS-API.md §5):
- * sch_net_trace, sch_symbol_neighbors, sch_path_find, sch_power_tree, sch_interface_map.
+ * sch_net_trace, sch_symbol_neighbors, sch_path_find, sch_power_tree, sch_interface_map,
+ * sch_net_search, sch_subcircuit.
  *
  * All methods work on one connectivity graph built per call: components (by reference,
  * units merged) connected through nets via their pins — the same nets and pins as
@@ -83,7 +84,7 @@ GRAPH buildGraph( SCHEMATIC* aSchematic )
 
             if( !sym || sym->IsPower() )
             {
-                g.netIsPower[n] = true;
+                g.netIsPower[n] = g.netIsPower[n] || isRailSymbol( sym );
                 continue;
             }
 
@@ -593,6 +594,252 @@ static KOPENAPI_RESULT h_sch_interface_map( KOPENAPI_CONTEXT& aCtx, const nlohma
 }
 
 
+static KOPENAPI_RESULT h_sch_net_search( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    const std::string pattern = aArgs.value( "pattern", std::string() );
+    const std::string by = aArgs.value( "by", std::string( "any" ) );
+    const std::string roleFilter = aArgs.value( "role", std::string() );
+
+    static const std::set<std::string> kinds = { "any", "name", "pin_name", "value", "ref" };
+
+    if( !kinds.count( by ) )
+        return KOPENAPI_RESULT::Error( 400, "by must be any, name, pin_name, value or ref" );
+
+    if( pattern.empty() && roleFilter.empty() )
+        return KOPENAPI_RESULT::Error( 400, "give 'pattern' (glob) and/or 'role'" );
+
+    const GRAPH g = buildGraph( context->GetSchematic() );
+    const bool  all = by == "any";
+    const int   listLimit = std::clamp( aArgs.value( "list_limit", 10 ), 1, 1000 );
+
+    std::vector<nlohmann::json> rows;
+
+    for( size_t n = 0; n < g.nets.size(); ++n )
+    {
+        const NET_ENTRY& net = g.nets[n];
+
+        if( !roleFilter.empty() && g.netRole[n] != roleFilter
+            && !( roleFilter == "power" && g.netIsPower[n] && g.netRole[n] != "ground" ) )
+        {
+            continue;
+        }
+
+        nlohmann::json matched = nlohmann::json::array();
+        int            matchCount = 0;
+        auto           hit = [&]( const char* aWhat, const std::string& aText, const std::string& aWhere )
+        {
+            if( matchCount++ < listLimit )
+                matched.push_back( { { "by", aWhat }, { "text", aText }, { "at", aWhere } } );
+        };
+
+        if( pattern.empty() )
+        {
+            hit( "role", g.netRole[n], net.name );
+        }
+        else
+        {
+            if( all || by == "name" )
+            {
+                std::set<std::string> names = { net.name };
+
+                for( const NET_INSTANCE& inst : net.instances )
+                {
+                    if( !inst.localName.empty() )
+                        names.insert( inst.localName );
+                }
+
+                for( const std::string& name : names )
+                {
+                    if( KopenapiGlob( pattern, name ) )
+                        hit( "name", name, net.name );
+                }
+            }
+
+            std::set<std::string> refsHit;
+
+            for( int pin : g.netPins[n] )
+            {
+                const PIN_NODE&  p = g.pins[pin];
+                const COMPONENT& comp = g.components.at( p.ref );
+
+                if( ( all || by == "pin_name" ) && KopenapiGlob( pattern, p.name ) )
+                    hit( "pin_name", p.name, p.id );
+
+                if( by == "value" && KopenapiGlob( pattern, comp.value ) && refsHit.insert( p.ref ).second )
+                    hit( "value", comp.value, p.ref );
+
+                if( by == "ref" && KopenapiGlob( pattern, p.ref ) && refsHit.insert( p.ref ).second )
+                    hit( "ref", p.ref, p.id );
+            }
+        }
+
+        if( matchCount == 0 )
+            continue;
+
+        rows.push_back( { { "name", net.name },
+                          { "code", net.code },
+                          { "role", g.netRole[n] },
+                          { "pins", g.netPins[n].size() },
+                          { "matched", matched },
+                          { "match_count", matchCount } } );
+    }
+
+    return KOPENAPI_RESULT::Ok( KopenapiPage( rows, aArgs ) );
+}
+
+
+static KOPENAPI_RESULT h_sch_subcircuit( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    const GRAPH       g = buildGraph( context->GetSchematic() );
+    const std::string ref = aArgs.value( "ref", std::string() );
+    const int         depth = std::clamp( aArgs.value( "depth", 2 ), 1, 6 );
+    const int         maxPartPins = std::clamp( aArgs.value( "max_part_pins", 3 ), 2, 64 );
+    const int         maxFanout = aArgs.value( "max_fanout", 30 );
+
+    auto center = g.components.find( ref );
+
+    if( center == g.components.end() )
+        return KOPENAPI_RESULT::Error( 404, "component not found (or not connected): " + ref );
+
+    // Members grow through small parts (<= max_part_pins: R, C, L, diodes, transistors);
+    // connectors and bigger parts (other ICs) are the boundary: listed, not expanded.
+    std::map<std::string, int>         level = { { ref, 0 } };
+    std::map<std::string, std::string> kind = { { ref, "center" } };
+    std::deque<std::string>            queue = { ref };
+    std::set<int>                      rails, crowded;
+
+    while( !queue.empty() )
+    {
+        const std::string current = queue.front();
+        queue.pop_front();
+
+        if( level[current] >= depth )
+            continue;
+
+        for( int pin : g.components.at( current ).pins )
+        {
+            const int net = g.pins[pin].net;
+
+            if( g.netIsPower[net] )
+            {
+                rails.insert( net );
+                continue;
+            }
+
+            if( maxFanout > 0 && static_cast<int>( g.netPins[net].size() ) > maxFanout )
+            {
+                crowded.insert( net );
+                continue;
+            }
+
+            for( int other : g.netPins[net] )
+            {
+                const std::string& otherRef = g.pins[other].ref;
+
+                if( level.count( otherRef ) )
+                    continue;
+
+                const COMPONENT& comp = g.components.at( otherRef );
+                level[otherRef] = level[current] + 1;
+
+                if( KopenapiIsConnectorRef( otherRef ) )
+                {
+                    kind[otherRef] = "boundary_connector";
+                }
+                else if( static_cast<int>( comp.pins.size() ) > maxPartPins )
+                {
+                    kind[otherRef] = "boundary_part";
+                }
+                else
+                {
+                    kind[otherRef] = "member";
+                    queue.push_back( otherRef );
+                }
+            }
+        }
+    }
+
+    // Nets of the block: internal when every pin belongs to the center or members
+    nlohmann::json parts = nlohmann::json::array(), internal = nlohmann::json::array(),
+                   external = nlohmann::json::array(), railList = nlohmann::json::array();
+    std::set<int>  nets;
+
+    std::vector<std::string> refs;
+
+    for( const auto& [r, k] : kind )
+        refs.push_back( r );
+
+    std::sort( refs.begin(), refs.end(),
+               [&]( const std::string& a, const std::string& b )
+               {
+                   if( level[a] != level[b] )
+                       return level[a] < level[b];
+
+                   return KopenapiNaturalLess( a, b );
+               } );
+
+    for( const std::string& r : refs )
+    {
+        const COMPONENT& comp = g.components.at( r );
+        parts.push_back( { { "ref", r }, { "value", comp.value }, { "lib_id", comp.libId },
+                           { "kind", kind[r] }, { "pins", comp.pins.size() }, { "distance", level[r] } } );
+
+        if( kind[r] == "center" || kind[r] == "member" )
+        {
+            for( int pin : comp.pins )
+            {
+                if( !g.netIsPower[g.pins[pin].net] )
+                    nets.insert( g.pins[pin].net );
+            }
+        }
+    }
+
+    for( int net : nets )
+    {
+        nlohmann::json outside = nlohmann::json::array();
+        int            outsideCount = 0;
+
+        for( int pin : g.netPins[net] )
+        {
+            auto k = kind.find( g.pins[pin].ref );
+
+            if( k == kind.end() || ( k->second != "center" && k->second != "member" ) )
+            {
+                if( outsideCount++ < 10 )
+                    outside.push_back( g.pins[pin].id );
+            }
+        }
+
+        if( outsideCount == 0 )
+            internal.push_back( g.nets[net].name );
+        else
+            external.push_back( { { "net", g.nets[net].name }, { "role", g.netRole[net] },
+                                  { "outside_pins", outside }, { "outside_count", outsideCount },
+                                  { "crowded", crowded.count( net ) > 0 } } );
+    }
+
+    for( int net : rails )
+        railList.push_back( { { "net", g.nets[net].name }, { "role", g.netRole[net] } } );
+
+    return KOPENAPI_RESULT::Ok( { { "ref", ref },
+                                  { "value", center->second.value },
+                                  { "parts", parts },
+                                  { "internal_nets", internal },
+                                  { "external_nets", external },
+                                  { "rails", railList } } );
+}
+
+
 KOPENAPI_REGISTER( "sch_net_trace",
                    "Trace a signal through the hierarchy: from a pin (REF.PIN) or net, every sheet instance "
                    "it reaches ordered by distance, with local name, labels and sheet ports it passes and "
@@ -636,3 +883,28 @@ KOPENAPI_REGISTER( "sch_interface_map",
                         "ref":{"type":"string","description":"connector ref glob"},
                         "list_limit":{"type":"integer","default":10}}})json"_json,
                    false, h_sch_interface_map );
+
+KOPENAPI_REGISTER( "sch_net_search",
+                   "Find nets by glob: by net name (incl. local names along the hierarchy), pin name "
+                   "(e.g. all nets touching a pin named *RESET*), value of a part on the net (e.g. Z84C15*), "
+                   "part reference; or by role (power/ground/clock/reset/signal/unconnected); shows what "
+                   "matched; paginated",
+                   KopenapiPagedSchema( R"json({
+                        "pattern":{"type":"string","description":"glob, case-insensitive"},
+                        "by":{"type":"string","enum":["any","name","pin_name","value","ref"],"default":"any",
+                              "description":"any = net names and pin names"},
+                        "role":{"type":"string","enum":["power","ground","clock","reset","signal","unconnected"]},
+                        "list_limit":{"type":"integer","default":10,"description":"max matches listed per net"}})json"_json ),
+                   false, h_sch_net_search );
+
+KOPENAPI_REGISTER( "sch_subcircuit",
+                   "Functional block around a part (e.g. a regulator with its capacitors, an oscillator "
+                   "with crystal and load caps): grows through small parts, stops at power rails, "
+                   "connectors and bigger parts (listed as boundary); internal nets, nets leaving the "
+                   "block with their outside pins, power rails used",
+                   R"json({"type":"object","required":["ref"],"properties":{
+                        "ref":{"type":"string"},
+                        "depth":{"type":"integer","default":2,"minimum":1,"maximum":6},
+                        "max_part_pins":{"type":"integer","default":3,"description":"parts with more pins are boundary, not expanded"},
+                        "max_fanout":{"type":"integer","default":30,"description":"do not expand through nets with more pins; 0 = no limit"}}})json"_json,
+                   false, h_sch_subcircuit );

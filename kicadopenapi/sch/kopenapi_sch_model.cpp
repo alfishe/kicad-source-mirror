@@ -221,6 +221,13 @@ std::vector<NET_ENTRY> collectNets( SCHEMATIC* aSchematic )
 }
 
 
+bool isRailSymbol( const SCH_SYMBOL* aSymbol )
+{
+    return aSymbol && aSymbol->IsPower()
+           && aSymbol->GetLibId().GetLibItemName().wx_str().CmpNoCase( wxS( "PWR_FLAG" ) ) != 0;
+}
+
+
 std::string pinId( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath )
 {
     SCH_SYMBOL* sym = pinSymbol( aPin );
@@ -258,7 +265,7 @@ std::string netRole( const NET_ENTRY& aNet )
     {
         for( const auto& [pin, path] : netPins( aNet ) )
         {
-            if( SCH_SYMBOL* sym = pinSymbol( pin ); sym && sym->IsPower() )
+            if( isRailSymbol( pinSymbol( pin ) ) )
                 return "power";
         }
     }

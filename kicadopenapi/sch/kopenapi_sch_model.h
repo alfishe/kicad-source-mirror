@@ -56,6 +56,9 @@ std::string sheetPath( const SCH_SHEET_PATH& aPath );
 
 SCH_SYMBOL* pinSymbol( const SCH_PIN* aPin );
 
+/// A power symbol that names a rail (+5V, GND); PWR_FLAG is a power symbol only marking a net for ERC
+bool isRailSymbol( const SCH_SYMBOL* aSymbol );
+
 /// REF.PIN of a pin on a sheet instance
 std::string pinId( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath );
 

@@ -631,7 +631,7 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
                     continue;
 
                 nlohmann::json p = pinJson( static_cast<SCH_PIN*>( item ), path, &pads );
-                powerSymbol |= p["power_symbol"].get<bool>();
+                powerSymbol |= isRailSymbol( pinSymbol( static_cast<SCH_PIN*>( item ) ) );
                 exported |= p.contains( "pads" ) && !p["pads"].empty();
 
                 if( !p["power_symbol"].get<bool>() )
