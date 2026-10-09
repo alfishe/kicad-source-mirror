@@ -25,17 +25,33 @@
 #include <netclass.h>
 #include <project/net_settings.h>
 #include <netinfo.h>
+#include <pcb_draw_panel_gal.h>
+#include <pcb_edit_frame.h>
+#include <kicadopenapi_glow_view.h>
+#include <pad.h>
+#include <pcb_field.h>
+#include <page_info.h>
+#include <pgm_base.h>
+#include <settings/settings_manager.h>
+#include <project.h>
+#include <project/project_file.h>
+#include <wildcards_and_files_ext.h>
 #include <pcb_shape.h>
+#include <tool/actions.h>
+#include <kiway.h>
 #include <pcb_track.h>
 #include <reporter.h>
 #include <richio.h>
 #include <string_utils.h>
 #include <tool/tool_manager.h>
 
+#include <wx/ffile.h>
 #include <wx/filename.h>
 #include <wx/tokenzr.h>
 
 #include <algorithm>
+#include <map>
+#include <fstream>
 #include <functional>
 #include <cmath>
 
@@ -92,6 +108,84 @@ std::optional<BOX2I> outlineBox( BOARD* aBoard )
     return box;
 }
 
+/// Board editor side of the GUI glow (kicadopenapi_glow_view.h); no frame headless
+struct PCB_GLOW_TRAITS
+{
+    using FRAME = PCB_EDIT_FRAME;
+
+    static FRAME* Frame( KIWAY* aKiway )
+    {
+        return aKiway ? dynamic_cast<PCB_EDIT_FRAME*>( aKiway->Player( FRAME_PCB_EDITOR, false ) ) : nullptr;
+    }
+
+    static EDA_ITEM* Resolve( FRAME* aFrame, const KIID& aId )
+    {
+        return aFrame->GetBoard() ? aFrame->GetBoard()->ResolveItem( aId, true ) : nullptr;
+    }
+
+    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn )
+    {
+        KIGFX::VIEW* view = aFrame->GetCanvas()->GetView();
+
+        auto one = [&]( EDA_ITEM* aOne )
+        {
+            if( aOn )
+                aOne->SetBrightened();
+            else
+                aOne->ClearBrightened();
+
+            view->Update( aOne, KIGFX::REPAINT );
+        };
+
+        one( aItem );
+
+        // a footprint's pads, texts and graphics are drawn on their own
+        if( aItem->Type() == PCB_FOOTPRINT_T )
+            static_cast<FOOTPRINT*>( aItem )->RunOnChildren( [&]( BOARD_ITEM* aChild ) { one( aChild ); }, RECURSE_MODE::RECURSE );
+    }
+
+    static BOX2I Box( EDA_ITEM* aItem ) { return aItem->GetBoundingBox(); }
+
+    static int Mm() { return pcbIUScale.mmToIU( 1.0 ); }
+
+    static void ItemColour( FRAME*, bool, std::optional<KIGFX::COLOR4D>& ) {}
+};
+
+
+/// Glow what a call changed (GUI); a batch lights up one item after another
+void glow( KOPENAPI_CONTEXT& aCtx, const std::vector<KIID>& aItems )
+{
+    if( !aCtx.headless )
+        KopenapiGlow<PCB_GLOW_TRAITS>( aCtx.kiway, aItems, aItems.size() > 1 ? 300 : 0 );
+}
+
+
+/// What a footprint looks like to the netlist update: changes in it make it glow
+std::string footprintState( FOOTPRINT* aFootprint )
+{
+    std::string state = str( aFootprint->GetReference() ) + "|" + str( aFootprint->GetValue() ) + "|"
+                        + str( aFootprint->GetFPID().Format() );
+
+    for( PCB_FIELD* field : aFootprint->GetFields() )
+        state += "|" + str( field->GetName() ) + "=" + str( field->GetText() );
+
+    for( PAD* pad : aFootprint->Pads() )
+        state += "|" + str( pad->GetNumber() ) + ":" + str( pad->GetNetname() );
+
+    return state;
+}
+
+
+/// No drawing frame on a board: an empty drawing sheet next to it, and a page that fits the
+/// board plus 10 mm (as the barycenter conversions do)
+void fitPage( BOARD* aBoard, const BOX2I& aOutline )
+{
+    PAGE_INFO page( PAGE_SIZE_TYPE::User );
+    page.SetWidthMils( std::max( 1000.0, pcbIUScale.IUToMils( aOutline.GetRight() ) + 10.0 * 1000.0 / 25.4 ) );
+    page.SetHeightMils( std::max( 1000.0, pcbIUScale.IUToMils( aOutline.GetBottom() ) + 10.0 * 1000.0 / 25.4 ) );
+    aBoard->SetPageSettings( page );
+}
+
 } // namespace
 
 
@@ -114,10 +208,61 @@ static KOPENAPI_RESULT h_pcb_new( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     if( !fn.DirExists() && !wxFileName::Mkdir( fn.GetPath(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL ) )
         return KOPENAPI_RESULT::Error( 500, "cannot create the directory" );
 
+    // No drawing frame unless asked: an empty drawing sheet for this board, named in the project
+    const bool frame = aArgs.value( "frame", false );
+    wxFileName sheet( fn );
+    sheet.SetName( fn.GetName() + wxS( "-board" ) );
+    sheet.SetExt( wxS( "kicad_wks" ) );
+
+    if( !frame )
+    {
+        wxFFile wks( sheet.GetFullPath(), wxS( "w" ) );
+
+        if( !wks.IsOpened()
+            || !wks.Write( wxS( "(kicad_wks (version 20220228) (generator \"kicadopenapi\")\n"
+                                "  (setup (textsize 1.5 1.5) (linewidth 0.15) (textlinewidth 0.15)\n"
+                                "    (left_margin 0) (right_margin 0) (top_margin 0) (bottom_margin 0))\n)\n" ) ) )
+        {
+            return KOPENAPI_RESULT::Error( 500, "cannot write the drawing sheet " + str( sheet.GetFullPath() ) );
+        }
+
+        wxFileName projectFile( fn );
+        projectFile.SetExt( FILEEXT::ProjectFileExtension );
+        SETTINGS_MANAGER& settings = Pgm().GetSettingsManager();
+
+        if( PROJECT* project = settings.GetProject( projectFile.GetFullPath() ) )
+        {
+            project->GetProjectFile().m_BoardDrawingSheetFile = sheet.GetFullName();
+            settings.SaveProject( projectFile.GetFullPath(), project );
+        }
+        else
+        {
+            // no project loaded yet: written into the project file pcb_open is about to load
+            nlohmann::json pro = nlohmann::json::object();
+
+            if( projectFile.FileExists() )
+            {
+                std::ifstream in( projectFile.GetFullPath().ToStdString( wxConvUTF8 ) );
+                pro = nlohmann::json::parse( in, nullptr, false );
+
+                if( pro.is_discarded() )
+                    pro = nlohmann::json::object();
+            }
+
+            pro["pcbnew"]["page_layout_descr_file"] = str( sheet.GetFullName() );
+            std::ofstream out( projectFile.GetFullPath().ToStdString( wxConvUTF8 ) );
+            out << pro.dump( 2 );
+        }
+    }
+
     try
     {
         BOARD board;
         board.SetCopperLayerCount( layers );
+
+        if( !frame )
+            fitPage( &board, BOX2I( VECTOR2I( 0, 0 ), VECTOR2I( toIU( 100 ), toIU( 80 ) ) ) );
+
         board.SetEnabledLayers( board.GetEnabledLayers() | LSET::AllCuMask( layers ) );
         PCB_IO_KICAD_SEXPR().SaveBoard( fn.GetFullPath(), board );
     }
@@ -167,6 +312,11 @@ static KOPENAPI_RESULT h_pcb_netlist_apply( KOPENAPI_CONTEXT& aCtx, const nlohma
     {
         return KOPENAPI_RESULT::Error( 400, "netlist not readable: " + str( ioe.What() ) );
     }
+
+    std::map<KIID, std::string> before;
+
+    for( FOOTPRINT* fp : board->Footprints() )
+        before[fp->m_Uuid] = footprintState( fp );
 
     std::unique_ptr<BOARD_NETLIST_UPDATER> updater = context->MakeNetlistUpdater();
     updater->SetReporter( &reporter );
@@ -236,6 +386,44 @@ static KOPENAPI_RESULT h_pcb_netlist_apply( KOPENAPI_CONTEXT& aCtx, const nlohma
 
         if( !fresh.empty() )
             commit.Push( _( "Spread new footprints (API)" ) );
+    }
+
+    // GUI: KiCad's OnNetlistChanged leaves the new footprints selected for an interactive drag
+    // (which an API call never starts) and the canvas did not show them until the board was
+    // reloaded; drop the selection and rebuild the view from the board
+    if( !dryRun && success && !aCtx.headless && aCtx.kiway )
+    {
+        if( auto* frame = dynamic_cast<PCB_EDIT_FRAME*>( aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) ) )
+        {
+            if( frame->GetBoard() == board )
+            {
+                frame->GetToolManager()->RunAction( ACTIONS::selectionClear );
+                frame->GetCanvas()->DisplayBoard( board );
+                frame->GetCanvas()->SyncLayersVisibility( board );
+                frame->GetToolManager()->RunAction( ACTIONS::zoomFitScreen );
+                frame->GetCanvas()->Refresh();
+            }
+        }
+    }
+
+    // Glow what the update added or changed (GUI)
+    if( !dryRun && success )
+    {
+        std::vector<KIID> changed;
+
+        std::vector<FOOTPRINT*> sorted( board->Footprints().begin(), board->Footprints().end() );
+        std::sort( sorted.begin(), sorted.end(), []( FOOTPRINT* a, FOOTPRINT* b )
+                   { return KopenapiNaturalLess( str( a->GetReference() ), str( b->GetReference() ) ); } );
+
+        for( FOOTPRINT* fp : sorted )
+        {
+            auto old = before.find( fp->m_Uuid );
+
+            if( old == before.end() || old->second != footprintState( fp ) )
+                changed.push_back( fp->m_Uuid );
+        }
+
+        glow( aCtx, changed );
     }
 
     // The report, one line per change / problem
@@ -348,6 +536,21 @@ static KOPENAPI_RESULT h_pcb_outline_set( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     commit.Add( outline );
     commit.Push( _( "Board outline (API)" ) );
+
+    // A frameless board's page follows its outline
+    if( board->GetPageSettings().GetType() == PAGE_SIZE_TYPE::User )
+    {
+        fitPage( board, rect );
+
+        if( auto* frame = PCB_GLOW_TRAITS::Frame( aCtx.headless ? nullptr : aCtx.kiway ) )
+        {
+            frame->GetCanvas()->DisplayBoard( board );
+            frame->GetToolManager()->RunAction( ACTIONS::zoomFitScreen );
+            frame->GetCanvas()->Refresh();
+        }
+    }
+
+    glow( aCtx, { outline->m_Uuid } );
 
     nlohmann::json outside = nlohmann::json::array();
 
@@ -649,6 +852,7 @@ KOPENAPI_REGISTER( "pcb_new",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string","description":"absolute path ending in .kicad_pcb"},
                         "layers":{"type":"integer","default":2},
+                        "frame":{"type":"boolean","default":false,"description":"KiCad's drawing frame and title block; default none (page fits the board, pcb_outline_set resizes it)"},
                         "overwrite":{"type":"boolean","default":false},
                         "discard":{"type":"boolean","default":false,"description":"drop unsaved changes of the open board"}}})json"_json,
                    false, h_pcb_new, 120 );

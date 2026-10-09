@@ -14,6 +14,7 @@
 
 #include <api/sch_context.h>
 #include <base_units.h>
+#include <kicadopenapi_glow_view.h>
 #include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
 #include <kiway.h>
@@ -393,244 +394,57 @@ wxString nextFreeRef( SCHEMATIC* aSchematic, const wxString& aPrefix, std::set<w
  * stayed unconnected until the file was reloaded), so every edit ends with a full rebuild —
  * the same the netlist exporter does.
  */
-/**
- * GUI: what an API edit changed glows for a moment, so a person watching sees where the agent
- * worked.  The item itself turns a colour the schematic does not use (vivid blue) and a halo
- * of the same colour fades around it.
- *
- * One collection per process: every glowing item with the time its glow started, in that
- * order, and one timer that redraws the fading halo and dims entries in the same order once
- * their time is up.  An item glowing again gets a newer entry; only its newest entry dims it.
- * Items are looked up again by uuid on every tick, so an undo or a closed editor in between is
- * harmless.  Main thread only (API methods run there).
- */
-class GLOW_TRACKER : public wxEvtHandler
+/// Schematic editor side of the GUI glow (kicadopenapi_glow.h)
+struct SCH_GLOW_TRAITS
 {
-public:
-    static constexpr int GLOW_MS = 2000;
+    using FRAME = SCH_EDIT_FRAME;
 
-    /// Process-wide; never destroyed (its timer is idle whenever the collection is empty)
-    static GLOW_TRACKER& Get()
-    {
-        static GLOW_TRACKER* tracker = new GLOW_TRACKER();
-        return *tracker;
-    }
-
-    void Add( KIWAY* aKiway, const std::vector<KIID>& aItems )
-    {
-        SCH_EDIT_FRAME* frame = frameOf( aKiway );
-
-        if( !frame || aItems.empty() )
-            return;
-
-        m_kiway = aKiway;
-        setItemColour( frame, true );
-
-        const CLOCK::time_point now = CLOCK::now();
-        SCH_SHEET_LIST          hierarchy = frame->Schematic().Hierarchy();
-
-        for( const KIID& id : aItems )
-        {
-            if( SCH_ITEM* item = hierarchy.ResolveItem( id, nullptr, true ) )
-            {
-                item->SetBrightened();
-                frame->UpdateItem( item );
-                m_entries.push_back( { id, now } );
-                m_newest[id] = now;
-            }
-        }
-
-        drawHalo( frame, now );
-
-        if( !m_entries.empty() && !m_timer.IsRunning() )
-            m_timer.Start( TICK_MS );
-    }
-
-private:
-    using CLOCK = std::chrono::steady_clock;
-
-    static constexpr int TICK_MS = 50;
-
-    /// Vivid blue: not among KiCad's default schematic colours (green wires, dark red bodies,
-    /// yellow fills, teal text, dark blue buses, magenta highlight); KOPENAPI_GLOW_COLOR=#RRGGBB
-    /// overrides it
-    static KIGFX::COLOR4D glowColour( double aAlpha )
-    {
-        static const KIGFX::COLOR4D base = []()
-        {
-            wxString hex;
-
-            if( wxGetEnv( wxS( "KOPENAPI_GLOW_COLOR" ), &hex ) && hex.length() == 7 && hex[0] == '#' )
-            {
-                unsigned long rgb = 0;
-
-                if( hex.Mid( 1 ).ToULong( &rgb, 16 ) )
-                    return KIGFX::COLOR4D( ( ( rgb >> 16 ) & 0xFF ) / 255.0, ( ( rgb >> 8 ) & 0xFF ) / 255.0, ( rgb & 0xFF ) / 255.0, 1.0 );
-            }
-
-            return KIGFX::COLOR4D( 0.10, 0.45, 1.0, 1.0 );
-        }();
-
-        return base.WithAlpha( aAlpha );
-    }
-
-    struct ENTRY
-    {
-        KIID              id;
-        CLOCK::time_point start;
-    };
-
-    GLOW_TRACKER()
-    {
-        m_timer.SetOwner( this );
-        Bind( wxEVT_TIMER, &GLOW_TRACKER::onTick, this );
-    }
-
-    static SCH_EDIT_FRAME* frameOf( KIWAY* aKiway )
+    static FRAME* Frame( KIWAY* aKiway )
     {
         return aKiway ? static_cast<SCH_EDIT_FRAME*>( aKiway->Player( FRAME_SCH, false ) ) : nullptr;
     }
 
+    static EDA_ITEM* Resolve( FRAME* aFrame, const KIID& aId )
+    {
+        return aFrame->Schematic().Hierarchy().ResolveItem( aId, nullptr, true );
+    }
+
+    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn )
+    {
+        if( aOn )
+            aItem->SetBrightened();
+        else
+            aItem->ClearBrightened();
+
+        aFrame->UpdateItem( aItem );
+    }
+
+    static BOX2I Box( EDA_ITEM* aItem ) { return aItem->GetBoundingBox(); }
+
+    static int Mm() { return schIUScale.mmToIU( 1.0 ); }
+
     /// Brightened items draw in the glow colour while anything glows; KiCad's own colour after
-    void setItemColour( SCH_EDIT_FRAME* aFrame, bool aGlow )
+    static void ItemColour( FRAME* aFrame, bool aGlow, std::optional<KIGFX::COLOR4D>& aSaved )
     {
         KIGFX::RENDER_SETTINGS* settings = aFrame->GetCanvas()->GetView()->GetPainter()->GetSettings();
 
-        if( aGlow && !m_savedColour )
+        if( aGlow && !aSaved )
         {
-            m_savedColour = settings->GetLayerColor( LAYER_BRIGHTENED );
-            settings->SetLayerColor( LAYER_BRIGHTENED, glowColour( 1.0 ) );
+            aSaved = settings->GetLayerColor( LAYER_BRIGHTENED );
+            settings->SetLayerColor( LAYER_BRIGHTENED, KopenapiGlowColour( 1.0 ) );
         }
-        else if( !aGlow && m_savedColour )
+        else if( !aGlow && aSaved )
         {
-            settings->SetLayerColor( LAYER_BRIGHTENED, *m_savedColour );
-            m_savedColour.reset();
-        }
-    }
-
-    /// Halo: nested rounded outlines around each glowing item, fading outwards and with age
-    void drawHalo( SCH_EDIT_FRAME* aFrame, CLOCK::time_point aNow )
-    {
-        KIGFX::VIEW* view = aFrame->GetCanvas()->GetView();
-
-        if( !m_overlay || m_overlayView != view )
-        {
-            m_overlay = view->MakeOverlay();
-            m_overlayView = view;
-        }
-
-        m_overlay->Clear();
-
-        SCH_SHEET_LIST hierarchy = aFrame->Schematic().Hierarchy();
-        const int      mm = schIUScale.mmToIU( 1.0 );
-
-        for( const auto& [id, start] : m_newest )
-        {
-            SCH_ITEM* item = hierarchy.ResolveItem( id, nullptr, true );
-
-            if( !item )
-                continue;
-
-            const double age = std::chrono::duration<double, std::milli>( aNow - start ).count() / GLOW_MS;
-            const double strength = std::clamp( 1.0 - age, 0.0, 1.0 );
-
-            if( strength <= 0 )
-                continue;
-
-            BOX2I box = item->GetBoundingBox();
-
-            m_overlay->SetIsFill( true );
-            m_overlay->SetIsStroke( false );
-            m_overlay->SetFillColor( glowColour( 0.10 * strength ) );
-            m_overlay->Rectangle( VECTOR2D( box.GetLeft() - mm, box.GetTop() - mm ),
-                                  VECTOR2D( box.GetRight() + mm, box.GetBottom() + mm ) );
-
-            m_overlay->SetIsFill( false );
-            m_overlay->SetIsStroke( true );
-
-            for( int ring = 0; ring < 5; ++ring )
-            {
-                const int margin = mm + ring * mm * 6 / 10;
-                m_overlay->SetLineWidth( mm * 0.6 );
-                m_overlay->SetStrokeColor( glowColour( ( 0.85 - ring * 0.17 ) * strength ) );
-                m_overlay->Rectangle( VECTOR2D( box.GetLeft() - margin, box.GetTop() - margin ),
-                                      VECTOR2D( box.GetRight() + margin, box.GetBottom() + margin ) );
-            }
-        }
-
-        view->Update( m_overlay.get() );
-        aFrame->GetCanvas()->Refresh();
-    }
-
-    void onTick( wxTimerEvent& )
-    {
-        const CLOCK::time_point       now = CLOCK::now();
-        SCH_EDIT_FRAME*               frame = frameOf( m_kiway );
-        std::optional<SCH_SHEET_LIST> hierarchy;
-
-        // Dim in the order the glows started
-        while( !m_entries.empty() && now - m_entries.front().start >= std::chrono::milliseconds( GLOW_MS ) )
-        {
-            const ENTRY entry = m_entries.front();
-            m_entries.pop_front();
-
-            auto newest = m_newest.find( entry.id );
-
-            if( newest == m_newest.end() || newest->second != entry.start )
-                continue;   // glowed again later: its newer entry dims it
-
-            m_newest.erase( newest );
-
-            if( !frame )
-                continue;
-
-            if( !hierarchy )
-                hierarchy = frame->Schematic().Hierarchy();
-
-            if( SCH_ITEM* item = hierarchy->ResolveItem( entry.id, nullptr, true ) )
-            {
-                item->ClearBrightened();
-                frame->UpdateItem( item );
-            }
-        }
-
-        if( frame )
-        {
-            drawHalo( frame, now );
-
-            if( m_entries.empty() )
-                setItemColour( frame, false );
-        }
-
-        if( m_entries.empty() )
-        {
-            m_timer.Stop();
-
-            if( m_overlay && frame )
-            {
-                m_overlay->Clear();
-                m_overlayView->Update( m_overlay.get() );
-                frame->GetCanvas()->Refresh();
-            }
-
-            m_overlay.reset();
-            m_overlayView = nullptr;
+            settings->SetLayerColor( LAYER_BRIGHTENED, *aSaved );
+            aSaved.reset();
         }
     }
-
-    KIWAY*                                  m_kiway = nullptr;
-    wxTimer                                 m_timer;
-    std::deque<ENTRY>                       m_entries;
-    std::map<KIID, CLOCK::time_point>       m_newest;
-    std::shared_ptr<KIGFX::VIEW_OVERLAY>    m_overlay;
-    KIGFX::VIEW*                            m_overlayView = nullptr;
-    std::optional<KIGFX::COLOR4D>           m_savedColour;
 };
 
 
 void glow( KIWAY* aKiway, const std::vector<KIID>& aItems )
 {
-    GLOW_TRACKER::Get().Add( aKiway, aItems );
+    KopenapiGlow<SCH_GLOW_TRAITS>( aKiway, aItems );
 }
 
 
