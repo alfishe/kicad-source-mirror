@@ -735,6 +735,79 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 }
 
 
+static KOPENAPI_RESULT h_sch_netlist( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    SCHEMATIC*   schematic = context->GetSchematic();
+    PAD_RESOLVER resolver( aCtx.kiway, &schematic->Project() );
+
+    // Components: one per reference (units merged), like the netlist exporter
+    std::map<std::string, nlohmann::json> components;
+
+    for( const SCH_SHEET_PATH& path : schematic->Hierarchy() )
+    {
+        for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* sym = static_cast<SCH_SYMBOL*>( item );
+
+            if( sym->IsPower() )
+                continue;
+
+            const std::string ref = str( sym->GetRef( &path, false ) );
+
+            if( components.count( ref ) )
+                continue;
+
+            components[ref] = { { "ref", ref },
+                                { "value", str( sym->GetValue( &path, FOR_GUI ) ) },
+                                { "footprint", str( sym->GetFootprintFieldText( &path, FOR_GUI ) ) },
+                                { "on_board", !sym->GetExcludedFromBoard( &path ) },
+                                { "dnp", sym->GetDNP( &path ) } };
+        }
+    }
+
+    nlohmann::json nets = nlohmann::json::array();
+    nlohmann::json unmapped = nlohmann::json::array();
+
+    for( const NET_ENTRY& net : collectNets( schematic ) )
+    {
+        std::vector<std::string> pads;
+
+        for( const auto& [pin, path] : netPins( net ) )
+        {
+            SCH_SYMBOL* sym = pinSymbol( pin );
+
+            if( !sym || sym->IsPower() )
+                continue;
+
+            std::string status;
+            const std::string ref = str( sym->GetRef( &path, false ) );
+
+            for( const std::string& pad : resolver.Resolve( pin, path, status ) )
+                pads.push_back( ref + "." + pad );
+
+            if( status == "unmapped" )
+                unmapped.push_back( { { "pin", pinId( pin, path ) }, { "net", net.name } } );
+        }
+
+        std::sort( pads.begin(), pads.end(), KopenapiNaturalLess );
+        pads.erase( std::unique( pads.begin(), pads.end() ), pads.end() );
+        nets.push_back( { { "name", net.name }, { "code", net.code }, { "role", netRole( net ) }, { "pads", pads } } );
+    }
+
+    nlohmann::json componentList = nlohmann::json::array();
+
+    for( auto& [ref, row] : components )
+        componentList.push_back( std::move( row ) );
+
+    return KOPENAPI_RESULT::Ok( { { "nets", nets }, { "unmapped_pins", unmapped }, { "components", componentList } } );
+}
+
+
 KOPENAPI_REGISTER( "sch_stats",
                    "Schematic statistics in one call: sheets (files, instances, depth), symbols (instances, "
                    "components, power, pins, DNP, unannotated, by library), wires, buses, bus entries, "
@@ -784,3 +857,9 @@ KOPENAPI_REGISTER( "sch_net_get",
                         "name":{"type":"string"},"code":{"type":"integer"},
                         "pin":{"type":"string","description":"REF.PIN, e.g. U3.14"}}})json"_json,
                    false, h_sch_net_get );
+
+KOPENAPI_REGISTER( "sch_netlist",
+                   "Schematic netlist in one call, compact, pads resolved like KiCad's netlist exporter: "
+                   "every net with role and its pads as REF.PAD, pins without a footprint pad, components "
+                   "(ref, value, footprint, on_board, dnp); input for schematic/board comparison",
+                   R"json({"type":"object","properties":{}})json"_json, false, h_sch_netlist );

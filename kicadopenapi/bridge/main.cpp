@@ -656,6 +656,7 @@ json Bridge::Search(const std::string& line, const json& args)
 {
     const std::string query = args.value("query", std::string());
     json methods = json::array();
+    json more = json::array();
     json instance = nullptr;
     std::string note;
 
@@ -669,7 +670,12 @@ json Bridge::Search(const std::string& line, const json& args)
                 && parsed["result"].contains("structuredContent")
                 && parsed["result"]["structuredContent"].contains("methods"))
             {
-                methods = parsed["result"]["structuredContent"]["methods"];
+                const json& found = parsed["result"]["structuredContent"];
+                methods = found["methods"];
+                if (found.contains("more") && found["more"].is_array())
+                {
+                    more = found["more"];
+                }
             }
         }
         if (std::optional<bridge::Instance> inst = bridge::FindByPid(m_cfg.discoveryDir, m_pid))
@@ -691,7 +697,11 @@ json Bridge::Search(const std::string& line, const json& args)
         }
     }
 
-    json data = {{"methods", methods}, {"count", methods.size()}, {"instance", instance}};
+    json data = {{"methods", methods},
+                 {"count", methods.size()},
+                 {"total", methods.size() + more.size()},
+                 {"more", more},
+                 {"instance", instance}};
     if (!note.empty())
     {
         data["note"] = note;

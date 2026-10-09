@@ -2,6 +2,9 @@
 
 #include <mcp_tools.h>
 
+#include <algorithm>
+#include <limits>
+
 using nlohmann::json;
 
 namespace mcp = kopenapi::mcp;
@@ -41,18 +44,30 @@ static json searchTool( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aArgs )
     const int         limit = std::clamp( aArgs.value( "limit", 20 ), 1, 100 );
 
     json methods = json::array();
+    json more = json::array();
 
-    // gui-only methods are hidden headless: they could only fail there
-    for( const KOPENAPI_METHOD& m :
-         KOPENAPI_REGISTRY::Get().Search( query, (size_t) limit, !aCtx.headless ) )
+    // gui-only methods are hidden headless: they could only fail there.  Matches beyond the
+    // limit are not dropped silently: they come back in "more" as name + summary only.
+    const std::vector<KOPENAPI_METHOD> found =
+            KOPENAPI_REGISTRY::Get().Search( query, std::numeric_limits<size_t>::max(), !aCtx.headless );
+
+    for( const KOPENAPI_METHOD& m : found )
     {
-        methods.push_back( { { "name", m.name },
-                             { "summary", m.summary },
-                             { "inputSchema", m.inputSchema },
-                             { "gui_only", m.guiOnly } } );
+        if( methods.size() < (size_t) limit )
+        {
+            methods.push_back( { { "name", m.name },
+                                 { "summary", m.summary },
+                                 { "inputSchema", m.inputSchema },
+                                 { "gui_only", m.guiOnly } } );
+        }
+        else
+        {
+            more.push_back( { { "name", m.name }, { "summary", m.summary } } );
+        }
     }
 
-    return toolResult( { { "methods", methods }, { "count", methods.size() } }, false );
+    return toolResult( { { "methods", methods }, { "count", methods.size() }, { "total", found.size() }, { "more", more } },
+                       false );
 }
 
 

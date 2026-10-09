@@ -20,6 +20,7 @@
 #include <pcb_field.h>
 #include <pcb_track.h>
 #include <ratsnest/ratsnest_data.h>
+#include <string_utils.h>
 #include <zone.h>
 
 #include <algorithm>
@@ -37,6 +38,25 @@ static double mm( double aIU )
 static std::string str( const wxString& aText )
 {
     return aText.ToStdString( wxConvUTF8 );
+}
+
+
+/// Net names are stored escaped ("RESET{slash}"); agents see and type them unescaped
+static std::string netName( const wxString& aName )
+{
+    return str( UnescapeString( aName ) );
+}
+
+
+/// Board net by name, as typed (unescaped) or in KiCad's stored form
+static NETINFO_ITEM* findNet( BOARD* aBoard, const std::string& aName )
+{
+    const wxString name = wxString::FromUTF8( aName );
+
+    if( NETINFO_ITEM* net = aBoard->FindNet( EscapeString( name, CTX_NETNAME ) ) )
+        return net;
+
+    return aBoard->FindNet( name );
 }
 
 
@@ -153,7 +173,7 @@ static std::string netClassName( const NETINFO_ITEM* aNet )
 static nlohmann::json inferRole( BOARD* aBoard, const NETINFO_ITEM* aNet, const NET_INFO_AGG& aAgg,
                                  const std::vector<const PAD*>& aPads )
 {
-    nlohmann::json byName = KopenapiNetRoleFromName( str( aNet->GetNetname() ) );
+    nlohmann::json byName = KopenapiNetRoleFromName( netName( aNet->GetNetname() ) );
     std::string    role = byName["role"];
     nlohmann::json basis = byName["basis"];
 
@@ -182,13 +202,13 @@ static nlohmann::json inferRole( BOARD* aBoard, const NETINFO_ITEM* aNet, const 
     for( const auto& [suffix, other] : std::vector<std::pair<std::string, std::string>>{
                  { "_P", "_N" }, { "_N", "_P" }, { "+", "-" }, { "-", "+" } } )
     {
-        const std::string full = str( aNet->GetNetname() );
+        const std::string full = netName( aNet->GetNetname() );
 
         if( full.size() > suffix.size() && upper( full ).compare( full.size() - suffix.size(), suffix.size(), suffix ) == 0 )
         {
             const std::string candidate = full.substr( 0, full.size() - suffix.size() ) + other;
 
-            if( aBoard->FindNet( wxString::FromUTF8( candidate ) ) )
+            if( findNet( aBoard, candidate ) )
             {
                 out["role"] = "diff_pair";
                 out["counterpart"] = candidate;
@@ -221,7 +241,7 @@ static nlohmann::json inferRole( BOARD* aBoard, const NETINFO_ITEM* aNet, const 
 static nlohmann::json padJson( const PAD* aPad, bool aWithFootprint )
 {
     nlohmann::json pad = { { "number", str( aPad->GetNumber() ) },
-                           { "net", str( aPad->GetNetname() ) },
+                           { "net", netName( aPad->GetNetname() ) },
                            { "function", str( aPad->GetPinFunction() ) },
                            { "pin_type", str( aPad->GetPinType() ) },
                            { "attribute", padAttribute( aPad ) },
@@ -243,7 +263,8 @@ static nlohmann::json padJson( const PAD* aPad, bool aWithFootprint )
         pad["footprint_uuid"] = str( fp->m_Uuid.AsString() );
 
         // Board-only footprints often have no reference: no REF.PAD handle for them
-        pad["pin"] = ref.empty() ? nlohmann::json() : nlohmann::json( ref + "." + str( aPad->GetNumber() ) );
+        const std::string number = str( aPad->GetNumber() );
+        pad["pin"] = ( ref.empty() || number.empty() ) ? nlohmann::json() : nlohmann::json( ref + "." + number );
     }
 
     return pad;
@@ -342,7 +363,7 @@ static KOPENAPI_RESULT h_pcb_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
             continue;
 
         const NET_INFO_AGG& a = agg[net->GetNetCode()];
-        const std::string   name = str( net->GetNetname() );
+        const std::string   name = netName( net->GetNetname() );
         const std::string   cls = netClassName( net );
         const int           open = unrouted( board, net->GetNetCode() );
 
@@ -384,7 +405,7 @@ static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     if( aArgs.contains( "code" ) && aArgs["code"].is_number_integer() )
         net = board->FindNet( aArgs["code"].get<int>() );
     else if( aArgs.contains( "name" ) && aArgs["name"].is_string() )
-        net = board->FindNet( wxString::FromUTF8( aArgs["name"].get<std::string>() ) );
+        net = findNet( board, aArgs["name"].get<std::string>() );
     else if( aArgs.contains( "pin" ) && aArgs["pin"].is_string() )
     {
         // "REF.PAD"
@@ -474,7 +495,7 @@ static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
             netClass["via_diameter_mm"] = mm( nc->GetViaDiameter() );
     }
 
-    return KOPENAPI_RESULT::Ok( { { "name", str( net->GetNetname() ) },
+    return KOPENAPI_RESULT::Ok( { { "name", netName( net->GetNetname() ) },
                                   { "code", net->GetNetCode() },
                                   { "class", netClass },
                                   { "pads", padList },
@@ -566,7 +587,7 @@ static KOPENAPI_RESULT h_pcb_footprint_get( KOPENAPI_CONTEXT& aCtx, const nlohma
         padList.push_back( padJson( pad, false ) );
 
         if( pad->GetNetCode() > 0 )
-            nets.insert( str( pad->GetNetname() ) );
+            nets.insert( netName( pad->GetNetname() ) );
     }
 
     card["pad_list"] = padList;
@@ -579,6 +600,78 @@ static KOPENAPI_RESULT h_pcb_footprint_get( KOPENAPI_CONTEXT& aCtx, const nlohma
 
     card["models"] = models;
     return KOPENAPI_RESULT::Ok( card );
+}
+
+
+static KOPENAPI_RESULT h_pcb_netlist( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD* board = context->GetBoard();
+
+    // Pads addressed as REF.PAD; pads without a reference or number cannot be matched to a
+    // schematic pin and are only counted
+    std::map<int, std::vector<std::string>> padsByNet;
+    std::map<int, int>                      anonymousByNet;
+    nlohmann::json                          withoutNet = nlohmann::json::array();
+    nlohmann::json                          footprints = nlohmann::json::array();
+
+    for( FOOTPRINT* fp : board->Footprints() )
+    {
+        const std::string ref = str( fp->GetReference() );
+
+        footprints.push_back( { { "ref", ref },
+                                { "value", str( fp->GetValue() ) },
+                                { "footprint", str( fp->GetFPIDAsString() ) },
+                                { "board_only", fp->IsBoardOnly() },
+                                { "dnp", fp->IsDNP() },
+                                { "uuid", str( fp->m_Uuid.AsString() ) } } );
+
+        for( PAD* pad : fp->Pads() )
+        {
+            const std::string number = str( pad->GetNumber() );
+            const int         code = pad->GetNetCode();
+
+            if( ref.empty() || number.empty() )
+            {
+                if( code > 0 )
+                    anonymousByNet[code]++;
+
+                continue;
+            }
+
+            if( code > 0 )
+                padsByNet[code].push_back( ref + "." + number );
+            else
+                withoutNet.push_back( ref + "." + number );
+        }
+    }
+
+    nlohmann::json nets = nlohmann::json::array();
+
+    for( NETINFO_ITEM* net : board->GetNetInfo() )
+    {
+        const int code = net->GetNetCode();
+
+        if( code <= 0 )
+            continue;
+
+        std::vector<std::string>& pads = padsByNet[code];
+        std::sort( pads.begin(), pads.end(), KopenapiNaturalLess );
+        pads.erase( std::unique( pads.begin(), pads.end() ), pads.end() );
+
+        nets.push_back( { { "name", netName( net->GetNetname() ) },
+                          { "code", code },
+                          { "pads", pads },
+                          { "anonymous_pads", anonymousByNet[code] } } );
+    }
+
+    return KOPENAPI_RESULT::Ok( { { "nets", nets },
+                                  { "pads_without_net", withoutNet },
+                                  { "footprints", footprints } } );
 }
 
 
@@ -621,3 +714,9 @@ KOPENAPI_REGISTER( "pcb_footprint_get",
                         "ref":{"type":"string","description":"reference designator, e.g. U3 (must be unique)"},
                         "uuid":{"type":"string","description":"footprint uuid from pcb_footprint_list"}}})json"_json,
                    false, h_pcb_footprint_get );
+
+KOPENAPI_REGISTER( "pcb_netlist",
+                   "Board netlist in one call, compact: every net with its pads as REF.PAD (pads without "
+                   "reference/number counted as anonymous), pads without a net, footprints (ref, value, "
+                   "footprint, board_only, dnp); input for schematic/board comparison",
+                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_netlist );

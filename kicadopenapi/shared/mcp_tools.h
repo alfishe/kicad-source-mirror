@@ -20,12 +20,12 @@ inline constexpr const char* kInvokeTool = "invoke";
 inline constexpr const char* kToolsJson = R"json([
   {
     "name": "search",
-    "description": "Find KiCad methods by keywords (e.g. 'open pcb', 'symbol', 'drc', 'instance'). Returns each method's name, summary, inputSchema and whether it needs the GUI. Empty query lists all methods. Call invoke with a returned name.",
+    "description": "Find KiCad methods by keywords (e.g. 'open pcb', 'symbol', 'drc', 'instance'). Returns each method's name, summary, inputSchema and whether it needs the GUI; matches beyond 'limit' are listed in 'more' (name + summary; search for one to get its inputSchema), 'total' counts all. Empty query lists all methods. Call invoke with a returned name.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "query": { "type": "string", "description": "Keywords; empty lists everything" },
-        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "methods returned with inputSchema; the rest go to 'more'" }
       }
     }
   },

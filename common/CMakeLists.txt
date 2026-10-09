@@ -402,6 +402,7 @@ list( APPEND KICOMMON_SRCS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_journal.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_util.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_core.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_design.cpp
     # platform layer shared with kicad-mcp-bridge; each file compiles only on its OS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_posix.cpp
