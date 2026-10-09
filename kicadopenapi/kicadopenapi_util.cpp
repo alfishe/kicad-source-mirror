@@ -192,3 +192,56 @@ bool KopenapiIsConnectorRef( const std::string& aRef )
 
     return false;
 }
+
+
+int KopenapiTextScore( const std::string& aQuery, const std::string& aName, const std::string& aKeywords,
+                       const std::string& aDescription )
+{
+    auto lower = []( std::string aText )
+    {
+        for( char& ch : aText )
+            ch = static_cast<char>( std::tolower( static_cast<unsigned char>( ch ) ) );
+
+        return aText;
+    };
+
+    const std::string name = lower( aName ), keywords = lower( aKeywords ), description = lower( aDescription );
+    const std::string query = lower( aQuery );
+
+    int    score = 1;
+    size_t start = 0;
+
+    while( start < query.size() )
+    {
+        const size_t end = query.find_first_of( " \t", start );
+        const std::string term = query.substr( start, end == std::string::npos ? std::string::npos : end - start );
+        start = end == std::string::npos ? query.size() : end + 1;
+
+        if( term.empty() )
+            continue;
+
+        int termScore = 0;
+
+        // A name hit says most, but a term buried inside a longer name ("usb" in FSUSB42MUX)
+        // says less than the part's own keywords and description
+        if( name == term )
+            termScore = 100;
+        else if( name.rfind( term, 0 ) == 0 )
+            termScore = 30;
+        else if( name.find( term ) != std::string::npos )
+            termScore = 8;
+
+        if( keywords.find( term ) != std::string::npos )
+            termScore += 12;
+
+        if( description.find( term ) != std::string::npos )
+            termScore += 6;
+
+        if( termScore == 0 )
+            return 0;
+
+        score += termScore;
+    }
+
+    return score;
+}

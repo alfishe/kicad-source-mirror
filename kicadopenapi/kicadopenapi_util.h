@@ -33,6 +33,14 @@ KICOMMON_API nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName
 /// Connector-like reference designator (J1, P2, X3, CN4, XS1, XP1, CON5): where nets leave the board
 KICOMMON_API bool KopenapiIsConnectorRef( const std::string& aRef );
 
+/**
+ * Relevance of a library item for a free-text query: every whitespace-separated term must
+ * occur (case-insensitive) in the name, keywords or description, else 0.  Name hits weigh
+ * most (exact name > name prefix > name substring), then keywords, then description.
+ */
+KICOMMON_API int KopenapiTextScore( const std::string& aQuery, const std::string& aName,
+                                    const std::string& aKeywords, const std::string& aDescription );
+
 /// JSON schema properties shared by all paginated methods (limit, cursor)
 KICOMMON_API nlohmann::json KopenapiPageSchema();
 
