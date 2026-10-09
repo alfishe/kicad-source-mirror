@@ -83,6 +83,14 @@ public:
 
     std::optional<KOPENAPI_METHOD> Find( const std::string& aName ) const;
 
+    /**
+     * Keyword search for the MCP `search` tool: query tokens are matched against method
+     * names (weight 3), summaries (2) and input property names (1); best first, then by
+     * name.  An empty query returns all methods by name.
+     */
+    std::vector<KOPENAPI_METHOD> Search( const std::string& aQuery, size_t aLimit,
+                                         bool aIncludeGuiOnly ) const;
+
 private:
     KOPENAPI_REGISTRY() = default;
 

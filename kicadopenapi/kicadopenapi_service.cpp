@@ -1,5 +1,6 @@
 #include "kicadopenapi_service.h"
 #include "kicadopenapi_registry.h"
+#include "kicadopenapi_mcp.h"
 
 #include <atomic>
 #include <chrono>
@@ -143,6 +144,11 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 
     KOPENAPI_RESULT invoke( const std::string& aName, const std::string& aBody ) const;
 
+    /// Same as invoke() with already parsed arguments (REST and MCP share this path)
+    KOPENAPI_RESULT invokeParsed( const std::string& aName, const nlohmann::json& aArgs ) const;
+
+    void handleMcp( const httplib::Request& aReq, httplib::Response& aRes ) const;
+
     void registerRoutes();
 };
 
@@ -176,6 +182,20 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::openApiJson() const
           { { "operationId", "openapi" },
             { "summary", "This OpenAPI manifest" },
             { "responses", { { "200", { { "description", "OpenAPI 3.0 document" } } } } } } }
+    };
+
+    paths["/mcp"] = {
+        { "post",
+          { { "operationId", "mcp" },
+            { "summary", "MCP endpoint (JSON-RPC 2.0, Streamable HTTP): tools search + invoke" },
+            { "requestBody",
+              { { "required", true },
+                { "content",
+                  { { "application/json",
+                      { { "schema", { { "type", "object" } } } } } } } } },
+            { "responses",
+              { { "200", { { "description", "JSON-RPC response" } } },
+                { "202", { { "description", "Notification accepted" } } } } } } }
     };
 
     if( shutdownHandler )
@@ -282,14 +302,6 @@ void KICAD_OPENAPI_SERVICE::IMPL::writeDiscoveryFile()
 KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invoke( const std::string& aName,
                                                      const std::string& aBody ) const
 {
-    std::optional<KOPENAPI_METHOD> method = KOPENAPI_REGISTRY::Get().Find( aName );
-
-    if( !method )
-        return KOPENAPI_RESULT::Error( 404, "unknown method '" + aName + "'" );
-
-    if( method->guiOnly && ctx.headless )
-        return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI" );
-
     nlohmann::json args = nlohmann::json::object();
 
     if( !aBody.empty() )
@@ -300,11 +312,26 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invoke( const std::string& aName,
             return KOPENAPI_RESULT::Error( 400, "request body must be a JSON object" );
     }
 
+    return invokeParsed( aName, args );
+}
+
+
+KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&    aName,
+                                                           const nlohmann::json& aArgs ) const
+{
+    std::optional<KOPENAPI_METHOD> method = KOPENAPI_REGISTRY::Get().Find( aName );
+
+    if( !method )
+        return KOPENAPI_RESULT::Error( 404, "unknown method '" + aName + "'" );
+
+    if( method->guiOnly && ctx.headless )
+        return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI" );
+
     if( method->inputSchema.contains( "required" ) )
     {
         for( const nlohmann::json& field : method->inputSchema["required"] )
         {
-            if( field.is_string() && !args.contains( field.get<std::string>() ) )
+            if( field.is_string() && !aArgs.contains( field.get<std::string>() ) )
                 return KOPENAPI_RESULT::Error( 400, "missing required field '"
                                                             + field.get<std::string>() + "'" );
         }
@@ -312,9 +339,64 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invoke( const std::string& aName,
 
     KOPENAPI_CONTEXT ctxCopy = ctx;
     KOPENAPI_HANDLER handler = method->handler;
+    nlohmann::json   args = aArgs;
 
     return runInMain( alive, waker,
                       [ctxCopy, handler, args]() mutable { return handler( ctxCopy, args ); } );
+}
+
+
+void KICAD_OPENAPI_SERVICE::IMPL::handleMcp( const httplib::Request& aReq,
+                                             httplib::Response&      aRes ) const
+{
+    KOPENAPI_MCP_CONTEXT mcpCtx;
+    mcpCtx.headless = ctx.headless;
+    mcpCtx.version = KOPENAPI_VERSION;
+    mcpCtx.invoke = [this]( const std::string& aName, const nlohmann::json& aArgs )
+    {
+        return invokeParsed( aName, aArgs );
+    };
+
+    const nlohmann::json msg = nlohmann::json::parse( aReq.body, nullptr, false );
+
+    if( msg.is_discarded() )
+    {
+        aRes.status = 400;
+        aRes.set_content( toJson( { { "jsonrpc", "2.0" },
+                                    { "id", nullptr },
+                                    { "error", { { "code", -32700 }, { "message", "parse error" } } } } ),
+                          "application/json" );
+        return;
+    }
+
+    nlohmann::json response;
+
+    if( msg.is_array() )   // JSON-RPC batch
+    {
+        response = nlohmann::json::array();
+
+        for( const nlohmann::json& item : msg )
+        {
+            if( std::optional<nlohmann::json> r = KopenapiMcpHandle( mcpCtx, item ) )
+                response.push_back( *r );
+        }
+
+        if( response.empty() )
+            response = nullptr;
+    }
+    else if( std::optional<nlohmann::json> r = KopenapiMcpHandle( mcpCtx, msg ) )
+    {
+        response = *r;
+    }
+
+    if( response.is_null() )
+    {
+        aRes.status = 202;   // notifications only
+        return;
+    }
+
+    aRes.status = 200;
+    aRes.set_content( toJson( response ), "application/json" );
 }
 
 
@@ -359,6 +441,12 @@ void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
                  {
                      reply( res, KOPENAPI_RESULT::Ok( openApiJson() ) );
                  } );
+
+    server->Post( "/mcp",
+                  [this]( const httplib::Request& req, httplib::Response& res )
+                  {
+                      handleMcp( req, res );
+                  } );
 
     if( shutdownHandler )
     {

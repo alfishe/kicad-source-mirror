@@ -24,6 +24,7 @@ add_executable( kicad-mcp-bridge
 # Header-only nlohmann/json from the KiCad tree (no link dependency)
 target_include_directories( kicad-mcp-bridge PRIVATE
     ${KOPENAPI_PLATFORM_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared
     ${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/nlohmann_json
     )
 

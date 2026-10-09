@@ -4,11 +4,12 @@
 // unreal-mcp-bridge (byte pipe to a Streamable-HTTP /mcp endpoint), extended with instance
 // management because one MCP client entry must serve every KiCad on the machine:
 //
-//   * initialize / ping / notifications are answered by the bridge itself (kicadopenapi's
-//     /mcp is stateless, so instances can come and go under one MCP session);
-//   * tools/list = the bound instance's tools + the bridge tools instance_list,
-//     instance_select, instance_start;
-//   * every other request is forwarded verbatim to the bound instance.
+//   * initialize / ping / notifications / tools/list are answered by the bridge itself
+//     (kicadopenapi's /mcp is stateless, so instances can come and go under one session);
+//   * exactly two tools are advertised, `search` and `invoke` (shared/mcp_tools.h);
+//   * search = the bound instance's methods + the bridge's instance_list / instance_select /
+//     instance_start; invoke of those runs in the bridge, everything else is forwarded
+//     verbatim to the bound instance.
 //
 // Binding: --url / KICAD_MCP_URL pins one endpoint. Otherwise the bridge picks a live
 // instance from the discovery files (<tmp>/kicad/openapi/<pid>.json) by policy
@@ -24,11 +25,13 @@
 #include "instances.h"
 #include "mini-http.h"
 
+#include <mcp_tools.h>
 #include <platform.h>
 
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <cctype>
 #include <ctime>
 #include <cstdlib>
 #include <iostream>
@@ -49,7 +52,6 @@ namespace
 {
 
 constexpr const char* kVersion = "0.2.0";
-constexpr const char* kDefaultProtocol = "2025-03-26";
 
 /// region <Configuration>
 
@@ -248,9 +250,43 @@ json Error(const json& id, int code, const std::string& message)
 
 json ToolResult(const json& data, bool isError = false)
 {
-    return {{"content", json::array({{{"type", "text"}, {"text", data.dump(2)}}})},
+    return {{"content", json::array({{{"type", "text"}, {"text", data.dump(2, ' ', false, json::error_handler_t::replace)}}})},
             {"structuredContent", data},
             {"isError", isError}};
+}
+
+std::string Lower(std::string text)
+{
+    for (char& c : text)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return text;
+}
+
+/// Same matching idea as the server's registry search, for the bridge's own methods
+bool Matches(const json& method, const std::string& query)
+{
+    std::string hay = Lower(method["name"].get<std::string>() + " " + method["summary"].get<std::string>());
+    std::string term;
+    bool any = false;
+    for (char c : Lower(query) + " ")
+    {
+        if (std::isalnum(static_cast<unsigned char>(c)))
+        {
+            term += c;
+        }
+        else if (!term.empty())
+        {
+            any = true;
+            if (hay.find(term) != std::string::npos)
+            {
+                return true;
+            }
+            term.clear();
+        }
+    }
+    return !any;  // empty query matches everything
 }
 
 std::vector<std::string> ExtractSseDataLines(const std::string& sseBody)
@@ -287,21 +323,35 @@ json InstanceJson(const bridge::Instance& inst)
 
 /// endregion </JSON-RPC helpers>
 
-const json kBridgeTools = json::parse(R"([
-  {"name": "instance_list",
-   "description": "List running KiCad instances (GUI and headless) this MCP session can talk to; marks the current one. Call before mutating after an instance change.",
+// Instance management methods, owned by the bridge. They are not MCP tools: like every KiCad
+// method they are found with `search` and called with `invoke`.
+const json kBridgeMethods = json::parse(R"([
+  {"name": "instance_list", "gui_only": false,
+   "summary": "List running KiCad instances (GUI and headless) this MCP session can talk to; marks the current one. Check it before mutating after an instance change.",
    "inputSchema": {"type": "object", "properties": {}}},
-  {"name": "instance_select",
-   "description": "Route all following tool calls to another running KiCad instance, by pid or port.",
+  {"name": "instance_select", "gui_only": false,
+   "summary": "Route all following calls to another running KiCad instance, by pid or port.",
    "inputSchema": {"type": "object", "properties": {
        "pid": {"type": "integer"}, "port": {"type": "integer"}}}},
-  {"name": "instance_start",
-   "description": "Start a new KiCad instance and route following calls to it. mode=headless (no windows, fast; stopped after the idle timeout unless it has unsaved changes) or gui (visible editor windows, never stopped by the bridge).",
+  {"name": "instance_start", "gui_only": false,
+   "summary": "Start a new KiCad instance and route following calls to it. mode=headless (no windows, fast; stopped after the idle timeout unless it has unsaved changes) or gui (visible editor windows, never stopped by the bridge).",
    "inputSchema": {"type": "object", "required": ["mode"], "properties": {
        "mode": {"type": "string", "enum": ["headless", "gui"]},
        "path": {"type": "string", "description": "Optional .kicad_pro/.kicad_sch/.kicad_pcb to open"},
        "select": {"type": "boolean", "default": true}}}}
 ])");
+
+bool IsBridgeMethod(const std::string& name)
+{
+    for (const json& m : kBridgeMethods)
+    {
+        if (m["name"] == name)
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 class Bridge
 {
@@ -346,7 +396,10 @@ private:
     /// Forward one request line; std::nullopt on transport failure (error already emitted)
     std::optional<bridge::HttpResult> Forward(const std::string& line, const json& id);
 
-    json CallBridgeTool(const std::string& name, const json& args);
+    json CallBridgeMethod(const std::string& name, const json& args);
+
+    /// MCP `search`: the bound instance's methods + matching bridge methods
+    json Search(const std::string& line, const json& args);
     json ListInstances();
 
     fs::path NewLogFile(const std::string& mode);
@@ -360,16 +413,11 @@ private:
     long m_pid = 0;     // bound pid (0 when pinned)
     std::map<long, Child> m_children;
     bool m_inFlight = false;
-    bool m_listChanged = false;
     long m_lostPid = 0;  // bound instance died unexpectedly; the next request reports it
 };
 
 void Bridge::BindTo(const bridge::Instance& inst, const std::string& why)
 {
-    if (m_pid != inst.pid)
-    {
-        m_listChanged = true;
-    }
     m_url = inst.mcpUrl;
     m_pid = inst.pid;
     Log("bound to pid " + std::to_string(inst.pid) + " " + inst.mcpUrl + " (" + why + ")");
@@ -555,7 +603,7 @@ json Bridge::ListInstances()
             {"idle_timeout_s", m_cfg.idle.count()}};
 }
 
-json Bridge::CallBridgeTool(const std::string& name, const json& args)
+json Bridge::CallBridgeMethod(const std::string& name, const json& args)
 {
     if (name == "instance_list")
     {
@@ -604,6 +652,53 @@ json Bridge::CallBridgeTool(const std::string& name, const json& args)
     return ToolResult({{"started", InstanceJson(*inst)}, {"selected", args.value("select", true)}});
 }
 
+json Bridge::Search(const std::string& line, const json& args)
+{
+    const std::string query = args.value("query", std::string());
+    json methods = json::array();
+    json instance = nullptr;
+    std::string note;
+
+    std::string error;
+    if (EnsureBound(error))
+    {
+        if (std::optional<bridge::HttpResult> result = Forward(line, nullptr))
+        {
+            json parsed = json::parse(result->body, nullptr, false);
+            if (!parsed.is_discarded() && parsed.contains("result")
+                && parsed["result"].contains("structuredContent")
+                && parsed["result"]["structuredContent"].contains("methods"))
+            {
+                methods = parsed["result"]["structuredContent"]["methods"];
+            }
+        }
+        if (std::optional<bridge::Instance> inst = bridge::FindByPid(m_cfg.discoveryDir, m_pid))
+        {
+            instance = InstanceJson(*inst);
+        }
+    }
+    else
+    {
+        note = error;
+        Log(error);
+    }
+
+    for (const json& m : kBridgeMethods)
+    {
+        if (Matches(m, query))
+        {
+            methods.push_back(m);
+        }
+    }
+
+    json data = {{"methods", methods}, {"count", methods.size()}, {"instance", instance}};
+    if (!note.empty())
+    {
+        data["note"] = note;
+    }
+    return ToolResult(data);
+}
+
 void Bridge::HandleLine(const std::string& line)
 {
     std::unique_lock<std::mutex> lock(m_mutex);
@@ -619,22 +714,24 @@ void Bridge::HandleLine(const std::string& line)
     const json id = isRequest ? msg["id"] : json();
     const std::string method = msg.is_object() ? msg.value("method", std::string()) : std::string();
 
-    // Session-level messages are the bridge's own: instances are stateless and may change
+    // Session-level messages are the bridge's own: instances are stateless and may change,
+    // and the tool list is fixed (search + invoke)
     if (method == "initialize")
     {
-        std::string version = msg.contains("params") ? msg["params"].value("protocolVersion", kDefaultProtocol)
-                                                      : kDefaultProtocol;
-        if (version != "2025-03-26" && version != "2024-11-05" && version != "2025-06-18")
+        std::string version = msg.contains("params") ? msg["params"].value("protocolVersion", std::string()) : "";
+        bool supported = false;
+        for (const char* v : kopenapi::mcp::kSupportedVersions)
         {
-            version = kDefaultProtocol;
+            supported |= version == v;
         }
-        Emit(Result(id, {{"protocolVersion", version},
-                         {"capabilities", {{"tools", {{"listChanged", true}}}}},
+        Emit(Result(id, {{"protocolVersion", supported ? version : kopenapi::mcp::kProtocolVersion},
+                         {"capabilities", {{"tools", json::object()}}},
                          {"serverInfo", {{"name", "kicad-mcp-bridge"}, {"version", kVersion}}},
                          {"instructions",
-                          "Tools act on one KiCad instance at a time. Use instance_list / instance_select / "
-                          "instance_start to see and switch instances. Save your work: idle headless "
-                          "instances started by the bridge are stopped (never with unsaved changes)."}}));
+                          "Use search to find KiCad methods (also instance_list / instance_select / "
+                          "instance_start for choosing the KiCad instance), then invoke to call them. "
+                          "Save your work: idle headless instances started by the bridge are stopped "
+                          "(never with unsaved changes)."}}));
         return;
     }
     if (method == "ping")
@@ -646,57 +743,40 @@ void Bridge::HandleLine(const std::string& line)
     {
         return;  // notifications (initialized, cancelled, ...) are not forwarded
     }
-
-    if (method == "tools/call" && msg.contains("params"))
+    if (method == "tools/list")
     {
-        const std::string name = msg["params"].value("name", std::string());
-        for (const json& tool : kBridgeTools)
+        Emit(Result(id, {{"tools", json::parse(kopenapi::mcp::kToolsJson)}}));
+        return;
+    }
+
+    if (method == "tools/call")
+    {
+        const json params = msg.value("params", json::object());
+        const std::string tool = params.value("name", std::string());
+        const json args = params.value("arguments", json::object());
+
+        if (tool == kopenapi::mcp::kSearchTool)
         {
-            if (tool["name"] == name)
-            {
-                const json args = msg["params"].value("arguments", json::object());
-                Emit(Result(id, CallBridgeTool(name, args)));
-                if (m_listChanged)
-                {
-                    m_listChanged = false;
-                    Emit({{"jsonrpc", "2.0"}, {"method", "notifications/tools/list_changed"}});
-                }
-                return;
-            }
+            Emit(Result(id, Search(line, args.is_object() ? args : json::object())));
+            return;
+        }
+        if (tool == kopenapi::mcp::kInvokeTool && args.is_object() && args.contains("name")
+            && args["name"].is_string() && IsBridgeMethod(args["name"].get<std::string>()))
+        {
+            json methodArgs = args.value("arguments", json::object());
+            Emit(Result(id, CallBridgeMethod(args["name"].get<std::string>(),
+                                             methodArgs.is_object() ? methodArgs : json::object())));
+            return;
+        }
+        if (tool != kopenapi::mcp::kInvokeTool)
+        {
+            Emit(Error(id, -32602, "unknown tool '" + tool + "' (tools: search, invoke)"));
+            return;
         }
     }
 
     std::string error;
-    const bool bound = EnsureBound(error);
-    m_listChanged = false;  // a (re)bind before the first forward needs no notification
-
-    if (method == "tools/list")
-    {
-        json tools = json::array();
-        if (bound)
-        {
-            if (std::optional<bridge::HttpResult> result = Forward(line, nullptr))
-            {
-                json parsed = json::parse(result->body, nullptr, false);
-                if (!parsed.is_discarded() && parsed.contains("result") && parsed["result"].contains("tools"))
-                {
-                    tools = parsed["result"]["tools"];
-                }
-            }
-        }
-        else
-        {
-            Log(error);
-        }
-        for (const json& tool : kBridgeTools)
-        {
-            tools.push_back(tool);
-        }
-        Emit(Result(id, {{"tools", tools}}));
-        return;
-    }
-
-    if (!bound)
+    if (!EnsureBound(error))
     {
         Emit(Error(id, -32603, error));
         return;
