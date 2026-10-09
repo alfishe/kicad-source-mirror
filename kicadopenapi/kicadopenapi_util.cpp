@@ -130,9 +130,17 @@ nlohmann::json KopenapiPageSchema()
 
 nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName )
 {
-    std::string bare = aNetName.substr( aNetName.find_last_of( '/' ) == std::string::npos
-                                                ? 0
-                                                : aNetName.find_last_of( '/' ) + 1 );
+    // KiCad auto names carry pin names ("unconnected-(U5-VDD-Pad4)", "Net-(R1-Pad2)"):
+    // their text says nothing about the net's role
+    if( aNetName.rfind( "unconnected-", 0 ) == 0 )
+        return { { "role", "unconnected" }, { "basis", { "auto name: a single unconnected pin" } } };
+
+    if( aNetName.rfind( "Net-(", 0 ) == 0 )
+        return { { "role", "signal" }, { "basis", { "auto name" } } };
+
+    // Strip the hierarchical prefix ("/CPU/"), keeping a trailing '/' (active-low, "RESET/")
+    const size_t slash = aNetName.size() > 1 ? aNetName.find_last_of( '/', aNetName.size() - 2 ) : std::string::npos;
+    std::string  bare = slash == std::string::npos ? aNetName : aNetName.substr( slash + 1 );
 
     for( char& c : bare )
         c = static_cast<char>( std::toupper( static_cast<unsigned char>( c ) ) );

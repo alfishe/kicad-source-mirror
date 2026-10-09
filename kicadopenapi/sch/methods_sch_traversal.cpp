@@ -17,6 +17,7 @@
 #include <sch_sheet_pin.h>
 #include <sch_symbol.h>
 #include <schematic.h>
+#include <string_utils.h>
 
 #include <algorithm>
 #include <deque>
@@ -169,7 +170,7 @@ static KOPENAPI_RESULT h_sch_net_trace( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     for( const NET_ENTRY& entry : nets )
     {
-        if( !name.empty() && entry.name == name )
+        if( !name.empty() && ( entry.name == name || entry.name == str( UnescapeString( name ) ) ) )
         {
             net = &entry;
             break;
@@ -229,12 +230,12 @@ static KOPENAPI_RESULT h_sch_net_trace( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             }
             else if( const char* kind = labelKind( item->Type() ) )
             {
-                via.push_back( { { "label", kind }, { "text", str( static_cast<SCH_LABEL_BASE*>( item )->GetText() ) } } );
+                via.push_back( { { "label", kind }, { "text", str( UnescapeString( static_cast<SCH_LABEL_BASE*>( item )->GetText() ) ) } } );
             }
             else if( item->Type() == SCH_SHEET_PIN_T )
             {
                 SCH_SHEET_PIN* sp = static_cast<SCH_SHEET_PIN*>( item );
-                via.push_back( { { "sheet_port", str( sp->GetText() ) },
+                via.push_back( { { "sheet_port", str( UnescapeString( sp->GetText() ) ) },
                                  { "into_sheet", str( static_cast<SCH_SHEET*>( sp->GetParent() )->GetName() ) },
                                  { "direction", portDirection( sp ) } } );
             }

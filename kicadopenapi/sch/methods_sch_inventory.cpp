@@ -23,16 +23,119 @@
 #include <sch_sheet_pin.h>
 #include <sch_symbol.h>
 #include <schematic.h>
+#include <string_utils.h>
 
 #include <algorithm>
+#include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 
 
 using namespace kopenapi_sch;
 
 
-static KOPENAPI_RESULT h_sch_stats( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
+/**
+ * Count the drawing items of a .kicad_sch file as written on disk (top-level S-expression
+ * nodes), named like the model counts.  KiCad's loader normalises older files (merges
+ * colinear wire/bus segments, adds implied junctions), so the model and the file can differ.
+ * Returns false for unreadable or non-S-expression files.
+ */
+static bool countFileItems( const std::string& aPath, std::map<std::string, int>& aItems )
+{
+    std::ifstream in( aPath, std::ios::binary );
+
+    if( !in )
+        return false;
+
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    const std::string text = buffer.str();
+
+    if( text.find( "(kicad_sch" ) == std::string::npos )
+        return false;
+
+    static const std::map<std::string, std::string> names = {
+        { "wire", "wires" },             { "bus", "buses" },
+        { "bus_entry", "bus_wire_entries" }, { "junction", "junctions" },
+        { "no_connect", "no_connects" }, { "text", "texts" },
+        { "text_box", "text_boxes" },    { "table", "tables" },
+        { "image", "images" },           { "label", "labels_local" },
+        { "global_label", "labels_global" }, { "hierarchical_label", "labels_hierarchical" },
+        { "directive_label", "labels_directive" }, { "netclass_flag", "labels_directive" },
+        { "rectangle", "shapes" },       { "circle", "shapes" },
+        { "arc", "shapes" },             { "bezier", "shapes" },
+        { "rule_area", "shapes" },       { "sheet", "sheet_symbols" } };
+
+    int         depth = 0;
+    std::string parent;   ///< head of the current depth-2 node
+    int         points = 0;
+    bool        inString = false;
+
+    for( size_t i = 0; i < text.size(); ++i )
+    {
+        const char c = text[i];
+
+        if( inString )
+        {
+            if( c == '\\' )
+                ++i;
+            else if( c == '"' )
+                inString = false;
+
+            continue;
+        }
+
+        if( c == '"' )
+        {
+            inString = true;
+        }
+        else if( c == '(' )
+        {
+            ++depth;
+            size_t end = i + 1;
+
+            while( end < text.size() && ( std::isalnum( static_cast<unsigned char>( text[end] ) ) || text[end] == '_' ) )
+                ++end;
+
+            const std::string head = text.substr( i + 1, end - i - 1 );
+
+            if( depth == 2 )
+            {
+                parent = head;
+                points = 0;
+            }
+            else if( depth == 3 && parent == "sheet" && head == "pin" )
+            {
+                aItems["sheet_pins"]++;
+            }
+            else if( depth == 4 && parent == "polyline" && head == "xy" )
+            {
+                ++points;
+            }
+        }
+        else if( c == ')' )
+        {
+            if( depth == 2 )
+            {
+                // (polyline) with two points is a graphic line, otherwise a shape
+                if( parent == "polyline" )
+                    aItems[points == 2 ? "graphic_lines" : "shapes"]++;
+                else if( auto it = names.find( parent ); it != names.end() )
+                    aItems[it->second]++;
+
+                parent.clear();
+            }
+
+            --depth;
+        }
+    }
+
+    return true;
+}
+
+
+static KOPENAPI_RESULT h_sch_stats( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
 
@@ -121,41 +224,79 @@ static KOPENAPI_RESULT h_sch_stats( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     }
 
     // ---- nets, from the connection graph ----
-    int netsTotal = 0, withPins = 0, singlePin = 0, powerNets = 0, noPins = 0;
+    int netsTotal = 0, withPins = 0, singlePin = 0, noPins = 0, inNetlist = 0;
+    std::map<std::string, int> roles, padStatus;
+    PAD_RESOLVER               pads( aCtx.kiway, &schematic->Project() );
+    const bool                 resolvePads = aArgs.value( "resolve_pads", false );
 
     for( const NET_ENTRY& net : collectNets( schematic ) )
     {
         netsTotal++;
         auto pins = netPins( net );
         int  realPins = 0;
-        bool isPower = false;
+        bool exported = false;
 
         for( const auto& [pin, path] : pins )
         {
             SCH_SYMBOL* sym = pinSymbol( pin );
 
             if( sym && sym->IsPower() )
-                isPower = true;
-            else
-                realPins++;
+                continue;
+
+            if( resolvePads )
+            {
+                std::string status;
+                exported |= !pads.Resolve( pin, path, status ).empty();
+                padStatus[status]++;
+            }
+
+            realPins++;
         }
 
-        if( pins.empty() )
+        inNetlist += exported ? 1 : 0;
+
+        roles[netRole( net )]++;
+
+        // "with pins" = at least one component pin (power symbols alone do not count): the nets
+        // the netlist exporter writes
+        if( realPins == 0 )
             noPins++;
         else
             withPins++;
 
         singlePin += realPins == 1 ? 1 : 0;
-        powerNets += isPower ? 1 : 0;
     }
+
+    // ---- the same items as written on disk, when asked ----
+    const std::string source = aArgs.value( "source", std::string( "model" ) );
+
+    if( source != "model" && source != "file" && source != "both" )
+        return KOPENAPI_RESULT::Error( 400, "source must be model, file or both" );
+
+    std::map<std::string, int> onDisk;
+    nlohmann::json             unreadable = nlohmann::json::array();
+
+    if( source != "model" )
+    {
+        for( SCH_SCREEN* screen : screens )
+        {
+            if( !countFileItems( str( screen->GetFileName() ), onDisk ) )
+                unreadable.push_back( str( screen->GetFileName() ) );
+        }
+    }
+
+    nlohmann::json roleCounts = nlohmann::json::object();
+
+    for( const auto& [role, count] : roles )
+        roleCounts[role] = count;
 
     nlohmann::json libs = nlohmann::json::object();
 
     for( const auto& [lib, count] : libraries )
         libs[lib.empty() ? "(none)" : lib] = count;
 
-    return KOPENAPI_RESULT::Ok(
-            { { "document", str( context->GetCurrentFileName() ) },
+    nlohmann::json result = {
+              { "document", str( context->GetCurrentFileName() ) },
               { "sheets",
                 { { "files", screens.size() },
                   { "instances", hierarchy.size() },
@@ -178,7 +319,50 @@ static KOPENAPI_RESULT h_sch_stats( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                   { "with_pins", withPins },
                   { "without_pins", noPins },
                   { "single_pin", singlePin },
-                  { "power", powerNets } } } } );
+                  { "power", roles["power"] },
+                  { "ground", roles["ground"] },
+                  { "by_role", roleCounts } } } };
+
+    if( resolvePads )
+    {
+        result["nets"]["in_netlist"] = inNetlist;
+        result["pins_by_pad_status"] = padStatus;
+    }
+
+    if( source == "file" )
+    {
+        result["items_per_file"] = onDisk;
+        result["items_source"] = "file";
+    }
+    else if( source == "both" )
+    {
+        // What KiCad's loader changed (or the user since the last save): model minus disk
+        nlohmann::json delta = nlohmann::json::object();
+        std::set<std::string> keys;
+
+        for( const auto& [k, v] : items )
+            keys.insert( k );
+
+        for( const auto& [k, v] : onDisk )
+            keys.insert( k );
+
+        for( const std::string& k : keys )
+        {
+            const int m = items.count( k ) ? items.at( k ) : 0;
+            const int d = onDisk.count( k ) ? onDisk.at( k ) : 0;
+
+            if( m != d )
+                delta[k] = m - d;
+        }
+
+        result["items_on_disk"] = onDisk;
+        result["model_minus_disk"] = delta;
+    }
+
+    if( !unreadable.empty() )
+        result["unreadable_files"] = unreadable;
+
+    return KOPENAPI_RESULT::Ok( result );
 }
 
 
@@ -210,7 +394,7 @@ static KOPENAPI_RESULT h_sch_sheet_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         if( path.size() > 1 )
         {
             for( const SCH_SHEET_PIN* pin : sheet->GetPins() )
-                ports.push_back( { { "name", str( pin->GetText() ) }, { "direction", portDirection( pin ) } } );
+                ports.push_back( { { "name", str( UnescapeString( pin->GetText() ) ) }, { "direction", portDirection( pin ) } } );
         }
 
         rows.push_back( { { "path", human },
@@ -292,20 +476,27 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
 
 /// Summary of one net for lists
-static nlohmann::json netRow( const NET_ENTRY& aNet )
+static nlohmann::json netRow( const NET_ENTRY& aNet, PAD_RESOLVER* aPads )
 {
     int                   pins = 0, labels = 0;
-    bool                  power = false;
     std::set<std::string> sheets;
+    const std::string     role = netRole( aNet );
+    bool                  exported = false;
 
     for( const auto& [pin, path] : netPins( aNet ) )
     {
         SCH_SYMBOL* sym = pinSymbol( pin );
 
         if( sym && sym->IsPower() )
-            power = true;
-        else
-            pins++;
+            continue;
+
+        if( aPads )
+        {
+            std::string status;
+            exported |= !aPads->Resolve( pin, path, status ).empty();
+        }
+
+        pins++;
     }
 
     for( const NET_INSTANCE& inst : aNet.instances )
@@ -316,12 +507,18 @@ static nlohmann::json netRow( const NET_ENTRY& aNet )
             labels += labelKind( item->Type() ) ? 1 : 0;
     }
 
-    return { { "name", aNet.name },
-             { "code", aNet.code },
-             { "pins", pins },
-             { "sheets", sheets.size() },
-             { "labels", labels },
-             { "power", power } };
+    nlohmann::json row = { { "name", aNet.name },
+                           { "code", aNet.code },
+                           { "pins", pins },
+                           { "sheets", sheets.size() },
+                           { "labels", labels },
+                           { "role", role },
+                           { "power", role == "power" || role == "ground" } };
+
+    if( aPads )
+        row["in_netlist"] = exported;
+
+    return row;
 }
 
 
@@ -338,9 +535,11 @@ static KOPENAPI_RESULT h_sch_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 
     std::vector<nlohmann::json> rows;
 
+    PAD_RESOLVER pads( aCtx.kiway, &context->GetSchematic()->Project() );
+
     for( const NET_ENTRY& net : collectNets( context->GetSchematic() ) )
     {
-        nlohmann::json row = netRow( net );
+        nlohmann::json row = netRow( net, aArgs.value( "resolve_pads", false ) ? &pads : nullptr );
 
         if( !KopenapiGlob( glob, row["name"] ) || row["pins"].get<int>() < minPins
             || ( hasPower && row["power"] != aArgs["power"] ) )
@@ -378,7 +577,8 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 
     for( const NET_ENTRY& entry : nets )
     {
-        if( ( !name.empty() && entry.name == name ) || ( code >= 0 && entry.code == code ) )
+        if( ( !name.empty() && ( entry.name == name || entry.name == str( UnescapeString( name ) ) ) )
+            || ( code >= 0 && entry.code == code ) )
         {
             found = &entry;
             break;
@@ -411,6 +611,8 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     std::map<std::string, nlohmann::json> byType;
     bool                  powerSymbol = false;
     std::set<std::string> seenPins;
+    PAD_RESOLVER          pads( aCtx.kiway, &context->GetSchematic()->Project() );
+    bool                  exported = false;
 
     for( const NET_INSTANCE& inst : found->instances )
     {
@@ -428,8 +630,9 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
                 if( !seenPins.insert( pinId( static_cast<SCH_PIN*>( item ), path ) ).second )
                     continue;
 
-                nlohmann::json p = pinJson( static_cast<SCH_PIN*>( item ), path );
+                nlohmann::json p = pinJson( static_cast<SCH_PIN*>( item ), path, &pads );
                 powerSymbol |= p["power_symbol"].get<bool>();
+                exported |= p.contains( "pads" ) && !p["pads"].empty();
 
                 if( !p["power_symbol"].get<bool>() )
                 {
@@ -441,7 +644,7 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
             }
             else if( const char* kind = labelKind( item->Type() ) )
             {
-                const std::string text = str( static_cast<SCH_LABEL_BASE*>( item )->GetText() );
+                const std::string text = str( UnescapeString( static_cast<SCH_LABEL_BASE*>( item )->GetText() ) );
                 labels.push_back( { { "kind", kind }, { "text", text } } );
                 names.insert( text );
             }
@@ -449,7 +652,7 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
             {
                 SCH_SHEET_PIN* sp = static_cast<SCH_SHEET_PIN*>( item );
                 ports.push_back( { { "sheet", str( sp->GetParent() ? static_cast<SCH_SHEET*>( sp->GetParent() )->GetName() : wxString() ) },
-                                   { "port", str( sp->GetText() ) } } );
+                                   { "port", str( UnescapeString( sp->GetText() ) ) } } );
             }
             else if( item->Type() == SCH_LINE_T )
             {
@@ -522,6 +725,7 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     return KOPENAPI_RESULT::Ok( { { "name", found->name },
                                   { "code", found->code },
                                   { "names", nameList },
+                                  { "in_netlist", exported },
                                   { "pins", allPins },
                                   { "drivers", drivers },
                                   { "loads", loads },
@@ -534,8 +738,15 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 KOPENAPI_REGISTER( "sch_stats",
                    "Schematic statistics in one call: sheets (files, instances, depth), symbols (instances, "
                    "components, power, pins, DNP, unannotated, by library), wires, buses, bus entries, "
-                   "junctions, labels/ports per kind, nets (total, with pins, single-pin, power)",
-                   R"json({"type":"object","properties":{}})json"_json, false, h_sch_stats );
+                   "junctions, labels/ports per kind, nets (total, with pins, single-pin, by role); "
+                   "source=file|both counts items as written on disk (KiCad merges segments and adds "
+                   "junctions when loading older files)",
+                   R"json({"type":"object","properties":{
+                        "source":{"type":"string","enum":["model","file","both"],"default":"model",
+                                  "description":"items from the loaded model, the files on disk, or both with the difference"},
+                        "resolve_pads":{"type":"boolean","default":false,
+                                  "description":"resolve every pin to its footprint pads like the netlist exporter: nets.in_netlist, pins_by_pad_status (loads footprints; slower)"}}})json"_json,
+                   false, h_sch_stats );
 
 KOPENAPI_REGISTER( "sch_sheet_list",
                    "List sheet instances of the hierarchy: path, name, file, page, symbol count, ports "
@@ -554,15 +765,19 @@ KOPENAPI_REGISTER( "sch_symbol_list",
 
 KOPENAPI_REGISTER( "sch_net_list",
                    "List schematic nets: name, code, pin count (without power symbols), sheets spanned, "
-                   "labels, power flag; filter by name glob, min_pins, power; paginated",
+                   "labels, role (power/ground/clock/reset/signal/unconnected), power flag, optional "
+                   "in_netlist (has a pin with a footprint pad); filter by name glob, "
+                   "min_pins, power; paginated",
                    KopenapiPagedSchema( R"json({
                         "name":{"type":"string","description":"glob, e.g. /CPU/* or *CLK*"},
                         "min_pins":{"type":"integer","default":0},
-                        "power":{"type":"boolean"}})json"_json ),
+                        "power":{"type":"boolean"},
+                        "resolve_pads":{"type":"boolean","default":false,"description":"add in_netlist per net (loads footprints; slower)"}})json"_json ),
                    false, h_sch_net_list );
 
 KOPENAPI_REGISTER( "sch_net_get",
-                   "Schematic net card: every pin (REF.PIN, pin name, electrical type, value, sheet), drivers "
+                   "Schematic net card: every pin (REF.PIN, pin name, electrical type, value, sheet, footprint "
+                   "pads and pad_status mapped/unmapped/no_footprint like the netlist exporter), drivers "
                    "vs loads, all names along the hierarchy, per sheet instance the labels, sheet ports, wires "
                    "and junctions, inferred role with basis; look up by name, code or pin REF.PIN",
                    R"json({"type":"object","properties":{

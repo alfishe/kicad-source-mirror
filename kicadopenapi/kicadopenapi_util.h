@@ -24,8 +24,9 @@ KICOMMON_API nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nl
                                           size_t aDefaultLimit = 100 );
 
 /**
- * Role of a net guessed from its name only: { role: ground|power|clock|reset|signal,
- * basis: [...] }.  Hierarchical prefixes ("/CPU/") are ignored.
+ * Role of a net guessed from its name only: { role: ground|power|clock|reset|signal|unconnected,
+ * basis: [...] }.  Hierarchical prefixes ("/CPU/") are ignored, a trailing '/' (active-low,
+ * "RESET/") is kept; KiCad auto names ("Net-(...)", "unconnected-(...)") are not guessed from.
  */
 KICOMMON_API nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName );
 

@@ -4,6 +4,10 @@
 #include <connection_graph.h>
 #include <connectivity/conn_facade.h>
 #include <kicadopenapi_util.h>
+#include <kiface_base.h>
+#include <kiface_ids.h>
+#include <kiway.h>
+#include <lib_id.h>
 #include <sch_label.h>
 #include <sch_pin.h>
 #include <sch_screen.h>
@@ -11,6 +15,7 @@
 #include <sch_sheet_pin.h>
 #include <sch_symbol.h>
 #include <schematic.h>
+#include <string_utils.h>
 
 #include <algorithm>
 #include <map>
@@ -64,19 +69,96 @@ SCH_SYMBOL* pinSymbol( const SCH_PIN* aPin )
 
 
 /// One pin of a net as seen on a given sheet instance
-nlohmann::json pinJson( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath )
+nlohmann::json pinJson( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath, PAD_RESOLVER* aPads )
 {
     SCH_SYMBOL*       sym = pinSymbol( aPin );
     const std::string ref = sym ? str( sym->GetRef( &aPath, false ) ) : std::string();
 
-    return { { "pin", ref + "." + str( aPin->GetNumber() ) },
-             { "ref", ref },
-             { "number", str( aPin->GetNumber() ) },
-             { "name", str( aPin->GetShownName() ) },
-             { "type", str( aPin->GetElectricalTypeName() ) },
-             { "value", sym ? str( sym->GetValue( &aPath, FOR_GUI ) ) : std::string() },
-             { "power_symbol", sym && sym->IsPower() },
-             { "sheet", sheetPath( aPath ) } };
+    nlohmann::json pin = { { "pin", ref + "." + str( aPin->GetNumber() ) },
+                           { "ref", ref },
+                           { "number", str( aPin->GetNumber() ) },
+                           { "name", str( aPin->GetShownName() ) },
+                           { "type", str( aPin->GetElectricalTypeName() ) },
+                           { "value", sym ? str( sym->GetValue( &aPath, FOR_GUI ) ) : std::string() },
+                           { "power_symbol", sym && sym->IsPower() },
+                           { "sheet", sheetPath( aPath ) } };
+
+    if( aPads && !( sym && sym->IsPower() ) )
+    {
+        std::string status;
+        pin["pads"] = aPads->Resolve( aPin, aPath, status );
+        pin["pad_status"] = status;
+    }
+
+    return pin;
+}
+
+
+std::vector<std::string> PAD_RESOLVER::Resolve( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath, std::string& aStatus )
+{
+    auto toStrings = []( const std::vector<wxString>& aPads )
+    {
+        std::vector<std::string> out;
+
+        for( const wxString& pad : aPads )
+            out.push_back( str( pad ) );
+
+        return out;
+    };
+
+    const SCH_SYMBOL* symbol = pinSymbol( aPin );
+    wxString          fpText = symbol ? symbol->GetFootprintFieldText( &aPath, RESOLVED ) : wxString();
+    LIB_ID            fpId;
+
+    if( fpText.IsEmpty() || fpId.Parse( fpText, true ) >= 0 )
+    {
+        aStatus = "no_footprint";
+        return toStrings( ExpandStackedPinNotation( aPin->GetEffectivePadNumber( aPath ) ) );
+    }
+
+    const std::set<wxString>& pads = footprintPads( fpId.GetUniStringLibId() );
+
+    if( pads.empty() )
+    {
+        aStatus = "footprint_not_found";
+        return toStrings( ExpandStackedPinNotation( aPin->GetEffectivePadNumber( aPath ) ) );
+    }
+
+    SCH_PIN::PAD_RESOLUTION state = SCH_PIN::PAD_RESOLUTION::MAPPED;
+    wxString pad = aPin->GetEffectivePadNumber( aPath, wxEmptyString, fpId, &pads, &state );
+
+    if( state == SCH_PIN::PAD_RESOLUTION::UNMAPPED )
+    {
+        aStatus = "unmapped";
+        return {};
+    }
+
+    aStatus = "mapped";
+    return toStrings( ExpandStackedPinNotation( pad ) );
+}
+
+
+const std::set<wxString>& PAD_RESOLVER::footprintPads( const wxString& aFootprintId )
+{
+    auto it = m_cache.find( aFootprintId );
+
+    if( it != m_cache.end() )
+        return it->second;
+
+    std::set<wxString>& pads = m_cache[aFootprintId];
+
+    if( m_kiway && m_project )
+    {
+        if( KIFACE* cvpcb = m_kiway->KiFACE( KIWAY::FACE_CVPCB ) )
+        {
+            typedef void ( *PAD_NUMBERS_FN )( const wxString&, PROJECT*, std::set<wxString>& );
+
+            if( auto fetch = (PAD_NUMBERS_FN) cvpcb->IfaceOrAddress( KIFACE_FOOTPRINT_PAD_NUMBERS ) )
+                fetch( aFootprintId, m_project, pads );
+        }
+    }
+
+    return pads;
 }
 
 
@@ -94,7 +176,7 @@ std::vector<NET_ENTRY> collectNets( SCHEMATIC* aSchematic )
         for( const SCH_CONNECTIVITY::NET_GROUP& group : aSchematic->Connectivity().GetNetMap() )
         {
             NET_ENTRY entry;
-            entry.name = str( group.name );
+            entry.name = str( UnescapeString( group.name ) );
 
             for( const SCH_CONNECTIVITY::NET_VIEW& view : group.instances )
             {
@@ -106,7 +188,7 @@ std::vector<NET_ENTRY> collectNets( SCHEMATIC* aSchematic )
                 if( path == paths.end() )
                     continue;
 
-                entry.instances.push_back( { path->second, view.Items(), str( view.Name( true ) ) } );
+                entry.instances.push_back( { path->second, view.Items(), str( UnescapeString( view.Name( true ) ) ) } );
             }
 
             nets.push_back( std::move( entry ) );
@@ -117,12 +199,12 @@ std::vector<NET_ENTRY> collectNets( SCHEMATIC* aSchematic )
         for( const auto& [key, subgraphs] : aSchematic->ConnectionGraph()->GetNetMap() )
         {
             NET_ENTRY entry;
-            entry.name = str( key.Name );
+            entry.name = str( UnescapeString( key.Name ) );
 
             for( const CONNECTION_SUBGRAPH* subgraph : subgraphs )
             {
                 std::vector<SCH_ITEM*> items( subgraph->GetItems().begin(), subgraph->GetItems().end() );
-                entry.instances.push_back( { subgraph->GetSheet(), items, str( subgraph->GetNetName() ) } );
+                entry.instances.push_back( { subgraph->GetSheet(), items, str( UnescapeString( subgraph->GetNetName() ) ) } );
             }
 
             nets.push_back( std::move( entry ) );
@@ -165,6 +247,23 @@ std::vector<std::pair<const SCH_PIN*, SCH_SHEET_PATH>> netPins( const NET_ENTRY&
     }
 
     return pins;
+}
+
+
+std::string netRole( const NET_ENTRY& aNet )
+{
+    std::string role = KopenapiNetRoleFromName( aNet.name )["role"];
+
+    if( role == "signal" )
+    {
+        for( const auto& [pin, path] : netPins( aNet ) )
+        {
+            if( SCH_SYMBOL* sym = pinSymbol( pin ); sym && sym->IsPower() )
+                return "power";
+        }
+    }
+
+    return role;
 }
 
 } // namespace kopenapi_sch
