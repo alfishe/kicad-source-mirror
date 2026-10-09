@@ -20,10 +20,13 @@
 
 #include <windows.h>
 
+#include <vector>
+
 #include <kiplatform/ui.h>
 
 #include <wx/cursor.h>
 #include <wx/dialog.h>
+#include <wx/image.h>
 #include <wx/nonownedwnd.h>
 #include <wx/window.h>
 #include <wx/msw/registry.h>
@@ -241,4 +244,62 @@ void KIPLATFORM::UI::SetWMClass( wxWindow* aWindow, const wxString& aClass )
 {
     // WM_CLASS is an X11/Wayland concept; taskbar identity on Windows is driven by the
     // AppUserModelID (see KIPLATFORM::ENV::SetAppDetailsForWindow).
+}
+
+
+bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
+{
+    if( !aWindow )
+        return false;
+
+    HWND hwnd = (HWND) aWindow->GetHandle();
+    RECT rect;
+
+    if( !hwnd || !GetClientRect( hwnd, &rect ) )
+        return false;
+
+    const int w = rect.right - rect.left;
+    const int h = rect.bottom - rect.top;
+
+    if( w <= 0 || h <= 0 )
+        return false;
+
+    HDC     screen = GetDC( nullptr );
+    HDC     mem = CreateCompatibleDC( screen );
+    HBITMAP bitmap = CreateCompatibleBitmap( screen, w, h );
+    HGDIOBJ old = SelectObject( mem, bitmap );
+
+    // PW_CLIENTONLY | PW_RENDERFULLCONTENT: the client area, including DirectComposition content
+    const BOOL ok = PrintWindow( hwnd, mem, 0x1 | 0x2 );
+
+    BITMAPINFO info = {};
+    info.bmiHeader.biSize = sizeof( BITMAPINFOHEADER );
+    info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -h;   // top-down
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    std::vector<unsigned char> bgra( (size_t) w * h * 4 );
+    SelectObject( mem, old );
+    const int lines = ok ? GetDIBits( mem, bitmap, 0, h, bgra.data(), &info, DIB_RGB_COLORS ) : 0;
+
+    DeleteObject( bitmap );
+    DeleteDC( mem );
+    ReleaseDC( nullptr, screen );
+
+    if( lines != h )
+        return false;
+
+    unsigned char* rgb = (unsigned char*) malloc( (size_t) w * h * 3 );
+
+    for( size_t i = 0; i < (size_t) w * h; ++i )
+    {
+        rgb[i * 3 + 0] = bgra[i * 4 + 2];
+        rgb[i * 3 + 1] = bgra[i * 4 + 1];
+        rgb[i * 3 + 2] = bgra[i * 4 + 0];
+    }
+
+    aImage.SetData( rgb, w, h, false );
+    return aImage.IsOk();
 }

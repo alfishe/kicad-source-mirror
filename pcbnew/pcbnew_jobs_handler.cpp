@@ -520,6 +520,9 @@ TOOL_MANAGER* PCBNEW_JOBS_HANDLER::getToolManager( BOARD* aBrd )
 
 BOARD* PCBNEW_JOBS_HANDLER::getBoard( const wxString& aPath )
 {
+    if( s_boardOverride )
+        return s_boardOverride;
+
     BOARD*            brd = nullptr;
     SETTINGS_MANAGER& settingsManager = Pgm().GetSettingsManager();
     wxString loadError;

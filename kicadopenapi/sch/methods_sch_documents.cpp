@@ -4,6 +4,8 @@
  */
 #include "kopenapi_sch.h"
 
+#include <wx/log.h>
+
 #include <api/headless_sch_context.h>
 #include <api/sch_context.h>
 #include <eeschema_helpers.h>
@@ -26,6 +28,11 @@ static std::shared_ptr<HEADLESS_SCH_CONTEXT> s_headless;
 
 static void releaseHeadless()
 {
+    // Stopping a headless server with unsaved work loses it: leave a trace in the journal
+    if( s_headless && s_schematic && s_schematic->HasHierarchy() && s_schematic->Hierarchy().IsModified() )
+        wxLogWarning( "Unsaved changes to %s discarded (headless server released the schematic)",
+                      s_headless->GetCurrentFileName() );
+
     s_headless.reset();
     delete s_schematic;
     s_schematic = nullptr;
@@ -222,6 +229,7 @@ static KOPENAPI_RESULT h_sch_close( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         if( !aArgs.value( "discard", false ) )
             return KOPENAPI_RESULT::Error( 409, "the schematic has unsaved changes; sch_save or pass discard: true" );
 
+        wxLogWarning( "Unsaved changes to %s discarded (sch_close discard)", context->GetCurrentFileName() );
         clearModified( *context );
     }
 
@@ -292,9 +300,10 @@ KOPENAPI_REGISTER( "sch_open",
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
                                    "description":"Drop unsaved changes of the currently open schematic"}}})json"_json,
-                   false, h_sch_open );
+                   false, h_sch_open, 120 );
 
-KOPENAPI_REGISTER( "sch_close", "Close the open schematic (refuses with unsaved changes unless discard)",
+KOPENAPI_REGISTER( "sch_close", "Close the open schematic: refuses with unsaved changes unless discard: true, which "
+                   "drops them without any dialog (a warning goes to the journal); GUI: the editor window closes",
                    R"json({"type":"object","properties":{"discard":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_close );
 
@@ -303,4 +312,4 @@ KOPENAPI_REGISTER( "sch_save",
                    R"json({"type":"object","properties":{"path":{"type":"string"}}})json"_json, false, h_sch_save );
 
 KOPENAPI_REGISTER( "sch_revert", "Reload the open schematic from disk, dropping unsaved changes",
-                   R"json({"type":"object","properties":{}})json"_json, false, h_sch_revert );
+                   R"json({"type":"object","properties":{}})json"_json, false, h_sch_revert, 120 );

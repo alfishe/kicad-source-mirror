@@ -94,7 +94,16 @@ public:
      */
     void ClearCachedBoard();
 
+    /**
+     * Run jobs on this in-memory board instead of loading one (nullptr: back to normal).  The
+     * API renders the live board — unsaved edits included — through the same job code as the
+     * CLI.  Main thread, scoped by the caller.
+     */
+    static void SetBoardOverride( BOARD* aBoard ) { s_boardOverride = aBoard; }
+
 private:
+    static inline BOARD* s_boardOverride = nullptr;
+
     BOARD* getBoard( const wxString& aPath = wxEmptyString );
     void refillFabZones( const JOB_EXPORT_PCB_FAB& aJob, BOARD* aBoard );
     LSEQ convertLayerArg( wxString& aLayerString, BOARD* aBoard ) const;

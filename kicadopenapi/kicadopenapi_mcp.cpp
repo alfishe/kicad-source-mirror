@@ -43,11 +43,32 @@ static json toolResult( json aData, bool aIsError )
         aData["image"] = "returned as MCP image content";
     }
 
+    // Several images (e.g. one per board layer): "images": [{ image_base64, mime_type, ... }]
+    json images = json::array();
+
+    if( aData.contains( "images" ) && aData["images"].is_array() )
+    {
+        for( json& item : aData["images"] )
+        {
+            if( item.is_object() && item.contains( "image_base64" ) && item["image_base64"].is_string() )
+            {
+                images.push_back( { { "type", "image" },
+                                    { "data", item["image_base64"] },
+                                    { "mimeType", item.value( "mime_type", std::string( "image/png" ) ) } } );
+                item.erase( "image_base64" );
+                item["image"] = "returned as MCP image content #" + std::to_string( images.size() );
+            }
+        }
+    }
+
     std::string text = aData.dump( 2, ' ', false, json::error_handler_t::replace );
     json        content = json::array( { { { "type", "text" }, { "text", text } } } );
 
     if( !image.is_null() )
         content.push_back( std::move( image ) );
+
+    for( json& item : images )
+        content.push_back( std::move( item ) );
 
     return { { "content", std::move( content ) },
              { "structuredContent", std::move( aData ) },

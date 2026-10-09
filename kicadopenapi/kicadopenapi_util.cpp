@@ -22,16 +22,18 @@ bool KopenapiGlob( const std::string& aPattern, const std::string& aText )
 
     while( t < aText.size() )
     {
-        if( p < aPattern.size()
-            && ( aPattern[p] == '?' || lowerChar( aPattern[p] ) == lowerChar( aText[t] ) ) )
-        {
-            ++p;
-            ++t;
-        }
-        else if( p < aPattern.size() && aPattern[p] == '*' )
+        // '*' first: a literal '*' in the text (e.g. "*board — PCB Editor", a modified
+        // document) must not consume the pattern's wildcard
+        if( p < aPattern.size() && aPattern[p] == '*' )
         {
             star = p++;
             mark = t;
+        }
+        else if( p < aPattern.size()
+                 && ( aPattern[p] == '?' || lowerChar( aPattern[p] ) == lowerChar( aText[t] ) ) )
+        {
+            ++p;
+            ++t;
         }
         else if( star != std::string::npos )
         {

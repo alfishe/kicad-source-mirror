@@ -22,7 +22,10 @@
 
 #import <Cocoa/Cocoa.h>
 
+#include <vector>
+
 #include <wx/dialog.h>
+#include <wx/image.h>
 #include <wx/nonownedwnd.h>
 #include <wx/toplevel.h>
 #include <wx/button.h>
@@ -288,4 +291,64 @@ void KIPLATFORM::UI::CancelPendingScroll( wxDataViewCtrl* aCtrl )
 void KIPLATFORM::UI::SetWMClass( wxWindow* aWindow, const wxString& aClass )
 {
     // Not applicable on macOS; the bundle identifier provides the application identity.
+}
+
+
+bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
+{
+    if( !aWindow )
+        return false;
+
+    NSView* view = (NSView*) aWindow->GetHandle();
+
+    // A top-level window: its whole content view (toolbars, panels, canvas)
+    if( aWindow->IsTopLevel() && [view window] )
+        view = [[view window] contentView];
+
+    if( !view )
+        return false;
+
+    const NSRect bounds = [view bounds];
+    NSBitmapImageRep* rep = [view bitmapImageRepForCachingDisplayInRect:bounds];
+
+    if( !rep )
+        return false;
+
+    [view cacheDisplayInRect:bounds toBitmapImageRep:rep];
+
+    CGImageRef cg = [rep CGImage];
+
+    if( !cg )
+        return false;
+
+    const size_t w = CGImageGetWidth( cg );
+    const size_t h = CGImageGetHeight( cg );
+
+    if( w == 0 || h == 0 )
+        return false;
+
+    // Normalise whatever the rep holds to 8-bit RGBA
+    std::vector<unsigned char> rgba( w * h * 4 );
+    CGColorSpaceRef            space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate( rgba.data(), w, h, 8, w * 4, space,
+                                              kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big );
+    CGColorSpaceRelease( space );
+
+    if( !ctx )
+        return false;
+
+    CGContextDrawImage( ctx, CGRectMake( 0, 0, w, h ), cg );
+    CGContextRelease( ctx );
+
+    unsigned char* rgb = (unsigned char*) malloc( w * h * 3 );
+
+    for( size_t i = 0; i < w * h; ++i )
+    {
+        rgb[i * 3 + 0] = rgba[i * 4 + 0];
+        rgb[i * 3 + 1] = rgba[i * 4 + 1];
+        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+    }
+
+    aImage.SetData( rgb, (int) w, (int) h, false );
+    return aImage.IsOk();
 }

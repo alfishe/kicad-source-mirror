@@ -23,6 +23,9 @@
 #include <wx/choice.h>
 #include <wx/dataview.h>
 #include <wx/dialog.h>
+#include <wx/dcclient.h>
+#include <wx/dcmemory.h>
+#include <wx/image.h>
 #include <wx/nonownedwnd.h>
 #include <wx/settings.h>
 #include <wx/window.h>
@@ -855,3 +858,32 @@ wxPoint KIPLATFORM::UI::GetMousePosition()
 
 
 #endif
+
+
+bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
+{
+    if( !aWindow )
+        return false;
+
+#ifdef GDK_WINDOWING_WAYLAND
+    // Wayland gives clients no access to their own window contents through GDK
+    if( GDK_IS_WAYLAND_DISPLAY( gdk_display_get_default() ) )
+        return false;
+#endif
+
+    const wxSize size = aWindow->GetClientSize();
+
+    if( size.x <= 0 || size.y <= 0 )
+        return false;
+
+    wxClientDC   source( aWindow );
+    wxBitmap     bitmap( size.x, size.y );
+    wxMemoryDC   target( bitmap );
+
+    if( !target.Blit( 0, 0, size.x, size.y, &source, 0, 0 ) )
+        return false;
+
+    target.SelectObject( wxNullBitmap );
+    aImage = bitmap.ConvertToImage();
+    return aImage.IsOk();
+}

@@ -4,6 +4,8 @@
  */
 #include "kopenapi_pcb.h"
 
+#include <wx/log.h>
+
 #include <api/headless_pcb_context.h>
 #include <api/pcb_context.h>
 #include <board.h>
@@ -206,6 +208,7 @@ static KOPENAPI_RESULT h_pcb_close( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         if( !aArgs.value( "discard", false ) )
             return KOPENAPI_RESULT::Error( 409, "the board has unsaved changes; pcb_save or pass discard: true" );
 
+        wxLogWarning( "Unsaved changes to %s discarded (pcb_close discard)", context->GetCurrentFileName() );
         context->SetContentModified( false );
     }
 
@@ -267,7 +270,16 @@ static KOPENAPI_RESULT h_pcb_revert( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 }
 
 
-KOPENAPI_REGISTER_DOCUMENTS( "pcb", documentStatus, []() { s_headless.reset(); } );
+KOPENAPI_REGISTER_DOCUMENTS( "pcb", documentStatus,
+                             []()
+                             {
+                                 // Stopping a headless server with unsaved work loses it: say so
+                                 if( s_headless && s_headless->IsContentModified() )
+                                     wxLogWarning( "Unsaved changes to %s discarded (headless server released the board)",
+                                                   s_headless->GetCurrentFileName() );
+
+                                 s_headless.reset();
+                             } );
 
 KOPENAPI_REGISTER( "pcb_open",
                    "Open a board (.kicad_pcb or its .kicad_pro): editor window in the GUI, in memory headless",
@@ -275,9 +287,10 @@ KOPENAPI_REGISTER( "pcb_open",
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
                                    "description":"Drop unsaved changes of the currently open board"}}})json"_json,
-                   false, h_pcb_open );
+                   false, h_pcb_open, 120 );
 
-KOPENAPI_REGISTER( "pcb_close", "Close the open board (refuses with unsaved changes unless discard)",
+KOPENAPI_REGISTER( "pcb_close", "Close the open board: refuses with unsaved changes unless discard: true, which drops "
+                   "them without any dialog (a warning goes to the journal); GUI: the editor window closes",
                    R"json({"type":"object","properties":{"discard":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_close );
 
@@ -286,4 +299,4 @@ KOPENAPI_REGISTER( "pcb_save",
                    R"json({"type":"object","properties":{"path":{"type":"string"}}})json"_json, false, h_pcb_save );
 
 KOPENAPI_REGISTER( "pcb_revert", "Reload the open board from disk, dropping unsaved changes",
-                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_revert );
+                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_revert, 120 );

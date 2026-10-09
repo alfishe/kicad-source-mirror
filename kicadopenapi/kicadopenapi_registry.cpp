@@ -188,3 +188,19 @@ std::vector<KOPENAPI_METHOD> KOPENAPI_REGISTRY::Search( const std::string& aQuer
 
     return out;
 }
+
+
+bool KOPENAPI_REGISTRY::AddCanvasCapture( KOPENAPI_CANVAS_CAPTURE aCapture )
+{
+    KOPENAPI_REGISTRY& reg = Get();
+    std::lock_guard<std::mutex> lock( reg.m_mutex );
+    reg.m_canvasCaptures.push_back( std::move( aCapture ) );
+    return true;
+}
+
+
+std::vector<KOPENAPI_CANVAS_CAPTURE> KOPENAPI_REGISTRY::CanvasCaptures() const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return m_canvasCaptures;
+}

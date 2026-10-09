@@ -11,7 +11,11 @@
 #include "kopenapi_sch_model.h"
 
 #include <api/sch_context.h>
+#include <kicadopenapi_image.h>
+#include <kicadopenapi_registry.h>
 #include <kiway.h>
+#include <class_draw_panel_gal.h>
+#include <sch_base_frame.h>
 #include <sch_draw_panel.h>
 #include <sch_edit_frame.h>
 #include <lib_symbol.h>
@@ -34,49 +38,6 @@
 #include <algorithm>
 
 using namespace kopenapi_sch;
-
-
-namespace
-{
-
-/// Crop to the bounding box of pixels that differ from the corner (background) colour
-wxImage cropToContent( const wxImage& aImage, int aMargin )
-{
-    const int           w = aImage.GetWidth(), h = aImage.GetHeight();
-    const unsigned char* data = aImage.GetData();
-    const unsigned char  r = data[0], g = data[1], b = data[2];
-    int                  left = w, top = h, right = -1, bottom = -1;
-
-    for( int y = 0; y < h; ++y )
-    {
-        const unsigned char* row = data + 3 * y * w;
-
-        for( int x = 0; x < w; ++x )
-        {
-            const unsigned char* px = row + 3 * x;
-
-            if( std::abs( px[0] - r ) + std::abs( px[1] - g ) + std::abs( px[2] - b ) > 24 )
-            {
-                left = std::min( left, x );
-                right = std::max( right, x );
-                top = std::min( top, y );
-                bottom = std::max( bottom, y );
-            }
-        }
-    }
-
-    if( right < 0 )
-        return aImage;
-
-    left = std::max( 0, left - aMargin );
-    top = std::max( 0, top - aMargin );
-    right = std::min( w - 1, right + aMargin );
-    bottom = std::min( h - 1, bottom + aMargin );
-
-    return aImage.GetSubImage( wxRect( left, top, right - left + 1, bottom - top + 1 ) );
-}
-
-} // namespace
 
 
 static KOPENAPI_RESULT h_sch_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
@@ -171,63 +132,62 @@ static KOPENAPI_RESULT h_sch_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     wxRemoveFile( file );
 
     if( crop )
-        image = cropToContent( image, dpi / 6 );
+        image = KopenapiCropToContent( image, dpi / 6 );
 
-    wxMemoryOutputStream png;
-    image.SaveFile( png, wxBITMAP_TYPE_PNG );
-
-    std::vector<char> bytes( png.GetSize() );
-    png.CopyTo( bytes.data(), bytes.size() );
-
-    return KOPENAPI_RESULT::Ok( { { "sheet", sheet ? sheetPath( *sheet ) : std::string() },
-                                  { "width", image.GetWidth() },
-                                  { "height", image.GetHeight() },
-                                  { "dpi", dpi },
-                                  { "mime_type", "image/png" },
-                                  { "image_base64", str( wxBase64Encode( bytes.data(), bytes.size() ) ) } } );
+    nlohmann::json result = KopenapiImageResult( image );
+    result["sheet"] = sheet ? sheetPath( *sheet ) : std::string();
+    result["dpi"] = dpi;
+    return KOPENAPI_RESULT::Ok( result );
 }
 
 
 static KOPENAPI_RESULT h_sch_view_capture( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
-    SCH_EDIT_FRAME* frame = aCtx.kiway ? static_cast<SCH_EDIT_FRAME*>( aCtx.kiway->Player( FRAME_SCH, false ) ) : nullptr;
+    const std::string editor = aArgs.value( "editor", std::string( "schematic" ) );
+    FRAME_T           type;
 
-    if( !frame || !frame->GetCanvas() )
-        return KOPENAPI_RESULT::Error( 409, "no schematic editor window" );
+    if( editor == "schematic" )
+        type = FRAME_SCH;
+    else if( editor == "symbol" )
+        type = FRAME_SCH_SYMBOL_EDITOR;
+    else if( editor == "symbol_viewer" )
+        type = FRAME_SCH_VIEWER;
+    else
+        return KOPENAPI_RESULT::Error( 400, "editor must be schematic, symbol or symbol_viewer" );
 
-    // The canvas's own OpenGL buffer: what the editor shows, glow included, without OS screen
-    // capture (no screen-recording permission involved)
+    auto* frame = aCtx.kiway ? dynamic_cast<SCH_BASE_FRAME*>( aCtx.kiway->Player( type, false ) ) : nullptr;
+
+    if( !frame || !frame->GetCanvas() || !frame->IsShown() )
+        return KOPENAPI_RESULT::Error( 409, "no " + editor + " window open" );
+
+    // The canvas's own OpenGL buffers (main + overlay): what the editor shows, glow included,
+    // without OS screen capture
     wxImage image;
 
     if( !frame->GetCanvas()->GetScreenshot( image ) || !image.IsOk() )
         return KOPENAPI_RESULT::Error( 500, "the canvas could not be read (not OpenGL, or not drawn yet)" );
 
-    const int maxWidth = std::clamp( aArgs.value( "max_width", 1600 ), 200, 8000 );
-
-    if( image.GetWidth() > maxWidth )
-        image.Rescale( maxWidth, image.GetHeight() * maxWidth / image.GetWidth(), wxIMAGE_QUALITY_HIGH );
-
-    if( !wxImage::FindHandler( wxBITMAP_TYPE_PNG ) )
-        wxImage::AddHandler( new wxPNGHandler );
-
-    wxMemoryOutputStream png;
-    image.SaveFile( png, wxBITMAP_TYPE_PNG );
-
-    std::vector<char> bytes( png.GetSize() );
-    png.CopyTo( bytes.data(), bytes.size() );
-
-    return KOPENAPI_RESULT::Ok( { { "width", image.GetWidth() },
-                                  { "height", image.GetHeight() },
-                                  { "mime_type", "image/png" },
-                                  { "image_base64", str( wxBase64Encode( bytes.data(), bytes.size() ) ) } } );
+    nlohmann::json result = KopenapiImageResult( image, std::clamp( aArgs.value( "max_width", 1600 ), 200, 8000 ) );
+    result["editor"] = editor;
+    return KOPENAPI_RESULT::Ok( result );
 }
 
 
+/// window_capture: schematic-side OpenGL canvases read back in place
+KOPENAPI_REGISTER_CANVAS_CAPTURE(
+        []( wxWindow* aWindow, wxImage& aImage ) -> bool
+        {
+            auto* canvas = dynamic_cast<EDA_DRAW_PANEL_GAL*>( aWindow );
+            return canvas && canvas->GetScreenshot( aImage ) && aImage.IsOk();
+        } );
+
+
 KOPENAPI_REGISTER( "sch_view_capture",
-                   "Capture what the schematic editor window shows right now (its own canvas: zoom, "
-                   "pan, selection and glow as on screen), as a PNG image; GUI only; no OS screen "
-                   "capture or permission involved. Over MCP an image",
+                   "Capture what a schematic-side editor window shows right now (its canvas: zoom, pan, "
+                   "selection, glow as on screen): schematic editor, symbol editor or symbol viewer; PNG; "
+                   "GUI only; no OS screen capture. For the whole window with toolbars use window_capture",
                    R"json({"type":"object","properties":{
+                        "editor":{"type":"string","enum":["schematic","symbol","symbol_viewer"],"default":"schematic"},
                         "max_width":{"type":"integer","default":1600}}})json"_json,
                    true, h_sch_view_capture );
 

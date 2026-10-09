@@ -29,6 +29,7 @@ class wxDialog;
 class wxNonOwnedWindow;
 class wxTopLevelWindow;
 class wxWindow;
+class wxImage;
 
 namespace KIPLATFORM
 {
@@ -173,6 +174,17 @@ namespace KIPLATFORM
          * Configures the IME mode of a given control handle
          */
         void ImmControl( wxWindow* aWindow, bool aEnable );
+
+        /**
+         * Render a window of this process into an image: the client area with its toolbars,
+         * panels and controls, at device pixel resolution, by asking the toolkit to draw it
+         * (not by reading the screen, so no screen-recording permission is involved and covered
+         * windows still capture).  OpenGL canvases may come out blank; callers paste their own
+         * framebuffer read-back on top.
+         *
+         * @return false if the platform cannot draw the window offscreen (e.g. Wayland)
+         */
+        bool CaptureWindow( wxWindow* aWindow, wxImage& aImage );
 
         /**
          * Asks the IME to cancel

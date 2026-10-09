@@ -925,6 +925,32 @@ bool OPENGL_GAL::GetScreenshot( wxImage& aDstImage )
         glReadBuffer( (GLenum) readBuffer );
         glReadPixels( 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data() );
 
+        // What the screen shows also includes the overlay buffer (previews, highlights drawn
+        // on top).  Buffers hold premultiplied colour; the compositor draws the overlay with
+        // GL_ONE, GL_ONE_MINUS_SRC_ALPHA, so blend it the same way.
+        if( m_overlayBuffer )
+        {
+            std::vector<unsigned char> over( (size_t) w * h * 4 );
+
+            m_compositor->SetBuffer( m_overlayBuffer );
+            glReadBuffer( (GLenum) readBuffer );
+            glReadPixels( 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, over.data() );
+
+            for( size_t i = 0; i < (size_t) w * h; ++i )
+            {
+                const unsigned a = over[i * 4 + 3];
+
+                if( a == 0 )
+                    continue;
+
+                for( int c = 0; c < 3; ++c )
+                {
+                    const unsigned v = over[i * 4 + c] + rgba[i * 4 + c] * ( 255 - a ) / 255;
+                    rgba[i * 4 + c] = (unsigned char) std::min( 255u, v );
+                }
+            }
+        }
+
         // wxImage wants separate RGB and alpha buffers and takes ownership of them.
         unsigned char* rgb = (unsigned char*) malloc( (size_t) w * h * 3 );
         unsigned char* alpha = (unsigned char*) malloc( (size_t) w * h );

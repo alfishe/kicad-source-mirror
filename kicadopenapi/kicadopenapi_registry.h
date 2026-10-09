@@ -84,6 +84,16 @@ struct KOPENAPI_METHOD
 };
 
 
+class wxWindow;
+class wxImage;
+
+/**
+ * Reads the pixels of a canvas window a kiface owns (OpenGL schematic / board / 3D canvases),
+ * which toolkit window rendering leaves blank.  Returns false for windows it does not own.
+ */
+using KOPENAPI_CANVAS_CAPTURE = std::function<bool( wxWindow* aWindow, wxImage& aImage )>;
+
+
 /// Thread-safe: kiface DSOs register while HTTP workers read; readers get copies.
 class KICOMMON_API KOPENAPI_REGISTRY
 {
@@ -105,6 +115,11 @@ public:
 
     std::vector<KOPENAPI_METHOD> Snapshot() const;
 
+    /// Kifaces register how to read their canvases (window_capture composes them)
+    static bool AddCanvasCapture( KOPENAPI_CANVAS_CAPTURE aCapture );
+
+    std::vector<KOPENAPI_CANVAS_CAPTURE> CanvasCaptures() const;
+
     std::optional<KOPENAPI_METHOD> Find( const std::string& aName ) const;
 
     /**
@@ -122,6 +137,7 @@ private:
     std::map<std::string, KOPENAPI_METHOD>     m_methods;
     std::map<std::string, KOPENAPI_DOC_STATUS>  m_docProviders;
     std::map<std::string, KOPENAPI_DOC_RELEASE> m_docReleasers;
+    std::vector<KOPENAPI_CANVAS_CAPTURE>        m_canvasCaptures;
 };
 
 
@@ -133,5 +149,8 @@ private:
 #define KOPENAPI_REGISTER_DOCUMENTS( aDomain, aStatus, aRelease )                         \
     static const bool kopenapi_docs_reg =                                                  \
             KOPENAPI_REGISTRY::AddDocumentProvider( aDomain, aStatus, aRelease )
+
+#define KOPENAPI_REGISTER_CANVAS_CAPTURE( aCapture )                                       \
+    static const bool kopenapi_canvas_reg = KOPENAPI_REGISTRY::AddCanvasCapture( aCapture )
 
 #endif
