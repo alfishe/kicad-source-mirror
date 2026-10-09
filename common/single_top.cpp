@@ -40,6 +40,7 @@
 
 #include <api/api_server.h>
 #include <kicadopenapi_service.h>
+#include <kicadopenapi_journal.h>
 #include <kiway.h>
 #include <build_version.h>
 #include <pgm_base.h>
@@ -63,7 +64,6 @@
 #include <thread_pool.h>
 
 #include <libraries/library_manager.h>
-#include <startwizard/startwizard.h>
 
 #ifdef KICAD_USE_SENTRY
 #include <sentry.h>
@@ -343,6 +343,9 @@ IMPLEMENT_APP( APP_SINGLE_TOP )
 
 bool PGM_SINGLE_TOP::OnPgmInit()
 {
+    // First: errors/warnings go to the journal (API + log file), never to dialogs
+    KOPENAPI_JOURNAL::Install( App().GetAppName().ToStdString() );
+
 #if defined(DEBUG)
     wxString absoluteArgv0 = wxStandardPaths::Get().GetExecutablePath();
 
@@ -429,10 +432,8 @@ bool PGM_SINGLE_TOP::OnPgmInit()
 
     Kiway.SetTop( frame );
 
-    STARTWIZARD startWizard;
-    startWizard.CheckAndRun( frame );
-
-    // Load library tables after startup wizard
+    // No first-run wizard: an agent-driven KiCad must never stop on a modal UI;
+    // missing setup is reported through the error journal instead
     GetLibraryManager().LoadGlobalTables();
 
     App().SetTopWindow( frame );      // wxApp gets a face.

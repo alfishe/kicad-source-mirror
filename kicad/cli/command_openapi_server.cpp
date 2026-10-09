@@ -27,6 +27,7 @@
 #include <mutex>
 
 #include <cli/exit_codes.h>
+#include <kicadopenapi_journal.h>
 #include <kicadopenapi_service.h>
 #include <wx/app.h>
 #include <wx/crt.h>
@@ -104,6 +105,9 @@ CLI::OPENAPI_SERVER_COMMAND::OPENAPI_SERVER_COMMAND() :
 
 int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
 {
+    // Errors/warnings go to the journal (API + log file + stderr)
+    KOPENAPI_JOURNAL::Install( "kicad-cli-openapi" );
+
     if( !m_argParser.get<std::string>( ARG_PATH ).empty() )
     {
         wxFprintf( stderr, _( "Pre-loading documents is not supported yet\n" ) );

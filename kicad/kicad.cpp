@@ -43,7 +43,6 @@
 #include <settings/settings_manager.h>
 #include <settings/kicad_settings.h>
 #include <settings/common_settings.h>
-#include <../include/startwizard/startwizard.h>
 #include <systemdirsappend.h>
 #include <thread_pool.h>
 #include <trace_helpers.h>
@@ -58,6 +57,7 @@
 #include <cstdlib>
 
 #include "pgm_kicad.h"
+#include <kicadopenapi_journal.h>
 #include "kicad_manager_frame.h"
 #include "mergetool_frame.h"
 
@@ -101,6 +101,9 @@ PGM_KICAD& PgmTop()
 
 bool PGM_KICAD::OnPgmInit()
 {
+    // First: errors/warnings go to the journal (API + log file), never to dialogs
+    KOPENAPI_JOURNAL::Install( "kicad" );
+
     App().SetAppDisplayName( wxT( "KiCad" ) );
 
 #if defined(DEBUG)
@@ -302,8 +305,8 @@ bool PGM_KICAD::OnPgmInit()
                                                 wxWindow::FromDIP( wxSize( 775, -1 ), NULL ) );
         frame = managerFrame;
 
-        STARTWIZARD startWizard;
-        startWizard.CheckAndRun( frame );
+        // No first-run wizard: an agent-driven KiCad must never stop on a modal UI;
+        // missing setup is reported through the error journal instead
     }
     else
     {

@@ -1,6 +1,7 @@
 #include "kicadopenapi_service.h"
 #include "kicadopenapi_registry.h"
 #include "kicadopenapi_mcp.h"
+#include "kicadopenapi_journal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +17,7 @@
 
 #include <kiway.h>
 #include <wx/app.h>
+#include <wx/log.h>
 
 #include <platform.h>
 
@@ -221,6 +223,7 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::liveStatus() const
 
     status["documents"] = docs.body;
     status["unsaved"] = unsaved;
+    status["journal"] = KOPENAPI_JOURNAL::Summary();
     return KOPENAPI_RESULT::Ok( status );
 }
 
@@ -337,6 +340,7 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::openApiJson() const
                         { "port", { { "type", "integer" } } },
                         { "headless", { { "type", "boolean" } } },
                         { "unsaved", { { "type", "boolean" } } },
+                        { "journal", { { "type", "object" } } },
                         { "documents", { { "type", "array" }, { "items", { { "type", "object" } } } } } } } } } } } } }
     };
 }
@@ -419,8 +423,33 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     KOPENAPI_HANDLER handler = method->handler;
     nlohmann::json   args = aArgs;
 
+    const std::string operation = "api:" + aName;
+
     return runInMain( alive, waker,
-                      [ctxCopy, handler, args]() mutable { return handler( ctxCopy, args ); },
+                      [ctxCopy, handler, args, operation]() mutable
+                      {
+                          // Log records during the call are attributed to this method
+                          KOPENAPI_JOURNAL::SCOPED_OPERATION scope( operation );
+                          KOPENAPI_RESULT result = handler( ctxCopy, args );
+
+                          // Failed operations are journaled too (4xx warning, 5xx error)
+                          if( result.status >= 400 )
+                          {
+                              const std::string message = result.body.contains( "error" )
+                                      ? result.body["error"].value( "message", std::string() )
+                                      : std::string();
+                              const wxString text = wxString::FromUTF8(
+                                      operation + " failed (" + std::to_string( result.status )
+                                      + "): " + message );
+
+                              if( result.status >= 500 )
+                                  wxLogError( "%s", text );
+                              else
+                                  wxLogWarning( "%s", text );
+                          }
+
+                          return result;
+                      },
                       std::chrono::seconds( std::max( method->timeoutSec, 1 ) ) );
 }
 
@@ -642,6 +671,11 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     }
 
     m_impl->alive->store( true );
+
+    // Startup ends when the main loop first runs; later records not caused by an API call
+    // are attributed to "background"
+    if( wxTheApp )
+        wxTheApp->CallAfter( []() { KOPENAPI_JOURNAL::SetOperation( "background" ); } );
 
     // The socket is already bound, so clients can connect as soon as Start() returns;
     // listen_after_bind() blocks in this thread until Stop().

@@ -189,6 +189,20 @@ if( APPLE )
         COMMENT "Copying runtime icon archive into KiCad.app/Contents/SharedSupport/resources"
         )
 
+    # Same for JSON schemas (PCM, jobs, DRC/ERC reports, remote libraries, API): without them
+    # startup reports "schema file … not found".  Copy straight from the source dirs.
+    add_custom_command( TARGET kicad POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_BUNDLE_DIR:kicad>/Contents/SharedSupport/schemas"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/kicad/pcm/schemas"
+                "$<TARGET_BUNDLE_DIR:kicad>/Contents/SharedSupport/schemas"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/resources/schemas"
+                "$<TARGET_BUNDLE_DIR:kicad>/Contents/SharedSupport/schemas"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/api/schemas"
+                "$<TARGET_BUNDLE_DIR:kicad>/Contents/SharedSupport/schemas"
+        COMMENT "Copying JSON schemas into KiCad.app/Contents/SharedSupport/schemas"
+        )
+
     target_link_libraries( kicad
         nlohmann_json
         common
