@@ -65,6 +65,7 @@ static void reply( httplib::Response& aRes, const KOPENAPI_RESULT& aResult )
  * because it only touches shared state.
  */
 static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAlive,
+                                  const std::function<void()>&             aWaker,
                                   std::function<KOPENAPI_RESULT()>         aFn )
 {
     if( !wxTheApp )
@@ -96,6 +97,9 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
                 }
             } );
 
+    if( aWaker )
+        aWaker();
+
     const auto deadline = std::chrono::steady_clock::now() + CALL_TIMEOUT;
 
     while( future.wait_for( WAIT_SLICE ) != std::future_status::ready )
@@ -120,6 +124,8 @@ struct KICAD_OPENAPI_SERVICE::IMPL
     std::string                       appName;
     std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>>( false );
     fs::path                          discoveryFile;
+    std::function<void()>             waker;
+    std::function<void()>             shutdownHandler;
 
     nlohmann::json statusJson() const
     {
@@ -172,8 +178,21 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::openApiJson() const
             { "responses", { { "200", { { "description", "OpenAPI 3.0 document" } } } } } } }
     };
 
+    if( shutdownHandler )
+    {
+        paths["/api/v1/shutdown"] = {
+            { "post",
+              { { "operationId", "shutdown" },
+                { "summary", "Stop this headless process" },
+                { "responses", { { "200", { { "description", "Shutdown started" } } } } } } }
+        };
+    }
+
     for( const KOPENAPI_METHOD& m : KOPENAPI_REGISTRY::Get().Snapshot() )
     {
+        if( shutdownHandler && m.name == "shutdown" )
+            continue;   // the built-in route wins
+
         json op = {
             { "operationId", m.name },
             { "summary", m.summary },
@@ -294,7 +313,7 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invoke( const std::string& aName,
     KOPENAPI_CONTEXT ctxCopy = ctx;
     KOPENAPI_HANDLER handler = method->handler;
 
-    return runInMain( alive,
+    return runInMain( alive, waker,
                       [ctxCopy, handler, args]() mutable { return handler( ctxCopy, args ); } );
 }
 
@@ -341,6 +360,17 @@ void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
                      reply( res, KOPENAPI_RESULT::Ok( openApiJson() ) );
                  } );
 
+    if( shutdownHandler )
+    {
+        // Registered before the generic method route so it takes precedence
+        server->Post( "/api/v1/shutdown",
+                      [this]( const httplib::Request&, httplib::Response& res )
+                      {
+                          reply( res, KOPENAPI_RESULT::Ok( { { "stopping", true } } ) );
+                          shutdownHandler();
+                      } );
+    }
+
     server->Post( R"(/api/v1/([a-z0-9_]+))",
                   [this]( const httplib::Request& req, httplib::Response& res )
                   {
@@ -373,6 +403,18 @@ KICAD_OPENAPI_SERVICE::KICAD_OPENAPI_SERVICE( KIWAY* aKiway, bool aHeadless ) :
 KICAD_OPENAPI_SERVICE::~KICAD_OPENAPI_SERVICE()
 {
     Stop();
+}
+
+
+void KICAD_OPENAPI_SERVICE::SetMainLoopWaker( std::function<void()> aWaker )
+{
+    m_impl->waker = std::move( aWaker );
+}
+
+
+void KICAD_OPENAPI_SERVICE::SetShutdownHandler( std::function<void()> aHandler )
+{
+    m_impl->shutdownHandler = std::move( aHandler );
 }
 
 
