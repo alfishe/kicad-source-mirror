@@ -1127,6 +1127,7 @@ add_subdirectory( pcb_calculator )
 add_subdirectory( plugins )             # 3D plugins must be built before kicad
 add_subdirectory( cvpcb )               # must be after pcbnew
 add_subdirectory( kicad )               # should follow pcbnew, eeschema, api
+add_subdirectory( kicadopenapi/bridge ) # kicad-mcp-bridge, placed next to kicad-cli
 add_subdirectory( tools )
 add_subdirectory( utils )
 
