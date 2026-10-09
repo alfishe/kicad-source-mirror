@@ -14,6 +14,7 @@
 #include <kicadopenapi_util.h>
 #include <sch_field.h>
 #include <sch_label.h>
+#include <sch_line.h>
 #include <sch_screen.h>
 #include <sch_sheet_path.h>
 #include <sch_symbol.h>
@@ -32,7 +33,8 @@ namespace
 struct BOXED
 {
     BOX2I       box;
-    std::string kind;    ///< "text" or "body"
+    std::string kind;    ///< "text", "body" or "wire"
+    bool        field = false;   ///< a part's field text (labels sit on wires by design)
     std::string owner;   ///< reference of the part it belongs to ("" for labels / texts)
     nlohmann::json what;
 };
@@ -80,7 +82,7 @@ static KOPENAPI_RESULT h_sch_layout_check( KOPENAPI_CONTEXT& aCtx, const nlohman
             const std::string uuid = str( symbol->m_Uuid.AsString() );
 
             if( !symbol->IsPower() )
-                items.push_back( { symbol->GetBodyBoundingBox(), "body", ref, { { "ref", ref }, { "uuid", uuid } } } );
+                items.push_back( { symbol->GetBodyBoundingBox(), "body", false, ref, { { "ref", ref }, { "uuid", uuid } } } );
 
             std::vector<SCH_FIELD*> fields;
             symbol->GetFields( fields, true );
@@ -90,7 +92,7 @@ static KOPENAPI_RESULT h_sch_layout_check( KOPENAPI_CONTEXT& aCtx, const nlohman
                 if( field->GetShownText( &*sheet, FOR_GUI ).IsEmpty() )
                     continue;
 
-                items.push_back( { field->GetBoundingBox(), "text", ref,
+                items.push_back( { field->GetBoundingBox(), "text", true, ref,
                                    { { "ref", ref }, { "field", str( field->GetName() ) },
                                      { "text", str( field->GetShownText( &*sheet, FOR_GUI ) ) }, { "uuid", uuid } } } );
             }
@@ -98,14 +100,23 @@ static KOPENAPI_RESULT h_sch_layout_check( KOPENAPI_CONTEXT& aCtx, const nlohman
         else if( labelKind( item->Type() ) || item->Type() == SCH_TEXT_T )
         {
             const std::string text = str( UnescapeString( static_cast<SCH_TEXT*>( item )->GetText() ) );
-            items.push_back( { item->GetBoundingBox(), "text", std::string(),
+            items.push_back( { item->GetBoundingBox(), "text", false, std::string(),
                                { { "label", labelKind( item->Type() ) ? labelKind( item->Type() ) : "text" },
                                  { "text", text }, { "uuid", str( item->m_Uuid.AsString() ) } } } );
         }
     }
 
-    // Overlaps worth fixing: text on text, text on another part's body, body on body.  A part's
-    // own texts over its own body are its own design.
+    // Wires, for part texts lying on them (labels are meant to sit on wires)
+    std::vector<SCH_LINE*> wires;
+
+    for( SCH_ITEM* item : sheet->LastScreen()->Items().OfType( SCH_LINE_T ) )
+    {
+        if( static_cast<SCH_LINE*>( item )->IsWire() || static_cast<SCH_LINE*>( item )->IsBus() )
+            wires.push_back( static_cast<SCH_LINE*>( item ) );
+    }
+
+    // Overlaps worth fixing: text on text, text on another part's body, body on body, a part's
+    // text on a wire.  A part's own texts over its own body are its own design.
     const double                minArea = std::pow( schIUScale.mmToIU( 0.3 ), 2 );
     std::vector<nlohmann::json> findings;
 
@@ -141,6 +152,30 @@ static KOPENAPI_RESULT h_sch_layout_check( KOPENAPI_CONTEXT& aCtx, const nlohman
         }
     }
 
+    for( const BOXED& text : items )
+    {
+        if( !text.field )
+            continue;
+
+        for( SCH_LINE* wire : wires )
+        {
+            // shrink the text box a little: a wire grazing the edge of the text is fine
+            BOX2I inner = text.box;
+            inner.Inflate( -schIUScale.mmToIU( 0.2 ) );
+
+            if( inner.GetWidth() <= 0 || inner.GetHeight() <= 0 || !wire->HitTest( inner, false, 0 ) )
+                continue;
+
+            const VECTOR2I a = wire->GetStartPoint(), b = wire->GetEndPoint();
+            findings.push_back( { { "kind", "text_on_wire" },
+                                  { "a", text.what },
+                                  { "b", { { "wire", str( wire->m_Uuid.AsString() ) },
+                                           { "from", { mm( a.x ), mm( a.y ) } }, { "to", { mm( b.x ), mm( b.y ) } } } },
+                                  { "at_mm", { mm( inner.Centre().x ), mm( inner.Centre().y ) } } } );
+            break;
+        }
+    }
+
     nlohmann::json result = KopenapiPage( findings, aArgs );
     result["sheet"] = sheetPath( *sheet );
     result["clean"] = findings.empty();
@@ -150,7 +185,8 @@ static KOPENAPI_RESULT h_sch_layout_check( KOPENAPI_CONTEXT& aCtx, const nlohman
 
 KOPENAPI_REGISTER( "sch_layout_check",
                    "Readability check of a sheet (what ERC does not see): texts lying on each other, a "
-                   "part's reference / value text over another part's body, overlapping part bodies; each "
+                   "part's reference / value text over another part's body or on a wire, overlapping part "
+                   "bodies; each "
                    "finding names both items (ref + field, or label text, uuid) and where (mm), so one can be "
                    "moved with sch_symbol_update (field_positions / x_mm, y_mm); clean flag; paginated",
                    KopenapiPagedSchema( R"json({"sheet":{"type":"string"}})json"_json ),

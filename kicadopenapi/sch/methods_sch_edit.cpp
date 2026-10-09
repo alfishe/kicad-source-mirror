@@ -1336,6 +1336,44 @@ static KOPENAPI_RESULT h_sch_wire( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
 
     pushEdit( junctions, schematic, _( "Wire (API)" ), aCtx.kiway, added );
 
+    // Part texts the new wire runs through move clear of it
+    {
+        SCH_COMMIT texts( context->GetToolManager() );
+        bool       moved = false;
+
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+            bool        hit = false;
+
+            for( SCH_FIELD& field : symbol->GetFields() )
+            {
+                if( !field.IsVisible() || field.GetShownText( &*sheet, FOR_GUI ).IsEmpty() )
+                    continue;
+
+                BOX2I box = field.GetBoundingBox();
+                box.Inflate( -schIUScale.mmToIU( 0.2 ) );
+
+                for( size_t i = 0; !hit && i + 1 < points.size(); ++i )
+                {
+                    SCH_LINE probe( points[i], LAYER_WIRE );
+                    probe.SetEndPoint( points[i + 1] );
+                    hit = box.GetWidth() > 0 && box.GetHeight() > 0 && probe.HitTest( box, false, 0 );
+                }
+            }
+
+            if( hit )
+            {
+                texts.Modify( symbol, screen );
+                placeFieldsClear( symbol, screen, *sheet, false );
+                moved = true;
+            }
+        }
+
+        if( moved )
+            pushEdit( texts, schematic, _( "Wire (API)" ) );
+    }
+
     nlohmann::json result = { { "segments", segments }, { "junctions", dots } };
 
     if( aArgs["from"].is_string() )
@@ -2057,8 +2095,21 @@ static KOPENAPI_RESULT h_sch_power_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
         for( SCH_ITEM* item : screen->Items() )
         {
-            if( item->Type() == SCH_SYMBOL_T && static_cast<SCH_SYMBOL*>( item )->GetBoundingBox().Intersects( box ) )
-                return false;
+            // other parts: their body and each visible text (a part's pins reach out to the
+            // point the symbol goes on, so not the whole bounding box)
+            if( item->Type() == SCH_SYMBOL_T )
+            {
+                SCH_SYMBOL* other = static_cast<SCH_SYMBOL*>( item );
+
+                if( other->GetBodyBoundingBox().Intersects( box ) )
+                    return false;
+
+                for( SCH_FIELD& field : other->GetFields() )
+                {
+                    if( field.IsVisible() && !field.GetShownText( &*sheet, FOR_GUI ).IsEmpty() && field.GetBoundingBox().Intersects( box ) )
+                        return false;
+                }
+            }
 
             if( ( labelKind( item->Type() ) || item->Type() == SCH_NO_CONNECT_T ) && item->GetBoundingBox().Intersects( box ) )
                 return false;
@@ -2110,42 +2161,95 @@ static KOPENAPI_RESULT h_sch_power_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     // Upright first, then upside down (PWR_FLAG below a rail is as common)
     const std::vector<VECTOR2I> bodies = { natural, VECTOR2I( -natural.x, -natural.y ) };
+    // Right on the point, but its body or texts would lie on something: step aside like a taken point
+    if( directions.empty() && stub == "auto" && !spotClear( *point, natural, *point ) )
+    {
+        if( out != VECTOR2I( 0, 0 ) && out != VECTOR2I( -natural.x, -natural.y ) )
+            directions.push_back( out );
+
+        for( const VECTOR2I& d : { VECTOR2I( natural.y, natural.x ), VECTOR2I( -natural.y, -natural.x ),
+                                   VECTOR2I( -natural.x, -natural.y ) } )
+        {
+            if( std::find( directions.begin(), directions.end(), d ) == directions.end() && d != out * -1 )
+                directions.push_back( d );
+        }
+    }
+
     bool                        found = directions.empty();
     SCH_LINE*                   tapped = nullptr;   // the wire the symbol hangs on (split there)
 
-    // First choice when the point is taken or sideways: hang the symbol on a wire already leaving
-    // it (a T with a junction), on a wire across the symbol's direction
+    // First choice when the point is taken, sideways or crowded: hang the symbol on the wiring
+    // of this net (a T with a junction) - wires reached from the point through wire ends and
+    // junctions, nearest first - on a wire across the symbol's direction
     if( !found && stub == "auto" )
     {
-        for( const VECTOR2I& b : bodies )
+        struct TAP
         {
-            for( SCH_ITEM* item : screen->Items().Overlapping( SCH_LINE_T, *point ) )
+            int       distance;
+            VECTOR2I  at;
+            SCH_LINE* wire;
+        };
+
+        std::vector<TAP>              taps;
+        std::vector<std::pair<VECTOR2I, int>> todo = { { *point, 0 } };
+        std::set<SCH_LINE*>           walked;
+        const int                     reach = 40 * grid;
+
+        while( !todo.empty() )
+        {
+            const auto [from, distance] = todo.back();
+            todo.pop_back();
+
+            for( SCH_ITEM* item : screen->Items().Overlapping( SCH_LINE_T, from ) )
             {
                 SCH_LINE* wire = static_cast<SCH_LINE*>( item );
 
-                if( found || !wire->IsWire() || ( wire->GetStartPoint() != *point && wire->GetEndPoint() != *point ) )
+                if( !wire->IsWire() || walked.count( wire ) || ( wire->GetStartPoint() != from && wire->GetEndPoint() != from ) )
                     continue;
 
-                const VECTOR2I other = wire->GetStartPoint() == *point ? wire->GetEndPoint() : wire->GetStartPoint();
-                const VECTOR2I along = other - *point;
-
-                if( ( along.x != 0 ) == ( b.x != 0 ) )
-                    continue;   // the wire runs the way the symbol points
-
+                walked.insert( wire );
+                const VECTOR2I other = wire->GetStartPoint() == from ? wire->GetEndPoint() : wire->GetStartPoint();
+                const VECTOR2I along = other - from;
                 const int      length = std::abs( along.x ) + std::abs( along.y );
                 const VECTOR2I step( along.x == 0 ? 0 : ( along.x > 0 ? grid : -grid ), along.y == 0 ? 0 : ( along.y > 0 ? grid : -grid ) );
 
-                for( int k = 1; k * grid < length && !found; ++k )
-                {
-                    const VECTOR2I at = *point + step * k;
+                for( int k = 1; k * grid < length; ++k )
+                    taps.push_back( { distance + k * grid, from + step * k, wire } );
 
-                    if( freePoint( at, wire ) && spotClear( at, b, at ) )
+                // go on through a plain wire joint (not into another part's pin)
+                if( distance + length < reach )
+                {
+                    bool pin = false;
+
+                    for( SCH_ITEM* o : screen->Items().Overlapping( SCH_SYMBOL_T, other ) )
                     {
-                        end = tap = at;
-                        body = b;
-                        tapped = wire;
-                        found = true;
+                        for( SCH_PIN* p : static_cast<SCH_SYMBOL*>( o )->GetPins( &*sheet ) )
+                            pin |= p->GetPosition() == other && !static_cast<SCH_SYMBOL*>( o )->IsPower();
                     }
+
+                    if( !pin )
+                        todo.push_back( { other, distance + length } );
+                }
+            }
+        }
+
+        std::stable_sort( taps.begin(), taps.end(), []( const TAP& a, const TAP& b ) { return a.distance < b.distance; } );
+
+        for( const VECTOR2I& b : bodies )
+        {
+            for( const TAP& t : taps )
+            {
+                const VECTOR2I along = t.wire->GetEndPoint() - t.wire->GetStartPoint();
+
+                if( found || ( along.x != 0 ) == ( b.x != 0 ) )
+                    continue;   // the wire runs the way the symbol points
+
+                if( freePoint( t.at, t.wire ) && spotClear( t.at, b, t.at ) )
+                {
+                    end = tap = t.at;
+                    body = b;
+                    tapped = t.wire;
+                    found = true;
                 }
             }
 
@@ -2250,8 +2354,18 @@ static KOPENAPI_RESULT h_sch_power_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                               { "at", { toMm( end.x ), toMm( end.y ) } },
                               { "net", net } };
 
+    auto dirName = []( const VECTOR2I& d )
+    {
+        return d.x > 0 ? "right" : d.x < 0 ? "left" : d.y < 0 ? "up" : "down";
+    };
+
+    result["body"] = dirName( body );
+
     if( end != tap )
-        result["stub"] = { { "from", { toMm( tap.x ), toMm( tap.y ) } }, { "to", { toMm( end.x ), toMm( end.y ) } } };
+    {
+        result["stub"] = { { "from", { toMm( tap.x ), toMm( tap.y ) } }, { "to", { toMm( end.x ), toMm( end.y ) } },
+                           { "direction", dirName( end - tap ) } };
+    }
     else if( tap != *point )
         result["on_wire_at"] = { toMm( tap.x ), toMm( tap.y ) };
 
@@ -2715,8 +2829,11 @@ KOPENAPI_REGISTER( "sch_connect",
 KOPENAPI_REGISTER( "sch_power_add",
                    std::string( "Put one power symbol (power:GND, power:+5V, ...) or power:PWR_FLAG on a pin "
                                 "(REF.PIN) or a point on a wire, upright; when the point is taken (another power "
-                                "symbol, a label) or the pin points sideways, a short stub wire leads to a free "
-                                "spot (stub auto, or a direction, or none). For ERC power_pin_not_driven: a "
+                                "symbol, a label), the pin points sideways or the symbol would lie on a part or "
+                                "text, it hangs on a wire already leaving the point (T + junction) or takes a "
+                                "short stub to a free spot - auto tries: out of the pin, sideways, against the "
+                                "body; upright before upside down; 2..8 grid - or give stub left/right/up/down/none; "
+                                "answers where it went (stub direction, body). For ERC power_pin_not_driven: a "
                                 "PWR_FLAG on the rail's connector pin." ) + EDIT_NOTE,
                    R"json({"type":"object","required":["lib_id","at"],"properties":{
                         "lib_id":{"type":"string","description":"e.g. power:PWR_FLAG, power:GND"},
