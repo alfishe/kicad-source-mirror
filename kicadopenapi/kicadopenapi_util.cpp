@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 
 
 static char lowerChar( char aChar )
@@ -196,8 +197,8 @@ bool KopenapiIsConnectorRef( const std::string& aRef )
 }
 
 
-int KopenapiTextScore( const std::string& aQuery, const std::string& aName, const std::string& aKeywords,
-                       const std::string& aDescription )
+KOPENAPI_TEXT_MATCH KopenapiTextMatch( const std::string& aQuery, const std::string& aName, const std::string& aKeywords,
+                                       const std::string& aDescription )
 {
     auto lower = []( std::string aText )
     {
@@ -210,18 +211,19 @@ int KopenapiTextScore( const std::string& aQuery, const std::string& aName, cons
     const std::string name = lower( aName ), keywords = lower( aKeywords ), description = lower( aDescription );
     const std::string query = lower( aQuery );
 
-    int    score = 1;
-    size_t start = 0;
+    KOPENAPI_TEXT_MATCH result;
+    size_t              start = 0;
 
     while( start < query.size() )
     {
-        const size_t end = query.find_first_of( " \t", start );
+        const size_t      end = query.find_first_of( " \t", start );
         const std::string term = query.substr( start, end == std::string::npos ? std::string::npos : end - start );
         start = end == std::string::npos ? query.size() : end + 1;
 
         if( term.empty() )
             continue;
 
+        result.terms++;
         int termScore = 0;
 
         // A name hit says most, but a term buried inside a longer name ("usb" in FSUSB42MUX)
@@ -240,10 +242,80 @@ int KopenapiTextScore( const std::string& aQuery, const std::string& aName, cons
             termScore += 6;
 
         if( termScore == 0 )
-            return 0;
+        {
+            result.unmatched.push_back( term );
+            continue;
+        }
 
-        score += termScore;
+        result.matched++;
+        result.score += termScore;
     }
 
-    return score;
+    return result;
+}
+
+
+int KopenapiTextScore( const std::string& aQuery, const std::string& aName, const std::string& aKeywords,
+                       const std::string& aDescription )
+{
+    const KOPENAPI_TEXT_MATCH m = KopenapiTextMatch( aQuery, aName, aKeywords, aDescription );
+    return m.matched == m.terms ? m.score + 1 : 0;
+}
+
+
+nlohmann::json KopenapiRankedPage( std::vector<std::pair<KOPENAPI_TEXT_MATCH, nlohmann::json>> aRows,
+                                   const nlohmann::json& aArgs )
+{
+    const bool anyFull = std::any_of( aRows.begin(), aRows.end(),
+                                      []( const auto& r ) { return r.first.matched == r.first.terms; } );
+
+    std::vector<std::pair<KOPENAPI_TEXT_MATCH, nlohmann::json>> kept;
+    std::set<std::string>                                      missing;
+
+    for( auto& [match, row] : aRows )
+    {
+        if( match.terms > 0 && match.matched == 0 )
+            continue;
+
+        if( anyFull && match.matched != match.terms )
+            continue;
+
+        row["score"] = match.score;
+
+        if( !anyFull )
+        {
+            row["unmatched_terms"] = match.unmatched;
+            missing.insert( match.unmatched.begin(), match.unmatched.end() );
+        }
+
+        kept.emplace_back( std::move( match ), std::move( row ) );
+    }
+
+    std::stable_sort( kept.begin(), kept.end(),
+                      []( const auto& a, const auto& b )
+                      {
+                          if( a.first.matched != b.first.matched )
+                              return a.first.matched > b.first.matched;
+
+                          if( a.first.score != b.first.score )
+                              return a.first.score > b.first.score;
+
+                          return KopenapiNaturalLess( a.second.value( "lib_id", std::string() ),
+                                                      b.second.value( "lib_id", std::string() ) );
+                      } );
+
+    std::vector<nlohmann::json> rows;
+
+    for( auto& [match, row] : kept )
+        rows.push_back( std::move( row ) );
+
+    nlohmann::json page = KopenapiPage( rows, aArgs );
+
+    if( !anyFull && !rows.empty() )
+    {
+        page["partial"] = true;
+        page["note"] = "no item matches every word; best partial matches first (fewer or different words may help)";
+    }
+
+    return page;
 }

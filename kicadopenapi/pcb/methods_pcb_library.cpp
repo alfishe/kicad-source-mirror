@@ -49,6 +49,60 @@ PROJECT* libraryProject( KOPENAPI_CONTEXT& aCtx )
 }
 
 
+/**
+ * The footprints of a loaded library.  FOOTPRINT_LIBRARY_ADAPTER keeps its enumerated footprints
+ * in statics of pcbcommon, a static library linked into pcbnew *and* cvpcb: the adapter is one
+ * object per process, created by whichever kiface asks first.  When cvpcb created it (ERC's
+ * footprint checks run through cvpcb), it fills cvpcb's copy of the cache and pcbnew's
+ * GetFootprints() answers nothing for every library.  Then the library is read here once
+ * (names + LoadFootprint) and kept until it changes on disk.
+ */
+std::vector<const FOOTPRINT*> libraryFootprints( FOOTPRINT_LIBRARY_ADAPTER* aAdapter, const wxString& aNickname )
+{
+    std::vector<const FOOTPRINT*> result;
+
+    for( const FOOTPRINT* fp : aAdapter->GetFootprints( aNickname, true ) )
+        result.push_back( fp );
+
+    if( !result.empty() || !aAdapter->IsLibraryLoaded( aNickname ) )
+        return result;
+
+    struct CACHED
+    {
+        long long                               timestamp = 0;
+        std::vector<std::unique_ptr<FOOTPRINT>> footprints;
+    };
+
+    static std::map<wxString, CACHED> cache;
+    const long long                   timestamp = aAdapter->GenerateTimestamp( &aNickname );
+    CACHED&                           entry = cache[aNickname];
+
+    if( entry.timestamp != timestamp || entry.footprints.empty() )
+    {
+        entry.timestamp = timestamp;
+        entry.footprints.clear();
+
+        for( const wxString& name : aAdapter->GetFootprintNames( aNickname, true ) )
+        {
+            try
+            {
+                if( FOOTPRINT* fp = aAdapter->LoadFootprint( aNickname, name, false ) )
+                    entry.footprints.emplace_back( fp );
+            }
+            catch( const IO_ERROR& )
+            {
+                // a broken file: skipped, as the adapter's own enumeration does
+            }
+        }
+    }
+
+    for( const std::unique_ptr<FOOTPRINT>& fp : entry.footprints )
+        result.push_back( fp.get() );
+
+    return result;
+}
+
+
 FOOTPRINT_LIBRARY_ADAPTER* loadedAdapter( KOPENAPI_CONTEXT& aCtx )
 {
     PROJECT* project = libraryProject( aCtx );
@@ -237,7 +291,7 @@ static KOPENAPI_RESULT h_pcb_lib_footprint_search( KOPENAPI_CONTEXT& aCtx, const
         return KOPENAPI_RESULT::Error( 503, "no project to read library tables from" );
 
     const std::map<std::string, int>            used = usage( aCtx );
-    std::vector<std::pair<int, nlohmann::json>> scored;
+    std::vector<std::pair<KOPENAPI_TEXT_MATCH, nlohmann::json>> scored;
 
     for( const wxString& nickname : adapter->GetLibraryNames() )
     {
@@ -246,7 +300,7 @@ static KOPENAPI_RESULT h_pcb_lib_footprint_search( KOPENAPI_CONTEXT& aCtx, const
         if( !KopenapiGlob( libGlob, lib ) )
             continue;
 
-        for( const FOOTPRINT* fp : adapter->GetFootprints( nickname, true ) )
+        for( const FOOTPRINT* fp : libraryFootprints( adapter, nickname ) )
         {
             if( !fp )
                 continue;
@@ -262,37 +316,20 @@ static KOPENAPI_RESULT h_pcb_lib_footprint_search( KOPENAPI_CONTEXT& aCtx, const
             if( !type.empty() && type != mountType( fp ) )
                 continue;
 
-            const int score = query.empty() ? 1
-                                            : KopenapiTextScore( query, name, str( fp->GetKeywords() ),
-                                                                 str( fp->GetLibDescription() ) );
+            const KOPENAPI_TEXT_MATCH match = KopenapiTextMatch( query, name, str( fp->GetKeywords() ), str( fp->GetLibDescription() ) );
 
-            if( score == 0 )
+            if( match.terms > 0 && match.matched == 0 )
                 continue;
 
             nlohmann::json row = footprintRow( nickname, fp );
-            row["score"] = score;
 
             auto u = used.find( row["lib_id"] );
             row["used_in_design"] = u == used.end() ? 0 : u->second;
-            scored.emplace_back( score, std::move( row ) );
+            scored.emplace_back( match, std::move( row ) );
         }
     }
 
-    std::stable_sort( scored.begin(), scored.end(),
-                      []( const auto& a, const auto& b )
-                      {
-                          if( a.first != b.first )
-                              return a.first > b.first;
-
-                          return KopenapiNaturalLess( a.second["lib_id"], b.second["lib_id"] );
-                      } );
-
-    std::vector<nlohmann::json> rows;
-
-    for( auto& [score, row] : scored )
-        rows.push_back( std::move( row ) );
-
-    return KOPENAPI_RESULT::Ok( KopenapiPage( rows, aArgs ) );
+    return KOPENAPI_RESULT::Ok( KopenapiRankedPage( std::move( scored ), aArgs ) );
 }
 
 

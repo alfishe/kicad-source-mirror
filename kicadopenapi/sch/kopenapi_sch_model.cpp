@@ -151,7 +151,7 @@ const std::set<wxString>& PAD_RESOLVER::footprintPads( const wxString& aFootprin
     if( m_kiway && m_project )
     {
         if( m_cache.size() == 1 )
-            KopenapiEnsureFootprintLibraries();   // first lookup of this call
+            KopenapiEnsureFootprintLibraries( m_kiway );   // first lookup of this call
 
         if( KIFACE* cvpcb = m_kiway->KiFACE( KIWAY::FACE_CVPCB ) )
         {

@@ -186,7 +186,7 @@ static KOPENAPI_RESULT h_sch_lib_symbol_search( KOPENAPI_CONTEXT& aCtx, const nl
         return KOPENAPI_RESULT::Error( 503, "no project to read library tables from" );
 
     const std::map<std::string, int>           used = usage( aCtx );
-    std::vector<std::pair<int, nlohmann::json>> scored;
+    std::vector<std::pair<KOPENAPI_TEXT_MATCH, nlohmann::json>> scored;
 
     for( const wxString& nickname : adapter->GetLibraryNames() )
     {
@@ -204,38 +204,20 @@ static KOPENAPI_RESULT h_sch_lib_symbol_search( KOPENAPI_CONTEXT& aCtx, const nl
             if( pins < minPins || ( maxPins > 0 && pins > maxPins ) )
                 continue;
 
-            const int score = query.empty() ? 1
-                                            : KopenapiTextScore( query, str( symbol->GetName() ),
-                                                                 str( symbol->GetKeyWords() ),
-                                                                 str( symbol->GetDescription() ) );
+            const KOPENAPI_TEXT_MATCH match = KopenapiTextMatch( query, str( symbol->GetName() ), str( symbol->GetKeyWords() ), str( symbol->GetDescription() ) );
 
-            if( score == 0 )
+            if( match.terms > 0 && match.matched == 0 )
                 continue;
 
             nlohmann::json row = symbolRow( nickname, symbol );
-            row["score"] = score;
 
             auto u = used.find( row["lib_id"] );
             row["used_in_design"] = u == used.end() ? 0 : u->second;
-            scored.emplace_back( score, std::move( row ) );
+            scored.emplace_back( match, std::move( row ) );
         }
     }
 
-    std::stable_sort( scored.begin(), scored.end(),
-                      []( const auto& a, const auto& b )
-                      {
-                          if( a.first != b.first )
-                              return a.first > b.first;
-
-                          return KopenapiNaturalLess( a.second["lib_id"], b.second["lib_id"] );
-                      } );
-
-    std::vector<nlohmann::json> rows;
-
-    for( auto& [score, row] : scored )
-        rows.push_back( std::move( row ) );
-
-    return KOPENAPI_RESULT::Ok( KopenapiPage( rows, aArgs ) );
+    return KOPENAPI_RESULT::Ok( KopenapiRankedPage( std::move( scored ), aArgs ) );
 }
 
 

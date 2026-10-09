@@ -1,6 +1,8 @@
 #include "kicadopenapi_libraries.h"
 
 #include <common.h>
+#include <kicadopenapi_registry.h>
+#include <kiway.h>
 #include <pgm_base.h>
 #include <libraries/library_manager.h>
 #include <libraries/library_table.h>
@@ -136,10 +138,23 @@ void KopenapiCheckGlobalLibraryTables()
 }
 
 
-void KopenapiEnsureFootprintLibraries()
+void KopenapiEnsureFootprintLibraries( KIWAY* aKiway )
 {
     if( !PgmOrNull() )
         return;
+
+    if( aKiway && !Pgm().GetLibraryManager().Adapter( LIBRARY_TABLE_TYPE::FOOTPRINT ) )
+    {
+        // pcbnew's library listing creates the adapter in pcbnew (and loads the libraries)
+        aKiway->KiFACE( KIWAY::FACE_PCB );
+
+        if( std::optional<KOPENAPI_METHOD> list = KOPENAPI_REGISTRY::Get().Find( "pcb_lib_list" ) )
+        {
+            KOPENAPI_CONTEXT context;
+            context.kiway = aKiway;
+            list->handler( context, { { "limit", 1 } } );
+        }
+    }
 
     if( std::optional<LIBRARY_MANAGER_ADAPTER*> adapter = Pgm().GetLibraryManager().Adapter( LIBRARY_TABLE_TYPE::FOOTPRINT );
         adapter && *adapter )

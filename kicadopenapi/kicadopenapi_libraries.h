@@ -7,6 +7,7 @@
 #include <json_common.h>
 #include <kicommon.h>
 
+class KIWAY;
 class LIBRARY_MANAGER_ADAPTER;
 
 
@@ -32,7 +33,12 @@ KICOMMON_API void KopenapiCheckGlobalLibraryTables();
  * leaves a per-library status behind, and cvpcb's lookups (ERC footprint links, netlist pad
  * resolution) then skip loading: every footprint looks missing (seen: 161 vs 3 ERC
  * footprint_link_issues after a DRC in the previous project).
+ *
+ * With aKiway, the footprint adapter is first created by pcbnew if nobody has created it yet:
+ * it is one object per process, made by whichever kiface asks first, and its footprint cache
+ * lives in statics of that kiface's copy of pcbcommon.  Made by cvpcb (ERC), pcbnew's library
+ * search would see empty libraries.
  */
-KICOMMON_API void KopenapiEnsureFootprintLibraries();
+KICOMMON_API void KopenapiEnsureFootprintLibraries( KIWAY* aKiway = nullptr );
 
 #endif

@@ -41,6 +41,26 @@ KICOMMON_API bool KopenapiIsConnectorRef( const std::string& aRef );
 KICOMMON_API int KopenapiTextScore( const std::string& aQuery, const std::string& aName,
                                     const std::string& aKeywords, const std::string& aDescription );
 
+/// Per-term outcome of a free-text query against a library item
+struct KOPENAPI_TEXT_MATCH
+{
+    int                      score = 0;     ///< relevance of the matched terms
+    int                      matched = 0;   ///< terms found
+    int                      terms = 0;     ///< terms in the query
+    std::vector<std::string> unmatched;     ///< terms not found
+};
+
+KICOMMON_API KOPENAPI_TEXT_MATCH KopenapiTextMatch( const std::string& aQuery, const std::string& aName,
+                                                    const std::string& aKeywords, const std::string& aDescription );
+
+/**
+ * Page of ranked search rows: rows matching every query term if there are any; otherwise the
+ * best partial matches (most terms first), flagged "partial" with the terms nothing matched, so
+ * a query with one unlucky word still returns something useful.
+ */
+KICOMMON_API nlohmann::json KopenapiRankedPage( std::vector<std::pair<KOPENAPI_TEXT_MATCH, nlohmann::json>> aRows,
+                                                const nlohmann::json& aArgs );
+
 /// JSON schema properties shared by all paginated methods (limit, cursor)
 KICOMMON_API nlohmann::json KopenapiPageSchema();
 

@@ -662,9 +662,12 @@ nlohmann::json symbolCard( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath )
     {
         if( field )
         {
+            const BOX2I box = field->GetBoundingBox();
             fields[str( field->GetName() )] = { { "x_mm", toMm( field->GetPosition().x ) },
                                                 { "y_mm", toMm( field->GetPosition().y ) },
-                                                { "visible", field->IsVisible() } };
+                                                { "visible", field->IsVisible() },
+                                                { "box_mm", { toMm( box.GetLeft() ), toMm( box.GetTop() ),
+                                                              toMm( box.GetRight() ), toMm( box.GetBottom() ) } } };
         }
     }
 
@@ -693,6 +696,124 @@ nlohmann::json symbolCard( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath )
 }
 
 
+/**
+ * Put a symbol's visible field texts (reference, value, ...) where they lie on nothing else: where
+ * they are (unless aReset), KiCad's own placement, then the whole text block right of, below,
+ * above or left of the part at a growing distance.  Obstacles: other parts (body and pins), their
+ * texts, labels, wires.  False (texts left where KiCad put them) when no candidate is clear.
+ */
+bool placeFieldsClear( SCH_SYMBOL* aSymbol, SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, bool aReset )
+{
+    if( aReset )
+        aSymbol->AutoplaceFields( aScreen, AUTOPLACE_AUTO );
+
+    std::vector<SCH_FIELD*> fields;
+
+    for( SCH_FIELD& field : aSymbol->GetFields() )
+    {
+        if( field.IsVisible() && !field.GetShownText( &aPath, FOR_GUI ).IsEmpty() )
+            fields.push_back( &field );
+    }
+
+    if( fields.empty() )
+        return true;
+
+    std::vector<BOX2I> obstacles;
+
+    for( SCH_ITEM* item : aScreen->Items() )
+    {
+        if( item == aSymbol )
+            continue;
+
+        if( item->Type() == SCH_SYMBOL_T )
+        {
+            SCH_SYMBOL* other = static_cast<SCH_SYMBOL*>( item );
+            obstacles.push_back( other->GetBodyAndPinsBoundingBox() );
+
+            for( SCH_FIELD& field : other->GetFields() )
+            {
+                if( field.IsVisible() && !field.GetShownText( &aPath, FOR_GUI ).IsEmpty() )
+                    obstacles.push_back( field.GetBoundingBox() );
+            }
+        }
+        else if( item->Type() == SCH_LINE_T || labelKind( item->Type() ) || item->Type() == SCH_TEXT_T
+                 || item->Type() == SCH_SHEET_T || item->Type() == SCH_NO_CONNECT_T )
+        {
+            obstacles.push_back( item->GetBoundingBox() );
+        }
+    }
+
+    const BOX2I own = aSymbol->GetBodyAndPinsBoundingBox();
+
+    auto blockBox = [&]()
+    {
+        BOX2I block = fields.front()->GetBoundingBox();
+
+        for( SCH_FIELD* field : fields )
+            block.Merge( field->GetBoundingBox() );
+
+        return block;
+    };
+
+    auto clear = [&]( const BOX2I& aBlock )
+    {
+        if( aBlock.Intersects( own ) )
+            return false;
+
+        for( const BOX2I& box : obstacles )
+        {
+            if( aBlock.Intersects( box ) )
+                return false;
+        }
+
+        return true;
+    };
+
+    if( !aReset && clear( blockBox() ) )
+        return true;
+
+    if( !aReset )
+        aSymbol->AutoplaceFields( aScreen, AUTOPLACE_AUTO );
+
+    const BOX2I start = blockBox();
+    const int   blockW = static_cast<int>( start.GetWidth() ), blockH = static_cast<int>( start.GetHeight() );
+
+    if( clear( start ) )
+        return true;
+
+    const int grid = toIU( GRID_MM );
+    auto      snap = [&]( int v ) { return int( std::lround( double( v ) / grid ) ) * grid; };
+
+    for( int gap : { 1, 2, 4, 6, 10 } )
+    {
+        const int g = gap * grid;
+        const std::vector<VECTOR2I> targets = {
+            // top-left corner of the block for: right, below, above, left
+            { own.GetRight() + g, own.Centre().y - blockH / 2 },
+            { own.Centre().x - blockW / 2, own.GetBottom() + g },
+            { own.Centre().x - blockW / 2, own.GetTop() - g - blockH },
+            { own.GetLeft() - g - blockW, own.Centre().y - blockH / 2 } };
+
+        for( const VECTOR2I& target : targets )
+        {
+            const VECTOR2I delta( snap( target.x - start.GetLeft() ), snap( target.y - start.GetTop() ) );
+            BOX2I          moved = start;
+            moved.Move( delta );
+
+            if( !clear( moved ) )
+                continue;
+
+            for( SCH_FIELD* field : fields )
+                field->SetPosition( field->GetPosition() + delta );
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
 /// The net a pin is on now (after a commit), for confirming connections
 std::string netOfPin( SCHEMATIC* aSchematic, const std::string& aPin )
 {
@@ -708,6 +829,366 @@ std::string netOfPin( SCHEMATIC* aSchematic, const std::string& aPin )
     return std::string();
 }
 
+
+
+/// Direction from a power symbol's pin to the centre of its body (power pins have zero length)
+VECTOR2I powerBodyDirection( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath )
+{
+    std::vector<SCH_PIN*> own = aSymbol->GetPins( &aPath );
+    const VECTOR2I        pin = own.empty() ? aSymbol->GetPosition() : own.front()->GetPosition();
+    const VECTOR2I        d = aSymbol->GetBodyBoundingBox().Centre() - pin;
+
+    if( std::abs( d.x ) >= std::abs( d.y ) )
+        return VECTOR2I( d.x < 0 ? -1 : 1, 0 );
+
+    return VECTOR2I( 0, d.y < 0 ? -1 : 1 );
+}
+
+
+/// Where a power symbol's body points in its library pose (GND down, +5V up, ...)
+VECTOR2I powerNaturalDirection( LIB_SYMBOL* aLib, SCHEMATIC* aSchematic, const SCH_SHEET_PATH& aPath )
+{
+    std::unique_ptr<LIB_SYMBOL> flat = aLib->Flatten();
+    SCH_SYMBOL                  probe( *flat, aLib->GetLibId(), &aPath, 1, 1, VECTOR2I( 0, 0 ), aSchematic );
+    return powerBodyDirection( &probe, aPath );
+}
+
+
+/// A power symbol with its pin on aPoint and its body pointing aBody, numbered #PWR<n>
+SCH_SYMBOL* makePowerSymbol( LIB_SYMBOL* aLib, SCHEMATIC* aSchematic, const SCH_SHEET_PATH& aPath, const VECTOR2I& aPoint,
+                             const VECTOR2I& aBody, std::set<wxString>& aTaken )
+{
+    std::unique_ptr<LIB_SYMBOL> flat = aLib->Flatten();
+    auto*                       symbol = new SCH_SYMBOL( *flat, aLib->GetLibId(), &aPath, 1, 1, aPoint, aSchematic );
+
+    for( int orientation : { SYM_ORIENT_0, SYM_ORIENT_90, SYM_ORIENT_180, SYM_ORIENT_270 } )
+    {
+        symbol->SetOrientation( orientation );
+
+        if( powerBodyDirection( symbol, aPath ) == aBody )
+            break;
+    }
+
+    if( std::vector<SCH_PIN*> own = symbol->GetPins( &aPath ); !own.empty() )
+        symbol->SetPosition( symbol->GetPosition() + ( aPoint - own.front()->GetPosition() ) );
+
+    const bool flag = aLib->GetName().CmpNoCase( wxS( "PWR_FLAG" ) ) == 0;
+    symbol->SetRef( &aPath, nextFreeRef( aSchematic, flag ? wxS( "#FLG" ) : wxS( "#PWR" ), aTaken ) );
+    symbol->AutoplaceFields( nullptr, AUTOPLACE_AUTO );
+    return symbol;
+}
+
+
+/**
+ * Carries the wiring along when parts move (sch_symbol_update, sch_items_move).
+ *
+ * From every connection point that moved, the attachment tree is collected: wires, junctions,
+ * labels, no-connects and power symbols (PWR_FLAG included) reachable without touching any other
+ * part.  A tree that belongs to the moving items alone moves with them as a rigid body (a stub
+ * with its power symbol stays a stub); a tree shared with other parts keeps its place — wire
+ * ends on the moved points stretch, labels / no-connects sitting on the point follow — and wires
+ * that turn diagonal are re-routed orthogonally.  A moving power symbol never drags another one.
+ */
+class SHEET_DRAG
+{
+public:
+    SHEET_DRAG( SCH_COMMIT& aCommit, SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath ) :
+            m_commit( aCommit ), m_screen( aScreen ), m_path( aPath )
+    {}
+
+    /// Items moved by the caller (not to be carried again)
+    void SetAnchors( const std::set<SCH_ITEM*>& aAnchors ) { m_anchors = aAnchors; }
+
+    /// A connection point of a moved item went from aFrom to aTo; aPowerMover: it was a power symbol
+    void AddPointMove( const VECTOR2I& aFrom, const VECTOR2I& aTo, bool aPowerMover )
+    {
+        if( aFrom != aTo )
+            m_moves.push_back( { aFrom, aTo, aPowerMover } );
+    }
+
+    /// Apply; returns warnings, fills aTouched with everything changed
+    nlohmann::json Apply( std::vector<KIID>& aTouched )
+    {
+        // Decide everything on the geometry before the move: a tree moved first must not look
+        // like a wire through the next point
+        struct PLAN
+        {
+            const MOVE*            move;
+            bool                   rigid;
+            std::set<SCH_ITEM*>    tree;
+            std::vector<SCH_ITEM*> here;
+        };
+
+        std::vector<PLAN> plans;
+
+        for( const MOVE& move : m_moves )
+        {
+            PLAN plan{ &move, false, {}, {} };
+            plan.rigid = !move.powerMover && collectTree( move.from, move.to - move.from, plan.tree );
+
+            if( !plan.rigid )
+            {
+                plan.tree.clear();
+
+                for( SCH_ITEM* item : m_screen->Items().Overlapping( move.from ) )
+                    plan.here.push_back( item );
+            }
+
+            plans.push_back( std::move( plan ) );
+        }
+
+        std::vector<SCH_LINE*> stretched;
+
+        for( PLAN& plan : plans )
+        {
+            const MOVE&    move = *plan.move;
+            const VECTOR2I delta = move.to - move.from;
+
+            if( plan.rigid )
+            {
+                for( SCH_ITEM* item : plan.tree )
+                {
+                    if( m_done.count( item ) )
+                        continue;
+
+                    m_commit.Modify( item, m_screen );
+                    item->Move( delta );
+                    m_done.insert( item );
+                    aTouched.push_back( item->m_Uuid );
+                }
+
+                continue;
+            }
+
+            // Shared with other parts: stretch / follow at the point itself
+            for( SCH_ITEM* item : plan.here )
+            {
+                if( m_anchors.count( item ) || m_done.count( item ) )
+                    continue;
+
+                if( labelKind( item->Type() ) || item->Type() == SCH_NO_CONNECT_T )
+                {
+                    if( item->GetPosition() != move.from )
+                        continue;
+
+                    m_commit.Modify( item, m_screen );
+                    item->SetPosition( move.to );
+                }
+                else if( !move.powerMover && item->Type() == SCH_SYMBOL_T && static_cast<SCH_SYMBOL*>( item )->IsPower() )
+                {
+                    std::vector<SCH_PIN*> own = static_cast<SCH_SYMBOL*>( item )->GetPins( &m_path );
+
+                    if( own.empty() || own.front()->GetPosition() != move.from )
+                        continue;
+
+                    m_commit.Modify( item, m_screen );
+                    item->Move( delta );
+                }
+                else if( item->Type() == SCH_LINE_T && static_cast<SCH_LINE*>( item )->IsWire() )
+                {
+                    SCH_LINE* wire = static_cast<SCH_LINE*>( item );
+
+                    if( wire->GetStartPoint() != move.from && wire->GetEndPoint() != move.from )
+                        continue;
+
+                    m_commit.Modify( item, m_screen );
+
+                    if( wire->GetStartPoint() == move.from )
+                        wire->SetStartPoint( move.to );
+                    else
+                        wire->SetEndPoint( move.to );
+
+                    stretched.push_back( wire );
+                }
+                else
+                {
+                    continue;
+                }
+
+                m_done.insert( item );
+                aTouched.push_back( item->m_Uuid );
+            }
+        }
+
+        return reroute( stretched, aTouched );
+    }
+
+private:
+    struct MOVE
+    {
+        VECTOR2I from, to;
+        bool     powerMover;
+    };
+
+    /// Wiring reachable from aStart that touches no other part; false if it does
+    bool collectTree( const VECTOR2I& aStart, const VECTOR2I& aDelta, std::set<SCH_ITEM*>& aTree )
+    {
+        std::vector<VECTOR2I> todo = { aStart };
+        std::set<std::pair<int, int>> seen;
+
+        while( !todo.empty() )
+        {
+            const VECTOR2I p = todo.back();
+            todo.pop_back();
+
+            if( !seen.insert( { p.x, p.y } ).second )
+                continue;
+
+            for( SCH_ITEM* item : m_screen->Items().Overlapping( p ) )
+            {
+                if( m_anchors.count( item ) )
+                {
+                    // the moving items' own other connection points: fine only if they move alike
+                    if( item->Type() == SCH_SYMBOL_T && p != aStart && !movesBy( p, aDelta ) )
+                    {
+                        for( SCH_PIN* pin : static_cast<SCH_SYMBOL*>( item )->GetPins( &m_path ) )
+                        {
+                            if( pin->GetPosition() == p )
+                                return false;
+                        }
+                    }
+
+                    continue;
+                }
+
+                switch( item->Type() )
+                {
+                case SCH_LINE_T:
+                {
+                    SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+                    if( !line->IsWire() )
+                        return false;
+
+                    if( line->GetStartPoint() != p && line->GetEndPoint() != p )
+                        return false;   // the point is in the middle of a wire: a T into shared wiring
+
+                    if( aTree.insert( item ).second )
+                    {
+                        todo.push_back( line->GetStartPoint() == p ? line->GetEndPoint() : line->GetStartPoint() );
+
+                        // another wire ending in the middle of this one joins it
+                        for( SCH_ITEM* other : m_screen->Items().OfType( SCH_LINE_T ) )
+                        {
+                            SCH_LINE* o = static_cast<SCH_LINE*>( other );
+
+                            for( const VECTOR2I& end : { o->GetStartPoint(), o->GetEndPoint() } )
+                            {
+                                if( other != item && end != line->GetStartPoint() && end != line->GetEndPoint()
+                                    && line->HitTest( end, 0 ) )
+                                {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+
+                    break;
+                }
+                case SCH_SYMBOL_T:
+                {
+                    SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+                    bool        pinHere = false;
+
+                    for( SCH_PIN* pin : symbol->GetPins( &m_path ) )
+                        pinHere |= pin->GetPosition() == p;
+
+                    if( !pinHere )
+                        break;   // only its body overlaps the point
+
+                    if( !symbol->IsPower() )
+                        return false;   // another part is on this wiring
+
+                    aTree.insert( item );
+                    break;
+                }
+                case SCH_JUNCTION_T:
+                case SCH_NO_CONNECT_T:
+                    if( item->GetPosition() == p )
+                        aTree.insert( item );
+
+                    break;
+
+                case SCH_SHEET_T:
+                case SCH_BUS_WIRE_ENTRY_T:
+                case SCH_BUS_BUS_ENTRY_T:
+                    return false;
+
+                default:
+                    if( labelKind( item->Type() ) && item->GetPosition() == p )
+                        aTree.insert( item );
+
+                    break;
+                }
+            }
+        }
+
+        return !aTree.empty();
+    }
+
+    bool movesBy( const VECTOR2I& aPoint, const VECTOR2I& aDelta ) const
+    {
+        for( const MOVE& m : m_moves )
+        {
+            if( m.from == aPoint )
+                return m.to - m.from == aDelta;
+        }
+
+        return false;
+    }
+
+    /// Stretched wires that turned diagonal: replace them by an orthogonal route
+    nlohmann::json reroute( const std::vector<SCH_LINE*>& aStretched, std::vector<KIID>& aTouched )
+    {
+        nlohmann::json warnings = nlohmann::json::array();
+        std::vector<SCH_LINE*> diagonal;
+
+        for( SCH_LINE* wire : aStretched )
+        {
+            if( wire->GetStartPoint().x != wire->GetEndPoint().x && wire->GetStartPoint().y != wire->GetEndPoint().y )
+                diagonal.push_back( wire );
+        }
+
+        if( diagonal.empty() )
+            return warnings;
+
+        std::set<const SCH_ITEM*> ignore( diagonal.begin(), diagonal.end() );
+        WIRE_ROUTER router( m_screen, m_path, toIU( GRID_MM ), ignore );
+
+        for( SCH_LINE* wire : diagonal )
+        {
+            const VECTOR2I a = wire->GetStartPoint(), b = wire->GetEndPoint();
+            std::optional<std::vector<VECTOR2I>> path = router.Route( a, b, "hv" );
+
+            if( !path )
+            {
+                warnings.push_back( "a wire stays diagonal: no clear orthogonal route from " + std::to_string( toMm( a.x ) ) + ", "
+                                    + std::to_string( toMm( a.y ) ) );
+                continue;
+            }
+
+            m_commit.Remove( wire, m_screen );
+
+            for( size_t i = 0; i + 1 < path->size(); ++i )
+            {
+                auto* segment = new SCH_LINE( ( *path )[i], LAYER_WIRE );
+                segment->SetEndPoint( ( *path )[i + 1] );
+                m_commit.Add( segment, m_screen );
+                router.AddWire( ( *path )[i], ( *path )[i + 1] );
+                aTouched.push_back( segment->m_Uuid );
+            }
+        }
+
+        return warnings;
+    }
+
+    SCH_COMMIT&           m_commit;
+    SCH_SCREEN*           m_screen;
+    SCH_SHEET_PATH        m_path;
+    std::set<SCH_ITEM*>   m_anchors;
+    std::set<SCH_ITEM*>   m_done;
+    std::vector<MOVE>     m_moves;
+};
 
 
 /// A wire end: REF.PIN, or a point {x_mm, y_mm} on the target sheet
@@ -939,12 +1420,19 @@ static KOPENAPI_RESULT h_sch_symbol_add( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         symbol->SetRef( &*sheet, nextFreeRef( schematic, prefix, taken ) );
     }
 
-    symbol->AutoplaceFields( nullptr, AUTOPLACE_AUTO );
+    const bool fieldsClear = placeFieldsClear( symbol, sheet->LastScreen(), *sheet, true );
 
     SCH_COMMIT commit( context->GetToolManager() );
     commit.Add( symbol, sheet->LastScreen() );
     pushEdit( commit, schematic, _( "Add symbol (API)" ), aCtx.kiway, { symbol->m_Uuid } );
-    return KOPENAPI_RESULT::Ok( symbolCard( symbol, *sheet ) );
+
+    nlohmann::json card = symbolCard( symbol, *sheet );
+
+    if( !fieldsClear )
+        card["warnings"] = { "no clear spot for the reference / value texts nearby: they overlap something "
+                             "(sch_layout_check; field_positions to place them)" };
+
+    return KOPENAPI_RESULT::Ok( card );
 }
 
 
@@ -1002,78 +1490,28 @@ static KOPENAPI_RESULT h_sch_symbol_update( KOPENAPI_CONTEXT& aCtx, const nlohma
     }
 
     std::vector<KIID> moved = { at->symbol->m_Uuid };
+    nlohmann::json    warnings = nlohmann::json::array();
 
-    if( orientation >= 0 || aArgs.contains( "x_mm" ) || aArgs.contains( "y_mm" ) )
+    const bool relocated = orientation >= 0 || aArgs.contains( "x_mm" ) || aArgs.contains( "y_mm" );
+
+    if( relocated )
     {
-        at->symbol->AutoplaceFields( screen, AUTOPLACE_AUTO );
-
-        // Drag: labels, no-connects, power symbols and wire ends sitting on a pin go with it
-        std::set<SCH_ITEM*> done;
+        SHEET_DRAG drag( commit, screen, at->path );
+        drag.SetAnchors( { at->symbol } );
 
         for( SCH_PIN* pin : at->symbol->GetPins( &at->path ) )
-        {
-            const VECTOR2I from = before[pin->GetNumber()];
-            const VECTOR2I to = pin->GetPosition();
+            drag.AddPointMove( before[pin->GetNumber()], pin->GetPosition(), at->symbol->IsPower() );
 
-            if( from == to )
-                continue;
-
-            std::vector<SCH_ITEM*> here;
-
-            for( SCH_ITEM* item : screen->Items().Overlapping( from ) )
-                here.push_back( item );
-
-            for( SCH_ITEM* item : here )
-            {
-                if( item == at->symbol || done.count( item ) )
-                    continue;
-
-                if( labelKind( item->Type() ) || item->Type() == SCH_NO_CONNECT_T )
-                {
-                    if( item->GetPosition() != from )
-                        continue;
-
-                    commit.Modify( item, screen );
-                    item->SetPosition( to );
-                }
-                else if( item->Type() == SCH_SYMBOL_T && static_cast<SCH_SYMBOL*>( item )->IsPower() )
-                {
-                    SCH_SYMBOL* power = static_cast<SCH_SYMBOL*>( item );
-                    std::vector<SCH_PIN*> own = power->GetPins( &at->path );
-
-                    if( own.empty() || own.front()->GetPosition() != from )
-                        continue;
-
-                    commit.Modify( item, screen );
-                    power->SetPosition( power->GetPosition() + ( to - from ) );
-                }
-                else if( item->Type() == SCH_LINE_T && static_cast<SCH_LINE*>( item )->IsWire() )
-                {
-                    SCH_LINE* wire = static_cast<SCH_LINE*>( item );
-
-                    if( wire->GetStartPoint() != from && wire->GetEndPoint() != from )
-                        continue;
-
-                    commit.Modify( item, screen );
-
-                    if( wire->GetStartPoint() == from )
-                        wire->SetStartPoint( to );
-                    else
-                        wire->SetEndPoint( to );
-                }
-                else
-                {
-                    continue;
-                }
-
-                done.insert( item );
-                moved.push_back( item->m_Uuid );
-            }
-        }
+        warnings = drag.Apply( moved );
     }
 
-    if( aArgs.value( "autoplace_fields", false ) )
-        at->symbol->AutoplaceFields( screen, AUTOPLACE_AUTO );
+    // Texts re-placed clear of the neighbours after a move / turn, or when asked
+    if( ( relocated && !at->symbol->IsPower() ) || aArgs.value( "autoplace_fields", false ) )
+    {
+        if( !placeFieldsClear( at->symbol, screen, at->path, aArgs.value( "autoplace_fields", false ) ) )
+            warnings.push_back( "no clear spot for the reference / value texts nearby: they overlap something "
+                                "(sch_layout_check; field_positions to place them)" );
+    }
 
     // Field text placement: {"Reference": {"x_mm":..,"y_mm":..}, "Value": "hide"}
     if( aArgs.contains( "field_positions" ) && aArgs["field_positions"].is_object() )
@@ -1094,54 +1532,6 @@ static KOPENAPI_RESULT h_sch_symbol_update( KOPENAPI_CONTEXT& aCtx, const nlohma
         }
     }
 
-    // Wires dragged out of square: re-route them from their fixed end to the pin's new place
-    nlohmann::json warnings = nlohmann::json::array();
-    std::vector<std::pair<SCH_LINE*, std::pair<VECTOR2I, VECTOR2I>>> diagonal;
-
-    for( SCH_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
-    {
-        SCH_LINE* wire = static_cast<SCH_LINE*>( item );
-
-        if( wire->IsWire() && std::find( moved.begin(), moved.end(), wire->m_Uuid ) != moved.end()
-            && wire->GetStartPoint().x != wire->GetEndPoint().x && wire->GetStartPoint().y != wire->GetEndPoint().y )
-        {
-            diagonal.push_back( { wire, { wire->GetStartPoint(), wire->GetEndPoint() } } );
-        }
-    }
-
-    if( !diagonal.empty() )
-    {
-        std::set<const SCH_ITEM*> ignore;
-
-        for( const auto& [wire, ends] : diagonal )
-            ignore.insert( wire );
-
-        WIRE_ROUTER router( screen, at->path, toIU( GRID_MM ), ignore );
-
-        for( const auto& [wire, ends] : diagonal )
-        {
-            std::optional<std::vector<VECTOR2I>> path = router.Route( ends.first, ends.second, "hv" );
-
-            if( !path )
-            {
-                warnings.push_back( "a wire stays diagonal: no clear orthogonal route from "
-                                    + std::to_string( toMm( ends.first.x ) ) + ", " + std::to_string( toMm( ends.first.y ) ) );
-                continue;
-            }
-
-            commit.Remove( wire, screen );
-
-            for( size_t i = 0; i + 1 < path->size(); ++i )
-            {
-                auto* segment = new SCH_LINE( ( *path )[i], LAYER_WIRE );
-                segment->SetEndPoint( ( *path )[i + 1] );
-                commit.Add( segment, screen );
-                router.AddWire( ( *path )[i], ( *path )[i + 1] );
-                moved.push_back( segment->m_Uuid );
-            }
-        }
-    }
-
     pushEdit( commit, context->GetSchematic(), _( "Edit symbol (API)" ), aCtx.kiway, moved );
 
     if( !warnings.empty() )
@@ -1151,6 +1541,96 @@ static KOPENAPI_RESULT h_sch_symbol_update( KOPENAPI_CONTEXT& aCtx, const nlohma
         return KOPENAPI_RESULT::Ok( card );
     }
     return KOPENAPI_RESULT::Ok( symbolCard( at->symbol, at->path ) );
+}
+
+
+static KOPENAPI_RESULT h_sch_items_move( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    if( !aArgs.contains( "uuids" ) || !aArgs["uuids"].is_array() || aArgs["uuids"].empty() )
+        return KOPENAPI_RESULT::Error( 400, "give 'uuids' (array) and dx_mm / dy_mm" );
+
+    std::optional<SCH_SHEET_PATH> sheet = targetSheet( *context, aArgs );
+
+    if( !sheet )
+        return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+
+    const VECTOR2I delta( toIU( aArgs.value( "dx_mm", 0.0 ) ), toIU( aArgs.value( "dy_mm", 0.0 ) ) );
+
+    if( delta == VECTOR2I( 0, 0 ) )
+        return KOPENAPI_RESULT::Error( 400, "dx_mm / dy_mm move by less than the 1.27 mm grid" );
+
+    std::set<std::string> wanted;
+
+    for( const nlohmann::json& u : aArgs["uuids"] )
+    {
+        if( u.is_string() )
+            wanted.insert( u.get<std::string>() );
+    }
+
+    SCH_SCREEN*         screen = sheet->LastScreen();
+    std::set<SCH_ITEM*> anchors;
+
+    for( SCH_ITEM* item : screen->Items() )
+    {
+        if( wanted.erase( str( item->m_Uuid.AsString() ) ) )
+            anchors.insert( item );
+    }
+
+    if( !wanted.empty() )
+    {
+        nlohmann::json missing = nlohmann::json::array();
+
+        for( const std::string& u : wanted )
+            missing.push_back( u );
+
+        return KOPENAPI_RESULT::Error( 404, "not on this sheet: " + missing.dump() );
+    }
+
+    SCH_COMMIT        commit( context->GetToolManager() );
+    SHEET_DRAG        drag( commit, screen, *sheet );
+    std::vector<KIID> touched;
+
+    // Connection points of the moving items, before they move
+    for( SCH_ITEM* item : anchors )
+    {
+        const bool power = item->Type() == SCH_SYMBOL_T && static_cast<SCH_SYMBOL*>( item )->IsPower();
+
+        if( item->Type() == SCH_SYMBOL_T )
+        {
+            for( SCH_PIN* pin : static_cast<SCH_SYMBOL*>( item )->GetPins( &*sheet ) )
+                drag.AddPointMove( pin->GetPosition(), pin->GetPosition() + delta, power );
+        }
+        else if( item->Type() == SCH_LINE_T )
+        {
+            SCH_LINE* line = static_cast<SCH_LINE*>( item );
+            drag.AddPointMove( line->GetStartPoint(), line->GetStartPoint() + delta, false );
+            drag.AddPointMove( line->GetEndPoint(), line->GetEndPoint() + delta, false );
+        }
+        else
+        {
+            drag.AddPointMove( item->GetPosition(), item->GetPosition() + delta, false );
+        }
+
+        commit.Modify( item, screen );
+        item->Move( delta );
+        touched.push_back( item->m_Uuid );
+    }
+
+    drag.SetAnchors( anchors );
+    nlohmann::json warnings = drag.Apply( touched );
+    pushEdit( commit, context->GetSchematic(), _( "Move (API)" ), aCtx.kiway, touched );
+
+    nlohmann::json result = { { "moved", anchors.size() }, { "touched", touched.size() } };
+
+    if( !warnings.empty() )
+        result["warnings"] = warnings;
+
+    return KOPENAPI_RESULT::Ok( result );
 }
 
 
@@ -1260,35 +1740,7 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     // has no direction to go by.)
     auto placePower = [&]( const VECTOR2I& aPoint, const VECTOR2I& aOut, const SCH_SHEET_PATH& aPath ) -> SCH_ITEM*
     {
-        std::unique_ptr<LIB_SYMBOL> flat = powerSymbol->Flatten();
-        auto* symbol = new SCH_SYMBOL( *flat, powerSymbol->GetLibId(), &aPath, 1, 1, aPoint, schematic );
-
-        auto bodyDirection = [&]() -> VECTOR2I
-        {
-            std::vector<SCH_PIN*> own = symbol->GetPins( &aPath );
-            const VECTOR2I        pin = own.empty() ? symbol->GetPosition() : own.front()->GetPosition();
-            const VECTOR2I        d = symbol->GetBodyBoundingBox().Centre() - pin;
-
-            if( std::abs( d.x ) >= std::abs( d.y ) )
-                return VECTOR2I( d.x < 0 ? -1 : 1, 0 );
-
-            return VECTOR2I( 0, d.y < 0 ? -1 : 1 );
-        };
-
-        for( int orientation : { SYM_ORIENT_0, SYM_ORIENT_90, SYM_ORIENT_180, SYM_ORIENT_270 } )
-        {
-            symbol->SetOrientation( orientation );
-
-            if( bodyDirection() == aOut )
-                break;
-        }
-
-        if( std::vector<SCH_PIN*> own = symbol->GetPins( &aPath ); !own.empty() )
-            symbol->SetPosition( symbol->GetPosition() + ( aPoint - own.front()->GetPosition() ) );
-
-        symbol->SetRef( &aPath, nextFreeRef( schematic, wxS( "#PWR" ), takenRefs ) );
-        symbol->AutoplaceFields( nullptr, AUTOPLACE_AUTO );
-        return symbol;
+        return makePowerSymbol( powerSymbol, schematic, aPath, aPoint, aOut, takenRefs );
     };
 
     const bool upright = aArgs.value( "orientation", std::string( "upright" ) ) != "away";
@@ -1296,18 +1748,7 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     // Where the power symbol's body points in its library pose (e.g. GND down, +5V up)
     auto naturalDirection = [&]( const SCH_SHEET_PATH& aPath ) -> VECTOR2I
     {
-        if( !powerSymbol )
-            return VECTOR2I( 0, 0 );
-
-        std::unique_ptr<LIB_SYMBOL> flat = powerSymbol->Flatten();
-        SCH_SYMBOL                  probe( *flat, powerSymbol->GetLibId(), &aPath, 1, 1, VECTOR2I( 0, 0 ), schematic );
-        std::vector<SCH_PIN*>       own = probe.GetPins( &aPath );
-        const VECTOR2I              d = probe.GetBodyBoundingBox().Centre() - ( own.empty() ? VECTOR2I( 0, 0 ) : own.front()->GetPosition() );
-
-        if( std::abs( d.x ) >= std::abs( d.y ) )
-            return VECTOR2I( d.x < 0 ? -1 : 1, 0 );
-
-        return VECTOR2I( 0, d.y < 0 ? -1 : 1 );
+        return powerSymbol ? powerNaturalDirection( powerSymbol, schematic, aPath ) : VECTOR2I( 0, 0 );
     };
 
     auto addWire = [&]( const VECTOR2I& aStart, const VECTOR2I& aEnd, SCH_SCREEN* aScreen )
@@ -1448,6 +1889,24 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     added.insert( added.end(), extra.begin(), extra.end() );
     pushEdit( commit, schematic, _( "Connect pins (API)" ), aCtx.kiway, added );
 
+    // The parts' texts out of the way of what was just put next to their pins
+    {
+        SCH_COMMIT      texts( context->GetToolManager() );
+        std::set<SCH_SYMBOL*> seen;
+
+        for( const PIN_AT& at : pins )
+        {
+            if( !seen.insert( at.symbol ).second || at.symbol->IsPower() )
+                continue;
+
+            texts.Modify( at.symbol, at.path.LastScreen() );
+            placeFieldsClear( at.symbol, at.path.LastScreen(), at.path, false );
+        }
+
+        if( !texts.Empty() )
+            pushEdit( texts, schematic, _( "Connect pins (API)" ) );
+    }
+
     // Confirm: every pin is now on one net
     std::set<std::string> nets;
 
@@ -1458,6 +1917,323 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
                                   { "connected", nets.size() == 1 && !nets.begin()->empty() },
                                   { "nets_seen", nets },
                                   { "placed", placed } } );
+}
+
+
+static KOPENAPI_RESULT h_sch_power_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    const std::string id = aArgs.value( "lib_id", std::string() );
+
+    if( id.empty() || !aArgs.contains( "at" ) )
+        return KOPENAPI_RESULT::Error( 400, "give 'lib_id' (e.g. power:GND, power:PWR_FLAG) and 'at' (REF.PIN or {x_mm, y_mm})" );
+
+    SCHEMATIC*  schematic = context->GetSchematic();
+    std::string error;
+    LIB_SYMBOL* lib = librarySymbol( aCtx, *context, id, error );
+
+    if( !lib || !lib->IsPower() )
+        return KOPENAPI_RESULT::Error( 404, lib ? "not a power symbol: " + id : error );
+
+    std::optional<SCH_SHEET_PATH> sheet;
+
+    if( !aArgs["at"].is_string() )
+    {
+        sheet = targetSheet( *context, aArgs );
+
+        if( !sheet )
+            return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+    }
+
+    VECTOR2I                out;
+    std::optional<VECTOR2I> point = wireEnd( schematic, aArgs["at"], sheet, out, error );
+
+    if( !point )
+        return KOPENAPI_RESULT::Error( 404, error );
+
+    SCH_SCREEN*    screen = sheet->LastScreen();
+    const VECTOR2I natural = powerNaturalDirection( lib, schematic, *sheet );
+    const int      grid = toIU( GRID_MM );
+
+    // Something else already sits on the point (a power symbol, a label): step aside with a stub
+    bool occupied = false;
+    bool onWire = out != VECTOR2I( 0, 0 );
+
+    for( SCH_ITEM* item : screen->Items().Overlapping( *point ) )
+    {
+        if( labelKind( item->Type() ) && item->GetPosition() == *point )
+            occupied = true;
+        else if( item->Type() == SCH_SYMBOL_T && static_cast<SCH_SYMBOL*>( item )->IsPower() )
+        {
+            for( SCH_PIN* pin : static_cast<SCH_SYMBOL*>( item )->GetPins( &*sheet ) )
+                occupied |= pin->GetPosition() == *point;
+        }
+        else if( item->Type() == SCH_LINE_T && static_cast<SCH_LINE*>( item )->IsWire() && item->HitTest( *point, 0 ) )
+            onWire = true;
+    }
+
+    if( !onWire )
+        return KOPENAPI_RESULT::Error( 422, "nothing to attach to at that point: give a pin (REF.PIN) or a point on a wire" );
+
+    const std::string stub = aArgs.value( "stub", std::string( "auto" ) );
+    static const std::map<std::string, VECTOR2I> named = {
+        { "left", { -1, 0 } }, { "right", { 1, 0 } }, { "up", { 0, -1 } }, { "down", { 0, 1 } } };
+
+    std::vector<VECTOR2I> directions;
+
+    if( stub == "none" )
+    {
+        if( occupied )
+            return KOPENAPI_RESULT::Error( 422, "another power symbol or label sits on that point: use a stub" );
+    }
+    else if( named.count( stub ) )
+    {
+        directions.push_back( named.at( stub ) );
+    }
+    else if( stub == "auto" )
+    {
+        // A sideways pin: out first (the conventional short stub); a crowded point: sideways of
+        // the body's direction, then against it
+        const bool sideways = out != VECTOR2I( 0, 0 ) && out != natural;
+
+        if( occupied || sideways )
+        {
+            if( out != VECTOR2I( 0, 0 ) && out != VECTOR2I( -natural.x, -natural.y ) )
+                directions.push_back( out );
+
+            for( const VECTOR2I& d : { VECTOR2I( natural.y, natural.x ), VECTOR2I( -natural.y, -natural.x ),
+                                       VECTOR2I( -natural.x, -natural.y ) } )
+            {
+                if( std::find( directions.begin(), directions.end(), d ) == directions.end() && d != out * -1 )
+                    directions.push_back( d );
+            }
+        }
+    }
+    else
+    {
+        return KOPENAPI_RESULT::Error( 400, "stub: auto, none, left, right, up or down" );
+    }
+
+    std::set<wxString> taken;
+    VECTOR2I           end = *point;   // where the symbol's pin goes
+    VECTOR2I           tap = *point;   // where its stub (if any) starts
+    std::string        why;
+
+    VECTOR2I body = natural;   // where the symbol's body points
+
+    // The symbol there lies on no other part, symbol, text, label or foreign wire
+    auto spotClear = [&]( const VECTOR2I& aAt, const VECTOR2I& aBody, const VECTOR2I& aTap )
+    {
+        std::unique_ptr<SCH_SYMBOL> probe( makePowerSymbol( lib, schematic, *sheet, aAt, aBody, taken ) );
+        taken.clear();
+        const BOX2I box = probe->GetBoundingBox();
+        const BOX2I shape = probe->GetBodyBoundingBox();
+
+        for( SCH_ITEM* item : screen->Items() )
+        {
+            if( item->Type() == SCH_SYMBOL_T && static_cast<SCH_SYMBOL*>( item )->GetBoundingBox().Intersects( box ) )
+                return false;
+
+            if( ( labelKind( item->Type() ) || item->Type() == SCH_NO_CONNECT_T ) && item->GetBoundingBox().Intersects( box ) )
+                return false;
+
+            if( item->Type() == SCH_LINE_T )
+            {
+                SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+                if( line->HitTest( aTap, 0 ) || line->HitTest( aAt, 0 ) )
+                    continue;   // the wire it hangs on
+
+                if( line->HitTest( shape, false, 0 ) )
+                    return false;
+            }
+        }
+
+        return true;
+    };
+
+    // A free connection point: nothing but the given wire meets there
+    auto freePoint = [&]( const VECTOR2I& aAt, const SCH_ITEM* aWire )
+    {
+        for( SCH_ITEM* item : screen->Items().Overlapping( aAt ) )
+        {
+            if( item == aWire )
+                continue;
+
+            if( item->Type() == SCH_SYMBOL_T )
+            {
+                for( SCH_PIN* pin : static_cast<SCH_SYMBOL*>( item )->GetPins( &*sheet ) )
+                {
+                    if( pin->GetPosition() == aAt )
+                        return false;
+                }
+            }
+            else if( item->Type() == SCH_LINE_T )
+            {
+                if( item->HitTest( aAt, 0 ) )
+                    return false;
+            }
+            else if( item->GetPosition() == aAt )
+            {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    // Upright first, then upside down (PWR_FLAG below a rail is as common)
+    const std::vector<VECTOR2I> bodies = { natural, VECTOR2I( -natural.x, -natural.y ) };
+    bool                        found = directions.empty();
+    SCH_LINE*                   tapped = nullptr;   // the wire the symbol hangs on (split there)
+
+    // First choice when the point is taken or sideways: hang the symbol on a wire already leaving
+    // it (a T with a junction), on a wire across the symbol's direction
+    if( !found && stub == "auto" )
+    {
+        for( const VECTOR2I& b : bodies )
+        {
+            for( SCH_ITEM* item : screen->Items().Overlapping( SCH_LINE_T, *point ) )
+            {
+                SCH_LINE* wire = static_cast<SCH_LINE*>( item );
+
+                if( found || !wire->IsWire() || ( wire->GetStartPoint() != *point && wire->GetEndPoint() != *point ) )
+                    continue;
+
+                const VECTOR2I other = wire->GetStartPoint() == *point ? wire->GetEndPoint() : wire->GetStartPoint();
+                const VECTOR2I along = other - *point;
+
+                if( ( along.x != 0 ) == ( b.x != 0 ) )
+                    continue;   // the wire runs the way the symbol points
+
+                const int      length = std::abs( along.x ) + std::abs( along.y );
+                const VECTOR2I step( along.x == 0 ? 0 : ( along.x > 0 ? grid : -grid ), along.y == 0 ? 0 : ( along.y > 0 ? grid : -grid ) );
+
+                for( int k = 1; k * grid < length && !found; ++k )
+                {
+                    const VECTOR2I at = *point + step * k;
+
+                    if( freePoint( at, wire ) && spotClear( at, b, at ) )
+                    {
+                        end = tap = at;
+                        body = b;
+                        tapped = wire;
+                        found = true;
+                    }
+                }
+            }
+
+            if( found )
+                break;
+        }
+    }
+
+    if( !found )
+    {
+        if( stub == "auto" && std::find( directions.begin(), directions.end(), natural ) == directions.end() )
+            directions.push_back( natural );
+
+        WIRE_ROUTER router( screen, *sheet, grid );
+
+        // shortest stub first; at each length every direction, upright before upside down
+        for( int steps : { 2, 4, 6, 8 } )
+        {
+            for( const VECTOR2I& b : bodies )
+            {
+                for( const VECTOR2I& d : directions )
+                {
+                    if( found || d == VECTOR2I( -b.x, -b.y ) )
+                        continue;   // a body pointing back along its own stub
+
+                    const VECTOR2I candidate = *point + d * ( steps * grid );
+                    std::optional<std::vector<VECTOR2I>> path = router.Route( *point, candidate, "hv", &why );
+
+                    if( path && path->size() == 2 && spotClear( candidate, b, *point ) )
+                    {
+                        end = candidate;
+                        body = b;
+                        found = true;
+                    }
+                }
+            }
+
+            if( found )
+                break;
+        }
+
+        if( !found )
+            return KOPENAPI_RESULT::Error( 422, "no free spot for a stub and the symbol near that point"
+                                                + ( why.empty() ? std::string() : " (" + why + ")" ) + "; give stub explicitly or move parts" );
+    }
+
+    SCH_COMMIT        commit( context->GetToolManager() );
+    std::vector<KIID> touched;
+
+    if( tapped )
+    {
+        // wires connect at their ends: split the one hung on
+        commit.Remove( tapped, screen );
+
+        for( const VECTOR2I& far : { tapped->GetStartPoint(), tapped->GetEndPoint() } )
+        {
+            auto* half = new SCH_LINE( far, LAYER_WIRE );
+            half->SetEndPoint( tap );
+            commit.Add( half, screen );
+            touched.push_back( half->m_Uuid );
+        }
+    }
+
+    if( end != tap )
+    {
+        auto* wire = new SCH_LINE( tap, LAYER_WIRE );
+        wire->SetEndPoint( end );
+        commit.Add( wire, screen );
+        touched.push_back( wire->m_Uuid );
+    }
+
+    SCH_SYMBOL* symbol = makePowerSymbol( lib, schematic, *sheet, end, body, taken );
+    commit.Add( symbol, screen );
+    touched.push_back( symbol->m_Uuid );
+    pushEdit( commit, schematic, _( "Power symbol (API)" ), aCtx.kiway, touched );
+
+    // A T onto a wire, or a stub from a point other wiring meets: a junction dot
+    if( screen->IsExplicitJunctionNeeded( tap ) )
+    {
+        SCH_COMMIT dots( context->GetToolManager() );
+        auto*      junction = new SCH_JUNCTION( tap );
+        dots.Add( junction, screen );
+        pushEdit( dots, schematic, _( "Power symbol (API)" ), aCtx.kiway, { junction->m_Uuid } );
+    }
+
+    std::string net;
+
+    for( const NET_ENTRY& entry : collectNets( schematic ) )
+    {
+        for( const NET_INSTANCE& inst : entry.instances )
+        {
+            for( SCH_PIN* pin : symbol->GetPins( &*sheet ) )
+            {
+                if( inst.path == *sheet && std::find( inst.items.begin(), inst.items.end(), pin ) != inst.items.end() )
+                    net = entry.name;
+            }
+        }
+    }
+
+    nlohmann::json result = { { "uuid", str( symbol->m_Uuid.AsString() ) },
+                              { "ref", str( symbol->GetRef( &*sheet, false ) ) },
+                              { "at", { toMm( end.x ), toMm( end.y ) } },
+                              { "net", net } };
+
+    if( end != tap )
+        result["stub"] = { { "from", { toMm( tap.x ), toMm( tap.y ) } }, { "to", { toMm( end.x ), toMm( end.y ) } } };
+    else if( tap != *point )
+        result["on_wire_at"] = { toMm( tap.x ), toMm( tap.y ) };
+
+    return KOPENAPI_RESULT::Ok( result );
 }
 
 
@@ -1764,8 +2540,9 @@ KOPENAPI_REGISTER( "sch_symbol_add",
 KOPENAPI_REGISTER( "sch_symbol_update",
                    std::string( "Edit a placed symbol by uuid or ref: value, footprint, fields, new_ref, "
                                 "position, rotation, mirror, dnp / in_bom / on_board, field text positions "
-                                "(field_positions, autoplace_fields); moving drags labels, power symbols and wires "
-                                "on its pins and re-routes wires that would turn diagonal." ) + EDIT_NOTE,
+                                "(field_positions, autoplace_fields); moving carries the part's own wiring (stubs, power "
+                                "symbols, PWR_FLAGs, labels) and stretches / re-routes wiring shared with other "
+                                "parts." ) + EDIT_NOTE,
                    R"json({"type":"object","properties":{
                         "uuid":{"type":"string"},"ref":{"type":"string","description":"lookup by reference"},
                         "new_ref":{"type":"string"},"value":{"type":"string"},"footprint":{"type":"string"},
@@ -1775,8 +2552,19 @@ KOPENAPI_REGISTER( "sch_symbol_update",
                         "mirror":{"type":"string","enum":["none","x","y"]},
                         "dnp":{"type":"boolean"},"in_bom":{"type":"boolean"},"on_board":{"type":"boolean"},
                         "field_positions":{"type":"object","description":"per field name: {x_mm, y_mm}, \"hide\" or \"show\""},
-                        "autoplace_fields":{"type":"boolean","default":false,"description":"let KiCad place reference / value text"}}})json"_json,
+                        "autoplace_fields":{"type":"boolean","default":false,"description":"re-place reference / value text clear of other parts, texts and wires (done anyway after a move)"}}})json"_json,
                    false, h_sch_symbol_update );
+
+KOPENAPI_REGISTER( "sch_items_move",
+                   std::string( "Move several schematic items together by dx / dy mm (symbols, wires, labels, "
+                                "power symbols, junctions by uuid, e.g. a part with its own wiring): connections "
+                                "among them are kept; wiring that belongs only to moved parts comes along; wires to "
+                                "the rest stretch and are re-routed orthogonally (warnings if not)." ) + EDIT_NOTE,
+                   R"json({"type":"object","required":["uuids"],"properties":{
+                        "uuids":{"type":"array","items":{"type":"string"}},
+                        "dx_mm":{"type":"number","default":0},"dy_mm":{"type":"number","default":0},
+                        "sheet":{"type":"string"}}})json"_json,
+                   false, h_sch_items_move );
 
 KOPENAPI_REGISTER( "sch_item_delete",
                    std::string( "Delete schematic items (symbols, labels, wires, no-connects...) by uuid." ) + EDIT_NOTE,
@@ -1797,6 +2585,19 @@ KOPENAPI_REGISTER( "sch_connect",
                         "orientation":{"type":"string","enum":["upright","away"],"default":"upright",
                                        "description":"power: upright keeps GND down / +V up (a short stub from sideways pins); away points the body away from the part"}}})json"_json,
                    false, h_sch_connect, 120 );
+
+KOPENAPI_REGISTER( "sch_power_add",
+                   std::string( "Put one power symbol (power:GND, power:+5V, ...) or power:PWR_FLAG on a pin "
+                                "(REF.PIN) or a point on a wire, upright; when the point is taken (another power "
+                                "symbol, a label) or the pin points sideways, a short stub wire leads to a free "
+                                "spot (stub auto, or a direction, or none). For ERC power_pin_not_driven: a "
+                                "PWR_FLAG on the rail's connector pin." ) + EDIT_NOTE,
+                   R"json({"type":"object","required":["lib_id","at"],"properties":{
+                        "lib_id":{"type":"string","description":"e.g. power:PWR_FLAG, power:GND"},
+                        "at":{"description":"REF.PIN or {x_mm, y_mm} on a wire"},
+                        "stub":{"type":"string","enum":["auto","none","left","right","up","down"],"default":"auto"},
+                        "sheet":{"type":"string","description":"for a point"}}})json"_json,
+                   false, h_sch_power_add );
 
 KOPENAPI_REGISTER( "sch_wire",
                    std::string( "Draw a wire between two pins (REF.PIN) or points {x_mm, y_mm} on one sheet: "

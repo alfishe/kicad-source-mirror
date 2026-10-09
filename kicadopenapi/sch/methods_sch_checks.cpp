@@ -44,7 +44,7 @@ static KOPENAPI_RESULT h_sch_erc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     adapter->BlockUntilLoaded();
 
     // ...and the footprint libraries (footprint link checks go through cvpcb)
-    KopenapiEnsureFootprintLibraries();
+    KopenapiEnsureFootprintLibraries( aCtx.kiway );
 
     // GUI: the editor showing this schematic gets the markers, as with its own ERC dialog
     SCH_EDIT_FRAME* frame = nullptr;
