@@ -5,6 +5,7 @@
 // implementation per OS (platform_windows / platform_posix / platform_macos /
 // platform_linux), each file compiled only on its platform. No KiCad or wx dependencies.
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -37,6 +38,14 @@ long SpawnDetached(const std::vector<std::string>& argv, const std::filesystem::
 
 /// Hard stop: SIGTERM on POSIX, TerminateProcess on Windows. Async-signal-safe on POSIX.
 void KillProcess(long pid);
+
+/**
+ * Make a TCP listening socket exclusive before bind(): a second process must fail to bind the
+ * same port (so port probing works).  POSIX: SO_REUSEADDR (TIME_WAIT reuse only; a live
+ * listener still blocks the port).  Windows: SO_EXCLUSIVEADDRUSE (SO_REUSEADDR there would
+ * let another process take over a live port).
+ */
+void ConfigureListenSocket(std::uintptr_t socket);
 
 /// Calls handler (must be async-signal-safe) on SIGINT/SIGTERM/SIGHUP or console close /
 /// Ctrl-C; the process then exits. Also makes writes to a closed pipe non-fatal.

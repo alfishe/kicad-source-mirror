@@ -5,6 +5,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <winsock2.h>
 #include <windows.h>
 
 #include <iterator>
@@ -165,6 +166,13 @@ void KillProcessWindows(long pid)
         TerminateProcess(process, 1);
         CloseHandle(process);
     }
+}
+
+void ConfigureListenSocketWindows(std::uintptr_t socket)
+{
+    BOOL yes = TRUE;
+    setsockopt(static_cast<SOCKET>(socket), SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&yes),
+               sizeof(yes));
 }
 
 void InstallTerminationHandlerWindows(void (*handler)())

@@ -111,6 +111,15 @@ void KillProcess(long pid)
 #endif
 }
 
+void ConfigureListenSocket(std::uintptr_t socket)
+{
+#if defined(_WIN32)
+    ConfigureListenSocketWindows(socket);
+#else
+    ConfigureListenSocketPosix(socket);
+#endif
+}
+
 void InstallTerminationHandler(void (*handler)())
 {
 #if defined(_WIN32)

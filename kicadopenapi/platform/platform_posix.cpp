@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <spawn.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -91,6 +92,12 @@ long SpawnDetachedPosix(const std::vector<std::string>& argv, const std::filesys
 void KillProcessPosix(long pid)
 {
     kill(static_cast<pid_t>(pid), SIGTERM);
+}
+
+void ConfigureListenSocketPosix(std::uintptr_t socket)
+{
+    int yes = 1;
+    setsockopt(static_cast<int>(socket), SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 }
 
 void InstallTerminationHandlerPosix(void (*handler)())
