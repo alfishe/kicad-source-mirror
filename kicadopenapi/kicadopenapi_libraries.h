@@ -26,4 +26,13 @@ KICOMMON_API nlohmann::json KopenapiLibraryTables( const LIBRARY_MANAGER_ADAPTER
  */
 KICOMMON_API void KopenapiCheckGlobalLibraryTables();
 
+/**
+ * Make sure the footprint libraries of the current project are loaded (from any kiface; the
+ * adapter lives in the shared library manager).  A project switch aborts running loads but
+ * leaves a per-library status behind, and cvpcb's lookups (ERC footprint links, netlist pad
+ * resolution) then skip loading: every footprint looks missing (seen: 161 vs 3 ERC
+ * footprint_link_issues after a DRC in the previous project).
+ */
+KICOMMON_API void KopenapiEnsureFootprintLibraries();
+
 #endif

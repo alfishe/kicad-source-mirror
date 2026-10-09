@@ -3,6 +3,7 @@
 #include <advanced_config.h>
 #include <connection_graph.h>
 #include <connectivity/conn_facade.h>
+#include <kicadopenapi_libraries.h>
 #include <kicadopenapi_util.h>
 #include <kiface_base.h>
 #include <kiface_ids.h>
@@ -149,6 +150,9 @@ const std::set<wxString>& PAD_RESOLVER::footprintPads( const wxString& aFootprin
 
     if( m_kiway && m_project )
     {
+        if( m_cache.size() == 1 )
+            KopenapiEnsureFootprintLibraries();   // first lookup of this call
+
         if( KIFACE* cvpcb = m_kiway->KiFACE( KIWAY::FACE_CVPCB ) )
         {
             typedef void ( *PAD_NUMBERS_FN )( const wxString&, PROJECT*, std::set<wxString>& );

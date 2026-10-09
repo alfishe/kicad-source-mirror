@@ -1,6 +1,7 @@
 #include "kicadopenapi_libraries.h"
 
 #include <common.h>
+#include <pgm_base.h>
 #include <libraries/library_manager.h>
 #include <libraries/library_table.h>
 #include <wx/log.h>
@@ -131,5 +132,19 @@ void KopenapiCheckGlobalLibraryTables()
                 break;
             }
         }
+    }
+}
+
+
+void KopenapiEnsureFootprintLibraries()
+{
+    if( !PgmOrNull() )
+        return;
+
+    if( std::optional<LIBRARY_MANAGER_ADAPTER*> adapter = Pgm().GetLibraryManager().Adapter( LIBRARY_TABLE_TYPE::FOOTPRINT );
+        adapter && *adapter )
+    {
+        ( *adapter )->AsyncLoad();
+        ( *adapter )->BlockUntilLoaded();
     }
 }

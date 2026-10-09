@@ -30,9 +30,26 @@ static json toolResult( json aData, bool aIsError )
     if( !aData.is_object() )
         aData = { { "result", std::move( aData ) } };
 
-    std::string text = aData.dump( 2, ' ', false, json::error_handler_t::replace );
+    // A method returning an image (image_base64 + mime_type) becomes MCP image content, so the
+    // agent sees a picture; the base64 is not repeated in the text / structured parts
+    json image;
 
-    return { { "content", json::array( { { { "type", "text" }, { "text", text } } } ) },
+    if( aData.contains( "image_base64" ) && aData["image_base64"].is_string() )
+    {
+        image = { { "type", "image" },
+                  { "data", aData["image_base64"] },
+                  { "mimeType", aData.value( "mime_type", std::string( "image/png" ) ) } };
+        aData.erase( "image_base64" );
+        aData["image"] = "returned as MCP image content";
+    }
+
+    std::string text = aData.dump( 2, ' ', false, json::error_handler_t::replace );
+    json        content = json::array( { { { "type", "text" }, { "text", text } } } );
+
+    if( !image.is_null() )
+        content.push_back( std::move( image ) );
+
+    return { { "content", std::move( content ) },
              { "structuredContent", std::move( aData ) },
              { "isError", aIsError } };
 }

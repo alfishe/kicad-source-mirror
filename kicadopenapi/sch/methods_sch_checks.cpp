@@ -14,6 +14,7 @@
 #include <erc/erc_report.h>
 #include <erc/erc_settings.h>
 #include <kicadopenapi_checks.h>
+#include <kicadopenapi_libraries.h>
 #include <kiway.h>
 #include <project_sch.h>
 #include <sch_edit_frame.h>
@@ -39,6 +40,9 @@ static KOPENAPI_RESULT h_sch_erc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( &schematic->Project() );
     adapter->AsyncLoad();
     adapter->BlockUntilLoaded();
+
+    // ...and the footprint libraries (footprint link checks go through cvpcb)
+    KopenapiEnsureFootprintLibraries();
 
     // GUI: the editor showing this schematic gets the markers, as with its own ERC dialog
     SCH_EDIT_FRAME* frame = nullptr;
