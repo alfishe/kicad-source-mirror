@@ -125,3 +125,35 @@ nlohmann::json KopenapiPageSchema()
     return { { "limit", { { "type", "integer" }, { "minimum", 1 }, { "maximum", 1000 }, { "default", 100 } } },
              { "cursor", { { "type", "string" }, { "description", "next_cursor of the previous page" } } } };
 }
+
+
+nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName )
+{
+    std::string bare = aNetName.substr( aNetName.find_last_of( '/' ) == std::string::npos
+                                                ? 0
+                                                : aNetName.find_last_of( '/' ) + 1 );
+
+    for( char& c : bare )
+        c = static_cast<char>( std::toupper( static_cast<unsigned char>( c ) ) );
+
+    auto has = [&]( const char* aToken ) { return bare.find( aToken ) != std::string::npos; };
+    const bool voltageName = bare.size() > 1 && bare[0] == 'V' && std::isdigit( static_cast<unsigned char>( bare[1] ) );
+
+    std::string role = "signal";
+
+    if( bare == "GND" || has( "GND" ) || bare == "VSS" || bare == "0V" )
+        role = "ground";
+    else if( !bare.empty() && ( bare[0] == '+' || has( "VCC" ) || has( "VDD" ) || has( "VBAT" ) || has( "VIN" ) || voltageName ) )
+        role = "power";
+    else if( has( "CLK" ) || has( "CLOCK" ) || has( "XTAL" ) || has( "OSC" ) )
+        role = "clock";
+    else if( has( "RESET" ) || has( "RST" ) )
+        role = "reset";
+
+    nlohmann::json basis = nlohmann::json::array();
+
+    if( role != "signal" )
+        basis.push_back( "net name " + bare );
+
+    return { { "role", role }, { "basis", basis } };
+}

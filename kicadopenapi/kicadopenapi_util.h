@@ -23,6 +23,12 @@ KICOMMON_API bool KopenapiNaturalLess( const std::string& aA, const std::string&
 KICOMMON_API nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json& aArgs,
                                           size_t aDefaultLimit = 100 );
 
+/**
+ * Role of a net guessed from its name only: { role: ground|power|clock|reset|signal,
+ * basis: [...] }.  Hierarchical prefixes ("/CPU/") are ignored.
+ */
+KICOMMON_API nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName );
+
 /// JSON schema properties shared by all paginated methods (limit, cursor)
 KICOMMON_API nlohmann::json KopenapiPageSchema();
 

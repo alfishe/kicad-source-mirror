@@ -168,35 +168,9 @@ static std::string netClassName( const NETINFO_ITEM* aNet )
 static nlohmann::json inferRole( BOARD* aBoard, const NETINFO_ITEM* aNet, const NET_INFO_AGG& aAgg,
                                  const std::vector<const PAD*>& aPads )
 {
-    const std::string name = upper( str( aNet->GetNetname() ) );
-    const std::string bare = name.substr( name.find_last_of( '/' ) == std::string::npos ? 0 : name.find_last_of( '/' ) + 1 );
-
-    std::string    role = "signal";
-    nlohmann::json basis = nlohmann::json::array();
-
-    auto has = [&]( const char* aToken ) { return bare.find( aToken ) != std::string::npos; };
-
-    if( bare == "GND" || has( "GND" ) || bare == "VSS" || bare == "0V" || has( "AGND" ) || has( "DGND" ) )
-    {
-        role = "ground";
-        basis.push_back( "net name " + bare );
-    }
-    else if( !bare.empty() && ( bare[0] == '+' || has( "VCC" ) || has( "VDD" ) || has( "VBAT" ) || has( "VIN" )
-                                || ( bare.rfind( "V", 0 ) == 0 && bare.size() > 1 && std::isdigit( (unsigned char) bare[1] ) ) ) )
-    {
-        role = "power";
-        basis.push_back( "net name " + bare );
-    }
-    else if( has( "CLK" ) || has( "CLOCK" ) || has( "XTAL" ) || has( "OSC" ) )
-    {
-        role = "clock";
-        basis.push_back( "net name " + bare );
-    }
-    else if( has( "RESET" ) || has( "RST" ) )
-    {
-        role = "reset";
-        basis.push_back( "net name " + bare );
-    }
+    nlohmann::json byName = KopenapiNetRoleFromName( str( aNet->GetNetname() ) );
+    std::string    role = byName["role"];
+    nlohmann::json basis = byName["basis"];
 
     for( const PAD* pad : aPads )
     {
