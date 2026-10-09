@@ -84,6 +84,18 @@ public:
 #endif
 
 
+void KIPLATFORM::APP::SetBackgroundProcess()
+{
+    // Command-line processes never own the desktop here
+}
+
+
+void KIPLATFORM::APP::DisableAutomaticFullScreen()
+{
+    // The window manager does not restore full-screen state on its own here
+}
+
+
 bool KIPLATFORM::APP::Init()
 {
 #if defined( _MSC_VER ) && defined( DEBUG )

@@ -37,6 +37,18 @@ static GLogWriterOutput nullLogWriter( GLogLevelFlags log_level, const GLogField
 }
 
 
+void KIPLATFORM::APP::SetBackgroundProcess()
+{
+    // Command-line processes never own the desktop here
+}
+
+
+void KIPLATFORM::APP::DisableAutomaticFullScreen()
+{
+    // The window manager does not restore full-screen state on its own here
+}
+
+
 bool KIPLATFORM::APP::Init()
 {
     // Set KICAD_SHOW_GTK_MESSAGES=1 env var to show GTK messages,

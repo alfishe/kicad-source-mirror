@@ -746,6 +746,9 @@ struct APP_KICAD_CLI : public wxAppConsole
 
     bool OnInit() override
     {
+        // kicad-cli lives in the GUI bundle; it must never activate or switch spaces
+        KIPLATFORM::APP::SetBackgroundProcess();
+
         // Perform platform-specific init tasks
         if( !KIPLATFORM::APP::Init() )
             return false;

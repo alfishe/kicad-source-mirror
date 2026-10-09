@@ -18,6 +18,8 @@
 * along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#import <Cocoa/Cocoa.h>
+
 #include <kiplatform/app.h>
 
 #include <wx/string.h>
@@ -29,6 +31,22 @@ bool KIPLATFORM::APP::Init()
     // KiCad relies on showing the file type selector in a few places; force it to be shown
     wxSystemOptions::SetOption( wxS( "osx.openfiledialog.always-show-types" ), 1 );
     return true;
+}
+
+
+void KIPLATFORM::APP::SetBackgroundProcess()
+{
+    [[NSApplication sharedApplication] setActivationPolicy:NSApplicationActivationPolicyProhibited];
+}
+
+
+void KIPLATFORM::APP::DisableAutomaticFullScreen()
+{
+    // macOS state restoration re-opens windows in their saved state, including full screen
+    // in its own (black until drawn) space.  KiCad restores its own window geometry.
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:YES forKey:@"ApplePersistenceIgnoreState"];
+    [defaults setBool:NO forKey:@"NSQuitAlwaysKeepsWindows"];
 }
 
 

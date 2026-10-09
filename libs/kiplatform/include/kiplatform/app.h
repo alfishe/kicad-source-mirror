@@ -36,6 +36,22 @@ namespace KIPLATFORM
          */
         bool Init();
 
+        /**
+         * Run as a background (non-UI) process: never activate, no dock icon, no window or
+         * space switching.  For command-line tools that live inside the GUI app bundle
+         * (kicad-cli), so batch runs cannot pull the desktop into the app's (full-screen)
+         * space.  Call at the start of OnInit, before any window exists.  No-op where the OS
+         * has no such concept.
+         */
+        void SetBackgroundProcess();
+
+        /**
+         * Never enter full screen (or restore any saved window state) automatically at
+         * startup; full screen stays available through explicit user action.  No-op where
+         * the OS does not restore window state.
+         */
+        void DisableAutomaticFullScreen();
+
         void EnableDarkMode( bool aForce );
 
         /**

@@ -201,6 +201,9 @@ struct APP_SINGLE_TOP : public wxApp
         if( !KIPLATFORM::APP::Init() )
             return false;
 
+        // Full screen only on explicit user action, never restored at startup
+        KIPLATFORM::APP::DisableAutomaticFullScreen();
+
 #ifndef DEBUG
         // Enable logging traces to the console in release build.
         // This is usually disabled, but it can be useful for users to run to help
