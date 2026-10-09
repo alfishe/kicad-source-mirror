@@ -12,6 +12,8 @@
 #include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
 
+#include <wx/filename.h>
+
 #include <algorithm>
 #include <map>
 #include <set>
@@ -426,6 +428,85 @@ static KOPENAPI_RESULT h_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                   { "board", boardNets } } );
 }
 
+
+static KOPENAPI_RESULT h_design_update_board( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    // 1. the schematic's netlist, unsaved edits included
+    KOPENAPI_RESULT sch = callMethod( aCtx, "sch_netlist_kicad" );
+
+    if( sch.status != 200 )
+        return sch;
+
+    // 2. the board: the open one, else the project's board file, created when missing
+    std::string boardPath = aArgs.value( "board_path", std::string() );
+
+    if( boardPath.empty() )
+    {
+        boardPath = sch.body.value( "schematic", std::string() );   // the project file
+
+        if( const size_t dot = boardPath.rfind( '.' ); dot != std::string::npos )
+            boardPath = boardPath.substr( 0, dot ) + ".kicad_pcb";
+    }
+
+    nlohmann::json  opened;
+    KOPENAPI_RESULT probe = callMethod( aCtx, "pcb_stats" );
+
+    if( probe.status == 409 || !aArgs.value( "board_path", std::string() ).empty() )
+    {
+        const bool exists = !boardPath.empty() && wxFileName::FileExists( wxString::FromUTF8( boardPath ) );
+
+        if( !exists && aArgs.value( "dry_run", false ) )
+            return KOPENAPI_RESULT::Error( 409, "no board yet at " + boardPath + ": run without dry_run to create it" );
+
+        if( !exists && !aArgs.value( "create", true ) )
+            return KOPENAPI_RESULT::Error( 404, "no board open and none at " + boardPath + " (create: true to make it)" );
+
+        KOPENAPI_RESULT open = exists ? callMethod( aCtx, "pcb_open", { { "path", boardPath } } )
+                                      : callMethod( aCtx, "pcb_new", { { "path", boardPath }, { "layers", aArgs.value( "layers", 2 ) } } );
+
+        if( open.status != 200 )
+            return open;
+
+        opened = { { "path", boardPath }, { "created", !exists } };
+    }
+
+    // 3. KiCad's Update PCB from Schematic
+    nlohmann::json apply = { { "netlist", sch.body["netlist"] } };
+
+    for( const char* key : { "dry_run", "match", "delete_extra", "replace_footprints", "spread", "spread_width_mm" } )
+    {
+        if( aArgs.contains( key ) )
+            apply[key] = aArgs[key];
+    }
+
+    KOPENAPI_RESULT result = callMethod( aCtx, "pcb_netlist_apply", apply );
+
+    if( result.status == 200 )
+    {
+        if( !opened.is_null() )
+            result.body["board"] = opened;
+
+        result.body["next"] = "pcb_rules_set (net classes, clearances), pcb_outline_set, then placement; pcb_save";
+    }
+
+    return result;
+}
+
+
+KOPENAPI_REGISTER( "design_update_board",
+                   "Schematic -> board in one call (KiCad's Update PCB from Schematic): takes the open "
+                   "schematic's netlist (unsaved edits included), opens the project's board or creates it "
+                   "(layers), adds / updates / removes footprints and nets, lays new footprints out beside "
+                   "the board; report per change; dry_run to preview",
+                   R"json({"type":"object","properties":{
+                        "board_path":{"type":"string","description":"default: the schematic's project, .kicad_pcb"},
+                        "create":{"type":"boolean","default":true},
+                        "layers":{"type":"integer","default":2,"description":"copper layers of a new board"},
+                        "dry_run":{"type":"boolean","default":false},
+                        "match":{"type":"string","enum":["uuid","reference"],"default":"uuid"},
+                        "delete_extra":{"type":"boolean","default":true},
+                        "replace_footprints":{"type":"boolean","default":true}}})json"_json,
+                   false, h_design_update_board, 600 );
 
 KOPENAPI_REGISTER( "design_parity",
                    "Compare schematic and board (both open): components (missing on either side, value / "
