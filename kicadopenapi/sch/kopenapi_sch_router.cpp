@@ -13,7 +13,10 @@
 #include <sch_symbol.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <set>
+#include <string>
 
 namespace kopenapi_sch
 {
@@ -84,11 +87,15 @@ int length( const std::vector<VECTOR2I>& aPolyline )
 } // namespace
 
 
-WIRE_ROUTER::WIRE_ROUTER( SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, int aGrid ) :
+WIRE_ROUTER::WIRE_ROUTER( SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, int aGrid,
+                          const std::set<const SCH_ITEM*>& aIgnore ) :
         m_grid( aGrid )
 {
     for( SCH_ITEM* item : aScreen->Items() )
     {
+        if( aIgnore.count( item ) )
+            continue;
+
         switch( item->Type() )
         {
         case SCH_LINE_T:
@@ -105,9 +112,13 @@ WIRE_ROUTER::WIRE_ROUTER( SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, int 
             SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
 
             for( SCH_PIN* pin : symbol->GetPins( &aPath ) )
+            {
                 m_points.push_back( pin->GetPosition() );
+                m_pinOwner.emplace_back( pin->GetPosition(), m_bodies.size() );
+            }
 
             m_bodies.push_back( symbol->GetBodyBoundingBox() );
+            m_bodyNames.push_back( symbol->GetRef( &aPath, false ).ToStdString( wxConvUTF8 ) );
             break;
         }
         case SCH_SHEET_T:
@@ -115,6 +126,7 @@ WIRE_ROUTER::WIRE_ROUTER( SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, int 
                 m_points.push_back( pin->GetPosition() );
 
             m_bodies.push_back( item->GetBoundingBox() );
+            m_bodyNames.push_back( "sheet " + static_cast<SCH_SHEET*>( item )->GetName().ToStdString( wxConvUTF8 ) );
             break;
 
         case SCH_JUNCTION_T:
@@ -145,56 +157,74 @@ void WIRE_ROUTER::AddWire( const VECTOR2I& aStart, const VECTOR2I& aEnd )
 }
 
 
-bool WIRE_ROUTER::clear( const std::vector<VECTOR2I>& aPolyline, const VECTOR2I& aFrom, const VECTOR2I& aTo ) const
+std::string WIRE_ROUTER::obstacle( const std::vector<VECTOR2I>& aPolyline, const VECTOR2I& aFrom,
+                                   const VECTOR2I& aTo ) const
 {
     auto isEnd = [&]( const VECTOR2I& p ) { return p == aFrom || p == aTo; };
+    auto mm = []( const VECTOR2I& p )
+    {
+        return "(" + std::to_string( std::lround( p.x / 100.0 ) / 100.0 ).substr( 0, 7 ) + ", "
+               + std::to_string( std::lround( p.y / 100.0 ) / 100.0 ).substr( 0, 7 ) + ") mm";
+    };
+
+    // The part an end pin belongs to may be touched by the segment leaving that pin
+    std::set<size_t> own;
+
+    for( const auto& [pos, body] : m_pinOwner )
+    {
+        if( pos == aFrom || pos == aTo )
+            own.insert( body );
+    }
 
     for( size_t i = 0; i + 1 < aPolyline.size(); ++i )
     {
         const VECTOR2I& p = aPolyline[i];
         const VECTOR2I& q = aPolyline[i + 1];
+        const bool      endSegment = i == 0 || i + 2 == aPolyline.size();
 
         if( p == q )
-            return false;
+            return "zero-length segment";
 
         for( const auto& [s, e] : m_wires )
         {
             if( overlapAlong( p, q, s, e ) )
-                return false;
+                return "runs along the wire " + mm( s ) + " - " + mm( e );
 
-            // another wire's end on this segment, or a corner of ours on another wire
             for( const VECTOR2I& end : { s, e } )
             {
                 if( onSegment( end, p, q ) && !isEnd( end ) )
-                    return false;
+                    return "touches the end of the wire " + mm( s ) + " - " + mm( e ) + " at " + mm( end );
             }
 
             for( const VECTOR2I& mine : { p, q } )
             {
                 if( !isEnd( mine ) && onSegment( mine, s, e ) )
-                    return false;
+                    return "corner " + mm( mine ) + " lies on the wire " + mm( s ) + " - " + mm( e );
             }
         }
 
         for( const VECTOR2I& point : m_points )
         {
             if( !isEnd( point ) && onSegment( point, p, q ) )
-                return false;
+                return "passes the connection point (pin end / label / junction) at " + mm( point );
         }
 
-        for( const BOX2I& body : m_bodies )
+        for( size_t b = 0; b < m_bodies.size(); ++b )
         {
-            if( crossesBody( p, q, body ) )
-                return false;
+            if( endSegment && own.count( b ) )
+                continue;
+
+            if( crossesBody( p, q, m_bodies[b] ) )
+                return "crosses the body of " + ( b < m_bodyNames.size() ? m_bodyNames[b] : std::string( "a symbol" ) );
         }
     }
 
-    return true;
+    return std::string();
 }
 
 
 std::optional<std::vector<VECTOR2I>> WIRE_ROUTER::Route( const VECTOR2I& aFrom, const VECTOR2I& aTo,
-                                                         const std::string& aPrefer ) const
+                                                         const std::string& aPrefer, std::string* aWhy ) const
 {
     std::vector<std::vector<VECTOR2I>> candidates;
 
@@ -244,8 +274,16 @@ std::optional<std::vector<VECTOR2I>> WIRE_ROUTER::Route( const VECTOR2I& aFrom, 
         // collapse zero-length legs (a Z whose start or end is already aligned)
         candidate.erase( std::unique( candidate.begin(), candidate.end() ), candidate.end() );
 
-        if( !clear( candidate, aFrom, aTo ) )
+        const std::string blocked = obstacle( candidate, aFrom, aTo );
+
+        if( !blocked.empty() )
+        {
+            // Report why the simple shapes (straight, L) failed: that is what the agent expects
+            if( aWhy && aWhy->empty() && candidate.size() <= 3 )
+                *aWhy = blocked;
+
             continue;
+        }
 
         if( !best || candidate.size() < best->size()
             || ( candidate.size() == best->size() && length( candidate ) < length( *best ) ) )

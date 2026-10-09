@@ -1,9 +1,11 @@
 #include "kicadopenapi_mcp.h"
 
+#include <mcp_search.h>
 #include <mcp_tools.h>
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 
 using nlohmann::json;
 
@@ -80,6 +82,26 @@ static json searchTool( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aArgs )
 {
     const std::string query = aArgs.value( "query", std::string() );
     const int         limit = std::clamp( aArgs.value( "limit", 20 ), 1, 100 );
+    const bool        full = aArgs.value( "detail", std::string( "brief" ) ) == "full";
+
+    // names: exact methods, described in full
+    if( aArgs.contains( "names" ) && aArgs["names"].is_array() )
+    {
+        json methods = json::array(), missing = json::array();
+
+        for( const json& name : aArgs["names"] )
+        {
+            std::optional<KOPENAPI_METHOD> m = name.is_string() ? KOPENAPI_REGISTRY::Get().Find( name.get<std::string>() )
+                                                                : std::nullopt;
+
+            if( m && ( !m->guiOnly || !aCtx.headless ) )
+                methods.push_back( kopenapi::mcp::FormatMethod( m->name, m->summary, m->inputSchema, m->guiOnly, true ) );
+            else
+                missing.push_back( name );
+        }
+
+        return toolResult( { { "methods", methods }, { "count", methods.size() }, { "not_found", missing } }, false );
+    }
 
     json methods = json::array();
     json more = json::array();
@@ -92,16 +114,9 @@ static json searchTool( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aArgs )
     for( const KOPENAPI_METHOD& m : found )
     {
         if( methods.size() < (size_t) limit )
-        {
-            methods.push_back( { { "name", m.name },
-                                 { "summary", m.summary },
-                                 { "inputSchema", m.inputSchema },
-                                 { "gui_only", m.guiOnly } } );
-        }
+            methods.push_back( kopenapi::mcp::FormatMethod( m.name, m.summary, m.inputSchema, m.guiOnly, full ) );
         else
-        {
             more.push_back( { { "name", m.name }, { "summary", m.summary } } );
-        }
     }
 
     return toolResult( { { "methods", methods }, { "count", methods.size() }, { "total", found.size() }, { "more", more } },

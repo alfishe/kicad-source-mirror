@@ -25,6 +25,7 @@
 #include "instances.h"
 #include "mini-http.h"
 
+#include <mcp_search.h>
 #include <mcp_tools.h>
 #include <platform.h>
 
@@ -689,11 +690,45 @@ json Bridge::Search(const std::string& line, const json& args)
         Log(error);
     }
 
-    for (const json& m : kBridgeMethods)
+    // The bridge's own methods, formatted like the server's (compact unless detail: full or
+    // asked for by name)
+    const bool full = args.value("detail", std::string("brief")) == "full";
+    const bool byName = args.contains("names") && args["names"].is_array();
+    json notFound = json::array();
+
+    if (byName)
     {
-        if (Matches(m, query))
+        // the server answered with not_found for names it does not know: some may be ours
+        for (const json& name : args["names"])
         {
-            methods.push_back(m);
+            bool ours = false;
+            for (const json& m : kBridgeMethods)
+            {
+                if (m["name"] == name)
+                {
+                    methods.push_back(kopenapi::mcp::FormatMethod(m["name"], m["summary"], m["inputSchema"], false, true));
+                    ours = true;
+                }
+            }
+            bool served = false;
+            for (const json& m : methods)
+            {
+                served |= m["name"] == name;
+            }
+            if (!ours && !served)
+            {
+                notFound.push_back(name);
+            }
+        }
+    }
+    else
+    {
+        for (const json& m : kBridgeMethods)
+        {
+            if (Matches(m, query))
+            {
+                methods.push_back(kopenapi::mcp::FormatMethod(m["name"], m["summary"], m["inputSchema"], false, full));
+            }
         }
     }
 
@@ -702,6 +737,12 @@ json Bridge::Search(const std::string& line, const json& args)
                  {"total", methods.size() + more.size()},
                  {"more", more},
                  {"instance", instance}};
+    if (byName)
+    {
+        data.erase("more");
+        data.erase("total");
+        data["not_found"] = notFound;
+    }
     if (!note.empty())
     {
         data["note"] = note;

@@ -20,12 +20,14 @@ inline constexpr const char* kInvokeTool = "invoke";
 inline constexpr const char* kToolsJson = R"json([
   {
     "name": "search",
-    "description": "Find KiCad methods by keywords (e.g. 'open pcb', 'symbol', 'drc', 'instance'). Returns each method's name, summary, inputSchema and whether it needs the GUI; matches beyond 'limit' are listed in 'more' (name + summary; search for one to get its inputSchema), 'total' counts all. Empty query lists all methods. Call invoke with a returned name.",
+    "description": "Find KiCad methods by keywords (e.g. 'open pcb', 'place symbol', 'wire', 'drc', 'render'). Compact by default: name, summary and one line of parameters ('path*: string, discard: boolean = false', * = required). For the full inputSchema pass detail: 'full', or names: ['method', ...] to describe specific methods. Matches beyond 'limit' are listed in 'more' (name + summary); 'total' counts all. Empty query lists all methods. Call invoke with a returned name.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "query": { "type": "string", "description": "Keywords; empty lists everything" },
-        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "methods returned with inputSchema; the rest go to 'more'" }
+        "names": { "type": "array", "items": { "type": "string" }, "description": "exact method names to describe in full (inputSchema)" },
+        "detail": { "type": "string", "enum": ["brief", "full"], "default": "brief", "description": "brief: params as one line; full: inputSchema" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "methods returned in detail; the rest go to 'more'" }
       }
     }
   },

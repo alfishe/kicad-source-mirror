@@ -656,8 +656,32 @@ nlohmann::json symbolCard( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath )
                           { "y_mm", toMm( pin->GetPosition().y ) } } );
     }
 
+    nlohmann::json fields = nlohmann::json::object();
+
+    for( SCH_FIELD* field : { aSymbol->GetField( FIELD_T::REFERENCE ), aSymbol->GetField( FIELD_T::VALUE ) } )
+    {
+        if( field )
+        {
+            fields[str( field->GetName() )] = { { "x_mm", toMm( field->GetPosition().x ) },
+                                                { "y_mm", toMm( field->GetPosition().y ) },
+                                                { "visible", field->IsVisible() } };
+        }
+    }
+
     return { { "uuid", str( aSymbol->m_Uuid.AsString() ) },
              { "ref", str( aSymbol->GetRef( &aPath, false ) ) },
+             { "fields_at", fields },
+             { "rotation", [&]()
+               {
+                   switch( aSymbol->GetOrientationProp() )
+                   {
+                   case SYMBOL_ORIENTATION_PROP::SYMBOL_ANGLE_90:  return 90;
+                   case SYMBOL_ORIENTATION_PROP::SYMBOL_ANGLE_180: return 180;
+                   case SYMBOL_ORIENTATION_PROP::SYMBOL_ANGLE_270: return 270;
+                   default:                                        return 0;
+                   }
+               }() },
+             { "mirror", aSymbol->GetMirrorX() ? "x" : aSymbol->GetMirrorY() ? "y" : "none" },
              { "value", str( aSymbol->GetValue( &aPath, FOR_GUI ) ) },
              { "lib_id", str( aSymbol->GetLibId().Format() ) },
              { "footprint", str( aSymbol->GetFootprintFieldText( &aPath, FOR_GUI ) ) },
@@ -764,11 +788,14 @@ static KOPENAPI_RESULT h_sch_wire( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         return KOPENAPI_RESULT::Error( 400, "route must be auto, hv (horizontal first) or vh" );
 
     WIRE_ROUTER router( sheet->LastScreen(), *sheet, toIU( GRID_MM ) );
-    std::optional<std::vector<VECTOR2I>> path = router.Route( *a, *b, route );
+    std::string why;
+    std::optional<std::vector<VECTOR2I>> path = router.Route( *a, *b, route, &why );
 
     if( !path )
-        return KOPENAPI_RESULT::Error( 422, "no clear route between the two ends (it would touch other wires or "
-                                            "pins); connect them with sch_connect labels instead" );
+        return KOPENAPI_RESULT::Error( 422, "no clear route between the two ends: the direct / one-corner wire "
+                                            + ( why.empty() ? std::string( "is blocked" ) : why )
+                                            + ", and no detour within 40 grid steps is clear. Move a part, "
+                                              "or connect the pins with sch_connect labels" );
 
     const std::vector<VECTOR2I>& points = *path;
 
@@ -1045,7 +1072,84 @@ static KOPENAPI_RESULT h_sch_symbol_update( KOPENAPI_CONTEXT& aCtx, const nlohma
         }
     }
 
+    if( aArgs.value( "autoplace_fields", false ) )
+        at->symbol->AutoplaceFields( screen, AUTOPLACE_AUTO );
+
+    // Field text placement: {"Reference": {"x_mm":..,"y_mm":..}, "Value": "hide"}
+    if( aArgs.contains( "field_positions" ) && aArgs["field_positions"].is_object() )
+    {
+        for( const auto& [name, place] : aArgs["field_positions"].items() )
+        {
+            SCH_FIELD* field = at->symbol->GetField( wxString::FromUTF8( name ) );
+
+            if( !field )
+                return KOPENAPI_RESULT::Error( 400, "no field '" + name + "' on " + str( at->symbol->GetRef( &at->path, false ) ) );
+
+            if( place.is_string() && ( place == "hide" || place == "show" ) )
+                field->SetVisible( place == "show" );
+            else if( place.is_object() && place.contains( "x_mm" ) && place.contains( "y_mm" ) )
+                field->SetPosition( VECTOR2I( toIU( place["x_mm"].get<double>() ), toIU( place["y_mm"].get<double>() ) ) );
+            else
+                return KOPENAPI_RESULT::Error( 400, "field_positions values: {x_mm, y_mm}, \"hide\" or \"show\"" );
+        }
+    }
+
+    // Wires dragged out of square: re-route them from their fixed end to the pin's new place
+    nlohmann::json warnings = nlohmann::json::array();
+    std::vector<std::pair<SCH_LINE*, std::pair<VECTOR2I, VECTOR2I>>> diagonal;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+    {
+        SCH_LINE* wire = static_cast<SCH_LINE*>( item );
+
+        if( wire->IsWire() && std::find( moved.begin(), moved.end(), wire->m_Uuid ) != moved.end()
+            && wire->GetStartPoint().x != wire->GetEndPoint().x && wire->GetStartPoint().y != wire->GetEndPoint().y )
+        {
+            diagonal.push_back( { wire, { wire->GetStartPoint(), wire->GetEndPoint() } } );
+        }
+    }
+
+    if( !diagonal.empty() )
+    {
+        std::set<const SCH_ITEM*> ignore;
+
+        for( const auto& [wire, ends] : diagonal )
+            ignore.insert( wire );
+
+        WIRE_ROUTER router( screen, at->path, toIU( GRID_MM ), ignore );
+
+        for( const auto& [wire, ends] : diagonal )
+        {
+            std::optional<std::vector<VECTOR2I>> path = router.Route( ends.first, ends.second, "hv" );
+
+            if( !path )
+            {
+                warnings.push_back( "a wire stays diagonal: no clear orthogonal route from "
+                                    + std::to_string( toMm( ends.first.x ) ) + ", " + std::to_string( toMm( ends.first.y ) ) );
+                continue;
+            }
+
+            commit.Remove( wire, screen );
+
+            for( size_t i = 0; i + 1 < path->size(); ++i )
+            {
+                auto* segment = new SCH_LINE( ( *path )[i], LAYER_WIRE );
+                segment->SetEndPoint( ( *path )[i + 1] );
+                commit.Add( segment, screen );
+                router.AddWire( ( *path )[i], ( *path )[i + 1] );
+                moved.push_back( segment->m_Uuid );
+            }
+        }
+    }
+
     pushEdit( commit, context->GetSchematic(), _( "Edit symbol (API)" ), aCtx.kiway, moved );
+
+    if( !warnings.empty() )
+    {
+        nlohmann::json card = symbolCard( at->symbol, at->path );
+        card["warnings"] = warnings;
+        return KOPENAPI_RESULT::Ok( card );
+    }
     return KOPENAPI_RESULT::Ok( symbolCard( at->symbol, at->path ) );
 }
 
@@ -1151,18 +1255,31 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     std::set<wxString> takenRefs;
     std::vector<KIID>  extra;    // stubs, joining wires, junctions (glow too)
 
-    // A power symbol at aPoint whose own pin faces aOut's opposite (body away from the part)
+    // A power symbol at aPoint with its body away from the part: the direction from its pin to
+    // the centre of its body must be aOut.  (Power pins have zero length, so the pin itself
+    // has no direction to go by.)
     auto placePower = [&]( const VECTOR2I& aPoint, const VECTOR2I& aOut, const SCH_SHEET_PATH& aPath ) -> SCH_ITEM*
     {
         std::unique_ptr<LIB_SYMBOL> flat = powerSymbol->Flatten();
         auto* symbol = new SCH_SYMBOL( *flat, powerSymbol->GetLibId(), &aPath, 1, 1, aPoint, schematic );
 
+        auto bodyDirection = [&]() -> VECTOR2I
+        {
+            std::vector<SCH_PIN*> own = symbol->GetPins( &aPath );
+            const VECTOR2I        pin = own.empty() ? symbol->GetPosition() : own.front()->GetPosition();
+            const VECTOR2I        d = symbol->GetBodyBoundingBox().Centre() - pin;
+
+            if( std::abs( d.x ) >= std::abs( d.y ) )
+                return VECTOR2I( d.x < 0 ? -1 : 1, 0 );
+
+            return VECTOR2I( 0, d.y < 0 ? -1 : 1 );
+        };
+
         for( int orientation : { SYM_ORIENT_0, SYM_ORIENT_90, SYM_ORIENT_180, SYM_ORIENT_270 } )
         {
             symbol->SetOrientation( orientation );
-            std::vector<SCH_PIN*> own = symbol->GetPins( &aPath );
 
-            if( !own.empty() && outward( own.front() ) == VECTOR2I( -aOut.x, -aOut.y ) )
+            if( bodyDirection() == aOut )
                 break;
         }
 
@@ -1296,6 +1413,220 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 }
 
 
+static KOPENAPI_RESULT h_sch_item_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    std::optional<SCH_SHEET_PATH> sheet = targetSheet( *context, aArgs );
+
+    if( !sheet )
+        return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+
+    std::set<std::string> types;
+
+    if( aArgs.contains( "types" ) && aArgs["types"].is_array() )
+    {
+        for( const nlohmann::json& t : aArgs["types"] )
+        {
+            if( t.is_string() )
+                types.insert( t.get<std::string>() );
+        }
+    }
+
+    const std::string       netGlob = aArgs.value( "net", std::string() );
+    std::optional<VECTOR2I> near;
+    const int               radius = toIU( aArgs.value( "radius_mm", 5.08 ) );
+
+    if( aArgs.contains( "near" ) && aArgs["near"].is_object() )
+        near = VECTOR2I( toIU( aArgs["near"].value( "x_mm", 0.0 ) ), toIU( aArgs["near"].value( "y_mm", 0.0 ) ) );
+
+    // Net of every connectable item on this sheet instance
+    std::map<const SCH_ITEM*, std::string> netOf;
+
+    for( const NET_ENTRY& net : collectNets( context->GetSchematic() ) )
+    {
+        for( const NET_INSTANCE& inst : net.instances )
+        {
+            if( inst.path == *sheet )
+            {
+                for( SCH_ITEM* item : inst.items )
+                    netOf[item] = net.name;
+            }
+        }
+    }
+
+    auto pt = []( const VECTOR2I& p ) { return nlohmann::json::array( { toMm( p.x ), toMm( p.y ) } ); };
+    std::vector<nlohmann::json> rows;
+
+    for( SCH_ITEM* item : sheet->LastScreen()->Items() )
+    {
+        nlohmann::json row = nlohmann::json::object();
+        std::string    type;
+
+        if( item->Type() == SCH_LINE_T )
+        {
+            SCH_LINE* line = static_cast<SCH_LINE*>( item );
+            type = line->IsWire() ? "wire" : line->IsBus() ? "bus" : "graphic_line";
+            row["from"] = pt( line->GetStartPoint() );
+            row["to"] = pt( line->GetEndPoint() );
+        }
+        else if( item->Type() == SCH_JUNCTION_T || item->Type() == SCH_NO_CONNECT_T )
+        {
+            type = item->Type() == SCH_JUNCTION_T ? "junction" : "no_connect";
+            row["at"] = pt( item->GetPosition() );
+        }
+        else if( item->Type() == SCH_SYMBOL_T )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+            if( !symbol->IsPower() )
+                continue;   // parts: sch_symbol_list
+
+            type = "power";
+            std::vector<SCH_PIN*> pins = symbol->GetPins( &*sheet );
+            row["ref"] = str( symbol->GetRef( &*sheet, false ) );
+            row["value"] = str( symbol->GetValue( &*sheet, FOR_GUI ) );
+            row["at"] = pt( pins.empty() ? symbol->GetPosition() : pins.front()->GetPosition() );
+
+            if( !pins.empty() && netOf.count( pins.front() ) )
+                row["net"] = netOf[pins.front()];
+        }
+        else if( const char* kind = labelKind( item->Type() ) )
+        {
+            type = "label";
+            row["kind"] = kind;
+            row["text"] = str( UnescapeString( static_cast<SCH_LABEL_BASE*>( item )->GetText() ) );
+            row["at"] = pt( item->GetPosition() );
+        }
+        else
+        {
+            continue;
+        }
+
+        if( !types.empty() && !types.count( type ) )
+            continue;
+
+        if( !row.contains( "net" ) && netOf.count( item ) )
+            row["net"] = netOf[item];
+
+        if( !KopenapiGlob( netGlob, row.value( "net", std::string() ) ) )
+            continue;
+
+        if( near )
+        {
+            const BOX2I probe( *near - VECTOR2I( radius, radius ), VECTOR2I( 2 * radius, 2 * radius ) );
+
+            if( !item->GetBoundingBox().Intersects( probe ) )
+                continue;
+        }
+
+        row["type"] = type;
+        row["uuid"] = str( item->m_Uuid.AsString() );
+        rows.push_back( std::move( row ) );
+    }
+
+    return KOPENAPI_RESULT::Ok( KopenapiPage( rows, aArgs ) );
+}
+
+
+static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    const std::string text = aArgs.value( "text", std::string() );
+    const std::string kind = aArgs.value( "kind", std::string( "local" ) );
+
+    if( text.empty() || !aArgs.contains( "x_mm" ) || !aArgs.contains( "y_mm" ) )
+        return KOPENAPI_RESULT::Error( 400, "give 'text', 'x_mm' and 'y_mm' (the end of a wire or a pin end)" );
+
+    if( kind != "local" && kind != "global" && kind != "hierarchical" )
+        return KOPENAPI_RESULT::Error( 400, "kind must be local, global or hierarchical" );
+
+    std::optional<SCH_SHEET_PATH> sheet = targetSheet( *context, aArgs );
+
+    if( !sheet )
+        return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+
+    const VECTOR2I point( toIU( aArgs["x_mm"].get<double>() ), toIU( aArgs["y_mm"].get<double>() ) );
+    SCH_SCREEN*    screen = sheet->LastScreen();
+
+    // Text side: given, else away from the wire the label ends
+    std::string side = aArgs.value( "side", std::string( "auto" ) );
+
+    if( side == "auto" )
+    {
+        side = "right";
+
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+        {
+            SCH_LINE* wire = static_cast<SCH_LINE*>( item );
+
+            if( !wire->IsWire() || ( wire->GetStartPoint() != point && wire->GetEndPoint() != point ) )
+                continue;
+
+            const VECTOR2I other = wire->GetStartPoint() == point ? wire->GetEndPoint() : wire->GetStartPoint();
+            const VECTOR2I d = point - other;
+            side = std::abs( d.x ) >= std::abs( d.y ) ? ( d.x < 0 ? "left" : "right" ) : ( d.y < 0 ? "up" : "down" );
+            break;
+        }
+    }
+
+    static const std::map<std::string, SPIN_STYLE> spins = { { "left", SPIN_STYLE::LEFT },
+                                                             { "right", SPIN_STYLE::RIGHT },
+                                                             { "up", SPIN_STYLE::UP },
+                                                             { "down", SPIN_STYLE::BOTTOM } };
+    auto spin = spins.find( side );
+
+    if( spin == spins.end() )
+        return KOPENAPI_RESULT::Error( 400, "side must be auto, left, right, up or down" );
+
+    const wxString  wxText = wxString::FromUTF8( text );
+    SCH_LABEL_BASE* label = nullptr;
+
+    if( kind == "global" )
+        label = new SCH_GLOBALLABEL( point, wxText );
+    else if( kind == "hierarchical" )
+        label = new SCH_HIERLABEL( point, wxText );
+    else
+        label = new SCH_LABEL( point, wxText );
+
+    label->SetSpinStyle( spin->second );
+
+    SCH_COMMIT commit( context->GetToolManager() );
+    commit.Add( label, screen );
+    pushEdit( commit, context->GetSchematic(), _( "Label (API)" ), aCtx.kiway, { label->m_Uuid } );
+
+    // What it joined
+    std::string net;
+    int         pins = 0;
+
+    for( const NET_ENTRY& entry : collectNets( context->GetSchematic() ) )
+    {
+        for( const NET_INSTANCE& inst : entry.instances )
+        {
+            if( inst.path == *sheet && std::find( inst.items.begin(), inst.items.end(), label ) != inst.items.end() )
+            {
+                net = entry.name;
+                pins = static_cast<int>( netPins( entry ).size() );
+            }
+        }
+    }
+
+    nlohmann::json result = { { "uuid", str( label->m_Uuid.AsString() ) }, { "net", net }, { "pins_on_net", pins }, { "side", side } };
+
+    if( pins == 0 )
+        result["warning"] = "the label touches no wire end or pin: it connects nothing yet";
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
+
 static KOPENAPI_RESULT h_sch_no_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
@@ -1384,7 +1715,9 @@ KOPENAPI_REGISTER( "sch_symbol_add",
 
 KOPENAPI_REGISTER( "sch_symbol_update",
                    std::string( "Edit a placed symbol by uuid or ref: value, footprint, fields, new_ref, "
-                                "position, rotation, mirror, dnp / in_bom / on_board." ) + EDIT_NOTE,
+                                "position, rotation, mirror, dnp / in_bom / on_board, field text positions "
+                                "(field_positions, autoplace_fields); moving drags labels, power symbols and wires "
+                                "on its pins and re-routes wires that would turn diagonal." ) + EDIT_NOTE,
                    R"json({"type":"object","properties":{
                         "uuid":{"type":"string"},"ref":{"type":"string","description":"lookup by reference"},
                         "new_ref":{"type":"string"},"value":{"type":"string"},"footprint":{"type":"string"},
@@ -1392,7 +1725,9 @@ KOPENAPI_REGISTER( "sch_symbol_update",
                         "x_mm":{"type":"number"},"y_mm":{"type":"number"},
                         "rotation":{"type":"integer","enum":[0,90,180,270]},
                         "mirror":{"type":"string","enum":["none","x","y"]},
-                        "dnp":{"type":"boolean"},"in_bom":{"type":"boolean"},"on_board":{"type":"boolean"}}})json"_json,
+                        "dnp":{"type":"boolean"},"in_bom":{"type":"boolean"},"on_board":{"type":"boolean"},
+                        "field_positions":{"type":"object","description":"per field name: {x_mm, y_mm}, \"hide\" or \"show\""},
+                        "autoplace_fields":{"type":"boolean","default":false,"description":"let KiCad place reference / value text"}}})json"_json,
                    false, h_sch_symbol_update );
 
 KOPENAPI_REGISTER( "sch_item_delete",
@@ -1424,6 +1759,30 @@ KOPENAPI_REGISTER( "sch_wire",
                         "route":{"type":"string","enum":["auto","hv","vh"],"default":"auto"},
                         "sheet":{"type":"string","description":"for point-only wires"}}})json"_json,
                    false, h_sch_wire );
+
+KOPENAPI_REGISTER( "sch_item_list",
+                   "List the wiring items of a sheet with uuids (to inspect, move or delete them): wires and "
+                   "buses (from, to), labels (kind, text, at), junctions, no-connects, power symbols; each with "
+                   "its net; filter by types, net glob, near a point; paginated. Parts: sch_symbol_list",
+                   KopenapiPagedSchema( R"json({
+                        "sheet":{"type":"string"},
+                        "types":{"type":"array","items":{"type":"string","enum":["wire","bus","graphic_line","label","junction","no_connect","power"]}},
+                        "net":{"type":"string","description":"net name glob"},
+                        "near":{"type":"object","properties":{"x_mm":{"type":"number"},"y_mm":{"type":"number"}}},
+                        "radius_mm":{"type":"number","default":5.08}})json"_json ),
+                   false, h_sch_item_list );
+
+KOPENAPI_REGISTER( "sch_label_add",
+                   std::string( "Place a net label at a point - the end of a wire or a pin end - so it names / "
+                                "joins that net (local, global or hierarchical); text side auto (away from the "
+                                "wire) or left/right/up/down; answers the net it joined and warns when it "
+                                "touches nothing. Labels straight on pins: sch_connect." ) + EDIT_NOTE,
+                   R"json({"type":"object","required":["text","x_mm","y_mm"],"properties":{
+                        "text":{"type":"string"},"x_mm":{"type":"number"},"y_mm":{"type":"number"},
+                        "kind":{"type":"string","enum":["local","global","hierarchical"],"default":"local"},
+                        "side":{"type":"string","enum":["auto","left","right","up","down"],"default":"auto"},
+                        "sheet":{"type":"string"}}})json"_json,
+                   false, h_sch_label_add );
 
 KOPENAPI_REGISTER( "sch_no_connect",
                    std::string( "Mark pins (REF.PIN) as intentionally unconnected (no-connect flag), so ERC "
