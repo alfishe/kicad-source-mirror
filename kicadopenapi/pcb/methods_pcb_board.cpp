@@ -36,6 +36,7 @@
 #include <project.h>
 #include <project/project_file.h>
 #include <wildcards_and_files_ext.h>
+#include <drc/drc_engine.h>
 #include <pcb_shape.h>
 #include <tool/actions.h>
 #include <kiway.h>
@@ -837,6 +838,20 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     board->SynchronizeNetsAndNetClasses( false );
+
+    // The rule engine (clearances and widths the router and DRC use) follows the new classes
+    if( std::shared_ptr<DRC_ENGINE> engine = bds.m_DRCEngine )
+    {
+        try
+        {
+            engine->InitEngine( board->GetDesignRulesPath() );
+        }
+        catch( const PARSE_ERROR& )
+        {
+            // a broken custom rules file: reported by pcb_drc
+        }
+    }
+
     context->SetContentModified();
 
     nlohmann::json result = rulesJson( board );
