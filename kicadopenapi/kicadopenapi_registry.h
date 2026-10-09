@@ -80,6 +80,7 @@ struct KOPENAPI_METHOD
     nlohmann::json   inputSchema;  ///< JSON Schema of the request body (type: object)
     bool             guiOnly;      ///< refused (501) when the process is headless
     KOPENAPI_HANDLER handler;
+    int              timeoutSec = 15;   ///< main-thread call cap; raise only for known-slow methods
 };
 
 

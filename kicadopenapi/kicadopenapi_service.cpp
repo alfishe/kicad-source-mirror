@@ -2,6 +2,7 @@
 #include "kicadopenapi_registry.h"
 #include "kicadopenapi_mcp.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -21,7 +22,8 @@
 static const char* const KOPENAPI_VERSION = "0.2.0";
 static const char* const KOPENAPI_HOST_ADDR = "127.0.0.1";
 
-/// Upper bound for one main-thread call; long operations will move to async jobs.
+/// Default upper bound for one main-thread call (methods may declare more); long operations
+/// will move to async jobs.
 static constexpr std::chrono::seconds CALL_TIMEOUT( 15 );
 static constexpr std::chrono::milliseconds WAIT_SLICE( 20 );
 
@@ -68,7 +70,8 @@ static void reply( httplib::Response& aRes, const KOPENAPI_RESULT& aResult )
  */
 static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAlive,
                                   const std::function<void()>&             aWaker,
-                                  std::function<KOPENAPI_RESULT()>         aFn )
+                                  std::function<KOPENAPI_RESULT()>         aFn,
+                                  std::chrono::seconds                     aTimeout = CALL_TIMEOUT )
 {
     if( !wxTheApp )
         return KOPENAPI_RESULT::Error( 503, "no application event loop" );
@@ -102,7 +105,7 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
     if( aWaker )
         aWaker();
 
-    const auto deadline = std::chrono::steady_clock::now() + CALL_TIMEOUT;
+    const auto deadline = std::chrono::steady_clock::now() + aTimeout;
 
     while( future.wait_for( WAIT_SLICE ) != std::future_status::ready )
     {
@@ -417,7 +420,8 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     nlohmann::json   args = aArgs;
 
     return runInMain( alive, waker,
-                      [ctxCopy, handler, args]() mutable { return handler( ctxCopy, args ); } );
+                      [ctxCopy, handler, args]() mutable { return handler( ctxCopy, args ); },
+                      std::chrono::seconds( std::max( method->timeoutSec, 1 ) ) );
 }
 
 
@@ -478,14 +482,12 @@ void KICAD_OPENAPI_SERVICE::IMPL::handleMcp( const httplib::Request& aReq,
 
 void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
 {
-    // Only SO_REUSEADDR: httplib's default SO_REUSEPORT would let two KiCad processes
-    // silently share one port.
+    // Exclusive listener (per OS, see platform layer): httplib's default SO_REUSEPORT would
+    // let two KiCad processes silently share one port
     server->set_socket_options(
             []( socket_t aSock )
             {
-                int yes = 1;
-                setsockopt( aSock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>( &yes ),
-                            sizeof( yes ) );
+                kopenapi::platform::ConfigureListenSocket( static_cast<std::uintptr_t>( aSock ) );
             } );
 
     server->Get( "/",
@@ -616,12 +618,14 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     const int basePort = aPort < 0 ? DefaultPort() : aPort;
 
     m_impl->appName = wxTheApp ? wxTheApp->GetAppName().ToStdString() : std::string( "kicad" );
-    m_impl->server = std::make_unique<httplib::Server>();
-    m_impl->registerRoutes();
     m_impl->port = 0;
 
     for( int i = 0; i < PORT_PROBE_COUNT; ++i )
     {
+        // A fresh server per attempt: httplib decommissions a server after a failed bind
+        m_impl->server = std::make_unique<httplib::Server>();
+        m_impl->registerRoutes();
+
         if( m_impl->server->bind_to_port( KOPENAPI_HOST_ADDR, basePort + i ) )
         {
             m_impl->port = basePort + i;
