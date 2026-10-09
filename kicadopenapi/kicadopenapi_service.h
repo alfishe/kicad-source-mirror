@@ -59,6 +59,13 @@ public:
      */
     void SetShutdownHandler( std::function<void()> aHandler );
 
+    /**
+     * Start loading the editor kifaces in the background (queued on the main loop, not
+     * awaited), so the first request does not pay for it.  Headless hosts call this after
+     * Start(); GUI hosts load lazily to keep the UI responsive.
+     */
+    void PreloadKifaces();
+
     bool Running() const;
 
     /// Bound port, or 0 when not running.

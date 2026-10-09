@@ -22,6 +22,60 @@ bool KOPENAPI_REGISTRY::Add( KOPENAPI_METHOD aMethod )
 }
 
 
+bool KOPENAPI_REGISTRY::AddDocumentProvider( const std::string& aDomain, KOPENAPI_DOC_STATUS aStatus,
+                                             KOPENAPI_DOC_RELEASE aRelease )
+{
+    KOPENAPI_REGISTRY& reg = Get();
+    std::lock_guard<std::mutex> lock( reg.m_mutex );
+
+    reg.m_docProviders[aDomain] = std::move( aStatus );
+    reg.m_docReleasers[aDomain] = std::move( aRelease );
+    return true;
+}
+
+
+void KOPENAPI_REGISTRY::ReleaseDocuments() const
+{
+    std::vector<KOPENAPI_DOC_RELEASE> releasers;
+
+    {
+        std::lock_guard<std::mutex> lock( m_mutex );
+
+        for( const auto& [domain, release] : m_docReleasers )
+            releasers.push_back( release );
+    }
+
+    for( const KOPENAPI_DOC_RELEASE& release : releasers )
+    {
+        if( release )
+            release();
+    }
+}
+
+
+std::vector<std::pair<std::string, KOPENAPI_DOC_STATUS>> KOPENAPI_REGISTRY::DocumentProviders() const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return { m_docProviders.begin(), m_docProviders.end() };
+}
+
+
+nlohmann::json KOPENAPI_REGISTRY::Documents( KOPENAPI_CONTEXT& aCtx ) const
+{
+    nlohmann::json docs = nlohmann::json::array();
+
+    for( const auto& [domain, status] : DocumentProviders() )
+    {
+        nlohmann::json doc = status( aCtx );
+
+        if( !doc.is_null() )
+            docs.push_back( std::move( doc ) );
+    }
+
+    return docs;
+}
+
+
 std::vector<KOPENAPI_METHOD> KOPENAPI_REGISTRY::Snapshot() const
 {
     std::lock_guard<std::mutex> lock( m_mutex );

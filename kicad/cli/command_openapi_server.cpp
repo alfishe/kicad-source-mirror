@@ -132,6 +132,8 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
     if( !service.Start( m_argParser.get<int>( ARG_PORT ) ) )
         return EXIT_CODES::ERR_UNKNOWN;
 
+    service.PreloadKifaces();
+
     // Readiness for humans and scripts; the bridge uses the discovery file instead
     std::printf( "kicadopenapi headless server listening at http://127.0.0.1:%d\n", service.Port() );
     std::fflush( stdout );

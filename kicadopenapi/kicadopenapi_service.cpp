@@ -13,6 +13,7 @@
 
 #include <httplib.h>
 
+#include <kiway.h>
 #include <wx/app.h>
 
 #include <platform.h>
@@ -140,6 +141,18 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 
     nlohmann::json openApiJson() const;
 
+    /// statusJson() + open documents and the unsaved flag (main-thread round trip)
+    KOPENAPI_RESULT liveStatus() const;
+
+    /**
+     * Load the editor kifaces (eeschema, pcbnew) once, on the main thread, so their methods
+     * and document providers are registered.  Lazy: paid by the first API use, not at start.
+     */
+    void ensureKifaces() const;
+
+    mutable std::atomic<bool> kifacesLoaded{ false };
+    std::thread               preloadThread;   ///< joined in Stop()
+
     void writeDiscoveryFile();
 
     KOPENAPI_RESULT invoke( const std::string& aName, const std::string& aBody ) const;
@@ -153,8 +166,66 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 };
 
 
+void KICAD_OPENAPI_SERVICE::IMPL::ensureKifaces() const
+{
+    if( kifacesLoaded.load() || !ctx.kiway )
+        return;
+
+    KIWAY* kiway = ctx.kiway;
+
+    runInMain( alive, waker,
+               [kiway]()
+               {
+                   for( KIWAY::FACE_T face : { KIWAY::FACE_SCH, KIWAY::FACE_PCB } )
+                   {
+                       try
+                       {
+                           kiway->KiFACE( face );
+                       }
+                       catch( ... )
+                       {
+                           // A missing kiface only means its methods are unavailable
+                       }
+                   }
+
+                   return KOPENAPI_RESULT::Ok( nlohmann::json::object() );
+               } );
+
+    kifacesLoaded.store( true );
+}
+
+
+KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::liveStatus() const
+{
+    ensureKifaces();
+
+    KOPENAPI_CONTEXT ctxCopy = ctx;
+    KOPENAPI_RESULT  docs = runInMain( alive, waker,
+                                       [ctxCopy]() mutable
+                                       {
+                                           return KOPENAPI_RESULT::Ok(
+                                                   KOPENAPI_REGISTRY::Get().Documents( ctxCopy ) );
+                                       } );
+
+    if( docs.status != 200 )
+        return docs;
+
+    nlohmann::json status = statusJson();
+    bool           unsaved = false;
+
+    for( const nlohmann::json& doc : docs.body )
+        unsaved |= doc.value( "unsaved", false );
+
+    status["documents"] = docs.body;
+    status["unsaved"] = unsaved;
+    return KOPENAPI_RESULT::Ok( status );
+}
+
+
 nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::openApiJson() const
 {
+    ensureKifaces();
+
     using nlohmann::json;
 
     const json errorRef = { { "$ref", "#/components/schemas/Error" } };
@@ -261,7 +332,9 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::openApiJson() const
                         { "app", { { "type", "string" } } },
                         { "pid", { { "type", "integer" } } },
                         { "port", { { "type", "integer" } } },
-                        { "headless", { { "type", "boolean" } } } } } } } } } } }
+                        { "headless", { { "type", "boolean" } } },
+                        { "unsaved", { { "type", "boolean" } } },
+                        { "documents", { { "type", "array" }, { "items", { { "type", "object" } } } } } } } } } } } } }
     };
 }
 
@@ -319,6 +392,8 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invoke( const std::string& aName,
 KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&    aName,
                                                            const nlohmann::json& aArgs ) const
 {
+    ensureKifaces();
+
     std::optional<KOPENAPI_METHOD> method = KOPENAPI_REGISTRY::Get().Find( aName );
 
     if( !method )
@@ -352,6 +427,7 @@ void KICAD_OPENAPI_SERVICE::IMPL::handleMcp( const httplib::Request& aReq,
     KOPENAPI_MCP_CONTEXT mcpCtx;
     mcpCtx.headless = ctx.headless;
     mcpCtx.version = KOPENAPI_VERSION;
+    ensureKifaces();   // search must see kiface methods
     mcpCtx.invoke = [this]( const std::string& aName, const nlohmann::json& aArgs )
     {
         return invokeParsed( aName, aArgs );
@@ -433,7 +509,7 @@ void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
     server->Get( "/api/v1/status",
                  [this]( const httplib::Request&, httplib::Response& res )
                  {
-                     reply( res, KOPENAPI_RESULT::Ok( statusJson() ) );
+                     reply( res, liveStatus() );
                  } );
 
     server->Get( "/api/v1/openapi.json",
@@ -491,6 +567,18 @@ KICAD_OPENAPI_SERVICE::KICAD_OPENAPI_SERVICE( KIWAY* aKiway, bool aHeadless ) :
 KICAD_OPENAPI_SERVICE::~KICAD_OPENAPI_SERVICE()
 {
     Stop();
+}
+
+
+void KICAD_OPENAPI_SERVICE::PreloadKifaces()
+{
+    if( !wxTheApp || !m_impl->ctx.kiway || m_impl->kifacesLoaded.load() )
+        return;
+
+    // ensureKifaces() on a worker: it marshals to the main loop and returns when the kifaces
+    // are in (or the service stops); requests arriving meanwhile queue behind it
+    if( !m_impl->preloadThread.joinable() )
+        m_impl->preloadThread = std::thread( [impl = m_impl.get()]() { impl->ensureKifaces(); } );
 }
 
 
@@ -573,11 +661,17 @@ void KICAD_OPENAPI_SERVICE::Stop()
     m_impl->alive->store( false );
     m_impl->server->stop();
 
+    if( m_impl->preloadThread.joinable() )
+        m_impl->preloadThread.join();
+
     if( m_impl->thread.joinable() )
         m_impl->thread.join();
 
     m_impl->server.reset();
     m_impl->port = 0;
+
+    // Headless documents live in the kifaces; drop them while the project/settings still exist
+    KOPENAPI_REGISTRY::Get().ReleaseDocuments();
 
     if( !m_impl->discoveryFile.empty() )
     {

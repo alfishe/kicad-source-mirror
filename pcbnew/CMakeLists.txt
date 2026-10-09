@@ -734,9 +734,13 @@ target_link_options( pcbnew PRIVATE
     )
 
 #the main pcbnew program, in DSO form.
+# kicadopenapi methods for boards; registered when this kiface loads
+file( GLOB KOPENAPI_PCB_SRCS ${CMAKE_SOURCE_DIR}/kicadopenapi/pcb/*.cpp )
+
 add_library( pcbnew_kiface_objects OBJECT
     ${PCBNEW_SRCS}
     ${PCBNEW_COMMON_SRCS}
+    ${KOPENAPI_PCB_SRCS}
     )
 
 if( KICAD_USE_PCH )

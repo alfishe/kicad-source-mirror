@@ -57,6 +57,18 @@ struct KOPENAPI_RESULT
 };
 
 
+/**
+ * Reports the document a kiface currently serves for its domain ("sch", "pcb"):
+ * { "domain", "path", "project", "unsaved", "mode": "gui"|"headless" }, or null when none
+ * is open.  Runs on the main thread.  Feeds /api/v1/status ("documents", "unsaved") and the
+ * `documents` method.
+ */
+using KOPENAPI_DOC_STATUS = std::function<nlohmann::json( KOPENAPI_CONTEXT& aCtx )>;
+
+/// Drops in-memory (headless) documents; called on the main thread when the service stops
+using KOPENAPI_DOC_RELEASE = std::function<void()>;
+
+
 using KOPENAPI_HANDLER =
         std::function<KOPENAPI_RESULT( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )>;
 
@@ -79,6 +91,17 @@ public:
 
     static bool Add( KOPENAPI_METHOD aMethod );
 
+    static bool AddDocumentProvider( const std::string& aDomain, KOPENAPI_DOC_STATUS aStatus,
+                                     KOPENAPI_DOC_RELEASE aRelease );
+
+    std::vector<std::pair<std::string, KOPENAPI_DOC_STATUS>> DocumentProviders() const;
+
+    /// Release all in-memory documents (main thread, service stop)
+    void ReleaseDocuments() const;
+
+    /// Open documents of all providers (main thread)
+    nlohmann::json Documents( KOPENAPI_CONTEXT& aCtx ) const;
+
     std::vector<KOPENAPI_METHOD> Snapshot() const;
 
     std::optional<KOPENAPI_METHOD> Find( const std::string& aName ) const;
@@ -95,7 +118,9 @@ private:
     KOPENAPI_REGISTRY() = default;
 
     mutable std::mutex                     m_mutex;
-    std::map<std::string, KOPENAPI_METHOD> m_methods;
+    std::map<std::string, KOPENAPI_METHOD>     m_methods;
+    std::map<std::string, KOPENAPI_DOC_STATUS>  m_docProviders;
+    std::map<std::string, KOPENAPI_DOC_RELEASE> m_docReleasers;
 };
 
 
@@ -103,5 +128,9 @@ private:
     static const bool kopenapi_reg_##line = KOPENAPI_REGISTRY::Add( KOPENAPI_METHOD{ __VA_ARGS__ } )
 #define KOPENAPI_REGISTER_IMPL( line, ... ) KOPENAPI_REGISTER_IMPL2( line, __VA_ARGS__ )
 #define KOPENAPI_REGISTER( ... ) KOPENAPI_REGISTER_IMPL( __LINE__, __VA_ARGS__ )
+
+#define KOPENAPI_REGISTER_DOCUMENTS( aDomain, aStatus, aRelease )                         \
+    static const bool kopenapi_docs_reg =                                                  \
+            KOPENAPI_REGISTRY::AddDocumentProvider( aDomain, aStatus, aRelease )
 
 #endif
