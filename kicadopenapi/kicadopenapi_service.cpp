@@ -2,6 +2,7 @@
 #include "kicadopenapi_registry.h"
 #include "kicadopenapi_mcp.h"
 #include "kicadopenapi_journal.h"
+#include "kicadopenapi_libraries.h"
 
 #include <algorithm>
 #include <atomic>
@@ -682,6 +683,9 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     m_impl->thread = std::thread( [srv = m_impl->server.get()]() { srv->listen_after_bind(); } );
 
     m_impl->writeDiscoveryFile();
+
+    // A process without libraries is a silent failure for an agent: say so in the journal
+    KopenapiCheckGlobalLibraryTables();
 
     std::fprintf( stderr, "kicadopenapi listening at http://%s:%d\n", KOPENAPI_HOST_ADDR,
                   m_impl->port );

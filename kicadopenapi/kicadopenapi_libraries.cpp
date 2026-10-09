@@ -3,6 +3,7 @@
 #include <common.h>
 #include <libraries/library_manager.h>
 #include <libraries/library_table.h>
+#include <wx/log.h>
 #include <wx/filename.h>
 
 
@@ -65,4 +66,70 @@ nlohmann::json KopenapiLibraryTables( const LIBRARY_MANAGER_ADAPTER& aAdapter, i
         tables.push_back( tableJson( *project, "project", aErrors ) );
 
     return tables;
+}
+
+
+void KopenapiCheckGlobalLibraryTables()
+{
+    for( const auto& [type, kind] : { std::pair{ LIBRARY_TABLE_TYPE::SYMBOL, "symbol" },
+                                      std::pair{ LIBRARY_TABLE_TYPE::FOOTPRINT, "footprint" } } )
+    {
+        const wxString path = LIBRARY_MANAGER::DefaultGlobalTablePath( type );
+        const wxString hint = wxString::Format( wxS( " - KiCad will see no global %s libraries "
+                                                     "(fix: kicad-toolset/tools/kicad_dev_libraries.py --fix)" ),
+                                                kind );
+
+        if( !wxFileName::FileExists( path ) )
+        {
+            wxLogWarning( "Global %s library table missing: %s%s", kind, path, hint );
+            continue;
+        }
+
+        LIBRARY_TABLE table( wxFileName( path ), LIBRARY_TABLE_SCOPE::GLOBAL );
+
+        if( !table.IsOk() )
+        {
+            wxLogWarning( "Global %s library table %s unreadable: %s%s", kind, path, table.ErrorDescription(), hint );
+            continue;
+        }
+
+        if( table.Rows().empty() )
+        {
+            wxLogWarning( "Global %s library table %s is empty%s", kind, path, hint );
+            continue;
+        }
+
+        for( const LIBRARY_TABLE_ROW& row : table.Rows() )
+        {
+            const wxString uri = ExpandEnvVarSubstitutions( row.URI(), nullptr );
+
+            if( row.Type() != wxS( "Table" ) )
+                continue;
+
+            if( !wxFileName::FileExists( uri ) )
+            {
+                wxLogWarning( "Global %s library table %s: nested table '%s' points to a missing file %s%s", kind,
+                              path, row.Nickname(), uri, hint );
+                continue;
+            }
+
+            // The nested table's own libraries usually use ${KICADn_SYMBOL_DIR} etc.: check the
+            // first one resolves (a development build has no libraries in its own bundle)
+            LIBRARY_TABLE nested( wxFileName( uri ), LIBRARY_TABLE_SCOPE::GLOBAL );
+
+            for( const LIBRARY_TABLE_ROW& lib : nested.Rows() )
+            {
+                const wxString libPath = ExpandEnvVarSubstitutions( lib.URI(), nullptr );
+
+                if( !wxFileName::Exists( libPath ) )
+                {
+                    wxLogWarning( "Global %s libraries from %s do not resolve: '%s' -> %s does not exist "
+                                  "(set the library path variables to an installed KiCad's libraries)%s",
+                                  kind, uri, lib.URI(), libPath, hint );
+                }
+
+                break;
+            }
+        }
+    }
 }

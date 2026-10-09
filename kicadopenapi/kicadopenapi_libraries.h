@@ -17,4 +17,13 @@ class LIBRARY_MANAGER_ADAPTER;
  */
 KICOMMON_API nlohmann::json KopenapiLibraryTables( const LIBRARY_MANAGER_ADAPTER& aAdapter, int& aErrors );
 
+/**
+ * Warn (wxLogWarning -> the error journal) when KiCad's global symbol / footprint library
+ * tables would leave this process without libraries: table file missing, unreadable or empty,
+ * a nested "Table" row naming a missing file, or library paths (e.g. ${KICAD10_SYMBOL_DIR})
+ * resolving to a missing directory.  Seen with development builds sharing one settings
+ * directory: a table pointing into another build's bundle that no longer exists.
+ */
+KICOMMON_API void KopenapiCheckGlobalLibraryTables();
+
 #endif
