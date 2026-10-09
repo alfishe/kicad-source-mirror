@@ -39,6 +39,7 @@
 #include <wx/html/htmlwin.h>
 
 #include <api/api_server.h>
+#include <kicadopenapi_service.h>
 #include <kiway.h>
 #include <build_version.h>
 #include <pgm_base.h>
@@ -88,6 +89,9 @@ static struct PGM_SINGLE_TOP : public PGM_BASE
         GetKiCadThreadPool().purge();
         GetKiCadThreadPool().wait();
 
+        // Web API goes first: no request may reach frames that are about to be destroyed
+        m_openapi.reset();
+
         Kiway.OnKiwayEnd();
 
         m_api_server.reset();
@@ -131,6 +135,8 @@ static struct PGM_SINGLE_TOP : public PGM_BASE
             }
         }
     }
+
+    std::unique_ptr<KICAD_OPENAPI_SERVICE> m_openapi;
 
 } program;
 
@@ -402,6 +408,9 @@ bool PGM_SINGLE_TOP::OnPgmInit()
 
     // Create the API server thread once the app event loop exists
     m_api_server = std::make_unique<KICAD_API_SERVER>();
+
+    m_openapi = std::make_unique<KICAD_OPENAPI_SERVICE>( &Kiway, false );
+    m_openapi->Start();
 
     // Use KIWAY to create a top window, which registers its existence also.
     // "TOP_FRAME" is a macro that is passed on compiler command line from CMake,

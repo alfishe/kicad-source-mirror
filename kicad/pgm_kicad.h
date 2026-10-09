@@ -26,6 +26,7 @@
 #include <api/api_handler_libraries.h>
 #include <libraries/library_table.h>
 #include <bin_mod.h>
+#include <kicadopenapi_service.h>
 
 /**
  * PGM_KICAD
@@ -70,6 +71,8 @@ protected:
     // because it depends on things like EDA_TEXT and EDA_SHAPE that aren't in the DLL
     std::unique_ptr<API_HANDLER_COMMON> m_api_common_handler;
     std::unique_ptr<API_HANDLER_LIBRARIES> m_api_libraries_handler;
+
+    std::unique_ptr<KICAD_OPENAPI_SERVICE> m_openapi;
 };
 
 

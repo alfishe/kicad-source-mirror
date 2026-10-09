@@ -1,114 +1,99 @@
 /*
- * kicadopenapi method registry: auto-indexing of handlers declared via macros.
+ * kicadopenapi method registry.
  *
- * A handler declares itself once:
+ * Every Web API method is declared once, next to its handler, and registers itself at
+ * static initialization:
  *
- *   static std::string h_open_project( KOPENAPI_HOST& aHost, const std::string& aArgs );
- *   KOPENAPI_REGISTER( "open_project", "Open a .kicad_pro in the GUI", h_open_project );
+ *   static KOPENAPI_RESULT h_open_pcb( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs );
  *
- * The registry is the MCP surface: /mcp/search scans names+summaries,
- * /mcp/invoke validates the name and dispatches the JSON body.
+ *   KOPENAPI_REGISTER( "open_pcb", "Open a .kicad_pcb in the PCB editor window",
+ *                      R"({"type":"object","required":["path"],
+ *                          "properties":{"path":{"type":"string"}}})"_json,
+ *                      true, h_open_pcb );
+ *
+ * The registry is the single source of truth: the service routes POST /api/v1/{name}
+ * through it and generates /api/v1/openapi.json from it, so the manifest can only list
+ * what is actually served.
+ *
+ * The registry lives in kicommon so that methods registered from kiface DSOs land in the
+ * same (process-wide) instance.
  */
 #ifndef KICADOPENAPI_REGISTRY_H
 #define KICADOPENAPI_REGISTRY_H
 
 #include <functional>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include <json_common.h>
+#include <kicommon.h>
+
 class KIWAY;
-class wxWindow;
 
-/**
- * Minimal host interface handed to every handler. Implemented by the owning
- * frame (or PGM window) so handlers can reach the Kiway and their window.
- */
-class KOPENAPI_HOST
+
+/// Process-level surface handed to every handler; handlers always run on the main thread.
+struct KOPENAPI_CONTEXT
 {
-public:
-    virtual ~KOPENAPI_HOST() = default;
-
-    virtual KIWAY* Ki() const = 0;
-    virtual wxWindow* Window() = 0;
+    KIWAY* kiway = nullptr;
+    bool   headless = false;
 };
 
-using KOPENAPI_HANDLER = std::function<std::string( KOPENAPI_HOST&, const std::string& aArgs )>;
+
+/// Handler outcome: HTTP status + JSON body.  Errors use { "error": { code, message } }.
+struct KOPENAPI_RESULT
+{
+    int            status = 200;
+    nlohmann::json body = nlohmann::json::object();
+
+    static KOPENAPI_RESULT Ok( nlohmann::json aBody ) { return { 200, std::move( aBody ) }; }
+
+    static KOPENAPI_RESULT Error( int aStatus, const std::string& aMessage )
+    {
+        return { aStatus, { { "error", { { "code", aStatus }, { "message", aMessage } } } } };
+    }
+};
+
+
+using KOPENAPI_HANDLER =
+        std::function<KOPENAPI_RESULT( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )>;
+
 
 struct KOPENAPI_METHOD
 {
-    std::string name;
-    std::string summary;
+    std::string      name;         ///< [a-z0-9_]+, served at POST /api/v1/{name}
+    std::string      summary;
+    nlohmann::json   inputSchema;  ///< JSON Schema of the request body (type: object)
+    bool             guiOnly;      ///< refused (501) when the process is headless
     KOPENAPI_HANDLER handler;
 };
 
-class KOPENAPI_REGISTRY
+
+/// Thread-safe: kiface DSOs register while HTTP workers read; readers get copies.
+class KICOMMON_API KOPENAPI_REGISTRY
 {
 public:
-    static KOPENAPI_REGISTRY& Get()
-    {
-        static KOPENAPI_REGISTRY inst;
-        return inst;
-    }
+    static KOPENAPI_REGISTRY& Get();
 
-    static bool Add( const std::string& aName, const std::string& aSummary,
-                     KOPENAPI_HANDLER aHandler )
-    {
-        Get().m_methods[aName] = { aName, aSummary, std::move( aHandler ) };
-        return true;
-    }
+    static bool Add( KOPENAPI_METHOD aMethod );
 
-    const std::map<std::string, KOPENAPI_METHOD>& Methods() const { return m_methods; }
+    std::vector<KOPENAPI_METHOD> Snapshot() const;
 
-    const KOPENAPI_METHOD* Find( const std::string& aName ) const
-    {
-        auto it = m_methods.find( aName );
-        return it == m_methods.end() ? nullptr : &it->second;
-    }
-
-    std::vector<KOPENAPI_METHOD> Search( const std::string& aQuery, size_t aLimit = 10 ) const
-    {
-        std::vector<KOPENAPI_METHOD> hits;
-        const std::string q = [&]
-        {
-            std::string lower = aQuery;
-            for( char& ch : lower )
-                ch = (char) tolower( (unsigned char) ch );
-            return lower;
-        }();
-
-        if( !q.empty() )
-        {
-            for( const auto& [name, method] : m_methods )
-            {
-                std::string hay = name + " " + method.summary;
-                for( char& ch : hay )
-                    ch = (char) tolower( (unsigned char) ch );
-                if( hay.find( q ) != std::string::npos )
-                    hits.push_back( method );
-            }
-        }
-
-        if( hits.size() > aLimit )
-            hits.resize( aLimit );
-        return hits;
-    }
+    std::optional<KOPENAPI_METHOD> Find( const std::string& aName ) const;
 
 private:
     KOPENAPI_REGISTRY() = default;
+
+    mutable std::mutex                     m_mutex;
     std::map<std::string, KOPENAPI_METHOD> m_methods;
 };
 
-/**
- * Auto-registers a handler at static initialization:
- *   static std::string my_handler( KOPENAPI_HOST&, const std::string& );
- *   KOPENAPI_REGISTER( "my_method", "does something", my_handler );
- */
-#define KOPENAPI_REGISTER_IMPL2( aName, aSummary, aFn, line )                            \
-    static bool kopenapi_reg_##line = KOPENAPI_REGISTRY::Add( aName, aSummary, aFn )
-#define KOPENAPI_REGISTER_IMPL( aName, aSummary, aFn, line )                             \
-    KOPENAPI_REGISTER_IMPL2( aName, aSummary, aFn, line )
-#define KOPENAPI_REGISTER( aName, aSummary, aFn )                                        \
-    KOPENAPI_REGISTER_IMPL( aName, aSummary, aFn, __LINE__ )
+
+#define KOPENAPI_REGISTER_IMPL2( line, ... )                                             \
+    static const bool kopenapi_reg_##line = KOPENAPI_REGISTRY::Add( KOPENAPI_METHOD{ __VA_ARGS__ } )
+#define KOPENAPI_REGISTER_IMPL( line, ... ) KOPENAPI_REGISTER_IMPL2( line, __VA_ARGS__ )
+#define KOPENAPI_REGISTER( ... ) KOPENAPI_REGISTER_IMPL( __LINE__, __VA_ARGS__ )
 
 #endif

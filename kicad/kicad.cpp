@@ -284,6 +284,9 @@ bool PGM_KICAD::OnPgmInit()
         m_api_libraries_handler = std::make_unique<API_HANDLER_LIBRARIES>(
                 LIBRARY_TABLE_TYPE::DESIGN_BLOCK );
         m_api_server->RegisterHandler( m_api_libraries_handler.get() );
+
+        m_openapi = std::make_unique<KICAD_OPENAPI_SERVICE>( &Kiway, false );
+        m_openapi->Start();
     }
 
     if( appType == FRAME_MERGETOOL )
@@ -557,6 +560,9 @@ void PGM_KICAD::OnPgmExit()
     // Abort and wait on any background jobs
     GetKiCadThreadPool().purge();
     GetKiCadThreadPool().wait();
+
+    // Web API goes first: no request may reach frames that are about to be destroyed
+    m_openapi.reset();
 
     Kiway.OnKiwayEnd();
 

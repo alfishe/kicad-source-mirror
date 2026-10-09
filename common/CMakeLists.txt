@@ -394,6 +394,19 @@ list( APPEND KICOMMON_SRCS
     navlib_safe_init.cpp
 )
 
+# kicadopenapi: in-process Web API service (one per process), see kicadopenapi/
+list( APPEND KICOMMON_SRCS
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_registry.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_service.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_project.cpp
+    # platform layer shared with kicad-mcp-bridge; each file compiles only on its OS
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_posix.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_macos.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_linux.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_windows.cpp
+)
+
 add_library( kicommon SHARED
     ${KICOMMON_SRCS}
     )
@@ -489,6 +502,12 @@ if( APPLE )
 endif()
 
 target_compile_definitions( kicommon PRIVATE KICOMMON_DLL=1 )
+
+target_include_directories( kicommon
+    PUBLIC ${CMAKE_SOURCE_DIR}/kicadopenapi
+    PRIVATE ${CMAKE_SOURCE_DIR}/kicadopenapi/platform
+            ${CMAKE_SOURCE_DIR}/thirdparty/httplib
+    )
 
 # Feed the desktop application identifiers to the Wayland app_id logic in pgm_base.cpp
 # so the compositor matches windows to the installed desktop files (regular, Flatpak,

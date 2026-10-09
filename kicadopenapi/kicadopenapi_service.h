@@ -1,63 +1,59 @@
 /*
- * kicadopenapi — in-process REST/OpenAPI/webui service embedded into KiCad
- * utilities (eeschema, pcbnew, PGM).
+ * kicadopenapi — in-process Web API service, one per KiCad process.
  *
- * Serves the method registry as OpenAPI + swagger-ui webapp, an MCP-style
- * /mcp/search and /mcp/invoke/{name} surface, and REST endpoints with direct
- * access to the owning frame's object model. Runs on 127.0.0.1 only.
+ * Independent of the IPC API: own HTTP transport (cpp-httplib), own method registry, direct
+ * object-model access.  Hosted by the project manager, by standalone editors, and (later)
+ * headless by kicad-cli.  Binds 127.0.0.1 only.
+ *
+ * Served surface (and nothing else — the OpenAPI manifest is generated from it):
+ *   GET  /                      swagger-ui over the manifest
+ *   GET  /api/v1/status         service/process info
+ *   GET  /api/v1/openapi.json   manifest
+ *   POST /api/v1/{method}       registry methods (KOPENAPI_REGISTRY)
+ *
+ * Threading: HTTP handlers run on httplib worker threads and never touch the model.  Every
+ * registry method is marshalled to the main thread via wxTheApp->CallAfter and awaited with
+ * a timeout; Stop() unblocks waiting workers before joining them.
  */
-#ifndef KICAD_OPENAPI_SERVICE_H
-#define KICAD_OPENAPI_SERVICE_H
+#ifndef KICADOPENAPI_SERVICE_H
+#define KICADOPENAPI_SERVICE_H
 
-#include <atomic>
-#include <functional>
-#include <map>
 #include <memory>
-#include <string>
-#include <thread>
-#include <vector>
 
-#include <httplib.h>
+#include <kicommon.h>
 
-#include "kicadopenapi_registry.h"
+class KIWAY;
 
-class KICAD_OPENAPI_SERVICE
+
+class KICOMMON_API KICAD_OPENAPI_SERVICE
 {
 public:
-    using JsonHandler = std::function<std::string( const std::string& aBody )>;
+    static constexpr int DEFAULT_PORT = 4242;
+    static constexpr int PORT_PROBE_COUNT = 10;
 
-    KICAD_OPENAPI_SERVICE( const std::string& aUtilityName, int aPort );
+    KICAD_OPENAPI_SERVICE( KIWAY* aKiway, bool aHeadless );
     ~KICAD_OPENAPI_SERVICE();
 
-    void add_endpoint( const std::string& aMethod, const std::string& aPath,
-                       const std::string& aSummary, JsonHandler aHandler );
+    /**
+     * Bind and start serving.  Tries aPort, then the next PORT_PROBE_COUNT - 1 ports.
+     * A negative aPort means DefaultPort().  Returns false if no port could be bound.
+     */
+    bool Start( int aPort = -1 );
 
-    /** Bind the object-model host; handlers receive it on every invoke. */
-    void set_host( KOPENAPI_HOST* aHost );
+    /// Stop serving; idempotent.  Must be called before the KIWAY/frames go away.
+    void Stop();
 
-    bool start();
-    void stop();
+    bool Running() const;
 
-    int port() const { return m_port; }
+    /// Bound port, or 0 when not running.
+    int Port() const;
+
+    /// KICAD_OPENAPI_PORT env override, else DEFAULT_PORT.
+    static int DefaultPort();
 
 private:
-    void register_builtin_endpoints();
-    std::string openapi_json() const;
-
-    std::string m_utilityName;
-    int m_port;
-    KOPENAPI_HOST* m_host = nullptr;
-    std::atomic<bool> m_running{ false };
-    std::thread m_thread;
-    std::unique_ptr<httplib::Server> m_server;
-
-    struct EndpointSpec
-    {
-        std::string method;
-        std::string path;
-        std::string summary;
-    };
-    std::vector<EndpointSpec> m_endpoints;
+    struct IMPL;
+    std::unique_ptr<IMPL> m_impl;
 };
 
 #endif
