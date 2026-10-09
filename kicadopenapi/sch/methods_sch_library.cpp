@@ -11,6 +11,7 @@
 
 #include <api/sch_context.h>
 #include <kicadopenapi_libraries.h>
+#include <base_units.h>
 #include <kicadopenapi_util.h>
 #include <kiway.h>
 #include <lib_symbol.h>
@@ -24,6 +25,7 @@
 #include <schematic.h>
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 
 using namespace kopenapi_sch;
@@ -285,11 +287,28 @@ static KOPENAPI_RESULT h_sch_lib_symbol_get( KOPENAPI_CONTEXT& aCtx, const nlohm
         if( pin->GetBodyStyle() > 1 )
             continue;
 
+        // Where the pin sits on the body, for planning a placement before placing: the
+        // connection point relative to the symbol origin (rotation 0, y down as on the sheet)
+        // and the side of the body it leaves from
+        const char* side = "left";
+
+        switch( pin->GetOrientation() )
+        {
+        case PIN_ORIENTATION::PIN_RIGHT: side = "left";   break;   // drawn rightwards into the body
+        case PIN_ORIENTATION::PIN_LEFT:  side = "right";  break;
+        case PIN_ORIENTATION::PIN_UP:    side = "bottom"; break;
+        case PIN_ORIENTATION::PIN_DOWN:  side = "top";    break;
+        default:                                          break;
+        }
+
         pins.push_back( { { "number", str( pin->GetNumber() ) },
                           { "name", str( pin->GetShownName() ) },
                           { "type", str( pin->GetElectricalTypeName() ) },
                           { "unit", pin->GetUnit() },
-                          { "hidden", !pin->IsVisible() } } );
+                          { "hidden", !pin->IsVisible() },
+                          { "side", side },
+                          { "x_mm", std::round( schIUScale.IUTomm( pin->GetPosition().x ) * 1000.0 ) / 1000.0 },
+                          { "y_mm", std::round( schIUScale.IUTomm( pin->GetPosition().y ) * 1000.0 ) / 1000.0 } } );
     }
 
     std::sort( pins.begin(), pins.end(),
@@ -340,7 +359,8 @@ KOPENAPI_REGISTER( "sch_lib_symbol_search",
 
 KOPENAPI_REGISTER( "sch_lib_symbol_get",
                    "Library symbol card by lib_id (LIBRARY:SYMBOL): fields, every pin (number, name, "
-                   "electrical type, unit, hidden), units with names, body styles, default footprint "
+                   "electrical type, unit, hidden, side of the body, position from the origin in mm — to plan "
+                   "a placement), units with names, body styles, default footprint "
                    "and footprint filters, datasheet, used_in_design",
                    R"json({"type":"object","required":["lib_id"],"properties":{
                         "lib_id":{"type":"string","description":"e.g. Regulator_Linear:AMS1117-3.3"}}})json"_json,

@@ -21,6 +21,8 @@
 #include <schematic.h>
 #include <libraries/symbol_library_adapter.h>
 
+#include <map>
+
 
 static KOPENAPI_RESULT h_sch_erc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
@@ -83,8 +85,32 @@ static KOPENAPI_RESULT h_sch_erc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         }
     }
 
-    return KOPENAPI_RESULT::Ok( KopenapiCheckResult( violations, {}, full.value( "ignored_checks", nlohmann::json::array() ),
-                                                     aArgs ) );
+    nlohmann::json result = KopenapiCheckResult( violations, {}, full.value( "ignored_checks", nlohmann::json::array() ), aArgs );
+
+    // The usual fixes for the usual findings, so an agent need not know KiCad's conventions
+    static const std::map<std::string, std::string> hints = {
+        { "power_pin_not_driven",
+          "a power input pin's net has no driver: if the rail comes in through a connector (passive pins), "
+          "place power:PWR_FLAG on that net once (sch_symbol_add, then connect it to the rail)" },
+        { "pin_not_connected", "intentionally unused pins: sch_no_connect" },
+        { "pin_not_driven", "an input pin's net has no output driving it: check the connection or the pin types" },
+        { "label_dangling", "a label touches no wire or pin: move it onto a wire end / pin end (sch_label_add answers the net)" },
+        { "unconnected_wire_endpoint", "a wire end touches nothing: sch_item_list types [wire] near the point, delete or extend it" },
+        { "pin_to_pin", "two pins of incompatible types share a net: often fine for passives / power outputs on one rail; "
+                        "check the pin types in the symbol cards" } };
+
+    nlohmann::json advice = nlohmann::json::array();
+
+    for( const auto& [type, count] : result["summary"]["by_type"].items() )
+    {
+        if( auto hint = hints.find( type ); hint != hints.end() )
+            advice.push_back( { { "type", type }, { "hint", hint->second } } );
+    }
+
+    if( !advice.empty() )
+        result["hints"] = advice;
+
+    return KOPENAPI_RESULT::Ok( result );
 }
 
 

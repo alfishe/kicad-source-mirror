@@ -20,7 +20,7 @@ inline constexpr const char* kInvokeTool = "invoke";
 inline constexpr const char* kToolsJson = R"json([
   {
     "name": "search",
-    "description": "Find KiCad methods by keywords (e.g. 'open pcb', 'place symbol', 'wire', 'drc', 'render'). Compact by default: name, summary and one line of parameters ('path*: string, discard: boolean = false', * = required). For the full inputSchema pass detail: 'full', or names: ['method', ...] to describe specific methods. Matches beyond 'limit' are listed in 'more' (name + summary); 'total' counts all. Empty query lists all methods. Call invoke with a returned name.",
+    "description": "Find KiCad methods by keywords (e.g. 'open pcb', 'place symbol', 'wire', 'drc', 'render'). Compact by default: name, summary and one line of parameters ('path*: string, discard: boolean = false', * = required). For the full inputSchema pass detail: 'full', or names: ['method', ...] to describe specific methods. Matches beyond 'limit' are listed by name in 'more'; 'total' counts all. Empty query lists all methods. Call invoke with a returned name.",
     "inputSchema": {
       "type": "object",
       "properties": {

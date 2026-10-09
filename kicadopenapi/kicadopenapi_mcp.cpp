@@ -107,7 +107,7 @@ static json searchTool( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aArgs )
     json more = json::array();
 
     // gui-only methods are hidden headless: they could only fail there.  Matches beyond the
-    // limit are not dropped silently: they come back in "more" as name + summary only.
+    // limit are not dropped silently: they come back in "more" as names.
     const std::vector<KOPENAPI_METHOD> found =
             KOPENAPI_REGISTRY::Get().Search( query, std::numeric_limits<size_t>::max(), !aCtx.headless );
 
@@ -116,7 +116,7 @@ static json searchTool( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aArgs )
         if( methods.size() < (size_t) limit )
             methods.push_back( kopenapi::mcp::FormatMethod( m.name, m.summary, m.inputSchema, m.guiOnly, full ) );
         else
-            more.push_back( { { "name", m.name }, { "summary", m.summary } } );
+            more.push_back( m.name );   // names only: describe them with names: [...]
     }
 
     return toolResult( { { "methods", methods }, { "count", methods.size() }, { "total", found.size() }, { "more", more } },

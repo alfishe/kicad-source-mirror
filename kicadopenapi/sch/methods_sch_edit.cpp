@@ -1291,6 +1291,25 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
         return symbol;
     };
 
+    const bool upright = aArgs.value( "orientation", std::string( "upright" ) ) != "away";
+
+    // Where the power symbol's body points in its library pose (e.g. GND down, +5V up)
+    auto naturalDirection = [&]( const SCH_SHEET_PATH& aPath ) -> VECTOR2I
+    {
+        if( !powerSymbol )
+            return VECTOR2I( 0, 0 );
+
+        std::unique_ptr<LIB_SYMBOL> flat = powerSymbol->Flatten();
+        SCH_SYMBOL                  probe( *flat, powerSymbol->GetLibId(), &aPath, 1, 1, VECTOR2I( 0, 0 ), schematic );
+        std::vector<SCH_PIN*>       own = probe.GetPins( &aPath );
+        const VECTOR2I              d = probe.GetBodyBoundingBox().Centre() - ( own.empty() ? VECTOR2I( 0, 0 ) : own.front()->GetPosition() );
+
+        if( std::abs( d.x ) >= std::abs( d.y ) )
+            return VECTOR2I( d.x < 0 ? -1 : 1, 0 );
+
+        return VECTOR2I( 0, d.y < 0 ? -1 : 1 );
+    };
+
     auto addWire = [&]( const VECTOR2I& aStart, const VECTOR2I& aEnd, SCH_SCREEN* aScreen )
     {
         auto* wire = new SCH_LINE( aStart, LAYER_WIRE );
@@ -1334,9 +1353,25 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
             continue;
         }
 
+        // Upright: the symbol keeps its library pose (GND down, +V up).  On a pin facing that
+        // way it sits on the pin; on a sideways pin a short stub leads out first; a pin facing
+        // the opposite way gets the symbol turned away from the part.
+        const VECTOR2I natural = naturalDirection( first.path );
+        const bool     sideways = upright && natural != out && natural != VECTOR2I( -out.x, -out.y );
+        const VECTOR2I body = upright && natural == out ? natural : upright && sideways ? natural : out;
+
         if( group.size() == 1 )
         {
-            SCH_ITEM* symbol = placePower( first.pin->GetPosition(), out, first.path );
+            VECTOR2I at = first.pin->GetPosition();
+
+            if( sideways )
+            {
+                const VECTOR2I end = at + VECTOR2I( out.x * toIU( 2 * GRID_MM ), out.y * toIU( 2 * GRID_MM ) );
+                addWire( at, end, screen );
+                at = end;
+            }
+
+            SCH_ITEM* symbol = placePower( at, body, first.path );
             commit.Add( symbol, screen );
             placed.push_back( { { "pin", pinId( first.pin, first.path ) }, { "uuid", str( symbol->m_Uuid.AsString() ) } } );
             continue;
@@ -1387,7 +1422,20 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
             extra.push_back( junction->m_Uuid );
         }
 
-        SCH_ITEM* symbol = placePower( ends.front(), out, first.path );
+        // The symbol at the row end lying furthest in its body direction (the row runs along
+        // it when the pins face sideways), else at the first stub
+        VECTOR2I at = ends.front();
+
+        if( sideways )
+        {
+            for( const VECTOR2I& end : ends )
+            {
+                if( ( end.x - at.x ) * natural.x + ( end.y - at.y ) * natural.y > 0 )
+                    at = end;
+            }
+        }
+
+        SCH_ITEM* symbol = placePower( at, body, first.path );
         commit.Add( symbol, screen );
         extra.push_back( symbol->m_Uuid );
     }
@@ -1745,7 +1793,9 @@ KOPENAPI_REGISTER( "sch_connect",
                         "net":{"type":"string"},
                         "pins":{"type":"array","items":{"type":"string"},"description":"REF.PIN, e.g. [\"U1.3\",\"C1.1\"]"},
                         "kind":{"type":"string","enum":["local","global","power"],"default":"local"},
-                        "power_lib_id":{"type":"string","description":"power symbol, default power:<net>"}}})json"_json,
+                        "power_lib_id":{"type":"string","description":"power symbol, default power:<net>"},
+                        "orientation":{"type":"string","enum":["upright","away"],"default":"upright",
+                                       "description":"power: upright keeps GND down / +V up (a short stub from sideways pins); away points the body away from the part"}}})json"_json,
                    false, h_sch_connect, 120 );
 
 KOPENAPI_REGISTER( "sch_wire",
