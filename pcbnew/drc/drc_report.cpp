@@ -145,6 +145,16 @@ bool DRC_REPORT::WriteJsonReport( const wxString& aFullFileName )
 {
     std::ofstream jsonFileStream( aFullFileName.fn_str() );
 
+    jsonFileStream << std::setw( 4 ) << GetJsonReport() << std::endl;
+    jsonFileStream.flush();
+    jsonFileStream.close();
+
+    return true;
+}
+
+
+nlohmann::json DRC_REPORT::GetJsonReport()
+{
     UNITS_PROVIDER            unitsProvider( pcbIUScale, m_reportUnits );
     BOARD_DESIGN_SETTINGS&    bds = m_board->GetDesignSettings();
     std::map<KIID, EDA_ITEM*> itemMap;
@@ -219,10 +229,5 @@ bool DRC_REPORT::WriteJsonReport( const wxString& aFullFileName )
         }
     }
 
-    nlohmann::json saveJson = nlohmann::json( reportHead );
-    jsonFileStream << std::setw( 4 ) << saveJson << std::endl;
-    jsonFileStream.flush();
-    jsonFileStream.close();
-
-    return true;
+    return nlohmann::json( reportHead );
 }

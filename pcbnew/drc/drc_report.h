@@ -22,6 +22,7 @@
 
 #include <memory>
 #include <eda_units.h>
+#include <json_common.h>
 #include <wx/string.h>
 
 class BOARD;
@@ -38,6 +39,11 @@ public:
 
     bool WriteTextReport( const wxString& aFullFileName );
     bool WriteJsonReport( const wxString& aFullFileName );
+
+    /**
+     * The JSON DRC report (drc.v1 schema) in memory, as written by WriteJsonReport.
+     */
+    nlohmann::json GetJsonReport();
 
 private:
     BOARD*                             m_board;

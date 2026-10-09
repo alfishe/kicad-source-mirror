@@ -22,6 +22,7 @@
 
 #include <memory>
 #include <eda_units.h>
+#include <json_common.h>
 #include <wx/string.h>
 
 class SCHEMATIC;
@@ -53,6 +54,11 @@ public:
      * @return True if the file write completed successfully, false otherwise
      */
     bool WriteJsonReport( const wxString& aFullFileName );
+
+    /**
+     * The JSON ERC report (erc.v1 schema) in memory, as written by WriteJsonReport.
+     */
+    nlohmann::json GetJsonReport();
 
 private:
     SCHEMATIC*                         m_sch;

@@ -160,6 +160,16 @@ bool ERC_REPORT::WriteJsonReport( const wxString& aFullFileName )
 {
     std::ofstream jsonFileStream( aFullFileName.fn_str() );
 
+    jsonFileStream << std::setw( 4 ) << GetJsonReport() << std::endl;
+    jsonFileStream.flush();
+    jsonFileStream.close();
+
+    return true;
+}
+
+
+nlohmann::json ERC_REPORT::GetJsonReport()
+{
     UNITS_PROVIDER            unitsProvider( schIUScale, m_reportUnits );
     std::map<KIID, EDA_ITEM*> itemMap;
 
@@ -233,10 +243,5 @@ bool ERC_REPORT::WriteJsonReport( const wxString& aFullFileName )
         }
     }
 
-    nlohmann::json saveJson = nlohmann::json( reportHead );
-    jsonFileStream << std::setw( 4 ) << saveJson << std::endl;
-    jsonFileStream.flush();
-    jsonFileStream.close();
-
-    return true;
+    return nlohmann::json( reportHead );
 }
