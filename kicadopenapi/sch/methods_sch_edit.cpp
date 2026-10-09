@@ -814,6 +814,27 @@ bool placeFieldsClear( SCH_SYMBOL* aSymbol, SCH_SCREEN* aScreen, const SCH_SHEET
 }
 
 
+/// When a footprint was given: does it exist and does every pin find its pad (sch_footprint_check)
+void attachFootprintCheck( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, nlohmann::json& aCard )
+{
+    if( aArgs.value( "footprint", std::string() ).empty() )
+        return;
+
+    std::optional<KOPENAPI_METHOD> check = KOPENAPI_REGISTRY::Get().Find( "sch_footprint_check" );
+
+    if( !check )
+        return;
+
+    KOPENAPI_RESULT result = check->handler( aCtx, { { "ref", aCard.value( "ref", std::string() ) }, { "problems_only", false } } );
+
+    if( result.status != 200 )
+        return;
+
+    const nlohmann::json& items = result.body["items"];
+    aCard["footprint_check"] = items.empty() ? nlohmann::json( { { "status", "ok" } } ) : items[0];
+}
+
+
 /// The net a pin is on now (after a commit), for confirming connections
 std::string netOfPin( SCHEMATIC* aSchematic, const std::string& aPin )
 {
@@ -1432,6 +1453,7 @@ static KOPENAPI_RESULT h_sch_symbol_add( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         card["warnings"] = { "no clear spot for the reference / value texts nearby: they overlap something "
                              "(sch_layout_check; field_positions to place them)" };
 
+    attachFootprintCheck( aCtx, aArgs, card );
     return KOPENAPI_RESULT::Ok( card );
 }
 
@@ -1534,13 +1556,13 @@ static KOPENAPI_RESULT h_sch_symbol_update( KOPENAPI_CONTEXT& aCtx, const nlohma
 
     pushEdit( commit, context->GetSchematic(), _( "Edit symbol (API)" ), aCtx.kiway, moved );
 
+    nlohmann::json card = symbolCard( at->symbol, at->path );
+
     if( !warnings.empty() )
-    {
-        nlohmann::json card = symbolCard( at->symbol, at->path );
         card["warnings"] = warnings;
-        return KOPENAPI_RESULT::Ok( card );
-    }
-    return KOPENAPI_RESULT::Ok( symbolCard( at->symbol, at->path ) );
+
+    attachFootprintCheck( aCtx, aArgs, card );
+    return KOPENAPI_RESULT::Ok( card );
 }
 
 
@@ -2366,23 +2388,125 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const std::string text = aArgs.value( "text", std::string() );
     const std::string kind = aArgs.value( "kind", std::string( "local" ) );
 
-    if( text.empty() || !aArgs.contains( "x_mm" ) || !aArgs.contains( "y_mm" ) )
-        return KOPENAPI_RESULT::Error( 400, "give 'text', 'x_mm' and 'y_mm' (the end of a wire or a pin end)" );
+    if( text.empty() || ( !aArgs.contains( "pin" ) && ( !aArgs.contains( "x_mm" ) || !aArgs.contains( "y_mm" ) ) ) )
+        return KOPENAPI_RESULT::Error( 400, "give 'text' and either 'pin' (REF.PIN: names the net there) or 'x_mm' / 'y_mm' "
+                                            "(a point on a wire or a pin end)" );
 
     if( kind != "local" && kind != "global" && kind != "hierarchical" )
         return KOPENAPI_RESULT::Error( 400, "kind must be local, global or hierarchical" );
 
-    std::optional<SCH_SHEET_PATH> sheet = targetSheet( *context, aArgs );
+    std::optional<SCH_SHEET_PATH> sheet;
+    VECTOR2I                      point;
+    std::string                   side = aArgs.value( "side", std::string( "auto" ) );
 
-    if( !sheet )
-        return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+    if( aArgs.contains( "pin" ) )
+    {
+        // Name the net at a pin: on a free grid point of the wire leaving the pin (text along
+        // the wire, away from the pin, clear of parts and texts), else on the pin end itself
+        std::optional<PIN_AT> at = aArgs["pin"].is_string() ? findPin( context->GetSchematic(), aArgs["pin"] ) : std::nullopt;
 
-    const VECTOR2I point( toIU( aArgs["x_mm"].get<double>() ), toIU( aArgs["y_mm"].get<double>() ) );
-    SCH_SCREEN*    screen = sheet->LastScreen();
+        if( !at )
+            return KOPENAPI_RESULT::Error( 404, "pin not found: " + aArgs["pin"].dump() );
+
+        sheet = at->path;
+        point = at->pin->GetPosition();
+
+        SCH_SCREEN* screen = sheet->LastScreen();
+        const int   grid = toIU( GRID_MM );
+        bool        found = false;
+
+        auto freeAt = [&]( const VECTOR2I& aAt, const SCH_ITEM* aWire )
+        {
+            for( SCH_ITEM* item : screen->Items().Overlapping( aAt ) )
+            {
+                if( item == aWire )
+                    continue;
+
+                if( item->Type() == SCH_LINE_T && item->HitTest( aAt, 0 ) )
+                    return false;
+
+                if( item->Type() == SCH_SYMBOL_T )
+                {
+                    for( SCH_PIN* pin : static_cast<SCH_SYMBOL*>( item )->GetPins( &*sheet ) )
+                    {
+                        if( pin->GetPosition() == aAt )
+                            return false;
+                    }
+                }
+                else if( item->Type() != SCH_LINE_T && item->GetPosition() == aAt )
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
+        for( SCH_ITEM* item : screen->Items().Overlapping( SCH_LINE_T, point ) )
+        {
+            SCH_LINE* wire = static_cast<SCH_LINE*>( item );
+
+            if( found || !wire->IsWire() || ( wire->GetStartPoint() != point && wire->GetEndPoint() != point ) )
+                continue;
+
+            const VECTOR2I other = wire->GetStartPoint() == point ? wire->GetEndPoint() : wire->GetStartPoint();
+            const VECTOR2I along = other - point;
+            const int      length = std::abs( along.x ) + std::abs( along.y );
+            const VECTOR2I step( along.x == 0 ? 0 : ( along.x > 0 ? grid : -grid ), along.y == 0 ? 0 : ( along.y > 0 ? grid : -grid ) );
+            const std::string away = along.x > 0 ? "right" : along.x < 0 ? "left" : along.y < 0 ? "up" : "down";
+
+            for( int k = 1; k * grid < length && !found; ++k )
+            {
+                const VECTOR2I candidate = point + step * k;
+
+                if( !freeAt( candidate, wire ) )
+                    continue;
+
+                // the text must lie on no part and no other text
+                SCH_LABEL probe( candidate, wxString::FromUTF8( text ) );
+                probe.SetSpinStyle( away == "right" ? SPIN_STYLE::RIGHT : away == "left" ? SPIN_STYLE::LEFT
+                                    : away == "up"  ? SPIN_STYLE::UP    : SPIN_STYLE::BOTTOM );
+                const BOX2I box = probe.GetBoundingBox();
+                bool        clear = true;
+
+                for( SCH_ITEM* other : screen->Items().Overlapping( box ) )
+                {
+                    if( other->Type() == SCH_SYMBOL_T )
+                        clear &= !static_cast<SCH_SYMBOL*>( other )->GetBodyAndPinsBoundingBox().Intersects( box );
+                    else if( labelKind( other->Type() ) || other->Type() == SCH_TEXT_T )
+                        clear = false;
+                }
+
+                if( clear )
+                {
+                    point = candidate;
+                    found = true;
+
+                    if( side == "auto" )
+                        side = away;
+                }
+            }
+        }
+
+        if( !found && side == "auto" )
+        {
+            const VECTOR2I out = outward( at->pin );
+            side = out.x > 0 ? "right" : out.x < 0 ? "left" : out.y < 0 ? "up" : "down";
+        }
+    }
+    else
+    {
+        sheet = targetSheet( *context, aArgs );
+
+        if( !sheet )
+            return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+
+        point = VECTOR2I( toIU( aArgs["x_mm"].get<double>() ), toIU( aArgs["y_mm"].get<double>() ) );
+    }
+
+    SCH_SCREEN* screen = sheet->LastScreen();
 
     // Text side: given, else away from the wire the label ends
-    std::string side = aArgs.value( "side", std::string( "auto" ) );
-
     if( side == "auto" )
     {
         side = "right";
@@ -2442,7 +2566,8 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
-    nlohmann::json result = { { "uuid", str( label->m_Uuid.AsString() ) }, { "net", net }, { "pins_on_net", pins }, { "side", side } };
+    nlohmann::json result = { { "uuid", str( label->m_Uuid.AsString() ) }, { "net", net }, { "pins_on_net", pins }, { "side", side },
+                              { "at", { toMm( point.x ), toMm( point.y ) } } };
 
     if( pins == 0 )
         result["warning"] = "the label touches no wire end or pin: it connects nothing yet";
@@ -2524,7 +2649,8 @@ KOPENAPI_REGISTER( "sch_symbol_add",
                    std::string( "Place a library symbol (part) on a sheet: lib_id from sch_lib_symbol_search, "
                                 "position in mm (snapped to the 1.27 mm grid), rotation, mirror, unit, value, "
                                 "footprint, fields, dnp; annotated automatically unless ref is given; returns "
-                                "uuid, ref and every pin with its position." ) + EDIT_NOTE,
+                                "uuid, ref, every pin with its position, field text boxes, and with a footprint "
+                                "footprint_check (found, every pin has its pad)." ) + EDIT_NOTE,
                    R"json({"type":"object","required":["lib_id","x_mm","y_mm"],"properties":{
                         "lib_id":{"type":"string"},"x_mm":{"type":"number"},"y_mm":{"type":"number"},
                         "sheet":{"type":"string","description":"sheet path from sch_sheet_list; default current/root"},
@@ -2624,12 +2750,15 @@ KOPENAPI_REGISTER( "sch_item_list",
                    false, h_sch_item_list );
 
 KOPENAPI_REGISTER( "sch_label_add",
-                   std::string( "Place a net label at a point - the end of a wire or a pin end - so it names / "
-                                "joins that net (local, global or hierarchical); text side auto (away from the "
-                                "wire) or left/right/up/down; answers the net it joined and warns when it "
-                                "touches nothing. Labels straight on pins: sch_connect." ) + EDIT_NOTE,
-                   R"json({"type":"object","required":["text","x_mm","y_mm"],"properties":{
-                        "text":{"type":"string"},"x_mm":{"type":"number"},"y_mm":{"type":"number"},
+                   std::string( "Place a net label so it names / joins a net (local, global or hierarchical): at "
+                                "a point on a wire or a pin end (x_mm, y_mm), or by pin (REF.PIN: on a free spot of "
+                                "the wire leaving that pin, text along the wire clear of parts, else on the pin "
+                                "end) - 'name this net'; text side auto or left/right/up/down; answers the net it "
+                                "joined and where, warns when it touches nothing. Labels on many pins at once: "
+                                "sch_connect." ) + EDIT_NOTE,
+                   R"json({"type":"object","required":["text"],"properties":{
+                        "text":{"type":"string"},"pin":{"type":"string","description":"REF.PIN, instead of x_mm / y_mm"},
+                        "x_mm":{"type":"number"},"y_mm":{"type":"number"},
                         "kind":{"type":"string","enum":["local","global","hierarchical"],"default":"local"},
                         "side":{"type":"string","enum":["auto","left","right","up","down"],"default":"auto"},
                         "sheet":{"type":"string"}}})json"_json,

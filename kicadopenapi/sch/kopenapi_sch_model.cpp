@@ -117,7 +117,7 @@ std::vector<std::string> PAD_RESOLVER::Resolve( const SCH_PIN* aPin, const SCH_S
         return toStrings( ExpandStackedPinNotation( aPin->GetEffectivePadNumber( aPath ) ) );
     }
 
-    const std::set<wxString>& pads = footprintPads( fpId.GetUniStringLibId() );
+    const std::set<wxString>& pads = FootprintPads( fpId.GetUniStringLibId() );
 
     if( pads.empty() )
     {
@@ -139,7 +139,7 @@ std::vector<std::string> PAD_RESOLVER::Resolve( const SCH_PIN* aPin, const SCH_S
 }
 
 
-const std::set<wxString>& PAD_RESOLVER::footprintPads( const wxString& aFootprintId )
+const std::set<wxString>& PAD_RESOLVER::FootprintPads( const wxString& aFootprintId )
 {
     auto it = m_cache.find( aFootprintId );
 

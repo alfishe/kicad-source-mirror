@@ -434,7 +434,7 @@ KOPENAPI_REGISTER( "pcb_lib_footprint_search",
                    "(from sch_lib_symbol_get) and pad count; filter by library glob, smd/tht; returns "
                    "lib_id, description, pads, type, pads extent, used_in_design; paginated",
                    KopenapiPagedSchema( R"json({
-                        "query":{"type":"string","description":"words, all must match"},
+                        "query":{"type":"string","description":"words; items matching all of them, else best partial matches (partial, unmatched_terms)"},
                         "filters":{"type":"array","items":{"type":"string"},"description":"footprint filters, e.g. [\"SOT?23*\"]"},
                         "pads":{"type":"integer","description":"exact number of connectable pads (= symbol pins)"},
                         "type":{"type":"string","enum":["smd","tht","unspecified"]},

@@ -77,8 +77,10 @@ public:
     /// aStatus: mapped | unmapped | no_footprint | footprint_not_found
     std::vector<std::string> Resolve( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath, std::string& aStatus );
 
+    /// Numbered pads of a library footprint (LIB:NAME); empty when not found
+    const std::set<wxString>& FootprintPads( const wxString& aFootprintId );
+
 private:
-    const std::set<wxString>& footprintPads( const wxString& aFootprintId );
 
     KIWAY*                                  m_kiway;
     PROJECT*                                m_project;

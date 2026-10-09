@@ -310,6 +310,13 @@ static KOPENAPI_RESULT h_sch_lib_symbol_get( KOPENAPI_CONTEXT& aCtx, const nlohm
     const std::map<std::string, int> used = usage( aCtx );
     auto                             u = used.find( card["lib_id"] );
 
+    // Body outline of unit 1 in the same frame as the pins: mm from the symbol origin at
+    // rotation 0, y growing downwards as on the sheet
+    const BOX2I body = flat->GetBodyBoundingBox( 1, 1, false, false );
+    auto        mm3 = []( int aIU ) { return std::round( schIUScale.IUTomm( aIU ) * 1000.0 ) / 1000.0; };
+
+    card["coordinates"] = "mm from the symbol origin, rotation 0, y grows downwards (as on the sheet)";
+    card["body_mm"] = { mm3( body.GetLeft() ), mm3( body.GetTop() ), mm3( body.GetRight() ), mm3( body.GetBottom() ) };
     card["fields"] = fields;
     card["pin_list"] = pins;
     card["unit_list"] = units;
@@ -333,7 +340,7 @@ KOPENAPI_REGISTER( "sch_lib_symbol_search",
                    "pin count; returns lib_id, description, pins, units, default footprint, footprint "
                    "filters, used_in_design; paginated",
                    KopenapiPagedSchema( R"json({
-                        "query":{"type":"string","description":"words, all must match"},
+                        "query":{"type":"string","description":"words; items matching all of them, else best partial matches (partial, unmatched_terms)"},
                         "lib":{"type":"string","description":"glob on the library name"},
                         "power":{"type":"boolean","default":false,"description":"power symbols only"},
                         "min_pins":{"type":"integer"},"max_pins":{"type":"integer"}})json"_json ),
