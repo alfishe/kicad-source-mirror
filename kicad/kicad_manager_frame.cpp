@@ -1421,7 +1421,11 @@ void KICAD_MANAGER_FRAME::OnIdle( wxIdleEvent& aEvent )
 
             int i = 0;
 
-            for( const PROJECT_FILE_STATE& file : Prj().GetLocalSettings().m_files )
+            // Iterate a copy: opening an editor saves its file state (m_files.push_back may
+            // reallocate) and wxYield() runs other events, which invalidates live iterators
+            const std::vector<PROJECT_FILE_STATE> files = Prj().GetLocalSettings().m_files;
+
+            for( const PROJECT_FILE_STATE& file : files )
             {
                 if( file.open && !openedFiles.count( file.fileName ) )
                 {
