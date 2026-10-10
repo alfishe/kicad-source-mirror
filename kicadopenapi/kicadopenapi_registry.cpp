@@ -256,3 +256,19 @@ std::vector<KOPENAPI_CANVAS_RENDER> KOPENAPI_REGISTRY::CanvasRenders() const
     std::lock_guard<std::mutex> lock( m_mutex );
     return m_canvasRenders;
 }
+
+
+bool KOPENAPI_REGISTRY::AddCanvasSteady( KOPENAPI_CANVAS_STEADY aSteady )
+{
+    KOPENAPI_REGISTRY& reg = Get();
+    std::lock_guard<std::mutex> lock( reg.m_mutex );
+    reg.m_canvasSteadies.push_back( std::move( aSteady ) );
+    return true;
+}
+
+
+std::vector<KOPENAPI_CANVAS_STEADY> KOPENAPI_REGISTRY::CanvasSteadies() const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return m_canvasSteadies;
+}

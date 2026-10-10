@@ -3,6 +3,7 @@
 /// written by the system, no external tools. Frames carry their own time (variable frame rate).
 #if defined( __APPLE__ )
 
+#include "frame_scaler.h"
 #include "video_encoder.h"
 
 #import <AVFoundation/AVFoundation.h>
@@ -140,19 +141,7 @@ public:
             uint8_t*     dst = static_cast<uint8_t*>( CVPixelBufferGetBaseAddress( buffer ) );
             const size_t stride = CVPixelBufferGetBytesPerRow( buffer );
 
-            for( int y = 0; y < m_inH; ++y )
-            {
-                const uint8_t* s = aRgb + size_t( y ) * m_inW * 3;
-                uint8_t*       d = dst + size_t( y ) * stride;
-
-                for( int x = 0; x < m_inW; ++x, s += 3, d += 4 )
-                {
-                    d[0] = s[2];
-                    d[1] = s[1];
-                    d[2] = s[0];
-                    d[3] = 255;
-                }
-            }
+            KopenapiRgbToBgra( aRgb, m_inW, m_inH, m_inW * 3, dst, int( stride ) );   // SIMD / vImage
 
             CVPixelBufferUnlockBaseAddress( buffer, 0 );
 

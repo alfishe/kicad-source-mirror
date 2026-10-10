@@ -51,6 +51,7 @@
 #include <core/profile.h>
 
 #include <functional>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <list>
@@ -874,6 +875,10 @@ void OPENGL_GAL::EndDrawing()
         m_compositor->DrawBuffer( m_overlayBuffer );
 
     m_compositor->Present();
+
+    if( m_frameCapture.pending )
+        captureFrame();   // the composed frame, before the cursor
+
     blitCursor();
 
     cntComposite.Stop();
@@ -936,43 +941,183 @@ bool OPENGL_GAL::GetScreenshot( wxImage& aDstImage )
             glReadBuffer( (GLenum) readBuffer );
             glReadPixels( 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, over.data() );
 
-            for( size_t i = 0; i < (size_t) w * h; ++i )
+            // premultiplied overlay over the main buffer: c = o + m * ( 255 - a ) / 255, in an
+            // integer form the compiler vectorizes ( x / 255 ~ ( x + 1 + ( x >> 8 ) ) >> 8 )
+            const size_t   n = (size_t) w * h * 4;
+            unsigned char* m = rgba.data();
+            const unsigned char* o = over.data();
+
+            for( size_t i = 0; i < n; i += 4 )
             {
-                const unsigned a = over[i * 4 + 3];
+                const unsigned inv = 255u - o[i + 3];
 
-                if( a == 0 )
-                    continue;
-
-                for( int c = 0; c < 3; ++c )
+                for( int k = 0; k < 3; ++k )
                 {
-                    const unsigned v = over[i * 4 + c] + rgba[i * 4 + c] * ( 255 - a ) / 255;
-                    rgba[i * 4 + c] = (unsigned char) std::min( 255u, v );
+                    const unsigned x = m[i + k] * inv;
+                    const unsigned v = o[i + k] + ( ( x + 1 + ( x >> 8 ) ) >> 8 );
+                    m[i + k] = (unsigned char) ( v > 255u ? 255u : v );
                 }
             }
         }
 
-        // wxImage wants separate RGB and alpha buffers and takes ownership of them.
+        // wxImage wants separate RGB and alpha buffers and takes ownership of them; rows are
+        // written top first (OpenGL reads bottom up), so no mirrored copy afterwards
         unsigned char* rgb = (unsigned char*) malloc( (size_t) w * h * 3 );
         unsigned char* alpha = (unsigned char*) malloc( (size_t) w * h );
 
-        for( int i = 0; i < w * h; ++i )
+        for( int y = 0; y < h; ++y )
         {
-            rgb[i * 3 + 0] = rgba[i * 4 + 0];
-            rgb[i * 3 + 1] = rgba[i * 4 + 1];
-            rgb[i * 3 + 2] = rgba[i * 4 + 2];
-            alpha[i] = rgba[i * 4 + 3];
+            const unsigned char* src = rgba.data() + (size_t) ( h - 1 - y ) * w * 4;
+            unsigned char*       dst = rgb + (size_t) y * w * 3;
+            unsigned char*       al = alpha + (size_t) y * w;
+
+            for( int x = 0; x < w; ++x )
+            {
+                dst[x * 3 + 0] = src[x * 4 + 0];
+                dst[x * 3 + 1] = src[x * 4 + 1];
+                dst[x * 3 + 2] = src[x * 4 + 2];
+                al[x] = src[x * 4 + 3];
+            }
         }
 
         aDstImage.SetData( rgb, w, h, false );
         aDstImage.SetAlpha( alpha, false );
-
-        aDstImage = aDstImage.Mirror( false );
         ok = true;
     }
 
     m_compositor->SetBuffer( OPENGL_COMPOSITOR::DIRECT_RENDERING );
 
     return ok;
+}
+
+
+void OPENGL_GAL::RequestFrameCapture( unsigned char* aRgb, int aWidth, int aHeight )
+{
+    m_frameCapture.pending = true;
+    m_frameCapture.rgb = aRgb;
+    m_frameCapture.width = aWidth;
+    m_frameCapture.height = aHeight;
+    m_frameCapture.done = false;
+}
+
+
+bool OPENGL_GAL::TakeFrameCaptured()
+{
+    const bool done = m_frameCapture.done;
+    m_frameCapture.pending = false;
+    m_frameCapture.rgb = nullptr;
+    m_frameCapture.done = false;
+    return done;
+}
+
+
+void OPENGL_GAL::captureFrame()
+{
+    FRAME_CAPTURE& c = m_frameCapture;
+    const int      w = c.width, h = c.height;
+    const bool     scaled = c.rgb != nullptr;
+
+    c.pending = false;
+
+    if( scaled && ( w <= 0 || h <= 0 || !glBlitFramebuffer ) )
+    {
+        c.rgb = nullptr;
+        return;
+    }
+
+    GLint drawFb = 0, readFb = 0, viewport[4];
+    glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &drawFb );
+    glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &readFb );
+    glGetIntegerv( GL_VIEWPORT, viewport );
+
+    const int sw = viewport[2], sh = viewport[3];
+
+    auto target = []( GLuint& aFbo, GLuint& aColor, int& aW, int& aH, int aWantW, int aWantH )
+    {
+        if( aFbo && aW == aWantW && aH == aWantH )
+            return;
+
+        if( aFbo )
+        {
+            glDeleteFramebuffers( 1, &aFbo );
+            glDeleteRenderbuffers( 1, &aColor );
+        }
+
+        glGenFramebuffers( 1, &aFbo );
+        glGenRenderbuffers( 1, &aColor );
+        glBindRenderbuffer( GL_RENDERBUFFER, aColor );
+        glRenderbufferStorage( GL_RENDERBUFFER, GL_RGBA8, aWantW, aWantH );
+        glBindFramebuffer( GL_FRAMEBUFFER, aFbo );
+        glFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, aColor );
+        aW = aWantW;
+        aH = aWantH;
+    };
+
+    // a multisampled screen cannot be scaled by a blit: resolve it at its own size first
+    GLint source = drawFb, samples = 0;
+    glBindFramebuffer( GL_READ_FRAMEBUFFER, drawFb );
+    glGetIntegerv( GL_SAMPLES, &samples );
+
+    if( samples > 0 && glBlitFramebuffer )
+    {
+        target( c.resolveFbo, c.resolveColor, c.resolveWidth, c.resolveHeight, sw, sh );
+        glBindFramebuffer( GL_READ_FRAMEBUFFER, drawFb );
+        glBindFramebuffer( GL_DRAW_FRAMEBUFFER, c.resolveFbo );
+        glBlitFramebuffer( 0, 0, sw, sh, 0, 0, sw, sh, GL_COLOR_BUFFER_BIT, GL_NEAREST );
+        source = c.resolveFbo;
+    }
+
+    // the screen's own size: one read, rows flipped here (the caller scales on the CPU)
+    if( !scaled )
+    {
+        const size_t row = (size_t) sw * 3;
+        c.raw.resize( row * sh );
+        glBindFramebuffer( GL_READ_FRAMEBUFFER, source );
+        glPixelStorei( GL_PACK_ALIGNMENT, 1 );
+        glReadPixels( 0, 0, sw, sh, GL_RGB, GL_UNSIGNED_BYTE, c.raw.data() );
+
+        std::vector<unsigned char> tmp( row );
+
+        for( int y = 0; y < sh / 2; ++y )
+        {
+            unsigned char* a = c.raw.data() + row * y;
+            unsigned char* b = c.raw.data() + row * ( sh - 1 - y );
+            std::memcpy( tmp.data(), a, row );
+            std::memcpy( a, b, row );
+            std::memcpy( b, tmp.data(), row );
+        }
+
+        c.rawWidth = sw;
+        c.rawHeight = sh;
+        c.done = glGetError() == GL_NO_ERROR;
+
+        glBindFramebuffer( GL_DRAW_FRAMEBUFFER, drawFb );
+        glBindFramebuffer( GL_READ_FRAMEBUFFER, readFb );
+        return;
+    }
+
+    // fitted, centred, letterboxed; flipped to top row first
+    target( c.fbo, c.color, c.fboWidth, c.fboHeight, w, h );
+    glBindFramebuffer( GL_DRAW_FRAMEBUFFER, c.fbo );
+    glClearColor( 18 / 255.0f, 18 / 255.0f, 22 / 255.0f, 1.0f );   // the bars of every fitted video frame
+    glClear( GL_COLOR_BUFFER_BIT );
+
+    const double k = std::min( double( w ) / sw, double( h ) / sh );
+    const int    dw = int( sw * k ), dh = int( sh * k );
+    const int    x0 = ( w - dw ) / 2, y0 = ( h - dh ) / 2;
+
+    glBindFramebuffer( GL_READ_FRAMEBUFFER, source );
+    glBlitFramebuffer( 0, 0, sw, sh, x0, y0 + dh, x0 + dw, y0, GL_COLOR_BUFFER_BIT, GL_LINEAR );
+
+    glBindFramebuffer( GL_READ_FRAMEBUFFER, c.fbo );
+    glPixelStorei( GL_PACK_ALIGNMENT, 1 );
+    glReadPixels( 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, c.rgb );
+
+    c.done = glGetError() == GL_NO_ERROR;
+    c.rgb = nullptr;
+
+    glBindFramebuffer( GL_DRAW_FRAMEBUFFER, drawFb );
+    glBindFramebuffer( GL_READ_FRAMEBUFFER, readFb );
 }
 
 

@@ -157,7 +157,9 @@ static KOPENAPI_RESULT openGui( KOPENAPI_CONTEXT& aCtx, const wxFileName& aBoard
     // another process holds it (or its project) open: refused here, never asked in a dialog
     if( !KICAD_OPENAPI_SERVICE::OverrideLock() && frame->GetCurrentFileName() != aBoard.GetFullPath() )
     {
-        if( const std::string owner = KopenapiLockedBy( aBoard ); !owner.empty() )
+        const wxString ownProject = aCtx.kiway ? aCtx.kiway->Prj().GetProjectFullName() : wxString();
+
+        if( const std::string owner = KopenapiLockedBy( aBoard, ownProject ); !owner.empty() )
         {
             return KOPENAPI_RESULT::Error( 409, "the board or its project is open in another process (" + owner
                                                         + "): close it there, or open with override_lock: true" );

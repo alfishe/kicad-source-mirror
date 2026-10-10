@@ -5,6 +5,8 @@
 #include <frame_type.h>
 #include <kicadopenapi_keepalive.h>
 #include <kicadopenapi_registry.h>
+#include <kicadopenapi_gal_render.h>
+#include <kicadopenapi_steadycam.h>
 #include <kicadopenapi_view_motion.h>
 #include <kiway.h>
 #include <sch_edit_frame.h>
@@ -78,6 +80,13 @@ static KOPENAPI_RESULT h_sch_view_zoom( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     auto        mm = []( double x ) { return std::round( x / schIUScale.IU_PER_MM * 100 ) / 100; };
     return KOPENAPI_RESULT::Ok( { { "viewport_mm", { mm( v.GetLeft() ), mm( v.GetTop() ), mm( v.GetRight() ), mm( v.GetBottom() ) } } } );
 }
+
+
+/// @brief Recordings' steadycam for the schematic canvas
+KOPENAPI_REGISTER_CANVAS_STEADY( KopenapiSteadyGal );
+
+/// @brief Recordings: the schematic canvas at the video's size (composed frame scaled on the GPU)
+KOPENAPI_REGISTER_CANVAS_RENDER( KopenapiRenderGal );
 
 
 KOPENAPI_REGISTER( "sch_view_zoom",

@@ -13,6 +13,7 @@
 #include <wx/display.h>
 
 #include <kicadopenapi_capture.h>
+#include <kicadopenapi_keepalive.h>
 #include <kicadopenapi_registry.h>
 
 #include <kiway.h>
@@ -27,6 +28,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -79,6 +81,34 @@ public:
             return KOPENAPI_RESULT::Error( 409, "a recording is running (record_stop)" );
 
         const std::string source = aArgs.value( "source", std::string( "window" ) );
+
+        if( std::string error; !SetSteady( aArgs.value( "steadycam", nlohmann::json( true ) ), error ) )
+            return KOPENAPI_RESULT::Error( 400, error );
+
+        // how frames are taken: the GPU (composed and scaled there), the CPU (one read, SIMD
+        // scaling on the encoder thread) or whichever works (auto)
+        m_capturePath = aArgs.value( "capture", std::string( "auto" ) );
+
+        if( m_capturePath != "auto" && m_capturePath != "gpu" && m_capturePath != "cpu" )
+            return KOPENAPI_RESULT::Error( 400, "capture: auto, gpu or cpu" );
+
+        // the clock: video time (every frame the next one, never faster than real time; when
+        // capture is slower the video runs longer instead of skipping) or wall time (frames the
+        // wall clock passed by are skipped)
+        m_clockMode = aArgs.value( "clock", std::string( "auto" ) );
+
+        if( m_clockMode != "auto" && m_clockMode != "video" && m_clockMode != "wall" )
+            return KOPENAPI_RESULT::Error( 400, "clock: auto, video or wall" );
+
+        m_videoClock = m_clockMode != "wall";
+        m_lastFrameWall = CLOCK::time_point();
+        m_videoEpoch = CLOCK::time_point();
+        m_videoFrames = 0;
+        m_clockMs.clear();
+        m_clockSkipped = 0;
+        m_clockLog = nlohmann::json::array();
+
+        m_steadyLast = CLOCK::time_point();
 
         if( source != "window" && source != "canvas" )
             return KOPENAPI_RESULT::Error( 400, "source: window or canvas" );
@@ -150,8 +180,10 @@ public:
             if( settings.width < 16 || settings.height < 16 || settings.width > 7680 || settings.height > 4320 )
                 return KOPENAPI_RESULT::Error( 400, "profile custom: width and height (16..7680 x 16..4320)" );
 
-            settings.inputWidth = std::max( 2, first.GetWidth() & ~1 );   // the encoder fits it in
-            settings.inputHeight = std::max( 2, first.GetHeight() & ~1 );
+            // frames of another size are fitted on the encoder thread (SIMD), so the encoder gets
+            // the video's size
+            settings.inputWidth = settings.width;
+            settings.inputHeight = settings.height;
             m_letterbox = true;
 
             // a canvas that can draw itself at the video's size (the 3D viewer) is rendered there:
@@ -159,11 +191,19 @@ public:
             wxImage sharp;
 
             m_qualityMode = aArgs.value( "quality_mode", std::string( "adaptive" ) );
-            m_tier = m_qualityMode == "fast" ? TIER_READBACK
+
+            if( m_capturePath != "auto" )
+                m_qualityMode = "max";   // the path asked for stays
+
+            m_tier = m_capturePath == "cpu" || m_qualityMode == "fast" ? TIER_READBACK
                      : aArgs.value( "antialias", std::string( "ssaa2" ) ) == "none" ? TIER_GPU : TIER_GPU_SSAA;
             m_tierLog = nlohmann::json::array();
             m_tierMs.clear();
             m_tierFrames = 0;
+
+            if( m_capturePath == "gpu" && !( m_canvas && KopenapiRenderCanvas( m_canvas, settings.width, settings.height, sharp ) ) )
+                return KOPENAPI_RESULT::Error( 409, "capture gpu: this canvas cannot be rendered on the GPU here (source canvas, a "
+                                                    "4k / 1080p / custom profile, OpenGL)" );
 
             if( m_canvas && m_tier != TIER_READBACK && KopenapiRenderCanvas( m_canvas, settings.width, settings.height, sharp ) )
             {
@@ -234,7 +274,8 @@ public:
         if( !m_timer )
             m_timer = std::make_unique<RECORD_TIMER>( *this );
 
-        m_timer->Start( std::max( 1, 1000 / settings.fps ) );
+        // twice per frame: a timer firing late does not skip a frame
+        m_timer->Start( std::max( 1, 500 / settings.fps ) );
 
         nlohmann::json answer = status();
         answer["encoder"] = m_encoder->Name();
@@ -331,6 +372,10 @@ public:
                  { "capture_ms_max", std::round( m_captureMsMax * 10 ) / 10 },
                  { "stop_reason", m_stopReason },
                  { "started_unix_ms", m_startedUnixMs },
+                 { "steadycam", steadyJson() },
+                 { "capture", m_capturePath },
+                 { "clock", m_videoClock ? "video" : "wall" },
+                 { "clock_changes", m_clockLog },
                  { "quality_tier", m_renderSize.x > 0 ? nlohmann::json( tierName( m_tier ) ) : nlohmann::json() },
                  { "quality_changes", m_tierLog },
                  { "error", m_error } };
@@ -375,22 +420,121 @@ public:
             }
         }
 
-        const int64_t index = currentIndex();
-
-        if( index <= m_lastIndex || m_window->IsIconized() )
+        if( m_window->IsIconized() )
             return;
 
+        if( m_videoClock )
+        {
+            advanceVideo();
+            return;
+        }
+
+        const int64_t index = currentIndex();
+
+        if( index <= m_lastIndex )
+            return;
+
+        m_clockSkipped += int( std::max<int64_t>( 0, index - m_lastIndex - 1 ) );
+        advance( index );
+    }
+
+    /// @brief Capture and enqueue frame aIndex; keeps the clock decision up to date
+    bool advance( int64_t aIndex )
+    {
         const auto t0 = CLOCK::now();
         wxImage    image;
 
         if( !capture( m_window, image ) )
-            return;
+            return false;
 
         const double ms = std::chrono::duration<double, std::milli>( CLOCK::now() - t0 ).count();
         m_captureMsTotal += ms;
         m_captureMsMax = std::max( m_captureMsMax, ms );
-        enqueue( image, index );
+
+        // the encoder keeps up: on video time wait for it instead of skipping
+        if( m_videoClock )
+        {
+            std::unique_lock<std::mutex> lock( m_mutex );
+            m_cv.wait( lock, [this]() { return m_queue.size() < 3 || !m_error.empty(); } );
+        }
+
+        enqueue( image, aIndex );
+        m_lastFrameWall = CLOCK::now();
+        clockStep( ms );
+        return true;
     }
+
+    /// @brief Wall clock: notes in clock_changes when frames start being skipped (capture slower
+    /// than real time; clock auto / video would not skip)
+    void clockStep( double aMs )
+    {
+        if( m_videoClock )
+            return;
+
+        const double budget = 1000.0 / m_settings.fps;
+
+        // frames the wall clock passed by since the last one count as time taken too
+        aMs += m_clockSkipped * budget;
+        m_clockSkipped = 0;
+        m_clockMs.push_back( aMs );
+
+        if( m_clockMs.size() > 30 )
+            m_clockMs.pop_front();
+
+        double avg = 0;
+
+        for( double v : m_clockMs )
+            avg += v;
+
+        avg /= m_clockMs.size();
+
+        if( m_clockMs.size() >= 10 && avg > budget * 0.95 && m_clockLog.empty() )
+        {
+            m_clockLog.push_back( { { "time_s", double( m_lastIndex ) / m_settings.fps },
+                                    { "clock", "wall" },
+                                    { "why", "frames skipped: they take " + std::to_string( int( avg ) ) + " ms (a frame is "
+                                                     + std::to_string( int( budget ) ) + "); clock auto would not skip" } } );
+        }
+    }
+
+    /// @brief Video time: the next frame, once a frame's time has passed since the last one (never
+    /// faster than real time; slower when capture is)
+    bool advanceVideo()
+    {
+        if( !m_active || m_paused || !m_videoClock || !m_window )
+            return false;
+
+        // frame n is due at epoch + n periods: a late timer is caught up, never ahead of real time;
+        // more than a quarter second behind (a long call held the main thread) the schedule moves
+        // on and the video runs longer than real time instead of repeating one picture
+        const auto now = CLOCK::now();
+        const auto period = std::chrono::duration_cast<CLOCK::duration>( std::chrono::duration<double>( 1.0 / m_settings.fps ) );
+
+        if( m_videoEpoch == CLOCK::time_point() )
+        {
+            m_videoEpoch = now;
+            m_videoFrames = 0;
+        }
+
+        const auto due = m_videoEpoch + period * m_videoFrames;
+
+        if( now < due )
+            return false;
+
+        if( now - due > std::chrono::milliseconds( 250 ) )
+        {
+            m_videoEpoch = now - period * m_videoFrames;
+        }
+
+        if( !advance( m_lastIndex + 1 ) )
+            return false;
+
+        m_videoFrames++;
+        return true;
+    }
+
+    int64_t LastIndex() const { return m_lastIndex; }
+    bool    VideoClock() const { return m_videoClock; }
 
     bool Synced( int* aFps )
     {
@@ -538,8 +682,85 @@ private:
         return true;
     }
 
+public:
+    /// @brief Steadycam settings from true / false / "filter" / "timed" / {mode, smooth_ms, duration_ms}
+    bool SetSteady( const nlohmann::json& aSpec, std::string& aError )
+    {
+        KOPENAPI_STEADY steady;
+        std::string     mode = "timed";
+
+        if( aSpec.is_boolean() )
+            mode = aSpec.get<bool>() ? "timed" : "off";
+        else if( aSpec.is_string() )
+            mode = aSpec.get<std::string>();
+        else if( aSpec.is_object() )
+            mode = aSpec.value( "enabled", true ) ? aSpec.value( "mode", std::string( "timed" ) ) : "off";
+
+        if( mode != "off" && mode != "filter" && mode != "timed" )
+        {
+            aError = "steadycam mode: off, filter or timed";
+            return false;
+        }
+
+        steady.mode = mode == "off" ? KOPENAPI_STEADY::OFF : mode == "filter" ? KOPENAPI_STEADY::FILTER : KOPENAPI_STEADY::TIMED;
+
+        if( aSpec.is_object() )
+        {
+            steady.smoothSeconds = std::clamp( aSpec.value( "smooth_ms", 450.0 ), 50.0, 5000.0 ) / 1000.0;
+            steady.durationSeconds = std::clamp( aSpec.value( "duration_ms", 600.0 ), 50.0, 10000.0 ) / 1000.0;
+        }
+
+        m_steady = steady;
+        return true;
+    }
+
+    nlohmann::json steadyJson() const
+    {
+        return { { "mode", m_steady.mode == KOPENAPI_STEADY::OFF ? "off" : m_steady.mode == KOPENAPI_STEADY::FILTER ? "filter" : "timed" },
+                 { "smooth_ms", std::lround( m_steady.smoothSeconds * 1000 ) },
+                 { "duration_ms", std::lround( m_steady.durationSeconds * 1000 ) } };
+    }
+
+private:
+    /// @brief Steadycam: the recorded view eases to where it was put instead of jumping
+    void steady( wxTopLevelWindow* aWindow, std::function<void()>& aRestore )
+    {
+        wxWindow* canvas = m_canvas ? m_canvas.get() : KopenapiFindCanvas( aWindow );
+
+        if( !canvas )
+            return;
+
+        const auto now = CLOCK::now();
+        double     dt = m_steadyLast == CLOCK::time_point() ? 1.0
+                                                            : std::chrono::duration<double>( now - m_steadyLast ).count();
+        m_steadyLast = now;
+
+        if( m_videoClock && dt < 1.0 )
+            dt = 1.0 / m_settings.fps;   // video time: one frame per step
+
+        for( const KOPENAPI_CANVAS_STEADY& step : KOPENAPI_REGISTRY::Get().CanvasSteadies() )
+        {
+            if( step( canvas, std::min( dt, 1.0 ), m_steady, KopenapiAnimating(), aRestore ) )
+                break;
+        }
+    }
+
     bool capture( wxTopLevelWindow* aWindow, wxImage& aImage )
     {
+        // steadycam: this frame is drawn from the eased view, the real one comes back after it
+        std::function<void()> restore;
+        steady( aWindow, restore );
+
+        struct RESTORE
+        {
+            std::function<void()>& fn;
+            ~RESTORE()
+            {
+                if( fn )
+                    fn();
+            }
+        } restoreAfter{ restore };
+
         if( m_source == "canvas" && m_canvas && m_renderSize.x > 0 )
             return renderSharp( aImage );
 
@@ -551,6 +772,9 @@ private:
 
     int64_t currentIndex() const
     {
+        if( m_videoClock )
+            return m_lastIndex + 1;   // every frame the next one
+
         CLOCK::duration elapsed = ( m_paused ? m_pauseStart : CLOCK::now() ) - m_start - m_pausedTotal;
         return int64_t( std::chrono::duration<double>( elapsed ).count() * m_settings.fps );
     }
@@ -621,18 +845,18 @@ private:
                 }
                 else
                 {
-                    std::vector<uint8_t> fitted( size_t( inW ) * inH * 3 );
-                    KopenapiFitRgb( frame.rgb.data(), frame.width, frame.height, frame.width * 3, fitted.data(), inW,
-                                    inH, inW * 3, KOPENAPI_SCALE_QUALITY::HIGH, 0x121216 );
-                    ok = m_encoder->Write( fitted.data(), frame.index, error );
+                    m_fitted.resize( size_t( inW ) * inH * 3 );
+                    m_scaler.FitRgb( frame.rgb.data(), frame.width, frame.height, frame.width * 3, m_fitted.data(), inW, inH,
+                                     inW * 3, KOPENAPI_SCALE_QUALITY::HIGH, 0x121216 );
+                    ok = m_encoder->Write( m_fitted.data(), frame.index, error );
                 }
             }
             else
             {
-                std::vector<uint8_t> rgb( outBytes );
-                KopenapiScaleRgb( frame.rgb.data(), frame.width, frame.height, frame.width * 3, rgb.data(), m_settings.width,
-                                  m_settings.height, m_settings.width * 3, KOPENAPI_SCALE_QUALITY::HIGH );
-                ok = m_encoder->Write( rgb.data(), frame.index, error );
+                m_fitted.resize( outBytes );
+                m_scaler.ScaleRgb( frame.rgb.data(), frame.width, frame.height, frame.width * 3, m_fitted.data(),
+                                   m_settings.width, m_settings.height, m_settings.width * 3, KOPENAPI_SCALE_QUALITY::HIGH );
+                ok = m_encoder->Write( m_fitted.data(), frame.index, error );
             }
 
             std::lock_guard<std::mutex> lock( m_mutex );
@@ -672,6 +896,19 @@ private:
     int64_t                                 m_startedUnixMs = 0;   ///< wall clock of frame 0 (aligning parallel recordings)
     int                                     m_tier = 0;            ///< TIER of the offscreen canvas path
     std::string                             m_qualityMode = "adaptive";
+    std::string                             m_capturePath = "auto"; ///< auto / gpu / cpu
+    KOPENAPI_FRAME_SCALER                   m_scaler;               ///< encoder thread: fits frames (tables kept)
+    std::vector<uint8_t>                    m_fitted;               ///< encoder thread: the fitted frame
+    std::string                             m_clockMode = "auto";   ///< auto / video / wall
+    bool                                    m_videoClock = false;   ///< frames on video time now
+    int                                     m_clockSkipped = 0;     ///< wall-clock frames passed by since the last one
+    CLOCK::time_point                       m_lastFrameWall;        ///< when the last frame was taken
+    CLOCK::time_point                       m_videoEpoch;           ///< video clock: when frame 0 of the schedule was due
+    int64_t                                 m_videoFrames = 0;      ///< video clock: frames taken on this schedule
+    std::deque<double>                      m_clockMs;              ///< recent capture times (auto clock)
+    nlohmann::json                          m_clockLog = nlohmann::json::array();
+    KOPENAPI_STEADY                         m_steady;              ///< steadycam mode and timing
+    CLOCK::time_point                       m_steadyLast;
     std::deque<double>                      m_tierMs;              ///< recent frame times on this tier
     int                                     m_tierFrames = 0;
     nlohmann::json                          m_tierLog = nlohmann::json::array();
@@ -821,6 +1058,59 @@ public:
             r->RecordFrame();
     }
 
+    /// @brief Let aSeconds of video pass in every running recording: on video time the frames are
+    /// taken here one after another (as fast as capture goes), on wall time the timer takes them;
+    /// the UI keeps running. Without a recording: a plain pause with the UI alive.
+    nlohmann::json Wait( double aSeconds )
+    {
+        const auto started = CLOCK::now();
+        auto       recorders = Active();
+
+        if( recorders.empty() )
+        {
+            while( std::chrono::duration<double>( CLOCK::now() - started ).count() < aSeconds )
+            {
+                KopenapiKeepUiAlive();
+                std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
+            }
+
+            return { { "recording", false }, { "wall_s", aSeconds } };
+        }
+
+        std::vector<std::pair<RECORDER*, int64_t>> targets;
+
+        for( RECORDER* r : recorders )
+            targets.push_back( { r, r->LastIndex() + std::max<int64_t>( 1, std::llround( aSeconds * r->Fps() ) ) } );
+
+        // a guard: a recording that stops taking frames (window closed) ends the wait
+        const double limit = std::max( 30.0, aSeconds * 30 );
+
+        for( ;; )
+        {
+            bool pending = false;
+
+            for( auto& [r, target] : targets )
+            {
+                if( !r->Active() || r->LastIndex() >= target )
+                    continue;
+
+                pending = true;
+
+                if( r->VideoClock() )
+                    r->advanceVideo();
+            }
+
+            if( !pending || std::chrono::duration<double>( CLOCK::now() - started ).count() > limit )
+                break;
+
+            KopenapiKeepUiAlive();
+            std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+        }
+
+        return { { "recording", true }, { "video_s", aSeconds },
+                 { "wall_s", std::chrono::duration<double>( CLOCK::now() - started ).count() } };
+    }
+
     int ScreenSteps()
     {
         int steps = 1;
@@ -844,6 +1134,21 @@ private:
 };
 
 } // namespace
+
+
+static std::atomic<bool> s_animating{ false };
+
+
+void KopenapiSetAnimating( bool aAnimating )
+{
+    s_animating = aAnimating;
+}
+
+
+bool KopenapiAnimating()
+{
+    return s_animating;
+}
 
 
 void KopenapiRecorderShutdown()
@@ -952,6 +1257,38 @@ static KOPENAPI_RESULT h_record_resume( KOPENAPI_CONTEXT&, const nlohmann::json&
 }
 
 
+static KOPENAPI_RESULT h_record_wait( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
+{
+    const double seconds = aArgs.value( "seconds", 1.0 );
+
+    if( seconds < 0 || seconds > 600 )
+        return KOPENAPI_RESULT::Error( 400, "seconds: 0..600" );
+
+    return KOPENAPI_RESULT::Ok( RECORDINGS::Get().Wait( seconds ) );
+}
+
+
+static KOPENAPI_RESULT h_record_steadycam( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
+{
+    if( RECORDINGS::Get().Active().empty() )
+        return KOPENAPI_RESULT::Error( 409, "no recording is running" );
+
+    nlohmann::json spec = aArgs;
+    spec.erase( "id" );
+
+    return forPicked( aArgs, true,
+                      [&]( RECORDER& r )
+                      {
+                          std::string error;
+
+                          if( !r.SetSteady( spec.empty() ? nlohmann::json( true ) : spec, error ) )
+                              return KOPENAPI_RESULT::Error( 400, error );
+
+                          return KOPENAPI_RESULT::Ok( r.status() );
+                      } );
+}
+
+
 static KOPENAPI_RESULT h_record_marker( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
 {
     const std::string text = aArgs.value( "text", std::string() );
@@ -972,6 +1309,9 @@ KOPENAPI_REGISTER( "record_start",
                         "encoder":{"type":"string","enum":["auto","native","ffmpeg"],"default":"auto"},
                         "fps":{"type":"integer","minimum":1,"maximum":60,"description":"default 20 for a window, 30 for a canvas"},
                         "antialias":{"type":"string","enum":["ssaa2","none"],"default":"ssaa2","description":"canvases rendered at the video size (3D viewer): 2x supersampling on the GPU"},
+                        "capture":{"type":"string","enum":["auto","gpu","cpu"],"default":"auto","description":"how frames are taken: gpu (composed and scaled on the GPU, read once; canvas source with a 4k / 1080p / custom profile), cpu (one read of the composed frame, SIMD scaling on the encoder thread), auto (gpu where it works)"},
+                        "clock":{"type":"string","enum":["auto","video","wall"],"default":"auto","description":"auto / video: video time — every frame the next one, never faster than real time; when capture is slower the video runs longer instead of skipping frames (smooth); record_wait paces scripts on it. wall: frames follow the wall clock, skipped when capture is slower"},
+                        "steadycam":{"description":"how the recorded view goes where it is put (API jumps, view changes): timed (default: a smooth path that arrives exactly duration_ms later), filter (eases through a smoothing filter, arrives later), off; true = timed, false = off, or {mode, smooth_ms (filter, default 450), duration_ms (timed, default 600)}; API animations pass as they are","oneOf":[{"type":"boolean"},{"type":"string","enum":["timed","filter","off"]},{"type":"object","properties":{"mode":{"type":"string","enum":["timed","filter","off"]},"enabled":{"type":"boolean"},"smooth_ms":{"type":"number"},"duration_ms":{"type":"number"}}}]},
                         "quality_mode":{"type":"string","enum":["adaptive","max","fast"],"default":"adaptive","description":"3D viewer canvas: adaptive starts at full quality and steps down (gpu 2x -> gpu -> window readback scaled) when frames exceed the budget or the GPU refuses, back up with room to spare; max keeps the best the GPU can do; fast uses the readback"},
                         "profile":{"type":"string","enum":["source","1080p","4k","custom"],"default":"source","description":"4k (3840x2160) / 1080p (1920x1080) / custom (width x height, e.g. one half of a side-by-side): every frame scaled (bicubic up, high-quality down) to fit, centred; the 3D viewer renders at that size; source: the window's size capped by max_width"},
                         "width":{"type":"integer","description":"profile custom"},
@@ -998,6 +1338,26 @@ KOPENAPI_REGISTER( "record_pause", "Pause the video recording(s) (the paused tim
 
 KOPENAPI_REGISTER( "record_resume", "Resume paused video recording(s); id, else all",
                    R"json({"type":"object","properties":{"id":{"type":"string","description":"default: every running recording"}}})json"_json, true, h_record_resume );
+
+KOPENAPI_REGISTER( "record_wait",
+                   "Pause a script by video time: returns once every running recording has taken this many "
+                   "seconds of video (on video time — capture slower than real time — the frames are taken "
+                   "here one after another, so the video keeps its pace); without a recording a plain pause; "
+                   "the UI keeps running. Answers the video and wall seconds",
+                   R"json({"type":"object","properties":{
+                        "seconds":{"type":"number","default":1,"minimum":0,"maximum":600}}})json"_json,
+                   true, h_record_wait, 660 );
+
+KOPENAPI_REGISTER( "record_steadycam",
+                   "Change a running recording's steadycam (how the recorded view goes where it is put): "
+                   "mode timed (a smooth path that arrives exactly duration_ms later), filter (eases "
+                   "through a smoothing filter, arrives later) or off; id, else every running recording",
+                   R"json({"type":"object","properties":{
+                        "id":{"type":"string"},
+                        "mode":{"type":"string","enum":["timed","filter","off"],"default":"timed"},
+                        "smooth_ms":{"type":"number","default":450},
+                        "duration_ms":{"type":"number","default":600}}})json"_json,
+                   true, h_record_steadycam );
 
 KOPENAPI_REGISTER( "record_marker",
                    "Mark the current time of the video recording with a text (chapters / captions for "

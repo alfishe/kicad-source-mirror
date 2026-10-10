@@ -176,8 +176,9 @@ static KOPENAPI_RESULT h_sch_view_capture( KOPENAPI_CONTEXT& aCtx, const nlohman
 KOPENAPI_REGISTER_CANVAS_CAPTURE(
         []( wxWindow* aWindow, wxImage& aImage ) -> bool
         {
+            // the composed frame in one read (no second buffer, no CPU blend); else KiCad's screenshot
             auto* canvas = dynamic_cast<EDA_DRAW_PANEL_GAL*>( aWindow );
-            return canvas && canvas->GetScreenshot( aImage ) && aImage.IsOk();
+            return canvas && ( canvas->CaptureComposed( aImage ) || canvas->GetScreenshot( aImage ) ) && aImage.IsOk();
         } );
 
 

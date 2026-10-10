@@ -174,6 +174,16 @@ public:
      */
     bool GetScreenshot( wxImage& aDstImage );
 
+    /// @brief Draw the view and take the composed frame into aRgb (aWidth x aHeight RGB, top row
+    /// first), fitted and letterboxed on the GPU (OpenGL only). For recordings.
+    /// @return false when the backend cannot (the caller falls back to GetScreenshot)
+    bool RenderToImage( unsigned char* aRgb, int aWidth, int aHeight );
+
+    /// @brief Draw the view and take the composed frame at the canvas' own size (one read back,
+    /// rows flipped on the CPU; OpenGL only). Faster than GetScreenshot (no second buffer, no
+    /// blending on the CPU). For recordings.
+    bool CaptureComposed( wxImage& aImage );
+
     virtual void Refresh( bool aEraseBackground = true, const wxRect* aRect = nullptr ) override;
 
     /**

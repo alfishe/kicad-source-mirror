@@ -116,6 +116,28 @@ using KOPENAPI_CANVAS_CAPTURE = std::function<bool( wxWindow* aWindow, wxImage& 
 /// aSupersample > 1 draws that many times larger and averages down (antialiasing).
 using KOPENAPI_CANVAS_RENDER = std::function<bool( wxWindow* aWindow, int aWidth, int aHeight, int aSupersample, wxImage& aImage )>;
 
+/// @brief How a recording's steadycam moves the view to where it was put
+struct KOPENAPI_STEADY
+{
+    enum MODE
+    {
+        OFF,      ///< jumps stay jumps
+        FILTER,   ///< follows through a smoothing filter: no jump, arrives later (time stretched)
+        TIMED     ///< a smooth path to the target that arrives exactly durationSeconds later
+    };
+
+    MODE   mode = TIMED;
+    double smoothSeconds = 0.45;     ///< FILTER: time constant of the two stages together
+    double durationSeconds = 0.6;    ///< TIMED: every move takes exactly this long
+};
+
+/// @brief Steadycam step for a canvas the kiface owns (recordings): puts the view where the
+/// recorded picture should be on its way to the view's real state (as aSteady says; exactly there
+/// when aExact: an API animation, already smooth) and sets aRestore, which the recorder calls
+/// after the frame to put the real state back. Returns false for windows it does not own.
+using KOPENAPI_CANVAS_STEADY = std::function<bool( wxWindow* aWindow, double aDt, const KOPENAPI_STEADY& aSteady,
+                                                   bool aExact, std::function<void()>& aRestore )>;
+
 
 /// @brief Thread-safe: kiface DSOs register while HTTP workers read; readers get copies.
 class KICOMMON_API KOPENAPI_REGISTRY
@@ -142,6 +164,9 @@ public:
     static bool AddCanvasCapture( KOPENAPI_CANVAS_CAPTURE aCapture );
     static bool AddCanvasRender( KOPENAPI_CANVAS_RENDER aRender );
     std::vector<KOPENAPI_CANVAS_RENDER> CanvasRenders() const;
+
+    static bool AddCanvasSteady( KOPENAPI_CANVAS_STEADY aSteady );
+    std::vector<KOPENAPI_CANVAS_STEADY> CanvasSteadies() const;
 
     std::vector<KOPENAPI_CANVAS_CAPTURE> CanvasCaptures() const;
 
@@ -172,6 +197,7 @@ private:
     std::map<std::string, KOPENAPI_DOC_RELEASE> m_docReleasers;
     std::vector<KOPENAPI_CANVAS_CAPTURE>        m_canvasCaptures;
     std::vector<KOPENAPI_CANVAS_RENDER>         m_canvasRenders;
+    std::vector<KOPENAPI_CANVAS_STEADY>         m_canvasSteadies;
     std::map<std::string, KOPENAPI_DOC_HISTORY> m_docHistories;
     std::set<std::string>                       m_editing;
 };
@@ -198,5 +224,8 @@ private:
 
 #define KOPENAPI_REGISTER_CANVAS_RENDER( aRender )                                         \
     static const bool kopenapi_canvas_render_reg = KOPENAPI_REGISTRY::AddCanvasRender( aRender )
+
+#define KOPENAPI_REGISTER_CANVAS_STEADY( aSteady )                                         \
+    static const bool kopenapi_canvas_steady_reg = KOPENAPI_REGISTRY::AddCanvasSteady( aSteady )
 
 #endif

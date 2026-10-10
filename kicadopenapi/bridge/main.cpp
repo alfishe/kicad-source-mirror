@@ -391,6 +391,8 @@ private:
     // All below run with m_mutex held
     void BindTo(const bridge::Instance& inst, const std::string& why);
     void Unbind();
+    /// @brief After app_restart: wait for the new process on the same port and bind to it
+    bool FollowRestart();
     bool EnsureBound(std::string& error);
     std::optional<bridge::Instance> Start(const std::string& mode, const std::string& path, std::string& error);
 
@@ -487,6 +489,33 @@ std::optional<bridge::Instance> Bridge::Start(const std::string& mode, const std
     return inst;
 }
 
+bool Bridge::FollowRestart()
+{
+    const std::string url = m_url;
+    const long        old = m_pid;
+    const auto        deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(m_cfg.startTimeout);
+
+    while (Clock::now() < deadline)
+    {
+        for (const bridge::Instance& inst : bridge::Discover(m_cfg.discoveryDir))
+        {
+            if (inst.mcpUrl == url && inst.pid != old)
+            {
+                BindTo(inst, "pid " + std::to_string(old) + " restarted on the same port");
+                m_restartUrl.clear();
+                m_lostPid = 0;
+                m_lostUrl.clear();
+                return true;
+            }
+        }
+        m_mutex.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        m_mutex.lock();
+    }
+    m_restartUrl.clear();
+    return false;
+}
+
 bool Bridge::EnsureBound(std::string& error)
 {
     if (!m_cfg.pinnedUrl.empty())
@@ -574,12 +603,24 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
         return std::nullopt;
     }
 
-    const long pid = m_pid;
+    long pid = m_pid;
     m_inFlight = true;
     m_mutex.unlock();  // long calls must not block housekeeping bookkeeping
     bridge::HttpResult result = bridge::Post(host, port, path, line);
     m_mutex.lock();
     m_inFlight = false;
+
+    // app_restart was sent here: the old process may still be quitting while its server is gone;
+    // wait for the new one on the same port and send the call once more
+    if (!result.ok && !m_restartUrl.empty() && m_restartUrl == m_url && FollowRestart())
+    {
+        pid = m_pid;
+        m_inFlight = true;
+        m_mutex.unlock();
+        result = bridge::Post(host, port, path, line);
+        m_mutex.lock();
+        m_inFlight = false;
+    }
 
     if (auto it = m_children.find(pid); it != m_children.end())
     {

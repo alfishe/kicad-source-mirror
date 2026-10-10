@@ -34,6 +34,14 @@ inline void KopenapiAnimate( double aSeconds, const std::function<void( double )
         return;
     }
 
+    // the motion is smooth already: a recording's steadycam follows it exactly
+    KopenapiSetAnimating( true );
+
+    struct ANIMATING_END
+    {
+        ~ANIMATING_END() { KopenapiSetAnimating( false ); }
+    } animatingEnd;
+
     if( KopenapiRecordingSync( &fps ) && fps > 0 )
     {
         const int frames = std::max( 1, int( std::lround( aSeconds * fps ) ) );

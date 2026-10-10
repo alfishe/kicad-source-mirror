@@ -339,6 +339,24 @@ public:
 
     bool GetScreenshot( wxImage& aDstImage );
 
+    /// @brief The next frame drawn is taken as the screen gets it (composed, cursor excepted), read
+    /// back once. With aRgb: into aRgb at aWidth x aHeight (RGB, top row first), scaled to fit
+    /// and letterboxed (#121216, as fitted video frames elsewhere) on the GPU. Without
+    /// (nullptr): at the screen's own size into a buffer of the GAL (CapturedFrame()), rows
+    /// flipped on the CPU; the caller scales. For recordings.
+    void RequestFrameCapture( unsigned char* aRgb, int aWidth, int aHeight );
+
+    /// @return true once the requested frame was captured (the request is then over)
+    bool TakeFrameCaptured();
+
+    /// @brief The last frame captured at the screen's size (RGB, top row first)
+    const std::vector<unsigned char>& CapturedFrame( int& aWidth, int& aHeight ) const
+    {
+        aWidth = m_frameCapture.rawWidth;
+        aHeight = m_frameCapture.rawHeight;
+        return m_frameCapture.raw;
+    }
+
     /// Parameters passed to the GLU tesselator
     struct TessParams
     {
@@ -350,6 +368,24 @@ public:
     };
 
 private:
+    /// @brief Capture target buffers (kept while the sizes stay) and the pending request
+    struct FRAME_CAPTURE
+    {
+        bool           pending = false;
+        unsigned char* rgb = nullptr;
+        std::vector<unsigned char> raw;                ///< the screen's size (no target given)
+        int            rawWidth = 0, rawHeight = 0;
+        int            width = 0, height = 0;
+        bool           done = false;
+        GLuint         fbo = 0, color = 0;             ///< the output size
+        int            fboWidth = 0, fboHeight = 0;
+        GLuint         resolveFbo = 0, resolveColor = 0; ///< the screen's size, for multisampled screens
+        int            resolveWidth = 0, resolveHeight = 0;
+    }                  m_frameCapture;
+
+    /// @brief Copy the composed frame (the screen's draw buffer) into the capture request
+    void captureFrame();
+
     /// Super class definition
     typedef GAL super;
 

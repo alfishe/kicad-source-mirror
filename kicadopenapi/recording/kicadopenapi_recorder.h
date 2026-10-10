@@ -27,4 +27,8 @@ class wxWindow;
 /// @return false when no recording renders it
 KICOMMON_API bool KopenapiRecordingRenderSize( wxWindow* aCanvas, int* aWidth, int* aHeight );
 
+/// @brief An API animation (KopenapiAnimate) is moving a view now: steadycam takes it as it is
+KICOMMON_API void KopenapiSetAnimating( bool aAnimating );
+KICOMMON_API bool KopenapiAnimating();
+
 #endif

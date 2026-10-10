@@ -12,8 +12,9 @@
 #include <string>
 
 
-/// @brief "user@host" of another process holding aDocument or its project open, else empty
-inline std::string KopenapiLockedBy( const wxFileName& aDocument )
+/// @brief "user@host" of another process holding aDocument or its project open, else empty.
+/// aOwnProject: the project this process has open (its lock is ours, not another's)
+inline std::string KopenapiLockedBy( const wxFileName& aDocument, const wxString& aOwnProject = wxEmptyString )
 {
     wxFileName project( aDocument );
     project.SetExt( FILEEXT::ProjectFileExtension );
@@ -21,6 +22,9 @@ inline std::string KopenapiLockedBy( const wxFileName& aDocument )
     for( const wxFileName& file : { project, aDocument } )
     {
         if( !file.FileExists() )
+            continue;
+
+        if( !aOwnProject.IsEmpty() && wxFileName( aOwnProject ).SameAs( project ) && file == project )
             continue;
 
         LOCKFILE lock = LOCKFILE::Inspect( file.GetFullPath() );

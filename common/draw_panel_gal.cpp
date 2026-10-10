@@ -48,6 +48,7 @@
 #include <kiplatform/touchpad.h>
 #include <kiplatform/ui.h>
 
+#include <cstring>
 #include <stdexcept>
 
 #include <core/profile.h>
@@ -728,6 +729,48 @@ bool EDA_DRAW_PANEL_GAL::GetScreenshot( wxImage& aDstImage )
         return false;
 
     return static_cast<KIGFX::OPENGL_GAL*>( m_gal )->GetScreenshot( aDstImage );
+}
+
+
+bool EDA_DRAW_PANEL_GAL::RenderToImage( unsigned char* aRgb, int aWidth, int aHeight )
+{
+    if( m_backend != GAL_TYPE_OPENGL || !m_gal || !aRgb || aWidth <= 0 || aHeight <= 0 )
+        return false;
+
+    auto* gal = static_cast<KIGFX::OPENGL_GAL*>( m_gal );
+    gal->RequestFrameCapture( aRgb, aWidth, aHeight );
+    DoRePaint( false );
+
+    // the repaint may have replaced a GAL lost to a GPU reset
+    if( m_backend != GAL_TYPE_OPENGL || m_gal != gal )
+        return false;
+
+    return gal->TakeFrameCaptured();
+}
+
+
+bool EDA_DRAW_PANEL_GAL::CaptureComposed( wxImage& aImage )
+{
+    if( m_backend != GAL_TYPE_OPENGL || !m_gal )
+        return false;
+
+    auto* gal = static_cast<KIGFX::OPENGL_GAL*>( m_gal );
+    gal->RequestFrameCapture( nullptr, 0, 0 );
+    DoRePaint( false );
+
+    if( m_backend != GAL_TYPE_OPENGL || m_gal != gal || !gal->TakeFrameCaptured() )
+        return false;
+
+    int                               w = 0, h = 0;
+    const std::vector<unsigned char>& rgb = gal->CapturedFrame( w, h );
+
+    if( w <= 0 || h <= 0 )
+        return false;
+
+    unsigned char* data = (unsigned char*) malloc( rgb.size() );   // wxImage takes ownership
+    std::memcpy( data, rgb.data(), rgb.size() );
+    aImage.SetData( data, w, h, false );
+    return true;
 }
 
 

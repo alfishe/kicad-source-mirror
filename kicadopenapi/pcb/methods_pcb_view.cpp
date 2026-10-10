@@ -16,13 +16,17 @@
 #include <footprint.h>
 #include <frame_type.h>
 #include <kicadopenapi_keepalive.h>
+#include <kicadopenapi_gal_render.h>
+#include <kicadopenapi_steadycam.h>
 #include <kicadopenapi_view_motion.h>
 #include <gal/3d/camera.h>
+#include <glm/gtc/quaternion.hpp>
 #include <3d_enums.h>
 #include <3d_canvas/board_adapter.h>
 #include <3d_rendering/raytracing/shapes3D/bbox_3d.h>
 
 #include <chrono>
+#include <map>
 #include <cmath>
 #include <thread>
 
@@ -89,23 +93,135 @@ static KOPENAPI_RESULT h_pcb_view_capture( KOPENAPI_CONTEXT& aCtx, const nlohman
 KOPENAPI_REGISTER_CANVAS_CAPTURE(
         []( wxWindow* aWindow, wxImage& aImage ) -> bool
         {
+            // the composed frame in one read (no second buffer, no CPU blend); else KiCad's screenshot
             if( auto* canvas = dynamic_cast<EDA_DRAW_PANEL_GAL*>( aWindow ) )
-                return canvas->GetScreenshot( aImage ) && aImage.IsOk();
+                return ( canvas->CaptureComposed( aImage ) || canvas->GetScreenshot( aImage ) ) && aImage.IsOk();
 
+            // the 3D canvas drawn offscreen at its own size in its own GL context (its screenshot
+            // reads whatever context is current, which may be another editor's)
             if( auto* canvas3d = dynamic_cast<EDA_3D_CANVAS*>( aWindow ) )
             {
-                canvas3d->GetScreenshot( aImage );
-                return aImage.IsOk();
+                const wxSize size = canvas3d->GetNativePixelSize();
+
+                if( size.x <= 0 || size.y <= 0 )
+                    return false;
+
+                aImage.Create( size.x, size.y, false );
+                return canvas3d->RenderToImage( aImage.GetData(), size.x, size.y, 1 ) && aImage.IsOk();
             }
 
             return false;
         } );
 
 
-/// @brief Recordings: the 3D viewer drawn offscreen at the video's size from its loaded scene
+/// @brief 3D camera pose for the steadycam: rotation and log zoom
+struct STEADY_3D_POSE
+{
+    glm::quat rotation{ 1, 0, 0, 0 };
+    double    logZoom = 0;
+};
+
+
+struct STEADY_3D_OPS
+{
+    /// @brief The turn from a to b as axis * angle, with the zoom change as the fourth part
+    static glm::dvec4 delta( const STEADY_3D_POSE& a, const STEADY_3D_POSE& b )
+    {
+        glm::quat d = b.rotation * glm::inverse( a.rotation );
+
+        if( d.w < 0 )
+            d = -d;   // the short way round
+
+        const double angle = 2 * std::acos( std::clamp( (double) d.w, -1.0, 1.0 ) );
+        const double sinHalf = std::sqrt( std::max( 0.0, 1.0 - (double) d.w * d.w ) );
+        const glm::dvec3 axis = sinHalf > 1e-9 ? glm::dvec3( d.x, d.y, d.z ) / sinHalf : glm::dvec3( 0 );
+        return glm::dvec4( axis * angle, b.logZoom - a.logZoom );
+    }
+
+    STEADY_3D_POSE lerp( const STEADY_3D_POSE& a, const STEADY_3D_POSE& b, double s ) const
+    {
+        glm::quat target = b.rotation;
+
+        if( glm::dot( a.rotation, target ) < 0 )
+            target = -target;
+
+        return { glm::normalize( glm::slerp( a.rotation, target, (float) s ) ), a.logZoom + ( b.logZoom - a.logZoom ) * s };
+    }
+
+    double distance( const STEADY_3D_POSE& a, const STEADY_3D_POSE& b ) const { return glm::length( delta( a, b ) ); }
+
+    double rate( const STEADY_3D_POSE& aFrom, const STEADY_3D_POSE& aTo, const STEADY_3D_POSE& aShown,
+                 const STEADY_3D_POSE& aTarget ) const
+    {
+        const glm::dvec4 v = delta( aFrom, aTo ), d = delta( aShown, aTarget );
+        const double     len2 = glm::dot( d, d );
+        return len2 > 1e-12 ? glm::dot( v, d ) / len2 : 0.0;
+    }
+};
+
+
+/// @brief Recordings' steadycam: board canvas (GAL) and the 3D viewer's camera
+static bool steadyBoard( wxWindow* aWindow, double aDt, const KOPENAPI_STEADY& aSteady, bool aExact,
+                         std::function<void()>& aRestore )
+{
+    if( KopenapiSteadyGal( aWindow, aDt, aSteady, aExact, aRestore ) )
+        return true;
+
+    auto* canvas = dynamic_cast<EDA_3D_CANVAS*>( aWindow );
+    auto* viewer = canvas ? dynamic_cast<EDA_3D_VIEWER_FRAME*>( wxGetTopLevelParent( canvas ) ) : nullptr;
+
+    if( !viewer )
+        return false;
+
+    static std::map<wxWindow*, KOPENAPI_STEADY_TRACK<STEADY_3D_POSE>> tracks;
+
+    CAMERA&              camera = viewer->GetCurrentCamera();
+    const STEADY_3D_POSE now{ glm::normalize( glm::quat_cast( glm::mat3( camera.GetRotationMatrix() ) ) ),
+                              std::log( std::max( 1e-6f, camera.GetZoom() ) ) };
+    auto                 it = tracks.find( aWindow );
+
+    if( it == tracks.end() || aDt > 0.5 || aExact || aSteady.mode == KOPENAPI_STEADY::OFF )
+    {
+        tracks[aWindow].reset( now );
+        return true;
+    }
+
+    const STEADY_3D_POSE show = it->second.step( now, aDt, aSteady, STEADY_3D_OPS() );
+
+    if( STEADY_3D_OPS().distance( show, now ) < 1e-9 )
+        return true;
+
+    // the camera's real state comes back after the frame: KiCad's own presets and animations keep
+    // working on it undisturbed
+    const glm::mat4 realRotation = camera.GetRotationMatrix();
+    const float     realZoom = camera.GetZoom();
+
+    // RotateX( 0 ) refreshes the view matrix (SetRotationMatrix alone does not)
+    camera.SetRotationMatrix( glm::mat4_cast( show.rotation ) );
+    camera.RotateX( 0.0f );
+    camera.Zoom( (float) ( camera.GetZoom() / std::exp( show.logZoom ) ) );
+
+    aRestore = [&camera, realRotation, realZoom]()
+    {
+        camera.SetRotationMatrix( realRotation );
+        camera.RotateX( 0.0f );
+        camera.Zoom( camera.GetZoom() / realZoom );
+    };
+
+    return true;
+}
+
+KOPENAPI_REGISTER_CANVAS_STEADY( steadyBoard );
+
+
+/// @brief Recordings: board canvas (GAL, composed frame scaled on the GPU) and the 3D viewer drawn
+/// offscreen at the video's size from its loaded scene
 KOPENAPI_REGISTER_CANVAS_RENDER(
         []( wxWindow* aWindow, int aWidth, int aHeight, int aSupersample, wxImage& aImage ) -> bool
         {
+            if( KopenapiRenderGal( aWindow, aWidth, aHeight, aSupersample, aImage ) )
+                return true;
+
             auto* canvas = dynamic_cast<EDA_3D_CANVAS*>( aWindow );
 
             if( !canvas || aWidth <= 0 || aHeight <= 0 )
