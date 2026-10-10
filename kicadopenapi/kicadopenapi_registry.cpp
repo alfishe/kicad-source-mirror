@@ -51,6 +51,23 @@ std::map<std::string, KOPENAPI_DOC_HISTORY> KOPENAPI_REGISTRY::DocumentHistories
 }
 
 
+bool KOPENAPI_REGISTRY::AddViewBenchmark( const std::string& aDomain, KOPENAPI_HANDLER aHandler )
+{
+    KOPENAPI_REGISTRY& reg = Get();
+    std::lock_guard<std::mutex> lock( reg.m_mutex );
+
+    reg.m_viewBenchmarks[aDomain] = std::move( aHandler );
+    return true;
+}
+
+
+std::map<std::string, KOPENAPI_HANDLER> KOPENAPI_REGISTRY::ViewBenchmarks() const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return m_viewBenchmarks;
+}
+
+
 bool KOPENAPI_REGISTRY::MarkEditing( std::initializer_list<const char*> aNames )
 {
     KOPENAPI_REGISTRY& reg = Get();

@@ -27,6 +27,7 @@
 #include <wx/log.h>
 
 #include <view/view.h>
+#include <gal/render_stats.h>
 #include <view/view_group.h>
 #include <view/view_item.h>
 #include <view/view_rtree.h>
@@ -1125,6 +1126,8 @@ void VIEW::redrawRect( const BOX2I& aRect )
 {
     SyncLayerVisibilityCache();
 
+    RENDER_STATS* stats = RENDER_STATS::Active();
+
     for( VIEW_LAYER* l : m_orderedLayers )
     {
         if( l->items->IsEmpty() )
@@ -1132,6 +1135,10 @@ void VIEW::redrawRect( const BOX2I& aRect )
 
         if( l->visible && IsTargetDirty( l->target ) && areRequiredLayersEnabled( l->id ) )
         {
+            const auto     layerStart = stats ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point();
+            const uint64_t itemsBefore = stats ? stats->frame.itemsCached + stats->frame.itemsImmediate : 0;
+
             DRAW_ITEM_VISITOR drawFunc( this, l->id, m_useDrawPriority, m_reverseDrawOrder );
 
             m_gal->SetTarget( l->target );
@@ -1164,6 +1171,15 @@ void VIEW::redrawRect( const BOX2I& aRect )
 
                 l->items->Query( aRect, drawFunc );
             }
+
+            if( stats )
+            {
+                RENDER_LAYER_STATS& ls = stats->layers[l->id];
+                ls.ms += RENDER_STATS::Since( layerStart );
+                ls.items += stats->frame.itemsCached + stats->frame.itemsImmediate - itemsBefore;
+                ls.frames++;
+                stats->frame.layers++;
+            }
         }
     }
 }
@@ -1182,15 +1198,25 @@ void VIEW::draw( VIEW_ITEM* aItem, int aLayer, bool aImmediate )
         int group = viewData->getGroup( aLayer );
 
         if( group >= 0 )
+        {
             m_gal->DrawGroup( group );
+
+            if( RENDER_STATS* stats = RENDER_STATS::Active() )
+                stats->frame.itemsCached++;
+        }
         else
+        {
             Update( aItem );
+        }
     }
     else
     {
         // Immediate mode
         if( !m_painter->Draw( aItem, aLayer ) )
             aItem->ViewDraw( aLayer, this );  // Alternative drawing method
+
+        if( RENDER_STATS* stats = RENDER_STATS::Active() )
+            stats->frame.itemsImmediate++;
     }
 }
 
@@ -1475,6 +1501,9 @@ void VIEW::updateItemGeometry( VIEW_ITEM* aItem, int aLayer )
         aItem->ViewDraw( aLayer, this ); // Alternative drawing method
 
     m_gal->EndGroup();
+
+    if( RENDER_STATS* stats = RENDER_STATS::Active() )
+        stats->frame.itemsRecached++;
 }
 
 
@@ -1596,6 +1625,21 @@ bool VIEW::areRequiredLayersEnabled( int aLayerId ) const
 
 void VIEW::RecacheAllItems()
 {
+    // only the view makes groups: all of them go at once, every item is drawn again
+    if( m_gal->DeleteAllGroups() )
+    {
+        for( VIEW_ITEM* item : *m_allItems )
+        {
+            if( item && item->viewPrivData() )
+            {
+                item->viewPrivData()->deleteGroups();
+                Update( item, KIGFX::REPAINT );
+            }
+        }
+
+        return;
+    }
+
     BOX2I r;
 
     r.SetMaximum();
@@ -1624,6 +1668,7 @@ void VIEW::UpdateItems()
         return;
 
     unsigned int cntGeomUpdate = 0;
+    unsigned int cntAnyUpdate = 0;
     bool         anyUpdated = false;
 
     for( VIEW_ITEM* item : *m_allItems )
@@ -1639,6 +1684,7 @@ void VIEW::UpdateItems()
         if( vpd->m_requiredUpdate != NONE )
         {
             anyUpdated = true;
+            cntAnyUpdate++;
 
             if( vpd->m_requiredUpdate & ( GEOMETRY | LAYERS ) )
                 cntGeomUpdate++;
@@ -1652,9 +1698,15 @@ void VIEW::UpdateItems()
     // R*-tree individual inserts use forced reinsertion on node overflow, making them
     // significantly more expensive than simple R-tree inserts. At ~5% changed items
     // the cost of individual Remove+Insert operations exceeds a full bulk rebuild.
+    RENDER_STATS* stats = RENDER_STATS::Active();
+
+    if( stats )
+        stats->frame.itemsUpdated += cntAnyUpdate;
+
     if( ratio > 0.05 )
     {
-        auto allItems = *m_allItems;
+        const auto rtreeStart = std::chrono::steady_clock::now();
+        auto       allItems = *m_allItems;
 
         // Clear all R-trees
         for( auto& [_, layer] : m_layers )
@@ -1703,6 +1755,9 @@ void VIEW::UpdateItems()
                 MarkTargetDirty( it->second.target );
             }
         }
+
+        if( stats )
+            stats->frame.rtree += RENDER_STATS::Since( rtreeStart );
     }
 
     // Skipping the loop below leaves m_requiredUpdate and m_hasPendingItemUpdates set so the

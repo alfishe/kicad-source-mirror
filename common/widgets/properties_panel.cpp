@@ -342,26 +342,27 @@ void PROPERTIES_PANEL::rebuildProperties( const SELECTION& aSelection )
         }
     }
 
+    // Dynamic properties of each item, read once; a name is common when every item has it
+    std::vector<std::vector<PROPERTY_BASE*>> dynamicProps;
+    std::map<wxString, size_t>               itemsWithName;
+
     for( const EDA_ITEM* item : aSelection )
     {
-        for( PROPERTY_BASE* prop : item->GetDynamicProperties() )
+        std::vector<PROPERTY_BASE*>& props = dynamicProps.emplace_back( item->GetDynamicProperties() );
+        std::set<wxString>           names;
+
+        for( PROPERTY_BASE* prop : props )
         {
-            bool commonToAll = true;
+            if( names.insert( prop->Name() ).second )
+                itemsWithName[prop->Name()]++;
+        }
+    }
 
-            for( const EDA_ITEM* other : aSelection )
-            {
-                std::vector<PROPERTY_BASE*> otherProps = other->GetDynamicProperties();
-
-                if( std::ranges::none_of( otherProps,
-                                          [&]( PROPERTY_BASE* p )
-                                          {
-                                              return p->Name() == prop->Name();
-                                          } ) )
-                {
-                    commonToAll = false;
-                    break;
-                }
-            }
+    for( const std::vector<PROPERTY_BASE*>& props : dynamicProps )
+    {
+        for( PROPERTY_BASE* prop : props )
+        {
+            const bool commonToAll = itemsWithName[prop->Name()] == dynamicProps.size();
 
             if( !commonToAll || commonProps.contains( prop->Name() ) )
                 continue;

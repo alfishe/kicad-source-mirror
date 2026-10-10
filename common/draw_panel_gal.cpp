@@ -36,6 +36,7 @@
 #include <gal/graphics_abstraction_layer.h>
 #include <gal/opengl/opengl_gal.h>
 #include <gal/opengl/gpu_oom_error.h>
+#include <gal/render_stats.h>
 #include <gal/cairo/cairo_gal.h>
 #include <math/vector2wx.h>
 
@@ -406,6 +407,8 @@ bool EDA_DRAW_PANEL_GAL::DoRePaint( bool aAllowSkip )
     PROF_TIMER cntRedraw("view-redraw-rects", false);
 
     bool isDirty = false;
+    bool updated = false;
+    bool drawn = false;
 
     cntTotal.Start();
 
@@ -428,6 +431,7 @@ bool EDA_DRAW_PANEL_GAL::DoRePaint( bool aAllowSkip )
         if( hasPendingItemUpdates )
         {
             cntUpd.Start();
+            updated = true;
 
             try
             {
@@ -533,6 +537,7 @@ bool EDA_DRAW_PANEL_GAL::DoRePaint( bool aAllowSkip )
 
         // ctx goes out of scope here so destructor would be called
         cntCtxDestroy.Stop();
+        drawn = true;
 
 #ifdef KICAD_GAL_PROFILE
     	latencyProbeZoomToRender.Checkpoint("do-repaint-ctx-done");
@@ -569,6 +574,17 @@ bool EDA_DRAW_PANEL_GAL::DoRePaint( bool aAllowSkip )
             cntCtxDestroy.to_string()
         );
 #endif
+    }
+
+    if( KIGFX::RENDER_STATS* stats = KIGFX::RENDER_STATS::Active(); stats && drawn )
+    {
+        cntTotal.Stop();
+        stats->frame.total = cntTotal.msecs();
+        stats->frame.update = updated ? cntUpd.msecs() : 0.0;
+        stats->frame.redraw = isDirty ? cntRedraw.msecs() : 0.0;
+        stats->frame.begin = cntCtx.msecs();
+        stats->frame.end = cntCtxDestroy.msecs();
+        stats->EndFrame();
     }
 
     m_lastRepaintEnd = std::chrono::steady_clock::now();

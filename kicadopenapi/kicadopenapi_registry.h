@@ -170,6 +170,12 @@ public:
 
     std::vector<KOPENAPI_CANVAS_CAPTURE> CanvasCaptures() const;
 
+    /// @brief Kifaces register the render benchmark of their editor's canvas ("pcb", "sch"); the
+    /// view_benchmark method dispatches to it
+    static bool AddViewBenchmark( const std::string& aDomain, KOPENAPI_HANDLER aHandler );
+
+    std::map<std::string, KOPENAPI_HANDLER> ViewBenchmarks() const;
+
     /// @brief Kifaces register how their documents roll back (see KOPENAPI_DOC_HISTORY)
     static bool AddDocumentHistory( const std::string& aDomain, KOPENAPI_DOC_HISTORY aHistory );
 
@@ -199,6 +205,7 @@ private:
     std::vector<KOPENAPI_CANVAS_RENDER>         m_canvasRenders;
     std::vector<KOPENAPI_CANVAS_STEADY>         m_canvasSteadies;
     std::map<std::string, KOPENAPI_DOC_HISTORY> m_docHistories;
+    std::map<std::string, KOPENAPI_HANDLER>     m_viewBenchmarks;
     std::set<std::string>                       m_editing;
 };
 
@@ -218,6 +225,9 @@ private:
 /// @brief The methods of this file that change documents: KOPENAPI_MARK_EDITING( "sch_wire", ... )
 #define KOPENAPI_MARK_EDITING( ... )                                                        \
     static const bool kopenapi_editing_reg = KOPENAPI_REGISTRY::MarkEditing( { __VA_ARGS__ } )
+
+#define KOPENAPI_REGISTER_VIEW_BENCHMARK( aDomain, aHandler )                              \
+    static const bool kopenapi_view_bench_reg = KOPENAPI_REGISTRY::AddViewBenchmark( aDomain, aHandler )
 
 #define KOPENAPI_REGISTER_CANVAS_CAPTURE( aCapture )                                       \
     static const bool kopenapi_canvas_reg = KOPENAPI_REGISTRY::AddCanvasCapture( aCapture )

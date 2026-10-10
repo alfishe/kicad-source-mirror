@@ -277,18 +277,12 @@ double PCB_TEXT::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 
     if( FOOTPRINT* parentFP = GetParentFootprint() )
     {
-        // Handle Render tab switches
-        if( GetText() == wxT( "${VALUE}" ) )
-        {
-            if( !aView->IsLayerVisibleCached( LAYER_FP_VALUES ) )
-                return LOD_HIDE;
-        }
+        // Handle Render tab switches (the text compared only when the switch hides something)
+        if( !aView->IsLayerVisibleCached( LAYER_FP_VALUES ) && GetText() == wxT( "${VALUE}" ) )
+            return LOD_HIDE;
 
-        if( GetText() == wxT( "${REFERENCE}" ) )
-        {
-            if( !aView->IsLayerVisibleCached( LAYER_FP_REFERENCES ) )
-                return LOD_HIDE;
-        }
+        if( !aView->IsLayerVisibleCached( LAYER_FP_REFERENCES ) && GetText() == wxT( "${REFERENCE}" ) )
+            return LOD_HIDE;
 
         PCB_LAYER_ID checkLayer = GetLayer();
 

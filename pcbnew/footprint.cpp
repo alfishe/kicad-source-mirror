@@ -429,27 +429,26 @@ std::vector<PROPERTY_BASE*> FOOTPRINT::GetDynamicProperties() const
         props.push_back( getOrCreate( name ) );
     }
 
-    std::vector<PCB_FIELD*> userFields;
+    // user fields by name, case-insensitive; each name built once, not per comparison
+    std::vector<std::pair<wxString, wxString>> userFields;   // lower-case name, name
 
     for( PCB_FIELD* field : GetFields() )
     {
         if( field->IsMandatory() || ( !isFPedit && field->IsPrivate() ) )
             continue;
 
-        userFields.push_back( field );
+        wxString name = field->GetUntranslatedName();
+        userFields.emplace_back( name.Lower(), std::move( name ) );
     }
 
-    std::ranges::sort( userFields,
-                       []( const PCB_FIELD* a, const PCB_FIELD* b )
-                       {
-                           return a->GetUntranslatedName().CmpNoCase( b->GetUntranslatedName() ) < 0;
-                       } );
+    std::ranges::stable_sort( userFields,
+                              []( const auto& a, const auto& b )
+                              {
+                                  return a.first.Cmp( b.first ) < 0;
+                              } );
 
-    for( PCB_FIELD* field : userFields )
-    {
-        const wxString& name = field->GetUntranslatedName();
+    for( const auto& [key, name] : userFields )
         props.push_back( getOrCreate( name ) );
-    }
 
     for( PROPERTY_BASE* prop : GetCustomPropertiesAsInspectables() )
         props.push_back( prop );

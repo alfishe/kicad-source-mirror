@@ -685,6 +685,13 @@ public:
      */
     virtual void ClearCache() {};
 
+    /**
+     * Delete every group at once (all cached geometry), keeping other caches (bitmaps).
+     *
+     * @return false if the GAL cannot: delete the groups one by one then.
+     */
+    virtual bool DeleteAllGroups() { return false; }
+
     // --------------------------------------------------------
     // Handling the world <-> screen transformation
     // --------------------------------------------------------

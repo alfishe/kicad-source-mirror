@@ -24,6 +24,7 @@
 #include <board.h>
 #include <board_design_settings.h>
 #include <project/net_settings.h>
+#include <footprint.h>
 #include <pad.h>
 #include <pcb_track.h>
 #include <eda_list_dialog.h>
@@ -1368,16 +1369,21 @@ void APPEARANCE_CONTROLS::setVisibleLayers( const LSET& aLayers )
     {
         board->SetVisibleLayers( aLayers );
 
-        // Note: KIGFX::REPAINT isn't enough for things that go from invisible to visible as
-        // they won't be found in the view layer's itemset for repainting.
-        view->UpdateAllItemsConditionally( KIGFX::ALL,
-                []( KIGFX::VIEW_ITEM* aItem ) -> bool
-                {
-                    // Items rendered to composite layers (such as LAYER_PAD_TH) must be redrawn
-                    // whether they're optionally flashed or not (as the layer being hidden/shown
-                    // might be the last layer the item is visible on).
-                    return dynamic_cast<PCB_VIA*>( aItem ) || dynamic_cast<PAD*>( aItem );
-                } );
+        // Pads and vias are redrawn (their look depends on the visible layers); their view
+        // layers and bounding boxes depend on the enabled layers only, so the view index stays
+        // (whether optionally flashed or not: the layer hidden / shown may be the last one an
+        // item is visible on)
+        for( FOOTPRINT* footprint : board->Footprints() )
+        {
+            for( PAD* pad : footprint->Pads() )
+                view->Update( pad, KIGFX::REPAINT );
+        }
+
+        for( PCB_TRACK* track : board->Tracks() )
+        {
+            if( track->Type() == PCB_VIA_T )
+                view->Update( track, KIGFX::REPAINT );
+        }
 
         m_frame->Update3DView( true, m_frame->GetPcbNewSettings()->m_Display.m_Live3DRefresh );
     }

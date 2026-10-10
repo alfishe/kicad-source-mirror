@@ -2830,9 +2830,9 @@ double PAD::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
     //const PCB_LAYER_ID& pcbLayer = static_cast<PCB_LAYER_ID>( aLayer );
 
     {
-        const LSET padLayers = GetLayerSet();
-        const bool onFront = ( padLayers & LSET::FrontMask() ).any();
-        const bool onBack = ( padLayers & LSET::BackMask() ).any();
+        const LSET& padLayers = m_padStack.LayerSet();
+        const bool  onFront = padLayers.Intersects( LSET::FrontMask() );
+        const bool  onBack = padLayers.Intersects( LSET::BackMask() );
         const bool frVis = aView->IsLayerVisible( LAYER_FOOTPRINTS_FR );
         const bool bkVis = aView->IsLayerVisible( LAYER_FOOTPRINTS_BK );
 
@@ -2848,11 +2848,7 @@ double PAD::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 
     if( IsHoleLayer( aLayer ) )
     {
-        LSET visiblePhysical = board->GetVisibleLayers();
-        visiblePhysical &= board->GetEnabledLayers();
-        visiblePhysical &= LSET::PhysicalLayersMask();
-
-        if( !visiblePhysical.any() )
+        if( !board->GetVisibleLayers().Intersects( board->GetEnabledLayers(), LSET::PhysicalLayersMask() ) )
             return LOD_HIDE;
     }
     else if( IsNetnameLayer( aLayer ) )
@@ -2865,11 +2861,20 @@ double PAD::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
         }
         else
         {
-            LSET visible = board->GetVisibleLayers();
-            visible &= board->GetEnabledLayers();
+            const LSET& enabled = board->GetEnabledLayers();
+            bool        flashed = false;
 
             // Hide netnames unless pad is flashed to a visible layer
-            if( !FlashLayer( visible ) )
+            for( PCB_LAYER_ID layer : board->GetVisibleLayers() )
+            {
+                if( enabled.Contains( layer ) && FlashLayer( layer ) )
+                {
+                    flashed = true;
+                    break;
+                }
+            }
+
+            if( !flashed )
                 return LOD_HIDE;
         }
 

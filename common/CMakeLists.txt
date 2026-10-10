@@ -410,6 +410,7 @@ list( APPEND KICOMMON_SRCS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_libraries.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_image.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_windows.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_view_bench.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_capture.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_keepalive.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/kicadopenapi_recorder.cpp

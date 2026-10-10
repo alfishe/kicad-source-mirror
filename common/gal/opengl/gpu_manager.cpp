@@ -29,6 +29,7 @@
 #include <gal/opengl/vertex_item.h>
 
 #include <core/profile.h>
+#include <gal/render_stats.h>
 
 #include <typeinfo>
 #include <confirm.h>
@@ -217,8 +218,19 @@ void GPU_CACHED_MANAGER::EndDrawing()
         drawCalls++;
     }
 
-    (void) drawCalls; // silence warning
     cntDraw.Stop();
+
+    if( RENDER_STATS* stats = RENDER_STATS::Active() )
+    {
+        uint64_t indices = 0;
+
+        for( const VRANGE& range : m_vranges )
+            indices += range.m_end - range.m_start + 1;
+
+        stats->frame.drawCalls += drawCalls;
+        stats->frame.cachedIndices += indices;
+        stats->frame.cacheVertices = cached->GetSize();
+    }
 
 #ifdef KICAD_GAL_PROFILE
     wxLogTrace( traceGalProfile,
@@ -309,6 +321,12 @@ void GPU_NONCACHED_MANAGER::EndDrawing()
     }
 
     glDrawArrays( GL_TRIANGLES, 0, m_container->GetSize() );
+
+    if( RENDER_STATS* stats = RENDER_STATS::Active() )
+    {
+        stats->frame.drawCalls++;
+        stats->frame.noncachedVertices += m_container->GetSize();
+    }
 
 #ifdef KICAD_GAL_PROFILE
     wxLogTrace( traceGalProfile, wxT( "Noncached manager size: %d" ), m_container->GetSize() );

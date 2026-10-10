@@ -254,6 +254,8 @@ public:
     /// @copydoc GAL::DeleteGroup()
     void DeleteGroup( int aGroupNumber ) override;
 
+    bool DeleteAllGroups() override;
+
     /// @copydoc GAL::ClearCache()
     void ClearCache() override;
 

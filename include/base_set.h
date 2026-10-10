@@ -193,6 +193,39 @@ public:
         return result;
     }
 
+    /// @brief True if any bit is set in both sets; no temporary set is built (sizes may differ)
+    bool Intersects( const BASE_SET& aOther ) const
+    {
+        const size_t    n = std::min( num_blocks(), aOther.num_blocks() );
+        const uint64_t* a = data();
+        const uint64_t* b = aOther.data();
+
+        for( size_t i = 0; i < n; ++i )
+        {
+            if( a[i] & b[i] )
+                return true;
+        }
+
+        return false;
+    }
+
+    /// @brief True if any bit is set in this set and in both others; no temporary set is built
+    bool Intersects( const BASE_SET& aB, const BASE_SET& aC ) const
+    {
+        const size_t    n = std::min( { num_blocks(), aB.num_blocks(), aC.num_blocks() } );
+        const uint64_t* a = data();
+        const uint64_t* b = aB.data();
+        const uint64_t* c = aC.data();
+
+        for( size_t i = 0; i < n; ++i )
+        {
+            if( a[i] & b[i] & c[i] )
+                return true;
+        }
+
+        return false;
+    }
+
     // Compound assignment AND operator
     BASE_SET& operator&=(const BASE_SET& other)
     {

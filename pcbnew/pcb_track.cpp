@@ -2596,33 +2596,19 @@ double PCB_VIA::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 
     if( IsHoleLayer( aLayer ) )
     {
-        LSET visible;
+        const LSET& visible = board ? board->GetVisibleLayers() : LSET::AllLayersMask();
+        const LSET& enabled = board ? board->GetEnabledLayers() : LSET::AllLayersMask();
 
-        if( board )
-        {
-            visible = board->GetVisibleLayers();
-            visible &= board->GetEnabledLayers();
-        }
-        else
-        {
-            visible = LSET::AllLayersMask();
-        }
-
+        // Show a through via's hole if any physical layer is shown, a blind or micro via's hole
+        // if it crosses a visible layer
         if( m_viaType == VIATYPE::THROUGH )
         {
-            // Show a through via's hole if any physical layer is shown
-            visible &= LSET::PhysicalLayersMask();
-
-            if( !visible.any() )
+            if( !visible.Intersects( enabled, LSET::PhysicalLayersMask() ) )
                 return LOD_HIDE;
         }
-        else
+        else if( !visible.Intersects( enabled, GetLayerSet() ) )
         {
-            // Show a blind or micro via's hole if it crosses a visible layer
-            visible &= GetLayerSet();
-
-            if( !visible.any() )
-                return LOD_HIDE;
+            return LOD_HIDE;
         }
 
         // The hole won't be visible anyway at this scale

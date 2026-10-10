@@ -29,6 +29,7 @@
 #include <build_version.h>
 #include <gal/opengl/opengl_gal.h>
 #include <gal/opengl/utils.h>
+#include <gal/render_stats.h>
 #include <gal/definitions.h>
 #include <kicad_gl/gl_context_mgr.h>
 #include <geometry/shape_poly_set.h>
@@ -842,6 +843,21 @@ void OPENGL_GAL::EndDrawing()
     PROF_TIMER cntComposite( "gl-composite" );
     PROF_TIMER cntSwap( "gl-swap" );
 
+    RENDER_STATS* stats = RENDER_STATS::Active();
+
+    // with gpuSync each stage waits for the GPU, so its time includes the GPU's work
+    auto syncGpu = [stats]()
+    {
+        if( stats && stats->gpuSync )
+            glFinish();
+    };
+
+    if( stats && stats->glRenderer.empty() )
+    {
+        stats->glRenderer = reinterpret_cast<const char*>( glGetString( GL_RENDERER ) );
+        stats->glVersion = reinterpret_cast<const char*>( glGetString( GL_VERSION ) );
+    }
+
     cntTotal.Start();
 
     // Cached & non-cached containers are rendered to the same buffer
@@ -849,11 +865,15 @@ void OPENGL_GAL::EndDrawing()
 
     cntEndNoncached.Start();
     m_nonCachedManager->EndDrawing();
+    syncGpu();
     cntEndNoncached.Stop();
 
     cntEndCached.Start();
     m_cachedManager->EndDrawing();
+    syncGpu();
     cntEndCached.Stop();
+
+    const uint64_t noncachedVertices = stats ? stats->frame.noncachedVertices : 0;
 
     cntEndOverlay.Start();
     // Overlay container is rendered to a different buffer
@@ -861,7 +881,15 @@ void OPENGL_GAL::EndDrawing()
         m_compositor->SetBuffer( m_overlayBuffer );
 
     m_overlayManager->EndDrawing();
+    syncGpu();
     cntEndOverlay.Stop();
+
+    // the overlay manager is a non-cached one: its vertices are counted apart
+    if( stats )
+    {
+        stats->frame.overlayVertices += stats->frame.noncachedVertices - noncachedVertices;
+        stats->frame.noncachedVertices = noncachedVertices;
+    }
 
     cntComposite.Start();
 
@@ -880,6 +908,7 @@ void OPENGL_GAL::EndDrawing()
         captureFrame();   // the composed frame, before the cursor
 
     blitCursor();
+    syncGpu();
 
     cntComposite.Stop();
 
@@ -888,6 +917,15 @@ void OPENGL_GAL::EndDrawing()
     cntSwap.Stop();
 
     cntTotal.Stop();
+
+    if( stats )
+    {
+        stats->frame.noncached += cntEndNoncached.msecs();
+        stats->frame.cached += cntEndCached.msecs();
+        stats->frame.overlay += cntEndOverlay.msecs();
+        stats->frame.composite += cntComposite.msecs();
+        stats->frame.swap += cntSwap.msecs();
+    }
 
 #ifdef KICAD_GAL_PROFILE
     wxLogTrace( traceGalProfile, "Timing: %s %s %s %s %s %s", cntTotal.to_string(),
@@ -3026,6 +3064,18 @@ void OPENGL_GAL::DeleteGroup( int aGroupNumber )
 {
     // Frees memory in the container as well
     m_groups.erase( aGroupNumber );
+}
+
+
+bool OPENGL_GAL::DeleteAllGroups()
+{
+    if( !m_isInitialized )
+        return false;
+
+    // the container is emptied first, so the groups' items free nothing one by one
+    m_cachedManager->Clear();
+    m_groups.clear();
+    return true;
 }
 
 
