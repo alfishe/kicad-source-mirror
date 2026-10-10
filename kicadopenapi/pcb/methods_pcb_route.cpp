@@ -17,6 +17,7 @@
 #include <board_commit.h>
 #include <board_design_settings.h>
 #include <connectivity/connectivity_data.h>
+#include <ratsnest/ratsnest_data.h>
 #include <footprint.h>
 #include <geometry/shape.h>
 #include <geometry/shape_poly_set.h>
@@ -227,7 +228,11 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
 }
 
 
-std::optional<PAD*> findPad( BOARD* aBoard, const std::string& aRefPad )
+/**
+ * A pad by REF.PAD.  Several pads can share a number (SOT-223: pin 2 and the tab): aNot excludes
+ * one (the route's start), and the nearest to aNear wins.
+ */
+std::optional<PAD*> findPad( BOARD* aBoard, const std::string& aRefPad, PAD* aNot = nullptr, PAD* aNear = nullptr )
 {
     const size_t dot = aRefPad.rfind( '.' );
 
@@ -237,6 +242,8 @@ std::optional<PAD*> findPad( BOARD* aBoard, const std::string& aRefPad )
     const wxString ref = wxString::FromUTF8( aRefPad.substr( 0, dot ) );
     const wxString number = wxString::FromUTF8( aRefPad.substr( dot + 1 ) );
 
+    std::optional<PAD*> best;
+
     for( FOOTPRINT* fp : aBoard->Footprints() )
     {
         if( fp->GetReference() != ref )
@@ -244,71 +251,86 @@ std::optional<PAD*> findPad( BOARD* aBoard, const std::string& aRefPad )
 
         for( PAD* pad : fp->Pads() )
         {
-            if( pad->GetNumber() == number )
-                return pad;
+            if( pad->GetNumber() != number || pad == aNot )
+                continue;
+
+            if( !best || ( aNear && ( pad->GetPosition() - aNear->GetPosition() ).EuclideanNorm()
+                                            < ( ( *best )->GetPosition() - aNear->GetPosition() ).EuclideanNorm() ) )
+            {
+                best = pad;
+            }
         }
     }
 
-    return std::nullopt;
+    return best;
 }
 
 } // namespace
 
 
-static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+namespace
 {
-    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
-    if( !context )
-        return KopenapiNoBoard();
+/// Board editor glow for routes (no frame headless)
+struct ROUTE_GLOW_TRAITS
+{
+    using FRAME = PCB_EDIT_FRAME;
 
-    BOARD*                board = context->GetBoard();
-    const auto            started = std::chrono::steady_clock::now();
-    std::optional<PAD*>   from = findPad( board, aArgs.value( "from", std::string() ) );
-    std::optional<PAD*>   to;
-
-    if( !from )
-        return KOPENAPI_RESULT::Error( 404, "give 'from' as REF.PAD of an existing pad" );
-
-    if( aArgs.contains( "to" ) )
+    static FRAME* Frame( KIWAY* aKiway )
     {
-        to = findPad( board, aArgs.value( "to", std::string() ) );
-
-        if( !to )
-            return KOPENAPI_RESULT::Error( 404, "'to' pad not found" );
-
-        if( ( *to )->GetNetCode() != ( *from )->GetNetCode() || ( *from )->GetNetCode() <= 0 )
-            return KOPENAPI_RESULT::Error( 422, "'from' and 'to' are not on one net" );
+        return aKiway ? dynamic_cast<PCB_EDIT_FRAME*>( aKiway->Player( FRAME_PCB_EDITOR, false ) ) : nullptr;
     }
 
-    const std::string layerName = aArgs.value( "layer", std::string( "F.Cu" ) );
-    const int         layerId = board->GetLayerID( wxString::FromUTF8( layerName ) );
+    static EDA_ITEM* Resolve( FRAME* aFrame, const KIID& aId )
+    {
+        return aFrame->GetBoard() ? aFrame->GetBoard()->ResolveItem( aId, true ) : nullptr;
+    }
 
-    if( layerId < 0 || !IsCopperLayer( layerId ) || !board->IsLayerEnabled( (PCB_LAYER_ID) layerId ) )
-        return KOPENAPI_RESULT::Error( 400, "layer: an enabled copper layer, e.g. F.Cu, B.Cu" );
+    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn )
+    {
+        if( aOn )
+            aItem->SetBrightened();
+        else
+            aItem->ClearBrightened();
 
-    const PCB_LAYER_ID layer = (PCB_LAYER_ID) layerId;
+        aFrame->GetCanvas()->GetView()->Update( aItem, KIGFX::REPAINT );
+    }
 
-    if( !( *from )->IsOnLayer( layer ) )
-        return KOPENAPI_RESULT::Error( 422, "'from' pad is not on " + layerName + " (SMD pad on the other side?)" );
+    static BOX2I Box( EDA_ITEM* aItem ) { return aItem->GetBoundingBox(); }
+    static int   Mm() { return pcbIUScale.mmToIU( 1.0 ); }
+    static void  ItemColour( FRAME*, bool, std::optional<KIGFX::COLOR4D>& ) {}
+};
 
-    const std::string modeName = aArgs.value( "mode", std::string( "walkaround" ) );
-    PNS::PNS_MODE     mode = modeName == "shove" ? PNS::RM_Shove : modeName == "walkaround" ? PNS::RM_Walkaround : PNS::RM_MarkObstacles;
 
-    if( modeName != "shove" && modeName != "walkaround" )
-        return KOPENAPI_RESULT::Error( 400, "mode: walkaround (go around obstacles) or shove (push other tracks)" );
+struct ROUTE_REQUEST
+{
+    PAD*                  from = nullptr;
+    BOARD_CONNECTED_ITEM* to = nullptr;        ///< nullptr: the nearest unconnected anchor of the net
+    VECTOR2I              toPos;
+    PCB_LAYER_ID          layer = F_Cu;
+    PNS::PNS_MODE         mode = PNS::RM_Walkaround;
+    bool                  dryRun = false;
+};
 
-    const bool dryRun = aArgs.value( "dry_run", false );
 
-    // The router, as the editor's router tool sets it up, on our staging interface
+/**
+ * One connection through PNS as a person routes it (see the file comment).  Fills aOut with what
+ * happened (routed / reason / segments / metrics / violations); the staged commit is pushed only
+ * when the guard is clean and it is no dry run.  aAdded: uuids of the new tracks / vias.
+ */
+bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
+{
+    BOARD*     board = aContext.GetBoard();
+    const auto started = std::chrono::steady_clock::now();
+
     auto iface = std::make_unique<KOPENAPI_PNS_IFACE>();
     iface->SetBoard( board );
     // no SetView: without a view the interface draws no previews (SetView( nullptr ) would
     // create a preview group that EraseView then updates on a null view)
-    iface->SetHostTool( routeHost( context->GetToolManager() ) );
+    iface->SetHostTool( routeHost( aContext.GetToolManager() ) );
 
     PNS::ROUTING_SETTINGS settings( nullptr, "" );
-    settings.SetMode( mode );
+    settings.SetMode( aReq.mode );
 
     auto router = std::make_unique<PNS::ROUTER>();
     router->SetInterface( iface.get() );
@@ -316,51 +338,56 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
     router->SyncWorld();
     router->SetMode( PNS::PNS_MODE_ROUTE_SINGLE );
 
-    PNS::ITEM* startItem = router->GetWorld()->FindItemByParent( *from );
+    PNS::ITEM* startItem = router->GetWorld()->FindItemByParent( aReq.from );
 
     if( !startItem )
-        return KOPENAPI_RESULT::Error( 500, "the router does not know the start pad" );
+    {
+        aOut["routed"] = false;
+        aOut["reason"] = "the router does not know the start pad";
+        return false;
+    }
 
-    const VECTOR2I start = ( *from )->GetPosition();
+    const VECTOR2I      start = aReq.from->GetPosition();
     PNS::SIZES_SETTINGS sizes( router->Sizes() );
-    iface->SetStartLayerFromPCBNew( layer );
+    iface->SetStartLayerFromPCBNew( aReq.layer );
     iface->ImportSizes( sizes, startItem, nullptr, start );
     sizes.AddLayerPair( iface->GetPNSLayerFromBoardLayer( F_Cu ), iface->GetPNSLayerFromBoardLayer( B_Cu ) );
     router->UpdateSizes( sizes );
 
-    nlohmann::json result = { { "from", aArgs["from"] }, { "layer", layerName }, { "mode", modeName },
-                              { "net", str( UnescapeString( ( *from )->GetNetname() ) ) },
-                              { "track_width_mm", toMm( sizes.TrackWidth() ) },
-                              { "clearance_mm", toMm( sizes.Clearance() ) } };
+    aOut["net"] = str( UnescapeString( aReq.from->GetNetname() ) );
+    aOut["layer"] = str( board->GetLayerName( aReq.layer ) );
+    aOut["mode"] = aReq.mode == PNS::RM_Shove ? "shove" : "walkaround";
+    aOut["track_width_mm"] = toMm( sizes.TrackWidth() );
+    aOut["clearance_mm"] = toMm( sizes.Clearance() );
 
-    if( !router->StartRouting( start, startItem, iface->GetPNSLayerFromBoardLayer( layer ) ) )
+    if( !router->StartRouting( start, startItem, iface->GetPNSLayerFromBoardLayer( aReq.layer ) ) )
     {
-        result["routed"] = false;
-        result["reason"] = "could not start: " + str( router->FailureReason() );
-        return KOPENAPI_RESULT::Ok( result );
+        aOut["routed"] = false;
+        aOut["reason"] = "could not start: " + str( router->FailureReason() );
+        return false;
     }
 
-    // The target: the given pad, else the nearest unconnected anchor of the net (as the editor's
-    // "Attempt Finish" does)
     VECTOR2I        target;
     PNS::ITEM*      targetItem = nullptr;
     PNS_LAYER_RANGE targetLayers;
 
-    if( to )
+    if( aReq.to )
     {
-        target = ( *to )->GetPosition();
-        targetItem = router->GetWorld()->FindItemByParent( *to );
-        result["to"] = aArgs["to"];
+        target = aReq.toPos;
+        targetItem = router->GetWorld()->FindItemByParent( aReq.to );
+
+        if( targetItem )
+            targetLayers = targetItem->Layers();
     }
     else if( !router->GetNearestRatnestAnchor( target, targetLayers, targetItem ) )
     {
         router->StopRouting();
-        result["routed"] = false;
-        result["reason"] = "nothing left to connect on this net from that pad";
-        return KOPENAPI_RESULT::Ok( result );
+        aOut["routed"] = false;
+        aOut["reason"] = "nothing left to connect on this net from that pad";
+        return false;
     }
 
-    // Move towards the target until the head stops changing (as Finish does)
+    // Move towards the target until the head stops changing (as the editor's Attempt Finish)
     PNS::PLACEMENT_ALGO* placer = router->Placer();
     VECTOR2I             previous;
     int                  tries = 8;
@@ -371,10 +398,12 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
         router->Move( target, targetItem );
     } while( placer->CurrentEnd() != previous && --tries );
 
-    const bool reached = placer->CurrentEnd() == target;
+    // At the target point and on one of its layers (an SMD pad is on one side only): what the
+    // editor's Finish requires too
+    const bool reached = placer->CurrentEnd() == target && targetLayers.Overlaps( router->GetCurrentLayer() );
 
-    // Fix the line in the router, then commit it to the board (as the router tool does);
-    // our interface stages the commit instead of pushing it
+    // Fix the line in the router, then commit it to the board (as the router tool does); our
+    // interface stages the commit instead of pushing it
     const bool fixed = reached && router->FixRoute( target, targetItem, false, false );
 
     if( fixed )
@@ -388,14 +417,13 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
             router->StopRouting();
 
         iface->Staged().Revert();
-        result["routed"] = false;
-        result["reason"] = reached ? "the router could not fix the route" : "blocked: the track stops before the target";
-        result["stopped_at_mm"] = { toMm( end.x ), toMm( end.y ) };
-        result["target_mm"] = { toMm( target.x ), toMm( target.y ) };
-        return KOPENAPI_RESULT::Ok( result );
+        aOut["routed"] = false;
+        aOut["reason"] = reached ? "the router could not fix the route" : "blocked: the track stops before the target";
+        aOut["stopped_at_mm"] = { toMm( end.x ), toMm( end.y ) };
+        aOut["target_mm"] = { toMm( target.x ), toMm( target.y ) };
+        return false;
     }
 
-    // What the route would put on the board, and the guard over it
     std::vector<BOARD_CONNECTED_ITEM*> changed;
     nlohmann::json                     segments = nlohmann::json::array();
     double                             length = 0;
@@ -430,51 +458,305 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
     const nlohmann::json violations = guard( board, changed, iface->m_removed );
     const double         direct = ( target - start ).EuclideanNorm();
 
-    result["segments"] = segments;
-    result["metrics"] = { { "length_mm", toMm( length ) },
-                          { "direct_mm", toMm( direct ) },
-                          { "detour", direct > 0 ? std::round( length / direct * 100.0 ) / 100.0 : 1.0 },
-                          { "segments", segments.size() },
-                          { "vias", vias },
-                          { "shoved_items", iface->m_modified.size() + iface->m_removed.size() },
-                          { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() } };
+    aOut["segments"] = segments;
+    aOut["metrics"] = { { "length_mm", toMm( length ) },
+                        { "direct_mm", toMm( direct ) },
+                        { "detour", direct > 0 ? std::round( length / direct * 100.0 ) / 100.0 : 1.0 },
+                        { "segments", segments.size() },
+                        { "vias", vias },
+                        { "shoved_items", iface->m_modified.size() + iface->m_removed.size() },
+                        { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() } };
 
     if( !violations.empty() )
     {
         iface->Staged().Revert();
-        result["routed"] = false;
-        result["reason"] = "rejected by the guard: the route would touch another net";
-        result["violations"] = violations;
-        return KOPENAPI_RESULT::Ok( result );
+        aOut["routed"] = false;
+        aOut["reason"] = "rejected by the guard: the route would touch another net";
+        aOut["violations"] = violations;
+        return false;
     }
 
-    if( dryRun )
+    if( aReq.dryRun )
     {
         iface->Staged().Revert();
-        result["routed"] = true;
-        result["applied"] = false;
-        return KOPENAPI_RESULT::Ok( result );
+        aOut["routed"] = true;
+        aOut["applied"] = false;
+        return true;
     }
 
-    std::vector<KIID> added;
-
     for( BOARD_ITEM* item : iface->m_added )
-        added.push_back( item->m_Uuid );
+        aAdded.push_back( item->m_Uuid );
 
     iface->Staged().Push( _( "Route (API)" ) );
     board->GetConnectivity()->RecalculateRatsnest();
+    aOut["routed"] = true;
+    aOut["applied"] = true;
+    return true;
+}
 
-    if( !aCtx.headless && aCtx.kiway )
+
+void showRoutes( KOPENAPI_CONTEXT& aCtx, const std::vector<KIID>& aAdded )
+{
+    if( aCtx.headless || !aCtx.kiway )
+        return;
+
+    if( auto* frame = ROUTE_GLOW_TRAITS::Frame( aCtx.kiway ) )
+        frame->GetCanvas()->Refresh();
+
+    KopenapiGlow<ROUTE_GLOW_TRAITS>( aCtx.kiway, aAdded, aAdded.size() > 1 ? 150 : 0 );
+}
+
+
+std::optional<PCB_LAYER_ID> parseLayer( BOARD* aBoard, const std::string& aName )
+{
+    const int id = aBoard->GetLayerID( wxString::FromUTF8( aName ) );
+
+    if( id < 0 || !IsCopperLayer( id ) || !aBoard->IsLayerEnabled( (PCB_LAYER_ID) id ) )
+        return std::nullopt;
+
+    return (PCB_LAYER_ID) id;
+}
+
+} // namespace
+
+
+static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*              board = context->GetBoard();
+    std::optional<PAD*> from = findPad( board, aArgs.value( "from", std::string() ) );
+
+    if( !from )
+        return KOPENAPI_RESULT::Error( 404, "give 'from' as REF.PAD of an existing pad" );
+
+    ROUTE_REQUEST req;
+    req.from = *from;
+    req.dryRun = aArgs.value( "dry_run", false );
+
+    if( aArgs.contains( "to" ) )
     {
-        // GUI: the new tracks glow (and the canvas shows them)
-        if( auto* frame = dynamic_cast<PCB_EDIT_FRAME*>( aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) ) )
-            frame->GetCanvas()->Refresh();
+        std::optional<PAD*> to = findPad( board, aArgs.value( "to", std::string() ), *from, *from );
+
+        if( !to )
+            return KOPENAPI_RESULT::Error( 404, "'to' pad not found" );
+
+        if( ( *to )->GetNetCode() != ( *from )->GetNetCode() || ( *from )->GetNetCode() <= 0 )
+            return KOPENAPI_RESULT::Error( 422, "'from' and 'to' are not on one net" );
+
+        req.to = *to;
+        req.toPos = ( *to )->GetPosition();
     }
 
-    result["routed"] = true;
-    result["applied"] = true;
-    result["unrouted_left"] = board->GetConnectivity()->GetUnconnectedCount( true );
+    const std::string           layerName = aArgs.value( "layer", std::string( "F.Cu" ) );
+    std::optional<PCB_LAYER_ID> layer = parseLayer( board, layerName );
+
+    if( !layer )
+        return KOPENAPI_RESULT::Error( 400, "layer: an enabled copper layer, e.g. F.Cu, B.Cu" );
+
+    if( !( *from )->IsOnLayer( *layer ) )
+        return KOPENAPI_RESULT::Error( 422, "'from' pad is not on " + layerName + " (SMD pad on the other side?)" );
+
+    req.layer = *layer;
+
+    const std::string modeName = aArgs.value( "mode", std::string( "walkaround" ) );
+
+    if( modeName != "shove" && modeName != "walkaround" )
+        return KOPENAPI_RESULT::Error( 400, "mode: walkaround (go around obstacles) or shove (push other tracks)" );
+
+    req.mode = modeName == "shove" ? PNS::RM_Shove : PNS::RM_Walkaround;
+
+    nlohmann::json    result = { { "from", aArgs["from"] } };
+    std::vector<KIID> added;
+
+    if( aArgs.contains( "to" ) )
+        result["to"] = aArgs["to"];
+
+    routeOne( *context, req, result, added );
+
+    if( result.value( "applied", false ) )
+    {
+        showRoutes( aCtx, added );
+        result["unrouted_left"] = board->GetConnectivity()->GetUnconnectedCount( false );
+    }
+
     return KOPENAPI_RESULT::Ok( result );
+}
+
+
+/**
+ * Route many connections: the board's airwires (all, or those of given nets), shortest first,
+ * each from a pad end; a connection that fails is tried again on the other layer, then in shove
+ * mode.  One push per accepted route (rollback by steps undoes the whole call: it is one step).
+ */
+static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD* board = context->GetBoard();
+    const auto started = std::chrono::steady_clock::now();
+
+    std::set<std::string> nets;
+
+    for( const nlohmann::json& n : aArgs.value( "nets", nlohmann::json::array() ) )
+    {
+        if( n.is_string() )
+            nets.insert( n.get<std::string>() );
+    }
+
+    std::vector<PCB_LAYER_ID> layers;
+
+    for( const nlohmann::json& l : aArgs.value( "layers", nlohmann::json::array( { "F.Cu", "B.Cu" } ) ) )
+    {
+        std::optional<PCB_LAYER_ID> layer = l.is_string() ? parseLayer( board, l.get<std::string>() ) : std::nullopt;
+
+        if( !layer )
+            return KOPENAPI_RESULT::Error( 400, "layers: enabled copper layers in order of preference" );
+
+        layers.push_back( *layer );
+    }
+
+    const std::string order = aArgs.value( "order", std::string( "short_first" ) );
+    const bool        dryRun = aArgs.value( "dry_run", false );
+
+    // The airwires to route: pad-to-pad (or pad-to-track) connections of the ratsnest
+    board->BuildConnectivity();
+    std::shared_ptr<CONNECTIVITY_DATA> connectivity = board->GetConnectivity();
+    connectivity->RecalculateRatsnest();
+
+    struct JOB
+    {
+        PAD*                  from;
+        BOARD_CONNECTED_ITEM* to;
+        VECTOR2I              toPos;
+        double                length;
+        std::string           net;
+        bool                  power;
+    };
+
+    std::vector<JOB> jobs;
+
+    for( int code = 1; code < (int) board->GetNetCount(); ++code )
+    {
+        RN_NET*       rn = connectivity->GetRatsnestForNet( code );
+        NETINFO_ITEM* info = board->FindNet( code );
+
+        if( !rn || !info )
+            continue;
+
+        const std::string name = str( UnescapeString( info->GetNetname() ) );
+
+        if( !nets.empty() && !nets.count( name ) )
+            continue;
+
+        NETCLASS*  netclass = info->GetNetClass();
+        const bool power = netclass && netclass->GetName() != NETCLASS::Default;
+
+        for( const CN_EDGE& edge : rn->GetEdges() )
+        {
+            std::shared_ptr<const CN_ANCHOR> a = edge.GetSourceNode(), b = edge.GetTargetNode();
+
+            if( !a || !b )
+                continue;
+
+            BOARD_CONNECTED_ITEM* pa = a->Parent();
+            BOARD_CONNECTED_ITEM* pb = b->Parent();
+
+            if( pa->Type() != PCB_PAD_T )
+                std::swap( a, b ), std::swap( pa, pb );
+
+            if( pa->Type() != PCB_PAD_T )
+                continue;   // track to track: later
+
+            jobs.push_back( { static_cast<PAD*>( pa ), pb, b->Pos(), (double) ( b->Pos() - a->Pos() ).EuclideanNorm(), name, power } );
+        }
+    }
+
+    std::stable_sort( jobs.begin(), jobs.end(),
+                      [&]( const JOB& x, const JOB& y )
+                      {
+                          if( order == "power_first" && x.power != y.power )
+                              return x.power;
+
+                          return x.length < y.length;
+                      } );
+
+    nlohmann::json    results = nlohmann::json::array();
+    std::vector<KIID> added;
+    int               routed = 0;
+    double            length = 0;
+    int               vias = 0;
+
+    for( const JOB& job : jobs )
+    {
+        nlohmann::json attempt;
+        bool           ok = false;
+        int            tries = 0;
+
+        // preferred layers in order, walkaround first, then shove
+        for( PNS::PNS_MODE mode : { PNS::RM_Walkaround, PNS::RM_Shove } )
+        {
+            for( PCB_LAYER_ID layer : layers )
+            {
+                // both ends on the layer (no vias yet)
+                if( ok || !job.from->IsOnLayer( layer ) || !job.to->IsOnLayer( layer ) )
+                    continue;
+
+                ROUTE_REQUEST req{ job.from, job.to, job.toPos, layer, mode, dryRun };
+                attempt = nlohmann::json::object();
+                tries++;
+                ok = routeOne( *context, req, attempt, added );
+            }
+        }
+
+        nlohmann::json row = { { "net", job.net },
+                               { "from", str( job.from->GetParentFootprint()->GetReference() ) + "." + str( job.from->GetNumber() ) },
+                               { "routed", ok }, { "tries", tries } };
+
+        if( job.to->Type() == PCB_PAD_T )
+            row["to"] = str( static_cast<PAD*>( job.to )->GetParentFootprint()->GetReference() ) + "."
+                        + str( static_cast<PAD*>( job.to )->GetNumber() );
+
+        if( ok )
+        {
+            routed++;
+            length += attempt["metrics"].value( "length_mm", 0.0 );
+            vias += attempt["metrics"].value( "vias", 0 );
+            row["layer"] = attempt["layer"];
+            row["mode"] = attempt["mode"];
+            row["length_mm"] = attempt["metrics"]["length_mm"];
+            row["detour"] = attempt["metrics"]["detour"];
+        }
+        else
+        {
+            row["reason"] = attempt.value( "reason", std::string() );
+
+            if( attempt.contains( "violations" ) )
+                row["violations"] = attempt["violations"];
+        }
+
+        results.push_back( row );
+    }
+
+    showRoutes( aCtx, added );
+
+    connectivity->RecalculateRatsnest();
+
+    return KOPENAPI_RESULT::Ok( { { "connections", jobs.size() },
+                                  { "routed", routed },
+                                  { "failed", (int) jobs.size() - routed },
+                                  { "length_mm", std::round( length * 1000.0 ) / 1000.0 },
+                                  { "vias", vias },
+                                  { "dry_run", dryRun },
+                                  { "unrouted_left", dryRun ? (int) jobs.size() - routed : (int) connectivity->GetUnconnectedCount( false ) },
+                                  { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
+                                  { "results", results } } );
 }
 
 
@@ -492,4 +774,17 @@ KOPENAPI_REGISTER( "pcb_route_connection",
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_route_connection, 120 );
 
-KOPENAPI_MARK_EDITING( "pcb_route_connection" );
+KOPENAPI_REGISTER( "pcb_route",
+                   "EXPERIMENTAL. Route the board's airwires (all, or of given nets) with KiCad's "
+                   "push-and-shove router, one connection after another (order short_first or "
+                   "power_first); a failed connection is tried on the next layer, then in shove mode; "
+                   "every route passes the net-merge guard; per connection routed / reason, totals "
+                   "(routed, length, vias, unrouted left); dry_run routes nothing",
+                   R"json({"type":"object","properties":{
+                        "nets":{"type":"array","items":{"type":"string"}},
+                        "layers":{"type":"array","items":{"type":"string"},"default":["F.Cu","B.Cu"]},
+                        "order":{"type":"string","enum":["short_first","power_first"],"default":"short_first"},
+                        "dry_run":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_route, 600 );
+
+KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route" );

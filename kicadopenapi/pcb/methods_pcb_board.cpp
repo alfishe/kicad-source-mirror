@@ -15,6 +15,7 @@
 #include <board.h>
 #include <board_commit.h>
 #include <board_design_settings.h>
+#include <connectivity/connectivity_data.h>
 #include <footprint.h>
 #include <kicadopenapi_util.h>
 #include <netlist_reader/board_netlist_updater.h>
@@ -376,6 +377,11 @@ static KOPENAPI_RESULT h_pcb_netlist_apply( KOPENAPI_CONTEXT& aCtx, const nlohma
 
             commit.Modify( fp );
             fp->Move( VECTOR2I( x, y ) - box.GetOrigin() );
+
+            // KiCad marks what a netlist update added as "just added" until the editor's move
+            // tool places it, and connectivity / ratsnest skip such footprints: laid out here,
+            // they count
+            fp->SetAttributes( fp->GetAttributes() & ~FP_JUST_ADDED );
             x += box.GetWidth() + gap;
             rowHeight = std::max( rowHeight, (int) box.GetHeight() );
 
@@ -386,7 +392,11 @@ static KOPENAPI_RESULT h_pcb_netlist_apply( KOPENAPI_CONTEXT& aCtx, const nlohma
         }
 
         if( !fresh.empty() )
+        {
             commit.Push( _( "Spread new footprints (API)" ) );
+            board->BuildConnectivity();
+            board->GetConnectivity()->RecalculateRatsnest();
+        }
     }
 
     // GUI: KiCad's OnNetlistChanged leaves the new footprints selected for an interactive drag
