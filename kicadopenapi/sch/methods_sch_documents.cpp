@@ -40,6 +40,11 @@ static void releaseHeadless()
                       s_headless->GetCurrentFileName() );
 
     s_headless.reset();
+
+    // the project's ERC / schematic settings belong to the schematic that installed them
+    if( s_schematic )
+        s_schematic->SetProject( nullptr );
+
     delete s_schematic;
     s_schematic = nullptr;
 }
@@ -340,6 +345,10 @@ static bool restoreHeadless( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
     PROJECT*         project = &s_headless->Prj();
     SCHEMATIC*       loaded = nullptr;
 
+    // the loaded copy installs its own ERC / schematic settings in the project: release the open
+    // schematic's first (they would leak), and give them back if the copy does not load
+    s_schematic->SetProject( nullptr );
+
     try
     {
         loaded = EESCHEMA_HELPERS::LoadSchematic( copy.GetFullPath(), false, false, project );
@@ -350,7 +359,10 @@ static bool restoreHeadless( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
     }
 
     if( !loaded )
+    {
+        s_schematic->SetProject( project );
         return false;
+    }
 
     // Every sheet file back under the document's own directory, all of them unsaved
     SCH_SCREENS screens( loaded->Root() );

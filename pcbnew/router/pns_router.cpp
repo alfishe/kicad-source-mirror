@@ -87,6 +87,12 @@ ROUTER* ROUTER::GetInstance()
 }
 
 
+void ROUTER::SetInstance( ROUTER* aRouter )
+{
+    theRouter = aRouter;
+}
+
+
 ROUTER::~ROUTER()
 {
     ClearWorld();

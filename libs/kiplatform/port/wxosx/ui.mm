@@ -294,7 +294,7 @@ void KIPLATFORM::UI::SetWMClass( wxWindow* aWindow, const wxString& aClass )
 }
 
 
-bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
+static bool captureWindow( wxWindow* aWindow, wxImage& aImage )
 {
     if( !aWindow )
         return false;
@@ -380,4 +380,14 @@ bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
 
     aImage.SetData( rgb, (int) w, (int) h, false );
     return aImage.IsOk();
+}
+
+
+bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
+{
+    // called every frame while recording: the views' bitmaps are released at once
+    @autoreleasepool
+    {
+        return captureWindow( aWindow, aImage );
+    }
 }

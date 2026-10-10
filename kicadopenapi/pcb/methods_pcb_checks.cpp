@@ -11,6 +11,8 @@
 #include <api/pcb_context.h>
 #include <kicadopenapi_keepalive.h>
 #include <board.h>
+#include <tool/actions.h>
+#include <tools/drc_tool.h>
 #include <board_commit.h>
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
@@ -38,6 +40,18 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     BOARD*        board = context->GetBoard();
     TOOL_MANAGER* toolManager = context->GetToolManager();
+
+    // the run replaces every marker: nothing may keep pointing at the old ones (the selection,
+    // the DRC dialog's lists)
+    if( DRC_TOOL* drcTool = toolManager->GetTool<DRC_TOOL>() )
+    {
+        if( drcTool->IsDRCDialogShown() )
+            return KOPENAPI_RESULT::Error( 409, "the DRC dialog is open: close it first" );
+
+        drcTool->DestroyDRCDialog();
+    }
+
+    toolManager->RunAction( ACTIONS::selectionClear );
 
     // DRC needs the footprint libraries (library footprint mismatch checks)
     FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( board->GetProject() );

@@ -359,12 +359,12 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
 
     schematic->ConnectionGraph()->Reset();
 
-    TOOL_MANAGER* toolManager = new TOOL_MANAGER;
+    std::unique_ptr<TOOL_MANAGER> toolManager = std::make_unique<TOOL_MANAGER>();
     toolManager->SetEnvironment( schematic.get(), nullptr, nullptr, Kiface().KifaceSettings(), nullptr );
 
     if( aCalculateConnectivity )
     {
-        SCH_COMMIT dummyCommit( toolManager );
+        SCH_COMMIT dummyCommit( toolManager.get() );
         schematic->CleanUpConnections( &dummyCommit, GLOBAL_CLEANUP );
         dummyCommit.Push( _( "Schematic Cleanup" ), SKIP_UNDO | SKIP_CONNECTIVITY | DELETE_REMOVED_ITEMS );
     }

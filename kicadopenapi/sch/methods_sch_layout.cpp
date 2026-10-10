@@ -41,7 +41,7 @@ struct BOXED
 
 double mm( double aIU )
 {
-    return std::round( schIUScale.IUTomm( aIU ) * 100.0 ) / 100.0;
+    return std::round( ( aIU / schIUScale.IU_PER_MM ) * 100.0 ) / 100.0;
 }
 
 } // namespace

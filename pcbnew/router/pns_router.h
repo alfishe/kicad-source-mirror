@@ -183,6 +183,9 @@ public:
 
     static ROUTER* GetInstance();
 
+    /// @brief Make another router the current one (a temporary router restores the previous one)
+    static void SetInstance( ROUTER* aRouter );
+
     void ClearWorld();
     void SyncWorld();
 

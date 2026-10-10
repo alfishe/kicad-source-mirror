@@ -232,7 +232,7 @@ static KOPENAPI_RESULT h_pcb_silk_tidy( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     BOARD*     board = context->GetBoard();
     const bool dryRun = aArgs.value( "dry_run", false );
     const int  gap = pcbIUScale.mmToIU( aArgs.value( "gap_mm", 0.15 ) );
-    const int  reach = pcbIUScale.mmToIU( aArgs.value( "max_distance_mm", 4.0 ) );
+    const int  reach = pcbIUScale.mmToIU( std::clamp( aArgs.value( "max_distance_mm", 4.0 ), 0.0, 50.0 ) );
     const bool onlyBad = aArgs.value( "only_problems", true );
 
     std::set<std::string> refs;
@@ -496,14 +496,21 @@ std::vector<FREE_SPOT> findFree( BOARD* aBoard, bool aBottom, int aGap, int aW, 
 
     std::vector<FREE_SPOT> spots;
 
-    if( area.GetWidth() <= 0 || aW <= 0 || aH <= 0 )
+    if( area.GetWidth() <= 0 || aW <= 0 || aH <= 0 || aStep <= 0 )
         return spots;
 
-    for( int y = area.GetTop(); y + aH <= area.GetBottom(); y += aStep )
+    // at most about kMaxCells positions: a coarser grid on a big area
+    constexpr double kMaxCells = 250000.0;
+    const double     cells = double( area.GetWidth() ) / aStep * ( double( area.GetHeight() ) / aStep );
+
+    if( cells > kMaxCells )
+        aStep = int( std::ceil( aStep * std::sqrt( cells / kMaxCells ) ) );
+
+    for( int64_t y = area.GetTop(); y + aH <= area.GetBottom(); y += aStep )
     {
-        for( int x = area.GetLeft(); x + aW <= area.GetRight(); x += aStep )
+        for( int64_t x = area.GetLeft(); x + aW <= area.GetRight(); x += aStep )
         {
-            const BOX2I box( VECTOR2I( x, y ), VECTOR2I( aW, aH ) );
+            const BOX2I box( VECTOR2I( int( x ), int( y ) ), VECTOR2I( aW, aH ) );
 
             if( ( !aRegion && !insideBoard( obs, box ) )
                 || std::any_of( blocked.begin(), blocked.end(), [&]( const BOX2I& b ) { return b.Intersects( box ); } )
@@ -715,8 +722,27 @@ static KOPENAPI_RESULT h_pcb_silk_fit( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 
     // the region to fit into: a box, a polygon or the whole board; obstacles inside it are avoided
     SHAPE_POLY_SET region;
-    const bool     hasBox = aArgs.contains( "box_mm" ) && aArgs["box_mm"].is_array() && aArgs["box_mm"].size() == 4;
-    const bool     hasPoly = aArgs.contains( "polygon_mm" ) && aArgs["polygon_mm"].is_array() && aArgs["polygon_mm"].size() >= 3;
+    const bool     hasBox = aArgs.contains( "box_mm" );
+    const bool     hasPoly = aArgs.contains( "polygon_mm" );
+
+    if( hasBox
+        && !( aArgs["box_mm"].is_array() && aArgs["box_mm"].size() == 4
+              && std::all_of( aArgs["box_mm"].begin(), aArgs["box_mm"].end(),
+                              []( const nlohmann::json& v ) { return v.is_number(); } ) ) )
+    {
+        return KOPENAPI_RESULT::Error( 400, "box_mm: [x0, y0, x1, y1] in mm" );
+    }
+
+    if( hasPoly
+        && !( aArgs["polygon_mm"].is_array() && aArgs["polygon_mm"].size() >= 3
+              && std::all_of( aArgs["polygon_mm"].begin(), aArgs["polygon_mm"].end(),
+                              []( const nlohmann::json& p )
+                              {
+                                  return p.is_array() && p.size() == 2 && p[0].is_number() && p[1].is_number();
+                              } ) ) )
+    {
+        return KOPENAPI_RESULT::Error( 400, "polygon_mm: at least 3 points [[x_mm, y_mm], ...]" );
+    }
 
     if( hasBox )
     {

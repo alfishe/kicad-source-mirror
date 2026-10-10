@@ -287,6 +287,22 @@ public:
         return KOPENAPI_RESULT::Ok( answer );
     }
 
+    /// @brief Still recording at exit: the encoder thread finishes the file with what it has
+    ~RECORDER()
+    {
+        if( !m_thread.joinable() )
+            return;
+
+        {
+            std::lock_guard<std::mutex> lock( m_mutex );
+            m_finishing = true;
+            m_endIndex = m_lastIndex + 1;
+        }
+
+        m_cv.notify_all();
+        m_thread.join();
+    }
+
     KOPENAPI_RESULT Stop( const std::string& aReason = "requested" )
     {
         if( !m_active )
@@ -294,7 +310,7 @@ public:
 
         m_timer->Stop();
         m_stopReason = aReason;
-        const int64_t end = m_rebase ? m_lastIndex + 1 : std::max<int64_t>( currentIndex() + 1, m_lastIndex + 1 );
+        const int64_t end = m_rebase ? m_lastIndex + 1 : std::max<int64_t>( wallIndex() + 1, m_lastIndex + 1 );
 
         {
             std::lock_guard<std::mutex> lock( m_mutex );
@@ -436,13 +452,29 @@ public:
             return;
         }
 
-        const int64_t index = currentIndex();
+        const int64_t index = wallIndex();
 
         if( index <= m_lastIndex )
             return;
 
         m_clockSkipped += int( std::max<int64_t>( 0, index - m_lastIndex - 1 ) );
         advance( index );
+    }
+
+    /// @brief The wall-clock frame index; a jump of the clock (the machine slept, the process was
+    /// stopped) costs at most kMaxGapSeconds of repeated frames: the start moves up for the rest
+    int64_t wallIndex()
+    {
+        constexpr double kMaxGapSeconds = 2.0;
+        const int64_t    index = currentIndex();
+        const int64_t    maxGap = int64_t( kMaxGapSeconds * m_settings.fps );
+
+        if( index - m_lastIndex <= maxGap )
+            return index;
+
+        m_start += std::chrono::duration_cast<CLOCK::duration>(
+                std::chrono::duration<double>( double( index - m_lastIndex - maxGap ) / m_settings.fps ) );
+        return m_lastIndex + maxGap;
     }
 
     /// @brief Capture and enqueue frame aIndex; keeps the clock decision up to date

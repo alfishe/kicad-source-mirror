@@ -16,6 +16,7 @@
 #include <wx/event.h>
 #include <wx/timer.h>
 #include <wx/utils.h>
+#include <wx/weakref.h>
 
 #include <algorithm>
 #include <chrono>
@@ -99,8 +100,7 @@ public:
         if( FRAME* frame = TRAITS::Frame( m_kiway ) )
             TRAITS::ItemColour( frame, false, m_savedColour );
 
-        m_overlay.reset();
-        m_overlayView = nullptr;
+        dropOverlay();
     }
 
     /// @brief Nested rounded outlines around each glowing item, fading outwards and with age
@@ -113,10 +113,12 @@ public:
 
         KIGFX::VIEW* view = frame->GetCanvas()->GetView();
 
-        if( !m_overlay || m_overlayView != view )
+        if( !m_overlay || !m_overlayCanvas || m_overlayCanvas.get() != frame->GetCanvas() || m_overlayView != view )
         {
+            dropOverlay();
             m_overlay = view->MakeOverlay();
             m_overlayView = view;
+            m_overlayCanvas = frame->GetCanvas();
         }
 
         m_overlay->Clear();
@@ -156,7 +158,22 @@ public:
     }
 
 private:
+    /// @brief Unregister the overlay from its view while that view exists; when the canvas (and
+    /// with it the view) is already gone the overlay still points at the freed view, so it is
+    /// abandoned instead of destroyed (its destructor would unlink itself from that view)
+    void dropOverlay()
+    {
+        // alive: the overlay's destructor unlinks it from the view
+        if( m_overlay && !( m_overlayCanvas && m_overlayCanvas->GetView() == m_overlayView ) )
+            new std::shared_ptr<KIGFX::VIEW_OVERLAY>( std::move( m_overlay ) );
+
+        m_overlay.reset();
+        m_overlayView = nullptr;
+        m_overlayCanvas = nullptr;
+    }
+
     KIWAY*                               m_kiway = nullptr;
+    wxWeakRef<EDA_DRAW_PANEL_GAL>        m_overlayCanvas;
     std::shared_ptr<KIGFX::VIEW_OVERLAY> m_overlay;
     KIGFX::VIEW*                         m_overlayView = nullptr;
     std::optional<KIGFX::COLOR4D>        m_savedColour;

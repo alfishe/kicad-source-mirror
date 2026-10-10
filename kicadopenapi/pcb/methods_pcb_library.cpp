@@ -36,7 +36,7 @@ std::string str( const wxString& aText )
 
 double mm( double aIU )
 {
-    return std::round( pcbIUScale.IUTomm( aIU ) * 10000.0 ) / 10000.0;
+    return std::round( ( aIU / pcbIUScale.IU_PER_MM ) * 10000.0 ) / 10000.0;
 }
 
 

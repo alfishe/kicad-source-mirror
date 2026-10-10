@@ -219,13 +219,14 @@ std::string Dechunk(const std::string& chunked)
         }
 
         pos = lineEnd + 2;
-        if (pos + size > chunked.size())
+        if (pos > chunked.size() || size > chunked.size() - pos)
         {
             out.append(chunked, pos, std::string::npos); // Truncated tail
             break;
         }
         out.append(chunked, pos, size);
-        pos += size + 2; // Skip chunk data + trailing CRLF
+        pos += size; // no overflow: size <= chunked.size() - pos
+        pos += 2;    // trailing CRLF
     }
     return out;
 }

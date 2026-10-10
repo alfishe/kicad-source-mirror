@@ -201,6 +201,9 @@ static KOPENAPI_RESULT h_sch_net_trace( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( !start && !net->instances.empty() )
         start = &net->instances.front().path;
 
+    if( !start )
+        return KOPENAPI_RESULT::Error( 404, "net '" + net->name + "' has no connected items on any sheet" );
+
     // Order sheet instances by distance from the start sheet in the hierarchy tree
     std::vector<const NET_INSTANCE*> order;
 

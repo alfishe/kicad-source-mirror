@@ -74,7 +74,7 @@ int toIU( double aMm )
 
 double toMm( double aIU )
 {
-    return std::round( pcbIUScale.IUTomm( aIU ) * 1000.0 ) / 1000.0;
+    return std::round( ( aIU / pcbIUScale.IU_PER_MM ) * 1000.0 ) / 1000.0;
 }
 
 

@@ -603,11 +603,22 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
         return std::nullopt;
     }
 
+    // long calls must not block housekeeping bookkeeping; re-locked even if Post throws, so the
+    // caller's lock never unlocks a mutex it does not hold
+    auto postUnlocked = [&]()
+    {
+        struct RELOCK
+        {
+            std::mutex& m;
+            ~RELOCK() { m.lock(); }
+        } relock{m_mutex};
+        m_mutex.unlock();
+        return bridge::Post(host, port, path, line);
+    };
+
     long pid = m_pid;
     m_inFlight = true;
-    m_mutex.unlock();  // long calls must not block housekeeping bookkeeping
-    bridge::HttpResult result = bridge::Post(host, port, path, line);
-    m_mutex.lock();
+    bridge::HttpResult result = postUnlocked();
     m_inFlight = false;
 
     // app_restart was sent here: the old process may still be quitting while its server is gone;
@@ -616,9 +627,7 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
     {
         pid = m_pid;
         m_inFlight = true;
-        m_mutex.unlock();
-        result = bridge::Post(host, port, path, line);
-        m_mutex.lock();
+        result = postUnlocked();
         m_inFlight = false;
     }
 
@@ -1062,7 +1071,17 @@ int main(int argc, char** argv)
     {
         if (!line.empty())
         {
-            bridgeState.HandleLine(line);
+            try
+            {
+                bridgeState.HandleLine(line);
+            }
+            catch (const std::exception& e)
+            {
+                // wrong JSON types in a request (nlohmann type_error) must not end the session
+                const json msg = json::parse(line, nullptr, false);
+                const json id = msg.is_object() && msg.contains("id") ? msg["id"] : json();
+                Emit(Error(id, -32600, std::string("invalid request: ") + e.what()));
+            }
         }
     }
 

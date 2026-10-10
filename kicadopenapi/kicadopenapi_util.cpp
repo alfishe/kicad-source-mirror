@@ -173,7 +173,10 @@ nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName )
 
 nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties )
 {
-    for( const auto& [key, value] : KopenapiPageSchema().items() )
+    // a named object: a range-for over items() of a temporary iterates a destroyed object
+    const nlohmann::json page = KopenapiPageSchema();
+
+    for( const auto& [key, value] : page.items() )
         aProperties[key] = value;
 
     return { { "type", "object" }, { "properties", aProperties } };

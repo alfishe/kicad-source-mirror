@@ -56,7 +56,7 @@ int toIU( double aMm )
 
 double toMm( double aIU )
 {
-    return std::round( pcbIUScale.IUTomm( aIU ) * 1000.0 ) / 1000.0;
+    return std::round( ( aIU / pcbIUScale.IU_PER_MM ) * 1000.0 ) / 1000.0;
 }
 
 
@@ -686,6 +686,14 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
     BOARD_COMMIT      commit( context->GetToolManager() );
     std::vector<KIID> moved;
 
+    // a flip or rotation can hide the front the plan found: nothing is moved then
+    auto noEdgeAfterTurn = [&]( FOOTPRINT* aFp )
+    {
+        commit.Revert();
+        return KOPENAPI_RESULT::Error( 409, str( aFp->GetReference() ) + ": no panel edge known after the flip / "
+                                                                         "rotation; place it with rotation_deg" );
+    };
+
     for( auto& [fp, m] : plan )
     {
         commit.Modify( fp );
@@ -700,6 +708,10 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         if( m.contains( "facing" ) )
         {
             std::optional<PANEL_EDGE> edge = panelEdge( fp );
+
+            if( !edge )
+                return noEdgeAfterTurn( fp );
+
             static const std::map<std::string, double> want = { { "right", 0 }, { "down", 90 }, { "left", 180 }, { "up", 270 } };
             const double now = std::atan2( edge->second.y, edge->second.x ) * 180.0 / M_PI;
             const double turn = now - want.at( m["facing"].get<std::string>() );   // CCW on screen lowers the angle
@@ -716,6 +728,10 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         else if( m.value( "anchor", std::string( "origin" ) ) == "panel_edge" )
         {
             std::optional<PANEL_EDGE> edge = panelEdge( fp );
+
+            if( !edge )
+                return noEdgeAfterTurn( fp );
+
             pos -= edge->first.Center() - fp->GetPosition();
 
             // edge_offset_mm: along the facing direction, + out past the edge, - recessed

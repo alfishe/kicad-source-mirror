@@ -44,6 +44,7 @@
 #include <chrono>
 #include <thread>
 #include <cmath>
+#include <optional>
 #include <set>
 
 
@@ -58,7 +59,7 @@ std::string str( const wxString& aText )
 
 double toMm( double aIU )
 {
-    return std::round( pcbIUScale.IUTomm( aIU ) * 1000.0 ) / 1000.0;
+    return std::round( ( aIU / pcbIUScale.IU_PER_MM ) * 1000.0 ) / 1000.0;
 }
 
 
@@ -319,6 +320,17 @@ struct ROUTE_REQUEST
 /// @brief One connection through PNS as a person routes it (see the file comment).  Fills aOut with what
 /// happened (routed / reason / segments / metrics / violations); the staged commit is pushed only
 /// when the guard is clean and it is no dry run.  aAdded: uuids of the new tracks / vias.
+/// @brief 409 while the editor's interactive router is routing or dragging (it shares the global
+/// router instance with ours)
+static std::optional<KOPENAPI_RESULT> guiRouting()
+{
+    if( PNS::ROUTER* gui = PNS::ROUTER::GetInstance(); gui && gui->RoutingInProgress() )
+        return KOPENAPI_RESULT::Error( 409, "the editor is routing interactively: finish or cancel it first" );
+
+    return std::nullopt;
+}
+
+
 bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
 {
     BOARD*     board = aContext.GetBoard();
@@ -332,6 +344,13 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
 
     PNS::ROUTING_SETTINGS settings( nullptr, "" );
     settings.SetMode( aReq.mode );
+
+    // the router is a process-wide singleton: the editor's own router is current again afterwards
+    struct RESTORE_ROUTER
+    {
+        PNS::ROUTER* previous = PNS::ROUTER::GetInstance();
+        ~RESTORE_ROUTER() { PNS::ROUTER::SetInstance( previous ); }
+    } restoreRouter;
 
     auto router = std::make_unique<PNS::ROUTER>();
     router->SetInterface( iface.get() );
@@ -567,6 +586,9 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
     if( !context )
         return KopenapiNoBoard();
 
+    if( std::optional<KOPENAPI_RESULT> busy = guiRouting() )
+        return *busy;
+
     BOARD*              board = context->GetBoard();
     std::optional<PAD*> from = findPad( board, aArgs.value( "from", std::string() ) );
 
@@ -636,6 +658,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     if( !context )
         return KopenapiNoBoard();
+
+    if( std::optional<KOPENAPI_RESULT> busy = guiRouting() )
+        return *busy;
 
     BOARD* board = context->GetBoard();
     const auto started = std::chrono::steady_clock::now();

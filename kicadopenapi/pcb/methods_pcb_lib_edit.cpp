@@ -81,7 +81,13 @@ std::filesystem::path KopenapiModelFile( const FOOTPRINT* aFootprint, const FP_3
 
         const fs::path dir = fs::path( str( wxStandardPaths::Get().GetUserDir( wxStandardPaths::Dir_Cache ) ) )
                              / "kicad" / "openapi" / "embedded";
-        const fs::path out = dir / ( file->data_hash.substr( 0, 16 ) + "-" + str( name ) );
+        // only the last component of the name: an embedded "../x" or "/x" stays in the cache folder
+        const std::string leaf = fs::path( str( name ) ).filename().string();
+
+        if( leaf.empty() || leaf == "." || leaf == ".." )
+            return {};
+
+        const fs::path out = dir / ( file->data_hash.substr( 0, 16 ) + "-" + leaf );
 
         if( !fs::exists( out ) )
         {

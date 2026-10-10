@@ -30,6 +30,26 @@ static std::optional<Instance> ReadInstance(const fs::path& file)
         return std::nullopt;
     }
 
+    // a stranger's or a broken file in the shared directory must not end the bridge
+    for (const char* key : {"pid", "port"})
+    {
+        if (info.contains(key) && !info[key].is_number_integer())
+        {
+            return std::nullopt;
+        }
+    }
+    for (const char* key : {"app", "url", "mcp"})
+    {
+        if (info.contains(key) && !info[key].is_string())
+        {
+            return std::nullopt;
+        }
+    }
+    if (info.contains("headless") && !info["headless"].is_boolean())
+    {
+        return std::nullopt;
+    }
+
     Instance inst;
     inst.pid = info.value("pid", 0L);
     inst.port = info.value("port", 0);
@@ -54,7 +74,7 @@ std::vector<Instance> Discover(const fs::path& dir)
     std::error_code ec;
     for (const fs::directory_entry& entry : fs::directory_iterator(dir, ec))
     {
-        if (entry.path().extension() == ".json")
+        if (entry.path().extension() == ".json" && entry.is_regular_file(ec))
         {
             if (std::optional<Instance> inst = ReadInstance(entry.path()))
             {

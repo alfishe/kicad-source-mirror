@@ -707,7 +707,12 @@ bool EDA_3D_CANVAS::RenderToImage( unsigned char* aRgb, int aWidth, int aHeight,
         return false;
     }
 
-    gl_mgr->LockCtx( m_glRC, this );
+    if( !gl_mgr->LockCtx( m_glRC, this ) )
+    {
+        gl_mgr->UnlockCtx( m_glRC );
+        m_is_currently_painting.clear();
+        return false;
+    }
 
     // errors left by earlier drawing are not ours
     while( glGetError() != GL_NO_ERROR )
@@ -827,8 +832,9 @@ bool EDA_3D_CANVAS::RenderToImage( unsigned char* aRgb, int aWidth, int aHeight,
         m_3d_render->SetCurWindowSize( wxSize( rw, rh ) );
         m_3d_render->Redraw( false );
     }
-    catch( std::runtime_error& )
+    catch( ... )
     {
+        // bad_alloc, IO_ERROR (not a std::exception) from a reload: the context must be unlocked
         return done( false );
     }
 

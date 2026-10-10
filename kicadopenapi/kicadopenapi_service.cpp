@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +44,82 @@ namespace fs = std::filesystem;
 
 /// @brief Drops discovery files left behind by crashed processes
 static std::atomic<int>  s_apiCalls{ 0 };       ///< API calls running on the main thread now
+
+
+/// @brief Arguments a handler can take as they are: top-level types as the method's schema says,
+/// every number finite and in range (millimetre values — keys ending in _mm, "points" — within
+/// +-2000 mm, which still fits nanometres in 32 bits; other numbers within 32-bit integers), and
+/// no nesting deeper than 64. Anything else is answered 400 before the main thread sees it.
+static std::string checkArgs( const nlohmann::json& aSchema, const nlohmann::json& aArgs )
+{
+    if( aSchema.contains( "properties" ) && aSchema["properties"].is_object() )
+    {
+        for( const auto& [key, prop] : aSchema["properties"].items() )
+        {
+            if( !aArgs.contains( key ) || !prop.is_object() || !prop.contains( "type" ) || !prop["type"].is_string() )
+                continue;
+
+            const std::string     type = prop["type"].get<std::string>();
+            const nlohmann::json& v = aArgs[key];
+            const bool            ok = type == "string"    ? v.is_string()
+                                       : type == "number"  ? v.is_number()
+                                       : type == "integer" ? v.is_number()
+                                       : type == "boolean" ? v.is_boolean()
+                                       : type == "array"   ? v.is_array()
+                                       : type == "object"  ? v.is_object()
+                                                           : true;
+
+            if( !ok )
+                return "'" + key + "' must be " + ( type == "integer" ? "an integer" : "a " + type );
+        }
+    }
+
+    std::string error;
+
+    std::function<void( const nlohmann::json&, const std::string&, bool, int )> walk =
+            [&]( const nlohmann::json& aValue, const std::string& aKey, bool aMm, int aDepth )
+    {
+        if( !error.empty() )
+            return;
+
+        if( aDepth > 64 )
+        {
+            error = "arguments nested too deep";
+            return;
+        }
+
+        if( aValue.is_number_float() || aValue.is_number_integer() || aValue.is_number_unsigned() )
+        {
+            const double v = aValue.get<double>();
+
+            if( !std::isfinite( v ) )
+                error = "'" + aKey + "' is not a finite number";
+            else if( aMm && std::abs( v ) > 2000.0 )
+                error = "'" + aKey + "' is out of range (millimetres within +-2000)";
+            else if( !aMm && std::abs( v ) > 2147483647.0 )
+                error = "'" + aKey + "' is out of range";
+
+            return;
+        }
+
+        if( aValue.is_object() )
+        {
+            for( const auto& [k, v] : aValue.items() )
+            {
+                const bool mm = k.size() > 3 && k.compare( k.size() - 3, 3, "_mm" ) == 0;
+                walk( v, k, mm || k == "points", aDepth + 1 );
+            }
+        }
+        else if( aValue.is_array() )
+        {
+            for( const nlohmann::json& v : aValue )
+                walk( v, aKey, aMm, aDepth + 1 );
+        }
+    };
+
+    walk( aArgs, "arguments", false, 0 );
+    return error;
+}
 static std::atomic<bool> s_overrideLock{ false };
 
 
@@ -529,6 +606,9 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
                                                             + field.get<std::string>() + "'" );
         }
     }
+
+    if( const std::string bad = checkArgs( method->inputSchema, aArgs ); !bad.empty() )
+        return KOPENAPI_RESULT::Error( 400, bad );
 
     // answered on the HTTP thread: works while the main thread is busy
     if( aName == "api_trace" )
