@@ -29,6 +29,12 @@ KICOMMON_API bool KopenapiCaptureWindow( wxTopLevelWindow* aWindow, wxImage& aIm
 /// reading canvases back, so resolve it once and reuse it
 KICOMMON_API wxWindow* KopenapiFindCanvas( wxTopLevelWindow* aWindow );
 
+/// @brief Paste the window's canvases, read now, onto aImage (a capture of the same window at the
+/// same size): a recording refreshes the canvases every frame and the rest of the window
+/// (toolbars, panels) less often
+/// @return the canvases pasted
+KICOMMON_API int KopenapiPasteCanvases( wxTopLevelWindow* aWindow, wxImage& aImage );
+
 /// @brief A canvas read back alone (from KopenapiFindCanvas)
 KICOMMON_API bool KopenapiCaptureCanvas( wxWindow* aCanvas, wxImage& aImage );
 

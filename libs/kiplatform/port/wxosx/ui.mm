@@ -327,6 +327,35 @@ bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
     if( w == 0 || h == 0 )
         return false;
 
+    // the usual cache rep is 8-bit RGB(A) in one plane: its pixels are taken directly, without
+    // drawing them once more through Core Graphics
+    const unsigned char* data = [rep bitmapData];
+    const NSInteger      spp = [rep samplesPerPixel];
+
+    if( data && ![rep isPlanar] && [rep bitsPerSample] == 8 && ( spp == 3 || spp == 4 )
+        && !( [rep bitmapFormat] & NSBitmapFormatAlphaFirst ) && (size_t) [rep pixelsWide] == w
+        && (size_t) [rep pixelsHigh] == h )
+    {
+        const size_t   stride = [rep bytesPerRow];
+        unsigned char* rgb = (unsigned char*) malloc( w * h * 3 );
+
+        for( size_t y = 0; y < h; ++y )
+        {
+            const unsigned char* s = data + y * stride;
+            unsigned char*       d = rgb + y * w * 3;
+
+            for( size_t x = 0; x < w; ++x )
+            {
+                d[x * 3 + 0] = s[x * spp + 0];
+                d[x * 3 + 1] = s[x * spp + 1];
+                d[x * 3 + 2] = s[x * spp + 2];
+            }
+        }
+
+        aImage.SetData( rgb, (int) w, (int) h, false );
+        return aImage.IsOk();
+    }
+
     // Normalise whatever the rep holds to 8-bit RGBA
     std::vector<unsigned char> rgba( w * h * 4 );
     CGColorSpaceRef            space = CGColorSpaceCreateDeviceRGB();

@@ -172,6 +172,14 @@ bool KopenapiCaptureWindow( wxTopLevelWindow* aWindow, wxImage& aImage, int* aCa
 }
 
 
+int KopenapiPasteCanvases( wxTopLevelWindow* aWindow, wxImage& aImage )
+{
+    const wxSize client = aWindow->GetClientSize();
+    const double scale = client.x > 0 ? double( aImage.GetWidth() ) / client.x : 1.0;
+    return pasteCanvases( aWindow, aWindow, aImage, scale, KOPENAPI_REGISTRY::Get().CanvasCaptures() );
+}
+
+
 wxWindow* KopenapiFindCanvas( wxTopLevelWindow* aWindow )
 {
     long area = 0;

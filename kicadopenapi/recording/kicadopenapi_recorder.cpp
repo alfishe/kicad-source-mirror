@@ -109,6 +109,10 @@ public:
         m_clockLog = nlohmann::json::array();
 
         m_steadyLast = CLOCK::time_point();
+        m_chrome = wxImage();
+        m_windowMs = m_pasteMs = 0;
+        m_windowFrames = m_pasteFrames = 0;
+        m_chromeMs = std::clamp( aArgs.value( "chrome_ms", 200 ), 0, 5000 );
 
         if( source != "window" && source != "canvas" )
             return KOPENAPI_RESULT::Error( 400, "source: window or canvas" );
@@ -374,6 +378,8 @@ public:
                  { "started_unix_ms", m_startedUnixMs },
                  { "steadycam", steadyJson() },
                  { "capture", m_capturePath },
+                 { "window_ms_avg", m_windowFrames ? std::round( m_windowMs / m_windowFrames * 10 ) / 10 : 0.0 },
+                 { "canvases_ms_avg", m_pasteFrames ? std::round( m_pasteMs / m_pasteFrames * 10 ) / 10 : 0.0 },
                  { "clock", m_videoClock ? "video" : "wall" },
                  { "clock_changes", m_clockLog },
                  { "quality_tier", m_renderSize.x > 0 ? nlohmann::json( tierName( m_tier ) ) : nlohmann::json() },
@@ -767,7 +773,30 @@ private:
         if( m_source == "canvas" )
             return m_canvas && KopenapiCaptureCanvas( m_canvas, aImage );
 
-        return KopenapiCaptureWindow( aWindow, aImage );
+        // the whole window: toolbars and panels change rarely, the canvases every frame — the
+        // window is drawn again every m_chromeMs (or on a new size), the canvases pasted fresh
+        const auto now = CLOCK::now();
+        const bool stale = !m_chrome.IsOk() || aWindow->GetClientSize() != m_chromeSize
+                           || now - m_chromeAt >= std::chrono::milliseconds( m_chromeMs );
+
+        if( stale )
+        {
+            if( !KopenapiCaptureWindow( aWindow, m_chrome ) )
+                return false;
+
+            m_chromeAt = now;
+            m_chromeSize = aWindow->GetClientSize();
+            aImage = m_chrome.Copy();
+            m_windowMs += std::chrono::duration<double, std::milli>( CLOCK::now() - now ).count();
+            m_windowFrames++;
+            return true;
+        }
+
+        aImage = m_chrome.Copy();
+        KopenapiPasteCanvases( aWindow, aImage );
+        m_pasteMs += std::chrono::duration<double, std::milli>( CLOCK::now() - now ).count();
+        m_pasteFrames++;
+        return true;
     }
 
     int64_t currentIndex() const
@@ -898,6 +927,12 @@ private:
     std::string                             m_qualityMode = "adaptive";
     std::string                             m_capturePath = "auto"; ///< auto / gpu / cpu
     KOPENAPI_FRAME_SCALER                   m_scaler;               ///< encoder thread: fits frames (tables kept)
+    wxImage                                 m_chrome;               ///< source window: the last whole-window picture
+    CLOCK::time_point                       m_chromeAt;
+    wxSize                                  m_chromeSize;
+    int                                     m_chromeMs = 200;       ///< source window: redraw the window this often
+    double                                  m_windowMs = 0, m_pasteMs = 0;   ///< source window: time drawing the window / pasting canvases
+    int                                     m_windowFrames = 0, m_pasteFrames = 0;
     std::vector<uint8_t>                    m_fitted;               ///< encoder thread: the fitted frame
     std::string                             m_clockMode = "auto";   ///< auto / video / wall
     bool                                    m_videoClock = false;   ///< frames on video time now
@@ -1309,6 +1344,7 @@ KOPENAPI_REGISTER( "record_start",
                         "encoder":{"type":"string","enum":["auto","native","ffmpeg"],"default":"auto"},
                         "fps":{"type":"integer","minimum":1,"maximum":60,"description":"default 20 for a window, 30 for a canvas"},
                         "antialias":{"type":"string","enum":["ssaa2","none"],"default":"ssaa2","description":"canvases rendered at the video size (3D viewer): 2x supersampling on the GPU"},
+                        "chrome_ms":{"type":"integer","default":200,"minimum":0,"maximum":5000,"description":"source window: the window itself (toolbars, panels) is drawn again this often, the canvases every frame; 0 = every frame"},
                         "capture":{"type":"string","enum":["auto","gpu","cpu"],"default":"auto","description":"how frames are taken: gpu (composed and scaled on the GPU, read once; canvas source with a 4k / 1080p / custom profile), cpu (one read of the composed frame, SIMD scaling on the encoder thread), auto (gpu where it works)"},
                         "clock":{"type":"string","enum":["auto","video","wall"],"default":"auto","description":"auto / video: video time — every frame the next one, never faster than real time; when capture is slower the video runs longer instead of skipping frames (smooth); record_wait paces scripts on it. wall: frames follow the wall clock, skipped when capture is slower"},
                         "steadycam":{"description":"how the recorded view goes where it is put (API jumps, view changes): timed (default: a smooth path that arrives exactly duration_ms later), filter (eases through a smoothing filter, arrives later), off; true = timed, false = off, or {mode, smooth_ms (filter, default 450), duration_ms (timed, default 600)}; API animations pass as they are","oneOf":[{"type":"boolean"},{"type":"string","enum":["timed","filter","off"]},{"type":"object","properties":{"mode":{"type":"string","enum":["timed","filter","off"]},"enabled":{"type":"boolean"},"smooth_ms":{"type":"number"},"duration_ms":{"type":"number"}}}]},
