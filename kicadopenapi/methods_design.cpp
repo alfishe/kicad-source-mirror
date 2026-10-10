@@ -525,3 +525,5 @@ KOPENAPI_REGISTER( "net_get",
                         "name":{"type":"string","description":"net name on either side"},
                         "pin":{"type":"string","description":"REF.PIN"}}})json"_json,
                    false, h_net_get );
+
+KOPENAPI_MARK_EDITING( "design_update_board" );

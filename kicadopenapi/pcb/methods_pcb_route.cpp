@@ -491,3 +491,5 @@ KOPENAPI_REGISTER( "pcb_route_connection",
                         "mode":{"type":"string","enum":["walkaround","shove"],"default":"walkaround"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_route_connection, 120 );
+
+KOPENAPI_MARK_EDITING( "pcb_route_connection" );

@@ -11,6 +11,9 @@
 #include <board.h>
 #include <board_loader.h>
 #include <kiway.h>
+#include <tool/tool_manager.h>
+#include <tool/actions.h>
+#include <kicadopenapi_history.h>
 #include <pcb_edit_frame.h>
 #include <pcb_io/pcb_io_mgr.h>
 #include <pcbnew_settings.h>
@@ -164,6 +167,8 @@ static KOPENAPI_RESULT openGui( KOPENAPI_CONTEXT& aCtx, const wxFileName& aBoard
 
 static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
+    KOPENAPI_HISTORY::Get().Reset( "pcb", "pcb_open" );   // earlier marks belong to another document state
+
     if( !aArgs["path"].is_string() || aArgs["path"].get<std::string>().empty() )
         return KOPENAPI_RESULT::Error( 400, "'path' must be a non-empty string" );
 
@@ -198,6 +203,8 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
 
 static KOPENAPI_RESULT h_pcb_close( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
+    KOPENAPI_HISTORY::Get().Reset( "pcb", "pcb_close" );   // earlier marks belong to another document state
+
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
     if( !context )
@@ -258,6 +265,8 @@ static KOPENAPI_RESULT h_pcb_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
 
 static KOPENAPI_RESULT h_pcb_revert( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
 {
+    KOPENAPI_HISTORY::Get().Reset( "pcb", "pcb_revert" );   // earlier marks belong to another document state
+
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
     if( !context )
@@ -269,6 +278,87 @@ static KOPENAPI_RESULT h_pcb_revert( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     return KOPENAPI_RESULT::Ok( documentStatus( aCtx ) );
 }
 
+
+// ---- edit history (kicadopenapi_history.h) --------------------------------------------------
+
+static KOPENAPI_DOC_HISTORY history()
+{
+    KOPENAPI_DOC_HISTORY h;
+
+    h.undoDepth = []( KOPENAPI_CONTEXT& aCtx ) -> std::optional<int>
+    {
+        PCB_EDIT_FRAME* frame = guiFrame( aCtx, false );
+
+        if( !frame || !KopenapiPcbContext( aCtx ) )
+            return std::nullopt;
+
+        return frame->GetUndoCommandCount();
+    };
+
+    h.undoTo = []( KOPENAPI_CONTEXT& aCtx, int aDepth )
+    {
+        PCB_EDIT_FRAME* frame = guiFrame( aCtx, false );
+
+        if( !frame )
+            return false;
+
+        while( frame->GetUndoCommandCount() > aDepth )
+        {
+            const int before = frame->GetUndoCommandCount();
+            frame->GetToolManager()->RunAction( ACTIONS::undo );
+
+            if( frame->GetUndoCommandCount() >= before )
+                return false;   // nothing undone: stop rather than loop
+        }
+
+        return frame->GetUndoCommandCount() == aDepth;
+    };
+
+    h.snapshot = []( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
+    {
+        if( !aCtx.headless || !s_headless )
+            return false;
+
+        const wxFileName target( wxString::FromUTF8( aDir ), wxFileName( s_headless->GetCurrentFileName() ).GetFullName() );
+        return s_headless->SavePcbCopy( target.GetFullPath(), false, true );
+    };
+
+    h.restore = []( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
+    {
+        if( !aCtx.headless || !s_headless )
+            return false;
+
+        const wxString   original = s_headless->GetCurrentFileName();
+        const wxFileName copy( wxString::FromUTF8( aDir ), wxFileName( original ).GetFullName() );
+        PROJECT*         project = s_headless->GetBoard()->GetProject();
+        std::unique_ptr<BOARD> board;
+
+        try
+        {
+            board = BOARD_LOADER::Load( copy.GetFullPath(), PCB_IO_MGR::KICAD_SEXP, project );
+        }
+        catch( const IO_ERROR& )
+        {
+            return false;
+        }
+
+        if( !board )
+            return false;
+
+        // Back under the document's own path, unsaved
+        board->SetFileName( original );
+        s_headless.reset();
+        s_headless = std::make_shared<HEADLESS_PCB_CONTEXT>( std::move( board ), project,
+                                                             GetAppSettings<PCBNEW_SETTINGS>( "pcbnew" ), aCtx.kiway );
+        s_headless->SetContentModified( true );
+        return true;
+    };
+
+    return h;
+}
+
+
+KOPENAPI_REGISTER_HISTORY( "pcb", history() );
 
 KOPENAPI_REGISTER_DOCUMENTS( "pcb", documentStatus,
                              []()

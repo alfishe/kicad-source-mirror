@@ -1,4 +1,5 @@
 #include "kicadopenapi_service.h"
+#include "kicadopenapi_history.h"
 #include "kicadopenapi_registry.h"
 #include "kicadopenapi_mcp.h"
 #include "kicadopenapi_journal.h"
@@ -431,7 +432,18 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
                       {
                           // Log records during the call are attributed to this method
                           KOPENAPI_JOURNAL::SCOPED_OPERATION scope( operation );
+
+                          // Editing calls: the documents are marked before, the call is logged
+                          const std::string name = operation.substr( 4 );
+                          const bool        editing = KOPENAPI_REGISTRY::Get().IsEditing( name );
+
+                          if( editing )
+                              KOPENAPI_HISTORY::Get().BeforeEdit( ctxCopy, name, args );
+
                           KOPENAPI_RESULT result = handler( ctxCopy, args );
+
+                          if( editing )
+                              KOPENAPI_HISTORY::Get().AfterEdit( ctxCopy, result );
 
                           // Failed operations are journaled too (4xx warning, 5xx error)
                           if( result.status >= 400 )

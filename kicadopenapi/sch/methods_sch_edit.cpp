@@ -2708,3 +2708,5 @@ KOPENAPI_REGISTER( "sch_annotate",
                                 "#PWR." ) + EDIT_NOTE,
                    R"json({"type":"object","properties":{"reset":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_annotate );
+
+KOPENAPI_MARK_EDITING( "sch_symbol_add", "sch_symbol_update", "sch_items_move", "sch_item_delete", "sch_connect", "sch_wire", "sch_power_add", "sch_label_add", "sch_no_connect", "sch_annotate" );

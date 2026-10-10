@@ -923,3 +923,5 @@ KOPENAPI_REGISTER( "pcb_rules_set",
                             "diff_pair_width_mm":{"type":"number"},"diff_pair_gap_mm":{"type":"number"},
                             "nets":{"type":"array","items":{"type":"string"}}}}}}})json"_json,
                    false, h_pcb_rules_set );
+
+KOPENAPI_MARK_EDITING( "pcb_netlist_apply", "pcb_outline_set", "pcb_rules_set" );

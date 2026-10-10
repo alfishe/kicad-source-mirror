@@ -7,9 +7,14 @@
 #include <wx/log.h>
 
 #include <api/headless_sch_context.h>
+#include <api/sch_api_save.h>
 #include <api/sch_context.h>
 #include <eeschema_helpers.h>
 #include <kiway.h>
+#include <tool/tool_manager.h>
+#include <tool/actions.h>
+#include <sch_screen.h>
+#include <kicadopenapi_history.h>
 #include <pgm_base.h>
 #include <project.h>
 #include <sch_edit_frame.h>
@@ -185,6 +190,8 @@ static KOPENAPI_RESULT openGui( KOPENAPI_CONTEXT& aCtx, const wxFileName& aSchem
 
 static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
+    KOPENAPI_HISTORY::Get().Reset( "sch", "sch_open" );   // earlier marks belong to another document state
+
     if( !aArgs["path"].is_string() || aArgs["path"].get<std::string>().empty() )
         return KOPENAPI_RESULT::Error( 400, "'path' must be a non-empty string" );
 
@@ -219,6 +226,8 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
 
 static KOPENAPI_RESULT h_sch_close( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
+    KOPENAPI_HISTORY::Get().Reset( "sch", "sch_close" );   // earlier marks belong to another document state
+
     std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
 
     if( !context )
@@ -280,6 +289,8 @@ static KOPENAPI_RESULT h_sch_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
 
 static KOPENAPI_RESULT h_sch_revert( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
 {
+    KOPENAPI_HISTORY::Get().Reset( "sch", "sch_revert" );   // earlier marks belong to another document state
+
     std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
 
     if( !context )
@@ -292,7 +303,131 @@ static KOPENAPI_RESULT h_sch_revert( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 }
 
 
+// ---- edit history (kicadopenapi_history.h) --------------------------------------------------
+
+/// Headless: load the copy written into aDir as the open schematic, under its own paths, unsaved
+static bool restoreHeadless( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
+{
+    if( !s_headless || !s_schematic )
+        return false;
+
+    const wxFileName original( s_schematic->GetFileName() );
+    const wxFileName copy( wxString::FromUTF8( aDir ), original.GetFullName() );
+    PROJECT*         project = &s_headless->Prj();
+    SCHEMATIC*       loaded = nullptr;
+
+    try
+    {
+        loaded = EESCHEMA_HELPERS::LoadSchematic( copy.GetFullPath(), false, false, project );
+    }
+    catch( ... )
+    {
+        loaded = nullptr;
+    }
+
+    if( !loaded )
+        return false;
+
+    // Every sheet file back under the document's own directory, all of them unsaved
+    SCH_SCREENS screens( loaded->Root() );
+
+    for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+    {
+        // the virtual root's screen has no file
+        if( screen->GetFileName().IsEmpty() )
+            continue;
+
+        wxFileName fn( screen->GetFileName() );
+        fn.MakeRelativeTo( copy.GetPath() );
+        fn.MakeAbsolute( original.GetPath() );
+        screen->SetFileName( fn.GetFullPath() );
+        screen->SetContentModified( true );
+    }
+
+    s_headless.reset();
+    delete s_schematic;
+    s_schematic = loaded;
+    s_headless = std::make_shared<HEADLESS_SCH_CONTEXT>( &s_schematic, project, aCtx.kiway );
+    return true;
+}
+
+
+static KOPENAPI_DOC_HISTORY history()
+{
+    KOPENAPI_DOC_HISTORY h;
+
+    h.undoDepth = []( KOPENAPI_CONTEXT& aCtx ) -> std::optional<int>
+    {
+        SCH_EDIT_FRAME* frame = guiFrame( aCtx, false );
+
+        if( !frame || !KopenapiSchContext( aCtx ) )
+            return std::nullopt;
+
+        return frame->GetUndoCommandCount();
+    };
+
+    h.undoTo = []( KOPENAPI_CONTEXT& aCtx, int aDepth )
+    {
+        SCH_EDIT_FRAME* frame = guiFrame( aCtx, false );
+
+        if( !frame )
+            return false;
+
+        while( frame->GetUndoCommandCount() > aDepth )
+        {
+            const int before = frame->GetUndoCommandCount();
+            frame->GetToolManager()->RunAction( ACTIONS::undo );
+
+            if( frame->GetUndoCommandCount() >= before )
+                return false;   // nothing undone: stop rather than loop
+        }
+
+        return frame->GetUndoCommandCount() == aDepth;
+    };
+
+    h.snapshot = []( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
+    {
+        if( !aCtx.headless || !s_headless || !s_schematic )
+            return false;
+
+        // Every sheet file of the hierarchy under the same relative name (KiCad's
+        // SaveSchematicCopy writes the root sheet only)
+        const wxFileName root( s_schematic->GetFileName() );
+        SCH_SCREENS      screens( s_schematic->Root() );
+        bool             ok = screens.GetCount() > 0;
+
+        for( size_t i = 0; i < screens.GetCount(); i++ )
+        {
+            SCH_SCREEN* screen = screens.GetScreen( i );
+            SCH_SHEET*  sheet = screens.GetSheet( i );
+
+            if( !screen || !sheet || wxFileName( screen->GetFileName() ).GetFullName().IsEmpty() )
+                continue;   // the virtual root's screen has no file
+
+            wxFileName target( screen->GetFileName() );
+            target.MakeRelativeTo( root.GetPath() );
+            target.MakeAbsolute( wxString::FromUTF8( aDir ) );
+
+            if( !target.DirExists() )
+                target.Mkdir( wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL );
+
+            ok &= SCH_API_SAVE::SaveSheetToFile( sheet, *s_schematic, target.GetFullPath() );
+        }
+
+        return ok;
+    };
+
+    h.restore = []( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
+    {
+        return aCtx.headless && restoreHeadless( aCtx, aDir );
+    };
+
+    return h;
+}
+
+
 KOPENAPI_REGISTER_DOCUMENTS( "sch", documentStatus, releaseHeadless );
+KOPENAPI_REGISTER_HISTORY( "sch", history() );
 
 KOPENAPI_REGISTER( "sch_open",
                    "Open a schematic (.kicad_sch or its .kicad_pro): editor window in the GUI, in memory headless",

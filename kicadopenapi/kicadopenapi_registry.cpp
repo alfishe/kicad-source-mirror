@@ -34,6 +34,42 @@ bool KOPENAPI_REGISTRY::AddDocumentProvider( const std::string& aDomain, KOPENAP
 }
 
 
+bool KOPENAPI_REGISTRY::AddDocumentHistory( const std::string& aDomain, KOPENAPI_DOC_HISTORY aHistory )
+{
+    KOPENAPI_REGISTRY& reg = Get();
+    std::lock_guard<std::mutex> lock( reg.m_mutex );
+
+    reg.m_docHistories[aDomain] = std::move( aHistory );
+    return true;
+}
+
+
+std::map<std::string, KOPENAPI_DOC_HISTORY> KOPENAPI_REGISTRY::DocumentHistories() const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return m_docHistories;
+}
+
+
+bool KOPENAPI_REGISTRY::MarkEditing( std::initializer_list<const char*> aNames )
+{
+    KOPENAPI_REGISTRY& reg = Get();
+    std::lock_guard<std::mutex> lock( reg.m_mutex );
+
+    for( const char* name : aNames )
+        reg.m_editing.insert( name );
+
+    return true;
+}
+
+
+bool KOPENAPI_REGISTRY::IsEditing( const std::string& aName ) const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return m_editing.count( aName ) > 0;
+}
+
+
 void KOPENAPI_REGISTRY::ReleaseDocuments() const
 {
     std::vector<KOPENAPI_DOC_RELEASE> releasers;

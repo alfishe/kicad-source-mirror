@@ -22,6 +22,8 @@
 #define KICADOPENAPI_REGISTRY_H
 
 #include <functional>
+#include <initializer_list>
+#include <set>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -67,6 +69,29 @@ using KOPENAPI_DOC_STATUS = std::function<nlohmann::json( KOPENAPI_CONTEXT& aCtx
 
 /// Drops in-memory (headless) documents; called on the main thread when the service stops
 using KOPENAPI_DOC_RELEASE = std::function<void()>;
+
+
+/**
+ * How a kiface rolls its open document back (edit_log / checkpoint / rollback).  GUI editors
+ * have an undo stack: a mark is its depth and rolling back undoes down to it (every change
+ * counts: API calls, the router, the netlist updater, edits by hand).  Headless documents have
+ * none: a mark is a copy of the document written into a directory, rolling back loads it again
+ * under the document's own path (unsaved).  Every function runs on the main thread.
+ */
+struct KOPENAPI_DOC_HISTORY
+{
+    /// Undo stack depth of the open GUI document; nullopt headless or when none is open
+    std::function<std::optional<int>( KOPENAPI_CONTEXT& )> undoDepth;
+
+    /// GUI: undo until the stack is that deep; false when it cannot get there
+    std::function<bool( KOPENAPI_CONTEXT&, int aDepth )> undoTo;
+
+    /// Headless: write a copy of the open document into aDir; false when none is open
+    std::function<bool( KOPENAPI_CONTEXT&, const std::string& aDir )> snapshot;
+
+    /// Headless: load the copy from aDir back as the open document (its own path, unsaved)
+    std::function<bool( KOPENAPI_CONTEXT&, const std::string& aDir )> restore;
+};
 
 
 using KOPENAPI_HANDLER =
@@ -120,6 +145,16 @@ public:
 
     std::vector<KOPENAPI_CANVAS_CAPTURE> CanvasCaptures() const;
 
+    /// Kifaces register how their documents roll back (see KOPENAPI_DOC_HISTORY)
+    static bool AddDocumentHistory( const std::string& aDomain, KOPENAPI_DOC_HISTORY aHistory );
+
+    std::map<std::string, KOPENAPI_DOC_HISTORY> DocumentHistories() const;
+
+    /// Methods that change documents: logged, and history is marked before each call
+    static bool MarkEditing( std::initializer_list<const char*> aNames );
+
+    bool IsEditing( const std::string& aName ) const;
+
     std::optional<KOPENAPI_METHOD> Find( const std::string& aName ) const;
 
     /**
@@ -138,6 +173,8 @@ private:
     std::map<std::string, KOPENAPI_DOC_STATUS>  m_docProviders;
     std::map<std::string, KOPENAPI_DOC_RELEASE> m_docReleasers;
     std::vector<KOPENAPI_CANVAS_CAPTURE>        m_canvasCaptures;
+    std::map<std::string, KOPENAPI_DOC_HISTORY> m_docHistories;
+    std::set<std::string>                       m_editing;
 };
 
 
@@ -149,6 +186,13 @@ private:
 #define KOPENAPI_REGISTER_DOCUMENTS( aDomain, aStatus, aRelease )                         \
     static const bool kopenapi_docs_reg =                                                  \
             KOPENAPI_REGISTRY::AddDocumentProvider( aDomain, aStatus, aRelease )
+
+#define KOPENAPI_REGISTER_HISTORY( aDomain, aHistory )                                     \
+    static const bool kopenapi_history_reg = KOPENAPI_REGISTRY::AddDocumentHistory( aDomain, aHistory )
+
+/// The methods of this file that change documents: KOPENAPI_MARK_EDITING( "sch_wire", ... )
+#define KOPENAPI_MARK_EDITING( ... )                                                        \
+    static const bool kopenapi_editing_reg = KOPENAPI_REGISTRY::MarkEditing( { __VA_ARGS__ } )
 
 #define KOPENAPI_REGISTER_CANVAS_CAPTURE( aCapture )                                       \
     static const bool kopenapi_canvas_reg = KOPENAPI_REGISTRY::AddCanvasCapture( aCapture )
