@@ -405,14 +405,16 @@ private:
 
     wxGLContext*           m_glRC = nullptr;                    // Current OpenGL context
 
-    /// RenderToImage() buffers, kept while the size stays: drawing target and its downsampled copy
     bool                   m_holdFrame = false;   ///< see HoldFrameUntilLoaded()
 
+    /// RenderToImage() buffers, kept while the size stays: drawing target, its downsampled copy
+    /// and the last complete frame (repeated while a reload builds the scene)
     struct OFFSCREEN
     {
-        GLuint drawFbo = 0, drawColor = 0, drawDepth = 0;
-        GLuint readFbo = 0, readColor = 0;
-        int    w = 0, h = 0, scale = 0;
+        GLuint                     drawFbo = 0, drawColor = 0, drawDepth = 0;
+        GLuint                     readFbo = 0, readColor = 0;
+        int                        w = 0, h = 0, scale = 0;
+        std::vector<unsigned char> last;
     }                      m_offscreen;
     bool                   m_is_opengl_initialized = false;
     bool                   m_is_opengl_version_supported = true;

@@ -8,9 +8,9 @@
 /// keeps real time. GUI only (registered GUI-only: headless answers 501).
 #include "kicadopenapi_recorder.h"
 #include "frame_scaler.h"
+#include "video_encoder.h"
 
 #include <wx/display.h>
-#include "video_encoder.h"
 
 #include <kicadopenapi_capture.h>
 #include <kicadopenapi_registry.h>
@@ -31,6 +31,9 @@
 #include <condition_variable>
 #include <deque>
 #include <fstream>
+#include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -67,13 +70,8 @@ private:
 class RECORDER
 {
 public:
-    static RECORDER& Get()
-    {
-        static RECORDER recorder;
-        return recorder;
-    }
-
     bool Active() const { return m_active; }
+    int  Fps() const { return m_settings.fps; }
 
     KOPENAPI_RESULT Start( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
     {
@@ -144,10 +142,14 @@ public:
         // profile: a fixed frame (frames fitted in, letterboxed) or the source size (capped)
         const std::string profile = aArgs.value( "profile", std::string( "source" ) );
 
-        if( profile == "4k" || profile == "1080p" )
+        if( profile == "4k" || profile == "1080p" || profile == "custom" )
         {
-            settings.width = profile == "4k" ? 3840 : 1920;
-            settings.height = profile == "4k" ? 2160 : 1080;
+            settings.width = profile == "4k" ? 3840 : profile == "1080p" ? 1920 : aArgs.value( "width", 0 ) & ~1;
+            settings.height = profile == "4k" ? 2160 : profile == "1080p" ? 1080 : aArgs.value( "height", 0 ) & ~1;
+
+            if( settings.width < 16 || settings.height < 16 || settings.width > 7680 || settings.height > 4320 )
+                return KOPENAPI_RESULT::Error( 400, "profile custom: width and height (16..7680 x 16..4320)" );
+
             settings.inputWidth = std::max( 2, first.GetWidth() & ~1 );   // the encoder fits it in
             settings.inputHeight = std::max( 2, first.GetHeight() & ~1 );
             m_letterbox = true;
@@ -182,7 +184,7 @@ public:
         }
         else
         {
-            return KOPENAPI_RESULT::Error( 400, "profile: 4k, 1080p or source" );
+            return KOPENAPI_RESULT::Error( 400, "profile: 4k, 1080p, custom or source" );
         }
 
         const std::string encoder = aArgs.value( "encoder", std::string( "auto" ) );
@@ -223,6 +225,8 @@ public:
         m_markers = nlohmann::json::array();
         m_finishing = false;
         m_active = true;
+        m_startedUnixMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch() ).count();
 
         m_thread = std::thread( [this]() { encodeLoop(); } );
         enqueue( first, 0 );
@@ -326,6 +330,7 @@ public:
                  { "capture_ms_avg", m_captured ? std::round( m_captureMsTotal / m_captured * 10 ) / 10 : 0.0 },
                  { "capture_ms_max", std::round( m_captureMsMax * 10 ) / 10 },
                  { "stop_reason", m_stopReason },
+                 { "started_unix_ms", m_startedUnixMs },
                  { "quality_tier", m_renderSize.x > 0 ? nlohmann::json( tierName( m_tier ) ) : nlohmann::json() },
                  { "quality_changes", m_tierLog },
                  { "error", m_error } };
@@ -397,6 +402,16 @@ public:
         if( aFps )
             *aFps = m_settings.fps;
 
+        return true;
+    }
+
+    bool RenderSize( wxWindow* aCanvas, int* aWidth, int* aHeight )
+    {
+        if( !m_active || m_canvas != aCanvas || m_renderSize.x <= 0 || m_tier == TIER_READBACK )
+            return false;
+
+        *aWidth = m_renderSize.x;
+        *aHeight = m_renderSize.y;
         return true;
     }
 
@@ -654,6 +669,7 @@ private:
     double                                  m_maxSeconds = 600;
     bool                                    m_letterbox = false;   ///< fixed profile frame
     wxSize                                  m_renderSize;          ///< canvas rendered offscreen at this size
+    int64_t                                 m_startedUnixMs = 0;   ///< wall clock of frame 0 (aligning parallel recordings)
     int                                     m_tier = 0;            ///< TIER of the offscreen canvas path
     std::string                             m_qualityMode = "adaptive";
     std::deque<double>                      m_tierMs;              ///< recent frame times on this tier
@@ -692,73 +708,261 @@ void RECORD_TIMER::Notify()
 
 
 
+/// Recordings running at the same time (e.g. the board editor and the 3D viewer for a
+/// side-by-side scene); a synced animation step is captured by every one of them
+class RECORDINGS
+{
+public:
+    static RECORDINGS& Get()
+    {
+        static RECORDINGS recordings;
+        return recordings;
+    }
+
+    std::vector<RECORDER*> Active()
+    {
+        std::vector<RECORDER*> out;
+
+        for( auto& [id, r] : m_list )
+        {
+            if( r->Active() )
+                out.push_back( r.get() );
+        }
+
+        return out;
+    }
+
+    KOPENAPI_RESULT Start( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+    {
+        // finished recordings make room; their last state was answered by record_stop
+        for( auto it = m_list.begin(); it != m_list.end(); )
+            it = it->second->Active() ? std::next( it ) : m_list.erase( it );
+
+        std::string id = aArgs.value( "id", std::string() );
+
+        if( id.empty() )
+            id = "rec" + std::to_string( ++m_counter );
+
+        if( m_list.count( id ) )
+            return KOPENAPI_RESULT::Error( 409, "a recording with id '" + id + "' is running" );
+
+        // one video clock for synced animations: every running recording at the same frame rate
+        if( !Active().empty() && aArgs.contains( "fps" ) && aArgs["fps"].get<int>() != Active().front()->Fps() )
+        {
+            return KOPENAPI_RESULT::Error( 409, "fps must match the running recording(s): "
+                                                        + std::to_string( Active().front()->Fps() ) );
+        }
+
+        auto            recorder = std::make_unique<RECORDER>();
+        nlohmann::json  args = aArgs;
+
+        if( !Active().empty() && !aArgs.contains( "fps" ) )
+            args["fps"] = Active().front()->Fps();
+
+        KOPENAPI_RESULT result = recorder->Start( aCtx, args );
+
+        if( result.status != 200 )
+            return result;
+
+        result.body["id"] = id;
+        m_list[id] = std::move( recorder );
+        m_last = id;
+        return result;
+    }
+
+    /// @brief By id, else the only running one; aAll: every running one when no id is given
+    std::vector<std::pair<std::string, RECORDER*>> Pick( const nlohmann::json& aArgs, bool aAll, std::string& aError )
+    {
+        std::vector<std::pair<std::string, RECORDER*>> out;
+        const std::string                               id = aArgs.value( "id", std::string() );
+
+        if( !id.empty() )
+        {
+            if( m_list.count( id ) )
+                out.push_back( { id, m_list[id].get() } );
+            else
+                aError = "no recording with id '" + id + "'";
+
+            return out;
+        }
+
+        for( auto& [rid, r] : m_list )
+        {
+            if( r->Active() )
+                out.push_back( { rid, r.get() } );
+        }
+
+        if( out.empty() && m_list.count( m_last ) )
+            out.push_back( { m_last, m_list[m_last].get() } );
+
+        if( out.size() > 1 && !aAll )
+        {
+            aError = "several recordings are running: give id";
+            out.clear();
+        }
+
+        return out;
+    }
+
+    bool Synced( int* aFps )
+    {
+        for( RECORDER* r : Active() )
+        {
+            if( r->Synced( aFps ) )
+                return true;
+        }
+
+        return false;
+    }
+
+    void RecordFrame()
+    {
+        for( RECORDER* r : Active() )
+            r->RecordFrame();
+    }
+
+    int ScreenSteps()
+    {
+        int steps = 1;
+
+        for( RECORDER* r : Active() )
+            steps = std::max( steps, r->ScreenSteps() );
+
+        return steps;
+    }
+
+    void Shutdown()
+    {
+        for( auto& [id, r] : m_list )
+            r->Shutdown();
+    }
+
+private:
+    std::map<std::string, std::unique_ptr<RECORDER>> m_list;
+    std::string                                      m_last;
+    int                                              m_counter = 0;
+};
+
 } // namespace
 
 
 void KopenapiRecorderShutdown()
 {
-    RECORDER::Get().Shutdown();
+    RECORDINGS::Get().Shutdown();
 }
 
 
 bool KopenapiRecordingSync( int* aFps )
 {
-    return RECORDER::Get().Synced( aFps );
+    return RECORDINGS::Get().Synced( aFps );
 }
 
 
 void KopenapiRecordFrame()
 {
-    RECORDER::Get().RecordFrame();
+    RECORDINGS::Get().RecordFrame();
 }
 
 
 int KopenapiRecordingScreenSteps()
 {
-    return RECORDER::Get().ScreenSteps();
+    return RECORDINGS::Get().ScreenSteps();
+}
+
+
+bool KopenapiRecordingRenderSize( wxWindow* aCanvas, int* aWidth, int* aHeight )
+{
+    for( RECORDER* r : RECORDINGS::Get().Active() )
+    {
+        if( r->RenderSize( aCanvas, aWidth, aHeight ) )
+            return true;
+    }
+
+    return false;
 }
 
 
 static KOPENAPI_RESULT h_record_start( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
-    return RECORDER::Get().Start( aCtx, aArgs );
+    return RECORDINGS::Get().Start( aCtx, aArgs );
 }
 
 
-static KOPENAPI_RESULT h_record_stop( KOPENAPI_CONTEXT&, const nlohmann::json& )
+/// @brief Runs aDo on the picked recording(s): one answer as is, several as {recordings: [...]}
+static KOPENAPI_RESULT forPicked( const nlohmann::json& aArgs, bool aAll,
+                                  const std::function<KOPENAPI_RESULT( RECORDER& )>& aDo )
 {
-    return RECORDER::Get().Stop();
+    std::string error;
+    auto        picked = RECORDINGS::Get().Pick( aArgs, aAll, error );
+
+    if( picked.empty() )
+        return KOPENAPI_RESULT::Error( error.empty() ? 409 : 400, error.empty() ? "no recording is running" : error );
+
+    if( picked.size() == 1 )
+    {
+        KOPENAPI_RESULT r = aDo( *picked.front().second );
+
+        if( r.status == 200 && r.body.is_object() )
+            r.body["id"] = picked.front().first;
+
+        return r;
+    }
+
+    nlohmann::json all = nlohmann::json::array();
+    int            status = 200;
+
+    for( auto& [id, rec] : picked )
+    {
+        KOPENAPI_RESULT r = aDo( *rec );
+        nlohmann::json  body = r.body.is_object() ? r.body : nlohmann::json::object();
+        body["id"] = id;
+        all.push_back( body );
+
+        if( r.status != 200 )
+            status = r.status;
+    }
+
+    KOPENAPI_RESULT out = KOPENAPI_RESULT::Ok( { { "recordings", all } } );
+    out.status = status;
+    return out;
 }
 
 
-static KOPENAPI_RESULT h_record_status( KOPENAPI_CONTEXT&, const nlohmann::json& )
+static KOPENAPI_RESULT h_record_stop( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
 {
-    return KOPENAPI_RESULT::Ok( RECORDER::Get().status() );
+    return forPicked( aArgs, true, []( RECORDER& r ) { return r.Stop(); } );
 }
 
 
-static KOPENAPI_RESULT h_record_pause( KOPENAPI_CONTEXT&, const nlohmann::json& )
+static KOPENAPI_RESULT h_record_status( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
 {
-    return RECORDER::Get().Pause( true );
+    return forPicked( aArgs, true, []( RECORDER& r ) { return KOPENAPI_RESULT::Ok( r.status() ); } );
 }
 
 
-static KOPENAPI_RESULT h_record_resume( KOPENAPI_CONTEXT&, const nlohmann::json& )
+static KOPENAPI_RESULT h_record_pause( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
 {
-    return RECORDER::Get().Pause( false );
+    return forPicked( aArgs, true, []( RECORDER& r ) { return r.Pause( true ); } );
+}
+
+
+static KOPENAPI_RESULT h_record_resume( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
+{
+    return forPicked( aArgs, true, []( RECORDER& r ) { return r.Pause( false ); } );
 }
 
 
 static KOPENAPI_RESULT h_record_marker( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
 {
-    return RECORDER::Get().Marker( aArgs.value( "text", std::string() ) );
+    const std::string text = aArgs.value( "text", std::string() );
+    return forPicked( aArgs, true, [&]( RECORDER& r ) { return r.Marker( text ); } );
 }
 
 
 KOPENAPI_REGISTER( "record_start",
                    "Start a video recording (screen capture, screencast, demo video) of a KiCad window or "
                    "of its canvas alone: offscreen, no screen-recording permission, covered windows still "
-                   "record; MP4 (native encoder: macOS VideoToolbox; else ffmpeg) or GIF; GUI only",
+                   "record; several at once (answers an id; started_unix_ms aligns them); MP4 (native encoder: macOS VideoToolbox; else ffmpeg) or GIF; GUI only",
                    R"json({"type":"object","properties":{
                         "source":{"type":"string","enum":["window","canvas"],"default":"window","description":"the whole window (toolbars, panels) or the editor's drawing area only"},
                         "window":{"type":"string","description":"window id or title glob from window_list; default the active window"},
@@ -769,30 +973,35 @@ KOPENAPI_REGISTER( "record_start",
                         "fps":{"type":"integer","minimum":1,"maximum":60,"description":"default 20 for a window, 30 for a canvas"},
                         "antialias":{"type":"string","enum":["ssaa2","none"],"default":"ssaa2","description":"canvases rendered at the video size (3D viewer): 2x supersampling on the GPU"},
                         "quality_mode":{"type":"string","enum":["adaptive","max","fast"],"default":"adaptive","description":"3D viewer canvas: adaptive starts at full quality and steps down (gpu 2x -> gpu -> window readback scaled) when frames exceed the budget or the GPU refuses, back up with room to spare; max keeps the best the GPU can do; fast uses the readback"},
-                        "profile":{"type":"string","enum":["source","1080p","4k"],"default":"source","description":"4k (3840x2160) / 1080p (1920x1080): every frame scaled (bicubic up, high-quality down) to fit, centred; source: the window's size capped by max_width"},
+                        "profile":{"type":"string","enum":["source","1080p","4k","custom"],"default":"source","description":"4k (3840x2160) / 1080p (1920x1080) / custom (width x height, e.g. one half of a side-by-side): every frame scaled (bicubic up, high-quality down) to fit, centred; the 3D viewer renders at that size; source: the window's size capped by max_width"},
+                        "width":{"type":"integer","description":"profile custom"},
+                        "height":{"type":"integer","description":"profile custom"},
                         "max_width":{"type":"integer","default":1920,"description":"source profile: scale down wider frames"},
                         "quality":{"type":"integer","minimum":0,"maximum":10,"default":5},
-                        "max_seconds":{"type":"number","default":600,"description":"stops by itself after this long"}}})json"_json,
+                        "max_seconds":{"type":"number","default":600,"description":"stops by itself after this long"},
+                        "id":{"type":"string","description":"name for this recording (default rec<N>); several can run at once, e.g. the board editor and the 3D viewer for a side-by-side scene: same fps, one video clock for animations"}}})json"_json,
                    true, h_record_start, 60 );
 
 KOPENAPI_REGISTER( "record_stop",
                    "Stop the video recording and finish the file: path, duration, frames captured / "
-                   "encoded / dropped, capture time, file size, markers file",
-                   R"json({"type":"object","properties":{}})json"_json, true, h_record_stop, 120 );
+                   "encoded / dropped, capture time, file size, markers file; id, else every running one",
+                   R"json({"type":"object","properties":{"id":{"type":"string","description":"default: every running recording"}}})json"_json, true, h_record_stop, 120 );
 
 KOPENAPI_REGISTER( "record_status",
                    "Video recording state: running / paused, path, size, fps, encoder, duration, frames "
-                   "captured / encoded / dropped, capture time per frame, stop reason, error",
-                   R"json({"type":"object","properties":{}})json"_json, true, h_record_status );
+                   "captured / encoded / dropped, capture time per frame, stop reason, error; id, else every "
+                   "running one (several: {recordings: [...]})",
+                   R"json({"type":"object","properties":{"id":{"type":"string","description":"default: every running recording"}}})json"_json, true, h_record_status );
 
-KOPENAPI_REGISTER( "record_pause", "Pause the video recording (the paused time is cut out)",
-                   R"json({"type":"object","properties":{}})json"_json, true, h_record_pause );
+KOPENAPI_REGISTER( "record_pause", "Pause the video recording(s) (the paused time is cut out); id, else all",
+                   R"json({"type":"object","properties":{"id":{"type":"string","description":"default: every running recording"}}})json"_json, true, h_record_pause );
 
-KOPENAPI_REGISTER( "record_resume", "Resume a paused video recording",
-                   R"json({"type":"object","properties":{}})json"_json, true, h_record_resume );
+KOPENAPI_REGISTER( "record_resume", "Resume paused video recording(s); id, else all",
+                   R"json({"type":"object","properties":{"id":{"type":"string","description":"default: every running recording"}}})json"_json, true, h_record_resume );
 
 KOPENAPI_REGISTER( "record_marker",
                    "Mark the current time of the video recording with a text (chapters / captions for "
                    "editing a demo; written next to the video as <video>.markers.json)",
-                   R"json({"type":"object","required":["text"],"properties":{"text":{"type":"string"}}})json"_json,
+                   R"json({"type":"object","required":["text"],"properties":{"text":{"type":"string"},
+                        "id":{"type":"string","description":"default: every running recording"}}})json"_json,
                    true, h_record_marker );

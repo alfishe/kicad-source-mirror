@@ -20,4 +20,11 @@ KICOMMON_API void KopenapiRecordFrame();
 /// the video's frame rate (at least 1), so the window animates at the display's rate
 KICOMMON_API int KopenapiRecordingScreenSteps();
 
+class wxWindow;
+
+/// @brief The frame size a running recording renders this canvas at (offscreen), so camera
+/// framing can fit what is recorded rather than the window
+/// @return false when no recording renders it
+KICOMMON_API bool KopenapiRecordingRenderSize( wxWindow* aCanvas, int* aWidth, int* aHeight );
+
 #endif

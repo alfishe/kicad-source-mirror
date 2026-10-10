@@ -89,4 +89,4 @@ KOPENAPI_REGISTER( "sch_view_zoom",
                         "refs":{"type":"array","items":{"type":"string"}},
                         "margin_mm":{"type":"number","default":5},
                         "animate_ms":{"type":"integer","default":600,"maximum":5000}}})json"_json,
-                   true, h_sch_view_zoom );
+                   true, h_sch_view_zoom, 300 );   // animations record on video time: slow while recording

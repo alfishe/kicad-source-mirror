@@ -561,14 +561,19 @@ bool placeFieldsClear( SCH_SYMBOL* aSymbol, SCH_SCREEN* aScreen, const SCH_SHEET
         return block;
     };
 
+    // texts keep a little air to lines and bodies, not just no overlap
+    const int air = toIU( 0.5 );
+
     auto clear = [&]( const BOX2I& aBlock )
     {
-        if( aBlock.Intersects( own ) )
+        const BOX2I block = aBlock.GetInflated( air );
+
+        if( block.Intersects( own ) )
             return false;
 
         for( const BOX2I& box : obstacles )
         {
-            if( aBlock.Intersects( box ) )
+            if( block.Intersects( box ) )
                 return false;
         }
 
@@ -617,6 +622,36 @@ bool placeFieldsClear( SCH_SYMBOL* aSymbol, SCH_SCREEN* aScreen, const SCH_SHEET
     }
 
     return false;
+}
+
+
+/// @brief After a part lands: its own texts on a clear spot, and the texts of other parts that its
+/// body now covers moved off it (all in aCommit)
+void settleTexts( SCH_SYMBOL* aSymbol, SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, SCH_COMMIT& aCommit )
+{
+    aCommit.Modify( aSymbol, aScreen );
+    placeFieldsClear( aSymbol, aScreen, aPath, false );
+
+    const BOX2I body = aSymbol->GetBodyAndPinsBoundingBox();
+
+    for( SCH_ITEM* item : aScreen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* other = static_cast<SCH_SYMBOL*>( item );
+
+        if( other == aSymbol )
+            continue;
+
+        for( SCH_FIELD& field : other->GetFields() )
+        {
+            if( field.IsVisible() && !field.GetShownText( &aPath, FOR_GUI ).IsEmpty()
+                && field.GetBoundingBox().Intersects( body ) )
+            {
+                aCommit.Modify( other, aScreen );
+                placeFieldsClear( other, aScreen, aPath, false );
+                break;
+            }
+        }
+    }
 }
 
 
@@ -1156,7 +1191,7 @@ static KOPENAPI_RESULT h_sch_wire( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
                     continue;
 
                 BOX2I box = field.GetBoundingBox();
-                box.Inflate( -schIUScale.mmToIU( 0.2 ) );
+                box.Inflate( schIUScale.mmToIU( 0.5 ) );   // a wire passing close counts too
 
                 for( size_t i = 0; !hit && i + 1 < points.size(); ++i )
                 {
@@ -1288,6 +1323,15 @@ static KOPENAPI_RESULT h_sch_symbol_add( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     SCH_COMMIT commit( context->GetToolManager() );
     commit.Add( symbol, sheet->LastScreen() );
     pushEdit( commit, schematic, _( "Add symbol (API)" ), aCtx.kiway, { symbol->m_Uuid } );
+
+    // with the part on the sheet: neighbours' texts it covers move off, its own stay clear
+    {
+        SCH_COMMIT texts( context->GetToolManager() );
+        settleTexts( symbol, sheet->LastScreen(), *sheet, texts );
+
+        if( !texts.Empty() )
+            pushEdit( texts, schematic, _( "Add symbol (API)" ) );
+    }
 
     nlohmann::json card = symbolCard( symbol, *sheet );
 
@@ -2129,6 +2173,14 @@ static KOPENAPI_RESULT h_sch_power_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     commit.Add( symbol, screen );
     touched.push_back( symbol->m_Uuid );
     pushEdit( commit, schematic, _( "Power symbol (API)" ), aCtx.kiway, touched );
+
+    {
+        SCH_COMMIT texts( context->GetToolManager() );
+        settleTexts( symbol, screen, *sheet, texts );
+
+        if( !texts.Empty() )
+            pushEdit( texts, schematic, _( "Power symbol (API)" ) );
+    }
 
     // A T onto a wire, or a stub from a point other wiring meets: a junction dot
     if( screen->IsExplicitJunctionNeeded( tap ) )

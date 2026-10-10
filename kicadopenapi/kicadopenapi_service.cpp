@@ -246,6 +246,7 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 
     nlohmann::json traceJson( const nlohmann::json& aArgs ) const;
     std::thread               preloadThread;   ///< joined in Stop()
+    std::thread               publishThread;   ///< restart: publishes once the reopened document is open
 
     void writeDiscoveryFile();
 
@@ -992,7 +993,62 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     // listen_after_bind() blocks in this thread until Stop().
     m_impl->thread = std::thread( [srv = m_impl->server.get()]() { srv->listen_after_bind(); } );
 
-    m_impl->writeDiscoveryFile();
+    // After app_restart clients find this process only once the document it reopens is open:
+    // their next call (e.g. a 3D view of the board) must not race the loading
+    std::string reopen;
+
+    if( const char* env = std::getenv( "KICAD_OPENAPI_REOPEN" ) )
+    {
+        reopen = env;
+        wxUnsetEnv( wxS( "KICAD_OPENAPI_REOPEN" ) );
+    }
+
+    if( reopen.empty() )
+    {
+        m_impl->writeDiscoveryFile();
+    }
+    else
+    {
+        m_impl->publishThread = std::thread(
+                [impl = m_impl.get(), reopen]()
+                {
+                    namespace fs = std::filesystem;
+                    std::error_code ec;
+                    const fs::path  want = fs::weakly_canonical( fs::path( reopen ), ec );
+                    const auto      deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+
+                    while( impl->alive->load() && std::chrono::steady_clock::now() < deadline )
+                    {
+                        KOPENAPI_CONTEXT ctx = impl->ctx;
+                        KOPENAPI_RESULT  docs = runInMain( impl->alive, impl->waker,
+                                                           [ctx]() mutable
+                                                           {
+                                                               return KOPENAPI_RESULT::Ok(
+                                                                       KOPENAPI_REGISTRY::Get().Documents( ctx ) );
+                                                           } );
+                        bool open = false;
+
+                        for( const nlohmann::json& d : docs.status == 200 ? docs.body : nlohmann::json::array() )
+                        {
+                            for( const char* key : { "path", "project" } )
+                            {
+                                std::error_code e;
+
+                                if( d.contains( key ) && fs::weakly_canonical( fs::path( d.value( key, std::string() ) ), e ) == want )
+                                    open = true;
+                            }
+                        }
+
+                        if( open )
+                            break;
+
+                        std::this_thread::sleep_for( std::chrono::milliseconds( 200 ) );
+                    }
+
+                    if( impl->alive->load() )
+                        impl->writeDiscoveryFile();
+                } );
+    }
 
     // A process without libraries is a silent failure for an agent: say so in the journal
     KopenapiCheckGlobalLibraryTables();
@@ -1017,6 +1073,9 @@ void KICAD_OPENAPI_SERVICE::Stop()
 
     if( m_impl->preloadThread.joinable() )
         m_impl->preloadThread.join();
+
+    if( m_impl->publishThread.joinable() )
+        m_impl->publishThread.join();
 
     if( m_impl->thread.joinable() )
         m_impl->thread.join();

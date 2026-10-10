@@ -785,9 +785,44 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                     out.push_back( p );
                 }
 
+                // clear of every hole already there (earlier vias, THT pads): hole-to-hole rule
+                const BOARD_DESIGN_SETTINGS& ds = board->GetDesignSettings();
+                const int                    drill = ds.GetCurrentViaDrill();
+                auto                         holeClash = [&]( const VECTOR2I& aAt )
+                {
+                    for( PCB_TRACK* t : board->Tracks() )
+                    {
+                        if( t->Type() == PCB_VIA_T
+                            && ( t->GetPosition() - aAt ).EuclideanNorm()
+                                       < ( static_cast<PCB_VIA*>( t )->GetDrillValue() + drill ) / 2 + ds.m_HoleToHoleMin )
+                        {
+                            return true;
+                        }
+                    }
+
+                    for( FOOTPRINT* fp : board->Footprints() )
+                    {
+                        for( PAD* p : fp->Pads() )
+                        {
+                            if( p->HasHole()
+                                && ( p->GetPosition() - aAt ).EuclideanNorm()
+                                           < ( std::max( p->GetDrillSize().x, p->GetDrillSize().y ) + drill ) / 2 + ds.m_HoleToHoleMin )
+                            {
+                                return true;
+                            }
+                        }
+                    }
+
+                    return false;
+                };
+
+                out.erase( std::remove_if( out.begin(), out.end(), holeClash ), out.end() );
                 std::sort( out.begin(), out.end(), [&]( const VECTOR2I& x, const VECTOR2I& y )
                            { return ( x - aToward ).EuclideanNorm() < ( y - aToward ).EuclideanNorm(); } );
-                out.resize( 4 );
+
+                if( out.size() > 4 )
+                    out.resize( 4 );
+
                 return out;
             };
 

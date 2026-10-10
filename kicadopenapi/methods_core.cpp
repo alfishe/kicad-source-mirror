@@ -178,6 +178,10 @@ static KOPENAPI_RESULT h_app_restart( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 
     wxSetEnv( wxS( "KICAD_OPENAPI_WAIT_PID" ), wxString::Format( wxS( "%ld" ), kopenapi::platform::CurrentPid() ) );
 
+    // the successor announces itself once this document is open again
+    if( !reopen.empty() )
+        wxSetEnv( wxS( "KICAD_OPENAPI_REOPEN" ), wxString::FromUTF8( reopen ) );
+
     if( port > 0 )
         wxSetEnv( wxS( "KICAD_OPENAPI_PORT" ), wxString::Format( wxS( "%d" ), port ) );
 
@@ -186,6 +190,7 @@ static KOPENAPI_RESULT h_app_restart( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     const long  pid = kopenapi::platform::SpawnDetached( argv, logDir / "restart.log", error );
 
     wxUnsetEnv( wxS( "KICAD_OPENAPI_WAIT_PID" ) );
+    wxUnsetEnv( wxS( "KICAD_OPENAPI_REOPEN" ) );
 
     nlohmann::json answer = quit.body;
     answer["restarting"] = pid != 0;
@@ -203,7 +208,8 @@ static KOPENAPI_RESULT h_app_restart( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 KOPENAPI_REGISTER( "app_restart",
                    "Restart KiCad (GUI) to pick up a new build: quits like app_quit (refuses on unsaved "
                    "documents unless discard: true), starts the same executable again on the same API "
-                   "port and reopens the open board / schematic / project; poll status until it answers",
+                   "port and reopens the open board / schematic / project; the new process is announced (instance "
+                   "list, bridge) only once that document is open",
                    R"json({"type":"object","properties":{
                         "discard":{"type":"boolean","default":false},
                         "reopen":{"type":"boolean","default":true}}})json"_json,

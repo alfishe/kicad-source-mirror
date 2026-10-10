@@ -794,6 +794,23 @@ bool EDA_3D_CANVAS::RenderToImage( unsigned char* aRgb, int aWidth, int aHeight,
         o.scale = aSupersample;
     }
 
+    const size_t bytes = (size_t) aWidth * aHeight * 3;
+
+    // a reload builds the scene in the background: no partial frame, the last complete one again
+    auto repeatLast = [&]()
+    {
+        std::copy( o.last.begin(), o.last.end(), aRgb );
+        m_camera.SetCurWindowSize( GetNativePixelSize() );
+
+        if( m_3d_render )
+            m_3d_render->SetCurWindowSize( GetNativePixelSize() );
+
+        return done( true );
+    };
+
+    if( m_3d_render && m_3d_render->IsSceneLoading() && o.last.size() == bytes )
+        return repeatLast();
+
     // draw the scene once at the drawing size
     glBindFramebuffer( GL_FRAMEBUFFER, o.drawFbo );
     glViewport( 0, 0, rw, rh );
@@ -815,6 +832,10 @@ bool EDA_3D_CANVAS::RenderToImage( unsigned char* aRgb, int aWidth, int aHeight,
         return done( false );
     }
 
+    // this draw started a reload (a pending request): its frame is partial
+    if( m_3d_render->IsSceneLoading() && o.last.size() == bytes )
+        return repeatLast();
+
     // average down (linear filter at an exact 1/n scale) and flip to top row first, on the GPU
     glBindFramebuffer( GL_READ_FRAMEBUFFER, o.drawFbo );
     glBindFramebuffer( GL_DRAW_FRAMEBUFFER, o.readFbo );
@@ -826,6 +847,9 @@ bool EDA_3D_CANVAS::RenderToImage( unsigned char* aRgb, int aWidth, int aHeight,
     glReadPixels( 0, 0, aWidth, aHeight, GL_RGB, GL_UNSIGNED_BYTE, aRgb );
 
     const bool ok = glGetError() == GL_NO_ERROR;
+
+    if( ok && !m_3d_render->IsSceneLoading() )
+        o.last.assign( aRgb, aRgb + bytes );
 
     const wxSize window = GetNativePixelSize();
 

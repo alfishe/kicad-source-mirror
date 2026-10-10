@@ -125,9 +125,9 @@ KOPENAPI_REGISTER_CANVAS_RENDER(
                 render->highlight_on_rollover = false;
             }
 
-            // drawn on the GPU at the asked size (supersampled and averaged there), read as RGB
+            // drawn on the GPU at the asked size (supersampled and averaged there), read as RGB; the
+            // window keeps its own on-screen rendering
             aImage.Create( aWidth, aHeight, false );
-            // drawn on the GPU at the asked size; the window keeps its own on-screen rendering
             const bool ok = canvas->RenderToImage( aImage.GetData(), aWidth, aHeight, std::max( 1, aSupersample ) );
 
             if( render )
@@ -272,8 +272,34 @@ struct CAMERA_MOVE
 };
 
 
+/// @brief Zoom correction along the moves (follow framing): (time into the moves, factor)
+using FRAMING = std::vector<std::pair<double, double>>;
+
 static nlohmann::json fitTrajectory( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard, const std::vector<CAMERA_MOVE>& aMoves,
-                                    double aSeconds );
+                                    double aSeconds, FRAMING* aFollow = nullptr );
+
+
+/// @brief The correction at time aT (linear between samples)
+static double framingAt( const FRAMING& aFraming, double aT )
+{
+    if( aFraming.empty() )
+        return 1.0;
+
+    if( aT <= aFraming.front().first )
+        return aFraming.front().second;
+
+    for( size_t i = 1; i < aFraming.size(); ++i )
+    {
+        if( aT <= aFraming[i].first )
+        {
+            const auto& [t0, k0] = aFraming[i - 1];
+            const auto& [t1, k1] = aFraming[i];
+            return t1 > t0 ? k0 + ( k1 - k0 ) * ( aT - t0 ) / ( t1 - t0 ) : k1;
+        }
+    }
+
+    return aFraming.back().second;
+}
 
 
 /// @brief The board shown in the board editor
@@ -378,10 +404,13 @@ static void stepMove( CAMERA& aCamera, const CAMERA_MOVE& aMove, double aFrom, d
 
 /// @brief Plays camera moves in order, each eased in and out, repainting as it goes (on video
 /// time while a recording runs)
-static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE>& aMoves )
+static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE>& aMoves,
+                      const FRAMING* aFollow = nullptr )
 {
     CAMERA& camera = aFrame->GetCurrentCamera();
     int     frames = 0;
+    double  start = 0;                                            // time into the moves at this move
+    double  applied = aFollow ? framingAt( *aFollow, 0 ) : 1.0;   // correction in the camera now
 
     for( const CAMERA_MOVE& move : aMoves )
     {
@@ -393,10 +422,19 @@ static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE
                              stepMove( camera, move, done, e );
                              done = e;
 
+                             if( aFollow )
+                             {
+                                 const double k = framingAt( *aFollow, start + e * move.seconds );
+                                 camera.Zoom( (float) ( applied / k ) );
+                                 applied = k;
+                             }
+
                              aFrame->GetCanvas()->DoRePaint();
 
                              frames++;
                          } );
+
+        start += move.seconds;
     }
 
     return frames;
@@ -466,7 +504,7 @@ static double reach( CAMERA& aCamera, const std::vector<glm::vec4>& aCorners )
 /// decides the zoom, the camera comes back and zooms there smoothly. Only as much room as the
 /// moves need (a half turn needs less than a full tumble).
 static nlohmann::json fitTrajectory( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard, const std::vector<CAMERA_MOVE>& aMoves,
-                                    double aSeconds )
+                                    double aSeconds, FRAMING* aFollow )
 {
     const std::vector<glm::vec4> corners = assemblyCorners( aFrame, aBoard );
 
@@ -475,20 +513,37 @@ static nlohmann::json fitTrajectory( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard,
 
     CAMERA&     camera = aFrame->GetCurrentCamera();
     const float zoom0 = camera.GetZoom();
-    double      worst = reach( camera, corners );
 
-    // dry run (no painting), then back along the exact inverse steps
-    const int                                 samples = 24;
+    // a recording renders this view at its own size: frame for that picture
+    int          recW = 0, recH = 0;
+    const wxSize windowSize = aFrame->GetCanvas()->GetNativePixelSize();
+    const bool   recorded = KopenapiRecordingRenderSize( aFrame->GetCanvas(), &recW, &recH );
+
+    if( recorded )
+        camera.SetCurWindowSize( wxSize( recW, recH ) );
+
+    double worst = reach( camera, corners );
+
+    // dry run (no painting), then back along the exact inverse steps; follow framing keeps the
+    // reach at every moment: (time, zoom factor that brings it to the margin)
+    const double                                margin = 0.93;
     std::vector<std::pair<CAMERA_MOVE, double>> done;
+    FRAMING                                     need = { { 0.0, reach( camera, corners ) / margin } };
+    double                                      t = 0;
 
     for( const CAMERA_MOVE& move : aMoves )
     {
+        const int samples = std::max( 24, int( move.seconds * 30 ) );
+
         for( int i = 1; i <= samples; ++i )
         {
             stepMove( camera, move, double( i - 1 ) / samples, double( i ) / samples );
             done.emplace_back( move, 1.0 / samples );
             worst = std::max( worst, reach( camera, corners ) * zoom0 / camera.GetZoom() );   // at the start zoom
+            need.emplace_back( t + move.seconds * i / samples, reach( camera, corners ) / margin );
         }
+
+        t += move.seconds;
     }
 
     for( auto it = done.rbegin(); it != done.rend(); ++it )
@@ -505,11 +560,56 @@ static nlohmann::json fitTrajectory( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard,
     }
 
     camera.Zoom( camera.GetZoom() / zoom0 );   // exact start zoom
+    const double reachNow = reach( camera, corners );
+
+    if( recorded )
+        camera.SetCurWindowSize( windowSize );
+
+    // follow: the envelope (max within +-w) averaged over +-w never falls below the need, and
+    // changes smoothly
+    if( aFollow )
+    {
+        const double w = 0.7;
+        FRAMING      envelope;
+
+        for( const auto& [ti, ki] : need )
+        {
+            double m = ki;
+
+            for( const auto& [tj, kj] : need )
+            {
+                if( std::abs( tj - ti ) <= w )
+                    m = std::max( m, kj );
+            }
+
+            envelope.emplace_back( ti, m );
+        }
+
+        aFollow->clear();
+
+        for( const auto& [ti, ki] : envelope )
+        {
+            double sum = 0;
+            int    n = 0;
+
+            for( const auto& [tj, kj] : envelope )
+            {
+                if( std::abs( tj - ti ) <= w )
+                {
+                    sum += kj;
+                    n++;
+                }
+            }
+
+            aFollow->emplace_back( ti, n ? sum / n : ki );
+        }
+    }
 
     // a larger zoom value moves the camera away; the view shrinks with it
-    const double target = zoom0 * worst / 0.94;
+    const double target = aFollow ? zoom0 * framingAt( *aFollow, 0 ) : zoom0 * worst / 0.94;
     nlohmann::json info = { { "zoom_from", zoom0 }, { "zoom_to", target }, { "reach_at_start_zoom", worst },
-                            { "reach_now", reach( camera, corners ) } };
+                            { "reach_now", reachNow }, { "framing", aFollow ? "follow" : "path" },
+                            { "framed_for", recorded ? "recording" : "window" } };
 
     if( std::abs( target - zoom0 ) / zoom0 < 0.01 )
         return info;
@@ -598,16 +698,18 @@ static KOPENAPI_RESULT h_view3d_animate( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         return KOPENAPI_RESULT::Error( 400, "give effect or moves" );
 
     nlohmann::json fit;
+    FRAMING        follow;
+    const bool     following = aArgs.value( "framing", std::string( "follow" ) ) == "follow";
 
     if( aArgs.value( "fit_assembly", true ) )
-        fit = fitTrajectory( frame, boardOf( aCtx ), moves, 0.7 );
+        fit = fitTrajectory( frame, boardOf( aCtx ), moves, 0.7, following ? &follow : nullptr );
 
     double total = 0;
 
     for( const CAMERA_MOVE& m : moves )
         total += m.seconds;
 
-    const int frames = playMoves( frame, moves );
+    const int frames = playMoves( frame, moves, follow.empty() ? nullptr : &follow );
     return KOPENAPI_RESULT::Ok( { { "moves", moves.size() }, { "seconds", total }, { "frames", frames }, { "fit", fit } } );
 }
 
@@ -626,10 +728,13 @@ static KOPENAPI_RESULT h_view3d_orbit( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     move.rotate[axis == "x" ? 0 : axis == "y" ? 1 : 2] = aArgs.value( "degrees", 360.0 );
     move.seconds = std::clamp( aArgs.value( "seconds", 8.0 ), 0.5, 120.0 );
 
-    if( aArgs.value( "fit_assembly", true ) )
-        fitTrajectory( frame, boardOf( aCtx ), { move }, 0.7 );
+    FRAMING follow;
 
-    const int frames = playMoves( frame, { move } );
+    if( aArgs.value( "fit_assembly", true ) )
+        fitTrajectory( frame, boardOf( aCtx ), { move }, 0.7,
+                       aArgs.value( "framing", std::string( "follow" ) ) == "follow" ? &follow : nullptr );
+
+    const int frames = playMoves( frame, { move }, follow.empty() ? nullptr : &follow );
     return KOPENAPI_RESULT::Ok( { { "degrees", aArgs.value( "degrees", 360.0 ) }, { "seconds", move.seconds },
                                   { "frames", frames } } );
 }
@@ -645,7 +750,7 @@ KOPENAPI_REGISTER( "pcb_view_zoom",
                         "margin_mm":{"type":"number","default":2},
                         "animate_ms":{"type":"integer","default":600,"maximum":5000,"description":"smooth camera move; 0 jumps"},
                         "side":{"type":"string","enum":["front","back","flip"],"description":"the side looked at: front (from above), back (from below, Flip Board View; bottom-side work), flip toggles; unchanged when absent"}}})json"_json,
-                   true, h_pcb_view_zoom );
+                   true, h_pcb_view_zoom, 300 );   // animations record on video time: slow while recording
 
 KOPENAPI_REGISTER( "view3d_camera",
                    "3D viewer camera: preset view (top, bottom, left, right, front, back, fit; animated), "
@@ -657,7 +762,7 @@ KOPENAPI_REGISTER( "view3d_camera",
                         "zoom":{"type":"number","description":"> 1 closer"},
                         "fit_assembly":{"type":"boolean","default":true,"description":"frame the whole assembly (board + models over its edges) for any rotation"},
                         "open":{"type":"boolean","default":true}}})json"_json,
-                   true, h_view3d_camera );
+                   true, h_view3d_camera, 300 );   // animations record on video time: slow while recording
 
 KOPENAPI_REGISTER( "view3d_orbit",
                    "Orbit the 3D viewer's camera smoothly (turntable for demos / recordings): degrees "
@@ -667,6 +772,7 @@ KOPENAPI_REGISTER( "view3d_orbit",
                         "seconds":{"type":"number","default":8},
                         "axis":{"type":"string","enum":["x","y","z"],"default":"z"},
                         "fit_assembly":{"type":"boolean","default":true},
+                        "framing":{"type":"string","enum":["follow","path"],"default":"follow","description":"follow: the zoom follows the assembly's reach along the way (close where it lies flat, wider while tilted, smooth, never clipped); path: one zoom for the whole way"},
                         "open":{"type":"boolean","default":true}}})json"_json,
                    true, h_view3d_orbit, 180 );
 
@@ -683,5 +789,6 @@ KOPENAPI_REGISTER( "view3d_animate",
                             "zoom":{"type":"number","default":1},
                             "seconds":{"type":"number","default":1}}}},
                         "fit_assembly":{"type":"boolean","default":true,"description":"first frame the whole assembly (board + models over its edges) so nothing leaves the view while turning"},
+                        "framing":{"type":"string","enum":["follow","path"],"default":"follow","description":"follow: the zoom follows the assembly's reach along the way (close where it lies flat, wider while tilted, smooth, never clipped); path: one zoom for the whole way"},
                         "open":{"type":"boolean","default":true}}})json"_json,
                    true, h_view3d_animate, 300 );
