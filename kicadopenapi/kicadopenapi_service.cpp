@@ -42,6 +42,10 @@ namespace fs = std::filesystem;
 
 
 /// @brief Drops discovery files left behind by crashed processes
+static std::atomic<int>  s_apiCalls{ 0 };       ///< API calls running on the main thread now
+static std::atomic<bool> s_overrideLock{ false };
+
+
 static void removeStaleDiscoveryFiles( const fs::path& aDir )
 {
     std::error_code ec;
@@ -553,11 +557,14 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
                               self->busySince = now;
                           }
 
+                          s_apiCalls++;
+
                           struct BUSY_END
                           {
                               const IMPL* impl;
                               ~BUSY_END()
                               {
+                                  s_apiCalls--;
                                   std::lock_guard<std::mutex> lock( impl->traceMutex );
                                   impl->busyMethod.clear();
                               }
@@ -1093,6 +1100,25 @@ void KICAD_OPENAPI_SERVICE::Stop()
         fs::remove( m_impl->discoveryFile, ec );
         m_impl->discoveryFile.clear();
     }
+}
+
+
+bool KICAD_OPENAPI_SERVICE::NoModalUi()
+{
+    static const bool agent = std::getenv( "KICAD_OPENAPI_AGENT" ) != nullptr;
+    return CurrentPort() > 0 && ( agent || s_apiCalls.load() > 0 );
+}
+
+
+void KICAD_OPENAPI_SERVICE::SetOverrideLock( bool aOverride )
+{
+    s_overrideLock = aOverride;
+}
+
+
+bool KICAD_OPENAPI_SERVICE::OverrideLock()
+{
+    return s_overrideLock;
 }
 
 

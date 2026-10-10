@@ -31,6 +31,9 @@ long CurrentPid();
 /// @brief Process exists and has not exited (on POSIX also collects our own exited children)
 bool ProcessAlive(long pid);
 
+/// @brief Sets an environment variable of this process (inherited by processes it starts)
+void SetEnv(const std::string& name, const std::string& value);
+
 /// @brief Starts argv[0] with argv detached from our stdio: stdin from the null device, stdout and
 /// stderr appended to logFile, own process group, default signal handling. Returns the pid,
 /// or 0 with error set.

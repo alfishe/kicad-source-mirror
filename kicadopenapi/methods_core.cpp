@@ -177,6 +177,7 @@ static KOPENAPI_RESULT h_app_restart( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
         argv.push_back( reopen );
 
     wxSetEnv( wxS( "KICAD_OPENAPI_WAIT_PID" ), wxString::Format( wxS( "%ld" ), kopenapi::platform::CurrentPid() ) );
+    wxSetEnv( wxS( "KICAD_OPENAPI_AGENT" ), wxS( "1" ) );   // restarted for an agent: no modal questions
 
     // the successor announces itself once this document is open again
     if( !reopen.empty() )

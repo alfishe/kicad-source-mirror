@@ -87,6 +87,15 @@ bool ProcessAlive(long pid)
 #endif
 }
 
+void SetEnv(const std::string& name, const std::string& value)
+{
+#if defined(_WIN32)
+    SetEnvWindows(name, value);
+#else
+    SetEnvPosix(name, value);
+#endif
+}
+
 long SpawnDetached(const std::vector<std::string>& argv, const fs::path& logFile, std::string& error)
 {
     if (argv.empty())

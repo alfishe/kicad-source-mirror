@@ -65,6 +65,16 @@ public:
     /// @brief Port of this process's running service, 0 when none
     static int CurrentPort();
 
+    /// @brief No modal questions in this process now: an API call is running, or an agent started
+    /// the process (KICAD_OPENAPI_AGENT, set by the bridge and app_restart). KiCad's prompts take
+    /// their API answer and report to the journal instead.
+    static bool NoModalUi();
+
+    /// @brief The answer to "open a file someone else has open" while NoModalUi(): pcb_open /
+    /// sch_open override_lock sets it for the duration of the call
+    static void SetOverrideLock( bool aOverride );
+    static bool OverrideLock();
+
     /// @brief KICAD_OPENAPI_PORT env override, else DEFAULT_PORT.
     static int DefaultPort();
 

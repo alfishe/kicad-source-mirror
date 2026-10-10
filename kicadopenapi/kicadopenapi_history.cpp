@@ -1,10 +1,14 @@
 #include "kicadopenapi_history.h"
 
+#include <platform.h>
+
 #include <wx/dir.h>
 #include <wx/filename.h>
 #include <wx/utils.h>
 
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
 #include <deque>
 #include <map>
 
@@ -98,6 +102,24 @@ struct KOPENAPI_HISTORY::IMPL
     {
         wxFileName dir( wxFileName::GetTempDir(), wxEmptyString );
         dir.AppendDir( wxS( "kicadopenapi-history" ) );
+
+        // once per process: the snapshots of processes that are gone are left-overs
+        static bool swept = false;
+
+        if( !swept )
+        {
+            swept = true;
+            std::error_code ec;
+
+            for( const auto& entry : std::filesystem::directory_iterator( dir.GetPath().ToStdString( wxConvUTF8 ), ec ) )
+            {
+                const long pid = std::atol( entry.path().filename().string().c_str() );
+
+                if( entry.is_directory() && pid > 0 && !kopenapi::platform::ProcessAlive( pid ) )
+                    std::filesystem::remove_all( entry.path(), ec );
+            }
+        }
+
         dir.AppendDir( wxString::Format( wxS( "%lu" ), wxGetProcessId() ) );
         dir.AppendDir( wxString::Format( wxS( "%ld" ), ++snapshotCount ) );
         dir.Mkdir( wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL );

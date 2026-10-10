@@ -1,6 +1,8 @@
 /// @file methods_pcb_documents.cpp
 /// @brief kicadopenapi PCB document methods: pcb_open, pcb_close, pcb_save, pcb_revert, and the
 /// "pcb" document provider.  Compiled into the pcbnew kiface; registered when it loads.
+#include <kicadopenapi_lock.h>
+#include <kicadopenapi_service.h>
 #include "kopenapi_pcb.h"
 
 #include <wx/log.h>
@@ -152,6 +154,16 @@ static KOPENAPI_RESULT openGui( KOPENAPI_CONTEXT& aCtx, const wxFileName& aBoard
     if( !frame )
         return KOPENAPI_RESULT::Error( 500, "could not create the PCB editor window" );
 
+    // another process holds it (or its project) open: refused here, never asked in a dialog
+    if( !KICAD_OPENAPI_SERVICE::OverrideLock() && frame->GetCurrentFileName() != aBoard.GetFullPath() )
+    {
+        if( const std::string owner = KopenapiLockedBy( aBoard ); !owner.empty() )
+        {
+            return KOPENAPI_RESULT::Error( 409, "the board or its project is open in another process (" + owner
+                                                        + "): close it there, or open with override_lock: true" );
+        }
+    }
+
     if( !frame->OpenProjectFiles( { aBoard.GetFullPath() } ) )
         return KOPENAPI_RESULT::Error( 422, "the PCB editor could not open the board" );
 
@@ -196,7 +208,18 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         }
     }
 
-    return aCtx.headless ? openHeadless( aCtx, board ) : openGui( aCtx, board );
+    if( aCtx.headless )
+        return openHeadless( aCtx, board );
+
+    // a file another process has open: opened only when asked (no modal question)
+    KICAD_OPENAPI_SERVICE::SetOverrideLock( aArgs.value( "override_lock", false ) );
+    KOPENAPI_RESULT result = openGui( aCtx, board );
+    KICAD_OPENAPI_SERVICE::SetOverrideLock( false );
+
+    if( result.status != 200 )
+        result.body["hint"] = "another process may have the file open (errors: journal); override_lock: true opens it anyway";
+
+    return result;
 }
 
 
@@ -375,7 +398,9 @@ KOPENAPI_REGISTER( "pcb_open",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
-                                   "description":"Drop unsaved changes of the currently open board"}}})json"_json,
+                                   "description":"Drop unsaved changes of the currently open board"},
+                        "override_lock":{"type":"boolean","default":false,
+                                   "description":"GUI: open even when another process has the file open (never asked in a dialog; refused with a journal error otherwise)"}}})json"_json,
                    false, h_pcb_open, 120 );
 
 KOPENAPI_REGISTER( "pcb_close", "Close the open board: refuses with unsaved changes unless discard: true, which drops "

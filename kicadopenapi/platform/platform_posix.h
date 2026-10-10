@@ -14,6 +14,7 @@ namespace kopenapi::platform
 
 long CurrentPidPosix();
 bool ProcessAlivePosix(long pid);
+void SetEnvPosix(const std::string& name, const std::string& value);
 long SpawnDetachedPosix(const std::vector<std::string>& argv, const std::filesystem::path& logFile,
                         std::string& error);
 void KillProcessPosix(long pid);

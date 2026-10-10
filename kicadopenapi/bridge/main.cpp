@@ -1003,6 +1003,9 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    // KiCad processes this bridge starts work for an agent: they never stop on a modal question
+    platform::SetEnv("KICAD_OPENAPI_AGENT", "1");
+
     Bridge bridgeState(*cfg);
     std::atomic<bool> running{true};
     std::thread housekeeping([&]() {

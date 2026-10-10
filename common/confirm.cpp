@@ -19,6 +19,7 @@
  */
 
 #include <confirm.h>
+#include <kicadopenapi_service.h>
 
 #include <functional>
 #include <wx/app.h>
@@ -37,6 +38,19 @@ static const wxChar traceConfirm[] = wxT( "KICAD_CONFIRM" );
 
 bool AskOverrideLock( wxWindow* aParent, const wxString& aMessage )
 {
+    // working for an agent (kicadopenapi): no modal question; the API's answer, reported
+    if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+    {
+        if( KICAD_OPENAPI_SERVICE::OverrideLock() )
+        {
+            wxLogWarning( _( "%s Opened anyway (override_lock)." ), aMessage );
+            return true;
+        }
+
+        wxLogError( _( "%s Not opened: close it there, or open it with override_lock: true." ), aMessage );
+        return false;
+    }
+
 #ifdef __APPLE__
     // wxMessageDialog gets the button spacing wrong on Mac so we have to use wxRichMessageDialog.
     // Note that its warning icon is more like wxMessageDialog's error icon, so we use it instead

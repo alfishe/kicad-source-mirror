@@ -1,6 +1,8 @@
 /// @file methods_sch_documents.cpp
 /// @brief kicadopenapi schematic document methods: sch_open, sch_close, sch_save, sch_revert, and
 /// the "sch" document provider.  Compiled into the eeschema kiface; registered when it loads.
+#include <kicadopenapi_lock.h>
+#include <kicadopenapi_service.h>
 #include "kopenapi_sch.h"
 
 #include <wx/log.h>
@@ -175,6 +177,16 @@ static KOPENAPI_RESULT openGui( KOPENAPI_CONTEXT& aCtx, const wxFileName& aSchem
     if( !frame )
         return KOPENAPI_RESULT::Error( 500, "could not create the schematic editor window" );
 
+    // another process holds it (or its project) open: refused here, never asked in a dialog
+    if( !KICAD_OPENAPI_SERVICE::OverrideLock() && frame->GetCurrentFileName() != aSchematic.GetFullPath() )
+    {
+        if( const std::string owner = KopenapiLockedBy( aSchematic ); !owner.empty() )
+        {
+            return KOPENAPI_RESULT::Error( 409, "the schematic or its project is open in another process (" + owner
+                                                        + "): close it there, or open with override_lock: true" );
+        }
+    }
+
     if( !frame->OpenProjectFiles( { aSchematic.GetFullPath() } ) )
         return KOPENAPI_RESULT::Error( 422, "the schematic editor could not open the schematic" );
 
@@ -219,7 +231,18 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         }
     }
 
-    return aCtx.headless ? openHeadless( aCtx, schematic ) : openGui( aCtx, schematic );
+    if( aCtx.headless )
+        return openHeadless( aCtx, schematic );
+
+    // a file another process has open: opened only when asked (no modal question)
+    KICAD_OPENAPI_SERVICE::SetOverrideLock( aArgs.value( "override_lock", false ) );
+    KOPENAPI_RESULT result = openGui( aCtx, schematic );
+    KICAD_OPENAPI_SERVICE::SetOverrideLock( false );
+
+    if( result.status != 200 )
+        result.body["hint"] = "another process may have the file open (errors: journal); override_lock: true opens it anyway";
+
+    return result;
 }
 
 
@@ -433,7 +456,9 @@ KOPENAPI_REGISTER( "sch_open",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
-                                   "description":"Drop unsaved changes of the currently open schematic"}}})json"_json,
+                                   "description":"Drop unsaved changes of the currently open schematic"},
+                        "override_lock":{"type":"boolean","default":false,
+                                   "description":"GUI: open even when another process has the file open (never asked in a dialog; refused with a journal error otherwise)"}}})json"_json,
                    false, h_sch_open, 120 );
 
 KOPENAPI_REGISTER( "sch_close", "Close the open schematic: refuses with unsaved changes unless discard: true, which "

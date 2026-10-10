@@ -3,6 +3,8 @@
 #include "platform_windows.h"
 #include "platform.h"
 
+#include <cstdlib>
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -80,6 +82,11 @@ std::filesystem::path ExecutablePathWindows()
 long CurrentPidWindows()
 {
     return static_cast<long>(GetCurrentProcessId());
+}
+
+void SetEnvWindows(const std::string& name, const std::string& value)
+{
+    _putenv_s(name.c_str(), value.c_str());
 }
 
 bool ProcessAliveWindows(long pid)

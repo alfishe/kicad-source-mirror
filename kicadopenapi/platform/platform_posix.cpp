@@ -3,6 +3,8 @@
 #include "platform_posix.h"
 #include "platform.h"
 
+#include <cstdlib>
+
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -35,6 +37,11 @@ extern "C" void kopenapiOnTerminationSignal(int sig)
 long CurrentPidPosix()
 {
     return static_cast<long>(getpid());
+}
+
+void SetEnvPosix(const std::string& name, const std::string& value)
+{
+    setenv(name.c_str(), value.c_str(), 1);
 }
 
 bool ProcessAlivePosix(long pid)
