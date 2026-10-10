@@ -6,6 +6,8 @@
 
 #include <kiplatform/ui.h>
 
+#include <map>
+
 #include <wx/app.h>
 #include <wx/image.h>
 #include <wx/toplevel.h>
@@ -35,8 +37,11 @@ int pasteCanvases( wxWindow* aRoot, wxWindow* aWindow, wxImage& aImage, double a
         if( !child->IsShownOnScreen() || child->IsTopLevel() )
             continue;
 
-        wxImage canvas;
-        bool    captured = false;
+        // a buffer per canvas, kept between frames: the capture reads straight into it
+        static std::map<wxWindow*, wxImage> buffers;
+
+        wxImage& canvas = buffers[child];
+        bool     captured = false;
 
         for( const KOPENAPI_CANVAS_CAPTURE& capture : aCaptures )
         {

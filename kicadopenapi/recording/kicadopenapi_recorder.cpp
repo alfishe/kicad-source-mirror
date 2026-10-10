@@ -31,6 +31,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <functional>
@@ -786,14 +787,19 @@ private:
 
             m_chromeAt = now;
             m_chromeSize = aWindow->GetClientSize();
-            aImage = m_chrome.Copy();
+            aImage = m_chrome;
             m_windowMs += std::chrono::duration<double, std::milli>( CLOCK::now() - now ).count();
             m_windowFrames++;
             return true;
         }
 
-        aImage = m_chrome.Copy();
-        KopenapiPasteCanvases( aWindow, aImage );
+        // the chrome into a kept frame buffer (no allocation per frame), the canvases on top
+        if( !m_frame.IsOk() || m_frame.GetSize() != m_chrome.GetSize() )
+            m_frame.Create( m_chrome.GetWidth(), m_chrome.GetHeight(), false );
+
+        std::memcpy( m_frame.GetData(), m_chrome.GetData(), size_t( m_chrome.GetWidth() ) * m_chrome.GetHeight() * 3 );
+        KopenapiPasteCanvases( aWindow, m_frame );
+        aImage = m_frame;
         m_pasteMs += std::chrono::duration<double, std::milli>( CLOCK::now() - now ).count();
         m_pasteFrames++;
         return true;
@@ -928,6 +934,7 @@ private:
     std::string                             m_capturePath = "auto"; ///< auto / gpu / cpu
     KOPENAPI_FRAME_SCALER                   m_scaler;               ///< encoder thread: fits frames (tables kept)
     wxImage                                 m_chrome;               ///< source window: the last whole-window picture
+    wxImage                                 m_frame;                ///< source window: the frame being built (kept)
     CLOCK::time_point                       m_chromeAt;
     wxSize                                  m_chromeSize;
     int                                     m_chromeMs = 200;       ///< source window: redraw the window this often

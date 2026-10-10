@@ -755,7 +755,14 @@ bool EDA_DRAW_PANEL_GAL::CaptureComposed( wxImage& aImage )
         return false;
 
     auto* gal = static_cast<KIGFX::OPENGL_GAL*>( m_gal );
-    gal->RequestFrameCapture( nullptr, 0, 0 );
+
+    // read straight into the image when it has the canvas' size (the usual case)
+    const wxSize size = gal->GetNativePixelSize();
+
+    if( size.x > 0 && size.y > 0 && ( !aImage.IsOk() || aImage.GetWidth() != size.x || aImage.GetHeight() != size.y ) )
+        aImage.Create( size.x, size.y, false );
+
+    gal->RequestFrameCapture( aImage.IsOk() ? aImage.GetData() : nullptr, aImage.GetWidth(), aImage.GetHeight(), false );
     DoRePaint( false );
 
     if( m_backend != GAL_TYPE_OPENGL || m_gal != gal || !gal->TakeFrameCaptured() )
@@ -764,13 +771,15 @@ bool EDA_DRAW_PANEL_GAL::CaptureComposed( wxImage& aImage )
     int                               w = 0, h = 0;
     const std::vector<unsigned char>& rgb = gal->CapturedFrame( w, h );
 
-    if( w <= 0 || h <= 0 )
-        return false;
+    // the GL viewport was not the canvas' size (rare): the frame is in the GAL's buffer
+    if( w > 0 && h > 0 )
+    {
+        unsigned char* data = (unsigned char*) malloc( rgb.size() );   // wxImage takes ownership
+        std::memcpy( data, rgb.data(), rgb.size() );
+        aImage.SetData( data, w, h, false );
+    }
 
-    unsigned char* data = (unsigned char*) malloc( rgb.size() );   // wxImage takes ownership
-    std::memcpy( data, rgb.data(), rgb.size() );
-    aImage.SetData( data, w, h, false );
-    return true;
+    return aImage.IsOk();
 }
 
 

@@ -991,9 +991,10 @@ bool OPENGL_GAL::GetScreenshot( wxImage& aDstImage )
 }
 
 
-void OPENGL_GAL::RequestFrameCapture( unsigned char* aRgb, int aWidth, int aHeight )
+void OPENGL_GAL::RequestFrameCapture( unsigned char* aRgb, int aWidth, int aHeight, bool aScale )
 {
     m_frameCapture.pending = true;
+    m_frameCapture.scale = aScale;
     m_frameCapture.rgb = aRgb;
     m_frameCapture.width = aWidth;
     m_frameCapture.height = aHeight;
@@ -1015,7 +1016,7 @@ void OPENGL_GAL::captureFrame()
 {
     FRAME_CAPTURE& c = m_frameCapture;
     const int      w = c.width, h = c.height;
-    const bool     scaled = c.rgb != nullptr;
+    const bool     scaled = c.scale && c.rgb != nullptr;
 
     c.pending = false;
 
@@ -1070,25 +1071,36 @@ void OPENGL_GAL::captureFrame()
     // the screen's own size: one read, rows flipped here (the caller scales on the CPU)
     if( !scaled )
     {
-        const size_t row = (size_t) sw * 3;
-        c.raw.resize( row * sh );
+        // straight into the caller's buffer when it has the screen's size, else into ours
+        const size_t   row = (size_t) sw * 3;
+        unsigned char* out = c.rgb && c.width == sw && c.height == sh ? c.rgb : nullptr;
+
+        if( !out )
+        {
+            c.raw.resize( row * sh );
+            out = c.raw.data();
+            c.rawWidth = sw;
+            c.rawHeight = sh;
+        }
+
         glBindFramebuffer( GL_READ_FRAMEBUFFER, source );
         glPixelStorei( GL_PACK_ALIGNMENT, 1 );
-        glReadPixels( 0, 0, sw, sh, GL_RGB, GL_UNSIGNED_BYTE, c.raw.data() );
+        glReadPixels( 0, 0, sw, sh, GL_RGB, GL_UNSIGNED_BYTE, out );
 
         std::vector<unsigned char> tmp( row );
 
         for( int y = 0; y < sh / 2; ++y )
         {
-            unsigned char* a = c.raw.data() + row * y;
-            unsigned char* b = c.raw.data() + row * ( sh - 1 - y );
+            unsigned char* a = out + row * y;
+            unsigned char* b = out + row * ( sh - 1 - y );
             std::memcpy( tmp.data(), a, row );
             std::memcpy( a, b, row );
             std::memcpy( b, tmp.data(), row );
         }
 
-        c.rawWidth = sw;
-        c.rawHeight = sh;
+        if( out == c.rgb )
+            c.rawWidth = c.rawHeight = 0;   // nothing in our buffer this time
+
         c.done = glGetError() == GL_NO_ERROR;
 
         glBindFramebuffer( GL_DRAW_FRAMEBUFFER, drawFb );

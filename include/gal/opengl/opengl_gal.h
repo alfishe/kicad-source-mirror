@@ -340,11 +340,11 @@ public:
     bool GetScreenshot( wxImage& aDstImage );
 
     /// @brief The next frame drawn is taken as the screen gets it (composed, cursor excepted), read
-    /// back once. With aRgb: into aRgb at aWidth x aHeight (RGB, top row first), scaled to fit
-    /// and letterboxed (#121216, as fitted video frames elsewhere) on the GPU. Without
-    /// (nullptr): at the screen's own size into a buffer of the GAL (CapturedFrame()), rows
-    /// flipped on the CPU; the caller scales. For recordings.
-    void RequestFrameCapture( unsigned char* aRgb, int aWidth, int aHeight );
+    /// back once into aRgb (RGB, top row first). aScale: at aWidth x aHeight, scaled to fit and
+    /// letterboxed (#121216, as fitted video frames elsewhere) on the GPU. Else at the screen's
+    /// own size (rows flipped on the CPU; the caller scales): into aRgb when aWidth x aHeight is
+    /// that size, otherwise into a buffer of the GAL (CapturedFrame()). For recordings.
+    void RequestFrameCapture( unsigned char* aRgb, int aWidth, int aHeight, bool aScale = true );
 
     /// @return true once the requested frame was captured (the request is then over)
     bool TakeFrameCaptured();
@@ -372,6 +372,7 @@ private:
     struct FRAME_CAPTURE
     {
         bool           pending = false;
+        bool           scale = true;
         unsigned char* rgb = nullptr;
         std::vector<unsigned char> raw;                ///< the screen's size (no target given)
         int            rawWidth = 0, rawHeight = 0;
