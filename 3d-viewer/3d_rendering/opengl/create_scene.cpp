@@ -832,6 +832,7 @@ void RENDER_3D_OPENGL::reload()
     // Create basic Board without holes
     assignRenderPtr( m_board, createBoard( m_boardAdapter.GetBoardPoly(), nullptr ) );
 
+    m_sceneLoading = true;
     startBgWorker();
 }
 
@@ -846,6 +847,13 @@ void RENDER_3D_OPENGL::sendRefreshView()
 void RENDER_3D_OPENGL::bgWorker( std::stop_token aStop )
 {
     int64_t stats_startReloadTime = GetRunningMicroSecs();
+
+    // complete or abandoned: either way no longer loading when the worker leaves
+    struct LOADED
+    {
+        std::atomic<bool>& flag;
+        ~LOADED() { flag = false; }
+    } loaded{ m_sceneLoading };
 
     if( aStop.stop_requested() )
         return;
@@ -1135,6 +1143,7 @@ void RENDER_3D_OPENGL::bgWorker( std::stop_token aStop )
     if( aStop.stop_requested() )
         return;
 
+    m_sceneLoading = false;
     sendRefreshView();
 
     // OpenGL draws the board on the GPU, but hover/picking still uses the auxiliary

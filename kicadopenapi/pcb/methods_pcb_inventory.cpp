@@ -273,7 +273,12 @@ static nlohmann::json padJson( const PAD* aPad, bool aWithFootprint )
 /// @brief Brief row for lists and the footprint card header
 static nlohmann::json footprintRow( const FOOTPRINT* aFp )
 {
+    // occupied area: the courtyard on the footprint's side, else the footprint's own box
+    const SHAPE_POLY_SET& cy = aFp->GetCourtyard( aFp->GetSide() == B_Cu ? B_CrtYd : F_CrtYd );
+    const BOX2I           box = cy.OutlineCount() ? cy.BBox() : aFp->GetBoundingBox( false );
+
     return { { "ref", str( aFp->GetReference() ) },
+             { "courtyard_mm", { mm( box.GetLeft() ), mm( box.GetTop() ), mm( box.GetRight() ), mm( box.GetBottom() ) } },
              { "value", str( aFp->GetValue() ) },
              { "footprint", str( aFp->GetFPIDAsString() ) },
              { "side", aFp->GetSide() == B_Cu ? "back" : "front" },
@@ -676,7 +681,8 @@ static KOPENAPI_RESULT h_pcb_netlist( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 
 
 KOPENAPI_REGISTER( "pcb_footprint_list",
-                   "List board footprints/components (ref, value, footprint, side, position, THT/SMD, DNP, uuid); "
+                   "List board footprints/components (ref, value, footprint, side, position, occupied box "
+                   "courtyard_mm [x0, y0, x1, y1], THT/SMD, DNP, uuid); "
                    "filter by ref/value/footprint glob, side, type; ref '?*' skips unnamed board-only "
                    "items; paginated, natural ref order",
                    KopenapiPagedSchema( R"json({

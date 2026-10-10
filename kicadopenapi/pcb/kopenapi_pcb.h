@@ -25,6 +25,12 @@ std::shared_ptr<PCB_CONTEXT> KopenapiPcbContext( KOPENAPI_CONTEXT& aCtx );
 /// @brief 409 "no board open" result for methods that need one
 KOPENAPI_RESULT KopenapiNoBoard();
 
+class PCB_BASE_FRAME;
+
+/// @brief Refresh the board's open 3D viewer after an edit: the current picture stays until the
+/// new scene is complete (no flashing); nothing when no viewer is open
+void KopenapiRefresh3D( PCB_BASE_FRAME* aFrame );
+
 /// @brief An edge connector's panel line for footprint cards.
 /// @param aMethod auto (marker, else inferred from the body), marker, infer
 /// @return line ends, facing (left/right/up/down or degrees), depth behind the line, overhang

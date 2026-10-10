@@ -204,13 +204,46 @@ static KOPENAPI_RESULT h_pcb_view_zoom( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             area = board->GetBoundingBox();
     }
 
+    // the side looked at (View > Flip Board View): back = from below, for bottom-side work
+    if( aArgs.contains( "side" ) )
+    {
+        const std::string side = aArgs["side"].get<std::string>();
+        const bool        flipped = frame->GetDisplayOptions().m_FlipBoardView;
+        const bool        want = side == "flip" ? !flipped : side == "back";
+
+        if( side != "front" && side != "back" && side != "flip" )
+            return KOPENAPI_RESULT::Error( 400, "side: front, back or flip" );
+
+        if( want != flipped )
+        {
+            PCB_DISPLAY_OPTIONS opts = frame->GetDisplayOptions();
+            opts.m_FlipBoardView = want;
+            frame->SetDisplayOptions( opts );
+        }
+    }
+
     area.Inflate( margin );
     KopenapiMoveView( frame->GetCanvas(), BOX2D( area.GetOrigin(), area.GetSize() ),
                       std::clamp( aArgs.value( "animate_ms", 600 ), 0, 5000 ) );
 
     const BOX2D v = frame->GetCanvas()->GetView()->GetViewport();
     auto        mm = []( double x ) { return std::round( x / pcbIUScale.IU_PER_MM * 100 ) / 100; };
-    return KOPENAPI_RESULT::Ok( { { "viewport_mm", { mm( v.GetLeft() ), mm( v.GetTop() ), mm( v.GetRight() ), mm( v.GetBottom() ) } } } );
+    return KOPENAPI_RESULT::Ok( { { "viewport_mm", { mm( v.GetLeft() ), mm( v.GetTop() ), mm( v.GetRight() ), mm( v.GetBottom() ) } },
+                                  { "side", frame->GetDisplayOptions().m_FlipBoardView ? "back" : "front" } } );
+}
+
+
+void KopenapiRefresh3D( PCB_BASE_FRAME* aFrame )
+{
+    EDA_3D_VIEWER_FRAME* viewer = aFrame ? aFrame->Get3DViewerFrame() : nullptr;
+
+    if( !viewer )
+        return;
+
+    if( EDA_3D_CANVAS* canvas = viewer->GetCanvas() )
+        canvas->HoldFrameUntilLoaded();
+
+    aFrame->Update3DView( true, true );
 }
 
 
@@ -604,12 +637,14 @@ static KOPENAPI_RESULT h_view3d_orbit( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 
 KOPENAPI_REGISTER( "pcb_view_zoom",
                    "Move the board editor's view (camera, zoom, pan): fit the board, an area in mm, or "
-                   "parts by reference; margin; animate_ms for a smooth camera move (recordings); GUI only",
+                   "parts by reference; margin; animate_ms for a smooth camera move (recordings); side front / back / "
+                   "flip to look from above or below; GUI only",
                    R"json({"type":"object","properties":{
                         "area_mm":{"type":"array","items":{"type":"number"},"description":"[x0, y0, x1, y1]"},
                         "refs":{"type":"array","items":{"type":"string"}},
                         "margin_mm":{"type":"number","default":2},
-                        "animate_ms":{"type":"integer","default":600,"maximum":5000,"description":"smooth camera move; 0 jumps"}}})json"_json,
+                        "animate_ms":{"type":"integer","default":600,"maximum":5000,"description":"smooth camera move; 0 jumps"},
+                        "side":{"type":"string","enum":["front","back","flip"],"description":"the side looked at: front (from above), back (from below, Flip Board View; bottom-side work), flip toggles; unchanged when absent"}}})json"_json,
                    true, h_pcb_view_zoom );
 
 KOPENAPI_REGISTER( "view3d_camera",

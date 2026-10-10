@@ -1,5 +1,5 @@
 /// @file methods_pcb_silk.cpp
-/// @brief kicadopenapi silkscreen layout: pcb_silk_tidy.
+/// @brief kicadopenapi silkscreen layout: pcb_silk_tidy, pcb_free_area, pcb_silk_fit.
 ///
 /// Reference designators go where they stay readable on the assembled board: off every
 /// courtyard (bodies cover silk), off exposed copper (pads, vias), clear of other silk and inside
@@ -25,6 +25,8 @@
 #include <tool/tool_manager.h>
 
 #include <algorithm>
+#include <functional>
+#include <optional>
 #include <cmath>
 #include <set>
 
@@ -405,7 +407,10 @@ static KOPENAPI_RESULT h_pcb_silk_tidy( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( !aCtx.headless )
         {
             if( auto* frame = SILK_GLOW_TRAITS::Frame( aCtx.kiway ) )
+            {
                 frame->GetCanvas()->Refresh();
+                KopenapiRefresh3D( frame );
+            }
 
             KopenapiGlow<SILK_GLOW_TRAITS>( aCtx.kiway, glowIds, glowIds.size() > 1 ? 120 : 0 );
         }
@@ -415,6 +420,436 @@ static KOPENAPI_RESULT h_pcb_silk_tidy( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                                   { "dry_run", dryRun } } );
 }
 
+
+namespace
+{
+
+bool boxInside( const SHAPE_POLY_SET& aPoly, const BOX2I& aBox );
+
+
+struct FREE_SPOT
+{
+    BOX2I  box;
+    double score;
+    double room;
+};
+
+
+/// @brief Distinct free places of aW x aH on one side: clear of bodies, exposed copper, silk and
+/// the board edge (each kept aGap away); best first (most room, or nearest to aNear)
+std::vector<FREE_SPOT> findFree( BOARD* aBoard, bool aBottom, int aGap, int aW, int aH, const std::optional<VECTOR2I>& aNear,
+                                 int aCount, int aStep, const SHAPE_POLY_SET* aRegion = nullptr, bool aIgnoreObstacles = false,
+                                 bool aAvoidTracks = true )
+{
+    const OBSTACLES    obs = collect( aBoard, aBottom, aGap, {} );
+    std::vector<BOX2I> blocked = obs.copper;
+    blocked.insert( blocked.end(), obs.silk.begin(), obs.silk.end() );
+
+    for( const auto& [c, owner] : obs.courtyards )
+        blocked.push_back( c.GetInflated( aGap ) );
+
+    // silk may cross tracks under the mask, but art reads better clear of them
+    if( aAvoidTracks )
+    {
+        const PCB_LAYER_ID cu = aBottom ? B_Cu : F_Cu;
+
+        for( PCB_TRACK* t : aBoard->Tracks() )
+        {
+            if( t->Type() != PCB_VIA_T && t->IsOnLayer( cu ) )
+                blocked.push_back( t->GetBoundingBox().GetInflated( aGap ) );
+        }
+    }
+
+    if( aIgnoreObstacles )
+        blocked.clear();
+
+    BOX2I area = aRegion ? aRegion->BBox() : aBoard->GetBoardEdgesBoundingBox();
+
+    // a rectangular region needs no polygon test per candidate
+    const bool regionIsRect = aRegion && aRegion->OutlineCount() == 1 && aRegion->COutline( 0 ).PointCount() == 4
+                              && std::abs( SHAPE_POLY_SET( *aRegion ).Area() - double( area.GetWidth() ) * area.GetHeight() ) < 1.0;
+    const int   cap = pcbIUScale.mmToIU( 10.0 );
+
+    // room around a free box: distance to the nearest obstacle or the board edge (capped)
+    auto room = [&]( const BOX2I& aBox )
+    {
+        double best = cap;
+
+        for( const BOX2I& b : blocked )
+        {
+            const int dx = std::max( { b.GetLeft() - aBox.GetRight(), aBox.GetLeft() - b.GetRight(), 0 } );
+            const int dy = std::max( { b.GetTop() - aBox.GetBottom(), aBox.GetTop() - b.GetBottom(), 0 } );
+            best = std::min( best, std::hypot( double( dx ), double( dy ) ) );
+        }
+
+        if( obs.inside.OutlineCount() )
+        {
+            for( const VECTOR2I& p : { aBox.GetOrigin(), VECTOR2I( aBox.GetRight(), aBox.GetTop() ), aBox.GetEnd(),
+                                       VECTOR2I( aBox.GetLeft(), aBox.GetBottom() ) } )
+            {
+                best = std::min( best, std::sqrt( double( obs.inside.SquaredDistance( p ) ) ) );
+            }
+        }
+
+        return best;
+    };
+
+    std::vector<FREE_SPOT> spots;
+
+    if( area.GetWidth() <= 0 || aW <= 0 || aH <= 0 )
+        return spots;
+
+    for( int y = area.GetTop(); y + aH <= area.GetBottom(); y += aStep )
+    {
+        for( int x = area.GetLeft(); x + aW <= area.GetRight(); x += aStep )
+        {
+            const BOX2I box( VECTOR2I( x, y ), VECTOR2I( aW, aH ) );
+
+            if( ( !aRegion && !insideBoard( obs, box ) )
+                || std::any_of( blocked.begin(), blocked.end(), [&]( const BOX2I& b ) { return b.Intersects( box ); } )
+                || ( aRegion && !regionIsRect && !boxInside( *aRegion, box ) ) )
+            {
+                continue;
+            }
+
+            const double r = room( box );
+            spots.push_back( { box, aNear ? -( box.Centre() - *aNear ).EuclideanNorm() : r, r } );
+        }
+    }
+
+    std::sort( spots.begin(), spots.end(), []( const FREE_SPOT& a, const FREE_SPOT& b ) { return a.score > b.score; } );
+
+    // a candidate overlapping a better one is the same place
+    std::vector<FREE_SPOT> out;
+
+    for( const FREE_SPOT& s : spots )
+    {
+        if( (int) out.size() >= aCount )
+            break;
+
+        if( std::none_of( out.begin(), out.end(), [&]( const FREE_SPOT& o ) { return o.box.Intersects( s.box ); } ) )
+            out.push_back( s );
+    }
+
+    return out;
+}
+
+
+double mmOf( int aIu )
+{
+    return std::round( aIu / pcbIUScale.IU_PER_MM * 100 ) / 100;
+}
+
+
+std::optional<VECTOR2I> pointArg( const nlohmann::json& aArgs, const char* aKey )
+{
+    if( !aArgs.contains( aKey ) || !aArgs[aKey].is_array() || aArgs[aKey].size() != 2 )
+        return std::nullopt;
+
+    return VECTOR2I( pcbIUScale.mmToIU( aArgs[aKey][0].get<double>() ), pcbIUScale.mmToIU( aArgs[aKey][1].get<double>() ) );
+}
+
+
+/// @brief Is the box fully inside the polygon
+bool boxInside( const SHAPE_POLY_SET& aPoly, const BOX2I& aBox )
+{
+    SHAPE_POLY_SET rect;
+    rect.NewOutline();
+    rect.Append( aBox.GetLeft(), aBox.GetTop() );
+    rect.Append( aBox.GetRight(), aBox.GetTop() );
+    rect.Append( aBox.GetRight(), aBox.GetBottom() );
+    rect.Append( aBox.GetLeft(), aBox.GetBottom() );
+    rect.BooleanSubtract( aPoly );
+    return rect.Area() < 1.0;
+}
+
+} // namespace
+
+
+static KOPENAPI_RESULT h_pcb_free_area( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*       board = context->GetBoard();
+    const double wMm = aArgs.value( "w_mm", 0.0 );
+    const double hMm = aArgs.value( "h_mm", 0.0 );
+
+    if( wMm <= 0 || hMm <= 0 )
+        return KOPENAPI_RESULT::Error( 400, "w_mm and h_mm: the size wanted" );
+
+    if( board->GetBoardEdgesBoundingBox().GetWidth() <= 0 )
+        return KOPENAPI_RESULT::Error( 409, "the board has no outline" );
+
+    const auto iu = []( double aMm ) { return pcbIUScale.mmToIU( aMm ); };
+    const bool bottom = aArgs.value( "side", std::string( "front" ) ) == "back";
+
+    std::vector<FREE_SPOT> spots = findFree( board, bottom, iu( std::max( 0.0, aArgs.value( "gap_mm", 0.5 ) ) ), iu( wMm ),
+                                             iu( hMm ), pointArg( aArgs, "near_mm" ), std::clamp( aArgs.value( "count", 5 ), 1, 50 ),
+                                             iu( std::clamp( aArgs.value( "step_mm", 0.5 ), 0.1, 5.0 ) ), nullptr, false,
+                                             aArgs.value( "avoid_tracks", true ) );
+    nlohmann::json out = nlohmann::json::array();
+
+    for( const FREE_SPOT& s : spots )
+    {
+        out.push_back( { { "box_mm", boxMm( s.box ) },
+                         { "center_mm", { mmOf( s.box.Centre().x ), mmOf( s.box.Centre().y ) } },
+                         { "room_mm", mmOf( int( s.room ) ) } } );
+    }
+
+    return KOPENAPI_RESULT::Ok( { { "areas", out }, { "side", bottom ? "back" : "front" },
+                                  { "searched_mm", boxMm( board->GetBoardEdgesBoundingBox() ) } } );
+}
+
+
+static KOPENAPI_RESULT h_pcb_silk_fit( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*                       board = context->GetBoard();
+    const BOARD_DESIGN_SETTINGS& ds = board->GetDesignSettings();
+    const auto                   iu = []( double aMm ) { return pcbIUScale.mmToIU( aMm ); };
+    const bool                   bottom = aArgs.value( "side", std::string( "front" ) ) == "back";
+    const std::string            text = aArgs.value( "text", std::string() );
+    const bool                   isText = !text.empty();
+
+    // the item at the asked size: its ink box (strokes included) and where that sits relative to
+    // the item's position
+    double size = aArgs.value( "size_mm", 1.5 );
+    double width = aArgs.value( "width_mm", size );
+    double thickness = aArgs.value( "thickness_mm", size * 0.15 );
+    BOX2I  ink;
+
+    if( isText )
+    {
+        PCB_TEXT probe( board );
+        probe.SetText( wxString::FromUTF8( text ) );
+        probe.SetLayer( bottom ? B_SilkS : F_SilkS );
+        probe.SetTextSize( VECTOR2I( iu( width ), iu( size ) ) );
+        probe.SetTextThickness( iu( thickness ) );
+        probe.SetBold( aArgs.value( "bold", false ) );
+        probe.SetItalic( aArgs.value( "italic", false ) );
+        probe.SetTextAngle( EDA_ANGLE( aArgs.value( "angle_deg", 0.0 ), DEGREES_T ) );
+        probe.SetHorizJustify( GR_TEXT_H_ALIGN_CENTER );
+        probe.SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+        probe.SetMirrored( bottom );
+        probe.SetPosition( VECTOR2I( 0, 0 ) );
+        std::shared_ptr<SHAPE_COMPOUND> shape = probe.GetEffectiveTextShape( false );
+        ink = shape && !shape->Shapes().empty() ? shape->BBox() : probe.GetBoundingBox();
+    }
+    else if( aArgs.contains( "art_mm" ) && aArgs["art_mm"].is_array() && aArgs["art_mm"].size() == 2 )
+    {
+        const int w = iu( aArgs["art_mm"][0].get<double>() ), h = iu( aArgs["art_mm"][1].get<double>() );
+        ink = BOX2I( VECTOR2I( -w / 2, -h / 2 ), VECTOR2I( w, h ) );
+        thickness = aArgs.value( "line_width_mm", 0.15 );
+    }
+    else
+    {
+        return KOPENAPI_RESULT::Error( 400, "give text (with its size) or art_mm [w, h] with line_width_mm" );
+    }
+
+    if( ink.GetWidth() <= 0 || ink.GetHeight() <= 0 )
+        return KOPENAPI_RESULT::Error( 400, "nothing to measure" );
+
+    // the silkscreen's resolution: the board's minimum text height and stroke (DRC), or stricter
+    const double minHeight = std::max( mmOf( ds.m_MinSilkTextHeight ), aArgs.value( "min_text_height_mm", 0.0 ) );
+    const double minStroke = std::max( mmOf( ds.m_MinSilkTextThickness ), aArgs.value( "min_stroke_mm", 0.0 ) );
+    double       minScale = thickness > 0 ? minStroke / thickness : 0.0;
+
+    if( isText )
+        minScale = std::max( { minScale, minHeight / size, minHeight / width } );
+
+    const double maxScale = std::max( aArgs.value( "max_scale", 1.0 ), 1e-3 );
+    const int    gap = iu( std::max( 0.0, aArgs.value( "gap_mm", 0.5 ) ) );
+
+    auto scaled = [&]( double aS ) { return VECTOR2I( int( ink.GetWidth() * aS ), int( ink.GetHeight() * aS ) ); };
+
+    // the best scale in [minScale, maxScale] for which aFits finds a place (bisection; larger is better)
+    double                 chosen = 0;
+    std::optional<BOX2I>   place;
+    nlohmann::json         candidates = nlohmann::json::array();
+    std::string            target;
+
+    auto search = [&]( const std::function<std::optional<BOX2I>( double )>& aFits )
+    {
+        if( minScale > maxScale )
+            return;
+
+        if( auto at = aFits( maxScale ) )
+        {
+            chosen = maxScale;
+            place = at;
+            return;
+        }
+
+        double lo = minScale, hi = maxScale;
+        auto   atLo = aFits( lo );
+
+        if( !atLo )
+            return;
+
+        place = atLo;
+
+        for( int i = 0; i < 14 && hi - lo > 0.005 * hi; ++i )
+        {
+            const double mid = ( lo + hi ) / 2;
+
+            if( auto at = aFits( mid ) )
+            {
+                lo = mid;
+                place = at;
+            }
+            else
+            {
+                hi = mid;
+            }
+        }
+
+        chosen = lo;
+    };
+
+    // the region to fit into: a box, a polygon or the whole board; obstacles inside it are avoided
+    SHAPE_POLY_SET region;
+    const bool     hasBox = aArgs.contains( "box_mm" ) && aArgs["box_mm"].is_array() && aArgs["box_mm"].size() == 4;
+    const bool     hasPoly = aArgs.contains( "polygon_mm" ) && aArgs["polygon_mm"].is_array() && aArgs["polygon_mm"].size() >= 3;
+
+    if( hasBox )
+    {
+        target = "box";
+        const auto& b = aArgs["box_mm"];
+        region.NewOutline();
+        region.Append( iu( b[0].get<double>() ), iu( b[1].get<double>() ) );
+        region.Append( iu( b[2].get<double>() ), iu( b[1].get<double>() ) );
+        region.Append( iu( b[2].get<double>() ), iu( b[3].get<double>() ) );
+        region.Append( iu( b[0].get<double>() ), iu( b[3].get<double>() ) );
+    }
+    else if( hasPoly )
+    {
+        target = "polygon";
+        region.NewOutline();
+
+        for( const nlohmann::json& p : aArgs["polygon_mm"] )
+            region.Append( iu( p[0].get<double>() ), iu( p[1].get<double>() ) );
+    }
+    else
+    {
+        target = "free";
+    }
+
+    // in a region: centred in it unless near_mm says otherwise
+    std::optional<VECTOR2I> near = pointArg( aArgs, "near_mm" );
+
+    if( !near && region.OutlineCount() )
+        near = region.BBox().Centre();
+
+    const bool ignore = aArgs.value( "ignore_obstacles", false );
+    const int  stepMm = iu( std::clamp( aArgs.value( "step_mm", region.OutlineCount() ? 0.1 : 0.5 ), 0.05, 5.0 ) );
+
+    search( [&]( double aS ) -> std::optional<BOX2I>
+            {
+                const VECTOR2I               sz = scaled( aS );
+                const std::vector<FREE_SPOT> f = findFree( board, bottom, gap, sz.x, sz.y, near, 1, stepMm,
+                                                           region.OutlineCount() ? &region : nullptr, ignore,
+                                                           aArgs.value( "avoid_tracks", true ) );
+                return f.empty() ? std::nullopt : std::optional<BOX2I>( f.front().box );
+            } );
+
+    const auto     r3 = []( double v ) { return std::round( v * 1000 ) / 1000; };
+    nlohmann::json answer = { { "target", target },
+                              { "ink_mm", { mmOf( ink.GetWidth() ), mmOf( ink.GetHeight() ) } },
+                              { "min_scale", std::round( minScale * 1000 ) / 1000 },
+                              { "silk_minimums", { { "text_height_mm", minHeight }, { "stroke_mm", minStroke } } },
+                              { "fits", place.has_value() } };
+
+    if( isText )
+        answer["min_size_mm"] = r3( size * minScale );
+
+    if( !place )
+    {
+        answer["why"] = minScale > maxScale ? "the asked size is below the silkscreen's resolution (min_scale > max_scale)"
+                                            : "no place even at the smallest size the silkscreen resolves (min_scale)";
+        return KOPENAPI_RESULT::Ok( answer );
+    }
+
+    // the item's position: the place's centre less the ink's offset from the item's anchor
+    const VECTOR2I inkOffset( int( ink.Centre().x * chosen ), int( ink.Centre().y * chosen ) );
+    const VECTOR2I pos = place->Centre() - inkOffset;
+    answer["scale"] = r3( chosen );
+    answer["box_mm"] = boxMm( *place );
+    answer["center_mm"] = { mmOf( pos.x ), mmOf( pos.y ) };
+
+    if( isText )
+    {
+        nlohmann::json add = { { "text", text }, { "layer", bottom ? "B.SilkS" : "F.SilkS" },
+                               { "x_mm", mmOf( pos.x ) }, { "y_mm", mmOf( pos.y ) },
+                               { "size_mm", r3( size * chosen ) }, { "width_mm", r3( width * chosen ) },
+                               { "thickness_mm", r3( thickness * chosen ) } };
+
+        for( const char* key : { "bold", "italic", "angle_deg" } )
+        {
+            if( aArgs.contains( key ) )
+                add[key] = aArgs[key];
+        }
+
+        answer["text_add_args"] = add;   // ready for pcb_text_add
+    }
+    else
+    {
+        answer["line_width_mm"] = r3( thickness * chosen );
+    }
+
+    return KOPENAPI_RESULT::Ok( answer );
+}
+
+
+KOPENAPI_REGISTER( "pcb_free_area",
+                   "Find free places of a given size on the board for silkscreen art, logos, labels: "
+                   "clear of bodies (courtyards), exposed copper (pads, vias), existing silk and the board "
+                   "edge on one side; best first: the most room around, or nearest to near_mm; distinct "
+                   "places (no overlaps between answers)",
+                   R"json({"type":"object","required":["w_mm","h_mm"],"properties":{
+                        "w_mm":{"type":"number"},
+                        "h_mm":{"type":"number"},
+                        "side":{"type":"string","enum":["front","back"],"default":"front"},
+                        "gap_mm":{"type":"number","default":0.5,"description":"clearance kept to every obstacle"},
+                        "near_mm":{"type":"array","items":{"type":"number"},"description":"[x, y]: prefer places closest to this point"},
+                        "count":{"type":"integer","default":5,"maximum":50},
+                        "avoid_tracks":{"type":"boolean","default":true,"description":"keep clear of tracks on that side too"},
+                        "step_mm":{"type":"number","default":0.5,"description":"search grid"}}})json"_json,
+                   false, h_pcb_free_area, 60 );
+
+KOPENAPI_REGISTER( "pcb_silk_fit",
+                   "Will it fit on the silkscreen, and at what size: measures a text (its drawn strokes) or "
+                   "an art box, then finds the largest scale (up to max_scale, never below the "
+                   "silkscreen's resolution: the board's minimum silk text height and stroke) at which it "
+                   "fits into box_mm, into polygon_mm, or (default) anywhere on the board, always clear of "
+                   "bodies, exposed copper, other silk and the edge; answers fits, scale, min_scale, the place and, for "
+                   "text, ready pcb_text_add arguments",
+                   R"json({"type":"object","properties":{
+                        "text":{"type":"string"},
+                        "size_mm":{"type":"number","default":1.5},
+                        "width_mm":{"type":"number","description":"glyph width; default the height"},
+                        "thickness_mm":{"type":"number","description":"default 15 % of the height"},
+                        "bold":{"type":"boolean"},"italic":{"type":"boolean"},"angle_deg":{"type":"number"},
+                        "art_mm":{"type":"array","items":{"type":"number"},"description":"[w, h] of graphics instead of a text"},
+                        "line_width_mm":{"type":"number","default":0.15,"description":"art: its stroke (scales with it)"},
+                        "box_mm":{"type":"array","items":{"type":"number"},"description":"[x0, y0, x1, y1] to fit into"},
+                        "polygon_mm":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"[[x, y], ...] to fit into"},
+                        "near_mm":{"type":"array","items":{"type":"number"},"description":"free place: prefer near [x, y]"},
+                        "side":{"type":"string","enum":["front","back"],"default":"front"},
+                        "gap_mm":{"type":"number","default":0.5},
+                        "max_scale":{"type":"number","default":1,"description":"> 1 lets it grow to fill the target"},
+                        "min_text_height_mm":{"type":"number","description":"stricter than the board's rule (e.g. the fab's)"},
+                        "min_stroke_mm":{"type":"number"},
+                        "avoid_tracks":{"type":"boolean","default":true,"description":"keep clear of tracks on that side too (legal under the mask, but art reads better)"},
+                        "ignore_obstacles":{"type":"boolean","default":false,"description":"box / polygon: fit the region only, not the parts inside it"},
+                        "step_mm":{"type":"number","description":"search grid; default 0.1 in a box / polygon, 0.5 on the board"}}})json"_json,
+                   false, h_pcb_silk_fit, 120 );
 
 KOPENAPI_REGISTER( "pcb_silk_tidy",
                    "Tidy the silkscreen: move reference designators that sit on bodies (courtyards), "

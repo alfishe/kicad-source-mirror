@@ -485,7 +485,7 @@ nlohmann::json apply( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const TRIM_
     if( !aCtx.headless && aCtx.kiway )
     {
         if( auto* frame = dynamic_cast<PCB_EDIT_FRAME*>( aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) ) )
-            frame->Update3DView( true, true );
+            KopenapiRefresh3D( frame );
     }
 
     return { { "rule", aRule.Json() }, { "board_thickness_mm", thickness }, { "trimmed", rows }, { "errors", errors } };

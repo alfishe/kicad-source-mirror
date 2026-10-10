@@ -83,6 +83,9 @@ public:
      */
     virtual void JoinBgWorker() {}
 
+    /// @return true while a reload builds the scene in the background (not yet complete)
+    virtual bool IsSceneLoading() const { return false; }
+
     /**
      * Request stop and join any in-progress background loading.
      */

@@ -625,7 +625,12 @@ void EDA_3D_CANVAS::DoRePaint()
     // "Swaps the double-buffer of this window, making the back-buffer the
     //  front-buffer and vice versa, so that the output of the previous OpenGL
     //  commands is displayed on the window."
-    SwapBuffers();
+    // A held reload shows nothing until its scene is complete: the last frame stays.
+    if( !( m_holdFrame && m_3d_render && m_3d_render->IsSceneLoading() ) )
+    {
+        SwapBuffers();
+        m_holdFrame = false;
+    }
 
     gl_mgr->UnlockCtx( m_glRC );
 

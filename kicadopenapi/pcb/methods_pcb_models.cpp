@@ -210,7 +210,7 @@ static KOPENAPI_RESULT h_pcb_footprint_model_set( KOPENAPI_CONTEXT& aCtx, const 
     if( !aCtx.headless )
     {
         if( auto* frame = dynamic_cast<PCB_EDIT_FRAME*>( aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) ) )
-            frame->Update3DView( true, true );
+            KopenapiRefresh3D( frame );
     }
 
     std::sort( changed.begin(), changed.end(),

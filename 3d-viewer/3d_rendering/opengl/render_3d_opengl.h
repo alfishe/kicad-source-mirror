@@ -68,6 +68,7 @@ public:
     int GetWaitForEditingTimeOut() override;
 
     void JoinBgWorker() override;
+    bool IsSceneLoading() const override { return m_sceneLoading; }
     void StopBgWorker() override;
 
     void SetCurrentRollOverItem( BOARD_ITEM* aRollOverItem )
@@ -288,6 +289,7 @@ private:
     EDA_3D_CANVAS*       m_canvas;
     std::jthread         m_bgWorkerThread;
     std::atomic<bool>    m_bgWorkerBusy{ false };
+    std::atomic<bool>    m_sceneLoading{ false };   ///< reload started, scene not complete yet
     std::atomic<bool>    m_hitTestDirty{ false };
     std::recursive_mutex m_renderMutex;
 

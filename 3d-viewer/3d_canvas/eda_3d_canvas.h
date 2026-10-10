@@ -297,6 +297,10 @@ public:
     /// @return false when the canvas cannot render (no context, framebuffer blit unsupported)
     bool RenderToImage( unsigned char* aRgb, int aWidth, int aHeight, int aSupersample = 1 );
 
+    /// @brief The next reload keeps the current picture on screen until the new scene is complete
+    /// (no partial frames); for reloads requested programmatically
+    void HoldFrameUntilLoaded() { m_holdFrame = true; }
+
     void OnCloseWindow( wxCloseEvent& event );
 
 private:
@@ -402,6 +406,8 @@ private:
     wxGLContext*           m_glRC = nullptr;                    // Current OpenGL context
 
     /// RenderToImage() buffers, kept while the size stays: drawing target and its downsampled copy
+    bool                   m_holdFrame = false;   ///< see HoldFrameUntilLoaded()
+
     struct OFFSCREEN
     {
         GLuint drawFbo = 0, drawColor = 0, drawDepth = 0;

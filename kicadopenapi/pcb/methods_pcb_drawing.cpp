@@ -14,6 +14,7 @@
 #include <pcb_edit_frame.h>
 #include <pcb_shape.h>
 #include <pcb_text.h>
+#include <geometry/shape_compound.h>
 #include <stroke_params.h>
 #include <tool/tool_manager.h>
 
@@ -98,7 +99,10 @@ void finish( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, BOARD_COMMIT& aCommi
     if( !aCtx.headless )
     {
         if( auto* frame = DRAW_GLOW_TRAITS::Frame( aCtx.kiway ) )
+        {
             frame->GetCanvas()->Refresh();
+            KopenapiRefresh3D( frame );   // an open 3D viewer shows the change right away
+        }
 
         KopenapiGlow<DRAW_GLOW_TRAITS>( aCtx.kiway, aIds, 0 );
     }
@@ -148,13 +152,19 @@ static KOPENAPI_RESULT h_pcb_text_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     commit.Add( item );
     finish( aCtx, *context, commit, { item->m_Uuid }, _( "Add text (API)" ) );
 
-    const BOX2I box = item->GetBoundingBox();
-    auto        mm = []( int v ) { return std::round( v / pcbIUScale.IU_PER_MM * 100 ) / 100; };
+    const BOX2I                     box = item->GetBoundingBox();
+    std::shared_ptr<SHAPE_COMPOUND> shape = item->GetEffectiveTextShape( false );
+    const BOX2I                     ink = shape && !shape->Shapes().empty() ? shape->BBox() : box;
+    auto                            mm = []( int v ) { return std::round( v / pcbIUScale.IU_PER_MM * 100 ) / 100; };
+    auto                            rect = [&]( const BOX2I& b ) -> nlohmann::json
+    {
+        return { mm( b.GetLeft() ), mm( b.GetTop() ), mm( b.GetRight() ), mm( b.GetBottom() ) };
+    };
 
     return KOPENAPI_RESULT::Ok( { { "uuid", str( item->m_Uuid.AsString() ) },
                                   { "layer", str( board->GetLayerName( *layer ) ) },
-                                  { "bbox_mm", { mm( box.GetLeft() ), mm( box.GetTop() ), mm( box.GetRight() ),
-                                                 mm( box.GetBottom() ) } } } );
+                                  { "bbox_mm", rect( box ) },
+                                  { "ink_mm", rect( ink ) } } );
 }
 
 
@@ -271,10 +281,280 @@ static KOPENAPI_RESULT h_pcb_graphic_add( KOPENAPI_CONTEXT& aCtx, const nlohmann
 }
 
 
+namespace
+{
+
+nlohmann::json rectMm( const BOX2I& aBox )
+{
+    auto mm = []( int v ) { return std::round( v / pcbIUScale.IU_PER_MM * 100 ) / 100; };
+    return { mm( aBox.GetLeft() ), mm( aBox.GetTop() ), mm( aBox.GetRight() ), mm( aBox.GetBottom() ) };
+}
+
+
+/// @brief Board-level drawings (texts, shapes) by uuid; footprints' own items are not included
+std::vector<BOARD_ITEM*> drawingsByUuid( BOARD* aBoard, const nlohmann::json& aUuids, nlohmann::json& aMissing )
+{
+    std::vector<BOARD_ITEM*> out;
+
+    for( const nlohmann::json& u : aUuids )
+    {
+        const KIID id( wxString::FromUTF8( u.get<std::string>() ) );
+        BOARD_ITEM* found = nullptr;
+
+        for( BOARD_ITEM* item : aBoard->Drawings() )
+        {
+            if( item->m_Uuid == id )
+                found = item;
+        }
+
+        if( found )
+            out.push_back( found );
+        else
+            aMissing.push_back( u );
+    }
+
+    return out;
+}
+
+} // namespace
+
+
+static KOPENAPI_RESULT h_pcb_drawing_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*            board = context->GetBoard();
+    const std::string layerName = aArgs.value( "layer", std::string() );
+    const std::string kind = aArgs.value( "kind", std::string() );
+    nlohmann::json    items = nlohmann::json::array();
+    auto              mm = []( int v ) { return std::round( v / pcbIUScale.IU_PER_MM * 100 ) / 100; };
+
+    for( BOARD_ITEM* item : board->Drawings() )
+    {
+        const std::string layer = str( board->GetLayerName( item->GetLayer() ) );
+
+        if( !layerName.empty() && layer != layerName && str( LayerName( item->GetLayer() ) ) != layerName )
+            continue;
+
+        nlohmann::json row = { { "uuid", str( item->m_Uuid.AsString() ) }, { "layer", layer },
+                               { "bbox_mm", rectMm( item->GetBoundingBox() ) } };
+
+        if( auto* t = dynamic_cast<PCB_TEXT*>( item ) )
+        {
+            if( !kind.empty() && kind != "text" )
+                continue;
+
+            std::shared_ptr<SHAPE_COMPOUND> ink = t->GetEffectiveTextShape( false );
+            row["kind"] = "text";
+            row["text"] = str( t->GetText() );
+            row["x_mm"] = mm( t->GetPosition().x );
+            row["y_mm"] = mm( t->GetPosition().y );
+            row["size_mm"] = mm( t->GetTextHeight() );
+            row["width_mm"] = mm( t->GetTextWidth() );
+            row["thickness_mm"] = mm( t->GetTextThickness() );
+            row["angle_deg"] = t->GetTextAngle().AsDegrees();
+            row["ink_mm"] = rectMm( ink && !ink->Shapes().empty() ? ink->BBox() : t->GetBoundingBox() );
+        }
+        else if( auto* sh = dynamic_cast<PCB_SHAPE*>( item ) )
+        {
+            if( !kind.empty() && kind != "shape" )
+                continue;
+
+            row["kind"] = "shape";
+            row["shape"] = str( sh->ShowShape() );
+            row["width_mm"] = mm( sh->GetWidth() );
+            row["filled"] = sh->IsSolidFill();
+        }
+        else
+        {
+            if( !kind.empty() )
+                continue;
+
+            row["kind"] = str( item->GetClass() );
+        }
+
+        items.push_back( row );
+    }
+
+    return KOPENAPI_RESULT::Ok( { { "items", items }, { "total", items.size() } } );
+}
+
+
+static KOPENAPI_RESULT h_pcb_item_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    if( !aArgs.contains( "uuids" ) || !aArgs["uuids"].is_array() || aArgs["uuids"].empty() )
+        return KOPENAPI_RESULT::Error( 400, "uuids: the drawings to delete (pcb_drawing_list)" );
+
+    nlohmann::json           missing = nlohmann::json::array();
+    std::vector<BOARD_ITEM*> items = drawingsByUuid( context->GetBoard(), aArgs["uuids"], missing );
+
+    if( items.empty() )
+        return KOPENAPI_RESULT::Error( 404, "no board drawing with these uuids" );
+
+    BOARD_COMMIT commit( context->GetToolManager() );
+
+    for( BOARD_ITEM* item : items )
+        commit.Remove( item );
+
+    commit.Push( _( "Delete drawings (API)" ) );
+
+    if( !aCtx.headless )
+    {
+        if( auto* frame = DRAW_GLOW_TRAITS::Frame( aCtx.kiway ) )
+        {
+            frame->GetCanvas()->Refresh();
+            KopenapiRefresh3D( frame );   // an open 3D viewer shows the change right away
+        }
+    }
+
+    return KOPENAPI_RESULT::Ok( { { "deleted", items.size() }, { "missing", missing } } );
+}
+
+
+static KOPENAPI_RESULT h_pcb_items_move( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    if( !aArgs.contains( "uuids" ) || !aArgs["uuids"].is_array() || aArgs["uuids"].empty() )
+        return KOPENAPI_RESULT::Error( 400, "uuids: the drawings to move (pcb_drawing_list)" );
+
+    nlohmann::json           missing = nlohmann::json::array();
+    std::vector<BOARD_ITEM*> items = drawingsByUuid( context->GetBoard(), aArgs["uuids"], missing );
+
+    if( items.empty() )
+        return KOPENAPI_RESULT::Error( 404, "no board drawing with these uuids" );
+
+    const VECTOR2I delta( toIU( aArgs.value( "dx_mm", 0.0 ) ), toIU( aArgs.value( "dy_mm", 0.0 ) ) );
+    BOARD_COMMIT   commit( context->GetToolManager() );
+    std::vector<KIID> ids;
+    BOX2I          box;
+
+    for( BOARD_ITEM* item : items )
+    {
+        commit.Modify( item );
+        item->Move( delta );
+        ids.push_back( item->m_Uuid );
+        box.Merge( item->GetBoundingBox() );
+    }
+
+    finish( aCtx, *context, commit, ids, _( "Move drawings (API)" ) );
+    return KOPENAPI_RESULT::Ok( { { "moved", items.size() }, { "missing", missing }, { "bbox_mm", rectMm( box ) } } );
+}
+
+
+static KOPENAPI_RESULT h_pcb_text_update( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    nlohmann::json           missing = nlohmann::json::array();
+    std::vector<BOARD_ITEM*> found = drawingsByUuid( context->GetBoard(), nlohmann::json::array( { aArgs.value( "uuid", std::string() ) } ),
+                                                     missing );
+    auto*                    t = found.empty() ? nullptr : dynamic_cast<PCB_TEXT*>( found.front() );
+
+    if( !t )
+        return KOPENAPI_RESULT::Error( 404, "uuid: a board text (pcb_drawing_list kind text)" );
+
+    BOARD_COMMIT commit( context->GetToolManager() );
+    commit.Modify( t );
+
+    if( aArgs.contains( "text" ) )
+        t->SetText( wxString::FromUTF8( aArgs["text"].get<std::string>() ) );
+
+    // a new height keeps the glyph proportions and the stroke ratio unless they are given too
+    if( aArgs.contains( "size_mm" ) )
+    {
+        const double k = toIU( aArgs["size_mm"].get<double>() ) / double( std::max( 1, t->GetTextHeight() ) );
+        t->SetTextSize( VECTOR2I( int( t->GetTextWidth() * k ), toIU( aArgs["size_mm"].get<double>() ) ) );
+        t->SetTextThickness( int( t->GetTextThickness() * k ) );
+    }
+
+    if( aArgs.contains( "width_mm" ) )
+        t->SetTextWidth( toIU( aArgs["width_mm"].get<double>() ) );
+
+    if( aArgs.contains( "thickness_mm" ) )
+        t->SetTextThickness( toIU( aArgs["thickness_mm"].get<double>() ) );
+
+    if( aArgs.contains( "angle_deg" ) )
+        t->SetTextAngle( EDA_ANGLE( aArgs["angle_deg"].get<double>(), DEGREES_T ) );
+
+    if( aArgs.contains( "bold" ) )
+        t->SetBold( aArgs["bold"].get<bool>() );
+
+    VECTOR2I pos = t->GetPosition();
+
+    if( aArgs.contains( "x_mm" ) )
+        pos.x = toIU( aArgs["x_mm"].get<double>() );
+
+    if( aArgs.contains( "y_mm" ) )
+        pos.y = toIU( aArgs["y_mm"].get<double>() );
+
+    pos += VECTOR2I( toIU( aArgs.value( "dx_mm", 0.0 ) ), toIU( aArgs.value( "dy_mm", 0.0 ) ) );
+    t->SetPosition( pos );
+
+    finish( aCtx, *context, commit, { t->m_Uuid }, _( "Edit text (API)" ) );
+
+    std::shared_ptr<SHAPE_COMPOUND> ink = t->GetEffectiveTextShape( false );
+    return KOPENAPI_RESULT::Ok( { { "uuid", str( t->m_Uuid.AsString() ) },
+                                  { "bbox_mm", rectMm( t->GetBoundingBox() ) },
+                                  { "ink_mm", rectMm( ink && !ink->Shapes().empty() ? ink->BBox() : t->GetBoundingBox() ) } } );
+}
+
+
+KOPENAPI_REGISTER( "pcb_drawing_list",
+                   "List the board's own drawings (not footprints'): texts (text, position, size, width, "
+                   "stroke, angle, drawn box ink_mm) and shapes (shape, stroke, fill) with uuid, layer and box; "
+                   "filter by layer and kind",
+                   R"json({"type":"object","properties":{
+                        "layer":{"type":"string","description":"e.g. F.SilkS or F.Silkscreen"},
+                        "kind":{"type":"string","enum":["text","shape"]}}})json"_json,
+                   false, h_pcb_drawing_list );
+
+KOPENAPI_REGISTER( "pcb_item_delete",
+                   "Delete board drawings (texts, shapes) by uuid (pcb_drawing_list); one undo step",
+                   R"json({"type":"object","required":["uuids"],"properties":{
+                        "uuids":{"type":"array","items":{"type":"string"}}}})json"_json,
+                   false, h_pcb_item_delete );
+
+KOPENAPI_REGISTER( "pcb_items_move",
+                   "Move board drawings (texts, shapes; e.g. a logo made of several) together by dx / dy mm; "
+                   "one undo step; answers their box",
+                   R"json({"type":"object","required":["uuids"],"properties":{
+                        "uuids":{"type":"array","items":{"type":"string"}},
+                        "dx_mm":{"type":"number","default":0},"dy_mm":{"type":"number","default":0}}})json"_json,
+                   false, h_pcb_items_move );
+
+KOPENAPI_REGISTER( "pcb_text_update",
+                   "Edit a board text by uuid: text, position (x_mm / y_mm or dx_mm / dy_mm), height "
+                   "(size_mm keeps the glyph proportions and stroke ratio), glyph width (narrower / wider), "
+                   "stroke, angle, bold; answers its boxes (check with pcb_silk_fit / pcb_drc)",
+                   R"json({"type":"object","required":["uuid"],"properties":{
+                        "uuid":{"type":"string"},
+                        "text":{"type":"string"},
+                        "x_mm":{"type":"number"},"y_mm":{"type":"number"},
+                        "dx_mm":{"type":"number"},"dy_mm":{"type":"number"},
+                        "size_mm":{"type":"number"},"width_mm":{"type":"number"},"thickness_mm":{"type":"number"},
+                        "angle_deg":{"type":"number"},"bold":{"type":"boolean"}}})json"_json,
+                   false, h_pcb_text_update );
+
+
 KOPENAPI_REGISTER( "pcb_text_add",
                    "Put text on the board (silkscreen title, labels, pinouts, fab notes) on any layer "
                    "(default F.SilkS): position, size, thickness, bold, italic, angle, justify, knockout; "
-                   "mirrored automatically on back layers; answers uuid and bounding box",
+                   "mirrored automatically on back layers; answers uuid, text box (bbox_mm) and drawn strokes (ink_mm)",
                    R"json({"type":"object","required":["text","x_mm","y_mm"],"properties":{
                         "text":{"type":"string"},
                         "x_mm":{"type":"number"}, "y_mm":{"type":"number"},
@@ -303,4 +583,4 @@ KOPENAPI_REGISTER( "pcb_graphic_add",
                         "filled":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_graphic_add );
 
-KOPENAPI_MARK_EDITING( "pcb_text_add", "pcb_graphic_add" );
+KOPENAPI_MARK_EDITING( "pcb_text_add", "pcb_graphic_add", "pcb_item_delete", "pcb_items_move", "pcb_text_update" );

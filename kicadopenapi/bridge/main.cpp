@@ -415,6 +415,8 @@ private:
     std::map<long, Child> m_children;
     bool m_inFlight = false;
     long m_lostPid = 0;  // bound instance died unexpectedly; the next request reports it
+    std::string m_lostUrl;     // its endpoint: a restart comes back on the same port
+    std::string m_restartUrl;  // app_restart was forwarded to this endpoint
 };
 
 void Bridge::BindTo(const bridge::Instance& inst, const std::string& why)
@@ -498,8 +500,38 @@ bool Bridge::EnsureBound(std::string& error)
     if (!m_url.empty())
     {
         m_lostPid = m_pid;
+        m_lostUrl = m_url;
     }
     Unbind();
+
+    // the same design came back on the same port (app_restart, or a restart by hand): follow it;
+    // after app_restart wait for the new process to publish its endpoint
+    if (m_lostPid && !m_lostUrl.empty())
+    {
+        const bool restarting = m_restartUrl == m_lostUrl;
+        const auto deadline = Clock::now() + (restarting ? std::chrono::duration_cast<Clock::duration>(m_cfg.startTimeout)
+                                                         : Clock::duration::zero());
+        for (;;)
+        {
+            for (const bridge::Instance& inst : bridge::Discover(m_cfg.discoveryDir))
+            {
+                if (inst.mcpUrl == m_lostUrl && inst.pid != m_lostPid)
+                {
+                    BindTo(inst, "pid " + std::to_string(m_lostPid) + " restarted on the same port");
+                    m_lostPid = 0;
+                    m_lostUrl.clear();
+                    m_restartUrl.clear();
+                    return true;
+                }
+            }
+            if (Clock::now() >= deadline)
+            {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        m_restartUrl.clear();
+    }
 
     if (m_lostPid)
     {
@@ -507,6 +539,7 @@ bool Bridge::EnsureBound(std::string& error)
         error = "the KiCad instance (pid " + std::to_string(m_lostPid) + ") is gone — the next call binds to "
                 + "another instance (policy '" + m_cfg.policy + "'); check instance_list before mutating";
         m_lostPid = 0;
+        m_lostUrl.clear();
         return false;
     }
 
@@ -551,6 +584,11 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
     if (auto it = m_children.find(pid); it != m_children.end())
     {
         it->second.lastUse = Clock::now();
+    }
+
+    if (result.ok && line.find("\"app_restart\"") != std::string::npos)
+    {
+        m_restartUrl = m_url;  // the next call follows the new process on this port
     }
 
     if (!result.ok)
@@ -871,7 +909,8 @@ void Bridge::Housekeeping()
                 UntrackHeadless(pid);
                 if (pid == m_pid)
                 {
-                    m_lostPid = pid;  // unexpected: the next request reports it
+                    m_lostPid = pid;  // unexpected: the next request reports it (unless it restarted)
+                    m_lostUrl = m_url;
                     Unbind();
                 }
                 it = m_children.erase(it);
