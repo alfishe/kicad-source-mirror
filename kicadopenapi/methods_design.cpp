@@ -1,5 +1,5 @@
 /*
- * kicadopenapi cross-domain methods (DESIGN-ANALYSIS-API.md principle A7): schematic <-> board.
+ * kicadopenapi cross-domain methods (docs/api/design-analysis-api.md principle A7): schematic <-> board.
  *
  *   design_parity  compare schematic and board: components, and nets by connectivity
  *   net_get        one net seen from both sides, matched through pads

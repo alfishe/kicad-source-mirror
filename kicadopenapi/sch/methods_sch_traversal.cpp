@@ -1,5 +1,5 @@
 /*
- * kicadopenapi schematic traversal (DESIGN-ANALYSIS-API.md §5):
+ * kicadopenapi schematic traversal (docs/api/design-analysis-api.md §5):
  * sch_net_trace, sch_symbol_neighbors, sch_path_find, sch_power_tree, sch_interface_map,
  * sch_net_search, sch_subcircuit.
  *

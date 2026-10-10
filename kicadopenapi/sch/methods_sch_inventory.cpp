@@ -1,5 +1,5 @@
 /*
- * kicadopenapi schematic statistics, inventories and net cards (DESIGN-ANALYSIS-API.md):
+ * kicadopenapi schematic statistics, inventories and net cards (docs/api/design-analysis-api.md):
  * sch_stats, sch_sheet_list, sch_symbol_list, sch_net_list, sch_net_get.
  *
  * Symbols and nets are reported per sheet *instance* (a reused sheet yields distinct

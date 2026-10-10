@@ -1,5 +1,5 @@
 /*
- * kicadopenapi pcb_stats: level-0 board statistics in one call (DESIGN-ANALYSIS-API.md §2).
+ * kicadopenapi pcb_stats: level-0 board statistics in one call (docs/api/design-analysis-api.md §2).
  *
  * The default pass is linear in the board size.  `slow: true` adds upstream's full board
  * statistics (copper areas, minimum track clearance — an O(n²) track scan), which is what

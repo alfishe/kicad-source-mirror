@@ -20,6 +20,7 @@
 #include <ratsnest/ratsnest_data.h>
 #include <footprint.h>
 #include <geometry/shape_poly_set.h>
+#include <geometry/seg.h>
 #include <kicadopenapi_glow_view.h>
 #include <kicadopenapi_util.h>
 #include <kiway.h>
@@ -252,6 +253,52 @@ nlohmann::json placementReport( BOARD* aBoard )
 }
 
 
+/**
+ * The panel edge a connector footprint marks for its front (KiCad's convention: a line on
+ * Dwgs.User where the board / panel edge goes, the mating side beyond it): the longest such
+ * line, and the direction from the pads towards it (where the connector faces).
+ */
+std::optional<std::pair<SEG, VECTOR2D>> panelEdge( FOOTPRINT* aFootprint )
+{
+    std::optional<SEG> best;
+
+    for( BOARD_ITEM* item : aFootprint->GraphicalItems() )
+    {
+        if( item->Type() != PCB_SHAPE_T || item->GetLayer() != Dwgs_User )
+            continue;
+
+        PCB_SHAPE* shape = static_cast<PCB_SHAPE*>( item );
+
+        if( shape->GetShape() != SHAPE_T::SEGMENT )
+            continue;
+
+        SEG seg( shape->GetStart(), shape->GetEnd() );
+
+        if( !best || seg.Length() > best->Length() )
+            best = seg;
+    }
+
+    if( !best || aFootprint->Pads().empty() )
+        return std::nullopt;
+
+    VECTOR2D centroid( 0, 0 );
+
+    for( PAD* pad : aFootprint->Pads() )
+        centroid += VECTOR2D( pad->GetPosition() );
+
+    centroid = centroid * ( 1.0 / aFootprint->Pads().size() );
+
+    const VECTOR2D d( best->B - best->A );
+    VECTOR2D       n( -d.y, d.x );
+    n = n.Resize( 1.0 );
+
+    if( ( VECTOR2D( best->Center() ) - centroid ).Dot( n ) < 0 )
+        n = -n;
+
+    return std::make_pair( *best, n );
+}
+
+
 void refreshGui( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard )
 {
     if( aCtx.headless )
@@ -295,6 +342,9 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         if( m.contains( "side" ) && m["side"] != "top" && m["side"] != "bottom" )
             return KOPENAPI_RESULT::Error( 400, "side: top or bottom" );
 
+        if( m.contains( "facing" ) && m["facing"] != "left" && m["facing"] != "right" && m["facing"] != "up" && m["facing"] != "down" )
+            return KOPENAPI_RESULT::Error( 400, "facing: left, right, up or down" );
+
         if( fp->IsLocked() && !aArgs.value( "override_locks", false ) )
             return KOPENAPI_RESULT::Error( 409, str( fp->GetReference() ) + " is locked (override_locks: true)" );
 
@@ -314,8 +364,48 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         if( m.contains( "rotation_deg" ) && m["rotation_deg"].is_number() )
             fp->SetOrientation( EDA_ANGLE( m["rotation_deg"].get<double>(), DEGREES_T ) );
 
-        const VECTOR2I pos( m.contains( "x_mm" ) ? toIU( m["x_mm"].get<double>() ) : fp->GetPosition().x,
-                            m.contains( "y_mm" ) ? toIU( m["y_mm"].get<double>() ) : fp->GetPosition().y );
+        // facing: turn so the front (beyond the footprint's panel-edge line) points that way
+        if( m.contains( "facing" ) )
+        {
+            std::optional<std::pair<SEG, VECTOR2D>> edge = panelEdge( fp );
+
+            if( !edge )
+            {
+                commit.Revert();
+                return KOPENAPI_RESULT::Error( 422, str( fp->GetReference() ) + " has no panel-edge line (Dwgs.User) to face with" );
+            }
+
+            static const std::map<std::string, double> want = { { "right", 0 }, { "down", 90 }, { "left", 180 }, { "up", 270 } };
+            const double now = std::atan2( edge->second.y, edge->second.x ) * 180.0 / M_PI;
+            const double turn = now - want.at( m["facing"].get<std::string>() );   // CCW on screen lowers the angle
+            fp->SetOrientation( fp->GetOrientation() + EDA_ANGLE( turn, DEGREES_T ) );
+        }
+
+        VECTOR2I pos( m.contains( "x_mm" ) ? toIU( m["x_mm"].get<double>() ) : fp->GetPosition().x,
+                      m.contains( "y_mm" ) ? toIU( m["y_mm"].get<double>() ) : fp->GetPosition().y );
+
+        // anchor center: the position names the middle of the courtyard (connectors' origin is
+        // often a pin far from their body)
+        if( m.value( "anchor", std::string( "origin" ) ) == "center" )
+            pos -= courtyard( fp ).BBox().Centre() - fp->GetPosition();
+        else if( m.value( "anchor", std::string( "origin" ) ) == "panel_edge" )
+        {
+            std::optional<std::pair<SEG, VECTOR2D>> edge = panelEdge( fp );
+
+            if( !edge )
+            {
+                commit.Revert();
+                return KOPENAPI_RESULT::Error( 422, str( fp->GetReference() ) + " has no panel-edge line (Dwgs.User) to anchor on" );
+            }
+
+            pos -= edge->first.Center() - fp->GetPosition();
+
+            // edge_offset_mm: along the facing direction - positive sticks out past the edge,
+            // negative sinks the connector in (case / panel specifics)
+            const double offset = m.value( "edge_offset_mm", 0.0 );
+            pos += VECTOR2I( KiROUND( edge->second.x * toIU( offset ) ), KiROUND( edge->second.y * toIU( offset ) ) );
+        }
+
         fp->SetPosition( pos );
         fp->SetAttributes( fp->GetAttributes() & ~FP_JUST_ADDED );   // placed now: connectivity counts it
         moved.push_back( fp->m_Uuid );
@@ -502,13 +592,18 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
 
 KOPENAPI_REGISTER( "pcb_footprint_move",
-                   "Place footprints: several at once in one undo step - position (mm), rotation_deg, side "
+                   "Place footprints: several at once in one undo step - position (mm) of the origin, the "
+                   "courtyard's middle (anchor center) or a connector's panel-edge line (anchor panel_edge), "
+                   "rotation_deg or facing (connectors: mating side towards left / right / up / down), side "
                    "top / bottom; locked ones need override_locks; answers where they are now and the "
                    "placement check (overlaps, outside the board, airwire length)",
                    R"json({"type":"object","required":["moves"],"properties":{
                         "moves":{"type":"array","items":{"type":"object","required":["ref"],"properties":{
                             "ref":{"type":"string"},"x_mm":{"type":"number"},"y_mm":{"type":"number"},
-                            "rotation_deg":{"type":"number"},"side":{"type":"string","enum":["top","bottom"]}}}},
+                            "rotation_deg":{"type":"number"},"side":{"type":"string","enum":["top","bottom"]},
+                            "anchor":{"type":"string","enum":["origin","center","panel_edge"],"default":"origin","description":"center: x / y are the courtyard's middle; panel_edge: the middle of the connector's panel-edge line (put it on the board edge)"},
+                            "edge_offset_mm":{"type":"number","default":0,"description":"anchor panel_edge: shift along the facing direction (+ out past the edge, - recessed)"},
+                            "facing":{"type":"string","enum":["left","right","up","down"],"description":"connectors: turn so the mating side (beyond the footprint's panel-edge line on Dwgs.User) faces this way"}}}},
                         "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_footprint_move );
 

@@ -1,5 +1,5 @@
 /*
- * kicadopenapi schematic buses (DESIGN-ANALYSIS-API.md §3 sch_buses): sch_bus_list, sch_bus_get.
+ * kicadopenapi schematic buses (docs/api/design-analysis-api.md §3 sch_buses): sch_bus_list, sch_bus_get.
  *
  * A bus is reported as a *drawn bus group*: bus segments connected end-to-segment on one sheet
  * instance.  Its members are what actually enters it — the nets of the wires attached through

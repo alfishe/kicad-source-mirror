@@ -1,5 +1,5 @@
 /*
- * kicadopenapi PCB inventories and cards (DESIGN-ANALYSIS-API.md §3–§4):
+ * kicadopenapi PCB inventories and cards (docs/api/design-analysis-api.md §3–§4):
  * pcb_footprint_list, pcb_net_list, pcb_net_get, pcb_footprint_get.
  *
  * All values in mm (KiCad coordinates: origin top-left, y grows downwards).  Lists are
