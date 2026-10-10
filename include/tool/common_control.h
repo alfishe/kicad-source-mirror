@@ -50,6 +50,10 @@ public:
     int Execute( const TOOL_EVENT& aEvent );
     int ShowProjectManager( const TOOL_EVENT& aEvent );
 
+    /// @brief Editors' File menu project items: run the project manager's own action (after
+    /// this handler returned, as a project switch closes the calling editor).
+    int ForwardToProjectManager( const TOOL_EVENT& aEvent );
+
     int ShowHelp( const TOOL_EVENT& aEvent );
     int About( const TOOL_EVENT& aEvent );
     int ListHotKeys( const TOOL_EVENT& aEvent );

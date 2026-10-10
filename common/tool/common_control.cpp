@@ -33,6 +33,7 @@
 #include <gal/graphics_abstraction_layer.h>
 #include <base_screen.h>
 #include <tool/common_control.h>
+#include <tool/project_manager_menu.h>
 
 #include <api/api_plugin_manager.h>
 #include <id.h>
@@ -290,6 +291,46 @@ int COMMON_CONTROL::ShowProjectManager( const TOOL_EVENT& aEvent )
 }
 
 
+int COMMON_CONTROL::ForwardToProjectManager( const TOOL_EVENT& aEvent )
+{
+    EDA_BASE_FRAME* top = static_cast<EDA_BASE_FRAME*>( m_frame->Kiway().GetTop() );
+
+    if( !top || top->GetFrameType() != KICAD_MAIN_FRAME_T )
+        return 0;
+
+    std::string action;
+    wxString    project;
+
+    if( aEvent.IsAction( &PROJECT_MANAGER_ACTIONS::newProject ) )
+    {
+        action = "kicad.Control.newProject";
+    }
+    else if( aEvent.IsAction( &PROJECT_MANAGER_ACTIONS::openProject ) )
+    {
+        action = "kicad.Control.openProject";
+    }
+    else if( aEvent.Parameter<wxString*>() )
+    {
+        action = "kicad.Control.loadProject";
+        project = *aEvent.Parameter<wxString*>();
+    }
+
+    if( action.empty() )
+        return 0;
+
+    top->CallAfter(
+            [top, action, project]() mutable
+            {
+                if( project.IsEmpty() )
+                    top->GetToolManager()->RunAction( action );
+                else
+                    top->GetToolManager()->RunAction<wxString*>( action, &project );
+            } );
+
+    return 0;
+}
+
+
 int COMMON_CONTROL::ShowHelp( const TOOL_EVENT& aEvent )
 {
     wxString helpFile;
@@ -482,6 +523,9 @@ void COMMON_CONTROL::setTransitions()
     Go( &COMMON_CONTROL::ShowPlayer,         ACTIONS::showFootprintEditor.MakeEvent() );
     Go( &COMMON_CONTROL::Execute,            ACTIONS::showCalculatorTools.MakeEvent() );
     Go( &COMMON_CONTROL::ShowProjectManager, ACTIONS::showProjectManager.MakeEvent() );
+    Go( &COMMON_CONTROL::ForwardToProjectManager, PROJECT_MANAGER_ACTIONS::newProject.MakeEvent() );
+    Go( &COMMON_CONTROL::ForwardToProjectManager, PROJECT_MANAGER_ACTIONS::openProject.MakeEvent() );
+    Go( &COMMON_CONTROL::ForwardToProjectManager, PROJECT_MANAGER_ACTIONS::openRecentProject.MakeEvent() );
 
     Go( &COMMON_CONTROL::ShowHelp,           ACTIONS::gettingStarted.MakeEvent() );
     Go( &COMMON_CONTROL::ShowHelp,           ACTIONS::help.MakeEvent() );

@@ -174,6 +174,111 @@ KICAD_SETTINGS::KICAD_SETTINGS() :
                                                 wxS( "PCM_" ) ) );
 
     m_params.emplace_back( new PARAM<wxString>( "pcm.last_selected_repo_id", &m_PcmLastSelectedRepoId, "" ) );
+
+    m_params.emplace_back( new PARAM_LAMBDA<std::string>(
+            "project_manager.show_on_start",
+            [&]() { return ToString( m_ProjectManager.show_on_start ); },
+            [&]( const std::string& aName )
+            {
+                m_ProjectManager.show_on_start = PM_SHOW_ON_START::ALWAYS;
+                FromString( aName, m_ProjectManager.show_on_start );
+            },
+            ToString( PM_SHOW_ON_START::ALWAYS ) ) );
+
+    m_params.emplace_back( new PARAM_LAMBDA<std::string>(
+            "project_manager.open_project_shows",
+            [&]() { return ToString( m_ProjectManager.open_project_shows ); },
+            [&]( const std::string& aName )
+            {
+                m_ProjectManager.open_project_shows = PM_OPEN_PROJECT_SHOWS::MANAGER;
+                FromString( aName, m_ProjectManager.open_project_shows );
+            },
+            ToString( PM_OPEN_PROJECT_SHOWS::MANAGER ) ) );
+
+    m_params.emplace_back( new PARAM_LAMBDA<std::string>(
+            "project_manager.quit_with_last_editor",
+            [&]() { return ToString( m_ProjectManager.quit_with_last_editor ); },
+            [&]( const std::string& aName )
+            {
+                m_ProjectManager.quit_with_last_editor = PM_QUIT_WITH_LAST_EDITOR::WHEN_HIDDEN;
+                FromString( aName, m_ProjectManager.quit_with_last_editor );
+            },
+            ToString( PM_QUIT_WITH_LAST_EDITOR::WHEN_HIDDEN ) ) );
+}
+
+
+std::string KICAD_SETTINGS::ToString( PM_SHOW_ON_START aValue )
+{
+    switch( aValue )
+    {
+    case PM_SHOW_ON_START::WITHOUT_DOCUMENT: return "without_document";
+    case PM_SHOW_ON_START::NEVER:            return "never";
+    default:                                 return "always";
+    }
+}
+
+
+std::string KICAD_SETTINGS::ToString( PM_OPEN_PROJECT_SHOWS aValue )
+{
+    return aValue == PM_OPEN_PROJECT_SHOWS::EDITORS ? "editors" : "manager";
+}
+
+
+std::string KICAD_SETTINGS::ToString( PM_QUIT_WITH_LAST_EDITOR aValue )
+{
+    switch( aValue )
+    {
+    case PM_QUIT_WITH_LAST_EDITOR::ALWAYS: return "always";
+    case PM_QUIT_WITH_LAST_EDITOR::NEVER:  return "never";
+    default:                               return "when_hidden";
+    }
+}
+
+
+bool KICAD_SETTINGS::FromString( const std::string& aName, PM_SHOW_ON_START& aValue )
+{
+    for( PM_SHOW_ON_START v : { PM_SHOW_ON_START::ALWAYS, PM_SHOW_ON_START::WITHOUT_DOCUMENT,
+                                PM_SHOW_ON_START::NEVER } )
+    {
+        if( aName == ToString( v ) )
+        {
+            aValue = v;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+bool KICAD_SETTINGS::FromString( const std::string& aName, PM_OPEN_PROJECT_SHOWS& aValue )
+{
+    for( PM_OPEN_PROJECT_SHOWS v : { PM_OPEN_PROJECT_SHOWS::MANAGER, PM_OPEN_PROJECT_SHOWS::EDITORS } )
+    {
+        if( aName == ToString( v ) )
+        {
+            aValue = v;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+bool KICAD_SETTINGS::FromString( const std::string& aName, PM_QUIT_WITH_LAST_EDITOR& aValue )
+{
+    for( PM_QUIT_WITH_LAST_EDITOR v : { PM_QUIT_WITH_LAST_EDITOR::WHEN_HIDDEN, PM_QUIT_WITH_LAST_EDITOR::ALWAYS,
+                                        PM_QUIT_WITH_LAST_EDITOR::NEVER } )
+    {
+        if( aName == ToString( v ) )
+        {
+            aValue = v;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 

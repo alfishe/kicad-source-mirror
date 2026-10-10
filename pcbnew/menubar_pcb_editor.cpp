@@ -30,6 +30,7 @@
 #include <settings/common_settings.h>
 #include <tool/action_manager.h>
 #include <tool/actions.h>
+#include <tool/project_manager_menu.h>
 #include <tool/tool_manager.h>
 #include <tools/pcb_actions.h>
 #include <tools/pcb_selection_tool.h>
@@ -79,6 +80,10 @@ void PCB_EDIT_FRAME::doReCreateMenuBar()
         ACTION_CONDITIONS cond;
         cond.Enable( FILE_HISTORY::FileHistoryNotEmpty( fileHistory ) );
         RegisterUIUpdateHandler( item->GetId(), cond );
+    }
+    else if( AddProjectManagerItems( fileMenu, selTool, Kiway() ) )
+    {
+        fileMenu->AppendSeparator();
     }
 
     fileMenu->Add( PCB_ACTIONS::appendBoard );

@@ -57,6 +57,15 @@ public:
     /// Start(); GUI hosts load lazily to keep the UI responsive.
     void PreloadKifaces();
 
+    /// @brief The host finished opening what it was started with (documents, editors).  After
+    /// app_restart the service announces itself (discovery file) only then, or once the
+    /// documents it was asked to reopen are open, whichever comes first.
+    void StartupOpened();
+
+    /// @brief True while a registry method runs on the main thread (work an agent asked for, as
+    /// opposed to user interaction).  Main thread only.
+    static bool InMainThreadCall();
+
     bool Running() const;
 
     /// @brief Bound port, or 0 when not running.

@@ -23,6 +23,9 @@
 
 #include <kiway_player.h>
 
+#include <settings/kicad_settings.h>
+#include <wx/timer.h>
+
 class ACTION_TOOLBAR;
 class BITMAP_BUTTON;
 class EDA_BASE_FRAME;
@@ -180,6 +183,54 @@ public:
      */
     bool LoadProject( const wxFileName& aProjectFileName );
 
+    /// What to open: from the command line, the file manager or app_restart.
+    struct OPEN_PLAN
+    {
+        wxString              project;     ///< project to load, empty: none
+        std::vector<wxString> documents;   ///< schematic / board files of that project
+        std::vector<wxString> editors;     ///< sch, pcb, 3d, symbol_editor, footprint_editor
+        bool                  exact = false;   ///< only documents + editors: no session restore
+
+        /// @brief True when the plan opens editor windows by itself.
+        bool HasEditors() const { return !documents.empty() || !editors.empty(); }
+    };
+
+    /// @brief Turn file arguments into a plan.  Files that do not exist, are no KiCad project or
+    /// document, or belong to another project than the first one are reported to the journal
+    /// and dropped (one project per process).
+    /// @param aFiles .kicad_pro / .kicad_sch / .kicad_pcb paths (relative to the working directory).
+    /// @param aEditors editor names, see OPEN_PLAN::editors; unknown names are reported and dropped.
+    /// @param aExact open exactly this (no session restore, no "open project shows editors").
+    static OPEN_PLAN PlanOpen( const std::vector<wxString>& aFiles, const std::vector<wxString>& aEditors,
+                               bool aExact );
+
+    /// @brief Whether the project manager window is shown after start-up with aPlan.
+    static bool ShowOnStart( PM_SHOW_ON_START aMode, PM_OPEN_PROJECT_SHOWS aProjectShows, const OPEN_PLAN& aPlan );
+
+    /// @brief Open the documents and editors of aPlan; its project must be loaded already.  A
+    /// plan without editors opens the project's editors when the window stays hidden or the
+    /// settings say opening a project shows the editors.
+    /// @return the number of editor windows opened.
+    int OpenPlanned( const OPEN_PLAN& aPlan );
+
+    /// @brief Open files at run time (file manager): their project first if it is not the
+    /// current one, then the documents.
+    void OpenFiles( const std::vector<wxString>& aFiles );
+
+    /// @brief Start-up opening is done: from now on closing the last editor may quit and project
+    /// switches with the window hidden open editors or show the window.
+    void SetStartupDone() { m_startupDone = true; }
+
+    /// @brief Called for wxEVT_CLOSE_WINDOW / wxEVT_SHOW of any window (the application's event
+    /// filter): quits when the last editor went away and the settings say so.
+    void TopLevelWindowEvent( wxEvent& aEvent );
+
+    /// @brief Show this window when no KiCad window is on screen (macOS dock click).
+    void ShowIfNothingShown();
+
+    /// @brief True when a top-level frame other than this one is on screen.
+    bool OtherWindowShown() const;
+
     void OpenJobsFile( const wxFileName& aFileName, bool aCreate = false,
                        bool aResaveProjectPreferences = true );
 
@@ -260,8 +311,29 @@ private:
 
     void updatePcmButtonBadge();
 
+    /// @brief Reopen the editors open in the project's last session (remember_open_files), else
+    /// the schematic (or the board when there is no schematic).
+    /// @return the number of editors opened.
+    int openProjectEditors();
+
+    /// @brief Session restore loop (project local settings' open files).
+    /// @return the number of editors opened.
+    int restoreSessionEditors();
+
+    /// @brief A project was loaded while this window is hidden: show its editors or this window.
+    void showLoadedProject();
+
+    void checkQuitWithLastEditor();
+    void onQuitCheckTimer( wxTimerEvent& aEvent );
+
+    static constexpr int QUIT_CHECK_DELAY_MS = 250;
+
 private:
     bool                  m_openSavedWindows;
+    bool                  m_skipSessionRestore = false;   ///< next session restore: only clear the file state
+    bool                  m_startupDone = false;
+    wxTimer               m_quitCheckTimer;                ///< quit-with-last-editor check after a close
+    bool                  m_apiClosedWindow = false;      ///< the last window close came from an API call
     bool                  m_restoredFromHistory;  ///< Set after restore to mark editors dirty
     int                   m_leftWinWidth;
     bool                  m_active_project;

@@ -128,6 +128,13 @@ bool PGM_KICAD::OnPgmInit()
           "Launch the 3-way merge tool. Expects four positional args: "
           "ANCESTOR OURS THEIRS MERGED. Intended as a `git mergetool` driver.",
           wxCMD_LINE_VAL_NONE, 0 },
+        { wxCMD_LINE_OPTION, nullptr, "manager",
+          "Project manager window: show or hide (overrides the setting and KICAD_PROJECT_MANAGER)",
+          wxCMD_LINE_VAL_STRING, 0 },
+        { wxCMD_LINE_OPTION, nullptr, "editors",
+          "Open exactly the files given and these editors (comma separated: sch, pcb, 3d, symbol_editor, "
+          "footprint_editor, or none); no session restore",
+          wxCMD_LINE_VAL_STRING, 0 },
 #ifndef __WXOSX__
         { wxCMD_LINE_SWITCH, nullptr, "software-rendering", "Use software rendering instead of OpenGL",
           wxCMD_LINE_VAL_NONE, 0 },
@@ -336,7 +343,9 @@ bool PGM_KICAD::OnPgmInit()
 
     GetLibraryManager().LoadGlobalTables();
 
-    wxString projToLoad;
+    KICAD_MANAGER_FRAME::OPEN_PLAN startupPlan;
+    bool                           showManager = true;
+    bool                           explicitManager = false;
 
     HideSplash();
 
@@ -393,114 +402,55 @@ bool PGM_KICAD::OnPgmInit()
     }
     else if( managerFrame )
     {
-        wxString docToLoad;
+        std::vector<wxString> files;
+        std::vector<wxString> editors;
+        wxString              editorList;
+        const bool            exact = parser.Found( "editors", &editorList );
 
-        if( parser.GetParamCount() > 0 )
-        {
-            wxFileName tmp = parser.GetParam( 0 );
+        for( size_t i = 0; i < parser.GetParamCount(); i++ )
+            files.push_back( parser.GetParam( i ) );
 
-            if( tmp.GetExt() == FILEEXT::ProjectFileExtension
-                            || tmp.GetExt() == FILEEXT::LegacyProjectFileExtension )
-            {
-                projToLoad = tmp.GetFullPath();
-            }
-            else if( tmp.GetExt() == FILEEXT::KiCadSchematicFileExtension
-                            || tmp.GetExt() == FILEEXT::KiCadPcbFileExtension )
-            {
-                // alfishe: a document argument opens its enclosing project (if any),
-                // then the document itself in its editor through the same KIWAY API
-                // path the open_document command uses.
-                tmp.MakeAbsolute();
-                docToLoad = tmp.GetFullPath();
+        for( const wxString& name : wxSplit( editorList, ',' ) )
+            editors.push_back( name.Strip( wxString::both ) );
 
-                wxFileName proj( tmp );
-                proj.SetExt( FILEEXT::ProjectFileExtension );
-
-                if( proj.FileExists() )
-                    projToLoad = proj.GetFullPath();
-            }
-            else
-            {
-                DisplayErrorMessage( nullptr, wxString::Format( _( "File '%s'\n"
-                                                                   "does not appear to be a KiCad project file." ),
-                                                                tmp.GetFullPath() ) );
-            }
-        }
-
-        // If no file was given as an argument, check that there was a file open.
-        if( projToLoad.IsEmpty() && settings->m_OpenProjects.size() && !parser.FoundSwitch( "new" ) )
+        // Without arguments the project open at the last exit comes back
+        if( files.empty() && !exact && settings->m_OpenProjects.size() && !parser.FoundSwitch( "new" ) )
         {
             wxString last_pro = settings->m_OpenProjects.front();
             settings->m_OpenProjects.erase( settings->m_OpenProjects.begin() );
 
             if( wxFileExists( last_pro ) )
-            {
-                // Try to open the last opened project,
-                // if a project name is not given when starting Kicad
-                projToLoad = last_pro;
-            }
+                files.push_back( last_pro );
         }
+
+        startupPlan = KICAD_MANAGER_FRAME::PlanOpen( files, editors, exact );
+
+        // Window visibility: --manager, else KICAD_PROJECT_MANAGER, else the setting
+        PM_SHOW_ON_START showMode = settings->m_ProjectManager.show_on_start;
+        wxString         override;
+
+        if( parser.Found( "manager", &override ) )
+            explicitManager = true;
+        else
+            wxGetEnv( wxS( "KICAD_PROJECT_MANAGER" ), &override );
+
+        if( override == wxS( "show" ) )
+            showMode = PM_SHOW_ON_START::ALWAYS;
+        else if( override == wxS( "hide" ) )
+            showMode = PM_SHOW_ON_START::NEVER;
+        else if( !override.IsEmpty() )
+            wxLogWarning( wxT( "Project manager override '%s' ignored (show or hide)" ), override );
+
+        showManager = KICAD_MANAGER_FRAME::ShowOnStart( showMode, settings->m_ProjectManager.open_project_shows,
+                                                        startupPlan );
 
         bool loaded = false;
 
-        // Do not attempt to load a non-existent project file.
-        if( !projToLoad.empty() )
-        {
-            wxFileName fn( projToLoad );
+        if( !startupPlan.project.IsEmpty() )
+            loaded = managerFrame->LoadProject( wxFileName( startupPlan.project ) );
 
-            if( fn.Exists() && (   fn.GetExt() == FILEEXT::ProjectFileExtension
-                                || fn.GetExt() == FILEEXT::LegacyProjectFileExtension ) )
-            {
-                fn.MakeAbsolute();
-
-                if( appType == KICAD_MAIN_FRAME_T )
-                    loaded = managerFrame->LoadProject( fn );
-            }
-        }
-
-        if( !loaded && appType == KICAD_MAIN_FRAME_T )
+        if( !loaded )
             managerFrame->PreloadAllLibraries();
-
-        if( !docToLoad.IsEmpty() )
-        {
-            // alfishe: defer until the project manager frame and the event loop are up,
-            // then open the document in its editor window (KIWAY player path, the same
-            // one the project manager uses when opening a schematic or board).
-            managerFrame->CallAfter(
-                    [docToLoad]()
-                    {
-                        wxFileName fn( docToLoad );
-                        KIWAY::FACE_T face = KIWAY::KIWAY_FACE_COUNT;
-
-                        if( fn.GetExt() == FILEEXT::KiCadSchematicFileExtension )
-                            face = KIWAY::FACE_SCH;
-                        else if( fn.GetExt() == FILEEXT::KiCadPcbFileExtension )
-                            face = KIWAY::FACE_PCB;
-
-                        if( face == KIWAY::KIWAY_FACE_COUNT )
-                            return;
-
-                        FRAME_T frame = ( face == KIWAY::FACE_SCH ) ? FRAME_SCH : FRAME_PCB_EDITOR;
-                        KIWAY_PLAYER* player = Kiway.Player( frame, true );
-
-                        if( !player )
-                            return;
-
-                        fn.MakeAbsolute();
-
-                        if( player->OpenProjectFiles( { fn.GetFullPath() } ) )
-                        {
-                            // Match KICAD_MANAGER_CONTROL::ShowPlayer: the player frame
-                            // is not shown by OpenProjectFiles itself.
-                            player->Iconize( false );
-                            player->Show( true );
-                            player->Raise();
-
-                            if( wxWindow::FindFocus() != player )
-                                player->SetFocus();
-                        }
-                    } );
-        }
     }
 
     if( mergetoolFrame )
@@ -529,6 +479,47 @@ bool PGM_KICAD::OnPgmInit()
 
                     mergeToolFrameRef->Close( true );
                 } );
+    }
+    else if( managerFrame )
+    {
+        if( showManager )
+        {
+            frame->Show( true );
+            frame->Raise();
+        }
+
+        // Editors open once the event loop runs; nothing on screen afterwards shows this window
+        // unless --manager hide asked for none
+        KICAD_OPENAPI_SERVICE* openapi = m_openapi.get();
+
+        managerFrame->CallAfter(
+                [managerFrame, openapi, plan = startupPlan, explicitHide = explicitManager && !showManager]()
+                {
+                    managerFrame->OpenPlanned( plan );
+
+                    if( !managerFrame->IsShown() && !managerFrame->OtherWindowShown() )
+                    {
+                        if( explicitHide )
+                        {
+                            wxLogWarning( wxT( "Nothing opened and the project manager is hidden (--manager hide); "
+                                               "app_project_manager shows it" ) );
+                        }
+                        else
+                        {
+                            managerFrame->Show( true );
+                            managerFrame->Raise();
+                        }
+                    }
+
+                    managerFrame->SetStartupDone();
+
+                    if( openapi )
+                        openapi->StartupOpened();
+                } );
+
+#if defined( KICAD_NATIVE_MODEL_PREVIEW ) && defined( __WINDOWS__ )
+        frame->CallAfter( [frame] { MaybeShowModelPreviewSetupPrompt( frame ); } );
+#endif
     }
     else
     {
@@ -587,14 +578,15 @@ void PGM_KICAD::OnPgmExit()
 
 void PGM_KICAD::MacOpenFile( const wxString& aFileName )
 {
-#if defined(__WXMAC__)
+    if( KICAD_MANAGER_FRAME* frame = dynamic_cast<KICAD_MANAGER_FRAME*>( App().GetTopWindow() ) )
+        frame->OpenFiles( { aFileName } );
+}
 
-    KICAD_MANAGER_FRAME* frame = (KICAD_MANAGER_FRAME*) App().GetTopWindow();
 
-    if( !aFileName.empty() && wxFileExists( aFileName ) )
-        frame->LoadProject( wxFileName( aFileName ) );
-
-#endif
+void PGM_KICAD::ReopenApp()
+{
+    if( KICAD_MANAGER_FRAME* frame = dynamic_cast<KICAD_MANAGER_FRAME*>( App().GetTopWindow() ) )
+        frame->ShowIfNothingShown();
 }
 
 
@@ -713,6 +705,14 @@ struct APP_KICAD : public wxApp
 
     int FilterEvent( wxEvent& aEvent ) override
     {
+        const wxEventType type = aEvent.GetEventType();
+
+        if( type == wxEVT_SHOW || type == wxEVT_CLOSE_WINDOW )
+        {
+            if( KICAD_MANAGER_FRAME* manager = dynamic_cast<KICAD_MANAGER_FRAME*>( GetTopWindow() ) )
+                manager->TopLevelWindowEvent( aEvent );
+        }
+
         if( aEvent.GetEventType() == wxEVT_SHOW )
         {
             wxShowEvent& event = static_cast<wxShowEvent&>( aEvent );
@@ -792,6 +792,12 @@ struct APP_KICAD : public wxApp
     void MacOpenFile( const wxString& aFileName ) override
     {
         Pgm().MacOpenFile( aFileName );
+    }
+
+    /// Dock icon clicked: the project manager when no window is on screen
+    void MacReopenApp() override
+    {
+        program.ReopenApp();
     }
 #endif
 };

@@ -61,6 +61,7 @@
 #include <settings/common_settings.h>
 #include <settings/settings_manager.h>
 #include <tool/action_manager.h>
+#include <tool/actions.h>
 #include <tool/action_toolbar.h>
 #include <tool/common_control.h>
 #include <tool/tool_dispatcher.h>
@@ -78,6 +79,9 @@
 #include <wx/process.h>
 #include <algorithm>
 #include <atomic>
+#include <set>
+#include <utility>
+#include <ki_exception.h>
 #include <update_manager.h>
 #include <jobs/jobset.h>
 #include <widgets/wx_aui_art_providers.h>
@@ -91,6 +95,7 @@
 #endif
 
 #include "kicad_manager_frame.h"
+#include <kicadopenapi_service.h>
 #include "settings/kicad_settings.h"
 
 #include <project/project_file.h>
@@ -258,6 +263,8 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
 
     m_notebook->SetArtProvider( new WX_AUI_TAB_ART() );
 
+    m_quitCheckTimer.Bind( wxEVT_TIMER, &KICAD_MANAGER_FRAME::onQuitCheckTimer, this );
+
     m_notebook->Bind( wxEVT_AUINOTEBOOK_PAGE_CLOSE, &KICAD_MANAGER_FRAME::onNotebookPageCloseRequest, this );
     m_notebook->Bind( wxEVT_AUINOTEBOOK_PAGE_CLOSED, &KICAD_MANAGER_FRAME::onNotebookPageCountChanged, this );
     m_launcher = new PANEL_KICAD_LAUNCHER( m_notebook );
@@ -311,6 +318,7 @@ KICAD_MANAGER_FRAME::KICAD_MANAGER_FRAME( wxWindow* parent, const wxString& titl
 
 KICAD_MANAGER_FRAME::~KICAD_MANAGER_FRAME()
 {
+    m_quitCheckTimer.Stop();
     Unbind( wxEVT_CHAR, &TOOL_DISPATCHER::DispatchWxEvent, m_toolDispatcher );
     Unbind( wxEVT_CHAR_HOOK, &TOOL_DISPATCHER::DispatchWxEvent, m_toolDispatcher );
 
@@ -1037,6 +1045,17 @@ bool KICAD_MANAGER_FRAME::LoadProject( const wxFileName& aProjectFileName )
     // Now that we have a new project, trigger a library preload, which will load in any
     // project-specific symbol and footprint libraries into the manager
     PreloadAllLibraries();
+
+    // A project switched to while this window is hidden (editors' File menu, file manager)
+    // must leave something on screen
+    if( m_startupDone && !IsShown() )
+    {
+        if( kicadSettings()->m_ProjectManager.open_project_shows == PM_OPEN_PROJECT_SHOWS::EDITORS )
+            m_skipSessionRestore = true;
+
+        CallAfter( [this]() { showLoadedProject(); } );
+    }
+
     return true;
 }
 
@@ -1403,53 +1422,8 @@ void KICAD_MANAGER_FRAME::OnIdle( wxIdleEvent& aEvent )
 
     m_openSavedWindows = false;
 
-    if( Pgm().GetCommonSettings()->m_Session.remember_open_files )
-    {
-        int previousOpenCount = std::count_if( Prj().GetLocalSettings().m_files.begin(),
-                                               Prj().GetLocalSettings().m_files.end(),
-                [&]( const PROJECT_FILE_STATE& f )
-                {
-                    return !f.fileName.EndsWith( FILEEXT::ProjectFileExtension ) && f.open;
-                } );
-
-        if( previousOpenCount > 0 )
-        {
-            APP_PROGRESS_DIALOG progressReporter( _( "Restoring session" ), wxEmptyString, previousOpenCount, this );
-
-            // We don't currently support opening more than one view per file
-            std::set<wxString> openedFiles;
-
-            int i = 0;
-
-            // Iterate a copy: opening an editor saves its file state (m_files.push_back may
-            // reallocate) and wxYield() runs other events, which invalidates live iterators
-            const std::vector<PROJECT_FILE_STATE> files = Prj().GetLocalSettings().m_files;
-
-            for( const PROJECT_FILE_STATE& file : files )
-            {
-                if( file.open && !openedFiles.count( file.fileName ) )
-                {
-                    progressReporter.Update( i++, wxString::Format( _( "Restoring '%s'" ), file.fileName ) );
-
-                    openedFiles.insert( file.fileName );
-                    wxFileName fn( file.fileName );
-
-                    if( fn.GetExt() == FILEEXT::LegacySchematicFileExtension
-                        || fn.GetExt() == FILEEXT::KiCadSchematicFileExtension )
-                    {
-                        GetToolManager()->RunAction( KICAD_MANAGER_ACTIONS::editSchematic );
-                    }
-                    else if( fn.GetExt() == FILEEXT::LegacyPcbFileExtension
-                             || fn.GetExt() == FILEEXT::KiCadPcbFileExtension )
-                    {
-                        GetToolManager()->RunAction( KICAD_MANAGER_ACTIONS::editPCB );
-                    }
-                }
-
-                wxYield();
-            }
-        }
-    }
+    if( !std::exchange( m_skipSessionRestore, false ) )
+        restoreSessionEditors();
 
     // clear file states regardless if we opened windows or not due to setting
     Prj().GetLocalSettings().ClearFileState();
@@ -1565,4 +1539,456 @@ void KICAD_MANAGER_FRAME::RestoreCommitFromHistory( const wxString& aHash )
 bool KICAD_MANAGER_FRAME::HistoryPanelShown()
 {
     return m_historyPane && m_auimgr.GetPane( m_historyPane ).IsShown();
+}
+
+
+int KICAD_MANAGER_FRAME::restoreSessionEditors()
+{
+    int opened = 0;
+
+    if( Pgm().GetCommonSettings()->m_Session.remember_open_files )
+    {
+        int previousOpenCount = std::count_if( Prj().GetLocalSettings().m_files.begin(),
+                                               Prj().GetLocalSettings().m_files.end(),
+                [&]( const PROJECT_FILE_STATE& f )
+                {
+                    return !f.fileName.EndsWith( FILEEXT::ProjectFileExtension ) && f.open;
+                } );
+
+        if( previousOpenCount > 0 )
+        {
+            APP_PROGRESS_DIALOG progressReporter( _( "Restoring session" ), wxEmptyString, previousOpenCount, this );
+
+            // We don't currently support opening more than one view per file
+            std::set<wxString> openedFiles;
+
+            int i = 0;
+
+            // Iterate a copy: opening an editor saves its file state (m_files.push_back may
+            // reallocate) and wxYield() runs other events, which invalidates live iterators
+            const std::vector<PROJECT_FILE_STATE> files = Prj().GetLocalSettings().m_files;
+
+            for( const PROJECT_FILE_STATE& file : files )
+            {
+                if( file.open && !openedFiles.count( file.fileName ) )
+                {
+                    progressReporter.Update( i++, wxString::Format( _( "Restoring '%s'" ), file.fileName ) );
+
+                    openedFiles.insert( file.fileName );
+                    wxFileName fn( file.fileName );
+
+                    if( fn.GetExt() == FILEEXT::LegacySchematicFileExtension
+                        || fn.GetExt() == FILEEXT::KiCadSchematicFileExtension )
+                    {
+                        GetToolManager()->RunAction( KICAD_MANAGER_ACTIONS::editSchematic );
+                        opened++;
+                    }
+                    else if( fn.GetExt() == FILEEXT::LegacyPcbFileExtension
+                             || fn.GetExt() == FILEEXT::KiCadPcbFileExtension )
+                    {
+                        GetToolManager()->RunAction( KICAD_MANAGER_ACTIONS::editPCB );
+                        opened++;
+                    }
+                }
+
+                wxYield();
+            }
+        }
+    }
+
+
+    return opened;
+}
+
+
+namespace
+{
+
+bool isSchematic( const wxFileName& aFile )
+{
+    return aFile.GetExt() == FILEEXT::KiCadSchematicFileExtension
+           || aFile.GetExt() == FILEEXT::LegacySchematicFileExtension;
+}
+
+
+bool isBoard( const wxFileName& aFile )
+{
+    return aFile.GetExt() == FILEEXT::KiCadPcbFileExtension || aFile.GetExt() == FILEEXT::LegacyPcbFileExtension;
+}
+
+
+bool isProject( const wxFileName& aFile )
+{
+    return aFile.GetExt() == FILEEXT::ProjectFileExtension
+           || aFile.GetExt() == FILEEXT::LegacyProjectFileExtension;
+}
+
+
+/// @brief Bring a player window to the front, as KICAD_MANAGER_CONTROL::ShowPlayer does.
+void showPlayer( KIWAY_PLAYER* aPlayer )
+{
+    aPlayer->Iconize( false );
+    aPlayer->Show( true );
+    aPlayer->Raise();
+
+    if( wxWindow::FindFocus() != aPlayer )
+        aPlayer->SetFocus();
+}
+
+
+/// @brief Open a schematic or board file in its editor (project already loaded).
+/// @return the editor, or nullptr when it could not be opened (reported by the editor).
+KIWAY_PLAYER* openDocument( KIWAY& aKiway, const wxString& aPath )
+{
+    wxFileName    fn( aPath );
+    FRAME_T       type = isSchematic( fn ) ? FRAME_SCH : FRAME_PCB_EDITOR;
+    KIWAY_PLAYER* player = nullptr;
+
+    try
+    {
+        player = aKiway.Player( type, true );
+    }
+    catch( const IO_ERROR& err )
+    {
+        wxLogError( _( "Application failed to load:\n" ) + err.What() );
+        return nullptr;
+    }
+
+    if( !player )
+        return nullptr;
+
+    // An editor already showing this file keeps its state
+    if( !player->IsShown() || player->GetCurrentFileName() != fn.GetFullPath() )
+    {
+        if( !player->OpenProjectFiles( { fn.GetFullPath() } ) )
+            return nullptr;
+    }
+
+    showPlayer( player );
+    return player;
+}
+
+} // namespace
+
+
+KICAD_MANAGER_FRAME::OPEN_PLAN KICAD_MANAGER_FRAME::PlanOpen( const std::vector<wxString>& aFiles,
+                                                              const std::vector<wxString>& aEditors,
+                                                              bool aExact )
+{
+    OPEN_PLAN plan;
+    plan.exact = aExact;
+
+    for( const wxString& arg : aFiles )
+    {
+        wxFileName fn( arg );
+        fn.MakeAbsolute();
+
+        if( !isProject( fn ) && !isSchematic( fn ) && !isBoard( fn ) )
+        {
+            wxLogError( _( "Not opened: '%s' is no KiCad project, schematic or board file." ), fn.GetFullPath() );
+            continue;
+        }
+
+        if( !fn.FileExists() )
+        {
+            wxLogError( _( "Not opened: '%s' does not exist." ), fn.GetFullPath() );
+            continue;
+        }
+
+        // A document opens its project: the project file of the same name next to it
+        wxFileName project( fn );
+
+        if( !isProject( fn ) )
+        {
+            project.SetExt( FILEEXT::ProjectFileExtension );
+
+            if( !project.FileExists() )
+                project.Clear();
+        }
+
+        wxString projectPath = project.IsOk() ? project.GetFullPath() : wxString();
+
+        if( plan.project.IsEmpty() && plan.documents.empty() )
+        {
+            plan.project = projectPath;
+        }
+        else if( projectPath != plan.project )
+        {
+            wxLogWarning( _( "Not opened: '%s' belongs to another project than '%s' (one project per KiCad "
+                             "process)." ),
+                          fn.GetFullPath(), plan.project.IsEmpty() ? plan.documents.front() : plan.project );
+            continue;
+        }
+
+        if( !isProject( fn ) )
+            plan.documents.push_back( fn.GetFullPath() );
+    }
+
+    for( const wxString& editor : aEditors )
+    {
+        static const std::set<wxString> known = { wxS( "sch" ), wxS( "pcb" ), wxS( "3d" ),
+                                                  wxS( "symbol_editor" ), wxS( "footprint_editor" ) };
+
+        if( editor == wxS( "none" ) || editor.IsEmpty() )
+            continue;
+
+        if( !known.count( editor ) )
+        {
+            wxLogWarning( _( "Unknown editor '%s' (sch, pcb, 3d, symbol_editor, footprint_editor)." ), editor );
+            continue;
+        }
+
+        if( std::find( plan.editors.begin(), plan.editors.end(), editor ) == plan.editors.end() )
+            plan.editors.push_back( editor );
+    }
+
+    return plan;
+}
+
+
+bool KICAD_MANAGER_FRAME::ShowOnStart( PM_SHOW_ON_START aMode, PM_OPEN_PROJECT_SHOWS aProjectShows,
+                                       const OPEN_PLAN& aPlan )
+{
+    switch( aMode )
+    {
+    case PM_SHOW_ON_START::NEVER:
+        return false;
+
+    case PM_SHOW_ON_START::WITHOUT_DOCUMENT:
+        if( aPlan.HasEditors() )
+            return false;
+
+        // a project opened to show its editors counts as a document
+        return aPlan.exact || aPlan.project.IsEmpty() || aProjectShows == PM_OPEN_PROJECT_SHOWS::MANAGER;
+
+    default:
+        return true;
+    }
+}
+
+
+int KICAD_MANAGER_FRAME::OpenPlanned( const OPEN_PLAN& aPlan )
+{
+    int opened = 0;
+
+    for( const wxString& doc : aPlan.documents )
+    {
+        if( openDocument( Kiway(), doc ) )
+            opened++;
+    }
+
+    for( const wxString& editor : aPlan.editors )
+    {
+        KIWAY_PLAYER* player = nullptr;
+
+        if( editor == wxS( "sch" ) || editor == wxS( "pcb" ) || editor == wxS( "3d" ) )
+        {
+            FRAME_T type = editor == wxS( "sch" ) ? FRAME_SCH : FRAME_PCB_EDITOR;
+
+            player = Kiway().Player( type, false );
+
+            if( !player || !player->IsShown() )
+            {
+                if( !IsProjectActive() )
+                {
+                    wxLogError( _( "Not opened: the %s editor needs a project." ), editor );
+                    continue;
+                }
+
+                GetToolManager()->RunAction( type == FRAME_SCH ? KICAD_MANAGER_ACTIONS::editSchematic
+                                                               : KICAD_MANAGER_ACTIONS::editPCB );
+                player = Kiway().Player( type, false );
+
+                if( player && player->IsShown() && editor != wxS( "3d" ) )
+                    opened++;
+            }
+
+            if( player && player->IsShown() && editor == wxS( "3d" ) )
+            {
+                player->GetToolManager()->RunAction( ACTIONS::show3DViewer );
+
+                if( KIWAY_PLAYER* viewer = Kiway().Player( FRAME_PCB_DISPLAY3D, false ); viewer && viewer->IsShown() )
+                    opened++;
+            }
+        }
+        else
+        {
+            FRAME_T type = editor == wxS( "symbol_editor" ) ? FRAME_SCH_SYMBOL_EDITOR : FRAME_FOOTPRINT_EDITOR;
+
+            GetToolManager()->RunAction( type == FRAME_SCH_SYMBOL_EDITOR ? KICAD_MANAGER_ACTIONS::editSymbols
+                                                                        : KICAD_MANAGER_ACTIONS::editFootprints );
+            player = Kiway().Player( type, false );
+
+            if( player && player->IsShown() )
+                opened++;
+        }
+
+        if( !player || !player->IsShown() )
+            wxLogError( _( "Could not open the %s window." ), editor );
+    }
+
+    // a project alone: its editors when this window stays hidden or the settings ask for them
+    if( !aPlan.exact && !aPlan.HasEditors() && IsProjectActive()
+        && ( !IsShown() || kicadSettings()->m_ProjectManager.open_project_shows == PM_OPEN_PROJECT_SHOWS::EDITORS ) )
+    {
+        m_skipSessionRestore = m_openSavedWindows;
+        opened += openProjectEditors();
+    }
+    else if( aPlan.exact || aPlan.HasEditors() )
+    {
+        // an explicit set: the editors of the last session stay closed
+        m_skipSessionRestore = m_openSavedWindows;
+    }
+
+    return opened;
+}
+
+
+int KICAD_MANAGER_FRAME::openProjectEditors()
+{
+    if( int opened = restoreSessionEditors() )
+        return opened;
+
+    for( const auto& [file, action] : { std::pair{ SchFileName(), &KICAD_MANAGER_ACTIONS::editSchematic },
+                                        std::pair{ PcbFileName(), &KICAD_MANAGER_ACTIONS::editPCB } } )
+    {
+        if( wxFileExists( file ) )
+        {
+            GetToolManager()->RunAction( *action );
+            return OtherWindowShown() ? 1 : 0;
+        }
+    }
+
+    return 0;
+}
+
+
+void KICAD_MANAGER_FRAME::OpenFiles( const std::vector<wxString>& aFiles )
+{
+    OPEN_PLAN plan = PlanOpen( aFiles, {}, false );
+
+    if( plan.project.IsEmpty() && plan.documents.empty() )
+        return;
+
+    if( !plan.project.IsEmpty() && plan.project != Prj().GetProjectFullName() )
+    {
+        if( !LoadProject( wxFileName( plan.project ) ) )
+            return;
+    }
+
+    OpenPlanned( plan );
+
+    if( !plan.documents.empty() || IsShown() )
+        return;
+
+    showLoadedProject();
+}
+
+
+void KICAD_MANAGER_FRAME::showLoadedProject()
+{
+    if( IsShown() || OtherWindowShown() )
+        return;
+
+    if( kicadSettings()->m_ProjectManager.open_project_shows == PM_OPEN_PROJECT_SHOWS::EDITORS
+        && openProjectEditors() > 0 )
+    {
+        return;
+    }
+
+    Show( true );
+    Raise();
+}
+
+
+bool KICAD_MANAGER_FRAME::OtherWindowShown() const
+{
+    for( wxWindow* win : wxTopLevelWindows )
+    {
+        if( win == this || !dynamic_cast<wxFrame*>( win ) || !win->IsShown() || win->IsBeingDeleted()
+            || wxTheApp->IsScheduledForDestruction( win ) )
+        {
+            continue;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+
+void KICAD_MANAGER_FRAME::ShowIfNothingShown()
+{
+    if( m_isClosing || IsShown() || OtherWindowShown() )
+        return;
+
+    Show( true );
+    Raise();
+}
+
+
+void KICAD_MANAGER_FRAME::TopLevelWindowEvent( wxEvent& aEvent )
+{
+    wxWindow* win = dynamic_cast<wxWindow*>( aEvent.GetEventObject() );
+
+    if( !win || win == this || !win->IsTopLevel() || !dynamic_cast<wxFrame*>( win ) )
+        return;
+
+    if( aEvent.GetEventType() == wxEVT_SHOW && static_cast<wxShowEvent&>( aEvent ).IsShown() )
+        return;
+
+    // windows an agent closes (pcb_close, sch_close) never end the process: app_quit does
+    if( aEvent.GetEventType() == wxEVT_CLOSE_WINDOW )
+        m_apiClosedWindow = KICAD_OPENAPI_SERVICE::InMainThreadCall();
+
+    if( !m_startupDone || m_isClosing )
+        return;
+
+    // Checked after the close was handled (save prompts, Destroy()), not in the middle of it
+    if( !m_quitCheckTimer.IsRunning() )
+        m_quitCheckTimer.StartOnce( QUIT_CHECK_DELAY_MS );
+}
+
+
+void KICAD_MANAGER_FRAME::onQuitCheckTimer( wxTimerEvent& aEvent )
+{
+    // a save prompt of the closing editor may still be open
+    if( !Pgm().m_ModalDialogs.empty() )
+    {
+        m_quitCheckTimer.StartOnce( QUIT_CHECK_DELAY_MS );
+        return;
+    }
+
+    checkQuitWithLastEditor();
+}
+
+
+void KICAD_MANAGER_FRAME::checkQuitWithLastEditor()
+{
+    if( std::exchange( m_apiClosedWindow, false ) )
+        return;
+
+    if( m_isClosing || Pgm().m_Quitting )
+        return;
+
+    switch( kicadSettings()->m_ProjectManager.quit_with_last_editor )
+    {
+    case PM_QUIT_WITH_LAST_EDITOR::NEVER:
+        return;
+
+    case PM_QUIT_WITH_LAST_EDITOR::WHEN_HIDDEN:
+        if( IsShown() )
+            return;
+
+        break;
+
+    default:
+        break;
+    }
+
+    if( OtherWindowShown() )
+        return;
+
+    Close( false );
 }

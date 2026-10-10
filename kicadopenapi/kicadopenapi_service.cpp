@@ -250,7 +250,8 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 
     nlohmann::json traceJson( const nlohmann::json& aArgs ) const;
     std::thread               preloadThread;   ///< joined in Stop()
-    std::thread               publishThread;   ///< restart: publishes once the reopened document is open
+    std::thread               publishThread;   ///< restart: publishes once the reopened documents are open
+    std::atomic<bool>         startupOpened{ false };   ///< the host finished its start-up opening
 
     void writeDiscoveryFile();
 
@@ -1000,17 +1001,34 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     // listen_after_bind() blocks in this thread until Stop().
     m_impl->thread = std::thread( [srv = m_impl->server.get()]() { srv->listen_after_bind(); } );
 
-    // After app_restart clients find this process only once the document it reopens is open:
-    // their next call (e.g. a 3D view of the board) must not race the loading
-    std::string reopen;
+    // After app_restart clients find this process only once the documents it reopens are open
+    // (or the host reports its start-up opening finished): their next call (e.g. a 3D view of
+    // the board) must not race the loading.  The variable holds a JSON array of paths or one path.
+    std::vector<std::string> reopen;
+    bool                     restarted = false;
 
     if( const char* env = std::getenv( "KICAD_OPENAPI_REOPEN" ) )
     {
-        reopen = env;
+        restarted = true;
+        nlohmann::json list = nlohmann::json::parse( env, nullptr, false );
+
+        if( list.is_array() )
+        {
+            for( const nlohmann::json& path : list )
+            {
+                if( path.is_string() )
+                    reopen.push_back( path.get<std::string>() );
+            }
+        }
+        else if( *env )
+        {
+            reopen.push_back( env );
+        }
+
         wxUnsetEnv( wxS( "KICAD_OPENAPI_REOPEN" ) );
     }
 
-    if( reopen.empty() )
+    if( !restarted )
     {
         m_impl->writeDiscoveryFile();
     }
@@ -1020,34 +1038,57 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
                 [impl = m_impl.get(), reopen]()
                 {
                     namespace fs = std::filesystem;
-                    std::error_code ec;
-                    const fs::path  want = fs::weakly_canonical( fs::path( reopen ), ec );
-                    const auto      deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+                    std::vector<fs::path> want;
 
-                    while( impl->alive->load() && std::chrono::steady_clock::now() < deadline )
+                    // a path that no longer exists is reported by the host and never waited for
+                    for( const std::string& path : reopen )
                     {
-                        KOPENAPI_CONTEXT ctx = impl->ctx;
-                        KOPENAPI_RESULT  docs = runInMain( impl->alive, impl->waker,
-                                                           [ctx]() mutable
-                                                           {
-                                                               return KOPENAPI_RESULT::Ok(
-                                                                       KOPENAPI_REGISTRY::Get().Documents( ctx ) );
-                                                           } );
-                        bool open = false;
+                        std::error_code ec;
 
-                        for( const nlohmann::json& d : docs.status == 200 ? docs.body : nlohmann::json::array() )
+                        if( fs::exists( fs::path( path ), ec ) )
+                            want.push_back( fs::weakly_canonical( fs::path( path ), ec ) );
+                    }
+
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+
+                    while( impl->alive->load() && !impl->startupOpened.load()
+                           && std::chrono::steady_clock::now() < deadline )
+                    {
+                        if( !want.empty() )
                         {
-                            for( const char* key : { "path", "project" } )
+                            KOPENAPI_CONTEXT ctx = impl->ctx;
+                            KOPENAPI_RESULT  docs = runInMain( impl->alive, impl->waker,
+                                                               [ctx]() mutable
+                                                               {
+                                                                   return KOPENAPI_RESULT::Ok(
+                                                                           KOPENAPI_REGISTRY::Get().Documents( ctx ) );
+                                                               } );
+                            size_t open = 0;
+
+                            for( const fs::path& path : want )
                             {
-                                std::error_code e;
+                                bool found = false;
 
-                                if( d.contains( key ) && fs::weakly_canonical( fs::path( d.value( key, std::string() ) ), e ) == want )
-                                    open = true;
+                                for( const nlohmann::json& d : docs.status == 200 ? docs.body : nlohmann::json::array() )
+                                {
+                                    for( const char* key : { "path", "project" } )
+                                    {
+                                        std::error_code e;
+
+                                        if( d.contains( key )
+                                            && fs::weakly_canonical( fs::path( d.value( key, std::string() ) ), e ) == path )
+                                        {
+                                            found = true;
+                                        }
+                                    }
+                                }
+
+                                open += found ? 1 : 0;
                             }
-                        }
 
-                        if( open )
-                            break;
+                            if( open == want.size() )
+                                break;
+                        }
 
                         std::this_thread::sleep_for( std::chrono::milliseconds( 200 ) );
                     }
@@ -1063,6 +1104,18 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     std::fprintf( stderr, "kicadopenapi listening at http://%s:%d\n", KOPENAPI_HOST_ADDR,
                   m_impl->port );
     return true;
+}
+
+
+void KICAD_OPENAPI_SERVICE::StartupOpened()
+{
+    m_impl->startupOpened.store( true );
+}
+
+
+bool KICAD_OPENAPI_SERVICE::InMainThreadCall()
+{
+    return s_apiCalls.load() > 0;
 }
 
 

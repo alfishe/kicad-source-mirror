@@ -52,6 +52,10 @@ public:
 
     void MacOpenFile( const wxString& aFileName ) override;
 
+    /// @brief The application was activated with no window on screen (macOS dock click): show
+    /// the project manager.
+    void ReopenApp();
+
     APP_SETTINGS_BASE* PgmSettings()       { return m_bm.m_config; }
 
     SEARCH_STACK&      SysSearch()         { return m_bm.m_search; }

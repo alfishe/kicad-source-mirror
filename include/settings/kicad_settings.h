@@ -39,6 +39,32 @@ struct LIB_OVERRIDE
 };
 
 
+/// When the project manager window is shown at start-up.
+enum class PM_SHOW_ON_START
+{
+    ALWAYS,             ///< always (classic behaviour)
+    WITHOUT_DOCUMENT,   ///< only when no schematic / board is opened on the command line
+    NEVER               ///< never; shown only when nothing else could be opened
+};
+
+
+/// What opening a project (command line, file manager, editors' File menu) shows.
+enum class PM_OPEN_PROJECT_SHOWS
+{
+    MANAGER,            ///< the project manager (classic behaviour)
+    EDITORS             ///< the editors open in the last session, else the schematic
+};
+
+
+/// Whether closing the last editor window ends KiCad.
+enum class PM_QUIT_WITH_LAST_EDITOR
+{
+    WHEN_HIDDEN,        ///< only while the project manager window is hidden
+    ALWAYS,
+    NEVER
+};
+
+
 class KICOMMON_API KICAD_SETTINGS : public APP_SETTINGS_BASE
 {
 public:
@@ -91,6 +117,27 @@ public:
     /// Overrides for libraries in read-only nested tables.
     /// Outer key is normalized table file path, inner key is library nickname.
     std::map<wxString, std::map<wxString, LIB_OVERRIDE>> m_LibOverrides;
+
+    /// Project manager window behaviour (kicad.json "project_manager").
+    struct PROJECT_MANAGER_BEHAVIOUR
+    {
+        PM_SHOW_ON_START         show_on_start = PM_SHOW_ON_START::ALWAYS;
+        PM_OPEN_PROJECT_SHOWS    open_project_shows = PM_OPEN_PROJECT_SHOWS::MANAGER;
+        PM_QUIT_WITH_LAST_EDITOR quit_with_last_editor = PM_QUIT_WITH_LAST_EDITOR::WHEN_HIDDEN;
+    };
+
+    PROJECT_MANAGER_BEHAVIOUR m_ProjectManager;
+
+    /// @brief Names of the project manager settings as stored in kicad.json.
+    static std::string ToString( PM_SHOW_ON_START aValue );
+    static std::string ToString( PM_OPEN_PROJECT_SHOWS aValue );
+    static std::string ToString( PM_QUIT_WITH_LAST_EDITOR aValue );
+
+    /// @brief Parse a stored name.
+    /// @return false (aValue unchanged) when the name is unknown.
+    static bool FromString( const std::string& aName, PM_SHOW_ON_START& aValue );
+    static bool FromString( const std::string& aName, PM_OPEN_PROJECT_SHOWS& aValue );
+    static bool FromString( const std::string& aName, PM_QUIT_WITH_LAST_EDITOR& aValue );
 
 protected:
     virtual std::string getLegacyFrameName() const override { return "KicadFrame"; }

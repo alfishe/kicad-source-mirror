@@ -970,6 +970,7 @@ set( COMMON_SRCS
     tool/arc_mode_session.cpp
     tool/arc_tangent_seed.cpp
     tool/common_control.cpp
+    tool/project_manager_menu.cpp
     tool/construction_manager.cpp
     tool/common_tools.cpp
     tool/conditional_menu.cpp

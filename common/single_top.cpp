@@ -500,6 +500,9 @@ bool PGM_SINGLE_TOP::OnPgmInit()
         frame->OpenProjectFiles( fileArgs );
     }
 
+    if( m_openapi )
+        m_openapi->StartupOpened();
+
     if( KIFACE* topFrame = Kiway.KiFACE( KIWAY::KifaceType( TOP_FRAME ) ) )
         topFrame->PreloadLibraries( &Kiway );
 

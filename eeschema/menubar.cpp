@@ -28,6 +28,7 @@
 #include <settings/common_settings.h>
 #include <tool/action_manager.h>
 #include <tool/action_menu.h>
+#include <tool/project_manager_menu.h>
 #include <tool/tool_manager.h>
 #include <tools/sch_selection_tool.h>
 #include <tools/sch_actions.h>
@@ -80,6 +81,10 @@ void SCH_EDIT_FRAME::doReCreateMenuBar()
         ACTION_CONDITIONS cond;
         cond.Enable( FILE_HISTORY::FileHistoryNotEmpty( fileHistory ) );
         RegisterUIUpdateHandler( item->GetId(), cond );
+        fileMenu->AppendSeparator();
+    }
+    else if( AddProjectManagerItems( fileMenu, selTool, Kiway() ) )
+    {
         fileMenu->AppendSeparator();
     }
 
