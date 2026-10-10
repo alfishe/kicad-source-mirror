@@ -1,15 +1,19 @@
-/*
- * Core kicadopenapi methods available in every host (GUI and headless).
- */
+/// @file methods_core.cpp
+/// @brief Core kicadopenapi methods available in every host (GUI and headless).
 #include "kicadopenapi_registry.h"
 #include "kicadopenapi_journal.h"
+#include "kicadopenapi_service.h"
+#include "platform/platform.h"
 
 #include <frame_type.h>
 #include <kiway.h>
 #include <kiway_player.h>
+#include <project.h>
 
 #include <wx/app.h>
 #include <wx/log.h>
+#include <wx/stdpaths.h>
+#include <wx/utils.h>
 
 #include <algorithm>
 
@@ -63,13 +67,11 @@ KOPENAPI_REGISTER( "errors",
                    false, h_errors );
 
 
-/**
- * Quit the GUI process without any dialog.  Unsaved documents block unless discard: true; then
- * each document is closed through its domain's *_close {discard: true} (a journal warning each)
- * and the top window closes after this answer has gone out.  Library editors with unsaved
- * library changes always block: KiCad can only ask about those, and a question would hang the
- * agent.
- */
+/// @brief Quit the GUI process without any dialog.  Unsaved documents block unless discard: true; then
+/// each document is closed through its domain's *_close {discard: true} (a journal warning each)
+/// and the top window closes after this answer has gone out.  Library editors with unsaved
+/// library changes always block: KiCad can only ask about those, and a question would hang the
+/// agent.
 static KOPENAPI_RESULT h_app_quit( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     const bool     discard = aArgs.value( "discard", false );
@@ -137,3 +139,72 @@ KOPENAPI_REGISTER( "app_quit",
                    "/api/v1/shutdown (unsaved work is lost with a journal warning)",
                    R"json({"type":"object","properties":{"discard":{"type":"boolean","default":false}}})json"_json,
                    true, h_app_quit );
+
+
+static KOPENAPI_RESULT h_app_restart( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    // what to open again: the board if one is open, else the schematic, else the project
+    std::string reopen;
+
+    if( aArgs.value( "reopen", true ) )
+    {
+        for( const char* domain : { "pcb", "sch" } )
+        {
+            for( const nlohmann::json& doc : KOPENAPI_REGISTRY::Get().Documents( aCtx ) )
+            {
+                if( reopen.empty() && doc.value( "domain", std::string() ) == domain )
+                    reopen = doc.value( "path", std::string() );
+            }
+        }
+
+        if( reopen.empty() && aCtx.kiway && !aCtx.kiway->Prj().GetProjectFullName().IsEmpty() )
+            reopen = aCtx.kiway->Prj().GetProjectFullName().ToStdString( wxConvUTF8 );
+    }
+
+    const std::string exe = wxStandardPaths::Get().GetExecutablePath().ToStdString( wxConvUTF8 );
+    const int         port = KICAD_OPENAPI_SERVICE::CurrentPort();
+
+    // same checks as app_quit (unsaved documents, library editors) before anything starts
+    KOPENAPI_RESULT quit = h_app_quit( aCtx, aArgs );
+
+    if( quit.status != 200 )
+        return quit;
+
+    // the successor waits for this process to exit, then takes the same port
+    std::vector<std::string> argv = { exe };
+
+    if( !reopen.empty() )
+        argv.push_back( reopen );
+
+    wxSetEnv( wxS( "KICAD_OPENAPI_WAIT_PID" ), wxString::Format( wxS( "%ld" ), kopenapi::platform::CurrentPid() ) );
+
+    if( port > 0 )
+        wxSetEnv( wxS( "KICAD_OPENAPI_PORT" ), wxString::Format( wxS( "%d" ), port ) );
+
+    std::string error;
+    const auto  logDir = kopenapi::platform::TempRoot() / "kicad" / "openapi-logs";
+    const long  pid = kopenapi::platform::SpawnDetached( argv, logDir / "restart.log", error );
+
+    wxUnsetEnv( wxS( "KICAD_OPENAPI_WAIT_PID" ) );
+
+    nlohmann::json answer = quit.body;
+    answer["restarting"] = pid != 0;
+    answer["new_pid"] = pid;
+    answer["reopen"] = reopen;
+    answer["port"] = port;
+
+    if( !pid )
+        answer["error"] = error;
+
+    return KOPENAPI_RESULT::Ok( answer );
+}
+
+
+KOPENAPI_REGISTER( "app_restart",
+                   "Restart KiCad (GUI) to pick up a new build: quits like app_quit (refuses on unsaved "
+                   "documents unless discard: true), starts the same executable again on the same API "
+                   "port and reopens the open board / schematic / project; poll status until it answers",
+                   R"json({"type":"object","properties":{
+                        "discard":{"type":"boolean","default":false},
+                        "reopen":{"type":"boolean","default":true}}})json"_json,
+                   true, h_app_restart );

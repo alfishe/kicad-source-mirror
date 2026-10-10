@@ -2,6 +2,9 @@
 
 #include "platform.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 #if defined(_WIN32)
 #include "platform_windows.h"
 #else
@@ -127,6 +130,100 @@ void InstallTerminationHandler(void (*handler)())
 #else
     InstallTerminationHandlerPosix(handler);
 #endif
+}
+
+PipeProcess SpawnWithStdinPipe(const std::vector<std::string>& argv, const fs::path& logFile, std::string& error)
+{
+    if (argv.empty())
+    {
+        error = "empty command";
+        return {};
+    }
+#if defined(_WIN32)
+    return SpawnWithStdinPipeWindows(argv, logFile, error);
+#else
+    return SpawnWithStdinPipePosix(argv, logFile, error);
+#endif
+}
+
+bool WritePipe(std::intptr_t handle, const void* data, std::size_t size)
+{
+    if (handle == -1)
+    {
+        return false;
+    }
+#if defined(_WIN32)
+    return WritePipeWindows(handle, data, size);
+#else
+    return WritePipePosix(handle, data, size);
+#endif
+}
+
+void ClosePipe(std::intptr_t handle)
+{
+    if (handle == -1)
+    {
+        return;
+    }
+#if defined(_WIN32)
+    ClosePipeWindows(handle);
+#else
+    ClosePipePosix(handle);
+#endif
+}
+
+int WaitProcess(long pid, int timeoutMs)
+{
+    if (pid <= 0)
+    {
+        return -1;
+    }
+#if defined(_WIN32)
+    return WaitProcessWindows(pid, timeoutMs);
+#else
+    return WaitProcessPosix(pid, timeoutMs);
+#endif
+}
+
+fs::path FindExecutable(const std::string& name)
+{
+    std::vector<fs::path> dirs;
+#if defined(_WIN32)
+    const char separator = ';';
+#else
+    const char separator = ':';
+#endif
+    if (const char* path = std::getenv("PATH"))
+    {
+        std::string all = path;
+        size_t start = 0;
+        while (start <= all.size())
+        {
+            const size_t end = std::min(all.find(separator, start), all.size());
+            if (end > start)
+            {
+                dirs.emplace_back(all.substr(start, end - start));
+            }
+            start = end + 1;
+        }
+    }
+#if defined(__APPLE__)
+    dirs.emplace_back("/opt/homebrew/bin");
+    dirs.emplace_back("/usr/local/bin");
+#elif defined(__linux__)
+    dirs.emplace_back("/usr/local/bin");
+    dirs.emplace_back("/usr/bin");
+#endif
+    for (const fs::path& dir : dirs)
+    {
+        std::error_code ec;
+        const fs::path candidate = dir / ExecutableName(name);
+        if (fs::is_regular_file(candidate, ec))
+        {
+            return candidate;
+        }
+    }
+    return {};
 }
 
 } // namespace kopenapi::platform

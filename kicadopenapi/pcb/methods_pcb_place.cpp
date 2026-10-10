@@ -1,13 +1,12 @@
-/*
- * kicadopenapi placement (ROADMAP task 3.2): pcb_footprint_move, pcb_placement_check,
- * pcb_place_auto.
- *
- * The agent places with pcb_footprint_move (several footprints in one undo step) and judges with
- * pcb_placement_check (courtyard overlaps, parts off the board, connectors away from the edge,
- * ratsnest length).  pcb_place_auto is a starting point: an outline sized from the parts if there
- * is none, connectors along the board edges, the rest by KiCad's own autoplacer (AR_AUTOPLACER:
- * a placement matrix inside the outline, ratsnest cost).
- */
+/// @file methods_pcb_place.cpp
+/// @brief kicadopenapi placement (ROADMAP task 3.2): pcb_footprint_move, pcb_placement_check,
+/// pcb_place_auto.
+///
+/// The agent places with pcb_footprint_move (several footprints in one undo step) and judges with
+/// pcb_placement_check (courtyard overlaps, parts off the board, connectors away from the edge,
+/// ratsnest length).  pcb_place_auto is a starting point: an outline sized from the parts if there
+/// is none, connectors along the board edges, the rest by KiCad's own autoplacer (AR_AUTOPLACER:
+/// a placement matrix inside the outline, ratsnest cost).
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -27,11 +26,13 @@
 #include <pad.h>
 #include <pcb_edit_frame.h>
 #include <pcb_shape.h>
+#include <pcb_text.h>
 #include <string_utils.h>
 #include <tool/actions.h>
 #include <tool/tool_manager.h>
 #include <view/view_overlay.h>
 
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <set>
@@ -58,14 +59,14 @@ double toMm( double aIU )
 }
 
 
-/// Area in mm2 from internal units squared
+/// @brief Area in mm2 from internal units squared
 double areaMm2( double aIU2 )
 {
     return aIU2 / ( pcbIUScale.IU_PER_MM * pcbIUScale.IU_PER_MM );
 }
 
 
-/// Board editor glow (no frame headless)
+/// @brief Board editor glow (no frame headless)
 struct PLACE_GLOW_TRAITS
 {
     using FRAME = PCB_EDIT_FRAME;
@@ -125,7 +126,7 @@ FOOTPRINT* findFootprint( BOARD* aBoard, const std::string& aRef )
 }
 
 
-/// Courtyard of a footprint on its side (its body box when it has none)
+/// @brief Courtyard of a footprint on its side (its body box when it has none)
 SHAPE_POLY_SET courtyard( FOOTPRINT* aFootprint )
 {
     const PCB_LAYER_ID   layer = aFootprint->IsFlipped() ? B_CrtYd : F_CrtYd;
@@ -155,7 +156,17 @@ bool isConnector( FOOTPRINT* aFootprint )
 }
 
 
-/// Placement findings over the whole board
+struct PANEL_EDGE;
+std::optional<PANEL_EDGE> panelEdge( FOOTPRINT* aFootprint, const std::string& aMethod = "auto" );
+
+
+/// @brief Edge connector facing against the board outline.
+/// @return facing (left/right/up/down/angle), the line's distance to the outline edge it faces
+/// (mm, + = inside the board), and whether it faces out over that edge
+nlohmann::json edgeFacing( FOOTPRINT* aFootprint, const BOX2I& aEdges );
+
+
+/// @brief Placement findings over the whole board
 nlohmann::json placementReport( BOARD* aBoard )
 {
     SHAPE_POLY_SET outline;
@@ -207,7 +218,42 @@ nlohmann::json placementReport( BOARD* aBoard )
             const BOX2I box = areas[i].BBox();
             const int   gap = std::min( { box.GetLeft() - edges.GetLeft(), edges.GetRight() - box.GetRight(),
                                           box.GetTop() - edges.GetTop(), edges.GetBottom() - box.GetBottom() } );
-            connectors.push_back( { { "ref", str( fps[i]->GetReference() ) }, { "to_edge_mm", toMm( gap ) } } );
+            nlohmann::json row = { { "ref", str( fps[i]->GetReference() ) }, { "to_edge_mm", toMm( gap ) } };
+            row.update( edgeFacing( fps[i], edges ) );
+            connectors.push_back( row );
+        }
+    }
+
+    // edge connectors facing out over their edge overhang by design: not "outside"
+    nlohmann::json problems = nlohmann::json::array();
+    nlohmann::json overhanging = nlohmann::json::array();
+
+    for( const nlohmann::json& c : connectors )
+    {
+        if( !c.contains( "faces_out" ) )
+            continue;
+
+        auto it = std::find( outside.begin(), outside.end(), c["ref"] );
+
+        if( c["faces_out"].get<bool>() && std::abs( c["line_to_edge_mm"].get<double>() ) <= 1.0 )
+        {
+            if( it != outside.end() )
+            {
+                outside.erase( it );
+                overhanging.push_back( c["ref"] );
+            }
+        }
+        else if( c["faces_out"].get<bool>() )
+        {
+            problems.push_back( { { "ref", c["ref"] }, { "problem", "connector_not_on_edge" },
+                                  { "line_to_edge_mm", c["line_to_edge_mm"] },
+                                  { "hint", "pcb_footprint_move {ref, edge}" } } );
+        }
+        else
+        {
+            problems.push_back( { { "ref", c["ref"] }, { "problem", "connector_facing_inward" },
+                                  { "facing", c["facing"] },
+                                  { "hint", "pcb_footprint_move {ref, edge} puts it on an edge facing out" } } );
         }
     }
 
@@ -239,10 +285,12 @@ nlohmann::json placementReport( BOARD* aBoard )
                               { "courtyard_overlaps", overlaps },
                               { "outside_board", outside },
                               { "connectors", connectors },
+                              { "connector_problems", problems },
+                              { "edge_overhang", overhanging },
                               { "unrouted", connectivity->GetUnconnectedCount( true ) },
                               { "airwire_length_mm", toMm( airwires ) },
                               { "airwires", edgesCount },
-                              { "ok", overlaps.empty() && outside.empty() && hasOutline } };
+                              { "ok", overlaps.empty() && outside.empty() && problems.empty() && hasOutline } };
 
     if( hasOutline )
         report["board_mm"] = { toMm( edges.GetWidth() ), toMm( edges.GetHeight() ) };
@@ -250,52 +298,6 @@ nlohmann::json placementReport( BOARD* aBoard )
         report["hint"] = "no board outline: pcb_outline_set, or pcb_place_auto sizes one";
 
     return report;
-}
-
-
-/**
- * The panel edge a connector footprint marks for its front (KiCad's convention: a line on
- * Dwgs.User where the board / panel edge goes, the mating side beyond it): the longest such
- * line, and the direction from the pads towards it (where the connector faces).
- */
-std::optional<std::pair<SEG, VECTOR2D>> panelEdge( FOOTPRINT* aFootprint )
-{
-    std::optional<SEG> best;
-
-    for( BOARD_ITEM* item : aFootprint->GraphicalItems() )
-    {
-        if( item->Type() != PCB_SHAPE_T || item->GetLayer() != Dwgs_User )
-            continue;
-
-        PCB_SHAPE* shape = static_cast<PCB_SHAPE*>( item );
-
-        if( shape->GetShape() != SHAPE_T::SEGMENT )
-            continue;
-
-        SEG seg( shape->GetStart(), shape->GetEnd() );
-
-        if( !best || seg.Length() > best->Length() )
-            best = seg;
-    }
-
-    if( !best || aFootprint->Pads().empty() )
-        return std::nullopt;
-
-    VECTOR2D centroid( 0, 0 );
-
-    for( PAD* pad : aFootprint->Pads() )
-        centroid += VECTOR2D( pad->GetPosition() );
-
-    centroid = centroid * ( 1.0 / aFootprint->Pads().size() );
-
-    const VECTOR2D d( best->B - best->A );
-    VECTOR2D       n( -d.y, d.x );
-    n = n.Resize( 1.0 );
-
-    if( ( VECTOR2D( best->Center() ) - centroid ).Dot( n ) < 0 )
-        n = -n;
-
-    return std::make_pair( *best, n );
 }
 
 
@@ -312,6 +314,302 @@ void refreshGui( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard )
             frame->GetCanvas()->Refresh();
         }
     }
+}
+
+/// @brief The panel / board edge line of an edge connector (first) with its outward normal (second)
+struct PANEL_EDGE
+{
+    SEG         first;
+    VECTOR2D    second;
+    std::string source;       ///< marker convention, or "inferred"
+    std::string confidence;   ///< "marked", or high / medium / low for inferred edges
+};
+
+
+/// @brief Front of an unmarked horizontal connector: the side where the courtyard reaches
+/// furthest beyond the signal pads (the mating body sticks out of the soldered area).
+/// @return the edge flush with the courtyard front, or nullopt for vertical / undecidable parts
+std::optional<PANEL_EDGE> inferEdge( FOOTPRINT* aFootprint )
+{
+    const wxString name = aFootprint->GetFPID().GetLibItemName().wx_str().Lower();
+
+    if( name.Contains( wxS( "vertical" ) ) || name.Contains( wxS( "topentry" ) ) || aFootprint->Pads().empty() )
+        return std::nullopt;
+
+    const VECTOR2I   origin = aFootprint->GetPosition();
+    const EDA_ANGLE  orient = aFootprint->GetOrientation();
+    auto local = [&]( VECTOR2I aPt )
+    {
+        VECTOR2I p = aPt - origin;
+        RotatePoint( p, -orient );
+        return p;
+    };
+    auto world = [&]( VECTOR2I aPt )
+    {
+        RotatePoint( aPt, orient );
+        return aPt + origin;
+    };
+
+    BOX2I pads;
+    bool  any = false;
+
+    for( PAD* pad : aFootprint->Pads() )
+    {
+        if( pad->GetAttribute() == PAD_ATTRIB::NPTH || pad->GetNumber().IsEmpty() )
+            continue;
+
+        const VECTOR2I p = local( pad->GetPosition() );
+
+        if( !any )
+            pads = BOX2I( p, VECTOR2I( 0, 0 ) ), any = true;
+        else
+            pads.Merge( p );
+    }
+
+    const SHAPE_POLY_SET& crt = aFootprint->GetCourtyard( aFootprint->IsFlipped() ? B_CrtYd : F_CrtYd );
+
+    if( !any || crt.OutlineCount() == 0 )
+        return std::nullopt;
+
+    BOX2I body;
+    bool  first = true;
+
+    for( auto it = crt.CIterate(); it; ++it )
+    {
+        const VECTOR2I p = local( *it );
+
+        if( first )
+            body = BOX2I( p, VECTOR2I( 0, 0 ) ), first = false;
+        else
+            body.Merge( p );
+    }
+
+    // reach beyond the pads: right, down, left, up (local frame)
+    const double reach[4] = { (double) body.GetRight() - pads.GetRight(), (double) body.GetBottom() - pads.GetBottom(),
+                              (double) pads.GetLeft() - body.GetLeft(), (double) pads.GetTop() - body.GetTop() };
+    int best = 0, second = -1;
+
+    for( int k = 1; k < 4; ++k )
+    {
+        if( reach[k] > reach[best] )
+            best = k;
+    }
+
+    for( int k = 0; k < 4; ++k )
+    {
+        if( k != best && ( second < 0 || reach[k] > reach[second] ) )
+            second = k;
+    }
+
+    const double mm = pcbIUScale.IU_PER_MM;
+
+    if( reach[best] < 3.0 * mm )
+        return std::nullopt;
+
+    const double ratio = reach[best] / std::max( reach[second], 0.5 * mm );
+    std::string  confidence = ratio >= 2.5 ? "high" : ratio >= 1.5 ? "medium" : "low";
+
+    VECTOR2I a, b;
+    VECTOR2D n;
+
+    switch( best )
+    {
+    case 0: a = { body.GetRight(), body.GetTop() };    b = { body.GetRight(), body.GetBottom() }; n = { 1, 0 };  break;
+    case 1: a = { body.GetLeft(), body.GetBottom() };  b = { body.GetRight(), body.GetBottom() }; n = { 0, 1 };  break;
+    case 2: a = { body.GetLeft(), body.GetTop() };     b = { body.GetLeft(), body.GetBottom() };  n = { -1, 0 }; break;
+    default: a = { body.GetLeft(), body.GetTop() };    b = { body.GetRight(), body.GetTop() };    n = { 0, -1 }; break;
+    }
+
+    const VECTOR2I tip = a + VECTOR2I( KiROUND( n.x * 1000000 ), KiROUND( n.y * 1000000 ) );
+    const VECTOR2D nw = VECTOR2D( world( tip ) - world( a ) ).Resize( 1.0 );
+
+    return PANEL_EDGE{ SEG( world( a ), world( b ) ), nw, "inferred", confidence };
+}
+
+
+/// @brief The panel edge a connector footprint marks for its front, and the direction from the pads
+/// towards it (where the connector faces).  Marked by a line on Dwgs.User, or by a "PCB Edge" text
+/// next to a line on another layer: longest Dwgs.User segment first, else the one nearest the text.
+std::optional<PANEL_EDGE> markedEdge( FOOTPRINT* aFootprint )
+{
+    std::optional<SEG>      best;
+    std::string             source;
+    std::vector<VECTOR2I>   marks;
+    std::vector<SEG>        others;
+
+    for( BOARD_ITEM* item : aFootprint->GraphicalItems() )
+    {
+        if( item->Type() == PCB_TEXT_T )
+        {
+            const wxString text = static_cast<PCB_TEXT*>( item )->GetText().Lower();
+
+            if( text.Contains( wxS( "edge" ) ) && ( text.Contains( wxS( "pcb" ) ) || text.Contains( wxS( "board" ) ) ) )
+                marks.push_back( item->GetPosition() );
+
+            continue;
+        }
+
+        if( item->Type() != PCB_SHAPE_T || static_cast<PCB_SHAPE*>( item )->GetShape() != SHAPE_T::SEGMENT )
+            continue;
+
+        PCB_SHAPE* shape = static_cast<PCB_SHAPE*>( item );
+        SEG        seg( shape->GetStart(), shape->GetEnd() );
+
+        if( item->GetLayer() == Dwgs_User )
+        {
+            if( !best || seg.Length() > best->Length() )
+                best = seg, source = "Dwgs.User line";
+        }
+        else if( !IsCopperLayer( item->GetLayer() ) && seg.Length() >= pcbIUScale.mmToIU( 2.0 ) )
+        {
+            others.push_back( seg );
+        }
+    }
+
+    if( !best && !marks.empty() )
+    {
+        // nearest long segment to the mark; among equally near ones (within 0.5 mm) the longest
+        double nearest = std::numeric_limits<double>::max();
+
+        for( const SEG& seg : others )
+            nearest = std::min( nearest, (double) seg.Distance( marks.front() ) );
+
+        for( const SEG& seg : others )
+        {
+            if( seg.Distance( marks.front() ) <= nearest + pcbIUScale.mmToIU( 0.5 )
+                && seg.Distance( marks.front() ) <= pcbIUScale.mmToIU( 3.0 )
+                && ( !best || seg.Length() > best->Length() ) )
+            {
+                best = seg, source = "\"PCB Edge\" text";
+            }
+        }
+    }
+
+    if( !best || aFootprint->Pads().empty() )
+        return std::nullopt;
+
+    // a panel line spans the body; short Dwgs.User strokes are drawings (arrows, notes)
+    const BOX2I body = aFootprint->GetCourtyard( aFootprint->IsFlipped() ? B_CrtYd : F_CrtYd ).OutlineCount()
+                               ? aFootprint->GetCourtyard( aFootprint->IsFlipped() ? B_CrtYd : F_CrtYd ).BBox()
+                               : aFootprint->GetBoundingBox( false );
+    const VECTOR2D dir = VECTOR2D( best->B - best->A ).Resize( 1.0 );
+    const double   span = std::abs( dir.x ) * body.GetWidth() + std::abs( dir.y ) * body.GetHeight();
+
+    if( best->Length() < 0.5 * span )
+        return std::nullopt;
+
+    VECTOR2D centroid( 0, 0 );
+
+    for( PAD* pad : aFootprint->Pads() )
+        centroid += VECTOR2D( pad->GetPosition() );
+
+    centroid = centroid * ( 1.0 / aFootprint->Pads().size() );
+
+    const VECTOR2D d( best->B - best->A );
+    VECTOR2D       n( -d.y, d.x );
+    n = n.Resize( 1.0 );
+
+    if( ( VECTOR2D( best->Center() ) - centroid ).Dot( n ) < 0 )
+        n = -n;
+
+    return PANEL_EDGE{ *best, n, source, "marked" };
+}
+
+
+/// @param aMethod auto (marker, else inference), marker, infer
+std::optional<PANEL_EDGE> panelEdge( FOOTPRINT* aFootprint, const std::string& aMethod )
+{
+    if( aMethod != "infer" )
+    {
+        if( std::optional<PANEL_EDGE> marked = markedEdge( aFootprint ) )
+            return marked;
+    }
+
+    return aMethod == "marker" ? std::nullopt : inferEdge( aFootprint );
+}
+
+} // namespace
+
+
+nlohmann::json KopenapiPanelEdgeJson( FOOTPRINT* aFootprint, const std::string& aMethod )
+{
+    const std::optional<PANEL_EDGE> edge = panelEdge( aFootprint, aMethod );
+
+    if( !edge )
+        return nullptr;
+
+    const auto mmv = []( double aIU ) { return std::round( pcbIUScale.IUTomm( 1 ) * aIU * 1000.0 ) / 1000.0; };
+    const VECTOR2D n = edge->second;
+    const VECTOR2D c( edge->first.Center() );
+
+    // depth behind the line (into the board) and overhang past it: courtyard, else bounding box
+    double         behind = 0, past = 0;
+    SHAPE_POLY_SET body = aFootprint->GetCourtyard( aFootprint->IsFlipped() ? B_CrtYd : F_CrtYd );
+
+    if( body.OutlineCount() == 0 )
+    {
+        const BOX2I b = aFootprint->GetBoundingBox( false );
+        body.NewOutline();
+        for( VECTOR2I p : { b.GetOrigin(), VECTOR2I( b.GetRight(), b.GetTop() ), b.GetEnd(), VECTOR2I( b.GetLeft(), b.GetBottom() ) } )
+            body.Append( p );
+    }
+
+    for( auto it = body.CIterate(); it; ++it )
+    {
+        const double d = ( VECTOR2D( *it ) - c ).Dot( n );
+        behind = std::max( behind, -d );
+        past = std::max( past, d );
+    }
+
+    const double deg = std::fmod( std::atan2( n.y, n.x ) * 180.0 / M_PI + 360.0, 360.0 );
+    nlohmann::json facing = std::round( deg * 10 ) / 10;
+
+    for( const auto& [name, a] : std::vector<std::pair<const char*, double>>{ { "right", 0 }, { "down", 90 }, { "left", 180 }, { "up", 270 }, { "right", 360 } } )
+    {
+        if( std::abs( deg - a ) < 1.0 )
+            facing = name;
+    }
+
+    return { { "line_mm", { { mmv( edge->first.A.x ), mmv( edge->first.A.y ) }, { mmv( edge->first.B.x ), mmv( edge->first.B.y ) } } },
+             { "facing", facing },
+             { "depth_mm", mmv( behind ) },
+             { "overhang_mm", mmv( past ) },
+             { "source", edge->source },
+             { "confidence", edge->confidence } };
+}
+
+
+namespace
+{
+
+nlohmann::json edgeFacing( FOOTPRINT* aFootprint, const BOX2I& aEdges )
+{
+    const std::optional<PANEL_EDGE> edge = panelEdge( aFootprint, "auto" );
+
+    if( !edge )
+        return nlohmann::json::object();
+
+    const VECTOR2D n = edge->second;
+    const VECTOR2I c = edge->first.Center();
+
+    // the outline edge the connector faces and the line's distance to it (inside = positive)
+    double      dist = 0;
+    std::string facing;
+
+    if( std::abs( n.x ) >= std::abs( n.y ) )
+        facing = n.x > 0 ? "right" : "left", dist = n.x > 0 ? aEdges.GetRight() - c.x : c.x - aEdges.GetLeft();
+    else
+        facing = n.y > 0 ? "down" : "up", dist = n.y > 0 ? aEdges.GetBottom() - c.y : c.y - aEdges.GetTop();
+
+    // facing out = the faced edge is the nearest outline edge to the line
+    const double nearest = std::min( { std::abs( (double) c.x - aEdges.GetLeft() ), std::abs( (double) aEdges.GetRight() - c.x ),
+                                       std::abs( (double) c.y - aEdges.GetTop() ), std::abs( (double) aEdges.GetBottom() - c.y ) } );
+
+    return { { "facing", facing },
+             { "line_to_edge_mm", std::round( dist / pcbIUScale.IU_PER_MM * 100.0 ) / 100.0 },
+             { "faces_out", std::abs( dist ) <= nearest + pcbIUScale.mmToIU( 0.01 ) },
+             { "edge_source", edge->source },
+             { "edge_confidence", edge->confidence } };
 }
 
 } // namespace
@@ -348,7 +646,40 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         if( fp->IsLocked() && !aArgs.value( "override_locks", false ) )
             return KOPENAPI_RESULT::Error( 409, str( fp->GetReference() ) + " is locked (override_locks: true)" );
 
-        plan.emplace_back( fp, m );
+        nlohmann::json move = m;
+
+        // edge: on the board outline, facing out; the coordinate along the edge stays the caller's
+        if( m.contains( "edge" ) )
+        {
+            static const std::map<std::string, std::string> facing = { { "left", "left" }, { "right", "right" },
+                                                                        { "top", "up" }, { "bottom", "down" } };
+
+            if( !m["edge"].is_string() || !facing.count( m["edge"].get<std::string>() ) )
+                return KOPENAPI_RESULT::Error( 400, "edge: left, right, top or bottom" );
+
+            const BOX2I outline = board->GetBoardEdgesBoundingBox();
+
+            if( outline.GetWidth() <= 0 )
+                return KOPENAPI_RESULT::Error( 409, "edge needs a board outline (pcb_outline_set)" );
+
+            const std::string e = m["edge"];
+            move["facing"] = facing.at( e );
+            move["anchor"] = "panel_edge";
+
+            if( e == "left" || e == "right" )
+                move["x_mm"] = toMm( e == "left" ? outline.GetLeft() : outline.GetRight() );
+            else
+                move["y_mm"] = toMm( e == "top" ? outline.GetTop() : outline.GetBottom() );
+        }
+
+        if( ( move.contains( "facing" ) || move.value( "anchor", std::string() ) == "panel_edge" ) && !panelEdge( fp ) )
+        {
+            return KOPENAPI_RESULT::Error( 409, str( fp->GetReference() ) + " (" + str( fp->GetFPID().Format() )
+                                                        + "): no panel edge known - neither a marker in the footprint nor "
+                                                          "an inferable front; place it with rotation_deg and check a render" );
+        }
+
+        plan.emplace_back( fp, move );
     }
 
     BOARD_COMMIT      commit( context->GetToolManager() );
@@ -367,14 +698,7 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         // facing: turn so the front (beyond the footprint's panel-edge line) points that way
         if( m.contains( "facing" ) )
         {
-            std::optional<std::pair<SEG, VECTOR2D>> edge = panelEdge( fp );
-
-            if( !edge )
-            {
-                commit.Revert();
-                return KOPENAPI_RESULT::Error( 422, str( fp->GetReference() ) + " has no panel-edge line (Dwgs.User) to face with" );
-            }
-
+            std::optional<PANEL_EDGE> edge = panelEdge( fp );
             static const std::map<std::string, double> want = { { "right", 0 }, { "down", 90 }, { "left", 180 }, { "up", 270 } };
             const double now = std::atan2( edge->second.y, edge->second.x ) * 180.0 / M_PI;
             const double turn = now - want.at( m["facing"].get<std::string>() );   // CCW on screen lowers the angle
@@ -390,18 +714,10 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
             pos -= courtyard( fp ).BBox().Centre() - fp->GetPosition();
         else if( m.value( "anchor", std::string( "origin" ) ) == "panel_edge" )
         {
-            std::optional<std::pair<SEG, VECTOR2D>> edge = panelEdge( fp );
-
-            if( !edge )
-            {
-                commit.Revert();
-                return KOPENAPI_RESULT::Error( 422, str( fp->GetReference() ) + " has no panel-edge line (Dwgs.User) to anchor on" );
-            }
-
+            std::optional<PANEL_EDGE> edge = panelEdge( fp );
             pos -= edge->first.Center() - fp->GetPosition();
 
-            // edge_offset_mm: along the facing direction - positive sticks out past the edge,
-            // negative sinks the connector in (case / panel specifics)
+            // edge_offset_mm: along the facing direction, + out past the edge, - recessed
             const double offset = m.value( "edge_offset_mm", 0.0 );
             pos += VECTOR2I( KiROUND( edge->second.x * toIU( offset ) ), KiROUND( edge->second.y * toIU( offset ) ) );
         }
@@ -420,11 +736,23 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
 
     for( auto& [fp, m] : plan )
     {
-        placed.push_back( { { "ref", str( fp->GetReference() ) },
-                            { "x_mm", toMm( fp->GetPosition().x ) },
-                            { "y_mm", toMm( fp->GetPosition().y ) },
-                            { "rotation_deg", fp->GetOrientation().AsDegrees() },
-                            { "side", fp->IsFlipped() ? "bottom" : "top" } } );
+        nlohmann::json row = { { "ref", str( fp->GetReference() ) },
+                               { "x_mm", toMm( fp->GetPosition().x ) },
+                               { "y_mm", toMm( fp->GetPosition().y ) },
+                               { "rotation_deg", fp->GetOrientation().AsDegrees() },
+                               { "side", fp->IsFlipped() ? "bottom" : "top" } };
+
+        if( m.contains( "facing" ) )
+        {
+            const nlohmann::json edge = KopenapiPanelEdgeJson( fp );
+            row["panel_edge"] = { { "source", edge["source"] }, { "confidence", edge["confidence"] } };
+
+            if( edge["confidence"] == "low" || edge["confidence"] == "medium" )
+                row["check"] = "front inferred from the body (" + edge["confidence"].get<std::string>()
+                               + " confidence): verify with pcb_render_3d";
+        }
+
+        placed.push_back( row );
     }
 
     report["moved"] = placed;
@@ -603,7 +931,8 @@ KOPENAPI_REGISTER( "pcb_footprint_move",
                             "rotation_deg":{"type":"number"},"side":{"type":"string","enum":["top","bottom"]},
                             "anchor":{"type":"string","enum":["origin","center","panel_edge"],"default":"origin","description":"center: x / y are the courtyard's middle; panel_edge: the middle of the connector's panel-edge line (put it on the board edge)"},
                             "edge_offset_mm":{"type":"number","default":0,"description":"anchor panel_edge: shift along the facing direction (+ out past the edge, - recessed)"},
-                            "facing":{"type":"string","enum":["left","right","up","down"],"description":"connectors: turn so the mating side (beyond the footprint's panel-edge line on Dwgs.User) faces this way"}}}},
+                            "edge":{"type":"string","enum":["left","right","top","bottom"],"description":"put the connector on that board edge facing out (facing + anchor panel_edge + the edge coordinate); give the other coordinate"},
+                            "facing":{"type":"string","enum":["left","right","up","down"],"description":"connectors: turn so the mating side faces this way (panel edge from the footprint's marker or inferred from its body, see pcb_footprint_get panel_edge)"}}}},
                         "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_footprint_move );
 

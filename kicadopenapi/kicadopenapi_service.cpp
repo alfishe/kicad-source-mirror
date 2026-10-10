@@ -1,6 +1,7 @@
 #include "kicadopenapi_service.h"
 #include "kicadopenapi_history.h"
 #include "kicadopenapi_registry.h"
+#include "recording/kicadopenapi_recorder.h"
 #include "kicadopenapi_mcp.h"
 #include "kicadopenapi_journal.h"
 #include "kicadopenapi_libraries.h"
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <wx/utils.h>
 #include <fstream>
 #include <future>
 #include <thread>
@@ -26,7 +28,7 @@
 static const char* const KOPENAPI_VERSION = "0.2.0";
 static const char* const KOPENAPI_HOST_ADDR = "127.0.0.1";
 
-/// Default upper bound for one main-thread call (methods may declare more); long operations
+/// @brief Default upper bound for one main-thread call (methods may declare more); long operations
 /// will move to async jobs.
 static constexpr std::chrono::seconds CALL_TIMEOUT( 15 );
 static constexpr std::chrono::milliseconds WAIT_SLICE( 20 );
@@ -34,7 +36,7 @@ static constexpr std::chrono::milliseconds WAIT_SLICE( 20 );
 namespace fs = std::filesystem;
 
 
-/// Drops discovery files left behind by crashed processes
+/// @brief Drops discovery files left behind by crashed processes
 static void removeStaleDiscoveryFiles( const fs::path& aDir )
 {
     std::error_code ec;
@@ -66,12 +68,10 @@ static void reply( httplib::Response& aRes, const KOPENAPI_RESULT& aResult )
 }
 
 
-/**
- * Run aFn on the main (GUI/event-loop) thread and wait for its result on the calling HTTP
- * worker.  The main thread never waits on HTTP threads.  If the service stops or the call
- * exceeds CALL_TIMEOUT, the worker returns an error; a late closure still completes safely
- * because it only touches shared state.
- */
+/// @brief Run aFn on the main (GUI/event-loop) thread and wait for its result on the calling HTTP
+/// worker.  The main thread never waits on HTTP threads.  If the service stops or the call
+/// exceeds CALL_TIMEOUT, the worker returns an error; a late closure still completes safely
+/// because it only touches shared state.
 static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAlive,
                                   const std::function<void()>&             aWaker,
                                   std::function<KOPENAPI_RESULT()>         aFn,
@@ -148,13 +148,11 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 
     nlohmann::json openApiJson() const;
 
-    /// statusJson() + open documents and the unsaved flag (main-thread round trip)
+    /// @brief statusJson() + open documents and the unsaved flag (main-thread round trip)
     KOPENAPI_RESULT liveStatus() const;
 
-    /**
-     * Load the editor kifaces (eeschema, pcbnew) once, on the main thread, so their methods
-     * and document providers are registered.  Lazy: paid by the first API use, not at start.
-     */
+    /// @brief Load the editor kifaces (eeschema, pcbnew) once, on the main thread, so their methods
+    /// and document providers are registered.  Lazy: paid by the first API use, not at start.
     void ensureKifaces() const;
 
     mutable std::atomic<bool> kifacesLoaded{ false };
@@ -164,7 +162,7 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 
     KOPENAPI_RESULT invoke( const std::string& aName, const std::string& aBody ) const;
 
-    /// Same as invoke() with already parsed arguments (REST and MCP share this path)
+    /// @brief Same as invoke() with already parsed arguments (REST and MCP share this path)
     KOPENAPI_RESULT invokeParsed( const std::string& aName, const nlohmann::json& aArgs ) const;
 
     void handleMcp( const httplib::Request& aReq, httplib::Response& aRes ) const;
@@ -638,6 +636,18 @@ void KICAD_OPENAPI_SERVICE::SetShutdownHandler( std::function<void()> aHandler )
 }
 
 
+namespace
+{
+std::atomic<int> s_currentPort{ 0 };
+}
+
+
+int KICAD_OPENAPI_SERVICE::CurrentPort()
+{
+    return s_currentPort.load();
+}
+
+
 int KICAD_OPENAPI_SERVICE::DefaultPort()
 {
     if( const char* env = std::getenv( "KICAD_OPENAPI_PORT" ) )
@@ -659,6 +669,17 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
 
     const int basePort = aPort < 0 ? DefaultPort() : aPort;
 
+    // app_restart: the process we replace still holds the port until it exits
+    if( const char* env = std::getenv( "KICAD_OPENAPI_WAIT_PID" ) )
+    {
+        const long pid = std::atol( env );
+
+        for( int i = 0; i < 300 && kopenapi::platform::ProcessAlive( pid ); ++i )
+            std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
+
+        wxUnsetEnv( wxS( "KICAD_OPENAPI_WAIT_PID" ) );
+    }
+
     m_impl->appName = wxTheApp ? wxTheApp->GetAppName().ToStdString() : std::string( "kicad" );
     m_impl->port = 0;
 
@@ -671,6 +692,7 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
         if( m_impl->server->bind_to_port( KOPENAPI_HOST_ADDR, basePort + i ) )
         {
             m_impl->port = basePort + i;
+            s_currentPort = m_impl->port;
             break;
         }
     }
@@ -710,6 +732,8 @@ void KICAD_OPENAPI_SERVICE::Stop()
     if( !m_impl->server )
         return;
 
+    KopenapiRecorderShutdown();   // a recording file must be finished while its window exists
+
     // Unblock workers waiting on main-thread calls first, then stop and join the listener
     // (which joins the worker pool).
     m_impl->alive->store( false );
@@ -723,6 +747,7 @@ void KICAD_OPENAPI_SERVICE::Stop()
 
     m_impl->server.reset();
     m_impl->port = 0;
+    s_currentPort = 0;
 
     // Headless documents live in the kifaces; drop them while the project/settings still exist
     KOPENAPI_REGISTRY::Get().ReleaseDocuments();

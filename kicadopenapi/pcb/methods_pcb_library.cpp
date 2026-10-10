@@ -1,11 +1,10 @@
-/*
- * kicadopenapi footprint libraries: pcb_lib_list, pcb_lib_footprint_search, pcb_lib_footprint_get.
- *
- * Libraries come from the same tables KiCad uses (global fp-lib-table + the project's), via the
- * project's FOOTPRINT_LIBRARY_ADAPTER; load errors are reported, not skipped.  Search accepts a
- * symbol's footprint filters (KiCad's `ki_fp_filters` patterns) and pad count, so an agent can
- * go from a symbol card straight to the footprints that fit it.
- */
+/// @file methods_pcb_library.cpp
+/// @brief kicadopenapi footprint libraries: pcb_lib_list, pcb_lib_footprint_search, pcb_lib_footprint_get.
+///
+/// Libraries come from the same tables KiCad uses (global fp-lib-table + the project's), via the
+/// project's FOOTPRINT_LIBRARY_ADAPTER; load errors are reported, not skipped.  Search accepts a
+/// symbol's footprint filters (KiCad's `ki_fp_filters` patterns) and pad count, so an agent can
+/// go from a symbol card straight to the footprints that fit it.
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -49,14 +48,12 @@ PROJECT* libraryProject( KOPENAPI_CONTEXT& aCtx )
 }
 
 
-/**
- * The footprints of a loaded library.  FOOTPRINT_LIBRARY_ADAPTER keeps its enumerated footprints
- * in statics of pcbcommon, a static library linked into pcbnew *and* cvpcb: the adapter is one
- * object per process, created by whichever kiface asks first.  When cvpcb created it (ERC's
- * footprint checks run through cvpcb), it fills cvpcb's copy of the cache and pcbnew's
- * GetFootprints() answers nothing for every library.  Then the library is read here once
- * (names + LoadFootprint) and kept until it changes on disk.
- */
+/// @brief The footprints of a loaded library.  FOOTPRINT_LIBRARY_ADAPTER keeps its enumerated footprints
+/// in statics of pcbcommon, a static library linked into pcbnew *and* cvpcb: the adapter is one
+/// object per process, created by whichever kiface asks first.  When cvpcb created it (ERC's
+/// footprint checks run through cvpcb), it fills cvpcb's copy of the cache and pcbnew's
+/// GetFootprints() answers nothing for every library.  Then the library is read here once
+/// (names + LoadFootprint) and kept until it changes on disk.
 std::vector<const FOOTPRINT*> libraryFootprints( FOOTPRINT_LIBRARY_ADAPTER* aAdapter, const wxString& aNickname )
 {
     std::vector<const FOOTPRINT*> result;
@@ -140,7 +137,7 @@ const char* mountType( const FOOTPRINT* aFp )
 }
 
 
-/// Pads that take a net (numbered, not NPTH): what a symbol's pins map to
+/// @brief Pads that take a net (numbered, not NPTH): what a symbol's pins map to
 int connectablePads( const FOOTPRINT* aFp )
 {
     std::set<wxString> numbers;
@@ -155,10 +152,8 @@ int connectablePads( const FOOTPRINT* aFp )
 }
 
 
-/**
- * KiCad footprint filter semantics (as the footprint chooser applies ki_fp_filters): a pattern
- * with ':' matches LIB:NAME, otherwise the name; '*' and '?' wildcards; case-insensitive.
- */
+/// @brief KiCad footprint filter semantics (as the footprint chooser applies ki_fp_filters): a pattern
+/// with ':' matches LIB:NAME, otherwise the name; '*' and '?' wildcards; case-insensitive.
 bool matchesFilters( const std::vector<std::string>& aFilters, const std::string& aLib, const std::string& aName )
 {
     if( aFilters.empty() )
@@ -413,6 +408,7 @@ static KOPENAPI_RESULT h_pcb_lib_footprint_get( KOPENAPI_CONTEXT& aCtx, const nl
 
     card["pad_list"] = padList;
     card["models_3d"] = models;
+    card["panel_edge"] = KopenapiPanelEdgeJson( fp.get(), aArgs.value( "edge_method", std::string( "auto" ) ) );
     card["courtyard_mm"] = hasCourtyard ? nlohmann::json( { mm( courtyard.GetWidth() ), mm( courtyard.GetHeight() ) } ) : nlohmann::json();
     card["reference"] = str( fp->GetReference() );
     card["value"] = str( fp->GetValue() );
@@ -444,7 +440,8 @@ KOPENAPI_REGISTER( "pcb_lib_footprint_search",
 KOPENAPI_REGISTER( "pcb_lib_footprint_get",
                    "Library footprint card by lib_id (LIBRARY:FOOTPRINT): description, keywords, every pad "
                    "(number, attribute, shape, position, size, drill in mm), courtyard size, 3D models, "
-                   "used_in_design",
+                   "used_in_design, panel_edge of edge connectors (where it faces, depth, overhang)",
                    R"json({"type":"object","required":["lib_id"],"properties":{
-                        "lib_id":{"type":"string","description":"e.g. Package_TO_SOT_SMD:SOT-223-3_TabPin2"}}})json"_json,
+                        "lib_id":{"type":"string","description":"e.g. Package_TO_SOT_SMD:SOT-223-3_TabPin2"},
+                        "edge_method":{"type":"string","enum":["auto","marker","infer"],"default":"auto","description":"panel_edge from the footprint's marker, inferred from its body, or marker else inferred"}}})json"_json,
                    false, h_pcb_lib_footprint_get, 600 );

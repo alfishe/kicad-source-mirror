@@ -1,14 +1,13 @@
-/*
- * kicadopenapi routing through KiCad's push-and-shove router (PNS) - experimental.
- *
- * pcb_route_connection drives PNS the way a person does in the editor: start a track on a pad,
- * move towards the target, let the router walk around / shove, fix the route.  Nothing reaches
- * the board directly: the router's interface (KOPENAPI_PNS_IFACE) keeps every change in one
- * staged BOARD_COMMIT, a guard checks the result for gross errors (new copper touching or
- * crossing another net - pads, tracks, vias, filled zones - within the clearance), and only then
- * is the commit pushed (one undo step in the GUI).  dry_run reverts after measuring: geometry
- * and metrics of what the router would do, for comparing variants.
- */
+/// @file methods_pcb_route.cpp
+/// @brief kicadopenapi routing through KiCad's push-and-shove router (PNS) - experimental.
+///
+/// pcb_route_connection drives PNS the way a person does in the editor: start a track on a pad,
+/// move towards the target, let the router walk around / shove, fix the route.  Nothing reaches
+/// the board directly: the router's interface (KOPENAPI_PNS_IFACE) keeps every change in one
+/// staged BOARD_COMMIT, a guard checks the result for gross errors (new copper touching or
+/// crossing another net - pads, tracks, vias, filled zones - within the clearance), and only then
+/// is the commit pushed (one undo step in the GUI).  dry_run reverts after measuring: geometry
+/// and metrics of what the router would do, for comparing variants.
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -61,13 +60,13 @@ double toMm( double aIU )
 }
 
 
-/// The tool the router's interface hangs its commits on (any PCB tool will do)
+/// @brief The tool the router's interface hangs its commits on (any PCB tool will do)
 class KOPENAPI_ROUTE_HOST : public PCB_TOOL_BASE
 {
 public:
     KOPENAPI_ROUTE_HOST() : PCB_TOOL_BASE( "kicadopenapi.RouteHost" ) {}
 
-    /// No menus or actions: it only lends its manager to the router's commits (the base Init
+    /// @brief No menus or actions: it only lends its manager to the router's commits (the base Init
     /// builds context menus, which a headless process does not have)
     bool Init() override { return true; }
     void Reset( RESET_REASON ) override {}
@@ -85,7 +84,7 @@ PCB_TOOL_BASE* routeHost( TOOL_MANAGER* aManager )
 }
 
 
-/// PNS interface that stages instead of pushing, and remembers what it touched
+/// @brief PNS interface that stages instead of pushing, and remembers what it touched
 class KOPENAPI_PNS_IFACE : public PNS_KICAD_IFACE
 {
 public:
@@ -141,10 +140,8 @@ int netClearance( BOARD_CONNECTED_ITEM* aItem, int aFloor )
 }
 
 
-/**
- * Gross errors in a staged route: new or moved copper (aChanged) within the clearance of copper
- * of another net - pads, tracks, vias, filled zones; removed items do not count.
- */
+/// @brief Gross errors in a staged route: new or moved copper (aChanged) within the clearance of copper
+/// of another net - pads, tracks, vias, filled zones; removed items do not count.
 nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& aChanged,
                       const std::set<BOARD_ITEM*>& aRemoved )
 {
@@ -230,10 +227,8 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
 }
 
 
-/**
- * A pad by REF.PAD.  Several pads can share a number (SOT-223: pin 2 and the tab): aNot excludes
- * one (the route's start), and the nearest to aNear wins.
- */
+/// @brief A pad by REF.PAD.  Several pads can share a number (SOT-223: pin 2 and the tab): aNot excludes
+/// one (the route's start), and the nearest to aNear wins.
 std::optional<PAD*> findPad( BOARD* aBoard, const std::string& aRefPad, PAD* aNot = nullptr, PAD* aNear = nullptr )
 {
     const size_t dot = aRefPad.rfind( '.' );
@@ -273,7 +268,7 @@ std::optional<PAD*> findPad( BOARD* aBoard, const std::string& aRefPad, PAD* aNo
 namespace
 {
 
-/// Board editor glow for routes (no frame headless)
+/// @brief Board editor glow for routes (no frame headless)
 struct ROUTE_GLOW_TRAITS
 {
     using FRAME = PCB_EDIT_FRAME;
@@ -313,17 +308,15 @@ struct ROUTE_REQUEST
     PNS::PNS_MODE         mode = PNS::RM_Walkaround;
     bool                  dryRun = false;
 
-    /// Through vias on the way: at each point the route changes to the given layer (a person
+    /// @brief Through vias on the way: at each point the route changes to the given layer (a person
     /// pressing V while routing)
     std::vector<std::pair<VECTOR2I, PCB_LAYER_ID>> vias;
 };
 
 
-/**
- * One connection through PNS as a person routes it (see the file comment).  Fills aOut with what
- * happened (routed / reason / segments / metrics / violations); the staged commit is pushed only
- * when the guard is clean and it is no dry run.  aAdded: uuids of the new tracks / vias.
- */
+/// @brief One connection through PNS as a person routes it (see the file comment).  Fills aOut with what
+/// happened (routed / reason / segments / metrics / violations); the staged commit is pushed only
+/// when the guard is clean and it is no dry run.  aAdded: uuids of the new tracks / vias.
 bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
 {
     BOARD*     board = aContext.GetBoard();
@@ -632,11 +625,9 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
 }
 
 
-/**
- * Route many connections: the board's airwires (all, or those of given nets), shortest first,
- * each from a pad end; a connection that fails is tried again on the other layer, then in shove
- * mode.  One push per accepted route (rollback by steps undoes the whole call: it is one step).
- */
+/// @brief Route many connections: the board's airwires (all, or those of given nets), shortest first,
+/// each from a pad end; a connection that fails is tried again on the other layer, then in shove
+/// mode.  One push per accepted route (rollback by steps undoes the whole call: it is one step).
 static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -763,7 +754,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 if( ok || rail || !job.from->IsOnLayer( layer ) || !job.to->IsOnLayer( layer ) )
                     continue;
 
-                ROUTE_REQUEST req{ job.from, job.to, job.toPos, layer, mode, dryRun };
+                ROUTE_REQUEST req{ job.from, job.to, job.toPos, layer, mode, dryRun, {} };
                 attempt = nlohmann::json::object();
                 tries++;
                 ok = routeOne( *context, req, attempt, added );
@@ -806,7 +797,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                     if( ok )
                         break;
 
-                    ROUTE_REQUEST req{ job.from, job.to, job.toPos, top, PNS::RM_Walkaround, dryRun };
+                    ROUTE_REQUEST req{ job.from, job.to, job.toPos, top, PNS::RM_Walkaround, dryRun, {} };
                     req.vias = { { va, other }, { vb, top } };
                     attempt = nlohmann::json::object();
                     tries++;
@@ -875,12 +866,10 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 }
 
 
-/**
- * Stitch a net's loose ends to its pour on another layer: for every open connection of the net,
- * an end on one side only (an SMD pad, an island of a zone) gets a through via at a free spot
- * next to it (and a short track from a pad); each via passes the net-merge guard and must land
- * inside the board; zones are refilled at the end.
- */
+/// @brief Stitch a net's loose ends to its pour on another layer: for every open connection of the net,
+/// an end on one side only (an SMD pad, an island of a zone) gets a through via at a free spot
+/// next to it (and a short track from a pad); each via passes the net-merge guard and must land
+/// inside the board; zones are refilled at the end.
 static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );

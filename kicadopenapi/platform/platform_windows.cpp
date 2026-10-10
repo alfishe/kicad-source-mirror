@@ -1,6 +1,7 @@
 #if defined(_WIN32)
 
 #include "platform_windows.h"
+#include "platform.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -8,6 +9,7 @@
 #include <winsock2.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <iterator>
 
 namespace kopenapi::platform
@@ -36,7 +38,7 @@ static std::wstring widen(const std::string& text)
     return out;
 }
 
-/// Quotes one argument per the CommandLineToArgvW rules
+/// @brief Quotes one argument per the CommandLineToArgvW rules
 static std::wstring quoteArg(const std::wstring& arg)
 {
     if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos)
@@ -179,6 +181,112 @@ void InstallTerminationHandlerWindows(void (*handler)())
 {
     s_terminationHandler = handler;
     SetConsoleCtrlHandler(onConsoleControl, TRUE);
+}
+
+PipeProcess SpawnWithStdinPipeWindows(const std::vector<std::string>& argv, const std::filesystem::path& logFile,
+                                      std::string& error)
+{
+    std::wstring cmdline;
+    for (const std::string& arg : argv)
+    {
+        if (!cmdline.empty())
+        {
+            cmdline += L' ';
+        }
+        cmdline += quoteArg(widen(arg));
+    }
+
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE readEnd = nullptr;
+    HANDLE writeEnd = nullptr;
+    if (!CreatePipe(&readEnd, &writeEnd, &sa, 1 << 20))
+    {
+        error = "CreatePipe failed, error " + std::to_string(GetLastError());
+        return {};
+    }
+    SetHandleInformation(writeEnd, HANDLE_FLAG_INHERIT, 0);   // the write end stays ours only
+
+    HANDLE log = CreateFileW(logFile.wstring().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log == INVALID_HANDLE_VALUE)
+    {
+        log = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+    }
+
+    HANDLE inherit[2] = {readEnd, log};
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    std::vector<char> attrBuffer(attrSize);
+    auto attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuffer.data());
+    InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize);
+    UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit), nullptr, nullptr);
+
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = readEnd;
+    si.StartupInfo.hStdOutput = log;
+    si.StartupInfo.hStdError = log;
+    si.lpAttributeList = attrs;
+
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(widen(argv[0]).c_str(), cmdline.data(), nullptr, nullptr, TRUE,
+                                   EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                                   nullptr, nullptr, &si.StartupInfo, &pi);
+    const DWORD lastError = GetLastError();
+
+    DeleteProcThreadAttributeList(attrs);
+    CloseHandle(readEnd);
+    CloseHandle(log);
+
+    if (!ok)
+    {
+        CloseHandle(writeEnd);
+        error = "cannot start " + argv[0] + ", error " + std::to_string(lastError);
+        return {};
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return {static_cast<long>(pi.dwProcessId), reinterpret_cast<std::intptr_t>(writeEnd)};
+}
+
+bool WritePipeWindows(std::intptr_t handle, const void* data, std::size_t size)
+{
+    const char* p = static_cast<const char*>(data);
+    while (size > 0)
+    {
+        DWORD written = 0;
+        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(size, std::size_t(1) << 30));
+        if (!WriteFile(reinterpret_cast<HANDLE>(handle), p, chunk, &written, nullptr) || written == 0)
+        {
+            return false;
+        }
+        p += written;
+        size -= written;
+    }
+    return true;
+}
+
+void ClosePipeWindows(std::intptr_t handle)
+{
+    CloseHandle(reinterpret_cast<HANDLE>(handle));
+}
+
+int WaitProcessWindows(long pid, int timeoutMs)
+{
+    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (!process)
+    {
+        return 0;   // gone already
+    }
+    const DWORD r = WaitForSingleObject(process, static_cast<DWORD>(timeoutMs));
+    DWORD code = 0;
+    if (r == WAIT_OBJECT_0)
+    {
+        GetExitCodeProcess(process, &code);
+    }
+    CloseHandle(process);
+    return r == WAIT_OBJECT_0 ? static_cast<int>(code) : -1;
 }
 
 } // namespace kopenapi::platform

@@ -1,12 +1,12 @@
-/*
- * kicadopenapi windows of the process (GUI): window_list, window_capture.
- *
- * window_capture renders a whole window — toolbars, panels, dialogs, the canvas — into an image
- * without reading the screen: the toolkit draws the window offscreen (KIPLATFORM::UI::
- * CaptureWindow, per OS), and the OpenGL canvases inside it, which that leaves blank, are read
- * back by the kifaces that own them (KOPENAPI_REGISTER_CANVAS_CAPTURE) and pasted in place.
- * No screen-recording permission, covered windows still capture.
- */
+/// @file methods_windows.cpp
+/// @brief kicadopenapi windows of the process (GUI): window_list, window_capture.
+///
+/// window_capture renders a whole window — toolbars, panels, dialogs, the canvas — into an image
+/// without reading the screen: the toolkit draws the window offscreen (KIPLATFORM::UI::
+/// CaptureWindow, per OS), and the OpenGL canvases inside it, which that leaves blank, are read
+/// back by the kifaces that own them (KOPENAPI_REGISTER_CANVAS_CAPTURE) and pasted in place.
+/// No screen-recording permission, covered windows still capture.
+#include <kicadopenapi_capture.h>
 #include <kicadopenapi_image.h>
 #include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
@@ -27,12 +27,6 @@
 namespace
 {
 
-std::string windowId( const wxWindow* aWindow )
-{
-    std::ostringstream id;
-    id << "w" << std::hex << reinterpret_cast<std::uintptr_t>( aWindow );
-    return id.str();
-}
 
 
 std::string str( const wxString& aText )
@@ -45,7 +39,7 @@ nlohmann::json windowJson( wxTopLevelWindow* aWindow )
 {
     const wxRect rect = aWindow->GetScreenRect();
 
-    return { { "id", windowId( aWindow ) },
+    return { { "id", KopenapiWindowId( aWindow ) },
              { "title", str( aWindow->GetTitle() ) },
              { "class", str( aWindow->GetClassInfo() ? wxString( aWindow->GetClassInfo()->GetClassName() ) : wxString() ) },
              { "shown", aWindow->IsShown() },
@@ -58,54 +52,7 @@ nlohmann::json windowJson( wxTopLevelWindow* aWindow )
 }
 
 
-/// Paste every canvas a kiface can read on top of the window image
-int pasteCanvases( wxWindow* aRoot, wxWindow* aWindow, wxImage& aImage, double aScale,
-                   const std::vector<KOPENAPI_CANVAS_CAPTURE>& aCaptures )
-{
-    int pasted = 0;
-
-    for( wxWindow* child : aWindow->GetChildren() )
-    {
-        if( !child->IsShownOnScreen() || child->IsTopLevel() )
-            continue;
-
-        wxImage canvas;
-        bool    captured = false;
-
-        for( const KOPENAPI_CANVAS_CAPTURE& capture : aCaptures )
-        {
-            if( capture( child, canvas ) && canvas.IsOk() )
-            {
-                captured = true;
-                break;
-            }
-        }
-
-        if( captured )
-        {
-            const wxPoint origin = child->GetScreenPosition() - aRoot->ClientToScreen( wxPoint( 0, 0 ) );
-            const wxSize  size = child->GetClientSize();
-            const int     w = std::lround( size.x * aScale );
-            const int     h = std::lround( size.y * aScale );
-
-            if( w > 0 && h > 0 )
-            {
-                if( canvas.GetWidth() != w || canvas.GetHeight() != h )
-                    canvas.Rescale( w, h, wxIMAGE_QUALITY_HIGH );
-
-                canvas.ClearAlpha();
-                aImage.Paste( canvas, std::lround( origin.x * aScale ), std::lround( origin.y * aScale ) );
-                pasted++;
-            }
-
-            continue;   // a canvas has no children worth composing
-        }
-
-        pasted += pasteCanvases( aRoot, child, aImage, aScale, aCaptures );
-    }
-
-    return pasted;
-}
+/// @brief Paste every canvas a kiface can read on top of the window image
 
 } // namespace
 
@@ -129,35 +76,7 @@ static KOPENAPI_RESULT h_window_list( KOPENAPI_CONTEXT&, const nlohmann::json& a
 
 static KOPENAPI_RESULT h_window_capture( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
 {
-    const std::string wanted = aArgs.value( "window", std::string() );
-    wxTopLevelWindow* target = nullptr;
-
-    for( wxWindow* window : wxTopLevelWindows )
-    {
-        auto* tlw = dynamic_cast<wxTopLevelWindow*>( window );
-
-        if( !tlw || !tlw->IsShown() )
-            continue;
-
-        if( wanted.empty() ? tlw->IsActive() : ( windowId( tlw ) == wanted || KopenapiGlob( wanted, str( tlw->GetTitle() ) ) ) )
-        {
-            target = tlw;
-            break;
-        }
-    }
-
-    // No active window (the agent's terminal has the focus): take the first shown one
-    if( !target && wanted.empty() )
-    {
-        for( wxWindow* window : wxTopLevelWindows )
-        {
-            if( auto* tlw = dynamic_cast<wxTopLevelWindow*>( window ); tlw && tlw->IsShown() )
-            {
-                target = tlw;
-                break;
-            }
-        }
-    }
+    wxTopLevelWindow* target = KopenapiFindWindow( aArgs.value( "window", std::string() ) );
 
     if( !target )
         return KOPENAPI_RESULT::Error( 404, "window not found (see window_list: id or title glob)" );
@@ -166,15 +85,11 @@ static KOPENAPI_RESULT h_window_capture( KOPENAPI_CONTEXT&, const nlohmann::json
         return KOPENAPI_RESULT::Error( 409, "the window is minimized" );
 
     wxImage image;
+    int     canvases = 0;
 
-    if( !KIPLATFORM::UI::CaptureWindow( target, image ) || !image.IsOk() )
+    if( !KopenapiCaptureWindow( target, image, &canvases ) )
         return KOPENAPI_RESULT::Error( 501, "this platform cannot draw windows offscreen (e.g. Wayland); "
                                             "sch_view_capture / pcb_view_capture still read the canvases" );
-
-    // Device pixels per window unit (Retina / HiDPI)
-    const wxSize client = target->GetClientSize();
-    const double scale = client.x > 0 ? double( image.GetWidth() ) / client.x : 1.0;
-    const int    canvases = pasteCanvases( target, target, image, scale, KOPENAPI_REGISTRY::Get().CanvasCaptures() );
 
     nlohmann::json result = KopenapiImageResult( image, std::clamp( aArgs.value( "max_width", 1600 ), 200, 8000 ) );
     result["window"] = windowJson( target );

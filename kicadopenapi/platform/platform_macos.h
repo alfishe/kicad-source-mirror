@@ -8,7 +8,7 @@
 namespace kopenapi::platform
 {
 
-/// /tmp: $TMPDIR is per-user and may be missing in sanitized environments (MCP clients)
+/// @brief /tmp: $TMPDIR is per-user and may be missing in sanitized environments (MCP clients)
 std::filesystem::path TempRootMacOS();
 
 std::filesystem::path ExecutablePathMacOS();

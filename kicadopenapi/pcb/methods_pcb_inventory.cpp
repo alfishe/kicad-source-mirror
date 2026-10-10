@@ -1,10 +1,9 @@
-/*
- * kicadopenapi PCB inventories and cards (docs/api/design-analysis-api.md §3–§4):
- * pcb_footprint_list, pcb_net_list, pcb_net_get, pcb_footprint_get.
- *
- * All values in mm (KiCad coordinates: origin top-left, y grows downwards).  Lists are
- * filtered and paginated; cards carry facts, plus heuristic `inferred` data with its basis.
- */
+/// @file methods_pcb_inventory.cpp
+/// @brief kicadopenapi PCB inventories and cards (docs/api/design-analysis-api.md §3–§4):
+/// pcb_footprint_list, pcb_net_list, pcb_net_get, pcb_footprint_get.
+///
+/// All values in mm (KiCad coordinates: origin top-left, y grows downwards).  Lists are
+/// filtered and paginated; cards carry facts, plus heuristic `inferred` data with its basis.
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -41,14 +40,14 @@ static std::string str( const wxString& aText )
 }
 
 
-/// Net names are stored escaped ("RESET{slash}"); agents see and type them unescaped
+/// @brief Net names are stored escaped ("RESET{slash}"); agents see and type them unescaped
 static std::string netName( const wxString& aName )
 {
     return str( UnescapeString( aName ) );
 }
 
 
-/// Board net by name, as typed (unescaped) or in KiCad's stored form
+/// @brief Board net by name, as typed (unescaped) or in KiCad's stored form
 static NETINFO_ITEM* findNet( BOARD* aBoard, const std::string& aName )
 {
     const wxString name = wxString::FromUTF8( aName );
@@ -102,7 +101,7 @@ static std::string upper( std::string aText )
 }
 
 
-/// Per-net aggregates computed in one pass over the board
+/// @brief Per-net aggregates computed in one pass over the board
 struct NET_INFO_AGG
 {
     double                         length = 0.0;
@@ -169,7 +168,7 @@ static std::string netClassName( const NETINFO_ITEM* aNet )
 }
 
 
-/// Heuristic role of a net; every conclusion carries its basis
+/// @brief Heuristic role of a net; every conclusion carries its basis
 static nlohmann::json inferRole( BOARD* aBoard, const NETINFO_ITEM* aNet, const NET_INFO_AGG& aAgg,
                                  const std::vector<const PAD*>& aPads )
 {
@@ -271,7 +270,7 @@ static nlohmann::json padJson( const PAD* aPad, bool aWithFootprint )
 }
 
 
-/// Brief row for lists and the footprint card header
+/// @brief Brief row for lists and the footprint card header
 static nlohmann::json footprintRow( const FOOTPRINT* aFp )
 {
     return { { "ref", str( aFp->GetReference() ) },
@@ -288,7 +287,7 @@ static nlohmann::json footprintRow( const FOOTPRINT* aFp )
 }
 
 
-/// Footprints with this reference (references are not guaranteed unique, may be empty)
+/// @brief Footprints with this reference (references are not guaranteed unique, may be empty)
 static std::vector<FOOTPRINT*> footprintsByRef( BOARD* aBoard, const std::string& aRef )
 {
     std::vector<FOOTPRINT*> found;
@@ -598,6 +597,7 @@ static KOPENAPI_RESULT h_pcb_footprint_get( KOPENAPI_CONTEXT& aCtx, const nlohma
     for( const FP_3DMODEL& model : fp->Models() )
         models.push_back( { { "file", str( model.m_Filename ) }, { "show", model.m_Show } } );
 
+    card["panel_edge"] = KopenapiPanelEdgeJson( fp );
     card["models"] = models;
     return KOPENAPI_RESULT::Ok( card );
 }
