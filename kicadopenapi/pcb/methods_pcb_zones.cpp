@@ -1,11 +1,10 @@
-/*
- * kicadopenapi copper zones: pcb_zone_add, pcb_zones_fill.
- *
- * A pour (typically GND on one or both copper layers) over the board outline or a polygon, with
- * its clearance, minimum width and thermal reliefs, filled by KiCad's own ZONE_FILLER (one undo
- * step).  The answer says what the fill did: area, islands, and how many connections are still
- * open (pads the pour could not reach need stitching vias or tracks).
- */
+/// @file methods_pcb_zones.cpp
+/// @brief kicadopenapi copper zones: pcb_zone_add, pcb_zones_fill.
+///
+/// A pour (typically GND on one or both copper layers) over the board outline or a polygon, with
+/// its clearance, minimum width and thermal reliefs, filled by KiCad's own ZONE_FILLER (one undo
+/// step).  The answer says what the fill did: area, islands, and how many connections are still
+/// open (pads the pour could not reach need stitching vias or tracks).
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -79,7 +78,7 @@ struct ZONE_GLOW_TRAITS
 };
 
 
-/// Fill the zones, push, report per zone and what stays unconnected
+/// @brief Fill the zones, push, report per zone and what stays unconnected
 nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::vector<ZONE*>& aZones )
 {
     BOARD*       board = aContext.GetBoard();

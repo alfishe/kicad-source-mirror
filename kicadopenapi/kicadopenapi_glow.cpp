@@ -78,7 +78,7 @@ public:
     size_t Count() const { return m_newest.size(); }
 
 private:
-    /// Halos of every editor with something glowing (or just emptied)
+    /// @brief Halos of every editor with something glowing (or just emptied)
     void redraw( CLOCK::time_point aNow )
     {
         std::map<KOPENAPI_GLOW_TARGET*, std::vector<std::pair<KIID, double>>> halos;

@@ -1,7 +1,6 @@
-/*
- * kicadopenapi schematic document methods: sch_open, sch_close, sch_save, sch_revert, and
- * the "sch" document provider.  Compiled into the eeschema kiface; registered when it loads.
- */
+/// @file methods_sch_documents.cpp
+/// @brief kicadopenapi schematic document methods: sch_open, sch_close, sch_save, sch_revert, and
+/// the "sch" document provider.  Compiled into the eeschema kiface; registered when it loads.
 #include "kopenapi_sch.h"
 
 #include <wx/log.h>
@@ -26,7 +25,7 @@
 #include <wx/filename.h>
 
 
-/// Headless schematic: the context reads it through this slot (RevertToSaved replaces it)
+/// @brief Headless schematic: the context reads it through this slot (RevertToSaved replaces it)
 static SCHEMATIC*                            s_schematic = nullptr;
 static std::shared_ptr<HEADLESS_SCH_CONTEXT> s_headless;
 
@@ -103,7 +102,7 @@ static nlohmann::json documentStatus( KOPENAPI_CONTEXT& aCtx )
 }
 
 
-/// Another open document of this process belongs to a different project
+/// @brief Another open document of this process belongs to a different project
 static std::string projectConflict( KOPENAPI_CONTEXT& aCtx, const wxFileName& aProject )
 {
     for( const nlohmann::json& doc : KOPENAPI_REGISTRY::Get().Documents( aCtx ) )
@@ -305,7 +304,7 @@ static KOPENAPI_RESULT h_sch_revert( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
 // ---- edit history (kicadopenapi_history.h) --------------------------------------------------
 
-/// Headless: load the copy written into aDir as the open schematic, under its own paths, unsaved
+/// @brief Headless: load the copy written into aDir as the open schematic, under its own paths, unsaved
 static bool restoreHeadless( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
 {
     if( !s_headless || !s_schematic )

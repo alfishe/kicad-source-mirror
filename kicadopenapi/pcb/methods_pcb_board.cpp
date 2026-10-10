@@ -1,13 +1,12 @@
-/*
- * kicadopenapi board from schematic (ROADMAP task 3.1): pcb_new, pcb_netlist_apply,
- * pcb_outline_set.
- *
- * pcb_netlist_apply is KiCad's own "Update PCB from Schematic": a KiCad netlist (from
- * sch_netlist_kicad; design_update_board chains both) read with KICAD_NETLIST_READER, footprints
- * loaded from the libraries, then BOARD_NETLIST_UPDATER through the document context — one undo
- * step in the GUI, the same in headless.  New footprints all land on one insertion point; they
- * are laid out in rows beside the board so nothing overlaps until placement (task 3.2).
- */
+/// @file methods_pcb_board.cpp
+/// @brief kicadopenapi board from schematic (ROADMAP task 3.1): pcb_new, pcb_netlist_apply,
+/// pcb_outline_set.
+///
+/// pcb_netlist_apply is KiCad's own "Update PCB from Schematic": a KiCad netlist (from
+/// sch_netlist_kicad; design_update_board chains both) read with KICAD_NETLIST_READER, footprints
+/// loaded from the libraries, then BOARD_NETLIST_UPDATER through the document context — one undo
+/// step in the GUI, the same in headless.  New footprints all land on one insertion point; they
+/// are laid out in rows beside the board so nothing overlaps until placement (task 3.2).
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -79,7 +78,7 @@ double toMm( double aIU )
 }
 
 
-/// Footprint extent for packing: courtyard if it has one, else its body / pads
+/// @brief Footprint extent for packing: courtyard if it has one, else its body / pads
 BOX2I footprintBox( FOOTPRINT* aFootprint )
 {
     BOX2I box = aFootprint->GetCourtyard( F_CrtYd ).BBox();
@@ -91,7 +90,7 @@ BOX2I footprintBox( FOOTPRINT* aFootprint )
 }
 
 
-/// Board outline extent, if there is one
+/// @brief Board outline extent, if there is one
 std::optional<BOX2I> outlineBox( BOARD* aBoard )
 {
     std::optional<BOX2I> box;
@@ -110,7 +109,7 @@ std::optional<BOX2I> outlineBox( BOARD* aBoard )
     return box;
 }
 
-/// Board editor side of the GUI glow (kicadopenapi_glow_view.h); no frame headless
+/// @brief Board editor side of the GUI glow (kicadopenapi_glow_view.h); no frame headless
 struct PCB_GLOW_TRAITS
 {
     using FRAME = PCB_EDIT_FRAME;
@@ -154,7 +153,7 @@ struct PCB_GLOW_TRAITS
 };
 
 
-/// Glow what a call changed (GUI); a batch lights up one item after another
+/// @brief Glow what a call changed (GUI); a batch lights up one item after another
 void glow( KOPENAPI_CONTEXT& aCtx, const std::vector<KIID>& aItems )
 {
     if( !aCtx.headless )
@@ -162,7 +161,7 @@ void glow( KOPENAPI_CONTEXT& aCtx, const std::vector<KIID>& aItems )
 }
 
 
-/// What a footprint looks like to the netlist update: changes in it make it glow
+/// @brief What a footprint looks like to the netlist update: changes in it make it glow
 std::string footprintState( FOOTPRINT* aFootprint )
 {
     std::string state = str( aFootprint->GetReference() ) + "|" + str( aFootprint->GetValue() ) + "|"
@@ -178,7 +177,7 @@ std::string footprintState( FOOTPRINT* aFootprint )
 }
 
 
-/// No drawing frame on a board: an empty drawing sheet next to it, and a page that fits the
+/// @brief No drawing frame on a board: an empty drawing sheet next to it, and a page that fits the
 /// board plus 10 mm (as the barycenter conversions do)
 void fitPage( BOARD* aBoard, const BOX2I& aOutline )
 {
@@ -589,7 +588,7 @@ static KOPENAPI_RESULT h_pcb_outline_set( KOPENAPI_CONTEXT& aCtx, const nlohmann
 namespace
 {
 
-/// The board-wide constraints the rules methods read and write: name -> member of the settings
+/// @brief The board-wide constraints the rules methods read and write: name -> member of the settings
 std::vector<std::pair<const char*, int BOARD_DESIGN_SETTINGS::*>> constraintFields()
 {
     return { { "min_clearance_mm", &BOARD_DESIGN_SETTINGS::m_MinClearance },
@@ -603,7 +602,7 @@ std::vector<std::pair<const char*, int BOARD_DESIGN_SETTINGS::*>> constraintFiel
 }
 
 
-/// Net class values: name -> getter / setter in mm
+/// @brief Net class values: name -> getter / setter in mm
 struct CLASS_FIELD
 {
     const char*                             name;

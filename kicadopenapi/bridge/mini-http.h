@@ -14,7 +14,7 @@
 namespace bridge
 {
 
-/// region <HttpResult>
+/// @brief region <HttpResult>
 
 struct HttpResult
 {
@@ -26,19 +26,19 @@ struct HttpResult
     std::string error;  // human-readable transport error when !ok
 };
 
-/// endregion </HttpResult>
+/// @brief endregion </HttpResult>
 
-/// Value of a response header (name lowercase), trimmed; "" when absent
+/// @brief Value of a response header (name lowercase), trimmed; "" when absent
 std::string HeaderValue(const HttpResult& result, const std::string& name);
 
-/// Parses "http://host[:port][/path]" (default port 80, default path "/")
+/// @brief Parses "http://host[:port][/path]" (default port 80, default path "/")
 bool ParseUrl(const std::string& url, std::string& host, int& port, std::string& path);
 
-/// Blocking POST with Content-Type: application/json. Handles both
+/// @brief Blocking POST with Content-Type: application/json. Handles both
 /// Content-Length and chunked response bodies (SSE answers are chunked).
 HttpResult Post(const std::string& host, int port, const std::string& path, const std::string& body);
 
-/// Blocking GET with a short receive timeout (status probes)
+/// @brief Blocking GET with a short receive timeout (status probes)
 HttpResult Get(const std::string& host, int port, const std::string& path, int receiveTimeoutSeconds = 5);
 
 } // namespace bridge

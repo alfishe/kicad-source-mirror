@@ -1,12 +1,11 @@
-/*
- * kicadopenapi schematic buses (docs/api/design-analysis-api.md §3 sch_buses): sch_bus_list, sch_bus_get.
- *
- * A bus is reported as a *drawn bus group*: bus segments connected end-to-segment on one sheet
- * instance.  Its members are what actually enters it — the nets of the wires attached through
- * bus entries — so graphical buses without a bus label (designs converted from P-CAD and other
- * tools) still tell which signals run in them.  When the bus carries a bus label ("D[0..7]",
- * "PCI{AD[0..31] CBE[0..3]}"), the declared members are expanded too and compared.
- */
+/// @file methods_sch_buses.cpp
+/// @brief kicadopenapi schematic buses (docs/api/design-analysis-api.md §3 sch_buses): sch_bus_list, sch_bus_get.
+///
+/// A bus is reported as a *drawn bus group*: bus segments connected end-to-segment on one sheet
+/// instance.  Its members are what actually enters it — the nets of the wires attached through
+/// bus entries — so graphical buses without a bus label (designs converted from P-CAD and other
+/// tools) still tell which signals run in them.  When the bus carries a bus label ("D[0..7]",
+/// "PCI{AD[0..31] CBE[0..3]}"), the declared members are expanded too and compared.
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 
@@ -39,7 +38,7 @@ using namespace kopenapi_sch;
 namespace
 {
 
-/// Name without the hierarchical prefix; a trailing '/' (active-low) is kept
+/// @brief Name without the hierarchical prefix; a trailing '/' (active-low) is kept
 std::string shortName( const std::string& aName )
 {
     const size_t slash = aName.size() > 1 ? aName.find_last_of( '/', aName.size() - 2 ) : std::string::npos;
@@ -405,13 +404,11 @@ std::vector<std::string> memberNames( const BUS_GROUP& aGroup )
 }
 
 
-/**
- * Declared members (expanded bus labels) resolved to the nets of this sheet, and the two real
- * findings: a declared member no net carries here, and an entry whose net the label does not
- * declare.  A labelled bus often has no entries at all (a stub between a sheet pin and a
- * label): its members are connected through the label, so "declared but not entered" is no
- * finding.
- */
+/// @brief Declared members (expanded bus labels) resolved to the nets of this sheet, and the two real
+/// findings: a declared member no net carries here, and an entry whose net the label does not
+/// declare.  A labelled bus often has no entries at all (a stub between a sheet pin and a
+/// label): its members are connected through the label, so "declared but not entered" is no
+/// finding.
 void compareDeclared( const BUS_GROUP& aGroup, nlohmann::json& aOut, bool aWithNets )
 {
     if( aGroup.declared.empty() )

@@ -1,10 +1,9 @@
-/*
- * kicadopenapi pcb_stats: level-0 board statistics in one call (docs/api/design-analysis-api.md §2).
- *
- * The default pass is linear in the board size.  `slow: true` adds upstream's full board
- * statistics (copper areas, minimum track clearance — an O(n²) track scan), which is what
- * makes `kicad-cli pcb export stats` take tens of seconds on large boards.
- */
+/// @file methods_pcb_stats.cpp
+/// @brief kicadopenapi pcb_stats: level-0 board statistics in one call (docs/api/design-analysis-api.md §2).
+///
+/// The default pass is linear in the board size.  `slow: true` adds upstream's full board
+/// statistics (copper areas, minimum track clearance — an O(n²) track scan), which is what
+/// makes `kicad-cli pcb export stats` take tens of seconds on large boards.
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -29,7 +28,7 @@
 #include <map>
 
 
-/// IU → mm at nanometre resolution; in double (IUTomm() takes int and overflows on sums)
+/// @brief IU → mm at nanometre resolution; in double (IUTomm() takes int and overflows on sums)
 static double mm( double aIU )
 {
     return std::round( aIU / pcbIUScale.IU_PER_MM * 1e6 ) / 1e6;
@@ -283,7 +282,7 @@ static nlohmann::json otherStats( BOARD* aBoard )
 }
 
 
-/// Board outline as upstream measures it: bbox and area of the outline polygons
+/// @brief Board outline as upstream measures it: bbox and area of the outline polygons
 static nlohmann::json outlineStats( BOARD* aBoard )
 {
     SHAPE_POLY_SET outlines;

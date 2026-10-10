@@ -1,23 +1,22 @@
-/*
- * kicadopenapi method registry.
- *
- * Every Web API method is declared once, next to its handler, and registers itself at
- * static initialization:
- *
- *   static KOPENAPI_RESULT h_open_pcb( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs );
- *
- *   KOPENAPI_REGISTER( "open_pcb", "Open a .kicad_pcb in the PCB editor window",
- *                      R"json({"type":"object","required":["path"],
- *                          "properties":{"path":{"type":"string"}}})json"_json,
- *                      true, h_open_pcb );
- *
- * The registry is the single source of truth: the service routes POST /api/v1/{name}
- * through it and generates /api/v1/openapi.json from it, so the manifest can only list
- * what is actually served.
- *
- * The registry lives in kicommon so that methods registered from kiface DSOs land in the
- * same (process-wide) instance.
- */
+/// @file kicadopenapi_registry.h
+/// @brief kicadopenapi method registry.
+///
+/// Every Web API method is declared once, next to its handler, and registers itself at
+/// static initialization:
+///
+///   static KOPENAPI_RESULT h_open_pcb( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs );
+///
+///   KOPENAPI_REGISTER( "open_pcb", "Open a .kicad_pcb in the PCB editor window",
+///                      R"json({"type":"object","required":["path"],
+///                          "properties":{"path":{"type":"string"}}})json"_json,
+///                      true, h_open_pcb );
+///
+/// The registry is the single source of truth: the service routes POST /api/v1/{name}
+/// through it and generates /api/v1/openapi.json from it, so the manifest can only list
+/// what is actually served.
+///
+/// The registry lives in kicommon so that methods registered from kiface DSOs land in the
+/// same (process-wide) instance.
 #ifndef KICADOPENAPI_REGISTRY_H
 #define KICADOPENAPI_REGISTRY_H
 
@@ -36,7 +35,7 @@
 class KIWAY;
 
 
-/// Process-level surface handed to every handler; handlers always run on the main thread.
+/// @brief Process-level surface handed to every handler; handlers always run on the main thread.
 struct KOPENAPI_CONTEXT
 {
     KIWAY* kiway = nullptr;
@@ -44,7 +43,7 @@ struct KOPENAPI_CONTEXT
 };
 
 
-/// Handler outcome: HTTP status + JSON body.  Errors use { "error": { code, message } }.
+/// @brief Handler outcome: HTTP status + JSON body.  Errors use { "error": { code, message } }.
 struct KOPENAPI_RESULT
 {
     int            status = 200;
@@ -59,37 +58,33 @@ struct KOPENAPI_RESULT
 };
 
 
-/**
- * Reports the document a kiface currently serves for its domain ("sch", "pcb"):
- * { "domain", "path", "project", "unsaved", "mode": "gui"|"headless" }, or null when none
- * is open.  Runs on the main thread.  Feeds /api/v1/status ("documents", "unsaved") and the
- * `documents` method.
- */
+/// @brief Reports the document a kiface currently serves for its domain ("sch", "pcb"):
+/// { "domain", "path", "project", "unsaved", "mode": "gui"|"headless" }, or null when none
+/// is open.  Runs on the main thread.  Feeds /api/v1/status ("documents", "unsaved") and the
+/// `documents` method.
 using KOPENAPI_DOC_STATUS = std::function<nlohmann::json( KOPENAPI_CONTEXT& aCtx )>;
 
-/// Drops in-memory (headless) documents; called on the main thread when the service stops
+/// @brief Drops in-memory (headless) documents; called on the main thread when the service stops
 using KOPENAPI_DOC_RELEASE = std::function<void()>;
 
 
-/**
- * How a kiface rolls its open document back (edit_log / checkpoint / rollback).  GUI editors
- * have an undo stack: a mark is its depth and rolling back undoes down to it (every change
- * counts: API calls, the router, the netlist updater, edits by hand).  Headless documents have
- * none: a mark is a copy of the document written into a directory, rolling back loads it again
- * under the document's own path (unsaved).  Every function runs on the main thread.
- */
+/// @brief How a kiface rolls its open document back (edit_log / checkpoint / rollback).  GUI editors
+/// have an undo stack: a mark is its depth and rolling back undoes down to it (every change
+/// counts: API calls, the router, the netlist updater, edits by hand).  Headless documents have
+/// none: a mark is a copy of the document written into a directory, rolling back loads it again
+/// under the document's own path (unsaved).  Every function runs on the main thread.
 struct KOPENAPI_DOC_HISTORY
 {
-    /// Undo stack depth of the open GUI document; nullopt headless or when none is open
+    /// @brief Undo stack depth of the open GUI document; nullopt headless or when none is open
     std::function<std::optional<int>( KOPENAPI_CONTEXT& )> undoDepth;
 
-    /// GUI: undo until the stack is that deep; false when it cannot get there
+    /// @brief GUI: undo until the stack is that deep; false when it cannot get there
     std::function<bool( KOPENAPI_CONTEXT&, int aDepth )> undoTo;
 
-    /// Headless: write a copy of the open document into aDir; false when none is open
+    /// @brief Headless: write a copy of the open document into aDir; false when none is open
     std::function<bool( KOPENAPI_CONTEXT&, const std::string& aDir )> snapshot;
 
-    /// Headless: load the copy from aDir back as the open document (its own path, unsaved)
+    /// @brief Headless: load the copy from aDir back as the open document (its own path, unsaved)
     std::function<bool( KOPENAPI_CONTEXT&, const std::string& aDir )> restore;
 };
 
@@ -112,14 +107,12 @@ struct KOPENAPI_METHOD
 class wxWindow;
 class wxImage;
 
-/**
- * Reads the pixels of a canvas window a kiface owns (OpenGL schematic / board / 3D canvases),
- * which toolkit window rendering leaves blank.  Returns false for windows it does not own.
- */
+/// @brief Reads the pixels of a canvas window a kiface owns (OpenGL schematic / board / 3D canvases),
+/// which toolkit window rendering leaves blank.  Returns false for windows it does not own.
 using KOPENAPI_CANVAS_CAPTURE = std::function<bool( wxWindow* aWindow, wxImage& aImage )>;
 
 
-/// Thread-safe: kiface DSOs register while HTTP workers read; readers get copies.
+/// @brief Thread-safe: kiface DSOs register while HTTP workers read; readers get copies.
 class KICOMMON_API KOPENAPI_REGISTRY
 {
 public:
@@ -132,36 +125,34 @@ public:
 
     std::vector<std::pair<std::string, KOPENAPI_DOC_STATUS>> DocumentProviders() const;
 
-    /// Release all in-memory documents (main thread, service stop)
+    /// @brief Release all in-memory documents (main thread, service stop)
     void ReleaseDocuments() const;
 
-    /// Open documents of all providers (main thread)
+    /// @brief Open documents of all providers (main thread)
     nlohmann::json Documents( KOPENAPI_CONTEXT& aCtx ) const;
 
     std::vector<KOPENAPI_METHOD> Snapshot() const;
 
-    /// Kifaces register how to read their canvases (window_capture composes them)
+    /// @brief Kifaces register how to read their canvases (window_capture composes them)
     static bool AddCanvasCapture( KOPENAPI_CANVAS_CAPTURE aCapture );
 
     std::vector<KOPENAPI_CANVAS_CAPTURE> CanvasCaptures() const;
 
-    /// Kifaces register how their documents roll back (see KOPENAPI_DOC_HISTORY)
+    /// @brief Kifaces register how their documents roll back (see KOPENAPI_DOC_HISTORY)
     static bool AddDocumentHistory( const std::string& aDomain, KOPENAPI_DOC_HISTORY aHistory );
 
     std::map<std::string, KOPENAPI_DOC_HISTORY> DocumentHistories() const;
 
-    /// Methods that change documents: logged, and history is marked before each call
+    /// @brief Methods that change documents: logged, and history is marked before each call
     static bool MarkEditing( std::initializer_list<const char*> aNames );
 
     bool IsEditing( const std::string& aName ) const;
 
     std::optional<KOPENAPI_METHOD> Find( const std::string& aName ) const;
 
-    /**
-     * Keyword search for the MCP `search` tool: query tokens are matched against method
-     * names (weight 3), summaries (2) and input property names (1); best first, then by
-     * name.  An empty query returns all methods by name.
-     */
+    /// @brief Keyword search for the MCP `search` tool: query tokens are matched against method
+    /// names (weight 3), summaries (2) and input property names (1); best first, then by
+    /// name.  An empty query returns all methods by name.
     std::vector<KOPENAPI_METHOD> Search( const std::string& aQuery, size_t aLimit,
                                          bool aIncludeGuiOnly ) const;
 
@@ -190,7 +181,7 @@ private:
 #define KOPENAPI_REGISTER_HISTORY( aDomain, aHistory )                                     \
     static const bool kopenapi_history_reg = KOPENAPI_REGISTRY::AddDocumentHistory( aDomain, aHistory )
 
-/// The methods of this file that change documents: KOPENAPI_MARK_EDITING( "sch_wire", ... )
+/// @brief The methods of this file that change documents: KOPENAPI_MARK_EDITING( "sch_wire", ... )
 #define KOPENAPI_MARK_EDITING( ... )                                                        \
     static const bool kopenapi_editing_reg = KOPENAPI_REGISTRY::MarkEditing( { __VA_ARGS__ } )
 

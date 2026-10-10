@@ -40,7 +40,7 @@ constexpr int kConnectTimeoutSeconds = 5;
 namespace
 {
 
-/// region <Platform bootstrap>
+/// @brief region <Platform bootstrap>
 
 #ifdef _WIN32
 struct WinsockGuard
@@ -73,11 +73,11 @@ bool EnsureSocketLibrary()
 #endif
 }
 
-/// endregion </Platform bootstrap>
+/// @brief endregion </Platform bootstrap>
 
-/// region <Helpers>
+/// @brief region <Helpers>
 
-/// Non-blocking connect bounded by `timeoutSeconds`. On timeout or failure, `sock` is left
+/// @brief Non-blocking connect bounded by `timeoutSeconds`. On timeout or failure, `sock` is left
 /// connected-or-not exactly as connect()/select() leaves it - the caller closes it either way.
 /// `error` is only written on failure.
 bool ConnectWithTimeout(SocketHandle sock, const struct sockaddr* addr, int addrLen, int timeoutSeconds,
@@ -186,7 +186,7 @@ std::string ToLower(const std::string& text)
     return lower;
 }
 
-/// Reassembles a chunked transfer-encoded body (hex sizes, CRLF framed)
+/// @brief Reassembles a chunked transfer-encoded body (hex sizes, CRLF framed)
 std::string Dechunk(const std::string& chunked)
 {
     std::string out;
@@ -230,14 +230,14 @@ std::string Dechunk(const std::string& chunked)
     return out;
 }
 
-/// endregion </Helpers>
+/// @brief endregion </Helpers>
 
 } // namespace
 
 namespace bridge
 {
 
-/// region <Public API>
+/// @brief region <Public API>
 
 bool ParseUrl(const std::string& url, std::string& host, int& port, std::string& path)
 {
@@ -551,6 +551,6 @@ std::string HeaderValue(const HttpResult& result, const std::string& name)
     return block.substr(valueStart, valueEnd - valueStart);
 }
 
-/// endregion </Public API>
+/// @brief endregion </Public API>
 
 } // namespace bridge

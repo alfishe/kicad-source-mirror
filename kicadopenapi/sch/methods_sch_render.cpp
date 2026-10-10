@@ -1,12 +1,11 @@
-/*
- * kicadopenapi schematic rendering: sch_render.
- *
- * Draws a sheet of the *live* schematic (unsaved edits included) with KiCad's own plotter to
- * PNG — the same renderer as File > Plot / `kicad-cli sch export` — so agents and people can look
- * at the result without screen capture (no OS screen-recording permission involved), in the GUI
- * and headless alike.  By default the page frame is left out and the image is cropped to the
- * drawing.  Over MCP the image is returned as image content.
- */
+/// @file methods_sch_render.cpp
+/// @brief kicadopenapi schematic rendering: sch_render.
+///
+/// Draws a sheet of the *live* schematic (unsaved edits included) with KiCad's own plotter to
+/// PNG — the same renderer as File > Plot / `kicad-cli sch export` — so agents and people can look
+/// at the result without screen capture (no OS screen-recording permission involved), in the GUI
+/// and headless alike.  By default the page frame is left out and the image is cropped to the
+/// drawing.  Over MCP the image is returned as image content.
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 
@@ -173,7 +172,7 @@ static KOPENAPI_RESULT h_sch_view_capture( KOPENAPI_CONTEXT& aCtx, const nlohman
 }
 
 
-/// window_capture: schematic-side OpenGL canvases read back in place
+/// @brief window_capture: schematic-side OpenGL canvases read back in place
 KOPENAPI_REGISTER_CANVAS_CAPTURE(
         []( wxWindow* aWindow, wxImage& aImage ) -> bool
         {

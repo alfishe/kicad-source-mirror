@@ -68,7 +68,7 @@ std::string isoTime( long long aMillis )
 }
 
 
-/// Replaces wxLogGui (dialogs) and wxLogStderr for the whole process
+/// @brief Replaces wxLogGui (dialogs) and wxLogStderr for the whole process
 class JOURNAL_LOG_TARGET : public wxLog
 {
 protected:

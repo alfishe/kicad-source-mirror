@@ -1,10 +1,9 @@
-/*
- * kicadopenapi schematic -> board: sch_netlist_kicad.
- *
- * The KiCad netlist of the open schematic, built in memory the way the editor builds it for
- * "Update PCB from Schematic" (NETLIST_EXPORTER_KICAD, GNL_ALL | GNL_OPT_KICAD), so the board can
- * follow unsaved schematic edits.  Consumed by design_update_board -> pcb_netlist_apply.
- */
+/// @file methods_sch_board.cpp
+/// @brief kicadopenapi schematic -> board: sch_netlist_kicad.
+///
+/// The KiCad netlist of the open schematic, built in memory the way the editor builds it for
+/// "Update PCB from Schematic" (NETLIST_EXPORTER_KICAD, GNL_ALL | GNL_OPT_KICAD), so the board can
+/// follow unsaved schematic edits.  Consumed by design_update_board -> pcb_netlist_apply.
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 

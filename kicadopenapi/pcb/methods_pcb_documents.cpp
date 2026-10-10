@@ -1,7 +1,6 @@
-/*
- * kicadopenapi PCB document methods: pcb_open, pcb_close, pcb_save, pcb_revert, and the
- * "pcb" document provider.  Compiled into the pcbnew kiface; registered when it loads.
- */
+/// @file methods_pcb_documents.cpp
+/// @brief kicadopenapi PCB document methods: pcb_open, pcb_close, pcb_save, pcb_revert, and the
+/// "pcb" document provider.  Compiled into the pcbnew kiface; registered when it loads.
 #include "kopenapi_pcb.h"
 
 #include <wx/log.h>
@@ -25,7 +24,7 @@
 #include <wx/filename.h>
 
 
-/// Headless board; GUI hosts use the editor frame instead
+/// @brief Headless board; GUI hosts use the editor frame instead
 static std::shared_ptr<HEADLESS_PCB_CONTEXT> s_headless;
 
 
@@ -74,7 +73,7 @@ static nlohmann::json documentStatus( KOPENAPI_CONTEXT& aCtx )
 }
 
 
-/// Another open document of this process belongs to a different project
+/// @brief Another open document of this process belongs to a different project
 static std::string projectConflict( KOPENAPI_CONTEXT& aCtx, const wxFileName& aProject )
 {
     for( const nlohmann::json& doc : KOPENAPI_REGISTRY::Get().Documents( aCtx ) )

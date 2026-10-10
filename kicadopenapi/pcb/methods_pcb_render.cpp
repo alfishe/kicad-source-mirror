@@ -1,10 +1,9 @@
-/*
- * kicadopenapi board rendering: pcb_render (layers plotted to PNG) and pcb_render_3d (the 3D
- * raytracer).  Both run KiCad's own jobs — the code behind `kicad-cli pcb export png` and
- * `kicad-cli pcb render` — on the live board (unsaved edits included) through
- * PCBNEW_JOBS_HANDLER::SetBoardOverride, in the GUI and headless.  Over MCP the result is an
- * image.
- */
+/// @file methods_pcb_render.cpp
+/// @brief kicadopenapi board rendering: pcb_render (layers plotted to PNG) and pcb_render_3d (the 3D
+/// raytracer).  Both run KiCad's own jobs — the code behind `kicad-cli pcb export png` and
+/// `kicad-cli pcb render` — on the live board (unsaved edits included) through
+/// PCBNEW_JOBS_HANDLER::SetBoardOverride, in the GUI and headless.  Over MCP the result is an
+/// image.
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -29,7 +28,7 @@
 namespace
 {
 
-/// Board jobs on the live board for the duration of a call
+/// @brief Board jobs on the live board for the duration of a call
 struct BOARD_OVERRIDE
 {
     explicit BOARD_OVERRIDE( BOARD* aBoard ) { PCBNEW_JOBS_HANDLER::SetBoardOverride( aBoard ); }

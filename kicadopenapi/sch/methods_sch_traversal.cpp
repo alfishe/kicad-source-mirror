@@ -1,12 +1,11 @@
-/*
- * kicadopenapi schematic traversal (docs/api/design-analysis-api.md §5):
- * sch_net_trace, sch_symbol_neighbors, sch_path_find, sch_power_tree, sch_interface_map,
- * sch_net_search, sch_subcircuit.
- *
- * All methods work on one connectivity graph built per call: components (by reference,
- * units merged) connected through nets via their pins — the same nets and pins as
- * sch_net_get / the netlist exporter.
- */
+/// @file methods_sch_traversal.cpp
+/// @brief kicadopenapi schematic traversal (docs/api/design-analysis-api.md §5):
+/// sch_net_trace, sch_symbol_neighbors, sch_path_find, sch_power_tree, sch_interface_map,
+/// sch_net_search, sch_subcircuit.
+///
+/// All methods work on one connectivity graph built per call: components (by reference,
+/// units merged) connected through nets via their pins — the same nets and pins as
+/// sch_net_get / the netlist exporter.
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 
@@ -125,7 +124,7 @@ nlohmann::json pinBrief( const GRAPH& g, int aPin )
 }
 
 
-/// A net is not walked through when it is a power net (optional) or too big (fan-out)
+/// @brief A net is not walked through when it is a power net (optional) or too big (fan-out)
 bool blocked( const GRAPH& g, int aNet, bool aSkipPower, int aMaxFanout )
 {
     if( aSkipPower && g.netIsPower[aNet] )
@@ -135,14 +134,14 @@ bool blocked( const GRAPH& g, int aNet, bool aSkipPower, int aMaxFanout )
 }
 
 
-/// Two-terminal parts (R, C, L, diodes, ferrites...) are what signals pass "through"
+/// @brief Two-terminal parts (R, C, L, diodes, ferrites...) are what signals pass "through"
 bool isPassive( const COMPONENT& aComp )
 {
     return aComp.pins.size() <= 2;
 }
 
 
-/// Distance between two sheet instances in the hierarchy tree
+/// @brief Distance between two sheet instances in the hierarchy tree
 size_t treeDistance( const SCH_SHEET_PATH& aA, const SCH_SHEET_PATH& aB )
 {
     size_t common = 0;

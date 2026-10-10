@@ -1,11 +1,10 @@
-/*
- * kicadopenapi schematic layout check: sch_layout_check.
- *
- * Readability problems a render shows but ERC does not: texts lying on each other, a part's
- * reference / value text over another part's body, part bodies overlapping.  Each finding names
- * both items (reference, field or label text, uuid) and where, so an agent can move one of them
- * (sch_symbol_update field_positions / position) without having to read the picture.
- */
+/// @file methods_sch_layout.cpp
+/// @brief kicadopenapi schematic layout check: sch_layout_check.
+///
+/// Readability problems a render shows but ERC does not: texts lying on each other, a part's
+/// reference / value text over another part's body, part bodies overlapping.  Each finding names
+/// both items (reference, field or label text, uuid) and where, so an agent can move one of them
+/// (sch_symbol_update field_positions / position) without having to read the picture.
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 

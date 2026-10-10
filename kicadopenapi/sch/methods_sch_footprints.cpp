@@ -1,12 +1,11 @@
-/*
- * kicadopenapi symbol <-> footprint check: sch_footprint_check.
- *
- * Before a board is made from the schematic: does every part have a footprint, does the
- * footprint exist, does every symbol pin find its pad (by number, like the netlist exporter)
- * and which numbered pads no pin uses.  Numbers only: a diode whose pins are 1 = K, 2 = A finds
- * pads 1 and 2 on any two-pad footprint; polarity is the footprint's convention (pad 1 = K for
- * KiCad's LED / diode footprints).
- */
+/// @file methods_sch_footprints.cpp
+/// @brief kicadopenapi symbol <-> footprint check: sch_footprint_check.
+///
+/// Before a board is made from the schematic: does every part have a footprint, does the
+/// footprint exist, does every symbol pin find its pad (by number, like the netlist exporter)
+/// and which numbered pads no pin uses.  Numbers only: a diode whose pins are 1 = K, 2 = A finds
+/// pads 1 and 2 on any two-pad footprint; polarity is the footprint's convention (pad 1 = K for
+/// KiCad's LED / diode footprints).
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 

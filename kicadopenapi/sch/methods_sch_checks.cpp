@@ -1,11 +1,10 @@
-/*
- * kicadopenapi schematic checks: sch_erc.
- *
- * Runs KiCad's own ERC (ERC_TESTER, as `kicad-cli sch erc` does) on the live schematic and
- * returns the erc.v1 report KiCad writes (ERC_REPORT::GetJsonReport), plus a summary and a
- * flat, filterable, paginated violation list for agents.  In the GUI the markers appear in the
- * open editor, like running ERC from its dialog.
- */
+/// @file methods_sch_checks.cpp
+/// @brief kicadopenapi schematic checks: sch_erc.
+///
+/// Runs KiCad's own ERC (ERC_TESTER, as `kicad-cli sch erc` does) on the live schematic and
+/// returns the erc.v1 report KiCad writes (ERC_REPORT::GetJsonReport), plus a summary and a
+/// flat, filterable, paginated violation list for agents.  In the GUI the markers appear in the
+/// open editor, like running ERC from its dialog.
 #include "kopenapi_sch.h"
 
 #include <api/sch_context.h>

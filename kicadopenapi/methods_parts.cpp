@@ -1,15 +1,14 @@
-/*
- * kicadopenapi part selection (ROADMAP task 2.2): part_find.
- *
- * One call from "what the design needs" — a function or part name, a value, a package — to
- * parts ready to place: the library symbol, the value to give it, footprints that fit (the
- * symbol's own footprint, then its footprint filters + pin count + package words), and the
- * arguments for sch_symbol_add.  Generic passives (resistor, capacitor, LED, ...) map to KiCad's
- * Device symbols, whose footprint is chosen by package (0603, 1206, axial, ...).
- *
- * Lives in kicommon and combines the library methods of both editors through the registry
- * (sch_lib_symbol_search / _get, pcb_lib_footprint_search).
- */
+/// @file methods_parts.cpp
+/// @brief kicadopenapi part selection (ROADMAP task 2.2): part_find.
+///
+/// One call from "what the design needs" — a function or part name, a value, a package — to
+/// parts ready to place: the library symbol, the value to give it, footprints that fit (the
+/// symbol's own footprint, then its footprint filters + pin count + package words), and the
+/// arguments for sch_symbol_add.  Generic passives (resistor, capacitor, LED, ...) map to KiCad's
+/// Device symbols, whose footprint is chosen by package (0603, 1206, axial, ...).
+///
+/// Lives in kicommon and combines the library methods of both editors through the registry
+/// (sch_lib_symbol_search / _get, pcb_lib_footprint_search).
 #include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
 #include <kiway.h>
@@ -62,7 +61,7 @@ std::vector<std::string> words( const std::string& aText )
 }
 
 
-/// "D5.0mm" -> "5mm", "P2.50mm" -> "2.5mm": a dimension token without its letter and trailing zeros
+/// @brief "D5.0mm" -> "5mm", "P2.50mm" -> "2.5mm": a dimension token without its letter and trailing zeros
 std::string normalizeToken( std::string aToken )
 {
     if( aToken.size() > 1 && std::isalpha( (unsigned char) aToken[0] ) && std::isdigit( (unsigned char) aToken[1] ) )
@@ -89,11 +88,9 @@ std::string normalizeToken( std::string aToken )
 }
 
 
-/**
- * How well a footprint name fits package words: per word 3 for a whole name token ("0603" in
- * R_0603_1608Metric, not in R_0201_0603Metric), 2 for the same dimension ("5mm" = "D5.0mm"),
- * 1 for a substring; 0 when a word does not occur at all.
- */
+/// @brief How well a footprint name fits package words: per word 3 for a whole name token ("0603" in
+/// R_0603_1608Metric, not in R_0201_0603Metric), 2 for the same dimension ("5mm" = "D5.0mm"),
+/// 1 for a substring; 0 when a word does not occur at all.
 int packageScore( const std::vector<std::string>& aPackage, const std::string& aFootprint )
 {
     std::string name = lower( aFootprint );
@@ -144,7 +141,7 @@ int packageScore( const std::vector<std::string>& aPackage, const std::string& a
 }
 
 
-/// Generic parts: the word an engineer uses -> KiCad's generic symbol
+/// @brief Generic parts: the word an engineer uses -> KiCad's generic symbol
 const std::vector<std::pair<std::vector<std::string>, std::string>>& genericParts()
 {
     static const std::vector<std::pair<std::vector<std::string>, std::string>> table = {
@@ -164,7 +161,7 @@ const std::vector<std::pair<std::vector<std::string>, std::string>>& genericPart
 }
 
 
-/// Rows x pins from "2x3", "1x04", "4 pin", "4-pin", "4pin", "4 way"; 0 when not given
+/// @brief Rows x pins from "2x3", "1x04", "4 pin", "4-pin", "4pin", "4 way"; 0 when not given
 std::pair<int, int> connectorLayout( const std::vector<std::string>& aQuery )
 {
     for( size_t k = 0; k < aQuery.size(); ++k )
@@ -208,13 +205,11 @@ bool hasWord( const std::vector<std::string>& aQuery, std::initializer_list<cons
 }
 
 
-/**
- * A generic part for the query, with the package words it implies:
- *  - "screw terminal 2 pin" -> Connector:Screw_Terminal_01x02, Phoenix MKDS 5.08 mm by default
- *  - "pin header 2x3", "JST XH 4 pin connector" -> Connector_Generic:Conn_02x03_Odd_Even /
- *    Conn_01x04, the rows x pins token ("2x03") and a 2.54 mm vertical pin header by default
- *  - resistor, capacitor, LED, ... -> Device:*
- */
+/// @brief A generic part for the query, with the package words it implies:
+///  - "screw terminal 2 pin" -> Connector:Screw_Terminal_01x02, Phoenix MKDS 5.08 mm by default
+///  - "pin header 2x3", "JST XH 4 pin connector" -> Connector_Generic:Conn_02x03_Odd_Even /
+///    Conn_01x04, the rows x pins token ("2x03") and a 2.54 mm vertical pin header by default
+///  - resistor, capacitor, LED, ... -> Device:*
 std::string genericSymbol( const std::vector<std::string>& aQuery, std::vector<std::string>& aDefaultPackage,
                            std::vector<std::string>& aLayout )
 {
@@ -253,7 +248,7 @@ std::string genericSymbol( const std::vector<std::string>& aQuery, std::vector<s
 }
 
 
-/// "10k", "4.7k", "4k7", "100nf", "10uf", "330", "16mhz", "1m" ...: a component value
+/// @brief "10k", "4.7k", "4k7", "100nf", "10uf", "330", "16mhz", "1m" ...: a component value
 bool looksLikeValue( const std::string& aWord )
 {
     if( aWord.empty() || !std::isdigit( (unsigned char) aWord[0] ) )
@@ -280,7 +275,7 @@ bool looksLikeValue( const std::string& aWord )
 }
 
 
-/// Words of a generic part's query that describe its package / series ("jst", "xh", "0603")
+/// @brief Words of a generic part's query that describe its package / series ("jst", "xh", "0603")
 std::vector<std::string> packageWordsOf( const std::vector<std::string>& aQuery )
 {
     static const std::set<std::string> skip = {

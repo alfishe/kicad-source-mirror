@@ -1,8 +1,7 @@
-/*
- * kicadopenapi GUI glow over an editor's view: the halo drawing and brightening an editor kiface
- * plugs into the shared KOPENAPI_GLOW_MANAGER (kicadopenapi_glow.h).  Header-only: each editor
- * instantiates KOPENAPI_VIEW_GLOW_TARGET with its traits.
- */
+/// @file kicadopenapi_glow_view.h
+/// @brief kicadopenapi GUI glow over an editor's view: the halo drawing and brightening an editor kiface
+/// plugs into the shared KOPENAPI_GLOW_MANAGER (kicadopenapi_glow.h).  Header-only: each editor
+/// instantiates KOPENAPI_VIEW_GLOW_TARGET with its traits.
 #ifndef KICADOPENAPI_GLOW_VIEW_H
 #define KICADOPENAPI_GLOW_VIEW_H
 
@@ -29,7 +28,7 @@
 class KIWAY;
 
 
-/// Vivid blue: not among KiCad's default schematic colours; KOPENAPI_GLOW_COLOR=#RRGGBB overrides
+/// @brief Vivid blue: not among KiCad's default schematic colours; KOPENAPI_GLOW_COLOR=#RRGGBB overrides
 inline KIGFX::COLOR4D KopenapiGlowColour( double aAlpha )
 {
     static const KIGFX::COLOR4D base = []()
@@ -51,23 +50,21 @@ inline KIGFX::COLOR4D KopenapiGlowColour( double aAlpha )
 }
 
 
-/**
- * An editor's glow target over its view, from its traits:
- *   using FRAME = the editor frame type
- *   static FRAME*    Frame( KIWAY* )                      the open editor, or nullptr (headless)
- *   static EDA_ITEM* Resolve( FRAME*, const KIID& )       item by uuid, or nullptr
- *   static void      Brighten( FRAME*, EDA_ITEM*, bool )  set / clear the item's brightening
- *   static BOX2I     Box( EDA_ITEM* )                     extent for the halo
- *   static int       Mm()                                 internal units per mm
- *   static void      ItemColour( FRAME*, bool aGlow, std::optional<KIGFX::COLOR4D>& aSaved )
- */
+/// @brief An editor's glow target over its view, from its traits:
+///   using FRAME = the editor frame type
+///   static FRAME*    Frame( KIWAY* )                      the open editor, or nullptr (headless)
+///   static EDA_ITEM* Resolve( FRAME*, const KIID& )       item by uuid, or nullptr
+///   static void      Brighten( FRAME*, EDA_ITEM*, bool )  set / clear the item's brightening
+///   static BOX2I     Box( EDA_ITEM* )                     extent for the halo
+///   static int       Mm()                                 internal units per mm
+///   static void      ItemColour( FRAME*, bool aGlow, std::optional<KIGFX::COLOR4D>& aSaved )
 template <typename TRAITS>
 class KOPENAPI_VIEW_GLOW_TARGET : public KOPENAPI_GLOW_TARGET
 {
 public:
     using FRAME = typename TRAITS::FRAME;
 
-    /// The editor's target (one per kiface); remembers the KIWAY to find its frame later
+    /// @brief The editor's target (one per kiface); remembers the KIWAY to find its frame later
     static KOPENAPI_VIEW_GLOW_TARGET* Get( KIWAY* aKiway )
     {
         static KOPENAPI_VIEW_GLOW_TARGET* target = new KOPENAPI_VIEW_GLOW_TARGET();
@@ -106,7 +103,7 @@ public:
         m_overlayView = nullptr;
     }
 
-    /// Nested rounded outlines around each glowing item, fading outwards and with age
+    /// @brief Nested rounded outlines around each glowing item, fading outwards and with age
     void Halo( const std::vector<std::pair<KIID, double>>& aItems ) override
     {
         FRAME* frame = TRAITS::Frame( m_kiway );
@@ -166,7 +163,7 @@ private:
 };
 
 
-/// Glow these items of the editor behind TRAITS (no-op headless); aStaggerMs: one after another
+/// @brief Glow these items of the editor behind TRAITS (no-op headless); aStaggerMs: one after another
 template <typename TRAITS>
 void KopenapiGlow( KIWAY* aKiway, const std::vector<KIID>& aItems, int aStaggerMs = 0 )
 {

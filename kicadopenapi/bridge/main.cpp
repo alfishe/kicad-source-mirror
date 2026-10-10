@@ -54,7 +54,7 @@ namespace
 
 constexpr const char* kVersion = "0.2.0";
 
-/// region <Configuration>
+/// @brief region <Configuration>
 
 struct Config
 {
@@ -68,7 +68,7 @@ struct Config
     fs::path kicadCli;
 };
 
-/// "600", "90s", "10m", "1m30s", "1h" → seconds; nullopt on garbage
+/// @brief "600", "90s", "10m", "1m30s", "1h" → seconds; nullopt on garbage
 std::optional<std::chrono::seconds> ParseDuration(const std::string& text)
 {
     if (text == "off" || text == "never")
@@ -181,9 +181,9 @@ std::optional<Config> ParseConfig(int argc, char** argv)
     return cfg;
 }
 
-/// endregion </Configuration>
+/// @brief endregion </Configuration>
 
-/// region <Signal-safe child registry>
+/// @brief region <Signal-safe child registry>
 
 // Headless children the bridge started; killed when the bridge is terminated by a signal or
 // console close (graceful shutdown happens on stdin EOF instead)
@@ -219,15 +219,15 @@ void TerminateHeadlessChildren()
     }
 }
 
-/// Termination signal / console close: async-signal-safe, the process exits afterwards
+/// @brief Termination signal / console close: async-signal-safe, the process exits afterwards
 void OnTermination()
 {
     TerminateHeadlessChildren();
 }
 
-/// endregion </Signal-safe child registry>
+/// @brief endregion </Signal-safe child registry>
 
-/// region <JSON-RPC helpers>
+/// @brief region <JSON-RPC helpers>
 
 void Emit(const json& message)
 {
@@ -265,7 +265,7 @@ std::string Lower(std::string text)
     return text;
 }
 
-/// Same matching idea as the server's registry search, for the bridge's own methods
+/// @brief Same matching idea as the server's registry search, for the bridge's own methods
 bool Matches(const json& method, const std::string& query)
 {
     std::string hay = Lower(method["name"].get<std::string>() + " " + method["summary"].get<std::string>());
@@ -322,7 +322,7 @@ json InstanceJson(const bridge::Instance& inst)
             {"url", inst.url}};
 }
 
-/// endregion </JSON-RPC helpers>
+/// @brief endregion </JSON-RPC helpers>
 
 // Instance management methods, owned by the bridge. They are not MCP tools: like every KiCad
 // method they are found with `search` and called with `invoke`.
@@ -372,10 +372,10 @@ public:
 
     void HandleLine(const std::string& line);
 
-    /// Reaper thread body: collects exited children and stops idle headless instances
+    /// @brief Reaper thread body: collects exited children and stops idle headless instances
     void Housekeeping();
 
-    /// Graceful stop of the headless instances this bridge started (stdin EOF)
+    /// @brief Graceful stop of the headless instances this bridge started (stdin EOF)
     void Shutdown();
 
 private:
@@ -394,12 +394,12 @@ private:
     bool EnsureBound(std::string& error);
     std::optional<bridge::Instance> Start(const std::string& mode, const std::string& path, std::string& error);
 
-    /// Forward one request line; std::nullopt on transport failure (error already emitted)
+    /// @brief Forward one request line; std::nullopt on transport failure (error already emitted)
     std::optional<bridge::HttpResult> Forward(const std::string& line, const json& id);
 
     json CallBridgeMethod(const std::string& name, const json& args);
 
-    /// MCP `search`: the bound instance's methods + matching bridge methods
+    /// @brief MCP `search`: the bound instance's methods + matching bridge methods
     json Search(const std::string& line, const json& args);
     json ListInstances();
 

@@ -1,7 +1,6 @@
-/*
- * kicadopenapi board-side captures: pcb_view_capture (board editor, footprint editor, footprint
- * viewer, 3D viewer canvases as shown) and the canvas read-back window_capture composes.
- */
+/// @file methods_pcb_view.cpp
+/// @brief kicadopenapi board-side captures: pcb_view_capture (board editor, footprint editor, footprint
+/// viewer, 3D viewer canvases as shown) and the canvas read-back window_capture composes.
 #include "kopenapi_pcb.h"
 
 #include <3d_canvas/eda_3d_canvas.h>
@@ -71,7 +70,7 @@ static KOPENAPI_RESULT h_pcb_view_capture( KOPENAPI_CONTEXT& aCtx, const nlohman
 }
 
 
-/// window_capture: board-side OpenGL canvases (2D and 3D) read back in place
+/// @brief window_capture: board-side OpenGL canvases (2D and 3D) read back in place
 KOPENAPI_REGISTER_CANVAS_CAPTURE(
         []( wxWindow* aWindow, wxImage& aImage ) -> bool
         {

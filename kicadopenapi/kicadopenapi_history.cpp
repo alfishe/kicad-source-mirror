@@ -14,14 +14,14 @@ namespace
 
 using CLOCK = std::chrono::system_clock;
 
-/// One document's state at a mark: undo depth (GUI) or a copy (headless)
+/// @brief One document's state at a mark: undo depth (GUI) or a copy (headless)
 struct DOC_MARK
 {
     std::optional<int> depth;
     std::string        snapshot;   ///< directory with the copy
 };
 
-/// Every open document at one moment
+/// @brief Every open document at one moment
 struct MARK
 {
     std::map<std::string, DOC_MARK> docs;   ///< by domain
@@ -56,7 +56,7 @@ std::string now()
 }
 
 
-/// Arguments as logged: long strings (netlists, images) shortened
+/// @brief Arguments as logged: long strings (netlists, images) shortened
 nlohmann::json brief( const nlohmann::json& aArgs )
 {
     if( aArgs.is_string() && aArgs.get<std::string>().size() > 200 )
@@ -144,7 +144,7 @@ struct KOPENAPI_HISTORY::IMPL
         return m;
     }
 
-    /// Bring every marked document back to the mark; per domain what happened
+    /// @brief Bring every marked document back to the mark; per domain what happened
     nlohmann::json restore( KOPENAPI_CONTEXT& aCtx, const MARK& aMark )
     {
         nlohmann::json done = nlohmann::json::object();
@@ -170,7 +170,7 @@ struct KOPENAPI_HISTORY::IMPL
         return done;
     }
 
-    /// Keep marks of the last MAX_STEPS steps (headless copies cost disk)
+    /// @brief Keep marks of the last MAX_STEPS steps (headless copies cost disk)
     void trim()
     {
         while( log.size() > MAX_STEPS )

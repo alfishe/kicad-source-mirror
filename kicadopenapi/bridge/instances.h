@@ -26,22 +26,22 @@ struct Instance
     std::filesystem::file_time_type started;
 };
 
-/// Live instances (files of dead processes are ignored)
+/// @brief Live instances (files of dead processes are ignored)
 std::vector<Instance> Discover(const std::filesystem::path& dir);
 
 std::optional<Instance> FindByPid(const std::filesystem::path& dir, long pid);
 
-/// Policy: newest | oldest | gui | headless | pid:<n> | port:<n>
+/// @brief Policy: newest | oldest | gui | headless | pid:<n> | port:<n>
 std::optional<Instance> Select(const std::vector<Instance>& instances, const std::string& policy);
 
-/// Waits until the process publishes its discovery file; nullopt if it exits or times out
+/// @brief Waits until the process publishes its discovery file; nullopt if it exits or times out
 std::optional<Instance> WaitForInstance(const std::filesystem::path& dir, long pid,
                                         std::chrono::seconds timeout);
 
-/// Graceful stop: POST <url>/api/v1/shutdown, then a hard kill if still alive after grace
+/// @brief Graceful stop: POST <url>/api/v1/shutdown, then a hard kill if still alive after grace
 void Stop(const Instance& inst, std::chrono::seconds grace);
 
-/// Deletes regular files in dir older than maxAge (old child logs)
+/// @brief Deletes regular files in dir older than maxAge (old child logs)
 void PruneOldFiles(const std::filesystem::path& dir, std::chrono::hours maxAge);
 
 } // namespace bridge

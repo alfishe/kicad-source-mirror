@@ -26,7 +26,7 @@ static json rpcError( const json& aId, int aCode, const std::string& aMessage )
 }
 
 
-/// MCP tool result: JSON text for any client plus structuredContent for typed clients
+/// @brief MCP tool result: JSON text for any client plus structuredContent for typed clients
 static json toolResult( json aData, bool aIsError )
 {
     if( !aData.is_object() )

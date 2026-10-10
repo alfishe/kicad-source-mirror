@@ -1,11 +1,10 @@
-/*
- * kicadopenapi schematic statistics, inventories and net cards (docs/api/design-analysis-api.md):
- * sch_stats, sch_sheet_list, sch_symbol_list, sch_net_list, sch_net_get.
- *
- * Symbols and nets are reported per sheet *instance* (a reused sheet yields distinct
- * references and net members per instance), using the same connection graph KiCad's
- * netlist exporter uses.  Drawing items (wires, labels, ...) are counted per file.
- */
+/// @file methods_sch_inventory.cpp
+/// @brief kicadopenapi schematic statistics, inventories and net cards (docs/api/design-analysis-api.md):
+/// sch_stats, sch_sheet_list, sch_symbol_list, sch_net_list, sch_net_get.
+///
+/// Symbols and nets are reported per sheet *instance* (a reused sheet yields distinct
+/// references and net members per instance), using the same connection graph KiCad's
+/// netlist exporter uses.  Drawing items (wires, labels, ...) are counted per file.
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 
@@ -35,12 +34,10 @@
 using namespace kopenapi_sch;
 
 
-/**
- * Count the drawing items of a .kicad_sch file as written on disk (top-level S-expression
- * nodes), named like the model counts.  KiCad's loader normalises older files (merges
- * colinear wire/bus segments, adds implied junctions), so the model and the file can differ.
- * Returns false for unreadable or non-S-expression files.
- */
+/// @brief Count the drawing items of a .kicad_sch file as written on disk (top-level S-expression
+/// nodes), named like the model counts.  KiCad's loader normalises older files (merges
+/// colinear wire/bus segments, adds implied junctions), so the model and the file can differ.
+/// Returns false for unreadable or non-S-expression files.
 static bool countFileItems( const std::string& aPath, std::map<std::string, int>& aItems )
 {
     std::ifstream in( aPath, std::ios::binary );
@@ -475,7 +472,7 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
 }
 
 
-/// Summary of one net for lists
+/// @brief Summary of one net for lists
 static nlohmann::json netRow( const NET_ENTRY& aNet, PAD_RESOLVER* aPads )
 {
     int                   pins = 0, labels = 0;

@@ -1,13 +1,12 @@
-/*
- * kicadopenapi schematic edits (step d4): sch_new, sch_symbol_add, sch_symbol_update,
- * sch_item_delete, sch_connect, sch_no_connect, sch_annotate.
- *
- * Every method is one SCH_COMMIT through the context's tool manager: in the GUI it is one undo
- * step, repaints and marks the document modified, like an edit made by hand; headless the
- * commit recalculates connectivity the same way.  Connections are made with labels (or power
- * symbols) on pins, so an agent never routes wires geometrically.  Coordinates are mm on the
- * 1.27 mm (50 mil) connection grid.
- */
+/// @file methods_sch_edit.cpp
+/// @brief kicadopenapi schematic edits (step d4): sch_new, sch_symbol_add, sch_symbol_update,
+/// sch_item_delete, sch_connect, sch_no_connect, sch_annotate.
+///
+/// Every method is one SCH_COMMIT through the context's tool manager: in the GUI it is one undo
+/// step, repaints and marks the document modified, like an edit made by hand; headless the
+/// commit recalculates connectivity the same way.  Connections are made with labels (or power
+/// symbols) on pins, so an agent never routes wires geometrically.  Coordinates are mm on the
+/// 1.27 mm (50 mil) connection grid.
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 #include "kopenapi_sch_router.h"
@@ -72,7 +71,7 @@ double toMm( int aIU )
 }
 
 
-/// Target sheet instance: args "sheet" (human path as listed by sch_sheet_list), else the
+/// @brief Target sheet instance: args "sheet" (human path as listed by sch_sheet_list), else the
 /// editor's current sheet, else the root
 std::optional<SCH_SHEET_PATH> targetSheet( SCH_CONTEXT& aContext, const nlohmann::json& aArgs )
 {
@@ -133,7 +132,7 @@ struct SYMBOL_AT
 };
 
 
-/// Symbol by "uuid" or "ref" (unique among sheet instances); aError/aStatus set when not found
+/// @brief Symbol by "uuid" or "ref" (unique among sheet instances); aError/aStatus set when not found
 std::optional<SYMBOL_AT> findSymbol( SCHEMATIC* aSchematic, const nlohmann::json& aArgs, int& aStatus, std::string& aError )
 {
     const std::string uuid = aArgs.value( "uuid", std::string() );
@@ -192,7 +191,7 @@ struct PIN_AT
 };
 
 
-/// Pin by REF.PIN (any unit of a multi-unit part)
+/// @brief Pin by REF.PIN (any unit of a multi-unit part)
 std::optional<PIN_AT> findPin( SCHEMATIC* aSchematic, const std::string& aPin )
 {
     for( const SCH_SHEET_PATH& path : aSchematic->Hierarchy() )
@@ -213,7 +212,7 @@ std::optional<PIN_AT> findPin( SCHEMATIC* aSchematic, const std::string& aPin )
 }
 
 
-/// Unit vector pointing out of the symbol body at a pin (from the pin root to its connection end)
+/// @brief Unit vector pointing out of the symbol body at a pin (from the pin root to its connection end)
 VECTOR2I outward( const SCH_PIN* aPin )
 {
     const VECTOR2I d = aPin->GetPosition() - aPin->GetPinRoot();
@@ -266,7 +265,7 @@ int orientationFlags( const nlohmann::json& aArgs, std::string& aError )
 }
 
 
-/// Apply value / footprint / free fields / flags from args to a symbol instance
+/// @brief Apply value / footprint / free fields / flags from args to a symbol instance
 void applyFields( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath, const nlohmann::json& aArgs )
 {
     if( aArgs.contains( "value" ) && aArgs["value"].is_string() )
@@ -306,11 +305,9 @@ void applyFields( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath, const nlohma
 }
 
 
-/**
- * Annotate like the editor's "Annotate Schematic" with "keep existing annotation" (or reset):
- * all sheets, by X position, first free number; power symbols get #PWR numbers.  Only symbols
- * whose reference changes are touched (each recorded in the commit).
- */
+/// @brief Annotate like the editor's "Annotate Schematic" with "keep existing annotation" (or reset):
+/// all sheets, by X position, first free number; power symbols get #PWR numbers.  Only symbols
+/// whose reference changes are touched (each recorded in the commit).
 int annotate( SCHEMATIC* aSchematic, SCH_COMMIT& aCommit, bool aReset )
 {
     SCH_SHEET_LIST               sheets = aSchematic->Hierarchy();
@@ -354,11 +351,9 @@ int annotate( SCHEMATIC* aSchematic, SCH_COMMIT& aCommit, bool aReset )
 }
 
 
-/**
- * First free reference number for a prefix ("C" -> "C4"), over all sheet instances plus the
- * references already handed out in this commit (aTaken).  New symbols get their reference
- * before the commit, so placing and numbering stay one undo step.
- */
+/// @brief First free reference number for a prefix ("C" -> "C4"), over all sheet instances plus the
+/// references already handed out in this commit (aTaken).  New symbols get their reference
+/// before the commit, so placing and numbering stay one undo step.
 wxString nextFreeRef( SCHEMATIC* aSchematic, const wxString& aPrefix, std::set<wxString>& aTaken )
 {
     std::set<long> used;
@@ -388,12 +383,10 @@ wxString nextFreeRef( SCHEMATIC* aSchematic, const wxString& aPrefix, std::set<w
 }
 
 
-/**
- * Push and bring connectivity fully up to date.  The incremental update after a commit misses
- * labels placed directly on a pin end without a wire (seen: two labels "USB_DP" on two pins
- * stayed unconnected until the file was reloaded), so every edit ends with a full rebuild —
- * the same the netlist exporter does.
- */
+/// @brief Push and bring connectivity fully up to date.  The incremental update after a commit misses
+/// labels placed directly on a pin end without a wire (seen: two labels "USB_DP" on two pins
+/// stayed unconnected until the file was reloaded), so every edit ends with a full rebuild —
+/// the same the netlist exporter does.
 /// Schematic editor side of the GUI glow (kicadopenapi_glow.h)
 struct SCH_GLOW_TRAITS
 {
@@ -423,7 +416,7 @@ struct SCH_GLOW_TRAITS
 
     static int Mm() { return schIUScale.mmToIU( 1.0 ); }
 
-    /// Brightened items draw in the glow colour while anything glows; KiCad's own colour after
+    /// @brief Brightened items draw in the glow colour while anything glows; KiCad's own colour after
     static void ItemColour( FRAME* aFrame, bool aGlow, std::optional<KIGFX::COLOR4D>& aSaved )
     {
         KIGFX::RENDER_SETTINGS* settings = aFrame->GetCanvas()->GetView()->GetPainter()->GetSettings();
@@ -510,12 +503,10 @@ nlohmann::json symbolCard( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath )
 }
 
 
-/**
- * Put a symbol's visible field texts (reference, value, ...) where they lie on nothing else: where
- * they are (unless aReset), KiCad's own placement, then the whole text block right of, below,
- * above or left of the part at a growing distance.  Obstacles: other parts (body and pins), their
- * texts, labels, wires.  False (texts left where KiCad put them) when no candidate is clear.
- */
+/// @brief Put a symbol's visible field texts (reference, value, ...) where they lie on nothing else: where
+/// they are (unless aReset), KiCad's own placement, then the whole text block right of, below,
+/// above or left of the part at a growing distance.  Obstacles: other parts (body and pins), their
+/// texts, labels, wires.  False (texts left where KiCad put them) when no candidate is clear.
 bool placeFieldsClear( SCH_SYMBOL* aSymbol, SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, bool aReset )
 {
     if( aReset )
@@ -628,7 +619,7 @@ bool placeFieldsClear( SCH_SYMBOL* aSymbol, SCH_SCREEN* aScreen, const SCH_SHEET
 }
 
 
-/// When a footprint was given: does it exist and does every pin find its pad (sch_footprint_check)
+/// @brief When a footprint was given: does it exist and does every pin find its pad (sch_footprint_check)
 void attachFootprintCheck( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, nlohmann::json& aCard )
 {
     if( aArgs.value( "footprint", std::string() ).empty() )
@@ -649,7 +640,7 @@ void attachFootprintCheck( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, 
 }
 
 
-/// The net a pin is on now (after a commit), for confirming connections
+/// @brief The net a pin is on now (after a commit), for confirming connections
 std::string netOfPin( SCHEMATIC* aSchematic, const std::string& aPin )
 {
     for( const NET_ENTRY& net : collectNets( aSchematic ) )
@@ -666,7 +657,7 @@ std::string netOfPin( SCHEMATIC* aSchematic, const std::string& aPin )
 
 
 
-/// Direction from a power symbol's pin to the centre of its body (power pins have zero length)
+/// @brief Direction from a power symbol's pin to the centre of its body (power pins have zero length)
 VECTOR2I powerBodyDirection( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath )
 {
     std::vector<SCH_PIN*> own = aSymbol->GetPins( &aPath );
@@ -680,7 +671,7 @@ VECTOR2I powerBodyDirection( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath )
 }
 
 
-/// Where a power symbol's body points in its library pose (GND down, +5V up, ...)
+/// @brief Where a power symbol's body points in its library pose (GND down, +5V up, ...)
 VECTOR2I powerNaturalDirection( LIB_SYMBOL* aLib, SCHEMATIC* aSchematic, const SCH_SHEET_PATH& aPath )
 {
     std::unique_ptr<LIB_SYMBOL> flat = aLib->Flatten();
@@ -689,7 +680,7 @@ VECTOR2I powerNaturalDirection( LIB_SYMBOL* aLib, SCHEMATIC* aSchematic, const S
 }
 
 
-/// A power symbol with its pin on aPoint and its body pointing aBody, numbered #PWR<n>
+/// @brief A power symbol with its pin on aPoint and its body pointing aBody, numbered #PWR<n>
 SCH_SYMBOL* makePowerSymbol( LIB_SYMBOL* aLib, SCHEMATIC* aSchematic, const SCH_SHEET_PATH& aPath, const VECTOR2I& aPoint,
                              const VECTOR2I& aBody, std::set<wxString>& aTaken )
 {
@@ -714,16 +705,14 @@ SCH_SYMBOL* makePowerSymbol( LIB_SYMBOL* aLib, SCHEMATIC* aSchematic, const SCH_
 }
 
 
-/**
- * Carries the wiring along when parts move (sch_symbol_update, sch_items_move).
- *
- * From every connection point that moved, the attachment tree is collected: wires, junctions,
- * labels, no-connects and power symbols (PWR_FLAG included) reachable without touching any other
- * part.  A tree that belongs to the moving items alone moves with them as a rigid body (a stub
- * with its power symbol stays a stub); a tree shared with other parts keeps its place — wire
- * ends on the moved points stretch, labels / no-connects sitting on the point follow — and wires
- * that turn diagonal are re-routed orthogonally.  A moving power symbol never drags another one.
- */
+/// @brief Carries the wiring along when parts move (sch_symbol_update, sch_items_move).
+///
+/// From every connection point that moved, the attachment tree is collected: wires, junctions,
+/// labels, no-connects and power symbols (PWR_FLAG included) reachable without touching any other
+/// part.  A tree that belongs to the moving items alone moves with them as a rigid body (a stub
+/// with its power symbol stays a stub); a tree shared with other parts keeps its place — wire
+/// ends on the moved points stretch, labels / no-connects sitting on the point follow — and wires
+/// that turn diagonal are re-routed orthogonally.  A moving power symbol never drags another one.
 class SHEET_DRAG
 {
 public:
@@ -731,17 +720,17 @@ public:
             m_commit( aCommit ), m_screen( aScreen ), m_path( aPath )
     {}
 
-    /// Items moved by the caller (not to be carried again)
+    /// @brief Items moved by the caller (not to be carried again)
     void SetAnchors( const std::set<SCH_ITEM*>& aAnchors ) { m_anchors = aAnchors; }
 
-    /// A connection point of a moved item went from aFrom to aTo; aPowerMover: it was a power symbol
+    /// @brief A connection point of a moved item went from aFrom to aTo; aPowerMover: it was a power symbol
     void AddPointMove( const VECTOR2I& aFrom, const VECTOR2I& aTo, bool aPowerMover )
     {
         if( aFrom != aTo )
             m_moves.push_back( { aFrom, aTo, aPowerMover } );
     }
 
-    /// Apply; returns warnings, fills aTouched with everything changed
+    /// @brief Apply; returns warnings, fills aTouched with everything changed
     nlohmann::json Apply( std::vector<KIID>& aTouched )
     {
         // Decide everything on the geometry before the move: a tree moved first must not look
@@ -855,7 +844,7 @@ private:
         bool     powerMover;
     };
 
-    /// Wiring reachable from aStart that touches no other part; false if it does
+    /// @brief Wiring reachable from aStart that touches no other part; false if it does
     bool collectTree( const VECTOR2I& aStart, const VECTOR2I& aDelta, std::set<SCH_ITEM*>& aTree )
     {
         std::vector<VECTOR2I> todo = { aStart };
@@ -972,7 +961,7 @@ private:
         return false;
     }
 
-    /// Stretched wires that turned diagonal: replace them by an orthogonal route
+    /// @brief Stretched wires that turned diagonal: replace them by an orthogonal route
     nlohmann::json reroute( const std::vector<SCH_LINE*>& aStretched, std::vector<KIID>& aTouched )
     {
         nlohmann::json warnings = nlohmann::json::array();
@@ -1026,7 +1015,7 @@ private:
 };
 
 
-/// A wire end: REF.PIN, or a point {x_mm, y_mm} on the target sheet
+/// @brief A wire end: REF.PIN, or a point {x_mm, y_mm} on the target sheet
 std::optional<VECTOR2I> wireEnd( SCHEMATIC* aSchematic, const nlohmann::json& aEnd, std::optional<SCH_SHEET_PATH>& aSheet,
                                  VECTOR2I& aOutward, std::string& aError )
 {

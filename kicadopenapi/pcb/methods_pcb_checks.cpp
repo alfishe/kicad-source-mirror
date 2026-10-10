@@ -1,12 +1,11 @@
-/*
- * kicadopenapi board checks: pcb_drc.
- *
- * Runs KiCad's own DRC engine (as `kicad-cli pcb drc` does) on the live board and returns the
- * drc.v1 report KiCad writes (DRC_REPORT::GetJsonReport), plus a summary and a flat,
- * filterable, paginated violation list for agents.  Markers land on the board (in the GUI
- * they show in the editor), without an undo step and without marking the board modified;
- * zones are refilled only when asked (that does change the board).
- */
+/// @file methods_pcb_checks.cpp
+/// @brief kicadopenapi board checks: pcb_drc.
+///
+/// Runs KiCad's own DRC engine (as `kicad-cli pcb drc` does) on the live board and returns the
+/// drc.v1 report KiCad writes (DRC_REPORT::GetJsonReport), plus a summary and a flat,
+/// filterable, paginated violation list for agents.  Markers land on the board (in the GUI
+/// they show in the editor), without an undo step and without marking the board modified;
+/// zones are refilled only when asked (that does change the board).
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>

@@ -1,14 +1,13 @@
-/*
- * kicadopenapi cross-domain methods (docs/api/design-analysis-api.md principle A7): schematic <-> board.
- *
- *   design_parity  compare schematic and board: components, and nets by connectivity
- *   net_get        one net seen from both sides, matched through pads
- *
- * They live in kicommon and combine the domain methods through the registry (sch_netlist,
- * pcb_netlist, sch_net_get, pcb_net_get), so eeschema and pcbnew stay independent.  Nets are
- * matched by their pads (REF.PAD), not by name: converted designs name auto nets differently
- * on each side.
- */
+/// @file methods_design.cpp
+/// @brief kicadopenapi cross-domain methods (docs/api/design-analysis-api.md principle A7): schematic <-> board.
+///
+///   design_parity  compare schematic and board: components, and nets by connectivity
+///   net_get        one net seen from both sides, matched through pads
+///
+/// They live in kicommon and combine the domain methods through the registry (sch_netlist,
+/// pcb_netlist, sch_net_get, pcb_net_get), so eeschema and pcbnew stay independent.  Nets are
+/// matched by their pads (REF.PAD), not by name: converted designs name auto nets differently
+/// on each side.
 #include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
 
@@ -22,7 +21,7 @@
 namespace
 {
 
-/// Call another registered method in-process (we already run on the main thread)
+/// @brief Call another registered method in-process (we already run on the main thread)
 KOPENAPI_RESULT callMethod( KOPENAPI_CONTEXT& aCtx, const std::string& aName, const nlohmann::json& aArgs = nlohmann::json::object() )
 {
     std::optional<KOPENAPI_METHOD> method = KOPENAPI_REGISTRY::Get().Find( aName );
@@ -41,7 +40,7 @@ std::string itemName( const std::string& aLibId )
 }
 
 
-/// Bounded list with its full count
+/// @brief Bounded list with its full count
 struct LIST
 {
     nlohmann::json items = nlohmann::json::array();

@@ -33,7 +33,7 @@ bool onSegment( const VECTOR2I& aP, const VECTOR2I& aA, const VECTOR2I& aB )
 }
 
 
-/// Two axis-aligned segments run along each other for more than a point
+/// @brief Two axis-aligned segments run along each other for more than a point
 bool overlapAlong( const VECTOR2I& aA, const VECTOR2I& aB, const VECTOR2I& aC, const VECTOR2I& aD )
 {
     if( aA.y == aB.y && aC.y == aD.y && aA.y == aC.y )
@@ -54,7 +54,7 @@ bool overlapAlong( const VECTOR2I& aA, const VECTOR2I& aB, const VECTOR2I& aC, c
 }
 
 
-/// An axis-aligned segment enters the open interior of a box
+/// @brief An axis-aligned segment enters the open interior of a box
 bool crossesBody( const VECTOR2I& aA, const VECTOR2I& aB, const BOX2I& aBox )
 {
     const int left = aBox.GetLeft(), right = aBox.GetRight(), top = aBox.GetTop(), bottom = aBox.GetBottom();

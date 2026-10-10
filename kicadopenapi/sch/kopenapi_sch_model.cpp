@@ -69,7 +69,7 @@ SCH_SYMBOL* pinSymbol( const SCH_PIN* aPin )
 }
 
 
-/// One pin of a net as seen on a given sheet instance
+/// @brief One pin of a net as seen on a given sheet instance
 nlohmann::json pinJson( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath, PAD_RESOLVER* aPads )
 {
     SCH_SYMBOL*       sym = pinSymbol( aPin );
@@ -239,10 +239,8 @@ std::string pinId( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath )
 }
 
 
-/**
- * Pins of a net across all its instances, one per REF.PIN: multi-unit symbols repeat shared
- * (e.g. power) pins in every unit; the netlist exporter lists them once as well.
- */
+/// @brief Pins of a net across all its instances, one per REF.PIN: multi-unit symbols repeat shared
+/// (e.g. power) pins in every unit; the netlist exporter lists them once as well.
 std::vector<std::pair<const SCH_PIN*, SCH_SHEET_PATH>> netPins( const NET_ENTRY& aNet )
 {
     std::vector<std::pair<const SCH_PIN*, SCH_SHEET_PATH>> pins;

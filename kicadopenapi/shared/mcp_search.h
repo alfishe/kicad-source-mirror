@@ -12,7 +12,7 @@
 namespace kopenapi::mcp
 {
 
-/// "path*: string, side: left|right = \"auto\", limit: integer = 20" (* = required)
+/// @brief "path*: string, side: left|right = \"auto\", limit: integer = 20" (* = required)
 inline std::string BriefParams( const nlohmann::json& aSchema )
 {
     if( !aSchema.is_object() || !aSchema.contains( "properties" ) || !aSchema["properties"].is_object() )
@@ -55,7 +55,7 @@ inline std::string BriefParams( const nlohmann::json& aSchema )
 }
 
 
-/// One method entry: aDetail "full" keeps inputSchema, else params as one line
+/// @brief One method entry: aDetail "full" keeps inputSchema, else params as one line
 inline nlohmann::json FormatMethod( const std::string& aName, const std::string& aSummary,
                                     const nlohmann::json& aSchema, bool aGuiOnly, bool aFull )
 {

@@ -1,11 +1,10 @@
-/*
- * kicadopenapi symbol libraries: sch_lib_list, sch_lib_symbol_search, sch_lib_symbol_get.
- *
- * Libraries come from the same tables KiCad uses (global sym-lib-table + the project's), via
- * the project's SYMBOL_LIBRARY_ADAPTER; a library that fails to load is reported with its
- * error, never silently skipped.  No document needs to be open: without one, the global
- * tables of the current (default) project apply.
- */
+/// @file methods_sch_library.cpp
+/// @brief kicadopenapi symbol libraries: sch_lib_list, sch_lib_symbol_search, sch_lib_symbol_get.
+///
+/// Libraries come from the same tables KiCad uses (global sym-lib-table + the project's), via
+/// the project's SYMBOL_LIBRARY_ADAPTER; a library that fails to load is reported with its
+/// error, never silently skipped.  No document needs to be open: without one, the global
+/// tables of the current (default) project apply.
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 
@@ -34,7 +33,7 @@ using namespace kopenapi_sch;
 namespace
 {
 
-/// The project whose library tables apply: the open schematic's, else KiCad's current one
+/// @brief The project whose library tables apply: the open schematic's, else KiCad's current one
 PROJECT* libraryProject( KOPENAPI_CONTEXT& aCtx )
 {
     if( std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx ) )
@@ -69,7 +68,7 @@ const char* scopeName( LIBRARY_TABLE_SCOPE aScope )
 }
 
 
-/// Symbol usage in the open schematic, by lib_id
+/// @brief Symbol usage in the open schematic, by lib_id
 std::map<std::string, int> usage( KOPENAPI_CONTEXT& aCtx )
 {
     std::map<std::string, int> used;

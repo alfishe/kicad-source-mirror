@@ -10,13 +10,13 @@ namespace kopenapi::mcp
 
 inline constexpr const char* kProtocolVersion = "2025-03-26";
 
-/// Protocol versions accepted from clients (anything else is answered with kProtocolVersion)
+/// @brief Protocol versions accepted from clients (anything else is answered with kProtocolVersion)
 inline constexpr const char* kSupportedVersions[] = { "2025-06-18", "2025-03-26", "2024-11-05" };
 
 inline constexpr const char* kSearchTool = "search";
 inline constexpr const char* kInvokeTool = "invoke";
 
-/// tools/list result "tools" array
+/// @brief tools/list result "tools" array
 inline constexpr const char* kToolsJson = R"json([
   {
     "name": "search",
