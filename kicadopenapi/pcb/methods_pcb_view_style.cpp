@@ -10,9 +10,15 @@
 #include <lset.h>
 #include <pcb_display_options.h>
 #include <pcb_edit_frame.h>
+#include <tool/actions.h>
+#include <tool/tool_manager.h>
+#include <tools/pcb_actions.h>
+#include <view/view.h>
+#include <gal/painter.h>
 #include <widgets/appearance_controls.h>
 
 #include <optional>
+#include <set>
 
 
 namespace
@@ -23,6 +29,8 @@ struct SAVED_LOOK
 {
     PCB_DISPLAY_OPTIONS options;
     LSET                visible;
+    std::set<int>       highlightNets;
+    bool                highlightOn = false;
 };
 
 std::optional<SAVED_LOOK> s_saved;
@@ -45,6 +53,11 @@ void restore( PCB_EDIT_FRAME* aFrame )
 
     for( PCB_LAYER_ID layer : aFrame->GetBoard()->GetEnabledLayers().Seq() )
         setLayerVisible( aFrame, layer, s_saved->visible.Contains( layer ) );
+
+    if( s_saved->highlightOn && !s_saved->highlightNets.empty() )
+        aFrame->GetToolManager()->RunAction<int>( PCB_ACTIONS::highlightNet, *s_saved->highlightNets.begin() );
+    else
+        aFrame->GetToolManager()->RunAction( PCB_ACTIONS::clearHighlight );
 
     s_saved.reset();
     aFrame->GetCanvas()->Refresh();
@@ -75,7 +88,9 @@ static KOPENAPI_RESULT h_pcb_view_style( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     // (before KiCad saves its settings)
     if( !persist && !s_saved )
     {
-        s_saved = SAVED_LOOK{ frame->GetDisplayOptions(), board->GetVisibleLayers() };
+        KIGFX::RENDER_SETTINGS* rs = frame->GetCanvas()->GetView()->GetPainter()->GetSettings();
+        s_saved = SAVED_LOOK{ frame->GetDisplayOptions(), board->GetVisibleLayers(), rs->GetHighlightNetCodes(),
+                              rs->IsHighlightEnabled() };
 
         if( s_boundFrame != frame )
         {
@@ -100,7 +115,32 @@ static KOPENAPI_RESULT h_pcb_view_style( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     opacity( "track_opacity", opts.m_TrackOpacity );
     opacity( "via_opacity", opts.m_ViaOpacity );
     opacity( "pad_opacity", opts.m_PadOpacity );
+
+    if( aArgs.contains( "high_contrast" ) )
+    {
+        opts.m_ContrastModeDisplay = aArgs["high_contrast"].get<bool>() ? HIGH_CONTRAST_MODE::DIMMED
+                                                                        : HIGH_CONTRAST_MODE::NORMAL;
+    }
+
     frame->SetDisplayOptions( opts );
+
+    if( aArgs.contains( "highlight_net" ) )
+    {
+        const std::string name = aArgs["highlight_net"].is_string() ? aArgs["highlight_net"].get<std::string>() : "";
+
+        if( name.empty() )
+        {
+            frame->GetToolManager()->RunAction( PCB_ACTIONS::clearHighlight );
+        }
+        else if( NETINFO_ITEM* net = board->FindNet( wxString::FromUTF8( name ) ) )
+        {
+            frame->GetToolManager()->RunAction<int>( PCB_ACTIONS::highlightNet, net->GetNetCode() );
+        }
+        else
+        {
+            return KOPENAPI_RESULT::Error( 404, "no net named " + name );
+        }
+    }
 
     nlohmann::json unknown = nlohmann::json::array();
 
@@ -139,6 +179,7 @@ static KOPENAPI_RESULT h_pcb_view_style( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
 KOPENAPI_REGISTER( "pcb_view_style",
                    "Board editor look for filming / screenshots: zone, track, via, pad opacity (0..1), "
+                   "high contrast, a highlighted net, "
                    "layers to hide / show (e.g. courtyards, fab); temporary by default: reset: true or "
                    "closing the editor brings the user's look back; persist: true keeps it; GUI only",
                    R"json({"type":"object","properties":{
@@ -146,6 +187,8 @@ KOPENAPI_REGISTER( "pcb_view_style",
                         "track_opacity":{"type":"number","minimum":0,"maximum":1},
                         "via_opacity":{"type":"number","minimum":0,"maximum":1},
                         "pad_opacity":{"type":"number","minimum":0,"maximum":1},
+                        "high_contrast":{"type":"boolean","description":"dim everything but the active layer"},
+                        "highlight_net":{"type":["string","null"],"description":"net name to highlight; empty / null clears"},
                         "hide_layers":{"type":"array","items":{"type":"string"},"description":"e.g. F.Courtyard, B.Courtyard, F.Fab, B.Fab"},
                         "show_layers":{"type":"array","items":{"type":"string"}},
                         "reset":{"type":"boolean","default":false,"description":"back to the look before the first temporary change"},

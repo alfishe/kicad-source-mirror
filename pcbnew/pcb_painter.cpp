@@ -208,7 +208,9 @@ void PCB_RENDER_SETTINGS::LoadDisplayOptions( const PCB_DISPLAY_OPTIONS& aOption
 
 COLOR4D PCB_RENDER_SETTINGS::GetColor( const VIEW_ITEM* aItem, int aLayer ) const
 {
-    return GetColor( dynamic_cast<const BOARD_ITEM*>( aItem ), aLayer );
+    // called for every cached group on each colour change: no dynamic_cast
+    const BOARD_ITEM* item = aItem && aItem->IsBOARD_ITEM() ? static_cast<const BOARD_ITEM*>( aItem ) : nullptr;
+    return GetColor( item, aLayer );
 }
 
 
@@ -277,12 +279,14 @@ COLOR4D PCB_RENDER_SETTINGS::GetColor( const BOARD_ITEM* aItem, int aLayer ) con
     // Pad and via copper and clearance outlines take their color from the copper layer
     if( IsPadCopperLayer( aLayer ) )
     {
-        if( pcbconfig() && aItem && aItem->Type() == PCB_PAD_T )
+        const PCBNEW_SETTINGS* cfg = aItem && aItem->Type() == PCB_PAD_T ? pcbconfig() : nullptr;
+
+        if( cfg )
         {
             const PAD* pad = static_cast<const PAD*>( aItem );
 
             // Old-skool display for people who struggle with change
-            if( pcbconfig()->m_Display.m_UseViaColorForNormalTHPadstacks
+            if( cfg->m_Display.m_UseViaColorForNormalTHPadstacks
                     && pad->GetAttribute() == PAD_ATTRIB::PTH
                     && pad->Padstack().Mode() == PADSTACK::MODE::NORMAL )
             {
@@ -310,24 +314,39 @@ COLOR4D PCB_RENDER_SETTINGS::GetColor( const BOARD_ITEM* aItem, int aLayer ) con
     // Show via mask layers if appropriate
     if( aLayer == LAYER_VIA_THROUGH && !m_isPrinting )
     {
-        if( aItem && aItem->GetBoard() )
+        if( const BOARD* board = aItem ? aItem->GetBoard() : nullptr )
         {
-            LSET visibleLayers = aItem->GetBoard()->GetVisibleLayers()
-                                 & aItem->GetBoard()->GetEnabledLayers()
-                                 & aItem->GetLayerSet();
+            // the via's layers that are visible and enabled, tested without building sets
+            const LSET& visible = board->GetVisibleLayers();
+            const LSET& enabled = board->GetEnabledLayers();
+            const LSET  itemLayers = aItem->GetLayerSet();
+            auto        shown = [&]( PCB_LAYER_ID aL )
+                                { return visible.test( aL ) && enabled.test( aL ) && itemLayers.test( aL ); };
 
-            if( GetActiveLayer() == F_Mask && visibleLayers.test( F_Mask ) )
+            if( GetActiveLayer() == F_Mask && shown( F_Mask ) )
             {
                 aLayer = F_Mask;
             }
-            else if( GetActiveLayer() == B_Mask && visibleLayers.test( B_Mask ) )
+            else if( GetActiveLayer() == B_Mask && shown( B_Mask ) )
             {
                 aLayer = B_Mask;
             }
-            else if( ( visibleLayers & LSET::AllCuMask() ).none() )
+            else
             {
-                if( visibleLayers.any() )
-                    aLayer = visibleLayers.Seq().back();
+                bool         anyCopper = false;
+                PCB_LAYER_ID lastShown = UNDEFINED_LAYER;
+
+                for( PCB_LAYER_ID layer : itemLayers )
+                {
+                    if( !visible.test( layer ) || !enabled.test( layer ) )
+                        continue;
+
+                    anyCopper |= IsCopperLayer( layer );
+                    lastShown = layer;
+                }
+
+                if( !anyCopper && lastShown != UNDEFINED_LAYER )
+                    aLayer = lastShown;
             }
         }
     }
