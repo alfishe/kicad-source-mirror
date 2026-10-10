@@ -127,8 +127,13 @@ void DS_PROXY_VIEW_ITEM::ViewDraw( int aLayer, VIEW* aView ) const
         viewport.SetOrigin( left, viewport.GetTop() );
     }
 
-    DS_PAINTER ws_painter( gal );
-    auto       ws_settings = static_cast<DS_RENDER_SETTINGS*>( ws_painter.GetSettings() );
+    if( !m_painter )
+        m_painter = std::make_shared<DS_PAINTER>( gal );
+
+    DS_PAINTER& ws_painter = *m_painter;
+    ws_painter.SetGAL( gal );
+
+    auto ws_settings = static_cast<DS_RENDER_SETTINGS*>( ws_painter.GetSettings() );
 
     ws_settings->SetNormalColor( settings->GetLayerColor( m_colorLayer ) );
     ws_settings->SetSelectedColor( settings->GetLayerColor( LAYER_SELECT_OVERLAY ) );

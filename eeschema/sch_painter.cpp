@@ -1731,6 +1731,10 @@ void SCH_PAINTER::draw( const SCH_LINE* aLine, int aLayer )
     if( drawingShadows && !( aLine->IsBrightened() || aLine->IsSelected() ) )
         return;
 
+    // the voltages layer shows only the operating point (no colour / width needed for it)
+    if( drawingOP && aLine->GetOperatingPoint().IsEmpty() )
+        return;
+
     // Line end dangling status isn't updated until the line is finished drawing, so don't warn
     // them about ends that are probably connected
     if( aLine->IsNew() && drawingDangling )
@@ -2706,6 +2710,31 @@ void SCH_PAINTER::draw( const SCH_SYMBOL* aSymbol, int aLayer )
     if( usingAlternateSymbol && originalPins.empty() && bodyStyle > 1 )
         originalPins = originalSymbol->GetGraphicalPins( unit, 1 );
 
+    std::vector<SCH_PIN*> symbolPins = aSymbol->MapLibPins( originalPins, usingAlternateSymbol );
+
+    // Shadows draw only selected / brightened items (body items carry the symbol's flags, pins
+    // their own) and the currents layer only pins with an operating point: without either the
+    // copy below would draw nothing, on every redraw of these overlay layers
+    if( drawingShadows || aLayer == LAYER_OP_CURRENTS )
+    {
+        bool anything = drawingShadows && ( aSymbol->IsSelected() || aSymbol->IsBrightened() );
+
+        for( const SCH_PIN* pin : symbolPins )
+        {
+            if( anything )
+                break;
+
+            if( pin )
+            {
+                anything = drawingShadows ? ( pin->IsSelected() || pin->IsBrightened() )
+                                          : !pin->GetOperatingPoint().IsEmpty();
+            }
+        }
+
+        if( !anything )
+            return;
+    }
+
     // Copy the source so we can re-orient and translate it.
     auto       tCopy1 = std::chrono::high_resolution_clock::now();
     LIB_SYMBOL tempSymbol( *originalSymbol, nullptr, false );
@@ -2749,8 +2778,7 @@ void SCH_PAINTER::draw( const SCH_SYMBOL* aSymbol, int aLayer )
     }
 
     // Copy the pin info from the symbol to the temp pins.
-    std::vector<SCH_PIN*> symbolPins = aSymbol->MapLibPins( originalPins, usingAlternateSymbol );
-    SCH_NETCHAIN*         highlightedChain = nullptr;
+    SCH_NETCHAIN* highlightedChain = nullptr;
 
     if( m_schematic && !m_schematic->GetHighlightedNetChain().IsEmpty() )
         highlightedChain = m_schematic->NetChains().GetNetChainByName( m_schematic->GetHighlightedNetChain() );

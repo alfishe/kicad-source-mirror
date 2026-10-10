@@ -25,6 +25,7 @@
 #include <eda_item.h>
 #include <eda_units.h>
 #include <functional>
+#include <memory>
 #include <vector>
 
 class BOARD;
@@ -43,6 +44,7 @@ namespace KIGFX
 {
 class VIEW;
 class GAL;
+class DS_PAINTER;
 }
 
 class DS_PROXY_VIEW_ITEM : public EDA_ITEM
@@ -162,6 +164,10 @@ protected:
 
 protected:
     const EDA_IU_SCALE& m_iuScale;
+
+    /// Made on the first draw and kept: building its render settings (colour tables of every
+    /// layer) cost more than drawing the sheet
+    mutable std::shared_ptr<KIGFX::DS_PAINTER> m_painter;
 
     std::string         m_fileName;
     std::string         m_sheetName;
