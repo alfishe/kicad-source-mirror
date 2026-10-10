@@ -8,6 +8,7 @@
 #include "kopenapi_sch.h"
 
 #include <api/sch_context.h>
+#include <kicadopenapi_keepalive.h>
 #include <erc/erc.h>
 #include <erc/erc_item.h>
 #include <erc/erc_report.h>
@@ -40,7 +41,7 @@ static KOPENAPI_RESULT h_sch_erc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     // ERC needs the symbol libraries (library symbol mismatch checks)
     SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( &schematic->Project() );
     adapter->AsyncLoad();
-    adapter->BlockUntilLoaded();
+    KopenapiWaitLibraries( adapter );
 
     // ...and the footprint libraries (footprint link checks go through cvpcb)
     KopenapiEnsureFootprintLibraries( aCtx.kiway );
@@ -59,9 +60,10 @@ static KOPENAPI_RESULT h_sch_erc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     if( frame )
         frame->ClearErcMarkers();
 
+    KOPENAPI_KEEPALIVE_REPORTER reporter;
     ERC_TESTER tester( schematic );
     tester.RunTests( nullptr, frame, aCtx.kiway ? aCtx.kiway->KiFACE( KIWAY::FACE_CVPCB ) : nullptr,
-                     &schematic->Project(), nullptr );
+                     &schematic->Project(), &reporter );
 
     if( frame )
         frame->RefreshErcMarkers();

@@ -240,3 +240,19 @@ std::vector<KOPENAPI_CANVAS_CAPTURE> KOPENAPI_REGISTRY::CanvasCaptures() const
     std::lock_guard<std::mutex> lock( m_mutex );
     return m_canvasCaptures;
 }
+
+
+bool KOPENAPI_REGISTRY::AddCanvasRender( KOPENAPI_CANVAS_RENDER aRender )
+{
+    KOPENAPI_REGISTRY& reg = Get();
+    std::lock_guard<std::mutex> lock( reg.m_mutex );
+    reg.m_canvasRenders.push_back( std::move( aRender ) );
+    return true;
+}
+
+
+std::vector<KOPENAPI_CANVAS_RENDER> KOPENAPI_REGISTRY::CanvasRenders() const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return m_canvasRenders;
+}

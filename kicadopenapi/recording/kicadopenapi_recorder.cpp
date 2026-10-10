@@ -7,6 +7,9 @@
 /// falls behind, frames are dropped (counted) and the previous frame stays on screen, so the video
 /// keeps real time. GUI only (registered GUI-only: headless answers 501).
 #include "kicadopenapi_recorder.h"
+#include "frame_scaler.h"
+
+#include <wx/display.h>
 #include "video_encoder.h"
 
 #include <kicadopenapi_capture.h>
@@ -130,6 +133,7 @@ public:
         std::filesystem::create_directories( settings.path.parent_path(), ec );
 
         m_source = source;
+        m_renderSize = wxSize();
 
         // first frame decides the video size
         wxImage first;
@@ -137,10 +141,49 @@ public:
         if( !capture( window, first ) )
             return KOPENAPI_RESULT::Error( 501, "this platform cannot draw windows offscreen (e.g. Wayland)" );
 
-        const int maxWidth = std::clamp( aArgs.value( "max_width", 1920 ), 160, 7680 );
-        double    scale = std::min( 1.0, double( maxWidth ) / first.GetWidth() );
-        settings.width = std::max( 2, int( first.GetWidth() * scale ) & ~1 );
-        settings.height = std::max( 2, int( first.GetHeight() * scale ) & ~1 );
+        // profile: a fixed frame (frames fitted in, letterboxed) or the source size (capped)
+        const std::string profile = aArgs.value( "profile", std::string( "source" ) );
+
+        if( profile == "4k" || profile == "1080p" )
+        {
+            settings.width = profile == "4k" ? 3840 : 1920;
+            settings.height = profile == "4k" ? 2160 : 1080;
+            settings.inputWidth = std::max( 2, first.GetWidth() & ~1 );   // the encoder fits it in
+            settings.inputHeight = std::max( 2, first.GetHeight() & ~1 );
+            m_letterbox = true;
+
+            // a canvas that can draw itself at the video's size (the 3D viewer) is rendered there:
+            // sharp, no scaling, no bars
+            wxImage sharp;
+
+            m_qualityMode = aArgs.value( "quality_mode", std::string( "adaptive" ) );
+            m_tier = m_qualityMode == "fast" ? TIER_READBACK
+                     : aArgs.value( "antialias", std::string( "ssaa2" ) ) == "none" ? TIER_GPU : TIER_GPU_SSAA;
+            m_tierLog = nlohmann::json::array();
+            m_tierMs.clear();
+            m_tierFrames = 0;
+
+            if( m_canvas && m_tier != TIER_READBACK && KopenapiRenderCanvas( m_canvas, settings.width, settings.height, sharp ) )
+            {
+                m_renderSize = wxSize( settings.width, settings.height );
+                renderSharp( sharp );
+                settings.inputWidth = settings.width;   // readback frames are fitted to this size
+                settings.inputHeight = settings.height;
+                first = sharp;
+            }
+        }
+        else if( profile == "source" )
+        {
+            const int maxWidth = std::clamp( aArgs.value( "max_width", 1920 ), 160, 7680 );
+            double    scale = std::min( 1.0, double( maxWidth ) / first.GetWidth() );
+            settings.width = std::max( 2, int( first.GetWidth() * scale ) & ~1 );
+            settings.height = std::max( 2, int( first.GetHeight() * scale ) & ~1 );
+            m_letterbox = false;
+        }
+        else
+        {
+            return KOPENAPI_RESULT::Error( 400, "profile: 4k, 1080p or source" );
+        }
 
         const std::string encoder = aArgs.value( "encoder", std::string( "auto" ) );
         std::string       error;
@@ -201,7 +244,7 @@ public:
 
         m_timer->Stop();
         m_stopReason = aReason;
-        const int64_t end = std::max<int64_t>( currentIndex() + 1, m_lastIndex + 1 );
+        const int64_t end = m_rebase ? m_lastIndex + 1 : std::max<int64_t>( currentIndex() + 1, m_lastIndex + 1 );
 
         {
             std::lock_guard<std::mutex> lock( m_mutex );
@@ -283,6 +326,8 @@ public:
                  { "capture_ms_avg", m_captured ? std::round( m_captureMsTotal / m_captured * 10 ) / 10 : 0.0 },
                  { "capture_ms_max", std::round( m_captureMsMax * 10 ) / 10 },
                  { "stop_reason", m_stopReason },
+                 { "quality_tier", m_renderSize.x > 0 ? nlohmann::json( tierName( m_tier ) ) : nlohmann::json() },
+                 { "quality_changes", m_tierLog },
                  { "error", m_error } };
     }
 
@@ -290,6 +335,18 @@ public:
     {
         if( !m_active || m_paused )
             return;
+
+        // an animation is feeding frames on video time: the timer stays out of its way, then
+        // continues the video clock from the last synced frame
+        if( CLOCK::now() - m_lastSync < std::chrono::milliseconds( 150 ) )
+            return;
+
+        if( m_rebase )
+        {
+            m_start = CLOCK::now() - m_pausedTotal
+                      - std::chrono::duration_cast<CLOCK::duration>( std::chrono::duration<double>( double( m_lastIndex + 1 ) / m_settings.fps ) );
+            m_rebase = false;
+        }
 
         if( !m_window || !m_window->IsShown() || ( m_source == "canvas" && !m_canvas ) )
         {
@@ -330,6 +387,61 @@ public:
         enqueue( image, index );
     }
 
+    bool Synced( int* aFps )
+    {
+        std::lock_guard<std::mutex> lock( m_mutex );
+
+        if( !m_active || m_paused || m_finishing || !m_error.empty() )
+            return false;
+
+        if( aFps )
+            *aFps = m_settings.fps;
+
+        return true;
+    }
+
+    int ScreenSteps()
+    {
+        int fps = 0;
+
+        if( !Synced( &fps ) || fps <= 0 || !m_window )
+            return 1;
+
+        const int display = wxDisplay::GetFromWindow( m_window );
+        int       hz = display != wxNOT_FOUND ? wxDisplay( display ).GetCurrentMode().GetRefresh() : 0;
+
+        if( hz <= 0 )
+            hz = 60;
+
+        return std::clamp( int( std::lround( double( hz ) / fps ) ), 1, 8 );
+    }
+
+    void RecordFrame()
+    {
+        if( !Synced( nullptr ) || !m_window )
+            return;
+
+        wxImage    image;
+        const auto t0 = CLOCK::now();
+
+        if( !capture( m_window, image ) )
+            return;
+
+        const double ms = std::chrono::duration<double, std::milli>( CLOCK::now() - t0 ).count();
+        m_captureMsTotal += ms;
+        m_captureMsMax = std::max( m_captureMsMax, ms );
+
+        // the encoder keeps up: wait instead of dropping (this is video time, not wall time)
+        {
+            std::unique_lock<std::mutex> lock( m_mutex );
+            m_cv.wait( lock, [this]() { return m_queue.size() < 3 || !m_error.empty(); } );
+        }
+
+        enqueue( image, m_lastIndex + 1 );
+        m_lastSync = CLOCK::now();
+        m_rebase = true;
+    }
+
     void Shutdown()
     {
         if( m_active )
@@ -337,8 +449,85 @@ public:
     }
 
 private:
+    /// Quality ladder for canvases that render offscreen (the 3D viewer): full quality first, then
+    /// down a step whenever frames take longer than the budget (or the GPU refuses), back up when
+    /// there is plenty of room.
+    enum TIER
+    {
+        TIER_GPU_SSAA = 0,   ///< drawn 2x on the GPU and averaged down there
+        TIER_GPU = 1,        ///< drawn at the video size on the GPU
+        TIER_READBACK = 2,   ///< the canvas as shown, scaled up by the encoder thread (SIMD)
+    };
+
+    static const char* tierName( int aTier )
+    {
+        return aTier == TIER_GPU_SSAA ? "gpu 2x supersampled" : aTier == TIER_GPU ? "gpu at video size" : "window readback, scaled";
+    }
+
+    void setTier( int aTier, const std::string& aWhy )
+    {
+        if( aTier == m_tier )
+            return;
+
+        m_tierLog.push_back( { { "time_s", double( std::max<int64_t>( m_lastIndex, 0 ) ) / m_settings.fps },
+                               { "from", tierName( m_tier ) }, { "to", tierName( aTier ) }, { "why", aWhy } } );
+        m_tier = aTier;
+        m_tierMs.clear();
+        m_tierFrames = 0;
+    }
+
+    /// @brief One frame of an offscreen-capable canvas on the current tier; adapts the tier
+    bool renderSharp( wxImage& aImage )
+    {
+        const auto t0 = CLOCK::now();
+        bool       ok = false;
+
+        while( !ok )
+        {
+            if( m_tier == TIER_READBACK )
+            {
+                ok = KopenapiCaptureCanvas( m_canvas, aImage );
+                break;
+            }
+
+            ok = KopenapiRenderCanvas( m_canvas, m_renderSize.x, m_renderSize.y, aImage, m_tier == TIER_GPU_SSAA ? 2 : 1 );
+
+            if( !ok )
+                setTier( m_tier + 1, "the GPU could not render this size" );
+        }
+
+        if( !ok || m_qualityMode != "adaptive" )
+            return ok;
+
+        // budget: most of a frame's time (the UI and the encoder need the rest)
+        const double ms = std::chrono::duration<double, std::milli>( CLOCK::now() - t0 ).count();
+        const double budget = 800.0 / m_settings.fps;
+        m_tierMs.push_back( ms );
+        m_tierFrames++;
+
+        if( m_tierMs.size() > 20 )
+            m_tierMs.pop_front();
+
+        double avg = 0;
+
+        for( double v : m_tierMs )
+            avg += v;
+
+        avg /= m_tierMs.size();
+
+        if( m_tierMs.size() >= 10 && avg > budget && m_tier < TIER_READBACK )
+            setTier( m_tier + 1, "frames took " + std::to_string( int( avg ) ) + " ms (budget " + std::to_string( int( budget ) ) + ")" );
+        else if( m_tierFrames >= 90 && avg < budget * 0.3 && m_tier > TIER_GPU_SSAA )
+            setTier( m_tier - 1, "room to spare (" + std::to_string( int( avg ) ) + " ms)" );
+
+        return true;
+    }
+
     bool capture( wxTopLevelWindow* aWindow, wxImage& aImage )
     {
+        if( m_source == "canvas" && m_canvas && m_renderSize.x > 0 )
+            return renderSharp( aImage );
+
         if( m_source == "canvas" )
             return m_canvas && KopenapiCaptureCanvas( m_canvas, aImage );
 
@@ -396,18 +585,38 @@ private:
                 m_queue.pop_front();
             }
 
+            m_cv.notify_all();   // a synced frame may be waiting for room
+
             std::string error;
             bool        ok = true;
 
-            if( frame.width == m_settings.width && frame.height == m_settings.height )
+            if( !m_letterbox && frame.width == m_settings.width && frame.height == m_settings.height )
             {
                 ok = m_encoder->Write( frame.rgb.data(), frame.index, error );
             }
+            else if( m_letterbox )
+            {
+                // the encoder letterboxes; only frames whose size changed (window resized) are
+                // scaled here, to the input size it was opened with
+                const int inW = m_settings.inputWidth, inH = m_settings.inputHeight;
+
+                if( frame.width == inW && frame.height == inH )
+                {
+                    ok = m_encoder->Write( frame.rgb.data(), frame.index, error );
+                }
+                else
+                {
+                    std::vector<uint8_t> fitted( size_t( inW ) * inH * 3 );
+                    KopenapiFitRgb( frame.rgb.data(), frame.width, frame.height, frame.width * 3, fitted.data(), inW,
+                                    inH, inW * 3, KOPENAPI_SCALE_QUALITY::HIGH, 0x121216 );
+                    ok = m_encoder->Write( fitted.data(), frame.index, error );
+                }
+            }
             else
             {
-                wxImage image( frame.width, frame.height, frame.rgb.data(), true );
-                wxImage scaled = image.Scale( m_settings.width, m_settings.height, wxIMAGE_QUALITY_BILINEAR );
-                std::vector<uint8_t> rgb( scaled.GetData(), scaled.GetData() + outBytes );
+                std::vector<uint8_t> rgb( outBytes );
+                KopenapiScaleRgb( frame.rgb.data(), frame.width, frame.height, frame.width * 3, rgb.data(), m_settings.width,
+                                  m_settings.height, m_settings.width * 3, KOPENAPI_SCALE_QUALITY::HIGH );
                 ok = m_encoder->Write( rgb.data(), frame.index, error );
             }
 
@@ -443,6 +652,15 @@ private:
     wxWeakRef<wxTopLevelWindow>             m_window;
     wxWeakRef<wxWindow>                     m_canvas;
     double                                  m_maxSeconds = 600;
+    bool                                    m_letterbox = false;   ///< fixed profile frame
+    wxSize                                  m_renderSize;          ///< canvas rendered offscreen at this size
+    int                                     m_tier = 0;            ///< TIER of the offscreen canvas path
+    std::string                             m_qualityMode = "adaptive";
+    std::deque<double>                      m_tierMs;              ///< recent frame times on this tier
+    int                                     m_tierFrames = 0;
+    nlohmann::json                          m_tierLog = nlohmann::json::array();
+    CLOCK::time_point                       m_lastSync;            ///< last frame fed on video time
+    bool                                    m_rebase = false;      ///< timer continues the video clock
     CLOCK::time_point                       m_start;
     CLOCK::time_point                       m_pauseStart;
     CLOCK::duration                         m_pausedTotal{};
@@ -480,6 +698,24 @@ void RECORD_TIMER::Notify()
 void KopenapiRecorderShutdown()
 {
     RECORDER::Get().Shutdown();
+}
+
+
+bool KopenapiRecordingSync( int* aFps )
+{
+    return RECORDER::Get().Synced( aFps );
+}
+
+
+void KopenapiRecordFrame()
+{
+    RECORDER::Get().RecordFrame();
+}
+
+
+int KopenapiRecordingScreenSteps()
+{
+    return RECORDER::Get().ScreenSteps();
 }
 
 
@@ -531,7 +767,10 @@ KOPENAPI_REGISTER( "record_start",
                         "codec":{"type":"string","enum":["h264","hevc"],"default":"h264"},
                         "encoder":{"type":"string","enum":["auto","native","ffmpeg"],"default":"auto"},
                         "fps":{"type":"integer","minimum":1,"maximum":60,"description":"default 20 for a window, 30 for a canvas"},
-                        "max_width":{"type":"integer","default":1920,"description":"scale down wider frames"},
+                        "antialias":{"type":"string","enum":["ssaa2","none"],"default":"ssaa2","description":"canvases rendered at the video size (3D viewer): 2x supersampling on the GPU"},
+                        "quality_mode":{"type":"string","enum":["adaptive","max","fast"],"default":"adaptive","description":"3D viewer canvas: adaptive starts at full quality and steps down (gpu 2x -> gpu -> window readback scaled) when frames exceed the budget or the GPU refuses, back up with room to spare; max keeps the best the GPU can do; fast uses the readback"},
+                        "profile":{"type":"string","enum":["source","1080p","4k"],"default":"source","description":"4k (3840x2160) / 1080p (1920x1080): every frame scaled (bicubic up, high-quality down) to fit, centred; source: the window's size capped by max_width"},
+                        "max_width":{"type":"integer","default":1920,"description":"source profile: scale down wider frames"},
                         "quality":{"type":"integer","minimum":0,"maximum":10,"default":5},
                         "max_seconds":{"type":"number","default":600,"description":"stops by itself after this long"}}})json"_json,
                    true, h_record_start, 60 );

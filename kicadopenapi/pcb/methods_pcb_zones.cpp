@@ -8,6 +8,7 @@
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
+#include <kicadopenapi_keepalive.h>
 #include <base_units.h>
 #include <board.h>
 #include <board_commit.h>
@@ -84,6 +85,8 @@ nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::v
     BOARD*       board = aContext.GetBoard();
     BOARD_COMMIT commit( aContext.GetToolManager() );
     ZONE_FILLER  filler( board, &commit );
+    KOPENAPI_KEEPALIVE_REPORTER reporter;
+    filler.SetProgressReporter( &reporter );
     const bool   ok = filler.Fill( aZones );
 
     if( ok )

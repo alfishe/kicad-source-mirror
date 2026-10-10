@@ -56,18 +56,23 @@ public:
             NSDictionary* color = @{ AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
                                      AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                                      AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2 };
+            // a different input size: VideoToolbox fits it in (keeping the aspect, letterboxed)
             NSDictionary* video = @{ AVVideoCodecKey: aSettings.codec == "hevc" ? AVVideoCodecTypeHEVC : AVVideoCodecTypeH264,
                                      AVVideoWidthKey: @( aSettings.width ),
                                      AVVideoHeightKey: @( aSettings.height ),
+                                     AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
                                      AVVideoCompressionPropertiesKey: compression,
                                      AVVideoColorPropertiesKey: color };
 
             AVAssetWriterInput* input = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeVideo outputSettings:video];
             input.expectsMediaDataInRealTime = YES;
 
+            m_inW = aSettings.inputWidth ? aSettings.inputWidth : aSettings.width;
+            m_inH = aSettings.inputHeight ? aSettings.inputHeight : aSettings.height;
+
             NSDictionary* buffers = @{ (id) kCVPixelBufferPixelFormatTypeKey: @( kCVPixelFormatType_32BGRA ),
-                                       (id) kCVPixelBufferWidthKey: @( aSettings.width ),
-                                       (id) kCVPixelBufferHeightKey: @( aSettings.height ) };
+                                       (id) kCVPixelBufferWidthKey: @( m_inW ),
+                                       (id) kCVPixelBufferHeightKey: @( m_inH ) };
             AVAssetWriterInputPixelBufferAdaptor* adaptor =
                     [[AVAssetWriterInputPixelBufferAdaptor alloc] initWithAssetWriterInput:input
                                                                sourcePixelBufferAttributes:buffers];
@@ -135,12 +140,12 @@ public:
             uint8_t*     dst = static_cast<uint8_t*>( CVPixelBufferGetBaseAddress( buffer ) );
             const size_t stride = CVPixelBufferGetBytesPerRow( buffer );
 
-            for( int y = 0; y < m_settings.height; ++y )
+            for( int y = 0; y < m_inH; ++y )
             {
-                const uint8_t* s = aRgb + size_t( y ) * m_settings.width * 3;
+                const uint8_t* s = aRgb + size_t( y ) * m_inW * 3;
                 uint8_t*       d = dst + size_t( y ) * stride;
 
-                for( int x = 0; x < m_settings.width; ++x, s += 3, d += 4 )
+                for( int x = 0; x < m_inW; ++x, s += 3, d += 4 )
                 {
                     d[0] = s[2];
                     d[1] = s[1];
@@ -211,6 +216,8 @@ private:
     AVAssetWriterInput*                   m_input = nil;
     AVAssetWriterInputPixelBufferAdaptor* m_adaptor = nil;
     int64_t                               m_lastIndex = -1;
+    int                                   m_inW = 0;
+    int                                   m_inH = 0;
 };
 
 } // namespace

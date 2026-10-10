@@ -291,6 +291,12 @@ public:
 
     void RenderToFrameBuffer( unsigned char* aBuffer, int aWidth, int aHeight );
 
+    /// @brief Render the loaded scene offscreen into an RGB image (top row first), optionally
+    /// supersampled: drawn at aSupersample times the size and averaged down on the GPU. The
+    /// offscreen buffers are kept between calls (video capture).
+    /// @return false when the canvas cannot render (no context, framebuffer blit unsupported)
+    bool RenderToImage( unsigned char* aRgb, int aWidth, int aHeight, int aSupersample = 1 );
+
     void OnCloseWindow( wxCloseEvent& event );
 
 private:
@@ -394,6 +400,14 @@ private:
     std::shared_ptr<SYNC_REPORTER> m_warningReporterSync;
 
     wxGLContext*           m_glRC = nullptr;                    // Current OpenGL context
+
+    /// RenderToImage() buffers, kept while the size stays: drawing target and its downsampled copy
+    struct OFFSCREEN
+    {
+        GLuint drawFbo = 0, drawColor = 0, drawDepth = 0;
+        GLuint readFbo = 0, readColor = 0;
+        int    w = 0, h = 0, scale = 0;
+    }                      m_offscreen;
     bool                   m_is_opengl_initialized = false;
     bool                   m_is_opengl_version_supported = true;
 

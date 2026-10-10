@@ -8,6 +8,7 @@
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
+#include <kicadopenapi_keepalive.h>
 #include <base_units.h>
 #include <board.h>
 #include <footprint.h>
@@ -109,7 +110,7 @@ FOOTPRINT_LIBRARY_ADAPTER* loadedAdapter( KOPENAPI_CONTEXT& aCtx )
 
     FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( project );
     adapter->AsyncLoad();
-    adapter->BlockUntilLoaded();
+    KopenapiWaitLibraries( adapter );
     return adapter;
 }
 

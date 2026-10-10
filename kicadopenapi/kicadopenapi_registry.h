@@ -111,6 +111,11 @@ class wxImage;
 /// which toolkit window rendering leaves blank.  Returns false for windows it does not own.
 using KOPENAPI_CANVAS_CAPTURE = std::function<bool( wxWindow* aWindow, wxImage& aImage )>;
 
+/// @brief Renders a canvas the kiface owns offscreen at a given pixel size (e.g. the 3D viewer at a
+/// video's 4K), from the scene it already holds. Returns false for windows it does not own.
+/// aSupersample > 1 draws that many times larger and averages down (antialiasing).
+using KOPENAPI_CANVAS_RENDER = std::function<bool( wxWindow* aWindow, int aWidth, int aHeight, int aSupersample, wxImage& aImage )>;
+
 
 /// @brief Thread-safe: kiface DSOs register while HTTP workers read; readers get copies.
 class KICOMMON_API KOPENAPI_REGISTRY
@@ -135,6 +140,8 @@ public:
 
     /// @brief Kifaces register how to read their canvases (window_capture composes them)
     static bool AddCanvasCapture( KOPENAPI_CANVAS_CAPTURE aCapture );
+    static bool AddCanvasRender( KOPENAPI_CANVAS_RENDER aRender );
+    std::vector<KOPENAPI_CANVAS_RENDER> CanvasRenders() const;
 
     std::vector<KOPENAPI_CANVAS_CAPTURE> CanvasCaptures() const;
 
@@ -164,6 +171,7 @@ private:
     std::map<std::string, KOPENAPI_DOC_STATUS>  m_docProviders;
     std::map<std::string, KOPENAPI_DOC_RELEASE> m_docReleasers;
     std::vector<KOPENAPI_CANVAS_CAPTURE>        m_canvasCaptures;
+    std::vector<KOPENAPI_CANVAS_RENDER>         m_canvasRenders;
     std::map<std::string, KOPENAPI_DOC_HISTORY> m_docHistories;
     std::set<std::string>                       m_editing;
 };
@@ -187,5 +195,8 @@ private:
 
 #define KOPENAPI_REGISTER_CANVAS_CAPTURE( aCapture )                                       \
     static const bool kopenapi_canvas_reg = KOPENAPI_REGISTRY::AddCanvasCapture( aCapture )
+
+#define KOPENAPI_REGISTER_CANVAS_RENDER( aRender )                                         \
+    static const bool kopenapi_canvas_render_reg = KOPENAPI_REGISTRY::AddCanvasRender( aRender )
 
 #endif

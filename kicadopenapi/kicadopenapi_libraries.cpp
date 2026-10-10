@@ -1,6 +1,7 @@
 #include "kicadopenapi_libraries.h"
 
 #include <common.h>
+#include <kicadopenapi_keepalive.h>
 #include <kicadopenapi_registry.h>
 #include <kiway.h>
 #include <pgm_base.h>
@@ -160,6 +161,6 @@ void KopenapiEnsureFootprintLibraries( KIWAY* aKiway )
         adapter && *adapter )
     {
         ( *adapter )->AsyncLoad();
-        ( *adapter )->BlockUntilLoaded();
+        KopenapiWaitLibraries( *adapter );
     }
 }

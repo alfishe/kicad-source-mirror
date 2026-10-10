@@ -15,6 +15,9 @@
 #include <wx/utils.h>
 #include <fstream>
 #include <future>
+#include <cmath>
+#include <mutex>
+#include <deque>
 #include <thread>
 
 #include <httplib.h>
@@ -22,6 +25,8 @@
 #include <kiway.h>
 #include <wx/app.h>
 #include <wx/log.h>
+#include <kicadopenapi_util.h>
+#include <wx/datetime.h>
 
 #include <platform.h>
 
@@ -68,6 +73,30 @@ static void reply( httplib::Response& aRes, const KOPENAPI_RESULT& aResult )
 }
 
 
+/// @brief The main-thread end of the gate: API work arrives as thread events (category THREAD),
+/// so a call that keeps the UI alive (KopenapiKeepUiAlive: paint and timers only) never starts
+/// another call inside itself.
+class MAIN_GATE_HANDLER : public wxEvtHandler
+{
+public:
+    MAIN_GATE_HANDLER()
+    {
+        Bind( wxEVT_THREAD,
+              []( wxThreadEvent& aEvent )
+              {
+                  if( auto job = aEvent.GetPayload<std::shared_ptr<std::function<void()>>>() )
+                      ( *job )();
+              } );
+    }
+
+    static MAIN_GATE_HANDLER& Get()
+    {
+        static MAIN_GATE_HANDLER handler;
+        return handler;
+    }
+};
+
+
 /// @brief Run aFn on the main (GUI/event-loop) thread and wait for its result on the calling HTTP
 /// worker.  The main thread never waits on HTTP threads.  If the service stops or the call
 /// exceeds CALL_TIMEOUT, the worker returns an error; a late closure still completes safely
@@ -83,7 +112,7 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
     auto promise = std::make_shared<std::promise<KOPENAPI_RESULT>>();
     std::future<KOPENAPI_RESULT> future = promise->get_future();
 
-    wxTheApp->CallAfter(
+    auto job = std::make_shared<std::function<void()>>(
             [aAlive, promise, fn = std::move( aFn )]()
             {
                 if( !aAlive->load() )
@@ -105,6 +134,10 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
                     promise->set_value( KOPENAPI_RESULT::Error( 500, "unknown exception" ) );
                 }
             } );
+
+    auto* event = new wxThreadEvent();
+    event->SetPayload( job );
+    MAIN_GATE_HANDLER::Get().QueueEvent( event );
 
     if( aWaker )
         aWaker();
@@ -143,7 +176,21 @@ struct KICAD_OPENAPI_SERVICE::IMPL
                  { "app", appName },
                  { "pid", kopenapi::platform::CurrentPid() },
                  { "port", port },
-                 { "headless", ctx.headless } };
+                 { "headless", ctx.headless },
+                 { "busy", busyJson() } };
+    }
+
+    /// @brief The call holding the main thread (method, running_ms), or null; any thread
+    nlohmann::json busyJson() const
+    {
+        std::lock_guard<std::mutex> lock( traceMutex );
+
+        if( busyMethod.empty() )
+            return nullptr;
+
+        return { { "method", busyMethod },
+                 { "running_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - busySince ).count() } };
     }
 
     nlohmann::json openApiJson() const;
@@ -156,6 +203,48 @@ struct KICAD_OPENAPI_SERVICE::IMPL
     void ensureKifaces() const;
 
     mutable std::atomic<bool> kifacesLoaded{ false };
+
+    /// @brief One API call through the gate, for api_trace
+    struct TRACE
+    {
+        long long   seq = 0;
+        std::string method;
+        size_t      argBytes = 0;
+        double      queuedMs = 0;   ///< waiting for the main thread
+        double      runMs = 0;      ///< running there
+        int         status = 0;
+        std::string at;             ///< wall clock when it was received
+        std::string args;           ///< arguments, cut at 2 KB
+        std::string error;          ///< error message of a failed call
+
+        nlohmann::json Json() const
+        {
+            nlohmann::json j = { { "seq", seq }, { "method", method }, { "at", at }, { "arg_bytes", argBytes },
+                                 { "queued_ms", queuedMs }, { "run_ms", runMs }, { "status", status },
+                                 { "args", args } };
+
+            if( !error.empty() )
+                j["error"] = error;
+
+            return j;
+        }
+    };
+
+    mutable std::atomic<bool> traceOn{ false };  ///< off: the gate records nothing (no buffer, no cost)
+    mutable std::mutex        traceMutex;
+    mutable std::deque<TRACE> traces;            ///< newest last, at most traceLimit bytes
+    mutable std::deque<size_t> traceSizes;       ///< bytes of each entry (its JSON line)
+    mutable size_t            traceBytes = 0;
+    mutable size_t            traceLimit = 1 << 20;
+    mutable std::string       traceFile;         ///< JSON lines appended per call, empty: off
+    mutable std::ofstream     traceStream;
+    bool                      traceToJournal = false;   ///< env KICAD_OPENAPI_TRACE
+    mutable long long         traceSeq = 0;
+    mutable std::string       busyMethod;        ///< the call running on the main thread now
+    mutable std::chrono::steady_clock::time_point busySince;
+    mutable nlohmann::json    lastDocuments = nlohmann::json::array();
+
+    nlohmann::json traceJson( const nlohmann::json& aArgs ) const;
     std::thread               preloadThread;   ///< joined in Stop()
 
     void writeDiscoveryFile();
@@ -204,6 +293,17 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::liveStatus() const
 {
     ensureKifaces();
 
+    // while a call holds the main thread, answer with the documents seen last
+    if( !busyJson().is_null() )
+    {
+        nlohmann::json status = statusJson();
+        std::lock_guard<std::mutex> lock( traceMutex );
+        status["documents"] = lastDocuments;
+        status["documents_stale"] = true;
+        status["journal"] = KOPENAPI_JOURNAL::Summary();
+        return KOPENAPI_RESULT::Ok( status );
+    }
+
     KOPENAPI_CONTEXT ctxCopy = ctx;
     KOPENAPI_RESULT  docs = runInMain( alive, waker,
                                        [ctxCopy]() mutable
@@ -214,6 +314,11 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::liveStatus() const
 
     if( docs.status != 200 )
         return docs;
+
+    {
+        std::lock_guard<std::mutex> lock( traceMutex );
+        lastDocuments = docs.body;
+    }
 
     nlohmann::json status = statusJson();
     bool           unsaved = false;
@@ -419,15 +524,44 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
         }
     }
 
+    // answered on the HTTP thread: works while the main thread is busy
+    if( aName == "api_trace" )
+        return KOPENAPI_RESULT::Ok( traceJson( aArgs ) );
+
     KOPENAPI_CONTEXT ctxCopy = ctx;
     KOPENAPI_HANDLER handler = method->handler;
     nlohmann::json   args = aArgs;
 
     const std::string operation = "api:" + aName;
+    const bool        tracing = traceOn.load( std::memory_order_relaxed );
+    const auto        received = tracing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    auto              started = tracing ? std::make_shared<std::chrono::steady_clock::time_point>( received ) : nullptr;
+    const IMPL*       self = this;
 
-    return runInMain( alive, waker,
-                      [ctxCopy, handler, args, operation]() mutable
+    KOPENAPI_RESULT outcome = runInMain( alive, waker,
+                      [ctxCopy, handler, args, operation, started, self]() mutable
                       {
+                          const auto now = std::chrono::steady_clock::now();
+
+                          if( started )
+                              *started = now;
+
+                          {
+                              std::lock_guard<std::mutex> lock( self->traceMutex );
+                              self->busyMethod = operation.substr( 4 );
+                              self->busySince = now;
+                          }
+
+                          struct BUSY_END
+                          {
+                              const IMPL* impl;
+                              ~BUSY_END()
+                              {
+                                  std::lock_guard<std::mutex> lock( impl->traceMutex );
+                                  impl->busyMethod.clear();
+                              }
+                          } busyEnd{ self };
+
                           // Log records during the call are attributed to this method
                           KOPENAPI_JOURNAL::SCOPED_OPERATION scope( operation );
 
@@ -462,6 +596,141 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
                           return result;
                       },
                       std::chrono::seconds( std::max( method->timeoutSec, 1 ) ) );
+
+    if( !tracing )
+        return outcome;
+
+    const auto finished = std::chrono::steady_clock::now();
+    auto       ms = []( auto d ) { return std::round( std::chrono::duration<double, std::milli>( d ).count() * 10 ) / 10; };
+    TRACE      t;
+    t.method = aName;
+    t.args = aArgs.dump();
+    t.argBytes = t.args.size();
+
+    if( t.args.size() > 2048 )
+        t.args = t.args.substr( 0, 2048 ) + "...";
+
+    if( outcome.status >= 400 && outcome.body.contains( "error" ) )
+        t.error = outcome.body["error"].value( "message", std::string() );
+    t.queuedMs = ms( *started - received );
+    t.runMs = ms( finished - *started );
+    t.status = outcome.status;
+    t.at = wxDateTime::Now().FormatISOCombined( ' ' ).ToStdString();
+
+    {
+        std::lock_guard<std::mutex> lock( traceMutex );
+        t.seq = ++traceSeq;
+        const std::string line = t.Json().dump();
+
+        traces.push_back( t );
+        traceSizes.push_back( line.size() + 1 );
+        traceBytes += line.size() + 1;
+
+        while( traceBytes > traceLimit && traces.size() > 1 )
+        {
+            traceBytes -= traceSizes.front();
+            traceSizes.pop_front();
+            traces.pop_front();
+        }
+
+        if( traceStream.is_open() )
+            traceStream << line << '\n' << std::flush;
+    }
+
+    if( traceToJournal )
+        wxLogMessage( "api #%lld %s %zu B: queued %.1f ms, ran %.1f ms -> %d", t.seq, aName, t.argBytes, t.queuedMs,
+                      t.runMs, t.status );
+
+    return outcome;
+}
+
+
+nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::traceJson( const nlohmann::json& aArgs ) const
+{
+    // configuration: on / off, buffer size, file sink
+    if( aArgs.contains( "enabled" ) || aArgs.contains( "buffer_bytes" ) || aArgs.contains( "file" ) )
+    {
+        std::lock_guard<std::mutex> lock( traceMutex );
+        const bool on = aArgs.value( "enabled", true );
+
+        traceOn = on;
+
+        if( !on )
+        {
+            traces.clear();
+            traces.shrink_to_fit();
+            traceSizes.clear();
+            traceSizes.shrink_to_fit();
+            traceBytes = 0;
+            traceStream.close();
+            traceFile.clear();
+            return { { "enabled", false } };
+        }
+
+        if( aArgs.contains( "buffer_bytes" ) )
+            traceLimit = std::clamp<size_t>( aArgs["buffer_bytes"].get<size_t>(), 4096, size_t( 1 ) << 30 );
+
+        if( aArgs.contains( "file" ) )
+        {
+            traceStream.close();
+            traceFile = aArgs["file"].is_string() ? aArgs["file"].get<std::string>() : std::string();
+
+            if( !traceFile.empty() )
+            {
+                traceStream.open( traceFile, std::ios::app );
+
+                if( !traceStream )
+                {
+                    const std::string bad = traceFile;
+                    traceFile.clear();
+                    return { { "error", "cannot open " + bad } };
+                }
+            }
+        }
+
+        while( traceBytes > traceLimit && traces.size() > 1 )
+        {
+            traceBytes -= traceSizes.front();
+            traceSizes.pop_front();
+            traces.pop_front();
+        }
+    }
+
+    if( !traceOn )
+        return { { "enabled", false }, { "hint", "api_trace {enabled: true, buffer_bytes?, file?} starts tracing" } };
+
+    const size_t   limit = std::max( aArgs.value( "limit", 50 ), 1 );
+    const std::string only = aArgs.value( "method", std::string() );
+    const double   slowerMs = aArgs.value( "slower_ms", 0.0 );
+    nlohmann::json calls = nlohmann::json::array();
+
+    std::lock_guard<std::mutex> lock( traceMutex );
+
+    for( auto it = traces.rbegin(); it != traces.rend() && calls.size() < limit; ++it )
+    {
+        if( ( !only.empty() && !KopenapiGlob( only, it->method ) ) || it->runMs + it->queuedMs < slowerMs )
+            continue;
+
+        nlohmann::json row = it->Json();
+
+        if( !aArgs.value( "with_args", false ) )
+            row.erase( "args" );
+
+        calls.push_back( row );
+    }
+
+    nlohmann::json busy = nullptr;
+
+    if( !busyMethod.empty() )
+    {
+        busy = { { "method", busyMethod },
+                 { "running_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - busySince ).count() } };
+    }
+
+    return { { "enabled", true }, { "calls", calls }, { "total", traceSeq }, { "busy", busy }, { "kept", traces.size() },
+             { "buffer_bytes", traceLimit }, { "used_bytes", traceBytes },
+             { "file", traceFile.empty() ? nlohmann::json() : nlohmann::json( traceFile ) } };
 }
 
 
@@ -706,6 +975,13 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     }
 
     m_impl->alive->store( true );
+    MAIN_GATE_HANDLER::Get();   // created on the main thread
+
+    if( std::getenv( "KICAD_OPENAPI_TRACE" ) )
+    {
+        m_impl->traceOn = true;
+        m_impl->traceToJournal = true;
+    }
 
     // Startup ends when the main loop first runs; later records not caused by an API call
     // are attributed to "background"

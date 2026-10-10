@@ -9,6 +9,7 @@
 #include "kopenapi_sch_model.h"
 
 #include <api/sch_context.h>
+#include <kicadopenapi_keepalive.h>
 #include <kicadopenapi_libraries.h>
 #include <base_units.h>
 #include <kicadopenapi_util.h>
@@ -52,7 +53,7 @@ SYMBOL_LIBRARY_ADAPTER* loadedAdapter( KOPENAPI_CONTEXT& aCtx )
 
     SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( project );
     adapter->AsyncLoad();
-    adapter->BlockUntilLoaded();
+    KopenapiWaitLibraries( adapter );
     return adapter;
 }
 

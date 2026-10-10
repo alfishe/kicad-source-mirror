@@ -411,8 +411,11 @@ list( APPEND KICOMMON_SRCS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_image.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_windows.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_capture.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_keepalive.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/kicadopenapi_recorder.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/video_encoder_ffmpeg.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/frame_scaler.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/frame_scaler_generic.cpp
     # platform layer shared with kicad-mcp-bridge; each file compiles only on its OS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_posix.cpp
@@ -423,7 +426,8 @@ list( APPEND KICOMMON_SRCS
 
 # native video encoders, one per OS (others record through ffmpeg)
 if( APPLE )
-    list( APPEND KICOMMON_SRCS ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/video_encoder_apple.mm )
+    list( APPEND KICOMMON_SRCS ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/video_encoder_apple.mm
+                               ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/frame_scaler_apple.cpp )
     set_source_files_properties( ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/video_encoder_apple.mm
                                  PROPERTIES SKIP_PRECOMPILE_HEADERS ON )
 else()
@@ -435,7 +439,8 @@ add_library( kicommon SHARED
     )
 
 if( APPLE )
-    target_link_libraries( kicommon "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo" )
+    target_link_libraries( kicommon "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
+                           "-framework Accelerate" )
 endif()
 
 if( KICAD_USE_PCH )

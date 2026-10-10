@@ -12,6 +12,7 @@
 #include "kopenapi_sch_router.h"
 
 #include <api/sch_context.h>
+#include <kicadopenapi_keepalive.h>
 #include <base_units.h>
 #include <kicadopenapi_glow_view.h>
 #include <kicadopenapi_registry.h>
@@ -107,7 +108,7 @@ LIB_SYMBOL* librarySymbol( KOPENAPI_CONTEXT& aCtx, SCH_CONTEXT& aContext, const 
 
     SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( &aContext.GetSchematic()->Project() );
     adapter->AsyncLoad();
-    adapter->BlockUntilLoaded();
+    KopenapiWaitLibraries( adapter );
 
     try
     {

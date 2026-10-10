@@ -11,6 +11,7 @@
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
+#include <kicadopenapi_keepalive.h>
 #include <base_units.h>
 #include <board.h>
 #include <board_commit.h>
@@ -41,6 +42,7 @@
 #include <zone_filler.h>
 
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <set>
 
@@ -737,6 +739,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     for( const JOB& job : jobs )
     {
+        KopenapiKeepUiAlive();
+
         nlohmann::json attempt;
         bool           ok = false;
         int            tries = 0;
@@ -823,8 +827,15 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 glowFrom = added.size();
                 KopenapiGlow<ROUTE_GLOW_TRAITS>( aCtx.kiway, mine, 0 );
                 frame->GetCanvas()->Refresh();
-                wxSafeYield();
-                wxMilliSleep( stepMs );
+
+                // the UI keeps running (paint, glow, recordings) while the step shows
+                const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds( stepMs );
+
+                do
+                {
+                    KopenapiKeepUiAlive();
+                    std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
+                } while( std::chrono::steady_clock::now() < until );
             }
         }
 
@@ -903,6 +914,8 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     {
         BOARD_COMMIT fillCommit( context->GetToolManager() );
         ZONE_FILLER  filler( board, &fillCommit );
+        KOPENAPI_KEEPALIVE_REPORTER reporter;
+        filler.SetProgressReporter( &reporter );
         std::vector<ZONE*> zones( board->Zones().begin(), board->Zones().end() );
 
         if( !zones.empty() && filler.Fill( zones ) )
@@ -944,6 +957,8 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     for( const auto& [item, pos] : ends )
     {
+        KopenapiKeepUiAlive();
+
         if( done.count( item ) && item->Type() != PCB_ZONE_T )
             continue;
 

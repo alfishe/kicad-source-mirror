@@ -192,3 +192,15 @@ bool KopenapiCaptureCanvas( wxWindow* aCanvas, wxImage& aImage )
 
     return false;
 }
+
+
+bool KopenapiRenderCanvas( wxWindow* aCanvas, int aWidth, int aHeight, wxImage& aImage, int aSupersample )
+{
+    for( const KOPENAPI_CANVAS_RENDER& render : KOPENAPI_REGISTRY::Get().CanvasRenders() )
+    {
+        if( render( aCanvas, aWidth, aHeight, aSupersample, aImage ) && aImage.IsOk() )
+            return true;
+    }
+
+    return false;
+}

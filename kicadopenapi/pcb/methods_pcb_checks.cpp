@@ -9,6 +9,7 @@
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
+#include <kicadopenapi_keepalive.h>
 #include <board.h>
 #include <board_commit.h>
 #include <board_design_settings.h>
@@ -41,7 +42,9 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     // DRC needs the footprint libraries (library footprint mismatch checks)
     FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( board->GetProject() );
     adapter->AsyncLoad();
-    adapter->BlockUntilLoaded();
+    KopenapiWaitLibraries( adapter );
+
+    KOPENAPI_KEEPALIVE_REPORTER reporter;
 
     std::shared_ptr<DRC_ENGINE> engine = board->GetDesignSettings().m_DRCEngine;
 
@@ -62,7 +65,7 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         if( !toolManager->FindTool( ZONE_FILLER_TOOL_NAME ) )
             toolManager->RegisterTool( new ZONE_FILLER_TOOL );
 
-        toolManager->GetTool<ZONE_FILLER_TOOL>()->FillAllZones( nullptr, nullptr, true );
+        toolManager->GetTool<ZONE_FILLER_TOOL>()->FillAllZones( nullptr, &reporter, true );
     }
 
     BOARD_COMMIT commit( toolManager );
@@ -80,7 +83,9 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     board->DeleteMARKERs( true, true );
     // Every track error by default: with one error per track KiCad keeps whichever segment its
     // threads report first, so repeated runs differ (seen on Sprinter DX: 2..4 clearance errors)
+    engine->SetProgressReporter( &reporter );
     engine->RunTests( EDA_UNITS::MM, aArgs.value( "all_track_errors", true ), false );
+    engine->SetProgressReporter( nullptr );
     engine->ClearViolationHandler();
 
     commit.Push( _( "DRC" ), SKIP_UNDO | SKIP_SET_DIRTY );

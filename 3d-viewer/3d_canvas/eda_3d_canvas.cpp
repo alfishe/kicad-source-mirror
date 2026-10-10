@@ -671,6 +671,167 @@ void EDA_3D_CANVAS::DoRePaint()
 }
 
 
+bool EDA_3D_CANVAS::RenderToImage( unsigned char* aRgb, int aWidth, int aHeight, int aSupersample )
+{
+    if( !aRgb || aWidth <= 0 || aHeight <= 0 || aSupersample < 1 )
+        return false;
+
+    if( m_is_currently_painting.test_and_set() )
+        return false;
+
+    if( !GetParent() || !GetParent()->GetParent() || !GetParent()->GetParent()->IsShownOnScreen() )
+    {
+        m_is_currently_painting.clear();
+        return false;
+    }
+
+    GL_CONTEXT_MANAGER* gl_mgr = Pgm().GetGLContextManager();
+
+    if( !gl_mgr )
+    {
+        m_is_currently_painting.clear();
+        return false;
+    }
+
+    if( m_glRC == nullptr )
+        m_glRC = gl_mgr->CreateCtx( this );
+
+    if( m_glRC == nullptr )
+    {
+        m_is_currently_painting.clear();
+        return false;
+    }
+
+    gl_mgr->LockCtx( m_glRC, this );
+
+    // errors left by earlier drawing are not ours
+    while( glGetError() != GL_NO_ERROR )
+    {
+    }
+
+    GLint oldFramebuffer = 0;
+    GLint oldViewport[4];
+    glGetIntegerv( GL_FRAMEBUFFER_BINDING, &oldFramebuffer );
+    glGetIntegerv( GL_VIEWPORT, oldViewport );
+
+    auto done = [&]( bool aOk )
+    {
+        glBindFramebuffer( GL_FRAMEBUFFER, oldFramebuffer );
+        glViewport( oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3] );
+        gl_mgr->UnlockCtx( m_glRC );
+        m_is_currently_painting.clear();
+        return aOk;
+    };
+
+    if( !m_is_opengl_initialized && !initializeOpenGL() )
+        return done( false );
+
+    if( !m_is_opengl_version_supported || !glBlitFramebuffer )
+        return done( false );
+
+    const int rw = aWidth * aSupersample;
+    const int rh = aHeight * aSupersample;
+    OFFSCREEN& o = m_offscreen;
+
+    // (re)create the buffers when the size changes: drawing target with depth + stencil (the
+    // renderer cuts holes with the stencil), and a plain copy at the output size
+    if( o.w != aWidth || o.h != aHeight || o.scale != aSupersample || !o.drawFbo )
+    {
+        if( o.drawFbo )
+        {
+            glDeleteFramebuffers( 1, &o.drawFbo );
+            glDeleteRenderbuffers( 1, &o.drawColor );
+            glDeleteRenderbuffers( 1, &o.drawDepth );
+            glDeleteFramebuffers( 1, &o.readFbo );
+            glDeleteTextures( 1, &o.readColor );
+        }
+
+        o = OFFSCREEN();
+        glGenFramebuffers( 1, &o.drawFbo );
+        glBindFramebuffer( GL_FRAMEBUFFER, o.drawFbo );
+        glGenRenderbuffers( 1, &o.drawColor );
+        glBindRenderbuffer( GL_RENDERBUFFER, o.drawColor );
+        glRenderbufferStorage( GL_RENDERBUFFER, GL_RGBA8, rw, rh );
+        glFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, o.drawColor );
+        glGenRenderbuffers( 1, &o.drawDepth );
+        glBindRenderbuffer( GL_RENDERBUFFER, o.drawDepth );
+        glRenderbufferStorage( GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, rw, rh );
+        glFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, o.drawDepth );
+
+        const bool drawOk = glCheckFramebufferStatus( GL_FRAMEBUFFER ) == GL_FRAMEBUFFER_COMPLETE;
+
+        // the averaged frame lands in a texture: read back for the capture, drawn to the window
+        glGenFramebuffers( 1, &o.readFbo );
+        glBindFramebuffer( GL_FRAMEBUFFER, o.readFbo );
+        glGenTextures( 1, &o.readColor );
+        glBindTexture( GL_TEXTURE_2D, o.readColor );
+        glTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA8, aWidth, aHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr );
+        glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+        glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+        glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+        glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+        glBindTexture( GL_TEXTURE_2D, 0 );
+        glFramebufferTexture2D( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, o.readColor, 0 );
+
+        if( !drawOk || glCheckFramebufferStatus( GL_FRAMEBUFFER ) != GL_FRAMEBUFFER_COMPLETE )
+        {
+            glDeleteFramebuffers( 1, &o.drawFbo );
+            glDeleteRenderbuffers( 1, &o.drawColor );
+            glDeleteRenderbuffers( 1, &o.drawDepth );
+            glDeleteFramebuffers( 1, &o.readFbo );
+            glDeleteTextures( 1, &o.readColor );
+            o = OFFSCREEN();
+            return done( false );   // e.g. larger than the GPU allows
+        }
+
+        o.w = aWidth;
+        o.h = aHeight;
+        o.scale = aSupersample;
+    }
+
+    // draw the scene once at the drawing size
+    glBindFramebuffer( GL_FRAMEBUFFER, o.drawFbo );
+    glViewport( 0, 0, rw, rh );
+    m_camera.SetCurWindowSize( wxSize( rw, rh ) );
+
+    if( m_boardAdapter.m_Cfg->m_Render.engine == RENDER_ENGINE::OPENGL || !m_opengl_supports_raytracing )
+        m_3d_render = m_3d_render_opengl.get();
+
+    if( !m_3d_render )
+        return done( false );
+
+    try
+    {
+        m_3d_render->SetCurWindowSize( wxSize( rw, rh ) );
+        m_3d_render->Redraw( false );
+    }
+    catch( std::runtime_error& )
+    {
+        return done( false );
+    }
+
+    // average down (linear filter at an exact 1/n scale) and flip to top row first, on the GPU
+    glBindFramebuffer( GL_READ_FRAMEBUFFER, o.drawFbo );
+    glBindFramebuffer( GL_DRAW_FRAMEBUFFER, o.readFbo );
+    glBlitFramebuffer( 0, 0, rw, rh, 0, aHeight, aWidth, 0, GL_COLOR_BUFFER_BIT,
+                       aSupersample > 1 ? GL_LINEAR : GL_NEAREST );
+
+    glBindFramebuffer( GL_READ_FRAMEBUFFER, o.readFbo );
+    glPixelStorei( GL_PACK_ALIGNMENT, 1 );
+    glReadPixels( 0, 0, aWidth, aHeight, GL_RGB, GL_UNSIGNED_BYTE, aRgb );
+
+    const bool ok = glGetError() == GL_NO_ERROR;
+
+    const wxSize window = GetNativePixelSize();
+
+    // the camera follows the window again for the next on-screen paint
+    m_camera.SetCurWindowSize( window );
+    m_3d_render->SetCurWindowSize( window );
+
+    return done( ok );
+}
+
+
 void EDA_3D_CANVAS::RenderToFrameBuffer( unsigned char* buffer, int width, int height )
 {
     if( m_is_currently_painting.test_and_set() )

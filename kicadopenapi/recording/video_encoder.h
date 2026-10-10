@@ -14,8 +14,10 @@
 struct KOPENAPI_VIDEO_SETTINGS
 {
     std::filesystem::path path;
-    int                   width = 0;            ///< even
-    int                   height = 0;           ///< even
+    int                   width = 0;            ///< output, even
+    int                   height = 0;           ///< output, even
+    int                   inputWidth = 0;       ///< frames handed to Write(); 0: same as the output
+    int                   inputHeight = 0;      ///< (else the encoder fits them in, keeping the aspect, letterboxed)
     int                   fps = 30;
     std::string           format = "mp4";       ///< mp4 | gif
     std::string           codec = "h264";       ///< h264 | hevc (mp4)
@@ -35,7 +37,7 @@ public:
     virtual bool Open( const KOPENAPI_VIDEO_SETTINGS& aSettings, std::string& aError ) = 0;
 
     /// @brief Adds a frame shown from frame slot aIndex (time = aIndex / fps) until the next one.
-    /// @param aRgb width x height packed RGB24
+    /// @param aRgb input size (inputWidth x inputHeight, else width x height) packed RGB24
     /// @param aIndex increasing; gaps mean the previous frame stays on screen
     /// @return false when the encoder failed (aError set)
     virtual bool Write( const uint8_t* aRgb, int64_t aIndex, std::string& aError ) = 0;

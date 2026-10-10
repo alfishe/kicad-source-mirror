@@ -18,6 +18,10 @@
  */
 
 #include "command_openapi_server.h"
+#include <string_utils.h>
+#include <kicadopenapi_registry.h>
+#include <wx/filename.h>
+#include <wildcards_and_files_ext.h>
 
 #include <atomic>
 #include <chrono>
@@ -108,10 +112,12 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
     // Errors/warnings go to the journal (API + log file + stderr)
     KOPENAPI_JOURNAL::Install( "kicad-cli-openapi" );
 
-    if( !m_argParser.get<std::string>( ARG_PATH ).empty() )
+    const wxString preload = From_UTF8( m_argParser.get<std::string>( ARG_PATH ).c_str() );
+
+    if( !preload.IsEmpty() && !wxFileName::FileExists( preload ) )
     {
-        wxFprintf( stderr, _( "Pre-loading documents is not supported yet\n" ) );
-        return EXIT_CODES::ERR_ARGS;
+        wxFprintf( stderr, _( "File not found: %s\n" ), preload );
+        return EXIT_CODES::ERR_INVALID_INPUT_FILE;
     }
 
     const long parentPid = m_argParser.get<int>( ARG_PARENT_PID );
@@ -135,6 +141,53 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
 
     if( !service.Start( m_argParser.get<int>( ARG_PORT ) ) )
         return EXIT_CODES::ERR_UNKNOWN;
+
+    // a document given on the command line opens before the first request is served: a board or
+    // schematic, or both of a project
+    if( !preload.IsEmpty() )
+    {
+        wxFileName           fn( preload );
+        KOPENAPI_CONTEXT     ctx{ &aKiway, true };
+        std::vector<std::pair<std::string, wxString>> opens;
+
+        fn.MakeAbsolute();
+
+        if( fn.GetExt() == FILEEXT::KiCadPcbFileExtension )
+            opens.emplace_back( "pcb_open", fn.GetFullPath() );
+        else if( fn.GetExt() == FILEEXT::KiCadSchematicFileExtension )
+            opens.emplace_back( "sch_open", fn.GetFullPath() );
+        else if( fn.GetExt() == FILEEXT::ProjectFileExtension )
+        {
+            for( const auto& [method, ext] : { std::pair{ "sch_open", FILEEXT::KiCadSchematicFileExtension },
+                                               std::pair{ "pcb_open", FILEEXT::KiCadPcbFileExtension } } )
+            {
+                wxFileName doc( fn );
+                doc.SetExt( ext );
+
+                if( doc.FileExists() )
+                    opens.emplace_back( method, doc.GetFullPath() );
+            }
+        }
+        else
+        {
+            wxFprintf( stderr, _( "Cannot open %s: give a .kicad_pcb, .kicad_sch or .kicad_pro\n" ), preload );
+            service.Stop();
+            return EXIT_CODES::ERR_ARGS;
+        }
+
+        for( KIWAY::FACE_T face : { KIWAY::FACE_SCH, KIWAY::FACE_PCB } )
+            aKiway.KiFACE( face );
+
+        for( const auto& [method, path] : opens )
+        {
+            std::optional<KOPENAPI_METHOD> open = KOPENAPI_REGISTRY::Get().Find( method );
+            KOPENAPI_RESULT result = open ? open->handler( ctx, { { "path", path.ToStdString( wxConvUTF8 ) } } )
+                                          : KOPENAPI_RESULT::Error( 500, method + std::string( " not available" ) );
+
+            if( result.status != 200 )
+                wxFprintf( stderr, _( "Cannot open %s: %s\n" ), path, From_UTF8( result.body.dump().c_str() ) );
+        }
+    }
 
     service.PreloadKifaces();
 

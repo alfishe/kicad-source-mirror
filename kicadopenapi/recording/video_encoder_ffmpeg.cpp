@@ -30,22 +30,36 @@ public:
     bool Open( const KOPENAPI_VIDEO_SETTINGS& aSettings, std::string& aError ) override
     {
         m_settings = aSettings;
-        m_frameBytes = size_t( aSettings.width ) * aSettings.height * 3;
 
-        const std::string size = std::to_string( aSettings.width ) + "x" + std::to_string( aSettings.height );
+        const int inW = aSettings.inputWidth ? aSettings.inputWidth : aSettings.width;
+        const int inH = aSettings.inputHeight ? aSettings.inputHeight : aSettings.height;
+        m_frameBytes = size_t( inW ) * inH * 3;
+
+        const std::string size = std::to_string( inW ) + "x" + std::to_string( inH );
+        const std::string W = std::to_string( aSettings.width ), H = std::to_string( aSettings.height );
+
+        // a fixed output frame: ffmpeg fits the input in (lanczos), letterboxed on a dark field
+        const std::string fit = inW == aSettings.width && inH == aSettings.height
+                                        ? std::string()
+                                        : "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease:flags=lanczos,pad="
+                                                  + W + ":" + H + ":(ow-iw)/2:(oh-ih)/2:color=0x121216";
         const std::string fps = std::to_string( aSettings.fps );
         std::vector<std::string> argv = { m_exe.string(), "-hide_banner", "-loglevel", "error", "-y",
                                           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", size, "-r", fps, "-i", "-" };
 
         if( aSettings.format == "gif" )
         {
-            argv.insert( argv.end(), { "-vf", "split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=none",
+            argv.insert( argv.end(), { "-vf", ( fit.empty() ? "" : fit + "," )
+                                                       + "split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=none",
                                        "-loop", "0" } );
         }
         else
         {
             // quality 0..10 -> crf 34..18
             const int crf = 34 - std::clamp( aSettings.quality, 0, 10 ) * 16 / 10;
+
+            if( !fit.empty() )
+                argv.insert( argv.end(), { "-vf", fit } );
             argv.insert( argv.end(), { "-c:v", aSettings.codec == "hevc" ? "libx265" : "libx264", "-preset", "veryfast",
                                        "-crf", std::to_string( crf ), "-pix_fmt", "yuv420p", "-movflags", "+faststart" } );
 

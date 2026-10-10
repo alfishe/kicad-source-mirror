@@ -464,6 +464,9 @@ static KOPENAPI_RESULT h_pcb_netlist_apply( KOPENAPI_CONTEXT& aCtx, const nlohma
     if( !success )
         result["hint"] = "see report: missing footprints (sch_footprint_check), unannotated parts";
 
+    if( nlohmann::json trim = KopenapiLeadTrimRefresh( aCtx, *context ); !trim.is_null() )
+        result["lead_trim"] = trim["trimmed"].size();
+
     return KOPENAPI_RESULT::Ok( result );
 }
 

@@ -10,6 +10,7 @@
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
+#include <kicadopenapi_keepalive.h>
 #include <autorouter/ar_autoplacer.h>
 #include <base_units.h>
 #include <board.h>
@@ -891,6 +892,8 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
     board->BuildConnectivity();
     AR_AUTOPLACER autoplacer( board );
+    KOPENAPI_KEEPALIVE_REPORTER reporter;
+    autoplacer.SetProgressReporter( &reporter );
     autoplacer.SetOverlay( std::make_shared<KIGFX::VIEW_OVERLAY>() );   // it draws its matrix unconditionally
 
     const AR_RESULT result = rest.empty() ? AR_COMPLETED : autoplacer.AutoplaceFootprints( rest, &commit, false );

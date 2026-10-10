@@ -114,3 +114,42 @@ KOPENAPI_REGISTER( "window_capture",
                         "window":{"type":"string","description":"id or title glob, e.g. *Schematic Editor*"},
                         "max_width":{"type":"integer","default":1600}}})json"_json,
                    true, h_window_capture, 60 );
+
+
+static KOPENAPI_RESULT h_window_set( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
+{
+    wxTopLevelWindow* target = KopenapiFindWindow( aArgs.value( "window", std::string() ) );
+
+    if( !target )
+        return KOPENAPI_RESULT::Error( 404, "window not found (see window_list: id or title glob)" );
+
+    if( target->IsIconized() )
+        target->Iconize( false );
+
+    if( target->IsMaximized() && ( aArgs.contains( "width" ) || aArgs.contains( "x" ) ) )
+        target->Maximize( false );
+
+    wxPoint pos = target->GetPosition();
+    wxSize  size = target->GetSize();
+    pos.x = aArgs.value( "x", pos.x );
+    pos.y = aArgs.value( "y", pos.y );
+    size.x = std::max( 200, aArgs.value( "width", size.x ) );
+    size.y = std::max( 150, aArgs.value( "height", size.y ) );
+    target->SetSize( wxRect( pos, size ) );
+
+    if( aArgs.value( "raise", false ) )
+        target->Raise();
+
+    return KOPENAPI_RESULT::Ok( windowJson( target ) );
+}
+
+
+KOPENAPI_REGISTER( "window_set",
+                   "Move / resize a KiCad window (screen points): x, y, width, height, raise; e.g. the same "
+                   "editor size for every scene of a recording; GUI only",
+                   R"json({"type":"object","required":["window"],"properties":{
+                        "window":{"type":"string","description":"id or title glob from window_list"},
+                        "x":{"type":"integer"}, "y":{"type":"integer"},
+                        "width":{"type":"integer"}, "height":{"type":"integer"},
+                        "raise":{"type":"boolean","default":false}}})json"_json,
+                   true, h_window_set );

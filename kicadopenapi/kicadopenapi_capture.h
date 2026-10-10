@@ -32,4 +32,8 @@ KICOMMON_API wxWindow* KopenapiFindCanvas( wxTopLevelWindow* aWindow );
 /// @brief A canvas read back alone (from KopenapiFindCanvas)
 KICOMMON_API bool KopenapiCaptureCanvas( wxWindow* aCanvas, wxImage& aImage );
 
+/// @brief A canvas rendered offscreen at aWidth x aHeight pixels (sharp at any video size), when its
+/// kiface supports it (the 3D viewer); false otherwise
+KICOMMON_API bool KopenapiRenderCanvas( wxWindow* aCanvas, int aWidth, int aHeight, wxImage& aImage, int aSupersample = 1 );
+
 #endif
