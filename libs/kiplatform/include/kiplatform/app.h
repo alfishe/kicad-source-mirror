@@ -40,8 +40,9 @@ namespace KIPLATFORM
          * Run as a background (non-UI) process: never activate, no dock icon, no window or
          * space switching.  For command-line tools that live inside the GUI app bundle
          * (kicad-cli), so batch runs cannot pull the desktop into the app's (full-screen)
-         * space.  Call at the start of OnInit, before any window exists.  No-op where the OS
-         * has no such concept.
+         * space.  Call from the wxApp constructor, before the toolkit initialises (on macOS
+         * wxAppConsole::Initialize already registers the process with the window server).
+         * No-op where the OS has no such concept.
          */
         void SetBackgroundProcess();
 

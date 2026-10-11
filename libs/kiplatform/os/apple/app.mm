@@ -36,7 +36,23 @@ bool KIPLATFORM::APP::Init()
 
 void KIPLATFORM::APP::SetBackgroundProcess()
 {
-    [[NSApplication sharedApplication] setActivationPolicy:NSApplicationActivationPolicyProhibited];
+    // The process registers with the window server when NSApplication is first created (wx
+    // does that in wxAppConsole::Initialize), taking its activation policy from the main
+    // bundle's Info.plist, which this executable shares with the GUI app.  Marking the
+    // in-memory copy BackgroundOnly before that point keeps it out of the Dock entirely.
+    @try
+    {
+        NSDictionary* info = [[NSBundle mainBundle] infoDictionary];
+
+        if( [info isKindOfClass:[NSMutableDictionary class]] )
+            [(NSMutableDictionary*) info setObject:@YES forKey:@"LSBackgroundOnly"];
+    }
+    @catch( NSException* )
+    {
+    }
+
+    if( NSApp )
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
 }
 
 

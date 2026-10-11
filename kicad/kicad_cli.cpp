@@ -739,6 +739,10 @@ struct APP_KICAD_CLI : public wxAppConsole
     {
         SetPgm( &program );
 
+        // kicad-cli lives in the GUI bundle; it must never activate, show in the Dock or
+        // switch spaces.  Before wxEntry initialises the toolkit, which registers the process.
+        KIPLATFORM::APP::SetBackgroundProcess();
+
         // Init the environment each platform wants
         KIPLATFORM::ENV::Init();
     }
@@ -746,9 +750,6 @@ struct APP_KICAD_CLI : public wxAppConsole
 
     bool OnInit() override
     {
-        // kicad-cli lives in the GUI bundle; it must never activate or switch spaces
-        KIPLATFORM::APP::SetBackgroundProcess();
-
         // Perform platform-specific init tasks
         if( !KIPLATFORM::APP::Init() )
             return false;
