@@ -217,6 +217,25 @@ private:
 };
 
 
+/// @brief Stacking of the kinds, top first: texts over arrows over marked areas over dimming
+int zBand( const std::string& aKind )
+{
+    if( aKind == "key_hint" )
+        return 0;
+
+    if( aKind == "label" || aKind == "step" )
+        return 1;
+
+    if( aKind == "arrow" )
+        return 2;
+
+    if( aKind == "highlight" || aKind == "region" )
+        return 3;
+
+    return 4;   // spotlight: dims everything else
+}
+
+
 void LAYER::drawLabel( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const VECTOR2D& aAt, const wxString& aText,
                        const COLOR4D& aColour, double aAlpha )
 {
@@ -236,7 +255,8 @@ void LAYER::drawLabel( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const VECTOR2D
 
     aOverlay.SetIsFill( true );
     aOverlay.SetLineWidth( 2 * aPx );
-    aOverlay.SetFillColor( COLOR4D( 0.08, 0.08, 0.10, 0.85 * aAlpha ) );
+    // opaque: the layer is always above the document, nothing of it shows through a label
+    aOverlay.SetFillColor( COLOR4D( 0.08, 0.08, 0.10, aAlpha ) );
     aOverlay.SetStrokeColor( aColour.WithAlpha( aAlpha ) );
     aOverlay.Rectangle( topLeft, topLeft + VECTOR2D( width, height ) );
 }
@@ -485,14 +505,23 @@ void LAYER::Redraw()
     bool animating = false;
     bool following = false;
 
-    // the GAL keeps the first of equally deep shapes: the pointer, then the newest annotation on top
+    // the GAL keeps the first of equally deep shapes, so what is on top is drawn first: the
+    // pointer, then by kind (texts over arrows over marked areas), the newest first within a kind
     drawPointer( *m_overlay, px, viewport, now );
 
     std::erase_if( m_annotations, [&]( const ANNOTATION& n ) { return n.ttl > 0 && seconds( now - n.created ) >= n.ttl; } );
 
+    std::vector<ANNOTATION*> order;
+
     for( auto it = m_annotations.rbegin(); it != m_annotations.rend(); ++it )
+        order.push_back( &*it );
+
+    std::stable_sort( order.begin(), order.end(),
+                      []( const ANNOTATION* a, const ANNOTATION* b ) { return zBand( a->kind ) < zBand( b->kind ); } );
+
+    for( ANNOTATION* notePtr : order )
     {
-        ANNOTATION& note = *it;
+        ANNOTATION& note = *notePtr;
         double      alpha = 1.0;
 
         if( note.ttl > 0 )

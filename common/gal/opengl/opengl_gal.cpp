@@ -876,9 +876,14 @@ void OPENGL_GAL::EndDrawing()
     const uint64_t noncachedVertices = stats ? stats->frame.noncachedVertices : 0;
 
     cntEndOverlay.Start();
-    // Overlay container is rendered to a different buffer
+    // Overlay container is rendered to a different buffer, composited over the main one: it
+    // shares the depth buffer, so the main content's depth must not cut holes into it (only
+    // the overlay's own layers order it)
     if( m_overlayBuffer )
+    {
         m_compositor->SetBuffer( m_overlayBuffer );
+        glClear( GL_DEPTH_BUFFER_BIT );
+    }
 
     m_overlayManager->EndDrawing();
     syncGpu();
