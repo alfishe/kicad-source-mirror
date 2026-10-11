@@ -18,6 +18,7 @@
 #include <kiway_player.h>
 #include <project.h>
 #include <widgets/wx_infobar.h>
+#include <wx/stattext.h>
 
 #include <wx/app.h>
 #include <wx/dialog.h>
@@ -99,6 +100,40 @@ std::map<wxWindow*, std::pair<EDA_BASE_FRAME*, FRAME_T>> kicadFrames( KIWAY* aKi
 }
 
 
+/// @brief Collect the messages of every shown notice bar under @a aWindow (an editor can have
+/// more than one, e.g. the board editor's load notices about 3D models).
+void collectNotices( wxWindow* aWindow, nlohmann::json& aOut )
+{
+    for( wxWindow* child : aWindow->GetChildren() )
+    {
+        // WX_INFOBAR's own type info stays in the editors' library; the message is the bar's label
+        if( dynamic_cast<wxInfoBarGeneric*>( child ) )
+        {
+            if( child->IsShown() )
+            {
+                wxString message;
+
+                for( wxWindow* part : child->GetChildren() )
+                {
+                    if( wxStaticText* text = dynamic_cast<wxStaticText*>( part ) )
+                    {
+                        message = text->GetLabelText();
+                        break;
+                    }
+                }
+
+                aOut.push_back( { { "message", str( message.Trim() ) } } );
+            }
+
+            continue;
+        }
+
+        if( !child->IsTopLevel() )
+            collectNotices( child, aOut );
+    }
+}
+
+
 /// @brief What a KiCad frame is and has loaded: app, document (the 3D viewer: its board's),
 /// unsaved changes, project
 void describeFrame( EDA_BASE_FRAME* aFrame, FRAME_T aType, KIWAY* aKiway, nlohmann::json& aOut )
@@ -128,6 +163,10 @@ void describeFrame( EDA_BASE_FRAME* aFrame, FRAME_T aType, KIWAY* aKiway, nlohma
     WX_INFOBAR* bar = aFrame->GetInfoBar();
     aOut["infobar"] = bar && bar->IsShown() ? nlohmann::json( { { "message", str( bar->GetMessageText() ) } } )
                                             : nlohmann::json();
+
+    nlohmann::json notices = nlohmann::json::array();
+    collectNotices( aFrame, notices );
+    aOut["notices"] = std::move( notices );
 }
 
 
@@ -210,7 +249,8 @@ KOPENAPI_REGISTER( "window_list",
                    "List the windows of this KiCad process and what each one is: app (project_manager, "
                    "schematic_editor, board_editor, 3d_viewer, symbol_editor, footprint_editor, ..., dialog), "
                    "the document loaded (the 3D viewer: its board, shows_window), unsaved changes, project, the "
-                   "editor's notice bar (infobar: message, e.g. load warnings; null when hidden), a "
+                   "editor's notice bar (infobar: message, e.g. load warnings; null when hidden), every shown "
+                   "notice bar (notices: [{message}], includes the infobar and e.g. 3D model load notices), a "
                    "dialog's parent; id, title, class, shown / active / minimized, position and size; GUI only",
                    R"json({"type":"object","properties":{
                         "include_hidden":{"type":"boolean","default":false}}})json"_json,

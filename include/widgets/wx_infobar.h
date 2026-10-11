@@ -195,6 +195,13 @@ public:
     void ShowMessageAfterLoad( const wxString& aMessage, int aFlags, MESSAGE_TYPE aType,
                                std::function<bool()> aStillValid );
 
+    /// @brief ShowMessageAfterLoad() for a message hidden after a time, with its own buttons.
+    /// @param aTime is the display time in milliseconds.
+    /// @param aAddButtons adds the buttons (the previous ones are removed first).
+    /// @param aStillValid tested before showing; false drops the message (the document is gone).
+    void ShowMessageForAfterLoad( const wxString& aMessage, int aTime, int aFlags,
+                                  std::function<void()> aAddButtons, std::function<bool()> aStillValid );
+
     /**
      * Dismisses the infobar and updates the containing layout and AUI manager
      * (if one is provided).

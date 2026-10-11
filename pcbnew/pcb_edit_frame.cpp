@@ -2168,20 +2168,26 @@ void PCB_EDIT_FRAME::OnBoardLoaded()
                                         unresolved );
             }
 
-            m_loadNoticeInfoBar->RemoveAllButtons();
-            m_loadNoticeInfoBar->AddLink( _( "Show options" ),
-                    [this]( wxHyperlinkEvent& )
+            m_loadNoticeInfoBar->ShowMessageForAfterLoad( msg, 10000, wxICON_INFORMATION,
+                    [this]()
                     {
-                        DIALOG_MIGRATE_3D_MODELS dlg( this );
-                        dlg.ShowModal();
+                        m_loadNoticeInfoBar->AddLink( _( "Show options" ),
+                                [this]( wxHyperlinkEvent& )
+                                {
+                                    DIALOG_MIGRATE_3D_MODELS dlg( this );
+                                    dlg.ShowModal();
 
-                        // Dismiss the infobar if nothing remains to resolve;
-                        // otherwise leave it so the user can try again.
-                        if( DIALOG_MIGRATE_3D_MODELS::CountUnresolvedWrlReferences( this ) == 0 )
-                            m_loadNoticeInfoBar->Dismiss();
+                                    // Dismiss the infobar if nothing remains to resolve;
+                                    // otherwise leave it so the user can try again.
+                                    if( DIALOG_MIGRATE_3D_MODELS::CountUnresolvedWrlReferences( this ) == 0 )
+                                        m_loadNoticeInfoBar->Dismiss();
+                                } );
+                        m_loadNoticeInfoBar->AddCloseButton();
+                    },
+                    [this, file = GetBoard()->GetFileName()]()
+                    {
+                        return GetBoard() && GetBoard()->GetFileName() == file;
                     } );
-            m_loadNoticeInfoBar->AddCloseButton();
-            m_loadNoticeInfoBar->ShowMessageFor( msg, 10000, wxICON_INFORMATION );
         }
     }
 
@@ -2190,10 +2196,12 @@ void PCB_EDIT_FRAME::OnBoardLoaded()
     // Display a warning that the file is read only
     if( fn.FileExists() && !fn.IsFileWritable() )
     {
-        m_infoBar->RemoveAllButtons();
-        m_infoBar->AddCloseButton();
-        m_infoBar->ShowMessage( _( "Board file is read only." ), wxICON_WARNING,
-                                WX_INFOBAR::MESSAGE_TYPE::OUTDATED_SAVE );
+        m_infoBar->ShowMessageAfterLoad( _( "Board file is read only." ), wxICON_WARNING,
+                                         WX_INFOBAR::MESSAGE_TYPE::OUTDATED_SAVE,
+                                         [this, file = GetBoard()->GetFileName()]()
+                                         {
+                                             return GetBoard() && GetBoard()->GetFileName() == file;
+                                         } );
     }
 
     ReCreateLayerBox();

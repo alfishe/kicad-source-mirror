@@ -194,6 +194,25 @@ void WX_INFOBAR::ShowMessageAfterLoad( const wxString& aMessage, int aFlags, MES
 }
 
 
+void WX_INFOBAR::ShowMessageForAfterLoad( const wxString& aMessage, int aTime, int aFlags,
+                                          std::function<void()> aAddButtons, std::function<bool()> aStillValid )
+{
+    CallAfter(
+            [this, aMessage, aTime, aFlags, aAddButtons, aStillValid]()
+            {
+                if( aStillValid && !aStillValid() )
+                    return;
+
+                RemoveAllButtons();
+
+                if( aAddButtons )
+                    aAddButtons();
+
+                ShowMessageFor( aMessage, aTime, aFlags );
+            } );
+}
+
+
 void WX_INFOBAR::ShowMessage( const wxString& aMessage, int aFlags, MESSAGE_TYPE aType )
 {
     // Don't do anything if we requested the UI update
