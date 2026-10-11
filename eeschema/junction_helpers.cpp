@@ -56,7 +56,8 @@ POINT_INFO JUNCTION_HELPERS::AnalyzePoint( const EE_RTREE& aItems, const VECTOR2
     // Bus segments terminating here; a real fork ends at least one bus, a crossing ends none
     int busEndpointSegments = 0;
 
-    EE_RTREE filtered;
+    // Only iterated, never searched
+    std::vector<SCH_ITEM*> filtered;
     std::list<std::unique_ptr<SCH_LINE>> mergedLines;
 
     // Ignore items that are currently being moved or flagged to skip
@@ -82,12 +83,12 @@ POINT_INFO JUNCTION_HELPERS::AnalyzePoint( const EE_RTREE& aItems, const VECTOR2
             if( item->HitTest( aPosition, -1 ) )
                 info.hasExplicitJunctionDot = true;
 
-            filtered.insert( item );
+            filtered.push_back( item );
             break;
 
         case SCH_BUS_WIRE_ENTRY_T:
             info.hasBusEntry = true;
-            filtered.insert( item );
+            filtered.push_back( item );
             break;
 
         case SCH_SHEET_T:
@@ -95,7 +96,7 @@ POINT_INFO JUNCTION_HELPERS::AnalyzePoint( const EE_RTREE& aItems, const VECTOR2
         case SCH_LABEL_T:
         case SCH_HIER_LABEL_T:
         case SCH_GLOBAL_LABEL_T:
-            filtered.insert( item );
+            filtered.push_back( item );
             break;
 
         default:
@@ -155,7 +156,7 @@ POINT_INFO JUNCTION_HELPERS::AnalyzePoint( const EE_RTREE& aItems, const VECTOR2
     } while( merged );
 
     for( const auto& line : mergedLines )
-        filtered.insert( line.get() );
+        filtered.push_back( line.get() );
 
 
     // A pin at 90° still shouldn't match a line at 90° so just give pins unique numbers
