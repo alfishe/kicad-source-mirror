@@ -10,6 +10,7 @@
 #include <kicadopenapi_capture.h>
 #include <kicadopenapi_image.h>
 #include <kicadopenapi_registry.h>
+#include <kicadopenapi_remote.h>
 #include <kicadopenapi_util.h>
 
 #include <frame_type.h>
@@ -368,18 +369,23 @@ void toolbarsOf( wxWindow* aWindow, const wxString& aFilter, nlohmann::json& aOu
                     continue;
 
                 nlohmann::json entry = { { "label", str( label ) }, { "id", item->GetId() },
-                                         { "enabled", !( item->GetState() & wxAUI_BUTTON_STATE_DISABLED ) } };
+                                         { "enabled", !( item->GetState() & wxAUI_BUTTON_STATE_DISABLED ) },
+                                         { "looking", KOPENAPI_REMOTE::IsLookingCommand( bar, item->GetId() ) } };
 
                 if( item->GetKind() == wxITEM_CHECK || item->GetKind() == wxITEM_RADIO )
                     entry["checked"] = ( item->GetState() & wxAUI_BUTTON_STATE_CHECKED ) != 0;
 
-                if( item->GetWindow() )
-                    entry["control"] = str( item->GetWindow()->GetClassInfo()->GetClassName() );
+                if( wxWindow* control = item->GetWindow() )
+                {
+                    entry["control"] = str( control->GetClassInfo()->GetClassName() );
+                    entry["enabled"] = control->IsEnabled();
+                }
 
                 tools.push_back( entry );
             }
 
-            aOut.push_back( { { "name", str( bar->GetName() ) }, { "shown", bar->IsShown() }, { "tools", tools } } );
+            aOut.push_back( { { "name", str( bar->GetName() ) }, { "shown", bar->IsShown() },
+                              { "enabled", bar->IsEnabled() }, { "tools", tools } } );
         }
         else
         {

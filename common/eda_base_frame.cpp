@@ -674,6 +674,10 @@ static bool isLookingAction( int aUIId )
         {
             ids.insert( action->GetUIId() );
         }
+
+        // the toolbars' grid and zoom choices
+        ids.insert( ID_ON_GRID_SELECT );
+        ids.insert( ID_ON_ZOOM_SELECT );
     }
 
     return ids.count( aUIId ) > 0;

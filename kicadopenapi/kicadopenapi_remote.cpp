@@ -154,6 +154,13 @@ public:
         if( window && isBarWindow( window ) )
             return Event_Skip;
 
+        // looking controls (the toolbars' grid and zoom choices) and what they are made of
+        for( wxWindow* w = window; w && !w->IsTopLevel(); w = w->GetParent() )
+        {
+            if( KOPENAPI_REMOTE::IsLookingCommand( w, w->GetId() ) )
+                return Event_Skip;
+        }
+
         // looking: pointer moves, wheel (zoom / scroll), middle button (pan)
         if( type == wxEVT_MOTION || type == wxEVT_MOUSEWHEEL || type == wxEVT_MAGNIFY || type == wxEVT_MIDDLE_DOWN
             || type == wxEVT_MIDDLE_UP || type == wxEVT_ENTER_WINDOW || type == wxEVT_LEAVE_WINDOW )
@@ -548,8 +555,8 @@ private:
 };
 
 
-/// @brief Step: toolbar tools (embedded controls excluded: the filter refuses their input). Same
-/// snapshot rule as the menus.
+/// @brief Step: toolbar tools and the controls embedded in toolbars (track width, via size, layer;
+/// grid and zoom choices only look and stay). Same snapshot rule as the menus.
 class TOOLBARS_STEP : public KOPENAPI_REMOTE_PARTICIPANT
 {
 public:
@@ -558,6 +565,7 @@ public:
     void Engage() override
     {
         m_tools.clear();
+        m_controls.clear();
 
         for( wxWindow* window : wxTopLevelWindows )
         {
@@ -569,6 +577,14 @@ public:
     void Release() override
     {
         std::set<wxAuiToolBar*> changed;
+
+        for( wxWeakRef<wxWindow>& control : m_controls )
+        {
+            if( control && !control->IsEnabled() )
+                control->Enable( true );
+        }
+
+        m_controls.clear();
 
         for( TOOL& tool : m_tools )
         {
@@ -621,7 +637,19 @@ private:
             {
                 wxAuiToolBarItem* item = bar->FindToolByIndex( i );
 
-                if( !item || item->GetKind() == wxITEM_SEPARATOR || item->GetWindow() || item->GetId() == wxID_ANY
+                if( wxWindow* control = item ? item->GetWindow() : nullptr )
+                {
+                    if( control->IsEnabled() && !KOPENAPI_REMOTE::IsLookingCommand( bar, item->GetId() )
+                        && !KOPENAPI_REMOTE::IsLookingCommand( bar, control->GetId() ) )
+                    {
+                        control->Enable( false );
+                        m_controls.emplace_back( control );
+                    }
+
+                    continue;
+                }
+
+                if( !item || item->GetKind() == wxITEM_SEPARATOR || item->GetId() == wxID_ANY
                     || ( item->GetState() & wxAUI_BUTTON_STATE_DISABLED )
                     || KOPENAPI_REMOTE::IsLookingCommand( bar, item->GetId() ) )
                 {
@@ -638,7 +666,8 @@ private:
         }
     }
 
-    std::vector<TOOL> m_tools;
+    std::vector<TOOL>                m_tools;
+    std::vector<wxWeakRef<wxWindow>> m_controls;
 };
 
 
