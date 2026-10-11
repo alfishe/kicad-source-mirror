@@ -93,7 +93,7 @@ void CACHED_CONTAINER::FinishItem()
     }
 
     if( itemSize > 0 )
-        m_items.insert( m_item );
+        storeItem( m_item );
 
     m_item = nullptr;
     m_chunkSize = 0;
@@ -157,7 +157,7 @@ VERTEX* CACHED_CONTAINER::Allocate( unsigned int aSize )
 void CACHED_CONTAINER::Delete( VERTEX_ITEM* aItem )
 {
     assert( aItem != nullptr );
-    assert( m_items.find( aItem ) != m_items.end() || aItem->GetSize() == 0 );
+    assert( isStored( aItem ) || aItem->GetSize() == 0 );
 
     int size = aItem->GetSize();
 
@@ -172,7 +172,7 @@ void CACHED_CONTAINER::Delete( VERTEX_ITEM* aItem )
     // Indicate that the item is not stored in the container anymore
     aItem->setSize( 0 );
 
-    m_items.erase( aItem );
+    unstoreItem( aItem );
 
 #if CACHED_CONTAINER_TEST > 0
     test();
@@ -203,10 +203,8 @@ void CACHED_CONTAINER::Clear()
 
     // Set the size of all the stored VERTEX_ITEMs to 0, so it is clear that they are not held
     // in the container anymore
-    for( std::set<VERTEX_ITEM*>::iterator it = m_items.begin(); it != m_items.end(); ++it )
-        ( *it )->setSize( 0 );
-
-    m_items.clear();
+    forEachStored( []( VERTEX_ITEM* aItem ) { aItem->setSize( 0 ); } );
+    unstoreAll();
 
     // Now there is only free space left
     m_freeChunks.clear();
@@ -288,8 +286,7 @@ bool CACHED_CONTAINER::reallocate( unsigned int aSize )
 void CACHED_CONTAINER::defragment( VERTEX* aTarget )
 {
     // Defragmentation
-    std::set<VERTEX_ITEM*>::iterator it, it_end;
-    int                              newOffset = 0;
+    int newOffset = 0;
 
     [&]()
     {
@@ -302,7 +299,7 @@ void CACHED_CONTAINER::defragment( VERTEX* aTarget )
     #endif
 #endif
         {
-            for( VERTEX_ITEM* item : m_items )
+            for( VERTEX_ITEM* item = m_storedHead; item; item = item->m_nextStored )
             {
                 int itemOffset = item->GetOffset();
                 int itemSize = item->GetSize();
@@ -434,10 +431,7 @@ void CACHED_CONTAINER::test()
 
     // Used space check
     unsigned int                     used_space = 0;
-    std::set<VERTEX_ITEM*>::iterator itr;
-
-    for( itr = m_items.begin(); itr != m_items.end(); ++itr )
-        used_space += ( *itr )->GetSize();
+    forEachStored( [&]( VERTEX_ITEM* aItem ) { used_space += aItem->GetSize(); } );
 
     // If we have a chunk assigned, then there must be an item edited
     assert( m_chunkSize == 0 || m_item );

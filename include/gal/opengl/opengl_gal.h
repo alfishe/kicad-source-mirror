@@ -37,6 +37,7 @@
 #include <gal/opengl/noncached_container.h>
 #include <gal/opengl/opengl_compositor.h>
 #include <gal/hidpi_gl_canvas.h>
+#include <core/slot_pool.h>
 
 #include <set>
 #include <unordered_map>
@@ -412,15 +413,14 @@ private:
 
     static GLuint           g_fontTexture;      ///< Bitmap font texture handle (shared)
 
-    // Vertex buffer objects related fields
-    typedef std::unordered_map< unsigned int, std::shared_ptr<VERTEX_ITEM> > GROUPS_MAP;
-
-    GROUPS_MAP              m_groups;           ///< Stores information about VBO objects (groups)
+    // Vertex buffer objects related fields: one VERTEX_ITEM per group, in slots
+    KISLOT_POOL             m_groupPool{ sizeof( VERTEX_ITEM ), 1 };
+    size_t                  m_liveGroups = 0;
     unsigned int            m_groupCounter;     ///< Counter used for generating keys for groups
 
-    /// Groups by number in the window [m_groupIndexBase, m_groupIndexBase + size): the draw path
-    /// finds a group without a hash lookup. Numbers are never reused, so the window is rebuilt
-    /// when it gets sparse (more than about twice the live groups)
+    /// Groups by number in the window [m_groupIndexBase, m_groupIndexBase + size): the window
+    /// holds every live group. Numbers are never reused, so the window is rebuilt when it gets
+    /// sparse (more than about twice the live groups)
     std::vector<VERTEX_ITEM*> m_groupIndex;
     unsigned int              m_groupIndexBase = 0;
     size_t                    m_groupIndexRebuildBelow = 0; ///< live groups that allow the next rebuild (0: any)
@@ -434,8 +434,12 @@ private:
                        : nullptr;
     }
 
-    /// @brief Index window rebuilt over the live groups
-    void rebuildGroupIndex();
+    /// @brief Index window rebuilt over the live groups (plus aExtra numbered aExtraNumber)
+    void rebuildGroupIndex( unsigned int aExtraNumber = 0, VERTEX_ITEM* aExtra = nullptr );
+
+    /// @brief Every group's vertex item destroyed (each frees its vertices through the cached
+    /// manager), empty window
+    void destroyAllGroups();
 
     /// @brief All groups gone: empty window
     void clearGroupIndex();

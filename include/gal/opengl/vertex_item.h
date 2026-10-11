@@ -95,6 +95,10 @@ private:
     const VERTEX_MANAGER&   m_manager;
     unsigned int            m_offset;
     unsigned int            m_size;
+
+    ///< Links of CACHED_CONTAINER's list of the items it stores
+    VERTEX_ITEM*            m_prevStored = nullptr;
+    VERTEX_ITEM*            m_nextStored = nullptr;
 };
 } // namespace KIGFX
 

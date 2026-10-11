@@ -24,8 +24,8 @@
 #define CACHED_CONTAINER_H_
 
 #include <gal/opengl/vertex_container.h>
+#include <gal/opengl/vertex_item.h>
 #include <map>
-#include <set>
 
 namespace KIGFX
 {
@@ -157,9 +157,72 @@ protected:
      */
     void addFreeChunk( unsigned int aOffset, unsigned int aSize );
 
+    bool isStored( const VERTEX_ITEM* aItem ) const
+    {
+        return aItem->m_prevStored || m_storedHead == aItem;
+    }
+
+    /// Append to the stored items (no-op when stored already)
+    void storeItem( VERTEX_ITEM* aItem )
+    {
+        if( isStored( aItem ) )
+            return;
+
+        aItem->m_prevStored = m_storedTail;
+        aItem->m_nextStored = nullptr;
+
+        if( m_storedTail )
+            m_storedTail->m_nextStored = aItem;
+        else
+            m_storedHead = aItem;
+
+        m_storedTail = aItem;
+    }
+
+    void unstoreItem( VERTEX_ITEM* aItem )
+    {
+        if( !isStored( aItem ) )
+            return;
+
+        if( aItem->m_prevStored )
+            aItem->m_prevStored->m_nextStored = aItem->m_nextStored;
+        else
+            m_storedHead = aItem->m_nextStored;
+
+        if( aItem->m_nextStored )
+            aItem->m_nextStored->m_prevStored = aItem->m_prevStored;
+        else
+            m_storedTail = aItem->m_prevStored;
+
+        aItem->m_prevStored = aItem->m_nextStored = nullptr;
+    }
+
+    template <typename FUNC>
+    void forEachStored( FUNC&& aFunc ) const
+    {
+        for( VERTEX_ITEM* item = m_storedHead; item; item = item->m_nextStored )
+            aFunc( item );
+    }
+
+    /// Forget every stored item (each one's links reset)
+    void unstoreAll()
+    {
+        VERTEX_ITEM* item = m_storedHead;
+
+        while( item )
+        {
+            VERTEX_ITEM* next = item->m_nextStored;
+            item->m_prevStored = item->m_nextStored = nullptr;
+            item = next;
+        }
+
+        m_storedHead = m_storedTail = nullptr;
+    }
+
 protected:
     FREE_CHUNK_MAP         m_freeChunks;    ///< Store size & offset of free chunks.
-    std::set<VERTEX_ITEM*> m_items;         ///< Stored VERTEX_ITEMs
+    VERTEX_ITEM*           m_storedHead = nullptr; ///< Stored VERTEX_ITEMs, in the order stored
+    VERTEX_ITEM*           m_storedTail = nullptr;
     VERTEX_ITEM*           m_item;          ///< Currently modified item
 
     /// Properties of currently modified chunk & item

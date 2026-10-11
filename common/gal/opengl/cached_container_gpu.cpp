@@ -201,26 +201,25 @@ bool CACHED_CONTAINER_GPU::defragmentResize( unsigned int aNewSize )
     glBufferData( GL_ELEMENT_ARRAY_BUFFER, aNewSize * VERTEX_SIZE, nullptr, GL_DYNAMIC_DRAW );
     checkGlError( "creating buffer during defragmentation", __FILE__, __LINE__ );
 
-    std::set<VERTEX_ITEM*>::iterator it, it_end;
-    int                              newOffset = 0;
+    int newOffset = 0;
 
     // Defragmentation
-    for( it = m_items.begin(), it_end = m_items.end(); it != it_end; ++it )
-    {
-        VERTEX_ITEM* item = *it;
-        int          itemOffset = item->GetOffset();
-        int          itemSize = item->GetSize();
+    forEachStored(
+            [&]( VERTEX_ITEM* item )
+            {
+                int itemOffset = item->GetOffset();
+                int itemSize = item->GetSize();
 
-        // Move an item to the new container
-        glCopyBufferSubData( GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, itemOffset * VERTEX_SIZE,
-                             newOffset * VERTEX_SIZE, itemSize * VERTEX_SIZE );
+                // Move an item to the new container
+                glCopyBufferSubData( GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, itemOffset * VERTEX_SIZE,
+                                     newOffset * VERTEX_SIZE, itemSize * VERTEX_SIZE );
 
-        // Update new offset
-        item->setOffset( newOffset );
+                // Update new offset
+                item->setOffset( newOffset );
 
-        // Move to the next free space
-        newOffset += itemSize;
-    }
+                // Move to the next free space
+                newOffset += itemSize;
+            } );
 
     // Move the current item and place it at the end
     if( m_item->GetSize() > 0 )
@@ -439,10 +438,7 @@ unsigned int CACHED_CONTAINER_GPU::AllItemsSize() const
 {
     unsigned int size = 0;
 
-    for( const auto& item : m_items )
-    {
-        size += item->GetSize();
-    }
+    forEachStored( [&]( VERTEX_ITEM* aItem ) { size += aItem->GetSize(); } );
 
     return size;
 }

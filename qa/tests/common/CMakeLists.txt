@@ -98,6 +98,7 @@ set( QA_COMMON_SRCS
     test_refdes_utils.cpp
     test_reset_print_to_file.cpp
     test_scoped_temp_path.cpp
+    test_slot_pool.cpp
     test_wx_data_view_hyperlink_renderer.cpp
     test_grid_helper.cpp
     test_priority_thread_pool_task.cpp
