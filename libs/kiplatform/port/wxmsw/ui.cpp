@@ -104,6 +104,18 @@ void KIPLATFORM::UI::ReparentWindow( wxNonOwnedWindow* aWindow, wxTopLevelWindow
 }
 
 
+void KIPLATFORM::UI::DetachChildWindow( wxNonOwnedWindow* aWindow )
+{
+    // Not needed on this platform (see ReparentWindow)
+}
+
+
+bool KIPLATFORM::UI::IsChildWindow( wxNonOwnedWindow* aWindow )
+{
+    return false;
+}
+
+
 void KIPLATFORM::UI::FixupCancelButtonCmdKeyCollision( wxWindow *aWindow )
 {
     // Not needed on this platform

@@ -123,6 +123,22 @@ void KIPLATFORM::UI::ReparentWindow( wxNonOwnedWindow* aWindow, wxTopLevelWindow
 }
 
 
+void KIPLATFORM::UI::DetachChildWindow( wxNonOwnedWindow* aWindow )
+{
+    NSWindow* theWindow = aWindow->GetWXWindow();
+
+    if( theWindow && [theWindow parentWindow] )
+        [[theWindow parentWindow] removeChildWindow:theWindow];
+}
+
+
+bool KIPLATFORM::UI::IsChildWindow( wxNonOwnedWindow* aWindow )
+{
+    NSWindow* theWindow = aWindow->GetWXWindow();
+    return theWindow && [theWindow parentWindow] != nil;
+}
+
+
 void KIPLATFORM::UI::ReparentModal( wxNonOwnedWindow* aWindow )
 {
     // Quietly return if no parent is found

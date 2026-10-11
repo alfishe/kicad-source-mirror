@@ -78,6 +78,19 @@ namespace KIPLATFORM
 
         void ReparentWindow( wxNonOwnedWindow* aWindow, wxTopLevelWindow* aParent );
 
+        /**
+         * Undo ReparentWindow: the window no longer moves with its parent (call before hiding
+         * or destroying it).  NOP where ReparentWindow is one.
+         *
+         * @param aWindow is the window to detach
+         */
+        void DetachChildWindow( wxNonOwnedWindow* aWindow );
+
+        /**
+         * @return true when the window system moves aWindow with a parent (ReparentWindow)
+         */
+        bool IsChildWindow( wxNonOwnedWindow* aWindow );
+
         /*
          * An ugly hack to fix an issue on OSX: cmd+c closes the dialog instead of copying the
          * text if a button with wxID_CANCEL is used in a wxStdDialogButtonSizer created by

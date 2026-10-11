@@ -203,6 +203,11 @@ nlohmann::json windowJson( wxTopLevelWindow* aWindow, KIWAY* aKiway )
              { "y", rect.y },
              { "width", rect.width },
              { "height", rect.height } } );
+
+    // moved with a parent by the window system (macOS child windows, e.g. the remote control bar)
+    if( KIPLATFORM::UI::IsChildWindow( aWindow ) )
+        out["child_window"] = true;
+
     return out;
 }
 

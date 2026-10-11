@@ -711,7 +711,13 @@ public:
         m_panel->SetSizer( sizer );
 
         m_action->Bind( wxEVT_BUTTON, [this]( wxCommandEvent& ) { onAction(); } );
-        m_dismiss->Bind( wxEVT_BUTTON, [this]( wxCommandEvent& ) { Hide(); m_dismissed = true; } );
+        m_dismiss->Bind( wxEVT_BUTTON,
+                         [this]( wxCommandEvent& )
+                         {
+                             KIPLATFORM::UI::DetachChildWindow( this );
+                             Hide();
+                             m_dismissed = true;
+                         } );
 
         aParent->Bind( wxEVT_MOVE, &REMOTE_BAR::onParentMoved, this );
         aParent->Bind( wxEVT_SIZE, &REMOTE_BAR::onParentMoved, this );
@@ -719,6 +725,8 @@ public:
 
     ~REMOTE_BAR() override
     {
+        KIPLATFORM::UI::DetachChildWindow( this );
+
         if( m_parent )
         {
             m_parent->Unbind( wxEVT_MOVE, &REMOTE_BAR::onParentMoved, this );
@@ -747,6 +755,12 @@ public:
         m_panel->GetSizer()->Fit( this );
         place();
         wxFrame::Show( true );
+
+        // A child window moves with its parent by the window system itself (macOS): the
+        // parent's move events arrive throttled during a drag, so following them lags
+        if( m_parent )
+            KIPLATFORM::UI::ReparentWindow( this, m_parent.get() );
+
         Refresh();
     }
 
