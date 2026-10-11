@@ -888,6 +888,15 @@ struct ASCH_IMPLEMENTATION_LIST : ASCH_OWNER_INTERFACE
 };
 
 
+struct ASCH_MAP_DEFINER : ASCH_OWNER_INTERFACE
+{
+    wxString              designatorInterface;      // the symbol pin's designator
+    std::vector<wxString> designatorImplementation; // the footprint pads it connects to
+
+    explicit ASCH_MAP_DEFINER( const std::map<wxString, wxString>& aProps );
+};
+
+
 struct ASCH_BUS_ENTRY : ASCH_OWNER_INTERFACE
 {
     VECTOR2I location;

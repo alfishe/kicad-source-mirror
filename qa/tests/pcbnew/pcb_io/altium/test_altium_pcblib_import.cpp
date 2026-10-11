@@ -34,6 +34,7 @@
 #include <board.h>
 #include <footprint.h>
 #include <pad.h>
+#include <pcb_text.h>
 #include <zone.h>
 
 
@@ -101,6 +102,48 @@ BOOST_DATA_TEST_CASE( AltiumPcbLibImport2,
             KI_TEST::CheckFootprint( kicadFp.get(), altiumFp.get() );
         }
     }
+}
+
+
+/**
+ * Older records: pad subrecords of 105 / 106 bytes, texts of 43 / 123 bytes, and a footprint
+ * name ending with a space (its PATTERN parameter is read trimmed).
+ */
+BOOST_AUTO_TEST_CASE( AltiumPcbLibOlderRecords )
+{
+    std::string dataPath = KI_TEST::GetPcbnewTestDataDir() + "plugins/altium/pcblib/";
+    wxString    libraryPath = dataPath + "OlderRecords.PcbLib";
+
+    wxArrayString names;
+    altiumPlugin.FootprintEnumerate( names, libraryPath, true, nullptr );
+
+    BOOST_REQUIRE_EQUAL( names.GetCount(), 1u );
+    BOOST_CHECK_EQUAL( names[0], wxT( "OLD-2" ) );
+
+    std::unique_ptr<FOOTPRINT> fp = altiumPlugin.FootprintLoad( libraryPath, names[0], false, nullptr );
+    BOOST_REQUIRE( fp );
+
+    std::map<wxString, PAD*> pads;
+
+    for( PAD* pad : fp->Pads() )
+        pads[pad->GetNumber()] = pad;
+
+    BOOST_REQUIRE_EQUAL( pads.size(), 2u );
+    BOOST_CHECK_EQUAL( pads[wxT( "1" )]->GetPosition(), VECTOR2I( pcbIUScale.mmToIU( -1.27 ), 0 ) );
+    BOOST_CHECK_EQUAL( pads[wxT( "2" )]->GetPosition(), VECTOR2I( pcbIUScale.mmToIU( 1.27 ), 0 ) );
+    BOOST_CHECK_EQUAL( pads[wxT( "2" )]->GetSize( F_Cu ),
+                       VECTOR2I( pcbIUScale.mmToIU( 1.524 ), pcbIUScale.mmToIU( 1.016 ) ) );
+
+    // The 43-byte text becomes a text item, the 123-byte one marks the reference
+    bool hasText = false;
+
+    for( BOARD_ITEM* item : fp->GraphicalItems() )
+    {
+        if( item->Type() == PCB_TEXT_T && static_cast<PCB_TEXT*>( item )->GetText() == wxT( "OLD" ) )
+            hasText = true;
+    }
+
+    BOOST_CHECK( hasText );
 }
 
 BOOST_AUTO_TEST_SUITE_END()

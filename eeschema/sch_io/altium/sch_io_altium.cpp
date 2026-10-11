@@ -5648,6 +5648,19 @@ SCH_IO_ALTIUM::ParseLibFile( const ALTIUM_COMPOUND_FILE& aAltiumLibFile )
         std::vector<LIB_SYMBOL*> symbols;
         int pin_index = 0;
 
+        // OWNERINDEX of the records below counts every record of the symbol, the component being 0
+        int recordIndex = 0;
+
+        struct LIB_IMPLEMENTATION
+        {
+            std::map<wxString, wxString>                  properties;
+            bool                                          isCurrent;
+            std::map<wxString, std::vector<wxString>>     pinMap; // pin designator -> pads
+        };
+
+        std::map<int, LIB_IMPLEMENTATION> implementations;  // PCBLIB implementations by record index
+        std::map<int, int>                mapDefinerLists;  // map definer list -> its implementation
+
         if( reader.GetRemainingBytes() <= 0 )
             THROW_IO_ERROR( "LibSymbol does not contain any data" );
 
@@ -5716,6 +5729,7 @@ SCH_IO_ALTIUM::ParseLibFile( const ALTIUM_COMPOUND_FILE& aAltiumLibFile )
         while( reader.GetRemainingBytes() > 0 )
         {
             std::map<wxString, wxString> properties = reader.ReadProperties( handleBinaryPinLambda );
+            recordIndex++;
 
             if( properties.empty() )
                 continue;
@@ -5744,14 +5758,39 @@ SCH_IO_ALTIUM::ParseLibFile( const ALTIUM_COMPOUND_FILE& aAltiumLibFile )
             case ALTIUM_SCH_RECORD::DESIGNATOR:      ParseLibDesignator( properties, symbols, fontSizes ); break;
             case ALTIUM_SCH_RECORD::PARAMETER:       ParseLibParameter( properties, symbols, fontSizes );  break;
             case ALTIUM_SCH_RECORD::TEXT_FRAME:      ParseTextFrame( properties, symbols, fontSizes );     break;
-            case ALTIUM_SCH_RECORD::IMPLEMENTATION:  ParseImplementation( properties, symbols );           break;
+
+            case ALTIUM_SCH_RECORD::IMPLEMENTATION:
+            {
+                ASCH_IMPLEMENTATION elem( properties );
+
+                if( elem.type == wxS( "PCBLIB" ) )
+                    implementations[recordIndex] = { properties, elem.isCurrent, {} };
+
+                break;
+            }
 
             case ALTIUM_SCH_RECORD::IMPL_PARAMS:
                 break;
 
-            case ALTIUM_SCH_RECORD::MAP_DEFINER:
             case ALTIUM_SCH_RECORD::MAP_DEFINER_LIST:
+                mapDefinerLists[recordIndex] = ASCH_OWNER_INTERFACE( properties ).ownerindex;
                 break;
+
+            case ALTIUM_SCH_RECORD::MAP_DEFINER:
+            {
+                ASCH_MAP_DEFINER elem( properties );
+                auto             listIt = mapDefinerLists.find( elem.ownerindex );
+
+                if( listIt == mapDefinerLists.end() )
+                    break;
+
+                auto implIt = implementations.find( listIt->second );
+
+                if( implIt != implementations.end() && !elem.designatorInterface.IsEmpty() )
+                    implIt->second.pinMap[elem.designatorInterface] = elem.designatorImplementation;
+
+                break;
+            }
 
             case ALTIUM_SCH_RECORD::IEEE_SYMBOL:
                 // TODO: add support for these.  They are just drawn symbols, so we can probably hardcode
@@ -5780,17 +5819,67 @@ SCH_IO_ALTIUM::ParseLibFile( const ALTIUM_COMPOUND_FILE& aAltiumLibFile )
         if( reader.GetRemainingBytes() != 0 )
             THROW_IO_ERROR( wxT( "stream is not fully parsed" ) );
 
+        // The default footprint is the current implementation, else the first one
+        const LIB_IMPLEMENTATION* implementation = nullptr;
+
+        for( const auto& [index, impl] : implementations )
+        {
+            if( impl.isCurrent )
+            {
+                implementation = &impl;
+                break;
+            }
+        }
+
+        if( !implementation && !implementations.empty() )
+            implementation = &implementations.begin()->second;
+
+        if( implementation )
+        {
+            ParseImplementation( implementation->properties, symbols );
+
+            // Map definers connect a pin to other pads than its designator, or to several pads:
+            // one pin per pad, stacked
+            for( SCH_PIN* pin : symbols[0]->GetGraphicalPins( 0, 0 ) )
+            {
+                auto mapIt = implementation->pinMap.find( pin->GetNumber() );
+
+                if( mapIt == implementation->pinMap.end() || mapIt->second.empty() )
+                    continue;
+
+                const std::vector<wxString>& pads = mapIt->second;
+
+                if( pads.size() > 1 )
+                    pin->SetNumberTextSize( 0 );
+
+                for( size_t i = 1; i < pads.size(); i++ )
+                {
+                    SCH_PIN* stackedPin = new SCH_PIN( *pin );
+                    stackedPin->SetNumber( pads[i] );
+                    symbols[0]->AddDrawItem( stackedPin );
+                }
+
+                pin->SetNumber( pads[0] );
+            }
+        }
+
         LIB_SYMBOL* symbol = symbols[0];
         symbol->FixupDrawItems();
         fixupSymbolPinNameNumbers( symbol );
 
+        // The storage name is the LIBREFERENCE cut to 31 characters, with some characters replaced
+        wxString symbolName = symbol->GetName();
+
+        if( symbolName.IsEmpty() || ret.count( symbolName ) )
+            symbolName = name;
+
         SCH_FIELD& valField = symbol->GetValueField();
 
         if( valField.GetText().IsEmpty() )
-            valField.SetText( name );
+            valField.SetText( symbolName );
 
-        symbol->SetName( name );
-        ret[name] = symbol;
+        symbol->SetName( symbolName );
+        ret[symbolName] = symbol;
     }
 
     if( m_reporter )

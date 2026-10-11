@@ -400,7 +400,9 @@ void PCB_IO_ALTIUM_DESIGNER::FootprintEnumerate( wxArrayString&  aFootprintNames
                 wxScopedCharBuffer charBuffer = parser.ReadCharBuffer();
                 wxString           fpPattern( charBuffer, wxConvISO8859_1 );
 
-                auto it = patternMap.find( fpPattern );
+                // The pattern map comes from the footprints' PATTERN parameters, read with trailing
+                // spaces trimmed; footprint names may end with a space
+                auto it = patternMap.find( fpPattern.Trim() );
 
                 if( it != patternMap.end() )
                     aFootprintNames.Add( it->second ); // Proper unicode name

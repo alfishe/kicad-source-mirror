@@ -436,4 +436,29 @@ BOOST_AUTO_TEST_CASE( SheetNameDerivation )
 }
 
 
+/**
+ * A map definer (RECORD=47) connects the symbol pin DESINTF to the footprint pads DESIMP0..n.
+ */
+BOOST_AUTO_TEST_CASE( MapDefinerProperties )
+{
+    std::map<wxString, wxString> props = { { wxT( "RECORD" ), wxT( "47" ) },
+                                            { wxT( "OWNERINDEX" ), wxT( "12" ) },
+                                            { wxT( "DESINTF" ), wxT( "6" ) },
+                                            { wxT( "DESIMPCOUNT" ), wxT( "2" ) },
+                                            { wxT( "DESIMP0" ), wxT( "4" ) },
+                                            { wxT( "DESIMP1" ), wxT( "9" ) } };
+
+    ASCH_MAP_DEFINER definer( props );
+
+    BOOST_CHECK_EQUAL( definer.ownerindex, 12 );
+    BOOST_CHECK_EQUAL( definer.designatorInterface, wxT( "6" ) );
+    BOOST_REQUIRE_EQUAL( definer.designatorImplementation.size(), 2u );
+    BOOST_CHECK_EQUAL( definer.designatorImplementation[0], wxT( "4" ) );
+    BOOST_CHECK_EQUAL( definer.designatorImplementation[1], wxT( "9" ) );
+
+    props.erase( wxT( "DESIMPCOUNT" ) );
+    BOOST_CHECK( ASCH_MAP_DEFINER( props ).designatorImplementation.empty() );
+}
+
+
 BOOST_AUTO_TEST_SUITE_END()

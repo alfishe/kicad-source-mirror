@@ -931,6 +931,23 @@ ASCH_IMPLEMENTATION_LIST::ASCH_IMPLEMENTATION_LIST( const std::map<wxString, wxS
 }
 
 
+ASCH_MAP_DEFINER::ASCH_MAP_DEFINER( const std::map<wxString, wxString>& aProps ) :
+        ASCH_OWNER_INTERFACE( aProps )
+{
+    wxASSERT( ReadRecord( aProps ) == ALTIUM_SCH_RECORD::MAP_DEFINER );
+
+    designatorInterface = ALTIUM_PROPS_UTILS::ReadString( aProps, "DESINTF", "" );
+
+    int count = ALTIUM_PROPS_UTILS::ReadInt( aProps, "DESIMPCOUNT", 0 );
+
+    for( int i = 0; i < count; i++ )
+    {
+        designatorImplementation.push_back(
+                ALTIUM_PROPS_UTILS::ReadString( aProps, wxString::Format( "DESIMP%d", i ), "" ) );
+    }
+}
+
+
 ASCH_BUS_ENTRY::ASCH_BUS_ENTRY( const std::map<wxString, wxString>& aProps ) :
         ASCH_OWNER_INTERFACE( aProps )
 {

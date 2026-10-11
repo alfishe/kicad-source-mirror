@@ -1153,7 +1153,8 @@ APAD6::APAD6( ALTIUM_BINARY_PARSER& aReader )
     // Subrecord 5
     size_t subrecord5 = aReader.ReadAndSetSubrecordLength();
 
-    ExpectSubrecordLengthAtLeast( "Pads6", "subrecord5", 110, subrecord5 );
+    // Older files end the subrecord after the expansion modes (105 or 106 bytes)
+    ExpectSubrecordLengthAtLeast( "Pads6", "subrecord5", 103, subrecord5 );
 
     layer_v6 = static_cast<ALTIUM_LAYER>( aReader.Read<uint8_t>() );
     tolayer = ALTIUM_LAYER::UNKNOWN;
@@ -1192,14 +1193,19 @@ APAD6::APAD6( ALTIUM_BINARY_PARSER& aReader )
     soldermaskexpansionmanual = aReader.ReadKicadUnit();
     aReader.Skip( 7 );
     pastemaskexpansionmode = static_cast<ALTIUM_MODE>( aReader.Read<uint8_t>() );
-    soldermaskexpansionmode = static_cast<ALTIUM_MODE>( aReader.Read<uint8_t>() );
-    aReader.Skip( 3 ); // to 106
+    soldermaskexpansionmode = static_cast<ALTIUM_MODE>( aReader.Read<uint8_t>() ); // to 103
 
     pad_to_die_length = 0;
     pad_to_die_delay = 0;
 
-    if( subrecord5 == 110 )
+    if( subrecord5 < 110 )
     {
+        holerotation = 0;
+    }
+    else if( subrecord5 == 110 )
+    {
+        aReader.Skip( 3 ); // to 106
+
         // Don't know exactly what this is, but it's always been 0 in the files with 110-byte subrecord5.
         // e.g. https://gitlab.com/kicad/code/kicad/-/issues/16514
         const uint32_t unknown = aReader.ReadKicadUnit(); // to 110
@@ -1213,6 +1219,7 @@ APAD6::APAD6( ALTIUM_BINARY_PARSER& aReader )
     {
         // More than 110, need at least 114
         ExpectSubrecordLengthAtLeast( "Pads6", "subrecord5", 114, subrecord5 );
+        aReader.Skip( 3 ); // to 106
         holerotation = aReader.Read<double>(); // to 114
     }
 
@@ -1454,39 +1461,44 @@ ATEXT6::ATEXT6( ALTIUM_BINARY_PARSER& aReader, std::map<uint32_t, wxString>& aSt
     isMirrored   = aReader.Read<uint8_t>() != 0;
     strokewidth  = aReader.ReadKicadUnit();
 
-    if( subrecord1 < 123 )
+    char fontData[64] = { 0 };
+
+    // Older files end the subrecord here (43 bytes) or after the wide string index (123 bytes)
+    if( subrecord1 >= 123 )
+    {
+        isComment    = aReader.Read<uint8_t>() != 0;
+        isDesignator = aReader.Read<uint8_t>() != 0;
+        aReader.Skip( 1 );
+        fonttype = static_cast<ALTIUM_TEXT_TYPE>( aReader.Read<uint8_t>() );
+        isBold   = aReader.Read<uint8_t>() != 0;
+        isItalic = aReader.Read<uint8_t>() != 0;
+
+        aReader.ReadBytes( fontData, sizeof( fontData ) );
+        fontname = wxString( fontData, wxMBConvUTF16LE(), sizeof( fontData ) ).BeforeFirst( '\0' );
+
+        char tmpbyte = aReader.Read<uint8_t>();
+        isInverted = !!tmpbyte;
+        margin_border_width = aReader.ReadKicadUnit(); // "Margin Border"
+        widestring_index = aReader.Read<uint32_t>();
+        aReader.Skip( 4 ); // to 123
+    }
+    else
     {
         fonttype = ALTIUM_TEXT_TYPE::STROKE;
-        aReader.SkipSubrecord();
-        return;
     }
 
-    isComment    = aReader.Read<uint8_t>() != 0;
-    isDesignator = aReader.Read<uint8_t>() != 0;
-    aReader.Skip( 1 );
-    fonttype = static_cast<ALTIUM_TEXT_TYPE>( aReader.Read<uint8_t>() );
-    isBold   = aReader.Read<uint8_t>() != 0;
-    isItalic = aReader.Read<uint8_t>() != 0;
+    if( subrecord1 >= 137 )
+    {
+        // An inverted rect in Altium is like a text box with the text inverted.
+        isInvertedRect = aReader.Read<uint8_t>() != 0;
 
-    char fontData[64] = { 0 };
-    aReader.ReadBytes( fontData, sizeof( fontData ) );
-    fontname = wxString( fontData, wxMBConvUTF16LE(), sizeof( fontData ) ).BeforeFirst( '\0' );
+        textbox_rect_width = aReader.ReadKicadUnit();
+        textbox_rect_height = aReader.ReadKicadUnit();
+        textbox_rect_justification = static_cast<ALTIUM_TEXT_POSITION>( aReader.Read<uint8_t>() );
+        text_offset_width = aReader.ReadKicadUnit(); // "Text Offset"
+    }
 
-    char tmpbyte = aReader.Read<uint8_t>();
-    isInverted = !!tmpbyte;
-    margin_border_width = aReader.ReadKicadUnit(); // "Margin Border"
-    widestring_index = aReader.Read<uint32_t>();
-    aReader.Skip( 4 );
-
-    // An inverted rect in Altium is like a text box with the text inverted.
-    isInvertedRect = aReader.Read<uint8_t>() != 0;
-
-    textbox_rect_width = aReader.ReadKicadUnit();
-    textbox_rect_height = aReader.ReadKicadUnit();
-    textbox_rect_justification = static_cast<ALTIUM_TEXT_POSITION>( aReader.Read<uint8_t>() );
-    text_offset_width = aReader.ReadKicadUnit(); // "Text Offset"
-
-    int remaining = aReader.GetRemainingSubrecordBytes();
+    int remaining = subrecord1 >= 137 ? aReader.GetRemainingSubrecordBytes() : 0;
 
     if( remaining >= 93 )
     {
@@ -1552,7 +1564,7 @@ ATEXT6::ATEXT6( ALTIUM_BINARY_PARSER& aReader, std::map<uint32_t, wxString>& aSt
     // Subrecord 2 - Legacy 8bit string, max 255 chars, unknown codepage
     aReader.ReadAndSetSubrecordLength();
 
-    auto entry = aStringTable.find( widestring_index );
+    auto entry = subrecord1 >= 123 ? aStringTable.find( widestring_index ) : aStringTable.end();
 
     if( entry != aStringTable.end() )
         text = entry->second;

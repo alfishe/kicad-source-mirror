@@ -26,7 +26,9 @@
 #include <reporter.h>
 #include <schematic.h>
 #include <sch_io/altium/sch_io_altium.h>
+#include <lib_symbol.h>
 #include <sch_label.h>
+#include <sch_pin.h>
 #include <sch_no_connect.h>
 #include <sch_line.h>
 #include <sch_screen.h>
@@ -412,6 +414,37 @@ BOOST_AUTO_TEST_CASE( Issue16903_ImportKeepsGeometryOnGrid )
 
     ERC_TESTER tester( &m_schematic );
     BOOST_CHECK_EQUAL( tester.TestOffGridEndpoints(), 0 );
+}
+
+
+// A symbol keeps its LIBREFERENCE (longer than the 31-character storage name); its footprint is
+// the current PCBLIB implementation and that implementation's map definers renumber its pins:
+// pin 1 keeps its number (only another implementation maps it), pin 2 -> pad 5, pin 3 -> pads 6
+// and 7 (two stacked pins).
+BOOST_AUTO_TEST_CASE( SchLibMapDefinersAndCurrentImplementation )
+{
+    SCH_IO_ALTIUM plugin;
+    wxString      path = wxString::FromUTF8( KI_TEST::GetEeschemaTestDataDir()
+                                             + "/plugins/altium/map_definers/MapDefiners.SchLib" );
+
+    wxArrayString names;
+    plugin.EnumerateSymbolLib( names, path );
+
+    const wxString name = wxT( "COMPONENT_NAME_LONGER_THAN_31_CHARACTERS" );
+    BOOST_REQUIRE_EQUAL( names.GetCount(), 1u );
+    BOOST_CHECK_EQUAL( names[0], name );
+
+    LIB_SYMBOL* symbol = plugin.LoadSymbol( path, name );
+    BOOST_REQUIRE( symbol );
+
+    BOOST_CHECK_EQUAL( symbol->GetFootprintField().GetText(), wxT( "MapDefiners:CURRENT" ) );
+
+    std::multiset<wxString> numbers;
+
+    for( SCH_PIN* pin : symbol->GetGraphicalPins( 0, 0 ) )
+        numbers.insert( pin->GetNumber() );
+
+    BOOST_CHECK( numbers == std::multiset<wxString>( { wxT( "1" ), wxT( "5" ), wxT( "6" ), wxT( "7" ) } ) );
 }
 
 
