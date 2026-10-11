@@ -1,6 +1,6 @@
 /// @file methods_windows.cpp
 /// @brief kicadopenapi windows of the process (GUI): window_list (which app each window is and
-/// what it has loaded), window_capture, window_set.
+/// what it has loaded), window_capture, window_set, window_controls (menus and toolbars as shown).
 ///
 /// window_capture renders a whole window — toolbars, panels, dialogs, the canvas — into an image
 /// without reading the screen: the toolkit draws the window offscreen (KIPLATFORM::UI::
@@ -21,7 +21,11 @@
 #include <wx/stattext.h>
 
 #include <wx/app.h>
+#include <wx/aui/auibar.h>
+#include <wx/aui/framemanager.h>
 #include <wx/dialog.h>
+#include <wx/frame.h>
+#include <wx/menu.h>
 #include <wx/image.h>
 #include <wx/toplevel.h>
 #include <wx/window.h>
@@ -304,3 +308,130 @@ KOPENAPI_REGISTER( "window_set",
                         "width":{"type":"integer"}, "height":{"type":"integer"},
                         "raise":{"type":"boolean","default":false}}})json"_json,
                    true, h_window_set );
+
+
+namespace
+{
+
+nlohmann::json menuJson( wxMenu* aMenu, const wxString& aFilter )
+{
+    nlohmann::json items = nlohmann::json::array();
+
+    for( wxMenuItem* item : aMenu->GetMenuItems() )
+    {
+        if( item->IsSeparator() )
+            continue;
+
+        nlohmann::json entry = { { "label", str( item->GetItemLabelText() ) }, { "id", item->GetId() },
+                                 { "enabled", item->IsEnabled() } };
+
+        if( item->IsCheckable() )
+            entry["checked"] = item->IsChecked();
+
+        if( item->IsSubMenu() )
+        {
+            entry["items"] = menuJson( item->GetSubMenu(), aFilter );
+
+            if( entry["items"].empty() && !aFilter.IsEmpty() && !item->GetItemLabelText().Matches( aFilter ) )
+                continue;
+        }
+        else if( !aFilter.IsEmpty() && !item->GetItemLabelText().Matches( aFilter ) )
+        {
+            continue;
+        }
+
+        items.push_back( entry );
+    }
+
+    return items;
+}
+
+
+void toolbarsOf( wxWindow* aWindow, const wxString& aFilter, nlohmann::json& aOut )
+{
+    for( wxWindow* child : aWindow->GetChildren() )
+    {
+        if( auto* bar = dynamic_cast<wxAuiToolBar*>( child ) )
+        {
+            nlohmann::json tools = nlohmann::json::array();
+
+            for( int i = 0; i < bar->GetToolCount(); ++i )
+            {
+                wxAuiToolBarItem* item = bar->FindToolByIndex( i );
+
+                if( !item || item->GetKind() == wxITEM_SEPARATOR || ( item->GetId() == wxID_ANY && !item->GetWindow() ) )
+                    continue;
+
+                const wxString label = item->GetShortHelp().IsEmpty() ? item->GetLabel() : item->GetShortHelp();
+
+                if( !aFilter.IsEmpty() && !label.Matches( aFilter ) )
+                    continue;
+
+                nlohmann::json entry = { { "label", str( label ) }, { "id", item->GetId() },
+                                         { "enabled", !( item->GetState() & wxAUI_BUTTON_STATE_DISABLED ) } };
+
+                if( item->GetKind() == wxITEM_CHECK || item->GetKind() == wxITEM_RADIO )
+                    entry["checked"] = ( item->GetState() & wxAUI_BUTTON_STATE_CHECKED ) != 0;
+
+                if( item->GetWindow() )
+                    entry["control"] = str( item->GetWindow()->GetClassInfo()->GetClassName() );
+
+                tools.push_back( entry );
+            }
+
+            aOut.push_back( { { "name", str( bar->GetName() ) }, { "shown", bar->IsShown() }, { "tools", tools } } );
+        }
+        else
+        {
+            toolbarsOf( child, aFilter, aOut );
+        }
+    }
+}
+
+} // namespace
+
+
+static KOPENAPI_RESULT h_window_controls( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    wxTopLevelWindow* target = KopenapiFindWindow( aArgs.value( "window", std::string() ) );
+
+    if( !target )
+        return KOPENAPI_RESULT::Error( 404, "window not found (see window_list: id or title glob)" );
+
+    const wxString filter = wxString::FromUTF8( aArgs.value( "filter", std::string() ) );
+
+    // the states as the user would see them now (UI conditions evaluated)
+    target->UpdateWindowUI( wxUPDATE_UI_RECURSE );
+
+    nlohmann::json menus = nlohmann::json::array();
+
+    if( auto* frame = dynamic_cast<wxFrame*>( target ); frame && frame->GetMenuBar() )
+    {
+        wxMenuBar* bar = frame->GetMenuBar();
+
+        for( size_t i = 0; i < bar->GetMenuCount(); ++i )
+        {
+            nlohmann::json items = menuJson( bar->GetMenu( i ), filter );
+
+            if( filter.IsEmpty() || !items.empty() )
+                menus.push_back( { { "label", str( wxMenuItem::GetLabelText( bar->GetMenuLabel( i ) ) ) },
+                                   { "items", items } } );
+        }
+    }
+
+    nlohmann::json toolbars = nlohmann::json::array();
+    toolbarsOf( target, filter, toolbars );
+
+    return KOPENAPI_RESULT::Ok( { { "window", windowJson( target, aCtx.kiway ) },
+                                  { "menus", menus }, { "toolbars", toolbars } } );
+}
+
+
+KOPENAPI_REGISTER( "window_controls",
+                   "Menus and toolbars of a KiCad window as the user sees them now: label, id, enabled, "
+                   "checked, submenus; toolbars with their tools (embedded controls by class). filter: a label "
+                   "glob (e.g. *Zoom*). E.g. what is greyed out under remote control; GUI only",
+                   R"json({"type":"object","properties":{
+                        "window":{"type":"string","description":"id or title glob from window_list (default: the active one)"},
+                        "filter":{"type":"string","description":"label glob"}}})json"_json,
+                   true, h_window_controls );

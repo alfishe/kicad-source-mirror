@@ -18,6 +18,31 @@
 #include <string>
 
 
+class wxTopLevelWindow;
+class wxWindow;
+
+
+/// @brief One step of the remote lock cascade: what a part of KiCad switches off while the user's
+/// input is refused, and how it puts back exactly what it changed. Main thread.
+class KICOMMON_API KOPENAPI_REMOTE_PARTICIPANT
+{
+public:
+    virtual ~KOPENAPI_REMOTE_PARTICIPANT() = default;
+
+    virtual const char* Name() const = 0;
+
+    /// @brief The lock starts: switch off, remembering the state found
+    virtual void Engage() = 0;
+
+    /// @brief The lock ends: restore the remembered state (not "everything on"); a state someone
+    /// else changed meanwhile is left as it is
+    virtual void Release() = 0;
+
+    /// @brief A window appeared while engaged
+    virtual void WindowAdded( wxTopLevelWindow* aWindow ) {}
+};
+
+
 class KICOMMON_API KOPENAPI_REMOTE
 {
 public:
@@ -32,6 +57,25 @@ public:
 
     /// @brief A session is held now
     static bool Held();
+
+    /// @brief The user's input is refused now (main thread; cheap, for UI update handlers)
+    static bool UiLocked();
+
+    /// @brief Adds a step to the lock cascade (engaged in ascending aOrder, released in reverse);
+    /// engaged at once when the lock is on. Main thread; remove before destroying it.
+    static void AddParticipant( KOPENAPI_REMOTE_PARTICIPANT* aParticipant, int aOrder );
+
+    static void RemoveParticipant( KOPENAPI_REMOTE_PARTICIPANT* aParticipant );
+
+    /// @brief Which command ids (menu, toolbar) of a window only look: allowed and kept enabled
+    /// under the lock. Per window, as action ids are numbered per module; nullptr removes it.
+    static void SetLookingCommands( wxWindow* aFrame, bool ( *aIsLooking )( int aId ) );
+
+    /// @brief aId only looks in aWindow's top-level window (wx's own help / copy / find ids anywhere)
+    static bool IsLookingCommand( wxWindow* aWindow, int aId );
+
+    /// @brief Participants and their state, for remote_session status
+    static nlohmann::json Cascade();
 };
 
 #endif

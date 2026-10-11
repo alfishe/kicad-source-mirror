@@ -6,9 +6,12 @@
 #include <kiplatform/ui.h>
 
 #include <wx/app.h>
+#include <wx/aui/auibar.h>
+#include <wx/aui/framemanager.h>
 #include <wx/button.h>
 #include <wx/eventfilter.h>
 #include <wx/frame.h>
+#include <wx/menu.h>
 #include <wx/intl.h>
 #include <wx/log.h>
 #include <wx/panel.h>
@@ -18,11 +21,15 @@
 #include <wx/toplevel.h>
 #include <wx/weakref.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
+#include <unordered_set>
+#include <vector>
 
 
 namespace
@@ -46,7 +53,19 @@ struct SESSION_STATE
     std::map<std::string, CLOCK::time_point>   revoked;       ///< caller key -> cooldown end
     std::string                                lastRevokedClient;
     std::atomic<bool>                          lockedUi{ false };
+    std::atomic<long long>                     lastRefusedMs{ 0 };   ///< steady clock, user input refused
+    std::atomic<bool>                          hintPending{ false };
+    nlohmann::json                             cascade = nlohmann::json::array();  ///< published by the main thread
 };
+
+
+constexpr int REFUSED_HINT_MS = 3000;
+
+
+long long nowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>( CLOCK::now().time_since_epoch() ).count();
+}
 
 
 SESSION_STATE& state()
@@ -90,6 +109,9 @@ class REMOTE_BAR;
 
 /// @brief The bar's frame and its parent's id, so that input to it stays allowed
 bool isBarWindow( wxWindow* aWindow );
+
+
+wxWindow* commandWindow( wxEvent& aEvent );
 
 
 /// @brief Keys that only look: navigation, zoom, copy, find, escape
@@ -146,7 +168,8 @@ public:
         const bool key = type == wxEVT_KEY_DOWN || type == wxEVT_CHAR || type == wxEVT_CHAR_HOOK;
 
         // menu and toolbar commands of the user (the API's run inside a call, above)
-        const bool command = type == wxEVT_MENU || type == wxEVT_TOOL;
+        const bool command = ( type == wxEVT_MENU || type == wxEVT_TOOL )
+                             && !KOPENAPI_REMOTE::IsLookingCommand( commandWindow( aEvent ), aEvent.GetId() );
 
         if( key && isLookingKey( static_cast<wxKeyEvent&>( aEvent ) ) )
             return Event_Skip;
@@ -154,6 +177,11 @@ public:
         if( click || key || command )
         {
             m_refused++;
+            state().lastRefusedMs.store( nowMs() );
+
+            if( !state().hintPending.exchange( true ) )
+                updateUiLater();
+
             return Event_Processed;
         }
 
@@ -165,6 +193,472 @@ public:
 
 
 READONLY_FILTER* g_filter = nullptr;
+
+
+const std::unordered_set<int>& wxLookingIds()
+{
+    static const std::unordered_set<int> s_ids = { wxID_ABOUT, wxID_HELP, wxID_HELP_CONTENTS, wxID_HELP_INDEX,
+                                                   wxID_EXIT, wxID_COPY, wxID_FIND, wxID_ZOOM_IN, wxID_ZOOM_OUT,
+                                                   wxID_ZOOM_FIT, wxID_ZOOM_100 };
+    return s_ids;
+}
+
+
+/// @brief Per window: its module's "only looks" test (main thread)
+std::map<wxWindow*, bool ( * )( int )>& lookingResolvers()
+{
+    static std::map<wxWindow*, bool ( * )( int )> s_resolvers;
+    return s_resolvers;
+}
+
+
+/// @brief The window a command event is for: the event's window, a menu's window, else the focus'
+wxWindow* commandWindow( wxEvent& aEvent )
+{
+    wxObject* object = aEvent.GetEventObject();
+
+    if( auto* window = dynamic_cast<wxWindow*>( object ) )
+        return window;
+
+    if( auto* menu = dynamic_cast<wxMenu*>( object ) )
+    {
+        if( wxWindow* window = menu->GetWindow() )
+            return window;
+    }
+
+    if( wxWindow* focus = wxWindow::FindFocus() )
+        return focus;
+
+    return wxTheApp ? wxTheApp->GetTopWindow() : nullptr;
+}
+
+
+/// @brief The lock cascade: participants engaged in order when the user's input gets refused,
+/// released in reverse when it ends; each step guarded, so one failing step never stops the others
+class CASCADE
+{
+public:
+    void Add( KOPENAPI_REMOTE_PARTICIPANT* aParticipant, int aOrder )
+    {
+        Remove( aParticipant );
+        STEP step{ aParticipant, aOrder, false, 0 };
+        auto it = std::upper_bound( m_steps.begin(), m_steps.end(), aOrder,
+                                    []( int aO, const STEP& aS ) { return aO < aS.order; } );
+        it = m_steps.insert( it, step );
+
+        if( m_locked )
+            engage( *it );
+
+        publish();
+    }
+
+    void Remove( KOPENAPI_REMOTE_PARTICIPANT* aParticipant )
+    {
+        for( auto it = m_steps.begin(); it != m_steps.end(); ++it )
+        {
+            if( it->participant == aParticipant )
+            {
+                if( it->engaged )
+                    release( *it );
+
+                m_steps.erase( it );
+                publish();
+                return;
+            }
+        }
+    }
+
+    /// @brief Switches the lock: flag first, then the steps (engage ascending, release descending)
+    void SetLocked( bool aLocked )
+    {
+        if( aLocked == m_locked )
+        {
+            if( m_locked )
+                scanWindows();
+
+            return;
+        }
+
+        m_locked = aLocked;
+        state().lockedUi.store( aLocked );
+
+        if( aLocked )
+        {
+            m_windows.clear();
+
+            for( wxWindow* window : wxTopLevelWindows )
+                m_windows.emplace_back( window );
+
+            for( STEP& step : m_steps )
+                engage( step );
+        }
+        else
+        {
+            for( auto it = m_steps.rbegin(); it != m_steps.rend(); ++it )
+                release( *it );
+
+            m_windows.clear();
+        }
+
+        publish();
+    }
+
+    bool Locked() const { return m_locked; }
+
+    nlohmann::json Json() const
+    {
+        nlohmann::json out = nlohmann::json::array();
+
+        for( const STEP& step : m_steps )
+        {
+            out.push_back( { { "name", step.participant->Name() }, { "order", step.order },
+                             { "engaged", step.engaged }, { "failures", step.failures } } );
+        }
+
+        return out;
+    }
+
+private:
+    void publish()
+    {
+        nlohmann::json json = Json();
+        std::lock_guard<std::mutex> lock( state().mutex );
+        state().cascade = std::move( json );
+    }
+
+    struct STEP
+    {
+        KOPENAPI_REMOTE_PARTICIPANT* participant;
+        int                          order;
+        bool                         engaged;
+        int                          failures;
+    };
+
+    template <typename FN>
+    bool guarded( STEP& aStep, const char* aWhat, FN&& aFn )
+    {
+        try
+        {
+            aFn();
+            return true;
+        }
+        catch( const std::exception& e )
+        {
+            aStep.failures++;
+            wxLogMessage( "remote control: %s of '%s' failed: %s", aWhat, aStep.participant->Name(), e.what() );
+        }
+        catch( ... )
+        {
+            aStep.failures++;
+            wxLogMessage( "remote control: %s of '%s' failed", aWhat, aStep.participant->Name() );
+        }
+
+        return false;
+    }
+
+    void engage( STEP& aStep )
+    {
+        aStep.engaged = guarded( aStep, "engage", [&]() { aStep.participant->Engage(); } );
+    }
+
+    void release( STEP& aStep )
+    {
+        if( aStep.engaged )
+            guarded( aStep, "release", [&]() { aStep.participant->Release(); } );
+
+        aStep.engaged = false;
+    }
+
+    /// @brief Windows that appeared while locked are handed to the engaged steps
+    void scanWindows()
+    {
+        m_windows.erase( std::remove_if( m_windows.begin(), m_windows.end(),
+                                         []( const wxWeakRef<wxWindow>& aW ) { return !aW; } ),
+                         m_windows.end() );
+
+        for( wxWindow* window : wxTopLevelWindows )
+        {
+            auto* top = dynamic_cast<wxTopLevelWindow*>( window );
+
+            if( !top || isBarWindow( top ) )
+                continue;
+
+            bool known = false;
+
+            for( const wxWeakRef<wxWindow>& w : m_windows )
+                known = known || w.get() == window;
+
+            if( known )
+                continue;
+
+            m_windows.emplace_back( window );
+
+            for( STEP& step : m_steps )
+            {
+                if( step.engaged )
+                    guarded( step, "window", [&]() { step.participant->WindowAdded( top ); } );
+            }
+        }
+    }
+
+    std::vector<STEP>                m_steps;
+    std::vector<wxWeakRef<wxWindow>> m_windows;
+    bool                             m_locked = false;
+};
+
+
+CASCADE& cascade()
+{
+    static CASCADE* s_cascade = new CASCADE();
+    return *s_cascade;
+}
+
+
+/// @brief Step: the application event filter refusing the user's clicks, keys and commands
+class FILTER_STEP : public KOPENAPI_REMOTE_PARTICIPANT
+{
+public:
+    const char* Name() const override { return "input_filter"; }
+
+    void Engage() override
+    {
+        if( !g_filter )
+        {
+            g_filter = new READONLY_FILTER();
+            wxEvtHandler::AddFilter( g_filter );
+        }
+    }
+
+    void Release() override
+    {
+        if( g_filter )
+        {
+            wxEvtHandler::RemoveFilter( g_filter );
+            delete g_filter;
+            g_filter = nullptr;
+        }
+    }
+};
+
+
+/// @brief Step: KiCad's UI conditions (toolbars, menus of actions) re-evaluated. They add "not under
+/// remote control" to every editing action themselves, so releasing restores each control's own state.
+class CONDITIONS_STEP : public KOPENAPI_REMOTE_PARTICIPANT
+{
+public:
+    const char* Name() const override { return "ui_conditions"; }
+
+    void Engage() override { refresh(); }
+
+    void Release() override { refresh(); }
+
+    void WindowAdded( wxTopLevelWindow* aWindow ) override { aWindow->UpdateWindowUI( wxUPDATE_UI_RECURSE ); }
+
+private:
+    static void refresh()
+    {
+        for( wxWindow* window : wxTopLevelWindows )
+        {
+            if( !isBarWindow( window ) )
+                window->UpdateWindowUI( wxUPDATE_UI_RECURSE );
+        }
+    }
+};
+
+
+/// @brief Step: menu items. Disables the enabled ones that do not only look and remembers exactly
+/// those; release re-enables an item only if it is still the same item, disabled as we left it.
+/// Items with UI conditions are re-evaluated afterwards (CONDITIONS_STEP releases later).
+class MENUS_STEP : public KOPENAPI_REMOTE_PARTICIPANT
+{
+public:
+    const char* Name() const override { return "menus"; }
+
+    void Engage() override
+    {
+        m_items.clear();
+
+        for( wxWindow* window : wxTopLevelWindows )
+        {
+            if( auto* top = dynamic_cast<wxTopLevelWindow*>( window ) )
+                WindowAdded( top );
+        }
+    }
+
+    void Release() override
+    {
+        for( ITEM& item : m_items )
+        {
+            if( !item.frame )
+                continue;
+
+            wxMenuBar* bar = item.frame->GetMenuBar();
+
+            // the menu bar may have been rebuilt meanwhile: only the same item, still as we left it
+            if( bar && bar->FindItem( item.id ) == item.item && !item.item->IsEnabled() )
+                item.item->Enable( true );
+        }
+
+        m_items.clear();
+    }
+
+    void WindowAdded( wxTopLevelWindow* aWindow ) override
+    {
+        auto* frame = dynamic_cast<wxFrame*>( aWindow );
+
+        if( !frame || isBarWindow( frame ) || !frame->GetMenuBar() )
+            return;
+
+        wxMenuBar* bar = frame->GetMenuBar();
+
+        for( size_t i = 0; i < bar->GetMenuCount(); ++i )
+            addMenu( frame, bar->GetMenu( i ) );
+    }
+
+private:
+    struct ITEM
+    {
+        wxWeakRef<wxFrame> frame;
+        wxMenuItem*        item;
+        int                id;
+    };
+
+    void addMenu( wxFrame* aFrame, wxMenu* aMenu )
+    {
+        for( wxMenuItem* item : aMenu->GetMenuItems() )
+        {
+            if( item->IsSubMenu() )
+            {
+                addMenu( aFrame, item->GetSubMenu() );
+                continue;
+            }
+
+            if( item->IsSeparator() || !item->IsEnabled()
+                || KOPENAPI_REMOTE::IsLookingCommand( aFrame, item->GetId() ) )
+            {
+                continue;
+            }
+
+            item->Enable( false );
+            m_items.push_back( { aFrame, item, item->GetId() } );
+        }
+    }
+
+    std::vector<ITEM> m_items;
+};
+
+
+/// @brief Step: toolbar tools (embedded controls excluded: the filter refuses their input). Same
+/// snapshot rule as the menus.
+class TOOLBARS_STEP : public KOPENAPI_REMOTE_PARTICIPANT
+{
+public:
+    const char* Name() const override { return "toolbars"; }
+
+    void Engage() override
+    {
+        m_tools.clear();
+
+        for( wxWindow* window : wxTopLevelWindows )
+        {
+            if( auto* top = dynamic_cast<wxTopLevelWindow*>( window ) )
+                WindowAdded( top );
+        }
+    }
+
+    void Release() override
+    {
+        std::set<wxAuiToolBar*> changed;
+
+        for( TOOL& tool : m_tools )
+        {
+            if( !tool.bar )
+                continue;
+
+            wxAuiToolBarItem* item = tool.bar->FindTool( tool.id );
+
+            if( item && !item->GetWindow() && ( item->GetState() & wxAUI_BUTTON_STATE_DISABLED ) )
+            {
+                tool.bar->EnableTool( tool.id, true );
+                changed.insert( tool.bar.get() );
+            }
+        }
+
+        for( wxAuiToolBar* bar : changed )
+            bar->Refresh();
+
+        m_tools.clear();
+    }
+
+    void WindowAdded( wxTopLevelWindow* aWindow ) override
+    {
+        if( !isBarWindow( aWindow ) )
+            addBars( aWindow );
+    }
+
+private:
+    struct TOOL
+    {
+        wxWeakRef<wxAuiToolBar> bar;
+        int                     id;
+    };
+
+    void addBars( wxWindow* aWindow )
+    {
+        for( wxWindow* child : aWindow->GetChildren() )
+        {
+            auto* bar = dynamic_cast<wxAuiToolBar*>( child );
+
+            if( !bar )
+            {
+                addBars( child );
+                continue;
+            }
+
+            bool changed = false;
+
+            for( int i = 0; i < bar->GetToolCount(); ++i )
+            {
+                wxAuiToolBarItem* item = bar->FindToolByIndex( i );
+
+                if( !item || item->GetKind() == wxITEM_SEPARATOR || item->GetWindow() || item->GetId() == wxID_ANY
+                    || ( item->GetState() & wxAUI_BUTTON_STATE_DISABLED )
+                    || KOPENAPI_REMOTE::IsLookingCommand( bar, item->GetId() ) )
+                {
+                    continue;
+                }
+
+                bar->EnableTool( item->GetId(), false );
+                m_tools.push_back( { bar, item->GetId() } );
+                changed = true;
+            }
+
+            if( changed )
+                bar->Refresh();
+        }
+    }
+
+    std::vector<TOOL> m_tools;
+};
+
+
+void installBuiltinSteps()
+{
+    static FILTER_STEP     s_filter;
+    static CONDITIONS_STEP s_conditions;
+    static MENUS_STEP      s_menus;
+    static TOOLBARS_STEP   s_toolbars;
+    static bool            s_done = false;
+
+    if( s_done )
+        return;
+
+    s_done = true;
+    cascade().Add( &s_filter, 100 );
+    cascade().Add( &s_conditions, 200 );
+    cascade().Add( &s_menus, 300 );
+    cascade().Add( &s_toolbars, 400 );
+}
 
 
 /// @brief The bar over one KiCad window: a small frame floating on it, at the top centre
@@ -331,6 +825,9 @@ void UI::Update()
     wxString       text;
     bool           takenBack;
 
+    s.hintPending.store( false );
+    const bool refusedRecently = nowMs() - s.lastRefusedMs.load() < REFUSED_HINT_MS;
+
     {
         std::lock_guard<std::mutex> lock( s.mutex );
 
@@ -345,6 +842,9 @@ void UI::Update()
             text = wxString::Format( _( "Remote control: %s%s · %s" ), wxString::FromUTF8( s.client ),
                                      s.peer.empty() ? wxString() : wxString::FromUTF8( " · " + s.peer ),
                                      elapsed( s.since ) );
+
+            if( refusedRecently )
+                text += wxS( "  —  " ) + _( "take control back to edit" );
         }
         else if( takenBack )
         {
@@ -352,13 +852,8 @@ void UI::Update()
         }
     }
 
-    state().lockedUi.store( held );
-
-    if( held && !g_filter )
-    {
-        g_filter = new READONLY_FILTER();
-        wxEvtHandler::AddFilter( g_filter );
-    }
+    installBuiltinSteps();
+    cascade().SetLocked( held );
 
     // drop bars of closed windows
     for( auto it = m_bars.begin(); it != m_bars.end(); )
@@ -379,14 +874,6 @@ void UI::Update()
     if( !held && !takenBack )
     {
         Clear();
-
-        if( g_filter )
-        {
-            wxEvtHandler::RemoveFilter( g_filter );
-            delete g_filter;
-            g_filter = nullptr;
-        }
-
         return;
     }
 
@@ -490,7 +977,9 @@ nlohmann::json statusLocked( const SESSION_STATE& s, const std::string& aCaller 
                                                            std::chrono::system_clock::now() - s.since ).count() )
                                  : nlohmann::json() },
              { "lease_s", s.held ? nlohmann::json( s.leaseS ) : nlohmann::json() },
-             { "revoked_cooldowns", cooldowns } };
+             { "revoked_cooldowns", cooldowns },
+             { "ui_locked", s.lockedUi.load() },
+             { "cascade", s.cascade } };
 }
 
 
@@ -627,19 +1116,65 @@ void KOPENAPI_REMOTE::Shutdown()
         state().lastRevokedClient.clear();
     }
 
-    state().lockedUi.store( false );
-
     if( wxTheApp && wxThread::IsMain() )
     {
+        cascade().SetLocked( false );
         ui().Clear();
-
-        if( g_filter )
-        {
-            wxEvtHandler::RemoveFilter( g_filter );
-            delete g_filter;
-            g_filter = nullptr;
-        }
     }
+    else
+    {
+        state().lockedUi.store( false );
+    }
+}
+
+
+void KOPENAPI_REMOTE::AddParticipant( KOPENAPI_REMOTE_PARTICIPANT* aParticipant, int aOrder )
+{
+    installBuiltinSteps();
+    cascade().Add( aParticipant, aOrder );
+}
+
+
+void KOPENAPI_REMOTE::RemoveParticipant( KOPENAPI_REMOTE_PARTICIPANT* aParticipant )
+{
+    cascade().Remove( aParticipant );
+}
+
+
+nlohmann::json KOPENAPI_REMOTE::Cascade()
+{
+    installBuiltinSteps();
+    return cascade().Json();
+}
+
+
+void KOPENAPI_REMOTE::SetLookingCommands( wxWindow* aFrame, bool ( *aIsLooking )( int aId ) )
+{
+    if( aIsLooking )
+        lookingResolvers()[aFrame] = aIsLooking;
+    else
+        lookingResolvers().erase( aFrame );
+}
+
+
+bool KOPENAPI_REMOTE::IsLookingCommand( wxWindow* aWindow, int aId )
+{
+    if( wxLookingIds().count( aId ) )
+        return true;
+
+    if( !aWindow )
+        return false;
+
+    auto& resolvers = lookingResolvers();
+    auto  it = resolvers.find( wxGetTopLevelParent( aWindow ) );
+
+    return it != resolvers.end() && it->second( aId );
+}
+
+
+bool KOPENAPI_REMOTE::UiLocked()
+{
+    return state().lockedUi.load( std::memory_order_relaxed );
 }
 
 

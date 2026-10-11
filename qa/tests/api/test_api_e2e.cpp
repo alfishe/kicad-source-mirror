@@ -856,7 +856,13 @@ BOOST_FIXTURE_TEST_CASE( SaveDocumentAsSwitchesProject, API_SERVER_E2E_FIXTURE )
 {
     BOOST_REQUIRE_MESSAGE( Start(), LastError() );
 
-    wxString sourcePath = wxString::FromUTF8( KI_TEST::GetPcbnewTestDataDir() ) + wxS( "api_kitchen_sink.kicad_pcb" );
+    // A private copy: other test processes open the shared fixture, and a project locked by them
+    // opens read-only, which saves no project file
+    TEMP_KITCHEN_SINK_COPY copy;
+    wxString               copyError;
+    BOOST_REQUIRE_MESSAGE( copy.Create( &copyError ), copyError );
+
+    wxString sourcePath = copy.BoardPath();
 
     KI_TEST::SCOPED_TEMP_DIR tempDir( "kicad_api_e2e_saveas_project" );
 

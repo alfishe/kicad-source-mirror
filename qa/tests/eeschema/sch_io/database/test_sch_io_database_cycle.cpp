@@ -72,6 +72,9 @@ public:
     {
         return aPlugin.s_inProgressLoads.size();
     }
+
+    /// The set is static (per thread): a test that seeds it must clear it for the next tests
+    void ClearInProgress( SCH_IO_DATABASE& aPlugin ) { aPlugin.s_inProgressLoads.clear(); }
 };
 
 
@@ -104,6 +107,8 @@ BOOST_AUTO_TEST_CASE( DetectsAlreadyInProgressLibId )
     // The re-insert of the already-seeded key must observe it as present and so must not erase
     // the fixture's entry on the way out.
     BOOST_CHECK_EQUAL( fixture.InProgressSize( plugin ), 1u );
+
+    fixture.ClearInProgress( plugin );
 }
 
 

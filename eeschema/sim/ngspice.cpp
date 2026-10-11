@@ -671,7 +671,7 @@ bool NGSPICE::loadSpinit( const std::string& aFileName )
 
 std::string NGSPICE::findCmPath() const
 {
-    const std::vector<std::string> cmPaths =
+    std::vector<std::string> cmPaths =
     {
 #ifdef __WXMAC__
         "/Applications/ngspice/lib/ngspice",
@@ -687,6 +687,10 @@ std::string NGSPICE::findCmPath() const
         "lib/ngspice",
         "ngspice"
     };
+
+    // Unix layout of the library found at build time: <prefix>/lib/libngspice + <prefix>/lib/ngspice
+    if( wxGetEnv( wxT( "KICAD_RUN_FROM_BUILD_DIR" ), nullptr ) )
+        cmPaths.emplace_back( std::string( NGSPICE_DLL_DIR ) + "/ngspice" );
 
     for( const auto& path : cmPaths )
     {

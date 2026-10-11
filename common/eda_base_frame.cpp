@@ -57,6 +57,7 @@
 #include <tool/action_menu.h>
 #include <tool/action_toolbar.h>
 #include <tool/actions.h>
+#include <kicadopenapi_remote.h>
 #include <tool/common_control.h>
 #include <tool/tool_manager.h>
 #include <tool/tool_dispatcher.h>
@@ -83,6 +84,7 @@
 #include <nlohmann/json.hpp>
 
 #include <functional>
+#include <unordered_set>
 #include <kiface_ids.h>
 
 
@@ -134,8 +136,13 @@ BEGIN_EVENT_TABLE( EDA_BASE_FRAME, wxFrame )
     END_EVENT_TABLE()
 
 
+static bool isLookingAction( int aUIId );
+
+
 void EDA_BASE_FRAME::commonInit( FRAME_T aFrameType )
 {
+    KOPENAPI_REMOTE::SetLookingCommands( this, &isLookingAction );
+
     m_ident             = aFrameType;
     m_maximizeByDefault = false;
     m_infoBar           = nullptr;
@@ -339,6 +346,8 @@ void EDA_BASE_FRAME::windowClosing( wxCloseEvent& event )
 
 EDA_BASE_FRAME::~EDA_BASE_FRAME()
 {
+    KOPENAPI_REMOTE::SetLookingCommands( this, nullptr );
+
     Disconnect( ID_AUTO_SAVE_TIMER, wxEVT_TIMER, wxTimerEventHandler( EDA_BASE_FRAME::onAutoSaveTimer ) );
     Disconnect( wxEVT_CLOSE_WINDOW, wxCloseEventHandler( EDA_BASE_FRAME::windowClosing ) );
 
@@ -629,6 +638,48 @@ void EDA_BASE_FRAME::onUpdateUI( wxUpdateUIEvent& aEvent )
 }
 
 
+/// @brief Actions that only change the view (zoom, pan, grid, units, panels, copy, find, help):
+/// allowed and kept enabled while the user's input is refused under remote control. Action ids are
+/// numbered per module (each links its own ACTIONS), so the set is this module's.
+static bool isLookingAction( int aUIId )
+{
+    static std::unordered_set<int> ids;
+
+    // ids are assigned when the module's first ACTION_MANAGER is created
+    if( ids.empty() )
+    {
+        if( ACTIONS::zoomIn.GetUIId() < TOOL_ACTION::GetBaseUIId() )
+            return false;
+
+        for( const TOOL_ACTION* action : {
+                     &ACTIONS::zoomRedraw, &ACTIONS::zoomIn, &ACTIONS::zoomOut, &ACTIONS::zoomInCenter,
+                     &ACTIONS::zoomOutCenter, &ACTIONS::zoomInHorizontally, &ACTIONS::zoomOutHorizontally,
+                     &ACTIONS::zoomInVertically, &ACTIONS::zoomOutVertically, &ACTIONS::zoomCenter,
+                     &ACTIONS::zoomFitScreen, &ACTIONS::zoomFitObjects, &ACTIONS::zoomFitSelection,
+                     &ACTIONS::zoomPreset, &ACTIONS::zoomUndo, &ACTIONS::zoomRedo, &ACTIONS::centerContents,
+                     &ACTIONS::centerSelection, &ACTIONS::panUp, &ACTIONS::panDown, &ACTIONS::panLeft,
+                     &ACTIONS::panRight, &ACTIONS::toggleCursor, &ACTIONS::cursorSmallCrosshairs,
+                     &ACTIONS::cursorFullCrosshairs, &ACTIONS::highContrastMode, &ACTIONS::highContrastModeCycle,
+                     &ACTIONS::toggleBoundingBoxes, &ACTIONS::gridFast1, &ACTIONS::gridFast2,
+                     &ACTIONS::gridFastCycle, &ACTIONS::gridNext, &ACTIONS::gridPrev, &ACTIONS::gridPreset,
+                     &ACTIONS::toggleGrid, &ACTIONS::toggleGridOverrides, &ACTIONS::inchesUnits,
+                     &ACTIONS::milsUnits, &ACTIONS::millimetersUnits, &ACTIONS::toggleUnits,
+                     &ACTIONS::togglePolarCoords, &ACTIONS::copy, &ACTIONS::showSearch, &ACTIONS::find,
+                     &ACTIONS::findNext, &ACTIONS::findPrevious, &ACTIONS::findNextMarker,
+                     &ACTIONS::showProperties, &ACTIONS::showLibraryTree, &ACTIONS::show3DViewer,
+                     &ACTIONS::showProjectManager, &ACTIONS::showSymbolBrowser, &ACTIONS::showFootprintBrowser,
+                     &ACTIONS::showCalculatorTools, &ACTIONS::gettingStarted, &ACTIONS::help, &ACTIONS::about,
+                     &ACTIONS::listHotKeys, &ACTIONS::getInvolved, &ACTIONS::donate, &ACTIONS::reportBug,
+                     &ACTIONS::quit } )
+        {
+            ids.insert( action->GetUIId() );
+        }
+    }
+
+    return ids.count( aUIId ) > 0;
+}
+
+
 void EDA_BASE_FRAME::HandleUpdateUIEvent( wxUpdateUIEvent& aEvent, EDA_BASE_FRAME* aFrame,
                                           ACTION_CONDITIONS& aCond )
 {
@@ -686,6 +737,10 @@ void EDA_BASE_FRAME::HandleUpdateUIEvent( wxUpdateUIEvent& aEvent, EDA_BASE_FRAM
         else if( dynamic_cast<WX_GRID*>( focus ) )
             enableRes = false;  // Must disable menu in order to get command as CharHook event
     }
+
+    // under remote control the user only looks: editing commands are greyed out
+    if( enableRes && KOPENAPI_REMOTE::UiLocked() && !isLookingAction( aEvent.GetId() ) )
+        enableRes = false;
 
     aEvent.Enable( enableRes );
     aEvent.Show( showRes );
