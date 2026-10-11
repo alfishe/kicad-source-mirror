@@ -1,5 +1,5 @@
-/// @file methods_pcb_annotate.cpp
-/// @brief pcb_annotate: the board editor's annotation layer (kicadopenapi_annotations.h), and the
+/// @file methods_pcb_overlay.cpp
+/// @brief pcb_overlay: the board editor's annotation layer (kicadopenapi_annotations.h), and the
 /// board's change notifications forwarded to KOPENAPI_MODEL_EVENTS.
 #include <kicadopenapi_annotations.h>
 #include <kicadopenapi_model_events.h>
@@ -134,7 +134,7 @@ std::optional<BOX2I> resolveBoardItem( PCB_EDIT_FRAME* aFrame, const std::string
 }
 
 
-KOPENAPI_RESULT h_pcb_annotate( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+KOPENAPI_RESULT h_pcb_overlay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     auto* frame = aCtx.kiway ? dynamic_cast<PCB_EDIT_FRAME*>( aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) ) : nullptr;
 
@@ -154,7 +154,7 @@ KOPENAPI_RESULT h_pcb_annotate( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
 } // namespace
 
 
-KOPENAPI_REGISTER( "pcb_annotate",
+KOPENAPI_REGISTER( "pcb_overlay",
                    "Annotation layer over the board editor's canvas, for teaching and demos: highlight, arrow, "
                    "label, region, spotlight (dims the rest), numbered step, key hint. Anchors are references "
                    "(U1), pads (U1.3), uuids or [x, y] mm; anchored annotations follow their items (moves, "
@@ -162,4 +162,4 @@ KOPENAPI_REGISTER( "pcb_annotate",
                    "the board: tools, selection, DRC, plots and files never see it; captures and recordings "
                    "do. add / update / remove / clear (group or *); answers every annotation with its "
                    "resolved box; GUI only",
-                   KopenapiAnnotateSchema(), true, h_pcb_annotate );
+                   KopenapiAnnotateSchema(), true, h_pcb_overlay );

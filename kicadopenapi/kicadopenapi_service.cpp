@@ -1028,6 +1028,9 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
 {
     KOPENAPI_MEMORY::StartAutoTrim();
 
+    for( const std::string& name : KOPENAPI_REGISTRY::Get().Duplicates() )
+        wxLogError( "kicadopenapi: method '%s' is registered twice; the first registration is kept", name );
+
     if( Running() )
         return true;
 

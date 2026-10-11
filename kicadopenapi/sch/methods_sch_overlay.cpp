@@ -1,5 +1,5 @@
-/// @file methods_sch_annotate.cpp
-/// @brief sch_annotate: the schematic editor's annotation layer (kicadopenapi_annotations.h), and the
+/// @file methods_sch_overlay.cpp
+/// @brief sch_overlay: the schematic editor's annotation layer (kicadopenapi_annotations.h), and the
 /// schematic's change notifications forwarded to KOPENAPI_MODEL_EVENTS.
 #include <kicadopenapi_annotations.h>
 #include <kicadopenapi_model_events.h>
@@ -119,7 +119,7 @@ std::optional<BOX2I> resolveSchematicItem( SCH_EDIT_FRAME* aFrame, const std::st
 }
 
 
-KOPENAPI_RESULT h_sch_annotate( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+KOPENAPI_RESULT h_sch_overlay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     auto* frame = aCtx.kiway ? dynamic_cast<SCH_EDIT_FRAME*>( aCtx.kiway->Player( FRAME_SCH, false ) ) : nullptr;
 
@@ -139,10 +139,10 @@ KOPENAPI_RESULT h_sch_annotate( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
 } // namespace
 
 
-KOPENAPI_REGISTER( "sch_annotate",
+KOPENAPI_REGISTER( "sch_overlay",
                    "Annotation layer over the schematic editor's canvas (the shown sheet), for teaching and "
                    "demos: highlight, arrow, label, region, spotlight, numbered step, key hint. Anchors are "
                    "references (R5), pins (U1.3), uuids or [x, y] mm; anchored annotations follow their items, "
                    "a deleted item orphans them. Not part of the schematic: tools, ERC, plots and files never "
                    "see it; captures and recordings do. add / update / remove / clear; GUI only",
-                   KopenapiAnnotateSchema(), true, h_sch_annotate );
+                   KopenapiAnnotateSchema(), true, h_sch_overlay );

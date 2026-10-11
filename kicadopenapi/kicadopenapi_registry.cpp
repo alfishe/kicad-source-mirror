@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 
 
 KOPENAPI_REGISTRY& KOPENAPI_REGISTRY::Get()
@@ -17,8 +18,25 @@ bool KOPENAPI_REGISTRY::Add( KOPENAPI_METHOD aMethod )
     std::lock_guard<std::mutex> lock( reg.m_mutex );
 
     std::string name = aMethod.name;
+
+    // two methods under one name: the first stays, the clash is reported (stderr now, the journal
+    // when the service starts)
+    if( reg.m_methods.count( name ) )
+    {
+        std::fprintf( stderr, "kicadopenapi: method '%s' registered twice; the first one is kept\n", name.c_str() );
+        reg.m_duplicates.push_back( name );
+        return false;
+    }
+
     reg.m_methods[name] = std::move( aMethod );
     return true;
+}
+
+
+std::vector<std::string> KOPENAPI_REGISTRY::Duplicates() const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return m_duplicates;
 }
 
 

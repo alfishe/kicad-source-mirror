@@ -147,6 +147,9 @@ public:
 
     static bool Add( KOPENAPI_METHOD aMethod );
 
+    /// @brief Names registered more than once (the first registration is kept)
+    std::vector<std::string> Duplicates() const;
+
     static bool AddDocumentProvider( const std::string& aDomain, KOPENAPI_DOC_STATUS aStatus,
                                      KOPENAPI_DOC_RELEASE aRelease );
 
@@ -199,6 +202,7 @@ private:
 
     mutable std::mutex                     m_mutex;
     std::map<std::string, KOPENAPI_METHOD>     m_methods;
+    std::vector<std::string>                   m_duplicates;
     std::map<std::string, KOPENAPI_DOC_STATUS>  m_docProviders;
     std::map<std::string, KOPENAPI_DOC_RELEASE> m_docReleasers;
     std::vector<KOPENAPI_CANVAS_CAPTURE>        m_canvasCaptures;

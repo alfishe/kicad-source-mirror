@@ -34,7 +34,7 @@ struct KOPENAPI_ANNOTATION_HOST
 };
 
 
-/// @brief pcb_annotate / sch_annotate: add, update, remove, clear, list
+/// @brief pcb_overlay / sch_overlay: add, update, remove, clear, list
 KOPENAPI_RESULT KopenapiAnnotate( const KOPENAPI_ANNOTATION_HOST& aHost, const nlohmann::json& aArgs );
 
 const nlohmann::json& KopenapiAnnotateSchema();
