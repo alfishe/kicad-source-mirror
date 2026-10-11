@@ -1056,6 +1056,10 @@ int main(int argc, char** argv)
     // KiCad processes this bridge starts work for an agent: they never stop on a modal question
     platform::SetEnv("KICAD_OPENAPI_AGENT", "1");
 
+    // the agent's identity for remote control sessions (remote_session): one per bridge process
+    bridge::SetExtraHeader("X-Kicad-Session", "bridge-" + std::to_string(platform::CurrentPid()) + "-"
+                                                  + std::to_string(static_cast<long long>(std::time(nullptr))));
+
     Bridge bridgeState(*cfg);
     std::atomic<bool> running{true};
     std::thread housekeeping([&]() {

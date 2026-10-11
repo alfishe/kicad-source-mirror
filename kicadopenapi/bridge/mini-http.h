@@ -38,6 +38,9 @@ bool ParseUrl(const std::string& url, std::string& host, int& port, std::string&
 /// Content-Length and chunked response bodies (SSE answers are chunked).
 HttpResult Post(const std::string& host, int port, const std::string& path, const std::string& body);
 
+/// @brief Adds a header to every request from now on (e.g. X-Kicad-Session: the caller's identity)
+void SetExtraHeader(const std::string& name, const std::string& value);
+
 /// @brief Blocking GET with a short receive timeout (status probes)
 HttpResult Get(const std::string& host, int port, const std::string& path, int receiveTimeoutSeconds = 5);
 

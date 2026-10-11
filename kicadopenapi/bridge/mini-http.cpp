@@ -2,6 +2,8 @@
 
 #include "mini-http.h"
 
+#include <mutex>
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -291,6 +293,9 @@ bool ParseUrl(const std::string& url, std::string& host, int& port, std::string&
     return true;
 }
 
+static std::mutex  s_headersMutex;
+static std::string s_extraHeaders;   ///< "Name: value\r\n" lines
+
 static HttpResult Send(const char* method, const std::string& host, int port, const std::string& path,
                        const std::string& body, int receiveTimeoutSeconds)
 {
@@ -375,6 +380,10 @@ static HttpResult Send(const char* method, const std::string& host, int port, co
     request += "Accept: application/json, text/event-stream\r\n";
     request += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     request += "Connection: keep-alive\r\n";
+    {
+        std::lock_guard<std::mutex> lock(s_headersMutex);
+        request += s_extraHeaders;
+    }
     request += "\r\n";
     request += body;
 
@@ -518,6 +527,12 @@ static HttpResult Send(const char* method, const std::string& host, int port, co
 
     result.ok = true;
     return result;
+}
+
+void SetExtraHeader(const std::string& name, const std::string& value)
+{
+    std::lock_guard<std::mutex> lock(s_headersMutex);
+    s_extraHeaders += name + ": " + value + "\r\n";
 }
 
 HttpResult Post(const std::string& host, int port, const std::string& path, const std::string& body)

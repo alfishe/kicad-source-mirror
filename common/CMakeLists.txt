@@ -416,6 +416,7 @@ list( APPEND KICOMMON_SRCS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_memory.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_memory.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_model_events.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_remote.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/kicadopenapi_recorder.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/video_encoder_ffmpeg.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/frame_scaler.cpp

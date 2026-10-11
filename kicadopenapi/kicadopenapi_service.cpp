@@ -5,6 +5,7 @@
 #include "kicadopenapi_mcp.h"
 #include "kicadopenapi_journal.h"
 #include "kicadopenapi_memory.h"
+#include "kicadopenapi_remote.h"
 #include "kicadopenapi_libraries.h"
 
 #include <algorithm>
@@ -333,10 +334,12 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 
     void writeDiscoveryFile();
 
-    KOPENAPI_RESULT invoke( const std::string& aName, const std::string& aBody ) const;
+    KOPENAPI_RESULT invoke( const std::string& aName, const std::string& aBody, const std::string& aCaller = {} ) const;
 
     /// @brief Same as invoke() with already parsed arguments (REST and MCP share this path)
-    KOPENAPI_RESULT invokeParsed( const std::string& aName, const nlohmann::json& aArgs ) const;
+    /// @param aCaller the X-Kicad-Session header: the client's identity for remote control sessions
+    KOPENAPI_RESULT invokeParsed( const std::string& aName, const nlohmann::json& aArgs,
+                                  const std::string& aCaller = {} ) const;
 
     void handleMcp( const httplib::Request& aReq, httplib::Response& aRes ) const;
 
@@ -569,7 +572,8 @@ void KICAD_OPENAPI_SERVICE::IMPL::writeDiscoveryFile()
 
 
 KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invoke( const std::string& aName,
-                                                     const std::string& aBody ) const
+                                                     const std::string& aBody,
+                                                     const std::string& aCaller ) const
 {
     nlohmann::json args = nlohmann::json::object();
 
@@ -581,12 +585,13 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invoke( const std::string& aName,
             return KOPENAPI_RESULT::Error( 400, "request body must be a JSON object" );
     }
 
-    return invokeParsed( aName, args );
+    return invokeParsed( aName, args, aCaller );
 }
 
 
 KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&    aName,
-                                                           const nlohmann::json& aArgs ) const
+                                                           const nlohmann::json& aArgs,
+                                                           const std::string&    aCaller ) const
 {
     ensureKifaces();
 
@@ -594,6 +599,13 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
 
     if( !method )
         return KOPENAPI_RESULT::Error( 404, "unknown method '" + aName + "'" );
+
+    // a client the user took control back from is stopped; the holder's calls renew its lease
+    if( std::optional<KOPENAPI_RESULT> refused = KOPENAPI_REMOTE::Gate( aCaller, aName ) )
+        return *refused;
+
+    if( aName == "remote_session" )
+        return KOPENAPI_REMOTE::Handle( aCaller, aArgs );
 
     if( method->guiOnly && ctx.headless )
         return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI" );
@@ -834,9 +846,11 @@ void KICAD_OPENAPI_SERVICE::IMPL::handleMcp( const httplib::Request& aReq,
     mcpCtx.headless = ctx.headless;
     mcpCtx.version = KOPENAPI_VERSION;
     ensureKifaces();   // search must see kiface methods
-    mcpCtx.invoke = [this]( const std::string& aName, const nlohmann::json& aArgs )
+    const std::string caller = aReq.get_header_value( "X-Kicad-Session" );
+
+    mcpCtx.invoke = [this, caller]( const std::string& aName, const nlohmann::json& aArgs )
     {
-        return invokeParsed( aName, aArgs );
+        return invokeParsed( aName, aArgs, caller );
     };
 
     const nlohmann::json msg = nlohmann::json::parse( aReq.body, nullptr, false );
@@ -942,7 +956,7 @@ void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
     server->Post( R"(/api/v1/([a-z0-9_]+))",
                   [this]( const httplib::Request& req, httplib::Response& res )
                   {
-                      reply( res, invoke( req.matches[1], req.body ) );
+                      reply( res, invoke( req.matches[1], req.body, req.get_header_value( "X-Kicad-Session" ) ) );
                   } );
 
     server->set_error_handler(
@@ -1211,6 +1225,7 @@ bool KICAD_OPENAPI_SERVICE::InMainThreadCall()
 void KICAD_OPENAPI_SERVICE::Stop()
 {
     KOPENAPI_MEMORY::StopAutoTrim();
+    KOPENAPI_REMOTE::Shutdown();
 
     if( !m_impl->server )
         return;
