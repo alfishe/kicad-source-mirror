@@ -1007,11 +1007,10 @@ public:
     void InvalidateClearanceCache( const KIID& aUuid );
 
     /**
-     * Initialize the clearance cache for all board items.
-     *
-     * Pre-populates the cache to avoid delays during first render.
+     * Pre-populate the clearance cache of the given item kinds (see
+     * DRC_ENGINE::InitializeClearanceCache()).
      */
-    void InitializeClearanceCache();
+    void InitializeClearanceCache( bool aTracks = true, bool aPads = true );
 
     BOARD_STACKUP GetStackupOrDefault() const;
 

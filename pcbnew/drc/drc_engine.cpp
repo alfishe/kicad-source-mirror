@@ -3228,9 +3228,9 @@ void DRC_ENGINE::ClearClearanceCache()
 }
 
 
-void DRC_ENGINE::InitializeClearanceCache()
+void DRC_ENGINE::InitializeClearanceCache( bool aTracks, bool aPads )
 {
-    if( !m_board )
+    if( !m_board || ( !aTracks && !aPads ) )
         return;
 
     // Pre-populate the cache for all connected items to avoid delays during first render.
@@ -3248,27 +3248,44 @@ void DRC_ENGINE::InitializeClearanceCache()
     for( FOOTPRINT* footprint : m_board->Footprints() )
         estimatedPads += footprint->Pads().size();
 
-    itemsToProcess.reserve( m_board->Tracks().size() + estimatedPads * 2 );
+    itemsToProcess.reserve( ( aTracks ? m_board->Tracks().size() : 0 ) + ( aPads ? estimatedPads * 2 : 0 ) );
 
-    for( PCB_TRACK* track : m_board->Tracks() )
     {
-        if( track->Type() == PCB_VIA_T )
-        {
-            for( PCB_LAYER_ID layer : LSET( track->GetLayerSet() & copperLayers ).Seq() )
-                itemsToProcess.emplace_back( track, layer );
-        }
-        else
-        {
-            itemsToProcess.emplace_back( track, track->GetLayer() );
-        }
-    }
+        std::shared_lock<std::shared_mutex> readLock( m_clearanceCacheMutex );
 
-    for( FOOTPRINT* footprint : m_board->Footprints() )
-    {
-        for( PAD* pad : footprint->Pads() )
+        auto add =
+                [&]( const BOARD_ITEM* aItem, PCB_LAYER_ID aLayer )
+                {
+                    if( !m_ownClearanceCache.contains( { aItem->m_Uuid, aLayer } ) )
+                        itemsToProcess.emplace_back( aItem, aLayer );
+                };
+
+        if( aTracks )
         {
-            for( PCB_LAYER_ID layer : LSET( pad->GetLayerSet() & copperLayers ).Seq() )
-                itemsToProcess.emplace_back( pad, layer );
+            for( PCB_TRACK* track : m_board->Tracks() )
+            {
+                if( track->Type() == PCB_VIA_T )
+                {
+                    for( PCB_LAYER_ID layer : LSET( track->GetLayerSet() & copperLayers ).Seq() )
+                        add( track, layer );
+                }
+                else
+                {
+                    add( track, track->GetLayer() );
+                }
+            }
+        }
+
+        if( aPads )
+        {
+            for( FOOTPRINT* footprint : m_board->Footprints() )
+            {
+                for( PAD* pad : footprint->Pads() )
+                {
+                    for( PCB_LAYER_ID layer : LSET( pad->GetLayerSet() & copperLayers ).Seq() )
+                        add( pad, layer );
+                }
+            }
         }
     }
 
@@ -3277,7 +3294,7 @@ void DRC_ENGINE::InitializeClearanceCache()
 
     {
         std::unique_lock<std::shared_mutex> writeLock( m_clearanceCacheMutex );
-        m_ownClearanceCache.reserve( itemsToProcess.size() );
+        m_ownClearanceCache.reserve( m_ownClearanceCache.size() + itemsToProcess.size() );
     }
 
     thread_pool& tp = GetKiCadThreadPool();

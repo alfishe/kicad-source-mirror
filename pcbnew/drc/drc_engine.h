@@ -261,12 +261,14 @@ public:
     void ClearClearanceCache();
 
     /**
-     * Initialize the clearance cache for all items on the board.
+     * Pre-populate the clearance cache for the items whose clearance outline is drawn, so the
+     * first render does not evaluate rules item by item.  Entries already cached are kept; the
+     * rest is filled on demand by GetCachedOwnClearance().
      *
-     * Pre-populates the cache to avoid delays during first render. Should be called
-     * after InitEngine() when a board is loaded.
+     * @param aTracks include tracks, arcs and vias.
+     * @param aPads include pads.
      */
-    void InitializeClearanceCache();
+    void InitializeClearanceCache( bool aTracks = true, bool aPads = true );
 
     void ProcessAssertions( const BOARD_ITEM* a,
                             std::function<void( const DRC_CONSTRAINT* )> aFailureHandler,

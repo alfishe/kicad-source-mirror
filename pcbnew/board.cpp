@@ -1320,10 +1320,10 @@ void BOARD::InvalidateClearanceCache( const KIID& aUuid )
 }
 
 
-void BOARD::InitializeClearanceCache()
+void BOARD::InitializeClearanceCache( bool aTracks, bool aPads )
 {
     if( m_designSettings && m_designSettings->m_DRCEngine )
-        m_designSettings->m_DRCEngine->InitializeClearanceCache();
+        m_designSettings->m_DRCEngine->InitializeClearanceCache( aTracks, aPads );
 }
 
 

@@ -2142,7 +2142,10 @@ void PCB_EDIT_FRAME::OnBoardLoaded()
         // we'll stay quiet for now.  Feel free to revisit this decision....
     }
 
-    GetBoard()->InitializeClearanceCache();
+    {
+        const auto& opts = GetPcbNewSettings()->m_Display;
+        GetBoard()->InitializeClearanceCache( opts.m_TrackClearance == SHOW_WITH_VIA_ALWAYS, opts.m_PadClearance );
+    }
 
     // Migrate obsolete WRL 3D model references to current STEP models.  Only
     // runs in the GUI: CLI and scripting load paths must not mutate board
@@ -2753,6 +2756,11 @@ void PCB_EDIT_FRAME::CommonSettingsChanged( int aFlags )
         infobar->AddCloseButton();
         infobar->ShowMessage( _( "Could not compile custom design rules." ), wxICON_ERROR,
                               WX_INFOBAR::MESSAGE_TYPE::DRC_RULES_ERROR );
+    }
+
+    {
+        const auto& opts = GetPcbNewSettings()->m_Display;
+        GetBoard()->InitializeClearanceCache( opts.m_TrackClearance == SHOW_WITH_VIA_ALWAYS, opts.m_PadClearance );
     }
 
     GetCanvas()->GetView()->MarkTargetDirty( KIGFX::TARGET_NONCACHED );
