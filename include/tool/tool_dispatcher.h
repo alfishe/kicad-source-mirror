@@ -45,6 +45,12 @@ class VIEW;
  * - low-level input conditioning (drag/click threshold), updating mouse position during
  *   view auto-scroll/pan.
  * - issues TOOL_EVENTS to the tool manager
+ *
+ * Two layers: DispatchWxEvent() is the platform layer (wx events, focus, menus, text entry) and
+ * turns pointer and key events into toolkit-independent INPUT; DispatchInput() is the logic
+ * (button state machine, click / drag / double click, hotkeys) that makes TOOL_EVENTs of it.
+ * Automation (the API) feeds INPUT to DispatchInput() directly, so injected input takes the
+ * same path as a user's.
  */
 class TOOL_DISPATCHER : public wxEvtHandler
 {
@@ -68,6 +74,40 @@ public:
      * @param aEvent is the wxWidgets event to be processed.
      */
     virtual void DispatchWxEvent( wxEvent& aEvent );
+
+    /**
+     * Toolkit-independent pointer / keyboard input. The pointer position is not part of it: it
+     * is read through the view controls (KIPLATFORM::UI::GetMousePosition(), which reports an
+     * injected pointer while one is set).
+     */
+    struct INPUT
+    {
+        enum class KIND
+        {
+            POINTER,         ///< moved, wheel turned or view changed under the pointer
+            BUTTON_DOWN,
+            BUTTON_UP,
+            BUTTON_DCLICK,
+            KEY
+        };
+
+        KIND kind = KIND::POINTER;
+        int  button = 0;          ///< TOOL_MOUSE_BUTTONS of a button event
+        int  heldButtons = 0;     ///< TOOL_MOUSE_BUTTONS held now
+        int  modifiers = 0;       ///< MD_SHIFT | MD_CTRL | MD_ALT
+        int  wheelRotation = 0;   ///< POINTER: wheel turn
+        int  keyCode = 0;         ///< KEY: KiCad key code (letters upper case, WXK_ codes)
+    };
+
+    /**
+     * The tool logic for one input (see the class description).
+     *
+     * @return true when a tool handled it
+     */
+    bool DispatchInput( const INPUT& aInput );
+
+    /// @return the TOOL_MOUSE_BUTTONS held, from KIPLATFORM::UI::GetMouseState()
+    static int HeldButtons();
 
     /**
      * Map a wxWidgets key event to a TOOL_EVENT.
@@ -111,7 +151,14 @@ public:
 
 private:
     /// Handles mouse related events (click, motion, dragging).
-    bool handleMouseButton( wxEvent& aEvent, int aIndex, bool aMotion );
+    bool handleMouseButton( const INPUT& aInput, int aIndex, bool aMotion );
+
+    /// Pointer input: button events go to the tools here; a motion / wheel event is returned
+    /// @param aButtonEvents is set when a button event was dispatched
+    std::optional<TOOL_EVENT> pointerEvent( const INPUT& aInput, bool& aButtonEvents );
+
+    /// The TOOL_EVENT of a key (escape cancels)
+    static TOOL_EVENT keyEvent( int aKeyCode, int aModifiers );
 
     /// Processes any pending mouse clicks that have been physically completed but not yet
     /// dispatched. This ensures clicks are processed before cancel events when both happen

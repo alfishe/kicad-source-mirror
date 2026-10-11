@@ -215,6 +215,9 @@ bool KIPLATFORM::UI::SupportsKeyState()
 
 wxPoint KIPLATFORM::UI::GetMousePosition()
 {
+    if( const INJECTED_POINTER* injected = GetInjectedPointer() )
+        return injected->screenPosition;
+
     // wxOSX flips the pointer against screen 0, which raises NSRangeException with no window
     // server attached
     if( [[NSScreen screens] count] == 0 )

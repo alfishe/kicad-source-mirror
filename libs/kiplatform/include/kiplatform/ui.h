@@ -22,6 +22,7 @@
 #define KIPLATFORM_UI_H_
 
 #include <wx/cursor.h>
+#include <wx/mousestate.h>
 
 class wxChoice;
 class wxDataViewCtrl;
@@ -158,8 +159,38 @@ namespace KIPLATFORM
         /**
          * Returns the mouse position in screen coordinates.
          * If we've just warped the cursor, returns the new coordinates.
+         * While a pointer is injected (SetInjectedPointer()), returns its position.
          */
         wxPoint GetMousePosition();
+
+        /**
+         * Pointer state fed by automation (the kicadopenapi editor input methods) instead of the
+         * physical mouse: position in screen coordinates, buttons held and modifier keys.
+         */
+        struct INJECTED_POINTER
+        {
+            wxPoint screenPosition;
+            bool    left = false;
+            bool    middle = false;
+            bool    right = false;
+            bool    shift = false;
+            bool    control = false;   ///< Cmd on macOS, as wxMouseState::ControlDown()
+            bool    alt = false;
+        };
+
+        /**
+         * The single gate for injected pointer input: while set, GetMousePosition() and
+         * GetMouseState() report it. Main thread.
+         *
+         * @param aPointer is the state to report, or nullptr to return to the physical mouse.
+         */
+        void SetInjectedPointer( const INJECTED_POINTER* aPointer );
+
+        /// @return the injected pointer, or nullptr when the physical mouse is reported
+        const INJECTED_POINTER* GetInjectedPointer();
+
+        /// @return wxGetMouseState(), or the injected pointer's state while one is set
+        wxMouseState GetMouseState();
 
         /**
          * Move the mouse cursor to a specific position relative to the window

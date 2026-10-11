@@ -93,34 +93,6 @@ struct TOOL_DISPATCHER::BUTTON_STATE
         dragging = false;
         pressed = false;
     }
-
-    /// Checks the current state of the button.
-    bool GetState() const
-    {
-        wxMouseState mouseState = wxGetMouseState();
-
-        switch( button )
-        {
-        case BUT_LEFT:
-            return mouseState.LeftIsDown();
-
-        case BUT_MIDDLE:
-            return mouseState.MiddleIsDown();
-
-        case BUT_RIGHT:
-            return mouseState.RightIsDown();
-
-        case BUT_AUX1:
-            return mouseState.Aux1IsDown();
-
-        case BUT_AUX2:
-            return mouseState.Aux2IsDown();
-
-        default:
-            wxFAIL_MSG( wxT( "unknown button" ) );
-            return false;
-        }
-    }
 };
 
 
@@ -216,18 +188,28 @@ bool TOOL_DISPATCHER::IsPastDragThreshold( const VECTOR2D& aOffset, int aDragMin
 }
 
 
-bool TOOL_DISPATCHER::handleMouseButton( wxEvent& aEvent, int aIndex, bool aMotion )
+int TOOL_DISPATCHER::HeldButtons()
+{
+    const wxMouseState mouseState = KIPLATFORM::UI::GetMouseState();
+
+    return ( mouseState.LeftIsDown() ? BUT_LEFT : 0 ) | ( mouseState.MiddleIsDown() ? BUT_MIDDLE : 0 )
+           | ( mouseState.RightIsDown() ? BUT_RIGHT : 0 ) | ( mouseState.Aux1IsDown() ? BUT_AUX1 : 0 )
+           | ( mouseState.Aux2IsDown() ? BUT_AUX2 : 0 );
+}
+
+
+bool TOOL_DISPATCHER::handleMouseButton( const INPUT& aInput, int aIndex, bool aMotion )
 {
     BUTTON_STATE* st = m_buttons[aIndex];
-    wxEventType type = aEvent.GetEventType();
+    const bool    isThisButton = aInput.button == st->button;
     std::optional<TOOL_EVENT> evt;
     bool isClick = false;
 
 //    bool up = type == st->upEvent;
 //    bool down = type == st->downEvent;
     bool up = false, down = false;
-    bool dblClick = type == st->dblClickEvent;
-    bool state = st->GetState();
+    bool dblClick = isThisButton && aInput.kind == INPUT::KIND::BUTTON_DCLICK;
+    bool state = ( aInput.heldButtons & st->button ) != 0;
 
     if( dblClick )
     {
@@ -254,12 +236,11 @@ bool TOOL_DISPATCHER::handleMouseButton( wxEvent& aEvent, int aIndex, bool aMoti
         if( st->pressed && !state )
             up = true;
         // Don't apply same logic to down events as it kills touchpad tapping
-        else if( !st->pressed && type == st->downEvent )
+        else if( !st->pressed && isThisButton && aInput.kind == INPUT::KIND::BUTTON_DOWN )
             down = true;
     }
 
-    int mods = decodeModifiers( static_cast<wxMouseEvent*>( &aEvent ) );
-    int args = st->button | mods;
+    int args = st->button | aInput.modifiers;
 
     if( down )      // Handle mouse button press
     {
@@ -490,12 +471,16 @@ std::optional<TOOL_EVENT> TOOL_DISPATCHER::GetToolEvent( wxKeyEvent* aKeyEvent, 
     }
 #endif
 
-    if( key == WXK_ESCAPE ) // ESC is the special key for canceling tools
-        evt = TOOL_EVENT( TC_COMMAND, TA_CANCEL_TOOL, WXK_ESCAPE );
-    else
-        evt = TOOL_EVENT( TC_KEYBOARD, TA_KEY_PRESSED, key | mods );
+    return keyEvent( key, mods );
+}
 
-    return evt;
+
+TOOL_EVENT TOOL_DISPATCHER::keyEvent( int aKeyCode, int aModifiers )
+{
+    if( aKeyCode == WXK_ESCAPE ) // ESC is the special key for canceling tools
+        return TOOL_EVENT( TC_COMMAND, TA_CANCEL_TOOL, WXK_ESCAPE );
+
+    return TOOL_EVENT( TC_KEYBOARD, TA_KEY_PRESSED, aKeyCode | aModifiers );
 }
 
 
@@ -507,7 +492,7 @@ void TOOL_DISPATCHER::flushPendingClicks()
     // escape to maintain proper event ordering.
     for( BUTTON_STATE* st : m_buttons )
     {
-        if( st->pressed && !st->GetState() )
+        if( st->pressed && !( HeldButtons() & st->button ) )
         {
             st->pressed = false;
 
@@ -549,11 +534,90 @@ bool TOOL_DISPATCHER::isStaleAutoRepeat( const wxKeyEvent& aKeyEvent )
 }
 
 
+std::optional<TOOL_EVENT> TOOL_DISPATCHER::pointerEvent( const INPUT& aInput, bool& aButtonEvents )
+{
+    std::optional<TOOL_EVENT> evt;
+    VECTOR2D                  pos;
+    bool                      motion = false;
+
+    if( m_toolMgr->GetViewControls() )
+    {
+        pos = m_toolMgr->GetViewControls()->GetMousePosition();
+        m_lastMousePosScreen = m_toolMgr->GetViewControls()->GetMousePosition( false );
+
+        if( pos != m_lastMousePos )
+        {
+            motion = true;
+            m_lastMousePos = pos;
+        }
+    }
+
+    for( unsigned int i = 0; i < m_buttons.size(); i++ )
+        aButtonEvents |= handleMouseButton( aInput, i, motion );
+
+    if( m_toolMgr->GetViewControls() )
+    {
+        if( !aButtonEvents && motion )
+        {
+            evt = TOOL_EVENT( TC_MOUSE, TA_MOUSE_MOTION, aInput.modifiers );
+            evt->SetMousePosition( pos );
+        }
+    }
+
+    // We only handle wheel events that aren't for the view control.
+    // Events with zero or one modifier are reserved for view control.
+    // When using WX_VIEW_CONTROLS, these will already be handled, but
+    // we still shouldn't consume such events if we get them (e.g. for
+    // when WX_VIEW_CONTROLS is not in use, like in the 3D viewer)
+    if( !evt && aInput.wheelRotation != 0 )
+    {
+        const unsigned modBits = static_cast<unsigned>( aInput.modifiers ) & MD_MODIFIER_MASK;
+        const bool shouldHandle = std::popcount( modBits ) > 1;
+
+        if( shouldHandle )
+        {
+            evt = TOOL_EVENT( TC_MOUSE, TA_MOUSE_WHEEL, aInput.modifiers );
+            evt->SetParameter<int>( aInput.wheelRotation );
+        }
+    }
+
+    return evt;
+}
+
+
+bool TOOL_DISPATCHER::DispatchInput( const INPUT& aInput )
+{
+    std::optional<TOOL_EVENT> evt;
+    bool                      buttonEvents = false;
+
+    if( aInput.kind == INPUT::KIND::KEY )
+    {
+        // A click completed before the escape must reach the tools first
+        if( aInput.keyCode == WXK_ESCAPE )
+            flushPendingClicks();
+
+        evt = keyEvent( aInput.keyCode, aInput.modifiers );
+
+        if( !evt->IsCancel() && m_toolMgr->GetViewControls() )
+        {
+            evt->SetMousePosition( m_lastMousePos );
+            evt->SetHasPosition( true );
+        }
+    }
+    else
+    {
+        evt = pointerEvent( aInput, buttonEvents );
+    }
+
+    if( evt )
+        return m_toolMgr->ProcessEvent( *evt );
+
+    return buttonEvents;
+}
+
+
 void TOOL_DISPATCHER::DispatchWxEvent( wxEvent& aEvent )
 {
-    bool            motion = false;
-    bool            buttonEvents = false;
-    VECTOR2D        pos;
     std::optional<TOOL_EVENT> evt;
     bool            keyIsEscape  = false;  // True if the keypress was the escape key
     bool            keyIsSpecial = false;  // True if the key is a special key code
@@ -612,48 +676,25 @@ void TOOL_DISPATCHER::DispatchWxEvent( wxEvent& aEvent )
             || type == KIGFX::WX_VIEW_CONTROLS::EVT_REFRESH_MOUSE )
     {
         wxMouseEvent* me = static_cast<wxMouseEvent*>( &aEvent );
-        int mods = decodeModifiers( me );
+        INPUT         input;
 
-        if( m_toolMgr->GetViewControls() )
+        input.modifiers = decodeModifiers( me );
+        input.heldButtons = HeldButtons();
+        input.wheelRotation = me->GetWheelRotation();
+
+        for( const BUTTON_STATE* st : m_buttons )
         {
-            pos = m_toolMgr->GetViewControls()->GetMousePosition();
-            m_lastMousePosScreen = m_toolMgr->GetViewControls()->GetMousePosition( false );
-
-            if( pos != m_lastMousePos )
+            if( type == st->downEvent || type == st->upEvent || type == st->dblClickEvent )
             {
-                motion = true;
-                m_lastMousePos = pos;
+                input.button = st->button;
+                input.kind = type == st->downEvent ? INPUT::KIND::BUTTON_DOWN
+                             : type == st->upEvent ? INPUT::KIND::BUTTON_UP
+                                                   : INPUT::KIND::BUTTON_DCLICK;
             }
         }
 
-        for( unsigned int i = 0; i < m_buttons.size(); i++ )
-            buttonEvents |= handleMouseButton( aEvent, i, motion );
-
-        if( m_toolMgr->GetViewControls() )
-        {
-            if( !buttonEvents && motion )
-            {
-                evt = TOOL_EVENT( TC_MOUSE, TA_MOUSE_MOTION, mods );
-                evt->SetMousePosition( pos );
-            }
-        }
-
-        // We only handle wheel events that aren't for the view control.
-        // Events with zero or one modifier are reserved for view control.
-        // When using WX_VIEW_CONTROLS, these will already be handled, but
-        // we still shouldn't consume such events if we get them (e.g. for
-        // when WX_VIEW_CONTROLS is not in use, like in the 3D viewer)
-        if( !evt && me->GetWheelRotation() != 0 )
-        {
-            const unsigned modBits = static_cast<unsigned>( mods ) & MD_MODIFIER_MASK;
-            const bool shouldHandle = std::popcount( modBits ) > 1;
-
-            if( shouldHandle )
-            {
-                evt = TOOL_EVENT( TC_MOUSE, TA_MOUSE_WHEEL, mods );
-                evt->SetParameter<int>( me->GetWheelRotation() );
-            }
-        }
+        bool buttonEvents = false;
+        evt = pointerEvent( input, buttonEvents );
     }
     else if( type == wxEVT_CHAR_HOOK || type == wxEVT_CHAR )
     {

@@ -20,6 +20,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <kiplatform/ui.h>
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -395,7 +396,7 @@ void PCB_SELECTION_TOOL::OnIdle( wxIdleEvent& aEvent )
 {
     if( m_frame->ToolStackIsEmpty() && !m_multiple )
     {
-        wxMouseState keyboardState = wxGetMouseState();
+        wxMouseState keyboardState = KIPLATFORM::UI::GetMouseState();
 
         setModifiersState( keyboardState.ShiftDown(), keyboardState.ControlDown(), keyboardState.AltDown() );
 
@@ -1875,7 +1876,7 @@ void PCB_SELECTION_TOOL::SelectMultiple( KIGFX::PREVIEW::SELECTION_AREA& aArea, 
 
 int PCB_SELECTION_TOOL::disambiguateCursor( const TOOL_EVENT& aEvent )
 {
-    wxMouseState keyboardState = wxGetMouseState();
+    wxMouseState keyboardState = KIPLATFORM::UI::GetMouseState();
 
     setModifiersState( keyboardState.ShiftDown(), keyboardState.ControlDown(), keyboardState.AltDown() );
 

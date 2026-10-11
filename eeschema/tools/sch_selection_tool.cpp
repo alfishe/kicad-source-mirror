@@ -18,6 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <kiplatform/ui.h>
 #include <advanced_config.h>
 #include <core/typeinfo.h>
 #include <core/kicad_algo.h>
@@ -1727,7 +1728,7 @@ OPT_TOOL_EVENT SCH_SELECTION_TOOL::autostartEvent( TOOL_EVENT* aEvent, EE_GRID_H
 
 int SCH_SELECTION_TOOL::disambiguateCursor( const TOOL_EVENT& aEvent )
 {
-    wxMouseState keyboardState = wxGetMouseState();
+    wxMouseState keyboardState = KIPLATFORM::UI::GetMouseState();
 
     setModifiersState( keyboardState.ShiftDown(), keyboardState.ControlDown(), keyboardState.AltDown() );
 
@@ -1744,7 +1745,7 @@ void SCH_SELECTION_TOOL::OnIdle( wxIdleEvent& aEvent )
 {
     if( m_frame->ToolStackIsEmpty() && !m_multiple )
     {
-        wxMouseState keyboardState = wxGetMouseState();
+        wxMouseState keyboardState = KIPLATFORM::UI::GetMouseState();
 
         setModifiersState( keyboardState.ShiftDown(), keyboardState.ControlDown(), keyboardState.AltDown() );
 

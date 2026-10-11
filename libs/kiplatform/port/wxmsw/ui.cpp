@@ -174,6 +174,9 @@ bool KIPLATFORM::UI::SupportsKeyState()
 
 wxPoint KIPLATFORM::UI::GetMousePosition()
 {
+    if( const INJECTED_POINTER* injected = GetInjectedPointer() )
+        return injected->screenPosition;
+
     return wxGetMousePosition();
 }
 

@@ -415,6 +415,9 @@ static wxPoint s_warped_to;
 
 wxPoint KIPLATFORM::UI::GetMousePosition()
 {
+    if( const INJECTED_POINTER* injected = GetInjectedPointer() )
+        return injected->screenPosition;
+
     wxPoint wx_pos = wxGetMousePosition();
 
     if( wx_pos == s_warped_from )
@@ -853,6 +856,9 @@ void KIPLATFORM::UI::InfiniteDragReleaseWindow()
 
 wxPoint KIPLATFORM::UI::GetMousePosition()
 {
+    if( const INJECTED_POINTER* injected = GetInjectedPointer() )
+        return injected->screenPosition;
+
     return wxGetMousePosition();
 }
 

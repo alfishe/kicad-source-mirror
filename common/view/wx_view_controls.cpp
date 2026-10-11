@@ -235,21 +235,7 @@ void WX_VIEW_CONTROLS::onMotion( wxMouseEvent& aEvent )
     int      y = mouseRel.y;
     VECTOR2D mousePos( x, y );
 
-    // Clear keyboard cursor position flag when actual mouse motion is detected
-    // (i.e., not from cursor warping and position has changed)
-    if( !m_cursorWarped && m_settings.m_lastKeyboardCursorPositionValid )
-    {
-        VECTOR2I screenPos( x, y );
-        VECTOR2I keyboardScreenPos = m_view->ToScreen( m_settings.m_lastKeyboardCursorPosition );
-
-        // If mouse has moved to a different position than the keyboard cursor position,
-        // clear the keyboard position flag to allow mouse control
-        if( screenPos != keyboardScreenPos )
-        {
-            m_settings.m_lastKeyboardCursorPositionValid = false;
-            m_settings.m_lastKeyboardCursorPosition = { 0.0, 0.0 };
-        }
-    }
+    releaseKeyboardCursor( x, y );
 
     // Automatic focus switching between SCH and PCB windows on canvas mouse motion
     if( m_settings.m_focusFollowSchPcb )
@@ -417,12 +403,50 @@ void WX_VIEW_CONTROLS::onMotion( wxMouseEvent& aEvent )
         }
     }
 
+    followPointer( mousePos );
+    aEvent.Skip();
+}
+
+
+void WX_VIEW_CONTROLS::PointerMoved()
+{
+    const wxPoint mouseRel = m_parentPanel->ScreenToClient( KIPLATFORM::UI::GetMousePosition() );
+
+    releaseKeyboardCursor( mouseRel.x, mouseRel.y );
+
+    if( m_state != DRAG_PANNING && m_state != DRAG_ZOOMING )
+        handleCursorCapture( mouseRel.x, mouseRel.y );
+
+    followPointer( VECTOR2D( mouseRel.x, mouseRel.y ) );
+}
+
+
+void WX_VIEW_CONTROLS::releaseKeyboardCursor( int aX, int aY )
+{
+    // Clear keyboard cursor position flag when actual mouse motion is detected
+    // (i.e., not from cursor warping and position has changed)
+    if( !m_cursorWarped && m_settings.m_lastKeyboardCursorPositionValid )
+    {
+        VECTOR2I screenPos( aX, aY );
+        VECTOR2I keyboardScreenPos = m_view->ToScreen( m_settings.m_lastKeyboardCursorPosition );
+
+        // If mouse has moved to a different position than the keyboard cursor position,
+        // clear the keyboard position flag to allow mouse control
+        if( screenPos != keyboardScreenPos )
+        {
+            m_settings.m_lastKeyboardCursorPositionValid = false;
+            m_settings.m_lastKeyboardCursorPosition = { 0.0, 0.0 };
+        }
+    }
+}
+
+
+void WX_VIEW_CONTROLS::followPointer( const VECTOR2D& aMousePos )
+{
     if( m_updateCursor )        // do not update the cursor position if it was explicitly set
-        m_cursorPos = GetClampedCoords( m_view->ToWorld( mousePos ) );
+        m_cursorPos = GetClampedCoords( m_view->ToWorld( aMousePos ) );
     else
         m_updateCursor = true;
-
-    aEvent.Skip();
 }
 
 

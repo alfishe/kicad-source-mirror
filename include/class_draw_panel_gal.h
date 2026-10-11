@@ -226,6 +226,9 @@ public:
      */
     void SetEventDispatcher( TOOL_DISPATCHER* aEventDispatcher );
 
+    /// @return the dispatcher feeding the tools (injected input goes through it), or nullptr
+    TOOL_DISPATCHER* GetEventDispatcher() const { return m_eventDispatcher; }
+
     /**
      * Begin drawing if it was stopped previously.
      */

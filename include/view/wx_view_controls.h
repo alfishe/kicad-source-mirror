@@ -53,6 +53,10 @@ public:
     /// Handler functions
     void onWheel( wxMouseEvent& aEvent );
     void onMotion( wxMouseEvent& aEvent );
+
+    /// @brief The pointer moved without a toolkit event (input injected through the API): the
+    /// cursor follows it as onMotion() makes it follow a real mouse.
+    void PointerMoved();
     void onMagnify( wxMouseEvent& aEvent );
     void onButton( wxMouseEvent& aEvent );
     void onEnter( wxMouseEvent& WXUNUSED( aEvent ) );
@@ -154,6 +158,12 @@ private:
      * @param y Mouse position
      */
     void handleCursorCapture( int x, int y );
+
+    /// @brief Drops the keyboard-placed cursor once the pointer is somewhere else
+    void releaseKeyboardCursor( int aX, int aY );
+
+    /// @brief Moves the cursor to the pointer (screen position) unless it was set explicitly
+    void followPointer( const VECTOR2D& aMousePos );
 
     /**
      * Send an event to refresh mouse position.

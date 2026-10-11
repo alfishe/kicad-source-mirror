@@ -995,6 +995,7 @@ set( COMMON_SRCS
     tool/tool_action.cpp
     tool/tool_base.cpp
     tool/tool_dispatcher.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_editor_input.cpp
     tool/tool_event.cpp
     tool/tools_holder.cpp
     tool/tool_interactive.cpp
