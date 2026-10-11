@@ -419,6 +419,9 @@ def test_sch_child_input_validation( kitest: KiTestFixture, tmp_path: Path, monk
     for variable in ("WXTRACE", "KICAD_ENABLE_WXTRACE", "KICAD_FORCE_CONSOLE_TRACE"):
         monkeypatch.delenv( variable, raising=False )
 
+    if trace and not utils.traces_available():
+        pytest.skip( "kicad-cli built without wxWidgets traces" )
+
     if trace:
         monkeypatch.setenv( "WXTRACE", "KICAD_SETTINGS" )
         monkeypatch.setenv( "KICAD_ENABLE_WXTRACE", "1" )

@@ -437,7 +437,7 @@ static void printHelp( argparse::ArgumentParser& argParser )
 {
     std::stringstream ss;
     ss << argParser;
-    wxPrintf( From_UTF8( ss.str().c_str() ) );
+    wxPrintf( wxS( "%s" ), From_UTF8( ss.str().c_str() ) );
 }
 
 
@@ -612,7 +612,7 @@ int PGM_KICAD::OnPgmRun()
     {
         std::stringstream ss;
         ss << argParser;
-        wxPrintf( From_UTF8( ss.str().c_str() ) );
+        wxPrintf( wxS( "%s" ), From_UTF8( ss.str().c_str() ) );
 
         return 0;
     }

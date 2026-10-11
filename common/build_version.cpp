@@ -348,6 +348,11 @@ wxString GetVersionInfoData( const wxString& aTitle, bool aHtml, bool aBrief )
     aMsg << OFF;
 #endif
 
+#if !wxUSE_LOG_TRACE
+    // e.g. a wxWidgets package configured without its debug level: KICAD_ENABLE_WXTRACE prints nothing
+    aMsg << indent4 << "wxWidgets traces: unavailable (wxDEBUG_LEVEL=0)" << eol;
+#endif
+
 #ifndef NDEBUG
     aMsg << indent4 << "KICAD_STDLIB_DEBUG=";
 #ifdef KICAD_STDLIB_DEBUG

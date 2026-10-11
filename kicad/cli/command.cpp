@@ -49,7 +49,7 @@ void CLI::COMMAND::PrintHelp()
 {
     std::stringstream ss;
     ss << m_argParser;
-    wxPrintf( From_UTF8( ss.str().c_str() ) );
+    wxPrintf( wxS( "%s" ), From_UTF8( ss.str().c_str() ) );
 }
 
 

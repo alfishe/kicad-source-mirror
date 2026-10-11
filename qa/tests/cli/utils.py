@@ -59,6 +59,22 @@ def _get_kicad_major_version() -> int:
 
 
 _kicad_major_version = None
+_traces_available = None
+
+
+def traces_available() -> bool:
+    """False when kicad-cli was built without wxWidgets traces (wxDEBUG_LEVEL=0)."""
+    global _traces_available
+
+    if _traces_available is None:
+        try:
+            proc = subprocess.run( [kicad_cli(), 'version', '--format', 'about'],
+                                   capture_output=True, text=True, timeout=30 )
+            _traces_available = "wxWidgets traces: unavailable" not in proc.stdout
+        except Exception:
+            _traces_available = True
+
+    return _traces_available
 
 def _get_cached_kicad_major_version() -> int:
     global _kicad_major_version
