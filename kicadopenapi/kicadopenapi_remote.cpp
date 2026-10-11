@@ -772,6 +772,15 @@ public:
 
     wxTopLevelWindow* Parent() const { return m_parent; }
 
+    /// @brief Hide and destroy: detached from its parent first, else the window system shows a
+    /// hidden child window again when the parent comes to the front (macOS)
+    void Dispose()
+    {
+        KIPLATFORM::UI::DetachChildWindow( this );
+        Hide();
+        Destroy();
+    }
+
 private:
     void place()
     {
@@ -835,7 +844,7 @@ public:
         for( auto& [parent, bar] : m_bars )
         {
             if( bar )
-                bar->Destroy();
+                bar->Dispose();
         }
 
         m_bars.clear();
@@ -910,7 +919,7 @@ void UI::Update()
         if( !it->second || !it->second->Parent() )
         {
             if( it->second )
-                it->second->Destroy();
+                it->second->Dispose();
 
             it = m_bars.erase( it );
         }
