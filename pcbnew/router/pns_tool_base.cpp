@@ -92,8 +92,7 @@ void TOOL_BASE::Reset( RESET_REASON aReason )
 
     m_router = new ROUTER;
     m_router->SetInterface( m_iface );
-    m_router->ClearWorld();
-    m_router->SyncWorld();
+    m_router->SyncWorldOnUse();
 
     m_router->UpdateSizes( m_savedSizes );
 

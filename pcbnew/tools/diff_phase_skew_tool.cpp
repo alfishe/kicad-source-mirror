@@ -102,8 +102,7 @@ void DIFF_PHASE_SKEW_TOOL::Reset( const RESET_REASON aReason )
 
     m_router = new PNS::ROUTER;
     m_router->SetInterface( m_iface );
-    m_router->ClearWorld();
-    m_router->SyncWorld();
+    m_router->SyncWorldOnUse();
     m_router->UpdateSizes( m_savedSizes );
 
     PCBNEW_SETTINGS* settings = m_frame->GetPcbNewSettings();

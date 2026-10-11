@@ -187,7 +187,13 @@ public:
     static void SetInstance( ROUTER* aRouter );
 
     void ClearWorld();
+
+    /// @brief Builds the world from the board now
     void SyncWorld();
+
+    /// @brief Drops the world; it is built from the board on first use (GetWorld() or a routing
+    /// call), so editors that never route do not pay for it
+    void SyncWorldOnUse();
 
     bool RoutingInProgress() const;
     bool StartRouting( const VECTOR2I& aP, ITEM* aItem, int aLayer );
@@ -207,7 +213,11 @@ public:
     void StopRouting();
     void ClearViewDecorations();
 
-    NODE* GetWorld() const { return m_world.get(); }
+    NODE* GetWorld() const
+    {
+        ensureWorld();
+        return m_world.get();
+    }
 
     void FlipPosture();
 
@@ -297,7 +307,15 @@ private:
     BOX2I                           m_visibleViewArea;
     RouterState                     m_state;
 
+    /// @brief The single gate to a pending world (SyncWorldOnUse())
+    void ensureWorld() const
+    {
+        if( m_worldPending )
+            const_cast<ROUTER*>( this )->SyncWorld();
+    }
+
     std::unique_ptr<NODE>           m_world;
+    bool                            m_worldPending = false;
     NODE*                           m_lastNode;
 
     std::unique_ptr<PLACEMENT_ALGO> m_placer;

@@ -113,8 +113,17 @@ void ROUTER::SyncWorld()
 }
 
 
+void ROUTER::SyncWorldOnUse()
+{
+    ClearWorld();
+    m_worldPending = true;
+}
+
+
 void ROUTER::ClearWorld()
 {
+    m_worldPending = false;
+
     if( m_world )
     {
         m_world->SetRuleResolver( nullptr );
@@ -134,7 +143,7 @@ bool ROUTER::RoutingInProgress() const
 
 const ITEM_SET ROUTER::QueryHoverItems( const VECTOR2I& aP, int aSlopRadius )
 {
-    NODE*         node = m_placer ? m_placer->CurrentNode() : m_world.get();
+    NODE*         node = m_placer ? m_placer->CurrentNode() : GetWorld();
     PNS::ITEM_SET ret;
 
     wxCHECK( node, ret );
@@ -299,7 +308,7 @@ bool ROUTER::StartDragging( const VECTOR2I& aP, ITEM_SET aStartItems, int aDragM
     }
 
     m_dragger->SetMode( static_cast<PNS::DRAG_MODE>( aDragMode ) );
-    m_dragger->SetWorld( m_world.get() );
+    m_dragger->SetWorld( GetWorld() );
     m_dragger->SetLogger( m_logger );
     m_dragger->SetDebugDecorator( m_iface->GetDebugDecorator() );
 
@@ -425,18 +434,18 @@ bool ROUTER::isStartingPointRoutable( const VECTOR2I& aWhere, ITEM* aStartItem, 
         dummyStartLine.SetNet( aStartItem ? aStartItem->Net() : 0 );
         dummyStartLine.SetWidth( m_sizes.TrackWidth() );
 
-        if( m_world->CheckColliding( &dummyStartLine, ITEM::ANY_T ) )
+        if( GetWorld()->CheckColliding( &dummyStartLine, ITEM::ANY_T ) )
         {
             // If the only reason we collide is track width; it's better to allow the user to start
             // anyway and just highlight the resulting collisions, so they can change width later.
             dummyStartLine.SetWidth( m_sizes.BoardMinTrackWidth() );
 
-            if( m_world->CheckColliding( &dummyStartLine, ITEM::ANY_T ) )
+            if( GetWorld()->CheckColliding( &dummyStartLine, ITEM::ANY_T ) )
             {
                 ITEM_SET dummyStartSet( &dummyStartLine );
                 NODE::ITEM_VECTOR highlightedItems;
 
-                markViolations( m_world.get(), dummyStartSet, highlightedItems );
+                markViolations( GetWorld(), dummyStartSet, highlightedItems );
 
                 for( ITEM* item : highlightedItems )
                     m_iface->HideItem( item );
@@ -459,7 +468,7 @@ bool ROUTER::isStartingPointRoutable( const VECTOR2I& aWhere, ITEM* aStartItem, 
         wxString          errorMsg;
 
         
-        if( !dpPlacer.FindDpPrimitivePair( m_world.get(), startPoint, aStartItem, dpPair,
+        if( !dpPlacer.FindDpPrimitivePair( GetWorld(), startPoint, aStartItem, dpPair,
                                                     &errorMsg ) )
         {
             SetFailureReason( errorMsg );
@@ -960,7 +969,7 @@ void ROUTER::CommitRouting( NODE* aNode )
     }
 
     m_iface->Commit();
-    m_world->Commit( aNode );
+    GetWorld()->Commit( aNode );
 }
 
 
@@ -1039,8 +1048,12 @@ void ROUTER::StopRouting()
     m_iface->EraseView();
 
     m_state = IDLE;
-    m_world->KillChildren();
-    m_world->ClearRanks();
+
+    if( m_world )
+    {
+        m_world->KillChildren();
+        m_world->ClearRanks();
+    }
 }
 
 
@@ -1157,7 +1170,7 @@ void ROUTER::SetInterface( ROUTER_IFACE *aIface )
 
 void ROUTER::BreakSegmentOrArc( ITEM *aItem, const VECTOR2I& aP )
 {
-    NODE *node = m_world->Branch();
+    NODE *node = GetWorld()->Branch();
 
     bool ret = false;
 
