@@ -817,6 +817,17 @@ void BOARD_COMMIT::Push( const wxString& aMessage, int aCommitFlags )
     if( containsDrillMap && frame )
         frame->RefreshDrillSymbols( KIGFX::LAYERS | KIGFX::GEOMETRY | KIGFX::REPAINT );
 
+    // Without a frame no undo list takes ownership: free the images and the removed items here
+    // (with SKIP_UNDO the caller owns the removed items)
+    if( !frame && !( aCommitFlags & SKIP_UNDO ) )
+    {
+        undoList.ClearListAndDeleteItems(
+                []( EDA_ITEM* aItem )
+                {
+                    delete aItem;
+                } );
+    }
+
     clear();
 }
 
