@@ -235,4 +235,54 @@ fs::path FindExecutable(const std::string& name)
     return {};
 }
 
+ProcessMemoryInfo ProcessMemory()
+{
+#if defined(_WIN32)
+    return ProcessMemoryWindows();
+#elif defined(__APPLE__)
+    return ProcessMemoryMacOS();
+#elif defined(__linux__)
+    return ProcessMemoryLinux();
+#else
+    return {};
+#endif
+}
+
+AllocatorInfo AllocatorStats()
+{
+#if defined(_WIN32)
+    return AllocatorStatsWindows();
+#elif defined(__APPLE__)
+    return AllocatorStatsMacOS();
+#elif defined(__linux__)
+    return AllocatorStatsLinux();
+#else
+    return {};
+#endif
+}
+
+int64_t AllocatorTrim()
+{
+#if defined(_WIN32)
+    return AllocatorTrimWindows();
+#elif defined(__APPLE__)
+    return AllocatorTrimMacOS();
+#elif defined(__linux__)
+    return AllocatorTrimLinux();
+#else
+    return -1;
+#endif
+}
+
+void LowerCurrentThreadPriority()
+{
+#if defined(_WIN32)
+    LowerCurrentThreadPriorityWindows();
+#elif defined(__APPLE__)
+    LowerCurrentThreadPriorityMacOS();
+#elif defined(__linux__)
+    LowerCurrentThreadPriorityLinux();
+#endif
+}
+
 } // namespace kopenapi::platform

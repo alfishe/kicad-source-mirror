@@ -82,4 +82,43 @@ int WaitProcess(long pid, int timeoutMs);
 /// @return the full path, or empty
 std::filesystem::path FindExecutable(const std::string& name);
 
+/// @brief Memory the OS charges this process for, in bytes; -1 where the OS does not report a field
+struct ProcessMemoryInfo
+{
+    int64_t     rss = -1;             ///< resident set / working set
+    int64_t     footprint = -1;       ///< what memory pressure counts (see footprintKind)
+    int64_t     peakRss = -1;
+    int64_t     peakFootprint = -1;
+    int64_t     virtualSize = -1;
+    int64_t     compressed = -1;      ///< macOS: compressed pages of this process
+    int64_t     swapped = -1;         ///< Linux: VmSwap
+    int         threads = -1;
+    const char* footprintKind = "";   ///< phys_footprint (macOS), rss_anon+swap (Linux), private_usage (Windows)
+};
+
+/// @brief A few microseconds; safe on any thread
+ProcessMemoryInfo ProcessMemory();
+
+/// @brief The system allocator: bytes in live blocks and bytes it holds from the OS; -1 when unknown
+struct AllocatorInfo
+{
+    const char* allocator = "unknown";   ///< macos-malloc, glibc, windows-heap
+    int64_t     live = -1;
+    int64_t     mapped = -1;
+    int64_t     peakLive = -1;
+};
+
+/// @brief Takes the allocator's locks briefly (microseconds to a millisecond); safe on any thread
+AllocatorInfo AllocatorStats();
+
+/// @brief Gives memory the allocator holds but does not use back to the OS. Pauses the calling
+/// thread (macOS ~20 ms + 0.1 ms per MB released, glibc ~1 ms + 0.1 ms per MB; POC-001) and briefly
+/// blocks allocations on other threads.
+/// @return bytes released where the allocator reports it (macOS), else -1
+int64_t AllocatorTrim();
+
+/// @brief Runs the calling thread at background priority (macOS QoS utility, Linux nice 10,
+/// Windows below normal)
+void LowerCurrentThreadPriority();
+
 } // namespace kopenapi::platform

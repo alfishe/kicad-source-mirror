@@ -10,6 +10,8 @@
 #endif
 #include <winsock2.h>
 #include <windows.h>
+#include <malloc.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <iterator>
@@ -294,6 +296,114 @@ int WaitProcessWindows(long pid, int timeoutMs)
     }
     CloseHandle(process);
     return r == WAIT_OBJECT_0 ? static_cast<int>(code) : -1;
+}
+
+namespace
+{
+// HeapSummary (heapapi.h, Windows 7+), looked up at run time: older SDK / MinGW headers lack it
+struct HEAP_SUMMARY_DATA
+{
+    DWORD  cb;
+    SIZE_T cbAllocated;
+    SIZE_T cbCommitted;
+    SIZE_T cbReserved;
+    SIZE_T cbMaxReserve;
+};
+
+using HEAP_SUMMARY_FN = BOOL(WINAPI*)(HANDLE, DWORD, HEAP_SUMMARY_DATA*);
+
+HEAP_SUMMARY_FN heapSummary()
+{
+    static HEAP_SUMMARY_FN fn = reinterpret_cast<HEAP_SUMMARY_FN>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "HeapSummary")));
+    return fn;
+}
+
+std::vector<HANDLE> processHeaps()
+{
+    std::vector<HANDLE> heaps(64);
+    DWORD               count = GetProcessHeaps((DWORD) heaps.size(), heaps.data());
+
+    if (count > heaps.size())
+    {
+        heaps.resize(count);
+        count = GetProcessHeaps((DWORD) heaps.size(), heaps.data());
+    }
+
+    heaps.resize(std::min<size_t>(count, heaps.size()));
+    return heaps;
+}
+} // namespace
+
+ProcessMemoryInfo ProcessMemoryWindows()
+{
+    ProcessMemoryInfo info;
+    info.footprintKind = "private_usage";
+
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+
+    // K32 entry point: in kernel32 since Windows 7, so no psapi.lib for kicommon or the bridge
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*) &counters, sizeof(counters)))
+    {
+        info.rss = (int64_t) counters.WorkingSetSize;
+        info.peakRss = (int64_t) counters.PeakWorkingSetSize;
+        info.footprint = (int64_t) counters.PrivateUsage;
+        info.peakFootprint = (int64_t) counters.PeakPagefileUsage;
+    }
+
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+
+    if (GlobalMemoryStatusEx(&status))
+    {
+        info.virtualSize = (int64_t) (status.ullTotalVirtual - status.ullAvailVirtual);
+    }
+
+    return info;
+}
+
+AllocatorInfo AllocatorStatsWindows()
+{
+    AllocatorInfo info;
+    info.allocator = "windows-heap";
+
+    if (!heapSummary())
+    {
+        return info;
+    }
+
+    info.live = info.mapped = 0;
+
+    for (HANDLE heap : processHeaps())
+    {
+        HEAP_SUMMARY_DATA summary{};
+        summary.cb = sizeof(summary);
+
+        if (heapSummary()(heap, 0, &summary))
+        {
+            info.live += (int64_t) summary.cbAllocated;
+            info.mapped += (int64_t) summary.cbCommitted;
+        }
+    }
+
+    return info;
+}
+
+int64_t AllocatorTrimWindows()
+{
+    for (HANDLE heap : processHeaps())
+    {
+        HeapCompact(heap, 0);
+    }
+
+    _heapmin();
+    return -1;
+}
+
+void LowerCurrentThreadPriorityWindows()
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 }
 
 } // namespace kopenapi::platform

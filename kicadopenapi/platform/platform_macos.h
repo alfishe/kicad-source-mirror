@@ -3,6 +3,7 @@
 
 // macOS-specific parts of the kicadopenapi platform layer
 
+#include <cstdint>
 #include <filesystem>
 
 namespace kopenapi::platform
@@ -12,6 +13,13 @@ namespace kopenapi::platform
 std::filesystem::path TempRootMacOS();
 
 std::filesystem::path ExecutablePathMacOS();
+
+struct ProcessMemoryInfo;
+struct AllocatorInfo;
+ProcessMemoryInfo ProcessMemoryMacOS();
+AllocatorInfo AllocatorStatsMacOS();
+int64_t AllocatorTrimMacOS();
+void LowerCurrentThreadPriorityMacOS();
 
 } // namespace kopenapi::platform
 

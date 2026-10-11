@@ -1,10 +1,18 @@
 #if defined(__APPLE__)
 
 #include "platform_macos.h"
+#include "platform.h"
 
 #include <climits>
 #include <cstdint>
+#include <libproc.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
+#include <malloc/malloc.h>
+#include <pthread.h>
+#include <sys/qos.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 namespace kopenapi::platform
 {
@@ -25,6 +33,77 @@ std::filesystem::path ExecutablePathMacOS()
     std::error_code ec;
     std::filesystem::path exe = std::filesystem::canonical(buffer, ec);
     return ec ? std::filesystem::path() : exe;
+}
+
+ProcessMemoryInfo ProcessMemoryMacOS()
+{
+    ProcessMemoryInfo info;
+    info.footprintKind = "phys_footprint";
+
+    task_vm_info_data_t    vm{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &vm, &count) == KERN_SUCCESS)
+    {
+        info.rss = (int64_t) vm.resident_size;
+        info.peakRss = (int64_t) vm.resident_size_peak;
+        info.footprint = (int64_t) vm.phys_footprint;
+        info.virtualSize = (int64_t) vm.virtual_size;
+        info.compressed = (int64_t) vm.compressed;
+    }
+
+    rusage_info_v4 usage{};
+
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t*) &usage) == 0)
+    {
+        info.peakFootprint = (int64_t) usage.ri_lifetime_max_phys_footprint;
+    }
+
+    proc_taskinfo task{};
+
+    if (proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &task, sizeof(task)) == (int) sizeof(task))
+    {
+        info.threads = task.pti_threadnum;
+    }
+
+    return info;
+}
+
+AllocatorInfo AllocatorStatsMacOS()
+{
+    AllocatorInfo info;
+    info.allocator = "macos-malloc";
+
+    vm_address_t* zones = nullptr;
+    unsigned      count = 0;
+
+    if (malloc_get_all_zones(mach_task_self(), nullptr, &zones, &count) != KERN_SUCCESS)
+    {
+        return info;
+    }
+
+    info.live = info.mapped = info.peakLive = 0;
+
+    for (unsigned i = 0; i < count; ++i)
+    {
+        malloc_statistics_t stats{};
+        malloc_zone_statistics((malloc_zone_t*) zones[i], &stats);
+        info.live += (int64_t) stats.size_in_use;
+        info.mapped += (int64_t) stats.size_allocated;
+        info.peakLive += (int64_t) stats.max_size_in_use;
+    }
+
+    return info;
+}
+
+int64_t AllocatorTrimMacOS()
+{
+    return (int64_t) malloc_zone_pressure_relief(nullptr, 0);
+}
+
+void LowerCurrentThreadPriorityMacOS()
+{
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 }
 
 } // namespace kopenapi::platform

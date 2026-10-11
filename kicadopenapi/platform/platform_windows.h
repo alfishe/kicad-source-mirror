@@ -28,6 +28,13 @@ bool WritePipeWindows(std::intptr_t handle, const void* data, std::size_t size);
 void ClosePipeWindows(std::intptr_t handle);
 int WaitProcessWindows(long pid, int timeoutMs);
 
+struct ProcessMemoryInfo;
+struct AllocatorInfo;
+ProcessMemoryInfo ProcessMemoryWindows();
+AllocatorInfo AllocatorStatsWindows();
+int64_t AllocatorTrimWindows();
+void LowerCurrentThreadPriorityWindows();
+
 } // namespace kopenapi::platform
 
 #endif // _WIN32

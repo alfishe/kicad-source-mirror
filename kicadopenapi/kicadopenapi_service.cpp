@@ -4,6 +4,7 @@
 #include "recording/kicadopenapi_recorder.h"
 #include "kicadopenapi_mcp.h"
 #include "kicadopenapi_journal.h"
+#include "kicadopenapi_memory.h"
 #include "kicadopenapi_libraries.h"
 
 #include <algorithm>
@@ -614,6 +615,9 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     if( aName == "api_trace" )
         return KOPENAPI_RESULT::Ok( traceJson( aArgs ) );
 
+    if( aName == "memory_summary" )
+        return KOPENAPI_RESULT::Ok( KOPENAPI_MEMORY::Summary() );
+
     KOPENAPI_CONTEXT ctxCopy = ctx;
     KOPENAPI_HANDLER handler = method->handler;
     nlohmann::json   args = aArgs;
@@ -1022,6 +1026,8 @@ int KICAD_OPENAPI_SERVICE::DefaultPort()
 
 bool KICAD_OPENAPI_SERVICE::Start( int aPort )
 {
+    KOPENAPI_MEMORY::StartAutoTrim();
+
     if( Running() )
         return true;
 
@@ -1201,6 +1207,8 @@ bool KICAD_OPENAPI_SERVICE::InMainThreadCall()
 
 void KICAD_OPENAPI_SERVICE::Stop()
 {
+    KOPENAPI_MEMORY::StopAutoTrim();
+
     if( !m_impl->server )
         return;
 
