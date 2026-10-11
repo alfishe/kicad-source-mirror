@@ -10,6 +10,8 @@
 #include <api/headless_pcb_context.h>
 #include <api/pcb_context.h>
 #include <board.h>
+#include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
+#include <richio.h>
 #include <board_loader.h>
 #include <kiway.h>
 #include <tool/tool_manager.h>
@@ -344,7 +346,24 @@ static KOPENAPI_DOC_HISTORY history()
             return false;
 
         const wxFileName target( wxString::FromUTF8( aDir ), wxFileName( s_headless->GetCurrentFileName() ).GetFullName() );
-        return s_headless->SavePcbCopy( target.GetFullPath(), false, true );
+
+        // an internal copy read back only by restore: plain s-expressions, without the prettifying
+        // pass of a saved file (half the time of a copy of a large board, taken before every edit)
+        try
+        {
+            FILE_OUTPUTFORMATTER out( target.GetFullPath() );
+            PCB_IO_KICAD_SEXPR   io;
+            io.FormatBoardToFormatter( &out, s_headless->GetBoard() );
+
+            if( !out.Finish() )   // written to a sibling temporary file until here
+                return false;
+        }
+        catch( const IO_ERROR& )
+        {
+            return false;
+        }
+
+        return true;
     };
 
     h.restore = []( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )

@@ -34,6 +34,7 @@
 #include <view/view_overlay.h>
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <map>
 #include <set>
@@ -167,45 +168,119 @@ std::optional<PANEL_EDGE> panelEdge( FOOTPRINT* aFootprint, const std::string& a
 nlohmann::json edgeFacing( FOOTPRINT* aFootprint, const BOX2I& aEdges );
 
 
-/// @brief Placement findings over the whole board
-nlohmann::json placementReport( BOARD* aBoard )
+/// @brief Placement findings: courtyard overlaps, parts outside the board, connectors, ratsnest.
+/// @param aOnly when given, overlaps / outside / connectors only for these footprints (the ones just
+/// moved); the ratsnest figures are always for the whole board
+nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>* aOnly = nullptr )
 {
     SHAPE_POLY_SET outline;
     const bool     hasOutline = aBoard->GetBoardPolygonOutlines( outline, true ) && outline.OutlineCount() > 0;
     const BOX2I    edges = aBoard->GetBoardEdgesBoundingBox();
 
-    std::vector<FOOTPRINT*> fps( aBoard->Footprints().begin(), aBoard->Footprints().end() );
+    std::vector<FOOTPRINT*>     fps( aBoard->Footprints().begin(), aBoard->Footprints().end() );
     std::vector<SHAPE_POLY_SET> areas;
+    std::vector<BOX2I>          boxes;
+
+    areas.reserve( fps.size() );
+    boxes.reserve( fps.size() );
 
     for( FOOTPRINT* fp : fps )
+    {
         areas.push_back( courtyard( fp ) );
+        boxes.push_back( areas.back().BBox() );
+    }
+
+    auto wanted = [&]( size_t i ) { return !aOnly || aOnly->count( fps[i] ); };
+
+    // pairs whose boxes meet (only those can overlap), found by a sweep over the left edges and
+    // checked in the board's order
+    std::vector<size_t> byLeft( fps.size() );
+    std::iota( byLeft.begin(), byLeft.end(), 0 );
+    std::sort( byLeft.begin(), byLeft.end(),
+               [&]( size_t a, size_t b ) { return boxes[a].GetLeft() < boxes[b].GetLeft(); } );
+
+    std::vector<std::pair<size_t, size_t>> pairs;
+
+    for( size_t si = 0; si < byLeft.size(); ++si )
+    {
+        const size_t i = byLeft[si];
+
+        for( size_t sj = si + 1; sj < byLeft.size() && boxes[byLeft[sj]].GetLeft() <= boxes[i].GetRight(); ++sj )
+        {
+            const size_t j = byLeft[sj];
+
+            if( fps[i]->IsFlipped() != fps[j]->IsFlipped() || !boxes[i].Intersects( boxes[j] )
+                || !( wanted( i ) || wanted( j ) ) )
+            {
+                continue;
+            }
+
+            pairs.emplace_back( std::min( i, j ), std::max( i, j ) );
+        }
+    }
+
+    std::sort( pairs.begin(), pairs.end() );
 
     nlohmann::json overlaps = nlohmann::json::array();
 
-    for( size_t i = 0; i < fps.size(); ++i )
+    for( const auto& [i, j] : pairs )
     {
-        for( size_t j = i + 1; j < fps.size(); ++j )
+        SHAPE_POLY_SET both = areas[i];
+        both.BooleanIntersection( areas[j] );
+
+        if( both.OutlineCount() > 0 && areaMm2( both.Area() ) > 0.01 )
         {
-            if( fps[i]->IsFlipped() != fps[j]->IsFlipped() )
-                continue;
-
-            SHAPE_POLY_SET both = areas[i];
-            both.BooleanIntersection( areas[j] );
-
-            if( both.OutlineCount() > 0 && areaMm2( both.Area() ) > 0.01 )
-            {
-                overlaps.push_back( { { "a", str( fps[i]->GetReference() ) }, { "b", str( fps[j]->GetReference() ) },
-                                      { "area_mm2", std::round( areaMm2( both.Area() ) * 100.0 ) / 100.0 } } );
-            }
+            overlaps.push_back( { { "a", str( fps[i]->GetReference() ) }, { "b", str( fps[j]->GetReference() ) },
+                                  { "area_mm2", std::round( areaMm2( both.Area() ) * 100.0 ) / 100.0 } } );
         }
     }
+
+    // a courtyard box no outline edge (cut-outs included) enters, with its centre inside the board,
+    // lies wholly inside it: nothing to subtract
+    std::vector<SEG> outlineEdges;
+
+    for( auto it = outline.CIterateSegmentsWithHoles(); it; it++ )
+        outlineEdges.push_back( *it );
+
+    auto surelyInside = [&]( size_t i )
+    {
+        const BOX2I& box = boxes[i];
+
+        const SEG sides[4] = { SEG( box.GetOrigin(), VECTOR2I( box.GetRight(), box.GetTop() ) ),
+                               SEG( VECTOR2I( box.GetRight(), box.GetTop() ), box.GetEnd() ),
+                               SEG( box.GetEnd(), VECTOR2I( box.GetLeft(), box.GetBottom() ) ),
+                               SEG( VECTOR2I( box.GetLeft(), box.GetBottom() ), box.GetOrigin() ) };
+
+        for( const SEG& seg : outlineEdges )
+        {
+            BOX2I segBox( seg.A, VECTOR2I( 0, 0 ) );
+            segBox.Merge( seg.B );
+
+            if( !box.Intersects( segBox ) )
+                continue;
+
+            if( box.Contains( seg.A ) || box.Contains( seg.B ) )
+                return false;
+
+            for( const SEG& side : sides )
+            {
+                if( side.Intersect( seg ) )
+                    return false;
+            }
+        }
+
+        return outline.Contains( box.Centre() );
+    };
 
     nlohmann::json outside = nlohmann::json::array();
     nlohmann::json connectors = nlohmann::json::array();
 
     for( size_t i = 0; i < fps.size(); ++i )
     {
-        if( hasOutline )
+        if( !wanted( i ) )
+            continue;
+
+        if( hasOutline && !surelyInside( i ) )
         {
             SHAPE_POLY_SET out = areas[i];
             out.BooleanSubtract( outline );
@@ -628,6 +703,11 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
     if( !aArgs.contains( "moves" ) || !aArgs["moves"].is_array() || aArgs["moves"].empty() )
         return KOPENAPI_RESULT::Error( 400, "give 'moves': [{ref, x_mm, y_mm, rotation_deg?, side?}]" );
 
+    const std::string reportScope = aArgs.value( "report", std::string( "moved" ) );
+
+    if( reportScope != "moved" && reportScope != "full" && reportScope != "none" )
+        return KOPENAPI_RESULT::Error( 400, "report: moved, full or none" );
+
     // Validate everything first: all or nothing
     std::vector<std::pair<FOOTPRINT*, nlohmann::json>> plan;
 
@@ -748,7 +828,24 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
     refreshGui( aCtx, board );
     glow( aCtx, moved );
 
-    nlohmann::json report = placementReport( board );
+    // the placement check for the footprints just moved (the whole board: report full; none: skip)
+    nlohmann::json report = nlohmann::json::object();
+
+    if( reportScope == "moved" )
+    {
+        std::set<const FOOTPRINT*> movedFps;
+
+        for( auto& [fp, m] : plan )
+            movedFps.insert( fp );
+
+        report = placementReport( board, &movedFps );
+    }
+    else if( reportScope == "full" )
+    {
+        report = placementReport( board );
+    }
+
+    report["report"] = reportScope;
     nlohmann::json placed = nlohmann::json::array();
 
     for( auto& [fp, m] : plan )
@@ -943,7 +1040,8 @@ KOPENAPI_REGISTER( "pcb_footprint_move",
                    "courtyard's middle (anchor center) or a connector's panel-edge line (anchor panel_edge), "
                    "rotation_deg or facing (connectors: mating side towards left / right / up / down), side "
                    "top / bottom; locked ones need override_locks; answers where they are now and the "
-                   "placement check (overlaps, outside the board, airwire length)",
+                   "placement check of the moved footprints (overlaps, outside the board, airwire length; report: "
+                   "full for the whole board)",
                    R"json({"type":"object","required":["moves"],"properties":{
                         "moves":{"type":"array","items":{"type":"object","required":["ref"],"properties":{
                             "ref":{"type":"string"},"x_mm":{"type":"number"},"y_mm":{"type":"number"},
@@ -952,7 +1050,8 @@ KOPENAPI_REGISTER( "pcb_footprint_move",
                             "edge_offset_mm":{"type":"number","default":0,"description":"anchor panel_edge: shift along the facing direction (+ out past the edge, - recessed)"},
                             "edge":{"type":"string","enum":["left","right","top","bottom"],"description":"put the connector on that board edge facing out (facing + anchor panel_edge + the edge coordinate); give the other coordinate"},
                             "facing":{"type":"string","enum":["left","right","up","down"],"description":"connectors: turn so the mating side faces this way (panel edge from the footprint's marker or inferred from its body, see pcb_footprint_get panel_edge)"}}}},
-                        "override_locks":{"type":"boolean","default":false}}})json"_json,
+                        "override_locks":{"type":"boolean","default":false},
+                        "report":{"type":"string","enum":["moved","full","none"],"default":"moved","description":"placement check in the answer: for the footprints moved (overlaps with any part, outside the board, connector facing; ratsnest of the whole board), the whole board, or none"}}})json"_json,
                    false, h_pcb_footprint_move );
 
 KOPENAPI_REGISTER( "pcb_placement_check",
