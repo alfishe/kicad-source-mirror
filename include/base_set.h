@@ -48,7 +48,10 @@
 typedef SSIZE_T ssize_t;
 #endif
 
-class KICOMMON_API BASE_SET : public sul::dynamic_bitset<uint64_t>
+/// Two inline blocks hold every layer set (PCB_LAYER_ID_COUNT = 128) without a heap allocation
+using BASE_SET_BITS = sul::dynamic_bitset<uint64_t, sul::inline_allocator<uint64_t, 2>>;
+
+class KICOMMON_API BASE_SET : public BASE_SET_BITS
 {
 public:
     class KICOMMON_API iterator
@@ -118,7 +121,7 @@ public:
     const_iterator begin() const { return const_iterator(this, 0); }
     const_iterator end() const { return const_iterator(this, size()); }
 
-    BASE_SET( size_t size = 64 ) : sul::dynamic_bitset<uint64_t>( size ) {}
+    BASE_SET( size_t size = 64 ) : BASE_SET_BITS( size ) {}
 
     // Overloads for set, reset, and flip operations
 
@@ -126,9 +129,9 @@ public:
     BASE_SET& set(size_t pos)
     {
         if( pos >= size() )
-            sul::dynamic_bitset<uint64_t>::resize( pos + 1 );
+            BASE_SET_BITS::resize( pos + 1 );
 
-        sul::dynamic_bitset<uint64_t>::set(pos);
+        BASE_SET_BITS::set(pos);
         return *this;
     }
 
@@ -136,16 +139,16 @@ public:
     BASE_SET& set(size_t pos, bool value)
     {
         if( pos >= size() )
-            sul::dynamic_bitset<uint64_t>::resize( pos + 1 );
+            BASE_SET_BITS::resize( pos + 1 );
 
-        sul::dynamic_bitset<uint64_t>::set(pos, value);
+        BASE_SET_BITS::set(pos, value);
         return *this;
     }
 
     // Set all bits to 1
     BASE_SET& set()
     {
-        sul::dynamic_bitset<uint64_t>::set();
+        BASE_SET_BITS::set();
         return *this;
     }
 
@@ -153,16 +156,16 @@ public:
     BASE_SET& reset(size_t pos)
     {
         if( pos >= size() )
-            sul::dynamic_bitset<uint64_t>::resize( pos + 1 );
+            BASE_SET_BITS::resize( pos + 1 );
 
-        sul::dynamic_bitset<uint64_t>::reset(pos);
+        BASE_SET_BITS::reset(pos);
         return *this;
     }
 
     // Reset (clear) all bits
     BASE_SET& reset()
     {
-        sul::dynamic_bitset<uint64_t>::reset();
+        BASE_SET_BITS::reset();
         return *this;
     }
 
@@ -170,16 +173,16 @@ public:
     BASE_SET& flip(size_t pos)
     {
         if( pos >= size() )
-            sul::dynamic_bitset<uint64_t>::resize( pos + 1 );
+            BASE_SET_BITS::resize( pos + 1 );
 
-        sul::dynamic_bitset<uint64_t>::flip(pos);
+        BASE_SET_BITS::flip(pos);
         return *this;
     }
 
     // Flip all bits
     BASE_SET& flip()
     {
-        sul::dynamic_bitset<uint64_t>::flip();
+        BASE_SET_BITS::flip();
         return *this;
     }
 
@@ -234,18 +237,18 @@ public:
 
         if( my_size == other_size )
         {
-            sul::dynamic_bitset<uint64_t>::operator&=(other);
+            BASE_SET_BITS::operator&=(other);
         }
         else if( my_size < other_size )
         {
-            sul::dynamic_bitset<uint64_t>::resize( other_size );
-            sul::dynamic_bitset<uint64_t>::operator&=( other );
+            BASE_SET_BITS::resize( other_size );
+            BASE_SET_BITS::operator&=( other );
         }
         else
         {
             BASE_SET tmp( other );
             tmp.resize( my_size );
-            sul::dynamic_bitset<uint64_t>::operator&=( tmp );
+            BASE_SET_BITS::operator&=( tmp );
         }
 
         return *this;
@@ -259,18 +262,18 @@ public:
 
         if( my_size == other_size )
         {
-            sul::dynamic_bitset<uint64_t>::operator|=(other);
+            BASE_SET_BITS::operator|=(other);
         }
         else if( my_size < other_size )
         {
-            sul::dynamic_bitset<uint64_t>::resize( other_size );
-            sul::dynamic_bitset<uint64_t>::operator|=( other );
+            BASE_SET_BITS::resize( other_size );
+            BASE_SET_BITS::operator|=( other );
         }
         else
         {
             BASE_SET tmp( other );
             tmp.resize( my_size );
-            sul::dynamic_bitset<uint64_t>::operator|=( tmp );
+            BASE_SET_BITS::operator|=( tmp );
         }
 
         return *this;
@@ -284,18 +287,18 @@ public:
 
         if( my_size == other_size )
         {
-            sul::dynamic_bitset<uint64_t>::operator^=(other);
+            BASE_SET_BITS::operator^=(other);
         }
         else if( my_size < other_size )
         {
-            sul::dynamic_bitset<uint64_t>::resize( other_size );
-            sul::dynamic_bitset<uint64_t>::operator^=( other );
+            BASE_SET_BITS::resize( other_size );
+            BASE_SET_BITS::operator^=( other );
         }
         else
         {
             BASE_SET tmp( other );
             tmp.resize( my_size );
-            sul::dynamic_bitset<uint64_t>::operator^=( tmp );
+            BASE_SET_BITS::operator^=( tmp );
         }
 
         return *this;

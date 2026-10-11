@@ -55,6 +55,8 @@
 #include <type_traits>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 // define DYNAMIC_BITSET_CAN_USE_LIBPOPCNT
 #if !defined(DYNAMIC_BITSET_NO_LIBPOPCNT)
 // https://github.com/kimwalisch/libpopcnt
@@ -166,6 +168,32 @@ namespace sul
      *
      * @since      1.0.0
      */
+    /**
+     * @brief      Allocator marker: a dynamic_bitset with this allocator keeps up to @p N blocks
+     *             inline (no heap allocation) and allocates with std::allocator beyond that.
+     */
+    template<typename Block, size_t N>
+    struct inline_allocator : std::allocator<Block>
+    {
+        inline_allocator() noexcept = default;
+        inline_allocator(const std::allocator<Block>&) noexcept {}
+    };
+
+    namespace detail
+    {
+        template<typename Block, typename Allocator>
+        struct block_storage
+        {
+            using type = std::vector<Block, Allocator>;
+        };
+
+        template<typename Block, size_t N>
+        struct block_storage<Block, inline_allocator<Block, N>>
+        {
+            using type = boost::container::small_vector<Block, N, std::allocator<Block>>;
+        };
+    } // namespace detail
+
     template<typename Block = unsigned long long, typename Allocator = std::allocator<Block>>
     class dynamic_bitset
     {
@@ -1628,7 +1656,7 @@ namespace sul
         {
         };
 
-        std::vector<Block, Allocator> m_blocks;
+        typename detail::block_storage<Block, Allocator>::type m_blocks;
         size_type m_bits_number;
 
         static constexpr block_type zero_block = block_type(0);
