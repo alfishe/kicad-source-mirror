@@ -754,12 +754,18 @@ public:
         m_panel->Layout();
         m_panel->GetSizer()->Fit( this );
         place();
-        wxFrame::Show( true );
 
-        // A child window moves with its parent by the window system itself (macOS): the
-        // parent's move events arrive throttled during a drag, so following them lags
-        if( m_parent )
-            KIPLATFORM::UI::AttachChildWindow( this, m_parent.get() );
+        // Only when hidden: showing a shown window brings it to the front (macOS orders it
+        // above every window), the bar must stay just above its own window
+        if( !IsShown() )
+        {
+            wxFrame::Show( true );
+
+            // A child window moves with its parent by the window system itself (macOS): the
+            // parent's move events arrive throttled during a drag, so following them lags
+            if( m_parent )
+                KIPLATFORM::UI::AttachChildWindow( this, m_parent.get() );
+        }
 
         Refresh();
     }
