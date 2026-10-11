@@ -17,6 +17,7 @@
 #include <kiway.h>
 #include <kiway_player.h>
 #include <project.h>
+#include <widgets/wx_infobar.h>
 
 #include <wx/app.h>
 #include <wx/dialog.h>
@@ -122,6 +123,11 @@ void describeFrame( EDA_BASE_FRAME* aFrame, FRAME_T aType, KIWAY* aKiway, nlohma
 
     const wxString project = aKiway->Prj().GetProjectFullName();
     aOut["project"] = project.IsEmpty() ? nlohmann::json() : nlohmann::json( str( project ) );
+
+    // the editor's notice bar (e.g. "created by an older version", load warnings): null when hidden
+    WX_INFOBAR* bar = aFrame->GetInfoBar();
+    aOut["infobar"] = bar && bar->IsShown() ? nlohmann::json( { { "message", str( bar->GetMessageText() ) } } )
+                                            : nlohmann::json();
 }
 
 
@@ -203,7 +209,8 @@ static KOPENAPI_RESULT h_window_capture( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 KOPENAPI_REGISTER( "window_list",
                    "List the windows of this KiCad process and what each one is: app (project_manager, "
                    "schematic_editor, board_editor, 3d_viewer, symbol_editor, footprint_editor, ..., dialog), "
-                   "the document loaded (the 3D viewer: its board, shows_window), unsaved changes, project, a "
+                   "the document loaded (the 3D viewer: its board, shows_window), unsaved changes, project, the "
+                   "editor's notice bar (infobar: message, e.g. load warnings; null when hidden), a "
                    "dialog's parent; id, title, class, shown / active / minimized, position and size; GUI only",
                    R"json({"type":"object","properties":{
                         "include_hidden":{"type":"boolean","default":false}}})json"_json,

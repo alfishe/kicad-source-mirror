@@ -625,11 +625,13 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
             // Update all symbol library links for all sheets.
             schematic.UpdateSymbolLinks( &loadReporter );
 
-            m_infoBar->RemoveAllButtons();
-            m_infoBar->AddCloseButton();
-            m_infoBar->ShowMessage( _( "This file was created by an older version of KiCad. "
-                                       "It will be converted to the new format when saved." ),
-                                    wxICON_WARNING, WX_INFOBAR::MESSAGE_TYPE::OUTDATED_SAVE );
+            m_infoBar->ShowMessageAfterLoad( _( "This file was created by an older version of KiCad. "
+                                                   "It will be converted to the new format when saved." ),
+                                                wxICON_WARNING, WX_INFOBAR::MESSAGE_TYPE::OUTDATED_SAVE,
+                                                [this, file = Schematic().GetFileName()]()
+                                                {
+                                                    return Schematic().GetFileName() == file;
+                                                } );
 
             // Legacy schematic can have duplicate time stamps so fix that before converting
             // to the s-expression format.
@@ -651,11 +653,13 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
 
             if( first_screen && first_screen->GetFileFormatVersionAtLoad() < SEXPR_SCHEMATIC_FILE_VERSION )
             {
-                m_infoBar->RemoveAllButtons();
-                m_infoBar->AddCloseButton();
-                m_infoBar->ShowMessage( _( "This file was created by an older version of KiCad. "
-                                           "It will be converted to the new format when saved." ),
-                                        wxICON_WARNING, WX_INFOBAR::MESSAGE_TYPE::OUTDATED_SAVE );
+                m_infoBar->ShowMessageAfterLoad( _( "This file was created by an older version of KiCad. "
+                                                       "It will be converted to the new format when saved." ),
+                                                    wxICON_WARNING, WX_INFOBAR::MESSAGE_TYPE::OUTDATED_SAVE,
+                                                    [this, file = Schematic().GetFileName()]()
+                                                    {
+                                                        return Schematic().GetFileName() == file;
+                                                    } );
             }
 
             for( SCH_SCREEN* screen = schematic.GetFirst(); screen; screen = schematic.GetNext() )

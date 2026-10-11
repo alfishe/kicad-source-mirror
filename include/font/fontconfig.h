@@ -27,6 +27,7 @@
 #include <wx/string.h>
 #include <vector>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <font/fontinfo.h>
 
@@ -92,6 +93,7 @@ public:
 private:
     std::map<std::string, FONTINFO> m_fontInfoCache;
     wxString                        m_fontCacheLastLang;
+    std::set<wxString>              m_appFontFiles;   ///< embedded font files given to fontconfig
     static REPORTER*                s_reporter;
 
     /**

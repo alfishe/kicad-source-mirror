@@ -393,8 +393,20 @@ void FONTCONFIG::ListFonts( std::vector<std::string>& aFonts, const std::string&
     if( !g_fcInitSuccess )
         return;
 
+    // A forced refresh with embedded fonts is needed only when one of them is new to fontconfig
+    // (every sheet of a schematic passes the same files)
+    bool newEmbedded = false;
+
+    if( aEmbeddedFiles )
+    {
+        for( const wxString& file : *aEmbeddedFiles )
+            newEmbedded |= m_appFontFiles.insert( file ).second;
+    }
+
+    const bool forced = aForce && ( !aEmbeddedFiles || newEmbedded );
+
     // be sure to cache bust if the language changed
-    if( m_fontInfoCache.empty() || m_fontCacheLastLang != aDesiredLang || aForce )
+    if( m_fontInfoCache.empty() || m_fontCacheLastLang != aDesiredLang || forced )
     {
         FcConfig* config = FcConfigGetCurrent();
 

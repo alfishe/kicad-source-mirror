@@ -876,11 +876,13 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
                 && loadedBoard->GetFileFormatVersionAtLoad() < SEXPR_BOARD_FILE_VERSION
                 && loadedBoard->GetGenerator().Lower() != wxT( "gerbview" ) ) )
         {
-            m_infoBar->RemoveAllButtons();
-            m_infoBar->AddCloseButton();
-            m_infoBar->ShowMessage( _( "This file was created by an older version of KiCad. "
-                                       "It will be converted to the new format when saved." ),
-                                    wxICON_WARNING, WX_INFOBAR::MESSAGE_TYPE::OUTDATED_SAVE );
+            m_infoBar->ShowMessageAfterLoad( _( "This file was created by an older version of KiCad. "
+                                                "It will be converted to the new format when saved." ),
+                                             wxICON_WARNING, WX_INFOBAR::MESSAGE_TYPE::OUTDATED_SAVE,
+                                             [this, file = GetBoard()->GetFileName()]()
+                                             {
+                                                 return GetBoard() && GetBoard()->GetFileName() == file;
+                                             } );
         }
 
         // extract a project fp library and re-link board FPIDs so update-from-schematic works

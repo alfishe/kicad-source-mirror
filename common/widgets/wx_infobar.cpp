@@ -178,6 +178,22 @@ void WX_INFOBAR::ShowMessage( const wxString& aMessage, int aFlags )
 }
 
 
+void WX_INFOBAR::ShowMessageAfterLoad( const wxString& aMessage, int aFlags, MESSAGE_TYPE aType,
+                                       std::function<bool()> aStillValid )
+{
+    CallAfter(
+            [this, aMessage, aFlags, aType, aStillValid]()
+            {
+                if( aStillValid && !aStillValid() )
+                    return;
+
+                RemoveAllButtons();
+                AddCloseButton();
+                ShowMessage( aMessage, aFlags, aType );
+            } );
+}
+
+
 void WX_INFOBAR::ShowMessage( const wxString& aMessage, int aFlags, MESSAGE_TYPE aType )
 {
     // Don't do anything if we requested the UI update

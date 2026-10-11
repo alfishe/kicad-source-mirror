@@ -95,6 +95,9 @@ public:
 
     MESSAGE_TYPE GetMessageType() const { return m_type; }
 
+    /// @brief The message shown (without wrapping); empty when none was shown
+    const wxString& GetMessageText() const { return m_message; }
+
     /**
      * Set the time period to show the infobar.
      *
@@ -185,6 +188,12 @@ public:
      * @param aType is the type of message being displayed
      */
     void ShowMessage( const wxString& aMessage, int aFlags, MESSAGE_TYPE aType );
+
+    /// @brief Show a message with a close button once the current event (a document load) is
+    /// done: the slide-in effect runs a nested event loop that would otherwise hold up the load.
+    /// @param aStillValid tested before showing; false drops the message (the document is gone).
+    void ShowMessageAfterLoad( const wxString& aMessage, int aFlags, MESSAGE_TYPE aType,
+                               std::function<bool()> aStillValid );
 
     /**
      * Dismisses the infobar and updates the containing layout and AUI manager
