@@ -39,6 +39,7 @@ struct TARGET
     TOOL_DISPATCHER*         dispatcher = nullptr;
     KIGFX::WX_VIEW_CONTROLS* controls = nullptr;
     const EDA_IU_SCALE*      scale = nullptr;
+    const KOPENAPI_EDITOR_HOST* host = nullptr;
 };
 
 
@@ -49,7 +50,8 @@ int g_heldButtons = 0;
 VECTOR2D g_pointerMm;
 
 
-std::string checkTarget( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE& aScale, TARGET& aTarget )
+std::string checkTarget( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE& aScale, const KOPENAPI_EDITOR_HOST& aHost,
+                         TARGET& aTarget )
 {
     if( !aFrame || !aFrame->IsShown() )
         return "no editor window open";
@@ -57,6 +59,7 @@ std::string checkTarget( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE& aScale, TAR
     aTarget.frame = aFrame;
     aTarget.canvas = aFrame->GetCanvas();
     aTarget.scale = &aScale;
+    aTarget.host = &aHost;
 
     if( !aTarget.canvas || !aFrame->GetToolManager() )
         return "the editor has no canvas";
@@ -81,14 +84,35 @@ void pump()
 }
 
 
-/// @return the client (canvas) position of a document point in mm, or an error
-std::string toClient( const TARGET& aTarget, const nlohmann::json& aPoint, wxPoint& aClient )
+/// @return the document point of a step value: [x, y] mm, or an item (its centre), or an error
+std::string pointMm( const TARGET& aTarget, const nlohmann::json& aValue, VECTOR2D& aMm )
 {
-    if( !aPoint.is_array() || aPoint.size() != 2 || !aPoint[0].is_number() || !aPoint[1].is_number() )
-        return "a point is [x, y] in mm";
+    if( aValue.is_array() && aValue.size() == 2 && aValue[0].is_number() && aValue[1].is_number() )
+    {
+        aMm = VECTOR2D( aValue[0].get<double>(), aValue[1].get<double>() );
+        return {};
+    }
 
-    const VECTOR2D world( aTarget.scale->mmToIU( aPoint[0].get<double>() ),
-                          aTarget.scale->mmToIU( aPoint[1].get<double>() ) );
+    if( aValue.is_string() && aTarget.host->resolve )
+    {
+        if( std::optional<BOX2I> box = aTarget.host->resolve( aValue.get<std::string>() ) )
+        {
+            const VECTOR2I c = box->Centre();
+            aMm = VECTOR2D( aTarget.scale->IUTomm( c.x ), aTarget.scale->IUTomm( c.y ) );
+            return {};
+        }
+
+        return "no item '" + aValue.get<std::string>() + "' (a reference, REF.NUMBER pad / pin, or a uuid)";
+    }
+
+    return "a point is [x, y] in mm or an item reference";
+}
+
+
+/// @return the client (canvas) position of a document point in mm, or an error
+std::string toClient( const TARGET& aTarget, const VECTOR2D& aMm, wxPoint& aClient )
+{
+    const VECTOR2D world( aTarget.scale->mmToIU( aMm.x ), aTarget.scale->mmToIU( aMm.y ) );
     const VECTOR2D screen = aTarget.canvas->GetView()->ToScreen( world );
     const wxSize   size = aTarget.canvas->GetClientSize();
 
@@ -97,7 +121,7 @@ std::string toClient( const TARGET& aTarget, const nlohmann::json& aPoint, wxPoi
     if( aClient.x < 0 || aClient.y < 0 || aClient.x >= size.x || aClient.y >= size.y )
     {
         const BOX2D view = aTarget.canvas->GetView()->GetViewport();
-        return "point (" + std::to_string( aPoint[0].get<double>() ) + ", " + std::to_string( aPoint[1].get<double>() )
+        return "point (" + std::to_string( aMm.x ) + ", " + std::to_string( aMm.y )
                + ") mm is outside the visible canvas (" + std::to_string( aTarget.scale->IUTomm( view.GetLeft() ) )
                + ".." + std::to_string( aTarget.scale->IUTomm( view.GetRight() ) ) + ", "
                + std::to_string( aTarget.scale->IUTomm( view.GetTop() ) ) + ".."
@@ -213,7 +237,7 @@ void releasePointerIfIdle()
 }
 
 
-nlohmann::json state( const TARGET& aTarget, const KOPENAPI_TOOL_STATE& aState )
+nlohmann::json state( const TARGET& aTarget )
 {
     nlohmann::json out = { { "tool", aTarget.frame->ToolStackIsEmpty() ? nlohmann::json()
                                                                        : nlohmann::json( aTarget.frame->CurrentToolName() ) },
@@ -226,10 +250,69 @@ nlohmann::json state( const TARGET& aTarget, const KOPENAPI_TOOL_STATE& aState )
             out["held"].push_back( name );
     }
 
-    if( aState )
-        aState( out );
+    if( aTarget.host->state )
+        aTarget.host->state( out );
 
     return out;
+}
+
+
+/// Moves the pointer to a document point: at once, or gliding there over aMs (eased, ~30 frames a
+/// second), with the held buttons; every position goes through the tools as a real move does
+std::string pointerTo( const TARGET& aTarget, const VECTOR2D& aMm, int aModifiers, int aMs )
+{
+    const VECTOR2D from = g_pointerMm;
+    const int      frames = aMs > 0 ? std::max( 2, aMs / 33 ) : 1;
+
+    for( int i = 1; i <= frames; ++i )
+    {
+        const double   t = double( i ) / frames;
+        const double   eased = t * t * ( 3 - 2 * t );
+        const VECTOR2D at = frames == 1 ? aMm : from + ( aMm - from ) * eased;
+        wxPoint        client;
+
+        if( std::string bad = toClient( aTarget, at, client ); !bad.empty() )
+            return bad;
+
+        g_pointerMm = at;
+        injectPointer( aTarget, client, aModifiers );
+        aTarget.controls->PointerMoved();
+        dispatch( aTarget, INPUT::KIND::POINTER, 0, aModifiers );
+        KopenapiAnnotatePointer( aTarget.frame, VECTOR2D( aTarget.scale->mmToIU( at.x ), aTarget.scale->mmToIU( at.y ) ),
+                                 KOPENAPI_POINTER_EVENT::MOVE );
+
+        if( frames > 1 )
+        {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds( aMs / frames );
+
+            while( std::chrono::steady_clock::now() < until )
+            {
+                pump();
+                std::this_thread::sleep_for( std::chrono::milliseconds( 4 ) );
+            }
+        }
+    }
+
+    return {};
+}
+
+
+/// A button change where the pointer is
+void button( const TARGET& aTarget, INPUT::KIND aKind, int aButton, int aModifiers, KOPENAPI_POINTER_EVENT aShown )
+{
+    wxPoint client;
+    toClient( aTarget, g_pointerMm, client );
+
+    if( aKind == INPUT::KIND::BUTTON_DOWN || aKind == INPUT::KIND::BUTTON_DCLICK )
+        g_heldButtons |= aButton;
+    else if( aKind == INPUT::KIND::BUTTON_UP )
+        g_heldButtons &= ~aButton;
+
+    injectPointer( aTarget, client, aModifiers );
+    dispatch( aTarget, aKind, aButton, aModifiers );
+    KopenapiAnnotatePointer( aTarget.frame,
+                             VECTOR2D( aTarget.scale->mmToIU( g_pointerMm.x ), aTarget.scale->mmToIU( g_pointerMm.y ) ),
+                             aShown );
 }
 
 
@@ -238,67 +321,93 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
 {
     std::string error;
     const int   mods = parseModifiers( aStep, error );
+    const int   ms = std::clamp( aStep.value( "ms", 0 ), 0, 20000 );
 
     if( !error.empty() )
         return error;
+
+    // intents: what to do with which item, the helper finds how
+    if( aStep.contains( "select" ) || aStep.contains( "drag" ) )
+    {
+        const bool        drag = aStep.contains( "drag" );
+        const std::string ref = aStep.value( drag ? "drag" : "select", std::string() );
+        VECTOR2D          grab;
+
+        if( std::string bad = pointMm( aTarget, ref, grab ); !bad.empty() )
+            return bad;
+
+        if( !aTarget.host->select || !aTarget.host->select( ref ) )
+            return "'" + ref + "' cannot be selected in this editor";
+
+        pump();
+
+        if( std::string bad = pointerTo( aTarget, grab, mods, drag ? ms / 3 : ms ); !bad.empty() )
+            return bad;
+
+        if( !drag )
+            return {};
+
+        VECTOR2D to;
+
+        if( aStep.contains( "by" ) )
+        {
+            const nlohmann::json& by = aStep["by"];
+
+            if( !by.is_array() || by.size() != 2 )
+                return "by is [dx, dy] mm";
+
+            to = grab + VECTOR2D( by[0].get<double>(), by[1].get<double>() );
+        }
+        else if( std::string bad = pointMm( aTarget, aStep.value( "to", nlohmann::json() ), to ); !bad.empty() )
+        {
+            return "drag needs to: [x, y] mm (or an item) or by: [dx, dy] mm";
+        }
+
+        // the selection is dragged from inside it (KiCad's "drag selected items"), so an item lying
+        // on top of the part cannot take the drag
+        const int b = parseButton( aStep, error );
+        button( aTarget, INPUT::KIND::BUTTON_DOWN, b, mods, KOPENAPI_POINTER_EVENT::DOWN );
+
+        if( std::string bad = pointerTo( aTarget, to, mods, std::max( ms, 1 ) ); !bad.empty() )
+        {
+            button( aTarget, INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
+            return bad;
+        }
+
+        button( aTarget, INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
+        return {};
+    }
 
     for( const char* verb : { "move", "click", "dclick", "down", "up" } )
     {
         if( !aStep.contains( verb ) )
             continue;
 
-        wxPoint client;
+        VECTOR2D at;
 
-        if( std::string bad = toClient( aTarget, aStep[verb], client ); !bad.empty() )
+        if( std::string bad = pointMm( aTarget, aStep[verb], at ); !bad.empty() )
             return bad;
 
-        const int button = std::string( verb ) == "move" ? 0 : parseButton( aStep, error );
+        const std::string v = verb;
+        const int         b = v == "move" ? 0 : parseButton( aStep, error );
 
         if( !error.empty() )
             return error;
 
-        g_pointerMm = VECTOR2D( aStep[verb][0].get<double>(), aStep[verb][1].get<double>() );
-
-        const VECTOR2D world( aTarget.scale->mmToIU( g_pointerMm.x ), aTarget.scale->mmToIU( g_pointerMm.y ) );
-        auto           show = [&]( KOPENAPI_POINTER_EVENT aEvent )
-        {
-            KopenapiAnnotatePointer( aTarget.frame, world, aEvent );
-        };
-
         // the pointer arrives first, as a real one does before its button changes
-        injectPointer( aTarget, client, mods );
-        aTarget.controls->PointerMoved();
-        dispatch( aTarget, INPUT::KIND::POINTER, 0, mods );
-        show( KOPENAPI_POINTER_EVENT::MOVE );
-
-        const std::string v = verb;
+        if( std::string bad = pointerTo( aTarget, at, mods, ms ); !bad.empty() )
+            return bad;
 
         if( v == "down" || v == "click" || v == "dclick" )
-        {
-            g_heldButtons |= button;
-            injectPointer( aTarget, client, mods );
-            dispatch( aTarget, INPUT::KIND::BUTTON_DOWN, button, mods );
-            show( KOPENAPI_POINTER_EVENT::DOWN );
-        }
+            button( aTarget, INPUT::KIND::BUTTON_DOWN, b, mods, KOPENAPI_POINTER_EVENT::DOWN );
 
         if( v == "up" || v == "click" || v == "dclick" )
-        {
-            g_heldButtons &= ~button;
-            injectPointer( aTarget, client, mods );
-            dispatch( aTarget, INPUT::KIND::BUTTON_UP, button, mods );
-            show( KOPENAPI_POINTER_EVENT::UP );
-        }
+            button( aTarget, INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
 
         if( v == "dclick" )   // the toolkit's order: down, up, double click (held), up
         {
-            g_heldButtons |= button;
-            injectPointer( aTarget, client, mods );
-            dispatch( aTarget, INPUT::KIND::BUTTON_DCLICK, button, mods );
-            show( KOPENAPI_POINTER_EVENT::DCLICK );
-            g_heldButtons &= ~button;
-            injectPointer( aTarget, client, mods );
-            dispatch( aTarget, INPUT::KIND::BUTTON_UP, button, mods );
-            show( KOPENAPI_POINTER_EVENT::UP );
+            button( aTarget, INPUT::KIND::BUTTON_DCLICK, b, mods, KOPENAPI_POINTER_EVENT::DCLICK );
+            button( aTarget, INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
         }
 
         return {};
@@ -345,17 +454,17 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
         return {};
     }
 
-    return "a step is one of move, click, dclick, down, up, key, wait_ms";
+    return "a step is one of move, click, dclick, down, up, select, drag, key, wait_ms";
 }
 } // namespace
 
 
 KOPENAPI_RESULT KopenapiEditorInput( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE& aScale,
-                                     const nlohmann::json& aArgs, const KOPENAPI_TOOL_STATE& aState )
+                                     const nlohmann::json& aArgs, const KOPENAPI_EDITOR_HOST& aHost )
 {
     TARGET target;
 
-    if( std::string bad = checkTarget( aFrame, aScale, target ); !bad.empty() )
+    if( std::string bad = checkTarget( aFrame, aScale, aHost, target ); !bad.empty() )
         return KOPENAPI_RESULT::Error( 409, bad );
 
     const nlohmann::json steps = aArgs.value( "steps", nlohmann::json::array() );
@@ -389,18 +498,18 @@ KOPENAPI_RESULT KopenapiEditorInput( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE&
 
     releasePointerIfIdle();
 
-    nlohmann::json out = state( target, aState );
+    nlohmann::json out = state( target );
     out["steps"] = done;
     return KOPENAPI_RESULT::Ok( out );
 }
 
 
 KOPENAPI_RESULT KopenapiEditorAction( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE& aScale,
-                                      const nlohmann::json& aArgs, const KOPENAPI_TOOL_STATE& aState )
+                                      const nlohmann::json& aArgs, const KOPENAPI_EDITOR_HOST& aHost )
 {
     TARGET target;
 
-    if( std::string bad = checkTarget( aFrame, aScale, target ); !bad.empty() )
+    if( std::string bad = checkTarget( aFrame, aScale, aHost, target ); !bad.empty() )
         return KOPENAPI_RESULT::Error( 409, bad );
 
     ACTION_MANAGER* actions = aFrame->GetToolManager()->GetActionManager();
@@ -437,23 +546,24 @@ KOPENAPI_RESULT KopenapiEditorAction( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE
 
     if( aArgs.contains( "at" ) )
     {
-        if( std::string bad = runStep( target, { { "move", aArgs["at"] } } ); !bad.empty() )
+        VECTOR2D at;
+        std::string bad = pointMm( target, aArgs["at"], at );
+
+        if( bad.empty() )
+            bad = pointerTo( target, at, 0, 0 );
+
+        if( !bad.empty() )
         {
             releasePointerIfIdle();
             return KOPENAPI_RESULT::Error( 400, bad );
         }
-
-        // the action reads the pointer where it was put
-        wxPoint client;
-        toClient( target, aArgs["at"], client );
-        injectPointer( target, client, 0 );
     }
 
     const bool ran = aFrame->GetToolManager()->RunAction( *action );
     pump();
     releasePointerIfIdle();
 
-    nlohmann::json out = state( target, aState );
+    nlohmann::json out = state( target );
     out["ran"] = ran;
     return KOPENAPI_RESULT::Ok( out );
 }
@@ -463,11 +573,16 @@ const nlohmann::json& KopenapiEditorInputSchema()
 {
     static const nlohmann::json schema = R"json({"type":"object","properties":{
         "steps":{"type":"array","items":{"type":"object","properties":{
-            "move":{"type":"array","items":{"type":"number"},"description":"[x, y] mm: pointer moves there"},
-            "click":{"type":"array","items":{"type":"number"},"description":"[x, y] mm: press and release"},
-            "dclick":{"type":"array","items":{"type":"number"},"description":"[x, y] mm: double click"},
-            "down":{"type":"array","items":{"type":"number"},"description":"[x, y] mm: press (a drag: down, moves, up)"},
-            "up":{"type":"array","items":{"type":"number"},"description":"[x, y] mm: release"},
+            "move":{"description":"[x, y] mm or an item (reference, REF.NUMBER pad / pin, uuid): the pointer moves there"},
+            "click":{"description":"[x, y] mm or an item: press and release there"},
+            "dclick":{"description":"[x, y] mm or an item: double click"},
+            "down":{"description":"[x, y] mm or an item: press (a drag: down, moves, up)"},
+            "up":{"description":"[x, y] mm or an item: release"},
+            "select":{"type":"string","description":"intent: select exactly this item (even under a track or another item), pointer to it"},
+            "drag":{"type":"string","description":"intent: select this item and drag it (to / by); items on top of it cannot take the drag"},
+            "to":{"description":"drag target: [x, y] mm or an item"},
+            "by":{"type":"array","items":{"type":"number"},"description":"drag offset [dx, dy] mm"},
+            "ms":{"type":"integer","description":"glide the pointer there over this long (eased; visible in recordings)"},
             "button":{"type":"string","enum":["left","right","middle"],"default":"left"},
             "key":{"type":"string","description":"one character (hotkey letters as typed) or Escape, Enter, Tab, Space, Delete, Backspace, Insert, Home, End, PageUp, PageDown, Up, Down, Left, Right, F1..F12"},
             "mods":{"type":"array","items":{"type":"string","enum":["shift","ctrl","cmd","alt"]}},

@@ -232,7 +232,7 @@ void LAYER::drawLabel( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const VECTOR2D
     aOverlay.SetLineWidth( glyph * 0.16 );
     aOverlay.SetGlyphSize( VECTOR2I( KiROUND( glyph ), KiROUND( glyph ) ) );
     aOverlay.SetTextJustify( GR_TEXT_H_ALIGN_LEFT, GR_TEXT_V_ALIGN_CENTER );
-    aOverlay.BitmapText( aText, VECTOR2I( KiROUND( aAt.x + 8 * aPx ), KiROUND( aAt.y ) ), ANGLE_0 );
+    aOverlay.StrokeText( aText, VECTOR2I( KiROUND( aAt.x + 8 * aPx ), KiROUND( aAt.y ) ), ANGLE_0 );
 
     aOverlay.SetIsFill( true );
     aOverlay.SetLineWidth( 2 * aPx );
@@ -379,7 +379,7 @@ void LAYER::drawAnnotation( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const BOX
         aOverlay.SetLineWidth( 2.6 * aPx );
         aOverlay.SetGlyphSize( VECTOR2I( KiROUND( 15 * aPx ), KiROUND( 15 * aPx ) ) );
         aOverlay.SetTextJustify( GR_TEXT_H_ALIGN_CENTER, GR_TEXT_V_ALIGN_CENTER );
-        aOverlay.BitmapText( wxString::Format( "%d", aNote.number ), VECTOR2I( KiROUND( at.x ), KiROUND( at.y ) ), ANGLE_0 );
+        aOverlay.StrokeText( wxString::Format( "%d", aNote.number ), VECTOR2I( KiROUND( at.x ), KiROUND( at.y ) ), ANGLE_0 );
 
         aOverlay.SetIsFill( true );
         aOverlay.SetIsStroke( false );

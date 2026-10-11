@@ -256,6 +256,26 @@ struct VIEW_OVERLAY::COMMAND_TEXT_JUSTIFY : public VIEW_OVERLAY::COMMAND
 };
 
 
+struct VIEW_OVERLAY::COMMAND_STROKE_TEXT : public VIEW_OVERLAY::COMMAND
+{
+    COMMAND_STROKE_TEXT( const wxString& aText, const VECTOR2I& aPosition, const EDA_ANGLE& aAngle ) :
+        m_text( aText ),
+        m_pos( aPosition ),
+        m_angle( aAngle )
+    { }
+
+    virtual void Execute( VIEW* aView ) const override
+    {
+        // the base implementation draws with the stroke font; backends override it with bitmaps
+        aView->GetGAL()->GAL::BitmapText( m_text, m_pos, m_angle );
+    }
+
+    wxString  m_text;
+    VECTOR2I  m_pos;
+    EDA_ANGLE m_angle;
+};
+
+
 struct VIEW_OVERLAY::COMMAND_BITMAP_TEXT : public VIEW_OVERLAY::COMMAND
 {
     COMMAND_BITMAP_TEXT( const wxString& aText, const VECTOR2I& aPosition,
@@ -410,6 +430,12 @@ void VIEW_OVERLAY::SetIsFill( bool aIsFillEnabled )
 void VIEW_OVERLAY::SetGlyphSize( const VECTOR2I& aSize )
 {
     m_commands.push_back( new COMMAND_GLYPH_SIZE( aSize ) );
+}
+
+
+void VIEW_OVERLAY::StrokeText( const wxString& aText, const VECTOR2I& aPosition, const EDA_ANGLE& aAngle )
+{
+    m_commands.push_back( new COMMAND_STROKE_TEXT( aText, aPosition, aAngle ) );
 }
 
 

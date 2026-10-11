@@ -11,6 +11,8 @@
 #include <memory>
 #include <string>
 
+#include <math/box2.h>
+
 #include <kicadopenapi_registry.h>
 
 class FOOTPRINT;
@@ -52,5 +54,14 @@ bool KopenapiAssemblyBox( BOARD* aBoard, double aLo[3], double aHi[3] );
 nlohmann::json KopenapiLeadTrimRefresh( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext );
 
 nlohmann::json KopenapiPanelEdgeJson( FOOTPRINT* aFootprint, const std::string& aMethod = "auto" );
+
+class BOARD;
+class BOARD_ITEM;
+
+/// @brief A board item by uuid, a footprint by reference, a pad as REF.NUMBER; nullptr if none
+BOARD_ITEM* KopenapiFindBoardItem( BOARD* aBoard, const std::string& aRef );
+
+/// @brief The item's extent as a user sees it (a footprint without its texts)
+BOX2I KopenapiBoardItemBox( const BOARD_ITEM* aItem );
 
 #endif

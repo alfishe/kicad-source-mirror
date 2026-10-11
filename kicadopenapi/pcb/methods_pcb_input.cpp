@@ -1,6 +1,8 @@
 /// @file methods_pcb_input.cpp
 /// @brief pcb_action, pcb_input: the board editor's tools driven as by a user (see
 /// kicadopenapi_editor_input.h).
+#include "kopenapi_pcb.h"
+
 #include <kicadopenapi_editor_input.h>
 #include <kicadopenapi_registry.h>
 
@@ -34,17 +36,47 @@ static void boardState( PCB_EDIT_FRAME* aFrame, nlohmann::json& aOut )
 }
 
 
+/// The board editor's side: state, item lookup, selecting exactly one item
+static KOPENAPI_EDITOR_HOST boardHost( PCB_EDIT_FRAME* aFrame )
+{
+    KOPENAPI_EDITOR_HOST host;
+
+    host.state = [aFrame]( nlohmann::json& aOut ) { boardState( aFrame, aOut ); };
+
+    host.resolve = [aFrame]( const std::string& aRef ) -> std::optional<BOX2I>
+    {
+        BOARD_ITEM* item = KopenapiFindBoardItem( aFrame->GetBoard(), aRef );
+        return item ? std::optional<BOX2I>( KopenapiBoardItemBox( item ) ) : std::nullopt;
+    };
+
+    host.select = [aFrame]( const std::string& aRef ) -> bool
+    {
+        BOARD_ITEM*         item = KopenapiFindBoardItem( aFrame->GetBoard(), aRef );
+        PCB_SELECTION_TOOL* tool = aFrame->GetToolManager()->GetTool<PCB_SELECTION_TOOL>();
+
+        if( !item || !tool )
+            return false;
+
+        tool->ClearSelection();
+        tool->AddItemToSel( item );
+        return true;
+    };
+
+    return host;
+}
+
+
 static KOPENAPI_RESULT h_pcb_action( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     PCB_EDIT_FRAME* frame = boardEditor( aCtx );
-    return KopenapiEditorAction( frame, pcbIUScale, aArgs, [frame]( nlohmann::json& aOut ) { boardState( frame, aOut ); } );
+    return KopenapiEditorAction( frame, pcbIUScale, aArgs, boardHost( frame ) );
 }
 
 
 static KOPENAPI_RESULT h_pcb_input( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     PCB_EDIT_FRAME* frame = boardEditor( aCtx );
-    return KopenapiEditorInput( frame, pcbIUScale, aArgs, [frame]( nlohmann::json& aOut ) { boardState( frame, aOut ); } );
+    return KopenapiEditorInput( frame, pcbIUScale, aArgs, boardHost( frame ) );
 }
 
 
@@ -59,7 +91,9 @@ KOPENAPI_REGISTER( "pcb_action",
 KOPENAPI_REGISTER( "pcb_input",
                    "Pointer and keyboard input to the board editor's canvas, taking the same path as the "
                    "user's (click / drag thresholds, double clicks, hotkeys, Escape cancels): steps of move, "
-                   "click, dclick, down, up at [x, y] mm (the point must be visible), key (hotkey letters, "
-                   "Escape, Enter, ...), mods, wait_ms. No OS events or permissions involved. Answers the "
+                   "click, dclick, down, up at [x, y] mm or an item (U1, U1.3, uuid; visible on the canvas), "
+                   "ms to glide there; intents select (exactly that item, even under a track) and drag "
+                   "(select it and move it to / by); key (hotkey letters, Escape, Enter, ...), mods, wait_ms. "
+                   "No OS events or permissions involved. Answers the "
                    "active tool, pointer, held buttons, routing in progress, track count, selection size; GUI only",
                    KopenapiEditorInputSchema(), true, h_pcb_input );

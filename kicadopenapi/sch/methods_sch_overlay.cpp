@@ -1,6 +1,8 @@
 /// @file methods_sch_overlay.cpp
 /// @brief sch_overlay: the schematic editor's annotation layer (kicadopenapi_annotations.h), and the
 /// schematic's change notifications forwarded to KOPENAPI_MODEL_EVENTS.
+#include "kopenapi_sch.h"
+
 #include <kicadopenapi_annotations.h>
 #include <kicadopenapi_model_events.h>
 #include <kicadopenapi_registry.h>
@@ -73,49 +75,10 @@ SCHEMATIC_EVENTS& schematicEvents()
 }
 
 
-/// @brief An item of the shown sheet by uuid, a symbol by reference, a pin as REF.NUMBER: its box
 std::optional<BOX2I> resolveSchematicItem( SCH_EDIT_FRAME* aFrame, const std::string& aRef )
 {
-    SCH_SCREEN* screen = aFrame ? aFrame->GetScreen() : nullptr;
-
-    if( !screen )
-        return std::nullopt;
-
-    const wxString ref = wxString::FromUTF8( aRef );
-
-    if( KIID::SniffTest( ref ) )
-    {
-        const KIID id( ref );
-
-        for( SCH_ITEM* item : screen->Items() )
-        {
-            if( item->m_Uuid == id )
-                return item->GetBoundingBox();
-        }
-
-        return std::nullopt;
-    }
-
-    const wxString designator = ref.BeforeFirst( '.' );
-    SCH_SHEET_PATH& sheet = aFrame->GetCurrentSheet();
-
-    for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
-    {
-        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
-
-        if( symbol->GetRef( &sheet ) != designator )
-            continue;
-
-        if( !ref.Contains( wxS( "." ) ) )
-            return symbol->GetBoundingBox();
-
-        if( SCH_PIN* pin = symbol->GetPin( ref.AfterFirst( '.' ) ) )
-            return pin->GetBoundingBox();
-
-        return std::nullopt;
-    }
-
-    return std::nullopt;
+    SCH_ITEM* item = KopenapiFindSchematicItem( aFrame, aRef );
+    return item ? std::optional<BOX2I>( item->GetBoundingBox() ) : std::nullopt;
 }
 
 
@@ -137,6 +100,48 @@ KOPENAPI_RESULT h_sch_overlay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aAr
     return KopenapiAnnotate( host, aArgs );
 }
 } // namespace
+
+
+SCH_ITEM* KopenapiFindSchematicItem( SCH_EDIT_FRAME* aFrame, const std::string& aRef )
+{
+    SCH_SCREEN* screen = aFrame ? aFrame->GetScreen() : nullptr;
+
+    if( !screen )
+        return nullptr;
+
+    const wxString ref = wxString::FromUTF8( aRef );
+
+    if( KIID::SniffTest( ref ) )
+    {
+        const KIID id( ref );
+
+        for( SCH_ITEM* item : screen->Items() )
+        {
+            if( item->m_Uuid == id )
+                return item;
+        }
+
+        return nullptr;
+    }
+
+    const wxString  designator = ref.BeforeFirst( '.' );
+    SCH_SHEET_PATH& sheet = aFrame->GetCurrentSheet();
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        if( symbol->GetRef( &sheet ) != designator )
+            continue;
+
+        if( ref.Contains( wxS( "." ) ) )
+            return symbol->GetPin( ref.AfterFirst( '.' ) );
+
+        return symbol;
+    }
+
+    return nullptr;
+}
 
 
 KOPENAPI_REGISTER( "sch_overlay",

@@ -1,6 +1,8 @@
 /// @file methods_pcb_overlay.cpp
 /// @brief pcb_overlay: the board editor's annotation layer (kicadopenapi_annotations.h), and the
 /// board's change notifications forwarded to KOPENAPI_MODEL_EVENTS.
+#include "kopenapi_pcb.h"
+
 #include <kicadopenapi_annotations.h>
 #include <kicadopenapi_model_events.h>
 #include <kicadopenapi_registry.h>
@@ -92,45 +94,10 @@ BOARD_EVENTS& boardEvents()
 }
 
 
-/// @brief A board item by uuid, a footprint by reference, a pad as REF.NUMBER: its bounding box
 std::optional<BOX2I> resolveBoardItem( PCB_EDIT_FRAME* aFrame, const std::string& aRef )
 {
-    BOARD* board = aFrame ? aFrame->GetBoard() : nullptr;
-
-    if( !board )
-        return std::nullopt;
-
-    const wxString ref = wxString::FromUTF8( aRef );
-
-    if( KIID::SniffTest( ref ) )
-    {
-        BOARD_ITEM* item = board->ResolveItem( KIID( ref ), true );
-
-        if( !item || item == DELETED_BOARD_ITEM::GetInstance() )
-            return std::nullopt;
-
-        if( item->Type() == PCB_FOOTPRINT_T )
-            return static_cast<FOOTPRINT*>( item )->GetBoundingBox( false );
-
-        return item->GetBoundingBox();
-    }
-
-    const wxString designator = ref.BeforeFirst( '.' );
-
-    if( FOOTPRINT* footprint = board->FindFootprintByReference( designator ) )
-    {
-        if( ref.Contains( wxS( "." ) ) )
-        {
-            if( PAD* pad = footprint->FindPadByNumber( ref.AfterFirst( '.' ) ) )
-                return pad->GetBoundingBox();
-
-            return std::nullopt;
-        }
-
-        return footprint->GetBoundingBox( false );
-    }
-
-    return std::nullopt;
+    BOARD_ITEM* item = KopenapiFindBoardItem( aFrame ? aFrame->GetBoard() : nullptr, aRef );
+    return item ? std::optional<BOX2I>( KopenapiBoardItemBox( item ) ) : std::nullopt;
 }
 
 
@@ -152,6 +119,37 @@ KOPENAPI_RESULT h_pcb_overlay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aAr
     return KopenapiAnnotate( host, aArgs );
 }
 } // namespace
+
+
+BOARD_ITEM* KopenapiFindBoardItem( BOARD* aBoard, const std::string& aRef )
+{
+    if( !aBoard )
+        return nullptr;
+
+    const wxString ref = wxString::FromUTF8( aRef );
+
+    if( KIID::SniffTest( ref ) )
+    {
+        BOARD_ITEM* item = aBoard->ResolveItem( KIID( ref ), true );
+        return item == DELETED_BOARD_ITEM::GetInstance() ? nullptr : item;
+    }
+
+    FOOTPRINT* footprint = aBoard->FindFootprintByReference( ref.BeforeFirst( '.' ) );
+
+    if( footprint && ref.Contains( wxS( "." ) ) )
+        return footprint->FindPadByNumber( ref.AfterFirst( '.' ) );
+
+    return footprint;
+}
+
+
+BOX2I KopenapiBoardItemBox( const BOARD_ITEM* aItem )
+{
+    if( aItem->Type() == PCB_FOOTPRINT_T )
+        return static_cast<const FOOTPRINT*>( aItem )->GetBoundingBox( false );
+
+    return aItem->GetBoundingBox();
+}
 
 
 KOPENAPI_REGISTER( "pcb_overlay",

@@ -71,6 +71,7 @@ public:
 
     struct COMMAND_GLYPH_SIZE;
     struct COMMAND_TEXT_JUSTIFY;
+    struct COMMAND_STROKE_TEXT;
     struct COMMAND_BITMAP_TEXT;
 
     void Clear();
@@ -104,7 +105,11 @@ public:
     void SetStrokeColor( const COLOR4D& aColor );
     void SetGlyphSize( const VECTOR2I& aSize );
 
-    /// @brief Justification of the following BitmapText() calls
+    /// @brief Text in the stroke font (vector), the same look on every canvas and backend; BitmapText()
+    /// uses the OpenGL bitmap atlas where there is one
+    void StrokeText( const wxString& aText, const VECTOR2I& aPosition, const EDA_ANGLE& aAngle );
+
+    /// @brief Justification of the following BitmapText() / StrokeText() calls
     void SetTextJustify( GR_TEXT_H_ALIGN_T aHorizontal, GR_TEXT_V_ALIGN_T aVertical );
     void SetLineWidth( double aLineWidth );
 
