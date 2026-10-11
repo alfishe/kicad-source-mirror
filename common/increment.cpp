@@ -24,7 +24,6 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
-#include <regex>
 
 
 KICOMMON_API bool IncrementString( wxString& name, int aIncrement )
@@ -86,8 +85,8 @@ std::optional<wxString> STRING_INCREMENTER::Increment( const wxString& aStr, int
     if( aStr.IsEmpty() )
         return std::nullopt;
 
-    // Slice the UTF-8 encoding, not the wxString - the regexes report byte offsets, and mixing
-    // the two underflows the length arithmetic on non-ASCII input and never shortens the string
+    // Slice the UTF-8 encoding, not the wxString: the parts are byte runs, and mixing the two
+    // underflows the length arithmetic on non-ASCII input and never shortens the string
     std::string                                           remaining = aStr.utf8_string();
     std::vector<std::pair<std::string, STRING_PART_TYPE>> parts;
     size_t                                                goodParts = 0;
@@ -96,37 +95,46 @@ std::optional<wxString> STRING_INCREMENTER::Increment( const wxString& aStr, int
     // (compare against aRightIndex directly so a SIZE_MAX index can't wrap the target to zero)
     while( goodParts <= aRightIndex && !remaining.empty() )
     {
-        static const std::regex integerRegex( R"(\d+$)" );
+        // Trailing runs of one kind of byte: digits, letters of the last letter's case (ABC or abc
+        // but not Abc), or skippables (anything that is not an ASCII letter or digit)
+        auto trailing =
+                [&]( auto aIsMember ) -> size_t
+                {
+                    size_t start = remaining.size();
 
-        // ABC or abc but not Abc
-        static const std::regex sameCaseAlphabetRegex( R"(([a-z]+|[A-Z]+)$)" );
+                    while( start > 0 && aIsMember( static_cast<unsigned char>( remaining[start - 1] ) ) )
+                        --start;
 
-        // Skippables - for now anything that isn't a letter or number
-        static const std::regex skipRegex( R"([^a-zA-Z0-9]+$)" );
+                    return remaining.size() - start;
+                };
 
-        std::smatch match;
+        auto isDigit = []( unsigned char c ) { return c >= '0' && c <= '9'; };
+        auto isLower = []( unsigned char c ) { return c >= 'a' && c <= 'z'; };
+        auto isUpper = []( unsigned char c ) { return c >= 'A' && c <= 'Z'; };
+        auto isSkip = [&]( unsigned char c ) { return !isDigit( c ) && !isLower( c ) && !isUpper( c ); };
 
-        if( std::regex_search( remaining, match, integerRegex ) )
+        const unsigned char last = static_cast<unsigned char>( remaining.back() );
+        size_t              length = 0;
+
+        if( isDigit( last ) )
         {
-            parts.push_back( { match.str(), STRING_PART_TYPE::INTEGER } );
+            length = trailing( isDigit );
+            parts.push_back( { remaining.substr( remaining.size() - length ), STRING_PART_TYPE::INTEGER } );
             goodParts++;
         }
-        else if( std::regex_search( remaining, match, sameCaseAlphabetRegex ) )
+        else if( isLower( last ) || isUpper( last ) )
         {
-            parts.push_back( { match.str(), STRING_PART_TYPE::ALPHABETIC } );
+            length = isLower( last ) ? trailing( isLower ) : trailing( isUpper );
+            parts.push_back( { remaining.substr( remaining.size() - length ), STRING_PART_TYPE::ALPHABETIC } );
             goodParts++;
-        }
-        else if( std::regex_search( remaining, match, skipRegex ) )
-        {
-            parts.push_back( { match.str(), STRING_PART_TYPE::SKIP } );
         }
         else
         {
-            // Out of ideas
-            break;
+            length = trailing( isSkip );
+            parts.push_back( { remaining.substr( remaining.size() - length ), STRING_PART_TYPE::SKIP } );
         }
 
-        remaining.erase( remaining.size() - match.str().size() );
+        remaining.erase( remaining.size() - length );
     }
 
     // Couldn't find the part we wanted
