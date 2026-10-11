@@ -104,6 +104,13 @@ void KIPLATFORM::UI::ReparentWindow( wxNonOwnedWindow* aWindow, wxTopLevelWindow
 }
 
 
+void KIPLATFORM::UI::AttachChildWindow( wxNonOwnedWindow* aWindow, wxTopLevelWindow* aParent )
+{
+    // Not needed on this platform: wxFRAME_FLOAT_ON_PARENT keeps it above its owner and the
+    // parent's move events place it
+}
+
+
 void KIPLATFORM::UI::DetachChildWindow( wxNonOwnedWindow* aWindow )
 {
     // Not needed on this platform (see ReparentWindow)

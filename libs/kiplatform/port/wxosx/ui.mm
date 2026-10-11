@@ -123,6 +123,22 @@ void KIPLATFORM::UI::ReparentWindow( wxNonOwnedWindow* aWindow, wxTopLevelWindow
 }
 
 
+void KIPLATFORM::UI::AttachChildWindow( wxNonOwnedWindow* aWindow, wxTopLevelWindow* aParent )
+{
+    NSWindow* parentWindow = aParent->GetWXWindow();
+    NSWindow* theWindow    = aWindow->GetWXWindow();
+
+    if( !parentWindow || !theWindow )
+        return;
+
+    // wxFRAME_FLOAT_ON_PARENT makes it a floating (above everything) window here
+    [theWindow setLevel:[parentWindow level]];
+
+    if( [theWindow parentWindow] != parentWindow )
+        [parentWindow addChildWindow:theWindow ordered:NSWindowAbove];
+}
+
+
 void KIPLATFORM::UI::DetachChildWindow( wxNonOwnedWindow* aWindow )
 {
     NSWindow* theWindow = aWindow->GetWXWindow();

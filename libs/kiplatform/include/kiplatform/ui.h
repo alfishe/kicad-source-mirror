@@ -79,8 +79,19 @@ namespace KIPLATFORM
         void ReparentWindow( wxNonOwnedWindow* aWindow, wxTopLevelWindow* aParent );
 
         /**
-         * Undo ReparentWindow: the window no longer moves with its parent (call before hiding
-         * or destroying it).  NOP where ReparentWindow is one.
+         * Attach a small decoration window (a bar, a badge) to its parent: the window system
+         * moves it with the parent and keeps it just above the parent in the window order, not
+         * above every window.  NOP where windows have no such relation (keep the parent's move
+         * events and wxFRAME_FLOAT_ON_PARENT there).
+         *
+         * @param aWindow is the decoration window
+         * @param aParent is the window it belongs to
+         */
+        void AttachChildWindow( wxNonOwnedWindow* aWindow, wxTopLevelWindow* aParent );
+
+        /**
+         * Undo ReparentWindow / AttachChildWindow: the window no longer moves with its parent
+         * (call before hiding or destroying it).  NOP where those are.
          *
          * @param aWindow is the window to detach
          */

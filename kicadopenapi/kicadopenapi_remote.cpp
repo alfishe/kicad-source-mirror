@@ -759,7 +759,7 @@ public:
         // A child window moves with its parent by the window system itself (macOS): the
         // parent's move events arrive throttled during a drag, so following them lags
         if( m_parent )
-            KIPLATFORM::UI::ReparentWindow( this, m_parent.get() );
+            KIPLATFORM::UI::AttachChildWindow( this, m_parent.get() );
 
         Refresh();
     }
