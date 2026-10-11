@@ -41,10 +41,10 @@ BOOST_AUTO_TEST_CASE( CompressAndEncode_OK )
     EMBEDDED_FILES::EMBEDDED_FILE file;
     file.name = "test_file";
     std::string data = "Hello, World!";
-    file.decompressedData.assign(data.begin(), data.end());
+    file.SetData( std::vector<char>( data.begin(), data.end() ) );
 
     MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-    hash.add( file.decompressedData );
+    hash.add( *file.Data() );
     file.data_hash = hash.digest().ToString();
 
     EMBEDDED_FILES::RETURN_CODE result = EMBEDDED_FILES::CompressAndEncode(file);
@@ -56,10 +56,10 @@ BOOST_AUTO_TEST_CASE( DecompressAndDecode_OK )
     EMBEDDED_FILES::EMBEDDED_FILE file;
     file.name = "test_file";
     std::string data = "Hello, World!";
-    file.decompressedData.assign( data.begin(), data.end() );
+    file.SetData( std::vector<char>( data.begin(), data.end() ) );
 
     MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-    hash.add( file.decompressedData );
+    hash.add( *file.Data() );
     file.data_hash = hash.digest().ToString();
 
     EMBEDDED_FILES::RETURN_CODE result = EMBEDDED_FILES::CompressAndEncode( file );
@@ -75,10 +75,10 @@ BOOST_AUTO_TEST_CASE( DecompressAndDecode_OK )
     for( int i = 0; i < 100000; ++i )
         data += "Hello, World!";
 
-    file.decompressedData.assign( data.begin(), data.end() );
+    file.SetData( std::vector<char>( data.begin(), data.end() ) );
 
     hash.reset();
-    hash.add( file.decompressedData );
+    hash.add( *file.Data() );
     file.data_hash = hash.digest().ToString();
 
     result = EMBEDDED_FILES::CompressAndEncode( file );
@@ -94,9 +94,9 @@ BOOST_AUTO_TEST_CASE( DecompressAndDecode_OK )
     for( int i = 0; i < 100000; ++i )
         data += static_cast<char>( i % 256 );
 
-    file.decompressedData.assign( data.begin(), data.end() );
+    file.SetData( std::vector<char>( data.begin(), data.end() ) );
     hash.reset();
-    hash.add( file.decompressedData );
+    hash.add( *file.Data() );
     file.data_hash = hash.digest().ToString();
 
     result = EMBEDDED_FILES::CompressAndEncode( file );
@@ -115,9 +115,9 @@ BOOST_AUTO_TEST_CASE( DecompressAndDecode_OK )
     for( int i = 0; i < 100000; ++i )
         data += static_cast<char>( rng() % 256 );
 
-    file.decompressedData.assign( data.begin(), data.end() );
+    file.SetData( std::vector<char>( data.begin(), data.end() ) );
     hash.reset();
-    hash.add( file.decompressedData );
+    hash.add( *file.Data() );
     file.data_hash = hash.digest().ToString();
 
     result = EMBEDDED_FILES::CompressAndEncode( file );
@@ -133,7 +133,7 @@ BOOST_AUTO_TEST_CASE( DecompressAndDecode_ChecksumError )
     EMBEDDED_FILES::EMBEDDED_FILE file;
     file.name = "test_file";
     std::string data = "Hello, World!";
-    file.decompressedData.assign(data.begin(), data.end());
+    file.SetData( std::vector<char>( data.begin(), data.end() ) );
 
     EMBEDDED_FILES::RETURN_CODE result = EMBEDDED_FILES::CompressAndEncode(file);
     BOOST_CHECK_EQUAL(result, EMBEDDED_FILES::RETURN_CODE::OK);
@@ -228,7 +228,7 @@ BOOST_AUTO_TEST_CASE( DecompressAndDecode_V1HashFallback )
     {
         EMBEDDED_FILES::EMBEDDED_FILE file;
         file.name = "v1_hash_test";
-        file.decompressedData.assign( aData.begin(), aData.end() );
+        file.SetData( std::vector<char>( aData.begin(), aData.end() ) );
 
         // Hash with V1 algorithm
         MMH3_HASH v1hash( EMBEDDED_FILES::Seed() );
@@ -237,7 +237,7 @@ BOOST_AUTO_TEST_CASE( DecompressAndDecode_V1HashFallback )
 
         // Verify V1 and current hashes differ for non-aligned data
         MMH3_HASH curHash( EMBEDDED_FILES::Seed() );
-        curHash.add( file.decompressedData );
+        curHash.add( *file.Data() );
         std::string currentHash = curHash.digest().ToString();
 
         if( aData.size() % 16 != 0 )
@@ -267,14 +267,14 @@ BOOST_AUTO_TEST_CASE( DecompressAndDecode_V1HashFallback )
     std::string aligned( 100000UL * 16, 'x' );
     EMBEDDED_FILES::EMBEDDED_FILE alignedFile;
     alignedFile.name = "aligned_test";
-    alignedFile.decompressedData.assign( aligned.begin(), aligned.end() );
+    alignedFile.SetData( std::vector<char>( aligned.begin(), aligned.end() ) );
 
     MMH3_HASH v1h( EMBEDDED_FILES::Seed() );
     v1h.addDataV1( reinterpret_cast<const uint8_t*>( aligned.data() ), aligned.size() );
     std::string v1Hash = v1h.digest().ToString();
 
     MMH3_HASH curH( EMBEDDED_FILES::Seed() );
-    curH.add( alignedFile.decompressedData );
+    curH.add( *alignedFile.Data() );
     std::string curHash = curH.digest().ToString();
 
     BOOST_CHECK_EQUAL( v1Hash, curHash );
@@ -294,10 +294,10 @@ BOOST_AUTO_TEST_CASE( CopySharesEmbeddedFilePayloads )
     file->type = EMBEDDED_FILES::EMBEDDED_FILE::FILE_TYPE::MODEL;
 
     std::string payload( 1024 * 1024, 'x' );
-    file->decompressedData.assign( payload.begin(), payload.end() );
+    file->SetData( std::vector<char>( payload.begin(), payload.end() ) );
 
     MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-    hash.add( file->decompressedData );
+    hash.add( *file->Data() );
     file->data_hash = hash.digest().ToString();
 
     BOOST_REQUIRE_EQUAL( EMBEDDED_FILES::CompressAndEncode( *file ),
@@ -338,8 +338,8 @@ BOOST_AUTO_TEST_CASE( CopySharesEmbeddedFilePayloads )
     // Validate the payload via one of the shared copies (round-trip).
     BOOST_CHECK_EQUAL( EMBEDDED_FILES::DecompressAndDecode( *copy1File ),
                        EMBEDDED_FILES::RETURN_CODE::OK );
-    BOOST_CHECK_EQUAL( std::string( copy1File->decompressedData.begin(),
-                                    copy1File->decompressedData.end() ),
+    BOOST_CHECK_EQUAL( std::string( copy1File->Data()->begin(),
+                                    copy1File->Data()->end() ),
                        payload );
 }
 
@@ -351,10 +351,10 @@ BOOST_AUTO_TEST_CASE( DeepCopyAllocatesIndependentPayloads )
 
     auto* file = new EMBEDDED_FILES::EMBEDDED_FILE();
     file->name = wxS( "deep_copy.bin" );
-    file->decompressedData.assign( { '1', '2', '3' } );
+    file->SetData( { '1', '2', '3' } );
 
     MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-    hash.add( file->decompressedData );
+    hash.add( *file->Data() );
     file->data_hash = hash.digest().ToString();
 
     BOOST_REQUIRE_EQUAL( EMBEDDED_FILES::CompressAndEncode( *file ),
@@ -381,10 +381,10 @@ BOOST_AUTO_TEST_CASE( AssignSharedFromIsIdempotent )
     auto* file = new EMBEDDED_FILES::EMBEDDED_FILE();
     file->name = wxS( "ARTIDIS-KiCAD_HEADER.kicad_wks" );
     file->type = EMBEDDED_FILES::EMBEDDED_FILE::FILE_TYPE::WORKSHEET;
-    file->decompressedData.assign( { '1', '2', '3' } );
+    file->SetData( { '1', '2', '3' } );
 
     MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-    hash.add( file->decompressedData );
+    hash.add( *file->Data() );
     file->data_hash = hash.digest().ToString();
 
     BOOST_REQUIRE_EQUAL( EMBEDDED_FILES::CompressAndEncode( *file ),
@@ -420,13 +420,13 @@ BOOST_AUTO_TEST_CASE( AddFileReturnsTheStoredEntry )
 
     auto* first = new EMBEDDED_FILES::EMBEDDED_FILE();
     first->name = wxS( "duplicate.step" );
-    first->decompressedData.assign( { 'k', 'e', 'p', 't' } );
+    first->SetData( { 'k', 'e', 'p', 't' } );
 
     BOOST_REQUIRE_EQUAL( files.AddFile( first ), first );
 
     auto* duplicate = new EMBEDDED_FILES::EMBEDDED_FILE();
     duplicate->name = wxS( "duplicate.step" );
-    duplicate->decompressedData.assign( { 'd', 'r', 'o', 'p', 'p', 'e', 'd' } );
+    duplicate->SetData( { 'd', 'r', 'o', 'p', 'p', 'e', 'd' } );
 
     EMBEDDED_FILES::EMBEDDED_FILE* stored = files.AddFile( duplicate );
 
@@ -437,8 +437,8 @@ BOOST_AUTO_TEST_CASE( AddFileReturnsTheStoredEntry )
     BOOST_REQUIRE_EQUAL( EMBEDDED_FILES::CompressAndEncode( *stored ),
                          EMBEDDED_FILES::RETURN_CODE::OK );
     BOOST_CHECK( stored->Validate() );
-    BOOST_CHECK_EQUAL( std::string( stored->decompressedData.begin(),
-                                    stored->decompressedData.end() ),
+    BOOST_CHECK_EQUAL( std::string( stored->Data()->begin(),
+                                    stored->Data()->end() ),
                        std::string( "kept" ) );
 }
 

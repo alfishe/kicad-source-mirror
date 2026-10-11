@@ -170,10 +170,10 @@ BOOST_AUTO_TEST_CASE( FootprintCloneSharesEmbeddedFiles )
     // Keep the test payload small so the suite stays fast, but use enough data to exercise
     // the compression/encode path.
     std::string payload( 4096, 'k' );
-    file->decompressedData.assign( payload.begin(), payload.end() );
+    file->SetData( std::vector<char>( payload.begin(), payload.end() ) );
 
     MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-    hash.add( file->decompressedData );
+    hash.add( *file->Data() );
     file->data_hash = hash.digest().ToString();
 
     BOOST_REQUIRE( EMBEDDED_FILES::CompressAndEncode( *file ) == EMBEDDED_FILES::RETURN_CODE::OK );

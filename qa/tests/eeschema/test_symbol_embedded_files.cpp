@@ -74,10 +74,10 @@ public:
     {
         EMBEDDED_FILES::EMBEDDED_FILE* file = new EMBEDDED_FILES::EMBEDDED_FILE();
         file->name = aName;
-        file->decompressedData.assign( aContent.begin(), aContent.end() );
+        file->SetData( std::vector<char>( aContent.begin(), aContent.end() ) );
 
         MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-        hash.add( file->decompressedData );
+        hash.add( *file->Data() );
         file->data_hash = hash.digest().ToString();
 
         EMBEDDED_FILES::RETURN_CODE result = EMBEDDED_FILES::CompressAndEncode( *file );

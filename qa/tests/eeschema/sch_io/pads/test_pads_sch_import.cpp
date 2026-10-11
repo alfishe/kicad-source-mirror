@@ -1938,8 +1938,8 @@ BOOST_AUTO_TEST_CASE( BinarySymbolsAndSheets )
     const EMBEDDED_FILES::EMBEDDED_FILE* embeddedWorksheet =
             m_schematic.GetEmbeddedFiles()->GetEmbeddedFile( wxS( "pads_import.kicad_wks" ) );
     BOOST_REQUIRE( embeddedWorksheet );
-    const std::string  worksheetData( embeddedWorksheet->decompressedData.begin(),
-                                      embeddedWorksheet->decompressedData.end() );
+    const std::string  worksheetData( embeddedWorksheet->Data()->begin(),
+                                      embeddedWorksheet->Data()->end() );
     const double       pageWidthMm = model.sheets.front().pageSize.x * 0.0127;
     const double       pageHeightMm = model.sheets.front().pageSize.y * 0.0127;
     std::ostringstream topRight;

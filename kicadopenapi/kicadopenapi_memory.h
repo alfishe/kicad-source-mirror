@@ -22,7 +22,7 @@ public:
     /// @brief Stops both; safe to call more than once. Main thread.
     static void StopAutoTrim();
 
-    /// @brief { os, process, allocator, auto_trim }; any thread
+    /// @brief { os, process, allocator, unused, caches, auto_trim }; any thread
     static nlohmann::json Summary();
 
     /// @brief Trims now on the calling thread.

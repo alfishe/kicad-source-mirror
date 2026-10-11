@@ -514,9 +514,13 @@ void PANEL_EMBEDDED_FILES::onExportFiles( wxCommandEvent& event )
             continue;
         }
 
-        out.Write( file->decompressedData.data(), file->decompressedData.size() );
+        const std::shared_ptr<const std::vector<char>> data = file->Data();
+        const size_t                                   size = data ? data->size() : 0;
 
-        if( !out.IsOk() || ( out.LastWrite() != file->decompressedData.size() ) )
+        if( data )
+            out.Write( data->data(), size );
+
+        if( !data || !out.IsOk() || ( out.LastWrite() != size ) )
         {
             wxString msg = wxString::Format( _( "Failed to write file '%s'." ), fileName.GetFullName() );
 

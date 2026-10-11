@@ -23,6 +23,8 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
+#include <vector>
 
 #include <wx/string.h>
 #include <wx/filename.h>
@@ -65,13 +67,51 @@ public:
 
         wxString GetLink() const;
 
+        /**
+         * The file's content: the single gate to the decompressed bytes. Decoded from
+         * compressedEncodedData on first use and kept until ReleaseData(); the bytes held are
+         * counted in EMBEDDED_FILES::GetDataStats(). Thread-safe; the returned buffer stays valid
+         * for as long as the caller holds it, even if the file is released or changed meanwhile.
+         *
+         * @return the content, or nullptr when it cannot be decoded (or the file has none)
+         */
+        std::shared_ptr<const std::vector<char>> Data() const;
+
+        /// @return the content's size without decoding it (known once decoded or set)
+        size_t DataSize() const;
+
+        /// @brief Replaces the content (importers, files added from disk); compressedEncodedData
+        /// is not updated (EMBEDDED_FILES::CompressAndEncode() does that).
+        void SetData( std::vector<char> aData );
+
+        /// @brief Drops the decoded content when the compressed form can give it back
+        void ReleaseData();
+
+        /// @brief Shares another file's decoded content (no copy, no decode)
+        void ShareDataFrom( const EMBEDDED_FILE& aOther );
+
         wxString          name;
         FILE_TYPE         type;
         bool              is_valid;
         std::string       compressedEncodedData;
-        std::vector<char> decompressedData;
         std::string       data_hash;
+
+    private:
+        mutable std::shared_ptr<const std::vector<char>> m_data;
+        mutable size_t                                   m_dataSize = 0;
     };
+
+    /// @brief What the content gate holds: decoded bytes alive now (including buffers callers
+    /// still hold), number of decoded files, decodes and releases since start
+    struct DATA_STATS
+    {
+        size_t residentBytes = 0;
+        size_t residentFiles = 0;
+        size_t decodes = 0;
+        size_t releases = 0;
+    };
+
+    static DATA_STATS GetDataStats();
 
     enum class RETURN_CODE : int
     {
@@ -210,7 +250,7 @@ public:
     void ClearEmbeddedFonts();
 
     /**
-     * Take data from the decompressedData buffer and compresses it using ZSTD
+     * Take the file's content (EMBEDDED_FILE::Data()) and compresses it using ZSTD
      * into the compressedEncodedData buffer.
      *
      * The data is then Base64 encoded.  This call is used when adding a new file to the
@@ -221,7 +261,8 @@ public:
     /**
      * Takes data from the compressedEncodedData buffer and Base64 decodes it.
      *
-     * The data is then decompressed using ZSTD and stored in the decompressedData buffer.
+     * The data is then decompressed using ZSTD, checked against data_hash and stored as the
+     * file's content (EMBEDDED_FILE::Data()).
      * This call is used when loading the embedded files using the parsers.
      *
      * @param aFile

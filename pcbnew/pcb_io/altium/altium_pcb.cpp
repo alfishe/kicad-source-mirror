@@ -228,13 +228,12 @@ ALTIUM_PCB::HelperEmbedModel( FOOTPRINT* aFootprint, const wxString& aModelName,
 
     // Altium compresses STEP at roughly 5:1, so guess high and double rather than reallocate
     // on every read
-    file->decompressedData.resize( aCompressedData.size() * 6 );
-    size_t offset = 0;
+    std::vector<char> content( aCompressedData.size() * 6 );
+    size_t            offset = 0;
 
     while( !zlibStream.Eof() )
     {
-        zlibStream.Read( file->decompressedData.data() + offset,
-                         file->decompressedData.size() - offset );
+        zlibStream.Read( content.data() + offset, content.size() - offset );
 
         size_t bytesRead = zlibStream.LastRead();
 
@@ -243,15 +242,16 @@ ALTIUM_PCB::HelperEmbedModel( FOOTPRINT* aFootprint, const wxString& aModelName,
 
         offset += bytesRead;
 
-        if( offset >= file->decompressedData.size() )
-            file->decompressedData.resize( 2 * file->decompressedData.size() );
+        if( offset >= content.size() )
+            content.resize( 2 * content.size() );
     }
 
-    file->decompressedData.resize( offset );
+    content.resize( offset );
 
     // The guess above overshoots by up to 6x and resize() keeps the capacity, which the board
     // would then hold for as long as it is open
-    file->decompressedData.shrink_to_fit();
+    content.shrink_to_fit();
+    file->SetData( std::move( content ) );
 
     embeddedFiles->AddFile( file );
 

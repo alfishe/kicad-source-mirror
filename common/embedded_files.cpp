@@ -29,6 +29,8 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
+#include <atomic>
 #include <sstream>
 #include <vector>
 
@@ -42,10 +44,129 @@
 #include <wildcards_and_files_ext.h>
 
 
+namespace
+{
+// The content gate: every decoded buffer is created here, so the bytes alive are counted exactly
+std::mutex          g_dataMutex;   ///< guards EMBEDDED_FILE::m_data / m_dataSize
+std::atomic<size_t> g_residentBytes{ 0 };
+std::atomic<size_t> g_residentFiles{ 0 };
+std::atomic<size_t> g_decodes{ 0 };
+std::atomic<size_t> g_releases{ 0 };
+
+
+std::shared_ptr<const std::vector<char>> makeData( std::vector<char>&& aData )
+{
+    const size_t bytes = aData.size();
+    g_residentBytes += bytes;
+    g_residentFiles++;
+
+    return std::shared_ptr<const std::vector<char>>( new std::vector<char>( std::move( aData ) ),
+                                                     [bytes]( const std::vector<char>* aBuffer )
+                                                     {
+                                                         g_residentBytes -= bytes;
+                                                         g_residentFiles--;
+                                                         delete aBuffer;
+                                                     } );
+}
+
+
+const std::vector<char>& noData()
+{
+    static const std::vector<char> empty;
+    return empty;
+}
+
+
+/**
+ * @brief Base64-decodes and decompresses aEncoded and checks it against aHash.
+ * @param aHash is the expected hash; empty with aAllowEmptyHash set: replaced by the content's hash.
+ */
+EMBEDDED_FILES::RETURN_CODE decodeContent( const std::string& aEncoded, std::string& aHash,
+                                           bool aAllowEmptyHash, const wxString& aName,
+                                           std::vector<char>& aOut );
+} // namespace
+
+
+EMBEDDED_FILES::DATA_STATS EMBEDDED_FILES::GetDataStats()
+{
+    return { g_residentBytes.load(), g_residentFiles.load(), g_decodes.load(), g_releases.load() };
+}
+
+
+std::shared_ptr<const std::vector<char>> EMBEDDED_FILES::EMBEDDED_FILE::Data() const
+{
+    {
+        std::lock_guard<std::mutex> lock( g_dataMutex );
+
+        if( m_data || compressedEncodedData.empty() )
+            return m_data;
+    }
+
+    std::vector<char> decoded;
+    std::string       hash = data_hash;
+
+    if( decodeContent( compressedEncodedData, hash, true, name, decoded ) != RETURN_CODE::OK )
+        return nullptr;
+
+    std::lock_guard<std::mutex> lock( g_dataMutex );
+
+    if( !m_data )
+    {
+        m_data = makeData( std::move( decoded ) );
+        m_dataSize = m_data->size();
+        g_decodes++;
+    }
+
+    return m_data;
+}
+
+
+size_t EMBEDDED_FILES::EMBEDDED_FILE::DataSize() const
+{
+    std::lock_guard<std::mutex> lock( g_dataMutex );
+    return m_data ? m_data->size() : m_dataSize;
+}
+
+
+void EMBEDDED_FILES::EMBEDDED_FILE::SetData( std::vector<char> aData )
+{
+    std::shared_ptr<const std::vector<char>> data = makeData( std::move( aData ) );
+    std::lock_guard<std::mutex>              lock( g_dataMutex );
+
+    m_dataSize = data->size();
+    m_data = std::move( data );
+}
+
+
+void EMBEDDED_FILES::EMBEDDED_FILE::ReleaseData()
+{
+    std::shared_ptr<const std::vector<char>> released;   // freed outside the lock
+    std::lock_guard<std::mutex>              lock( g_dataMutex );
+
+    if( m_data && !compressedEncodedData.empty() )
+    {
+        released = std::move( m_data );
+        g_releases++;
+    }
+}
+
+
+void EMBEDDED_FILES::EMBEDDED_FILE::ShareDataFrom( const EMBEDDED_FILE& aOther )
+{
+    if( &aOther == this )
+        return;
+
+    std::lock_guard<std::mutex> lock( g_dataMutex );
+    m_data = aOther.m_data;
+    m_dataSize = aOther.m_dataSize;
+}
+
+
 bool EMBEDDED_FILES::EMBEDDED_FILE::Validate()
 {
+    const std::shared_ptr<const std::vector<char>> data = Data();
     MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-    hash.add( decompressedData );
+    hash.add( data ? *data : noData() );
 
     is_valid = ( hash.digest().ToString() == data_hash );
     return is_valid;
@@ -54,8 +175,9 @@ bool EMBEDDED_FILES::EMBEDDED_FILE::Validate()
 
 bool EMBEDDED_FILES::EMBEDDED_FILE::Validate_SHA256()
 {
+    const std::shared_ptr<const std::vector<char>> data = Data();
     std::string new_sha;
-    picosha2::hash256_hex_string( decompressedData, new_sha );
+    picosha2::hash256_hex_string( data ? *data : noData(), new_sha );
 
     is_valid = ( new_sha == data_hash );
     return is_valid;
@@ -88,7 +210,8 @@ EMBEDDED_FILES::EMBEDDED_FILE* EMBEDDED_FILES::AddFile( const wxFileName& aName,
 
     std::shared_ptr<EMBEDDED_FILE> efile = std::make_shared<EMBEDDED_FILE>();
     efile->name = aName.GetFullName();
-    efile->decompressedData.resize( length );
+
+    std::vector<char> content( length );
 
     wxString ext = aName.GetExt().Upper();
 
@@ -110,10 +233,7 @@ EMBEDDED_FILES::EMBEDDED_FILE* EMBEDDED_FILES::AddFile( const wxFileName& aName,
         efile->type = EMBEDDED_FILE::FILE_TYPE::WORKSHEET;
     }
 
-    if( !efile->decompressedData.data() )
-        return nullptr;
-
-    char* data = efile->decompressedData.data();
+    char* data = content.data();
     wxFileOffset total_read = 0;
 
     while( !file.Eof() && total_read < length )
@@ -124,6 +244,8 @@ EMBEDDED_FILES::EMBEDDED_FILE* EMBEDDED_FILES::AddFile( const wxFileName& aName,
         data += read;
         total_read += read;
     }
+
+    efile->SetData( std::move( content ) );
 
     if( CompressAndEncode( *efile ) != RETURN_CODE::OK )
         return nullptr;
@@ -272,12 +394,13 @@ void EMBEDDED_FILES::WriteEmbeddedFiles( OUTPUTFORMATTER& aOut, bool aWriteData 
 // Compress and Base64 encode data
 EMBEDDED_FILES::RETURN_CODE EMBEDDED_FILES::CompressAndEncode( EMBEDDED_FILE& aFile )
 {
+    const std::shared_ptr<const std::vector<char>> data = aFile.Data();
+    const std::vector<char>&                       content = data ? *data : noData();
     std::vector<char> compressedData;
-    size_t estCompressedSize = ZSTD_compressBound( aFile.decompressedData.size() );
+    size_t estCompressedSize = ZSTD_compressBound( content.size() );
     compressedData.resize( estCompressedSize );
     size_t compressedSize = ZSTD_compress( compressedData.data(), estCompressedSize,
-                                           aFile.decompressedData.data(),
-                                           aFile.decompressedData.size(), 15 );
+                                           content.data(), content.size(), 15 );
 
     if( ZSTD_isError( compressedSize ) )
     {
@@ -297,26 +420,29 @@ EMBEDDED_FILES::RETURN_CODE EMBEDDED_FILES::CompressAndEncode( EMBEDDED_FILE& aF
     }
 
     MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-    hash.add( aFile.decompressedData );
+    hash.add( content );
     aFile.data_hash = hash.digest().ToString();
 
     return RETURN_CODE::OK;
 }
 
 
-// Decompress and Base64 decode data
-EMBEDDED_FILES::RETURN_CODE EMBEDDED_FILES::DecompressAndDecode( EMBEDDED_FILE& aFile, bool aAllowEmptyHash )
+namespace
+{
+EMBEDDED_FILES::RETURN_CODE decodeContent( const std::string& aEncoded, std::string& aHash,
+                                           bool aAllowEmptyHash, const wxString& aName,
+                                           std::vector<char>& aOut )
 {
     std::vector<char> compressedData;
-    size_t            compressedSize = wxBase64DecodedSize( aFile.compressedEncodedData.size() );
+    size_t            compressedSize = wxBase64DecodedSize( aEncoded.size() );
 
     if( compressedSize == 0 )
     {
         wxLogTrace( wxT( "KICAD_EMBED" ),
                     wxT( "%s:%s:%d\n * Base64DecodedSize failed for file '%s' with size %zu" ),
-                    __FILE__, __FUNCTION__, __LINE__, aFile.name,
-                    aFile.compressedEncodedData.size() );
-        return RETURN_CODE::OUT_OF_MEMORY;
+                    __FILE__, __FUNCTION__, __LINE__, aName,
+                    aEncoded.size() );
+        return EMBEDDED_FILES::RETURN_CODE::OUT_OF_MEMORY;
     }
 
     compressedData.resize( compressedSize );
@@ -324,21 +450,21 @@ EMBEDDED_FILES::RETURN_CODE EMBEDDED_FILES::DecompressAndDecode( EMBEDDED_FILE& 
 
     // The return value from wxBase64Decode is the actual size of the decoded data avoiding
     // the modulo 4 padding of the base64 encoding
-    compressedSize = wxBase64Decode( compressed, compressedSize, aFile.compressedEncodedData );
+    compressedSize = wxBase64Decode( compressed, compressedSize, aEncoded );
 
     unsigned long long estDecompressedSize = ZSTD_getFrameContentSize( compressed, compressedSize );
 
     if( estDecompressedSize > 1e9 ) // Limit to 1GB
-        return RETURN_CODE::OUT_OF_MEMORY;
+        return EMBEDDED_FILES::RETURN_CODE::OUT_OF_MEMORY;
 
     if( estDecompressedSize == ZSTD_CONTENTSIZE_ERROR
         || estDecompressedSize == ZSTD_CONTENTSIZE_UNKNOWN )
     {
-        return RETURN_CODE::OUT_OF_MEMORY;
+        return EMBEDDED_FILES::RETURN_CODE::OUT_OF_MEMORY;
     }
 
-    aFile.decompressedData.resize( estDecompressedSize );
-    void* decompressed = aFile.decompressedData.data();
+    aOut.resize( estDecompressedSize );
+    void* decompressed = aOut.data();
 
     size_t decompressedSize = ZSTD_decompress( decompressed, estDecompressedSize,
                                                compressed, compressedSize );
@@ -348,56 +474,73 @@ EMBEDDED_FILES::RETURN_CODE EMBEDDED_FILES::DecompressAndDecode( EMBEDDED_FILE& 
         wxLogTrace( wxT( "KICAD_EMBED" ),
                     wxT( "%s:%s:%d\n * ZSTD_decompress failed with error '%s'" ),
                     __FILE__, __FUNCTION__, __LINE__, ZSTD_getErrorName( decompressedSize ) );
-        aFile.decompressedData.clear();
-        return RETURN_CODE::OUT_OF_MEMORY;
+        aOut.clear();
+        return EMBEDDED_FILES::RETURN_CODE::OUT_OF_MEMORY;
     }
 
-    aFile.decompressedData.resize( decompressedSize );
+    aOut.resize( decompressedSize );
 
     MMH3_HASH hash( EMBEDDED_FILES::Seed() );
-    hash.add( aFile.decompressedData );
+    hash.add( aOut );
     std::string new_hash = hash.digest().ToString();
 
-    if( aAllowEmptyHash && aFile.data_hash.empty() )
+    if( aAllowEmptyHash && aHash.empty() )
     {
-        wxLogTrace( wxT( "KICAD_EMBED" ), wxT( "Generated new hash for '%s'"), aFile.name );
+        wxLogTrace( wxT( "KICAD_EMBED" ), wxT( "Generated new hash for '%s'"), aName );
     }
-    else if( aFile.data_hash.length() == 64 )
+    else if( aHash.length() == 64 )
     {
         // SHA-256 hash from older file formats
         std::string sha_hash;
-        picosha2::hash256_hex_string( aFile.decompressedData, sha_hash );
+        picosha2::hash256_hex_string( aOut, sha_hash );
 
-        if( sha_hash != aFile.data_hash )
+        if( sha_hash != aHash )
         {
             wxLogTrace( wxT( "KICAD_EMBED" ),
                         wxT( "%s:%s:%d\n * Checksum error in embedded file '%s'" ),
-                        __FILE__, __FUNCTION__, __LINE__, aFile.name );
-            aFile.decompressedData.clear();
-            return RETURN_CODE::CHECKSUM_ERROR;
+                        __FILE__, __FUNCTION__, __LINE__, aName );
+            aOut.clear();
+            return EMBEDDED_FILES::RETURN_CODE::CHECKSUM_ERROR;
         }
     }
-    else if( new_hash != aFile.data_hash )
+    else if( new_hash != aHash )
     {
         // Current MMH3 hash didn't match. Try the V1 hash algorithm for files
         // saved before the tail-byte alignment fix.
         MMH3_HASH v1hash( EMBEDDED_FILES::Seed() );
-        v1hash.addDataV1( reinterpret_cast<const uint8_t*>( aFile.decompressedData.data() ),
-                          aFile.decompressedData.size() );
+        v1hash.addDataV1( reinterpret_cast<const uint8_t*>( aOut.data() ),
+                          aOut.size() );
         std::string v1_hash = v1hash.digest().ToString();
 
-        if( v1_hash != aFile.data_hash )
+        if( v1_hash != aHash )
         {
             wxLogTrace( wxT( "KICAD_EMBED" ),
                         wxT( "%s:%s:%d\n * Checksum error in embedded file '%s'" ),
-                        __FILE__, __FUNCTION__, __LINE__, aFile.name );
-            aFile.decompressedData.clear();
-            return RETURN_CODE::CHECKSUM_ERROR;
+                        __FILE__, __FUNCTION__, __LINE__, aName );
+            aOut.clear();
+            return EMBEDDED_FILES::RETURN_CODE::CHECKSUM_ERROR;
         }
     }
 
-    aFile.data_hash = new_hash;
+    aHash = new_hash;
 
+    return EMBEDDED_FILES::RETURN_CODE::OK;
+}
+} // namespace
+
+
+// Decompress and Base64 decode data
+EMBEDDED_FILES::RETURN_CODE EMBEDDED_FILES::DecompressAndDecode( EMBEDDED_FILE& aFile, bool aAllowEmptyHash )
+{
+    std::vector<char> decoded;
+    RETURN_CODE       result = decodeContent( aFile.compressedEncodedData, aFile.data_hash, aAllowEmptyHash,
+                                              aFile.name, decoded );
+
+    if( result != RETURN_CODE::OK )
+        return result;
+
+    aFile.SetData( std::move( decoded ) );
+    g_decodes++;
     return RETURN_CODE::OK;
 }
 
@@ -623,8 +766,12 @@ void EMBEDDED_FILES_PARSER::ParseEmbedded( EMBEDDED_FILES* aFiles )
                            CurSource(), CurLine(), CurLineNumber(), CurOffset() );
     }
 
+    // Checked; the content is decoded again on first use (EMBEDDED_FILE::Data())
     for( std::unique_ptr<EMBEDDED_FILES::EMBEDDED_FILE>& parsedFile : parsed )
+    {
+        parsedFile->ReleaseData();
         aFiles->AddFile( parsedFile.release() );
+    }
 }
 
 
@@ -667,7 +814,18 @@ wxFileName EMBEDDED_FILES::GetTemporaryFileName( const wxString& aName ) const
         return cacheFile;
     }
 
-    out.Write( it->second->decompressedData.data(), it->second->decompressedData.size() );
+    const std::shared_ptr<const std::vector<char>> data = it->second->Data();
+
+    if( !data )
+    {
+        cacheFile.Clear();
+        return cacheFile;
+    }
+
+    out.Write( data->data(), data->size() );
+
+    // The cache file now serves every reader; the compressed form stays for saving
+    it->second->ReleaseData();
 
     return cacheFile;
 }

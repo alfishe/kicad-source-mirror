@@ -1564,7 +1564,7 @@ BOOST_AUTO_TEST_CASE( SharedComponentBodyModelEmbeddedOnce )
 
     // A freed file yields garbage here rather than the STEP payload, and the exact length plus
     // the closing tag pin the inflate loop against silently truncating a model
-    const std::string step( file->decompressedData.begin(), file->decompressedData.end() );
+    const std::string step( file->Data()->begin(), file->Data()->end() );
 
     BOOST_REQUIRE_EQUAL( step.size(), 126391u );
     BOOST_CHECK( step.starts_with( "ISO-10303-21;" ) );

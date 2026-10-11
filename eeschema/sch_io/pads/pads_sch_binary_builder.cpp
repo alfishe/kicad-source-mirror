@@ -2038,7 +2038,7 @@ BUILD_RESULT PADS_SCH_BINARY_BUILDER::Build( const PADS_SCH_MODEL& aModel, SCHEM
         auto              embeddedWorksheet = std::make_shared<EMBEDDED_FILES::EMBEDDED_FILE>();
         embeddedWorksheet->name = wxS( "pads_import.kicad_wks" );
         embeddedWorksheet->type = EMBEDDED_FILES::EMBEDDED_FILE::FILE_TYPE::WORKSHEET;
-        embeddedWorksheet->decompressedData.assign( serialized.begin(), serialized.end() );
+        embeddedWorksheet->SetData( std::vector<char>( serialized.begin(), serialized.end() ) );
 
         if( EMBEDDED_FILES::CompressAndEncode( *embeddedWorksheet ) != EMBEDDED_FILES::RETURN_CODE::OK )
             THROW_IO_ERROR( FormatParserError( worksheet->source, wxS( "could not embed the PADS worksheet" ) ) );

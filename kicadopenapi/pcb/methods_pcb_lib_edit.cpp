@@ -73,11 +73,10 @@ std::filesystem::path KopenapiModelFile( const FOOTPRINT* aFootprint, const FP_3
         if( !file )
             return {};
 
-        if( file->decompressedData.empty()
-            && EMBEDDED_FILES::DecompressAndDecode( *file ) != EMBEDDED_FILES::RETURN_CODE::OK )
-        {
+        const std::shared_ptr<const std::vector<char>> data = file->Data();
+
+        if( !data )
             return {};
-        }
 
         const fs::path dir = fs::path( str( wxStandardPaths::Get().GetUserDir( wxStandardPaths::Dir_Cache ) ) )
                              / "kicad" / "openapi" / "embedded";
@@ -93,7 +92,7 @@ std::filesystem::path KopenapiModelFile( const FOOTPRINT* aFootprint, const FP_3
         {
             std::error_code ec;
             fs::create_directories( dir, ec );
-            std::ofstream( out, std::ios::binary ).write( file->decompressedData.data(), file->decompressedData.size() );
+            std::ofstream( out, std::ios::binary ).write( data->data(), data->size() );
         }
 
         return out;
@@ -169,7 +168,7 @@ static KOPENAPI_RESULT h_pcb_footprint_models_embed( KOPENAPI_CONTEXT& aCtx, con
 
             m.m_Filename = ef->GetLink();
             embedded.push_back( { { "ref", str( fp->GetReference() ) }, { "file", str( ef->GetLink() ) },
-                                  { "bytes", (int64_t) ef->decompressedData.size() } } );
+                                  { "bytes", (int64_t) ef->DataSize() } } );
         }
     }
 

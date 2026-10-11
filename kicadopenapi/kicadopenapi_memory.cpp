@@ -3,6 +3,8 @@
 #include <kicadopenapi_memory.h>
 #include <kicadopenapi_service.h>
 
+#include <embedded_files.h>
+
 #include "platform/platform.h"
 
 #include <wx/event.h>
@@ -264,6 +266,13 @@ nlohmann::json KOPENAPI_MEMORY::Summary()
                            { "unused", process.footprint >= 0 && allocator.live >= 0
                                                ? nlohmann::json( process.footprint - allocator.live )
                                                : nlohmann::json() } };
+
+    const EMBEDDED_FILES::DATA_STATS embedded = EMBEDDED_FILES::GetDataStats();
+
+    out["caches"] = { { "embedded_files", { { "resident_bytes", embedded.residentBytes },
+                                            { "resident_files", embedded.residentFiles },
+                                            { "decodes", embedded.decodes },
+                                            { "releases", embedded.releases } } } };
 
 #if defined( _WIN32 )
     out["os"] = "windows";

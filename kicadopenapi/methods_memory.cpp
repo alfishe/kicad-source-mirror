@@ -21,7 +21,8 @@ KOPENAPI_REGISTER( "memory_summary",
                    "Memory of the KiCad process now: resident, footprint (what memory pressure counts; "
                    "footprint_kind says which OS figure), peaks, virtual, compressed / swapped, threads; "
                    "the allocator's live bytes and what it holds from the OS (mapped, retained); unused = "
-                   "footprint - live (what a trim can give back); the automatic "
+                   "footprint - live (what a trim can give back); caches (embedded files decoded in memory "
+                   "now, decodes, releases); the automatic "
                    "trim (enabled, count, last result). Answers even while KiCad is busy",
                    R"json({"type":"object","properties":{}})json"_json,
                    false, h_memory_summary );
