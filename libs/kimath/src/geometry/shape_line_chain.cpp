@@ -1440,24 +1440,35 @@ const SHAPE_LINE_CHAIN SHAPE_LINE_CHAIN::Slice( int aStartIndex, int aEndIndex, 
         ssize_t          arcToSplitIndex = ArcIndex( aStartIndex );
         const SHAPE_ARC& arcToSplit = Arc( arcToSplitIndex );
 
-        // Copy the points as arc points
-        for( int i = aStartIndex; i < aEndIndex && arcToSplitIndex == ArcIndex( i ); i++ )
+        // Copy the points as arc points, up to the arc end (shared with a following arc or not)
+        int last = aStartIndex;
+
+        for( int i = aStartIndex; i <= aEndIndex && i < numPoints; i++ )
         {
+            if( m_shapes[i].first != arcToSplitIndex && m_shapes[i].second != arcToSplitIndex )
+                break;
+
             rv.m_points.push_back( m_points[i] );
             rv.m_shapes.push_back( { rv.m_arcs.size(), SHAPE_IS_PT } );
             rv.m_bbox.Merge( m_points[i] );
+            last = i;
         }
 
         // Create a new arc from the existing one, with different start point.
         SHAPE_ARC newArc;
         VECTOR2I  newArcStart = m_points[aStartIndex];
+        VECTOR2I  newArcEnd = m_points[last];
 
-        newArc.ConstructFromStartEndCenter( newArcStart, arcToSplit.GetP1(), arcToSplit.GetCenter(),
+        newArc.ConstructFromStartEndCenter( newArcStart, newArcEnd, arcToSplit.GetCenter(),
                                             arcToSplit.IsClockwise() );
 
         rv.m_arcs.push_back( newArc );
 
-        aStartIndex += rv.PointCount();
+        if( last == aEndIndex )
+            return rv;
+
+        // Continue from the arc end, which may also start the next arc
+        aStartIndex = last;
     }
 
     for( int i = aStartIndex; i <= aEndIndex && i < numPoints; i = NextShape( i ) )
@@ -1489,6 +1500,13 @@ const SHAPE_LINE_CHAIN SHAPE_LINE_CHAIN::Slice( int aStartIndex, int aEndIndex, 
                 {
                     if( arcIndex != ArcIndex( i ) )
                         break;
+
+                    if( rv.PointCount() > 0 && rv.CLastPoint() == m_points[i]
+                        && rv.m_shapes.back().first != SHAPE_IS_PT )
+                    {
+                        rv.m_shapes.back().second = rv.m_arcs.size();
+                        continue;
+                    }
 
                     rv.m_points.push_back( m_points[i] );
                     rv.m_shapes.push_back( { rv.m_arcs.size(), SHAPE_IS_PT } );
