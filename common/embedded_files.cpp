@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <vector>
 
 #include <zstd.h>
 
@@ -37,6 +38,7 @@
 #include <mmh3_hash.h>
 #include <paths.h>
 #include <picosha2.h>
+#include <thread_pool.h>
 #include <wildcards_and_files_ext.h>
 
 
@@ -436,6 +438,49 @@ EMBEDDED_FILES::RETURN_CODE EMBEDDED_FILES::ComputeFileHash( const wxFileName& a
 }
 
 
+/**
+ * @brief Decode the parsed files, in parallel when there is enough data and the caller is not a
+ * pool worker itself (waiting on the pool from a worker could starve it).
+ * @param aFiles are the files in file order.
+ * @return the index of the first file that failed to decode, or aFiles.size().
+ */
+static size_t decodeParsedFiles( std::vector<std::unique_ptr<EMBEDDED_FILES::EMBEDDED_FILE>>& aFiles )
+{
+    std::vector<EMBEDDED_FILES::RETURN_CODE> results( aFiles.size(), EMBEDDED_FILES::RETURN_CODE::OK );
+    size_t                                   encodedBytes = 0;
+
+    for( const std::unique_ptr<EMBEDDED_FILES::EMBEDDED_FILE>& file : aFiles )
+        encodedBytes += file->compressedEncodedData.size();
+
+    auto decode =
+            [&]( size_t aIndex )
+            {
+                if( !aFiles[aIndex]->compressedEncodedData.empty() )
+                    results[aIndex] = EMBEDDED_FILES::DecompressAndDecode( *aFiles[aIndex] );
+            };
+
+    constexpr size_t PARALLEL_MIN_BYTES = 1 << 20;
+
+    if( aFiles.size() > 1 && encodedBytes >= PARALLEL_MIN_BYTES && !BS::this_thread::get_pool() )
+    {
+        GetKiCadThreadPool().submit_loop( size_t( 0 ), aFiles.size(), decode ).get();
+    }
+    else
+    {
+        for( size_t i = 0; i < aFiles.size(); ++i )
+            decode( i );
+    }
+
+    for( size_t i = 0; i < results.size(); ++i )
+    {
+        if( results[i] != EMBEDDED_FILES::RETURN_CODE::OK )
+            return i;
+    }
+
+    return aFiles.size();
+}
+
+
 // Parsing method
 void EMBEDDED_FILES_PARSER::ParseEmbedded( EMBEDDED_FILES* aFiles )
 {
@@ -448,7 +493,8 @@ void EMBEDDED_FILES_PARSER::ParseEmbedded( EMBEDDED_FILES* aFiles )
 
     using namespace EMBEDDED_FILES_T;
 
-    std::unique_ptr<EMBEDDED_FILES::EMBEDDED_FILE> file( nullptr );
+    std::unique_ptr<EMBEDDED_FILES::EMBEDDED_FILE>              file( nullptr );
+    std::vector<std::unique_ptr<EMBEDDED_FILES::EMBEDDED_FILE>> parsed;
 
     for( T token = NextTok(); token != T_RIGHT; token = NextTok() )
     {
@@ -462,17 +508,7 @@ void EMBEDDED_FILES_PARSER::ParseEmbedded( EMBEDDED_FILES* aFiles )
 
         if( file )
         {
-            if( !file->compressedEncodedData.empty() )
-            {
-                if( EMBEDDED_FILES::DecompressAndDecode( *file )
-                        != EMBEDDED_FILES::RETURN_CODE::OK )
-                {
-                    THROW_PARSE_ERROR( "Checksum error in embedded file " + file->name,
-                                       CurSource(), CurLine(), CurLineNumber(), CurOffset() );
-                }
-            }
-
-            aFiles->AddFile( file.release() );
+            parsed.push_back( std::move( file ) );
         }
 
         file = std::unique_ptr<EMBEDDED_FILES::EMBEDDED_FILE>( nullptr );
@@ -578,21 +614,17 @@ void EMBEDDED_FILES_PARSER::ParseEmbedded( EMBEDDED_FILES* aFiles )
         }
     }
 
-    // Add the last file in the collection
     if( file )
-    {
-        if( !file->compressedEncodedData.empty() )
-        {
-            if( EMBEDDED_FILES::DecompressAndDecode( *file )
-                    != EMBEDDED_FILES::RETURN_CODE::OK )
-            {
-                THROW_PARSE_ERROR( "Checksum error in embedded file " + file->name,
-                                   CurSource(), CurLine(), CurLineNumber(), CurOffset() );
-            }
-        }
+        parsed.push_back( std::move( file ) );
 
-        aFiles->AddFile( file.release() );
+    if( size_t bad = decodeParsedFiles( parsed ); bad < parsed.size() )
+    {
+        THROW_PARSE_ERROR( "Checksum error in embedded file " + parsed[bad]->name,
+                           CurSource(), CurLine(), CurLineNumber(), CurOffset() );
     }
+
+    for( std::unique_ptr<EMBEDDED_FILES::EMBEDDED_FILE>& parsedFile : parsed )
+        aFiles->AddFile( parsedFile.release() );
 }
 
 

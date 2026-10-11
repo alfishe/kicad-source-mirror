@@ -207,14 +207,23 @@ public:
     {
         rewind( m_fp );
         m_lineNum = 0;
+        m_blockPos = m_blockEnd = 0;
     }
 
     long int FileLength();
     long int CurPos();
 
 protected:
+    /// Read the next line through m_block; only for owned files, a borrowed FILE must not be
+    /// read ahead of the lines returned.
+    char* readBlockLine();
+
     bool    m_iOwn; ///< if I own the file, I'll promise to close it, else not.
     FILE*   m_fp;   ///< I may own this file, but might not.
+
+    std::unique_ptr<char[]> m_block;        ///< read-ahead block of an owned file
+    size_t                  m_blockPos = 0;
+    size_t                  m_blockEnd = 0;
 };
 
 

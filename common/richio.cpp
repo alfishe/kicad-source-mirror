@@ -188,6 +188,7 @@ long int FILE_LINE_READER::FileLength()
     fseek( m_fp, 0, SEEK_END );
     long int fileLength = ftell( m_fp );
     rewind( m_fp );
+    m_blockPos = m_blockEnd = 0;
 
     return fileLength;
 }
@@ -195,13 +196,60 @@ long int FILE_LINE_READER::FileLength()
 
 long int FILE_LINE_READER::CurPos()
 {
-    return ftell( m_fp );
+    return ftell( m_fp ) - static_cast<long int>( m_blockEnd - m_blockPos );
+}
+
+
+char* FILE_LINE_READER::readBlockLine()
+{
+    constexpr size_t BLOCK_SIZE = 1 << 16;
+
+    if( !m_block )
+        m_block = std::make_unique<char[]>( BLOCK_SIZE );
+
+    for( ;; )
+    {
+        if( m_blockPos == m_blockEnd )
+        {
+            m_blockPos = 0;
+            m_blockEnd = fread( m_block.get(), 1, BLOCK_SIZE, m_fp );
+
+            if( m_blockEnd == 0 )
+                break;
+        }
+
+        const char* begin = m_block.get() + m_blockPos;
+        size_t      avail = m_blockEnd - m_blockPos;
+        const char* eol = static_cast<const char*>( memchr( begin, '\n', avail ) );
+        size_t      take = eol ? size_t( eol - begin ) + 1 : avail;
+
+        if( size_t( m_length ) + take > m_maxLineLength )
+            THROW_IO_ERROR( _( "Maximum line length exceeded" ) );
+
+        while( size_t( m_length ) + take > m_capacity )
+            expandCapacity( m_capacity * 2 );
+
+        memcpy( m_line + m_length, begin, take );
+        m_length += take;
+        m_blockPos += take;
+
+        if( eol )
+            break;
+    }
+
+    m_line[ m_length ] = 0;
+    ++m_lineNum;
+
+    return m_length ? m_line : nullptr;
 }
 
 
 char* FILE_LINE_READER::ReadLine()
 {
     m_length = 0;
+
+    if( m_iOwn && m_maxLineLength > 0 )
+        return readBlockLine();
 
     for( ;; )
     {

@@ -562,11 +562,12 @@ L_read:
         cur = start;    // after readLine() since start can change.
 
         // skip leading whitespace
+        const char* sepStart = cur;
+
         while( cur < limit && isSpace( *cur ) )
-        {
-            curSeparator += *cur;
             ++cur;
-        }
+
+        curSeparator.append( sepStart, cur - sepStart );
 
         // If the first non-blank character is #, this line is a comment.
         // Comments cannot follow any other token on the same line.
@@ -597,11 +598,12 @@ L_read:
     else
     {
         // skip leading whitespace
+        const char* sepStart = cur;
+
         while( cur < limit && isSpace( *cur ) )
-        {
-            curSeparator += *cur;
             ++cur;
-        }
+
+        curSeparator.append( sepStart, cur - sepStart );
     }
 
     if( cur >= limit )
@@ -721,8 +723,14 @@ L_read:
                 }
 
                 else
-                    curText += *head++;
+                {
+                    const char* run = head;
 
+                    while( head < limit && *head != '\\' && *head != '"' )
+                        ++head;
+
+                    curText.append( run, head - run );
+                }
             }   // while
 
             // L_unterminated:
@@ -805,8 +813,11 @@ L_read:
     curText.clear();
 
     head = cur;
+
     while( head<limit && !isSep( *head ) )
-        curText += *head++;
+        ++head;
+
+    curText.assign( cur, head - cur );
 
     if( isNumber( curText.c_str(), curText.c_str() + curText.size() ) )
     {

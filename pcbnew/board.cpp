@@ -3116,6 +3116,16 @@ FOOTPRINT* BOARD::FindFootprintByPath( const KIID_PATH& aPath ) const
 
 PAD* BOARD::FindPadByUuid( const KIID& aUuid ) const
 {
+    if( aUuid == niluuid )
+        return nullptr;
+
+    // Read-only probe: GetCachedItemById() would drop stale entries, this may run off the main thread
+    if( auto it = m_itemByIdCache.find( aUuid ); it != m_itemByIdCache.end() && it->second
+            && it->second->Type() == PCB_PAD_T && it->second->m_Uuid == aUuid )
+    {
+        return static_cast<PAD*>( it->second );
+    }
+
     for( FOOTPRINT* footprint : m_footprints )
     {
         if( PAD* pad = footprint->FindPadByUuid( aUuid ) )
