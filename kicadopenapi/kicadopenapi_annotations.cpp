@@ -98,6 +98,9 @@ struct ANNOTATION
     bool              orphaned = false;
     std::optional<BOX2D> lastTarget;        ///< resolved boxes from the last redraw
     std::optional<BOX2D> lastTo;
+    std::string       attach;               ///< item the point anchors and the area move with
+    VECTOR2D          attachOrigin;         ///< that item's centre when attached
+    VECTOR2D          attachShift;          ///< its move since then, as of the last redraw
 };
 
 
@@ -268,6 +271,26 @@ void LAYER::drawAnnotation( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const BOX
     std::optional<BOX2D> target = resolve( aNote.target );
     std::optional<BOX2D> to = resolve( aNote.to );
 
+    // points and the area attached to an item move with it
+    if( !aNote.attach.empty() )
+    {
+        ANCHOR item;
+        item.set = true;
+        item.isItem = true;
+        item.ref = aNote.attach;
+
+        if( std::optional<BOX2D> box = resolve( item ) )
+            aNote.attachShift = box->Centre() - aNote.attachOrigin;
+        else
+            aNote.orphaned = true;
+
+        if( target && !aNote.target.isItem )
+            target->Move( aNote.attachShift );
+
+        if( to && !aNote.to.isItem )
+            to->Move( aNote.attachShift );
+    }
+
     if( aNote.target.set && aNote.target.isItem && !target )
         aNote.orphaned = true;
     else if( target )
@@ -358,6 +381,9 @@ void LAYER::drawAnnotation( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const BOX
     else if( ( aNote.kind == "region" || aNote.kind == "spotlight" ) && ( aNote.area || target ) )
     {
         BOX2D box = aNote.area ? *aNote.area : *target;
+
+        if( aNote.area && !aNote.attach.empty() )
+            box.Move( aNote.attachShift );
 
         if( !aNote.area )
             box.Inflate( 10 * aPx );
@@ -541,7 +567,7 @@ void LAYER::Redraw()
         }
 
         animating |= note.pulse;
-        following |= note.target.isItem || note.to.isItem;
+        following |= note.target.isItem || note.to.isItem || !note.attach.empty();
     }
 
     std::erase_if( m_annotations, []( const ANNOTATION& n ) { return n.orphaned && n.onOrphan == "remove"; } );
@@ -661,6 +687,54 @@ std::string applyFields( const KOPENAPI_ANNOTATION_HOST& aHost, const nlohmann::
         aNote.area = box;
     }
 
+    if( aSpec.contains( "attach" ) )
+    {
+        const std::string ref = aSpec["attach"].is_string() ? aSpec["attach"].get<std::string>() : std::string();
+
+        // detached or attached elsewhere: what the old item moved stays where it is now
+        if( !aNote.attach.empty() && !aSpec.contains( "target" ) && !aSpec.contains( "to" ) && !aSpec.contains( "area" ) )
+        {
+            if( aNote.target.set && !aNote.target.isItem )
+                aNote.target.point += aNote.attachShift;
+
+            if( aNote.to.set && !aNote.to.isItem )
+                aNote.to.point += aNote.attachShift;
+
+            if( aNote.area )
+                aNote.area->Move( aNote.attachShift );
+
+            aNote.attachShift = VECTOR2D( 0, 0 );
+        }
+
+        if( ref.empty() )
+        {
+            aNote.attach.clear();
+        }
+        else
+        {
+            std::optional<BOX2I> box = aHost.resolve ? aHost.resolve( ref ) : std::nullopt;
+
+            if( !box )
+                return "attach: no item '" + ref + "' (a reference or a uuid on the shown sheet / board)";
+
+            aNote.attach = ref;
+            aNote.attachOrigin = VECTOR2D( box->Centre() );
+            aNote.attachShift = VECTOR2D( 0, 0 );
+        }
+    }
+
+    // new absolute points of an attached annotation: they keep their offset from where the item
+    // is now
+    if( !aSpec.contains( "attach" ) && !aNote.attach.empty()
+        && ( aSpec.contains( "target" ) || aSpec.contains( "to" ) || aSpec.contains( "area" ) ) )
+    {
+        if( std::optional<BOX2I> box = aHost.resolve ? aHost.resolve( aNote.attach ) : std::nullopt )
+        {
+            aNote.attachOrigin = VECTOR2D( box->Centre() );
+            aNote.attachShift = VECTOR2D( 0, 0 );
+        }
+    }
+
     if( aSpec.contains( "text" ) )
         aNote.text = aSpec.value( "text", std::string() ).substr( 0, MAX_TEXT );
 
@@ -706,6 +780,7 @@ nlohmann::json describe( const KOPENAPI_ANNOTATION_HOST& aHost, const ANNOTATION
              { "text", aNote.text },
              { "group", aNote.group },
              { "orphaned", aNote.orphaned },
+             { "attach", aNote.attach.empty() ? nlohmann::json() : nlohmann::json( aNote.attach ) },
              { "target_box_mm", box( aNote.lastTarget ) },
              { "to_box_mm", box( aNote.lastTo ) } };
 }
@@ -837,6 +912,7 @@ const nlohmann::json& KopenapiAnnotateSchema()
             "target":{"description":"anchor: a reference (U1, R5), a uuid, or [x, y] mm; items are followed when they move"},
             "to":{"description":"arrow end: an anchor"},
             "area":{"type":"array","items":{"type":"number"},"description":"region / spotlight: [x0, y0, x1, y1] mm"},
+            "attach":{"type":"string","description":"a reference or uuid: [x, y] anchors and the area keep their offset from this item and move with it (drags, moves); empty detaches; the item deleted orphans the annotation"},
             "text":{"type":"string"},
             "number":{"type":"integer","description":"step number"},
             "color":{"type":"string","description":"#RRGGBB (default orange)"},
