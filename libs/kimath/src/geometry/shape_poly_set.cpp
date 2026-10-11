@@ -31,6 +31,7 @@
 #include <istream>                           // for operator<<, operator>>
 #include <limits>                            // for numeric_limits
 #include <map>
+#include <numeric>
 #include <memory>
 #include <set>
 #include <string> // for char_traits, operator!=
@@ -40,6 +41,7 @@
 #include <utility> // for swap, move
 #include <vector>
 #include <array>
+#include <atomic>
 
 #include <clipper2/clipper.h>
 #include <geometry/geometry_predicates.h>
@@ -3453,6 +3455,427 @@ bool SHAPE_POLY_SET::IsTriangulationUpToDate() const
 }
 
 
+namespace
+{
+
+/// @brief Cuts a simple polygon (a ring of points) into strips without adding a point: along a few
+/// vertical lines, every stretch of a line inside the polygon (between two consecutive crossings)
+/// becomes a chord between the nearest vertices of the two crossed edges. A chord is kept only if it
+/// is a diagonal (inside at both ends, touching no edge of the ring) and crosses no kept chord; the
+/// kept chords split the ring into pieces whose boundary edges are the ring's own edges.
+class CHORD_SPLITTER
+{
+public:
+    CHORD_SPLITTER( const std::vector<VECTOR2I>& aPoints ) : m_pts( aPoints ) {}
+
+    /// @brief Pieces as lists of point indices (one piece, the whole ring, if no chord was kept)
+    std::vector<std::vector<uint32_t>> Split( int aStrips )
+    {
+        const size_t n = m_pts.size();
+        double       area2 = 0.0;
+        BOX2I        bbox;
+
+        for( size_t k = 0; k < n; ++k )
+        {
+            area2 += (double) m_pts[k].x * m_pts[( k + 1 ) % n].y - (double) m_pts[( k + 1 ) % n].x * m_pts[k].y;
+            bbox.Merge( m_pts[k] );
+        }
+
+        std::vector<uint32_t> all( n );
+
+        for( size_t k = 0; k < n; ++k )
+            all[k] = (uint32_t) k;
+
+        if( area2 == 0.0 || bbox.GetWidth() <= 0 )
+            return { all };
+
+        m_orient = area2 > 0 ? 1 : -1;
+        buildGrid( bbox );
+
+        // vertex count per column: the lines go where the points split evenly
+        std::vector<int> xs( n );
+
+        for( size_t k = 0; k < n; ++k )
+            xs[k] = m_pts[k].x;
+
+        std::sort( xs.begin(), xs.end() );
+
+        std::vector<std::pair<uint32_t, uint32_t>> chords;
+
+        for( int ss = 1; ss < aStrips; ++ss )
+        {
+            const int64_t line = (int64_t) xs[n * ss / aStrips] + 1;   // not through a vertex column
+            addChords( line, chords );
+        }
+
+        return splitRing( all, chords );
+    }
+
+private:
+    void buildGrid( const BOX2I& aBox )
+    {
+        const size_t n = m_pts.size();
+        m_box = aBox;
+        m_cell = std::max( 1.0, std::sqrt( std::max( 1.0, (double) aBox.GetWidth() * aBox.GetHeight() / std::max<size_t>( 1, n / 8 ) ) ) );
+        m_nx = std::clamp( (int) ( aBox.GetWidth() / m_cell ) + 1, 1, 4096 );
+        m_ny = std::clamp( (int) ( aBox.GetHeight() / m_cell ) + 1, 1, 4096 );
+        m_cells.assign( (size_t) m_nx * m_ny, {} );
+        m_stamp.assign( n, 0 );
+
+        for( size_t k = 0; k < n; ++k )
+        {
+            const VECTOR2I& c = m_pts[k];
+            const VECTOR2I& d = m_pts[( k + 1 ) % n];
+            forCells( std::min( c.x, d.x ), std::min( c.y, d.y ), std::max( c.x, d.x ), std::max( c.y, d.y ),
+                      [&]( std::vector<uint32_t>& aCell ) { aCell.push_back( (uint32_t) k ); } );
+        }
+    }
+
+    int cx( int64_t x ) const { return std::clamp( (int) ( ( x - m_box.GetX() ) / m_cell ), 0, m_nx - 1 ); }
+    int cy( int64_t y ) const { return std::clamp( (int) ( ( y - m_box.GetY() ) / m_cell ), 0, m_ny - 1 ); }
+
+    template <typename F>
+    void forCells( int64_t x0, int64_t y0, int64_t x1, int64_t y1, F&& f )
+    {
+        for( int gy = cy( y0 ); gy <= cy( y1 ); ++gy )
+            for( int gx = cx( x0 ); gx <= cx( x1 ); ++gx )
+                f( m_cells[(size_t) gy * m_nx + gx] );
+    }
+
+    static bool between( const VECTOR2I& a, const VECTOR2I& b, const VECTOR2I& p )
+    {
+        return std::min( a.x, b.x ) <= p.x && p.x <= std::max( a.x, b.x )
+               && std::min( a.y, b.y ) <= p.y && p.y <= std::max( a.y, b.y );
+    }
+
+    static bool segmentsTouch( const VECTOR2I& a, const VECTOR2I& b, const VECTOR2I& c, const VECTOR2I& d )
+    {
+        const int o1 = KIGEOM::OrientationSign( a, b, c );
+        const int o2 = KIGEOM::OrientationSign( a, b, d );
+        const int o3 = KIGEOM::OrientationSign( c, d, a );
+        const int o4 = KIGEOM::OrientationSign( c, d, b );
+
+        if( o1 * o2 < 0 && o3 * o4 < 0 )
+            return true;
+
+        return ( o1 == 0 && between( a, b, c ) ) || ( o2 == 0 && between( a, b, d ) )
+               || ( o3 == 0 && between( c, d, a ) ) || ( o4 == 0 && between( c, d, b ) );
+    }
+
+    /// @brief u -> w leaves vertex u into the polygon's inside
+    bool inCone( size_t u, const VECTOR2I& w ) const
+    {
+        const size_t    n = m_pts.size();
+        const VECTOR2I& a = m_pts[u];
+        const VECTOR2I& prev = m_pts[( u + n - 1 ) % n];
+        const VECTOR2I& next = m_pts[( u + 1 ) % n];
+        auto sgn = [&]( const VECTOR2I& p, const VECTOR2I& q, const VECTOR2I& t )
+        {
+            return KIGEOM::OrientationSign( p, q, t ) * m_orient;
+        };
+
+        if( sgn( a, next, prev ) >= 0 )   // convex corner
+            return sgn( a, w, prev ) > 0 && sgn( w, a, next ) > 0;
+
+        return !( sgn( a, w, next ) >= 0 && sgn( w, a, prev ) >= 0 );
+    }
+
+    /// @brief u -> v is a diagonal of the ring: inside at both ends, no other edge or vertex touched
+    bool isDiagonal( size_t u, size_t v )
+    {
+        const size_t n = m_pts.size();
+
+        if( u == v || ( u + 1 ) % n == v || ( v + 1 ) % n == u )
+            return false;
+
+        const VECTOR2I& a = m_pts[u];
+        const VECTOR2I& b = m_pts[v];
+
+        if( a == b || !inCone( u, b ) || !inCone( v, a ) )
+            return false;
+
+        const uint32_t gen = ++m_generation;
+        bool           ok = true;
+
+        forCells( std::min( a.x, b.x ), std::min( a.y, b.y ), std::max( a.x, b.x ), std::max( a.y, b.y ),
+                  [&]( std::vector<uint32_t>& aCell )
+                  {
+                      for( uint32_t k : aCell )
+                      {
+                          if( !ok || m_stamp[k] == gen )
+                              continue;
+
+                          m_stamp[k] = gen;
+
+                          const size_t k1 = ( k + 1 ) % n;
+
+                          if( k == u || k == v || k1 == u || k1 == v )
+                          {
+                              // the edges at the ends: only another vertex lying on the diagonal matters
+                              for( size_t e : { (size_t) k, k1 } )
+                              {
+                                  if( e != u && e != v && m_pts[e] != a && m_pts[e] != b
+                                      && KIGEOM::OrientationSign( a, b, m_pts[e] ) == 0 && between( a, b, m_pts[e] ) )
+                                  {
+                                      ok = false;
+                                  }
+                              }
+
+                              continue;
+                          }
+
+                          if( segmentsTouch( a, b, m_pts[k], m_pts[k1] ) )
+                              ok = false;
+                      }
+                  } );
+
+        return ok;
+    }
+
+    void addChords( int64_t aLine, std::vector<std::pair<uint32_t, uint32_t>>& aChords )
+    {
+        const size_t n = m_pts.size();
+
+        struct CROSSING
+        {
+            double   y;
+            uint32_t edge;
+        };
+
+        std::vector<CROSSING> crossings;
+
+        for( size_t k = 0; k < n; ++k )
+        {
+            const VECTOR2I& p = m_pts[k];
+            const VECTOR2I& q = m_pts[( k + 1 ) % n];
+
+            if( ( p.x < aLine ) == ( q.x < aLine ) )
+                continue;
+
+            const double t = (double) ( aLine - p.x ) / (double) ( q.x - p.x );
+            crossings.push_back( { p.y + t * ( q.y - p.y ), (uint32_t) k } );
+        }
+
+        std::sort( crossings.begin(), crossings.end(),
+                   []( const CROSSING& x, const CROSSING& y ) { return x.y < y.y; } );
+
+        for( size_t c = 0; c + 1 < crossings.size(); c += 2 )
+        {
+            const uint32_t e1 = crossings[c].edge;
+            const uint32_t e2 = crossings[c + 1].edge;
+
+            if( crossings[c + 1].y - crossings[c].y <= 0.0 )
+                continue;   // a hole bridge: both sides at the same place
+
+            // the ends of the two edges, nearest to the line first
+            auto byDistance = [&]( uint32_t e )
+            {
+                std::array<uint32_t, 2> ends = { e, (uint32_t) ( ( e + 1 ) % n ) };
+
+                if( std::abs( m_pts[ends[1]].x - aLine ) < std::abs( m_pts[ends[0]].x - aLine ) )
+                    std::swap( ends[0], ends[1] );
+
+                return ends;
+            };
+
+            bool kept = false;
+
+            for( uint32_t u : byDistance( e1 ) )
+            {
+                for( uint32_t v : byDistance( e2 ) )
+                {
+                    if( kept || !isDiagonal( u, v ) )
+                        continue;
+
+                    bool crossesChord = false;
+
+                    for( const auto& [cu, cv] : aChords )
+                    {
+                        if( cu == u || cu == v || cv == u || cv == v )
+                            continue;
+
+                        if( segmentsTouch( m_pts[u], m_pts[v], m_pts[cu], m_pts[cv] ) )
+                            crossesChord = true;
+                    }
+
+                    if( !crossesChord )
+                    {
+                        aChords.emplace_back( u, v );
+                        kept = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// @brief The ring cut by non-crossing diagonals (point indices) into pieces
+    static std::vector<std::vector<uint32_t>> splitRing( const std::vector<uint32_t>& aRing,
+                                                         const std::vector<std::pair<uint32_t, uint32_t>>& aChords )
+    {
+        std::vector<std::vector<uint32_t>> rings = { aRing };
+
+        for( const auto& [u, v] : aChords )
+        {
+            for( size_t r = 0; r < rings.size(); ++r )
+            {
+                std::vector<uint32_t>& ring = rings[r];
+                auto                   iu = std::find( ring.begin(), ring.end(), u );
+                auto                   iv = std::find( ring.begin(), ring.end(), v );
+
+                if( iu == ring.end() || iv == ring.end() )
+                    continue;
+
+                const size_t          pu = iu - ring.begin();
+                const size_t          pv = iv - ring.begin();
+                const size_t          m = ring.size();
+                std::vector<uint32_t> first, second;
+
+                for( size_t k = pu;; k = ( k + 1 ) % m )
+                {
+                    first.push_back( ring[k] );
+
+                    if( k == pv )
+                        break;
+                }
+
+                for( size_t k = pv;; k = ( k + 1 ) % m )
+                {
+                    second.push_back( ring[k] );
+
+                    if( k == pu )
+                        break;
+                }
+
+                ring = std::move( first );
+                rings.push_back( std::move( second ) );
+                break;
+            }
+        }
+
+        return rings;
+    }
+
+    const std::vector<VECTOR2I>&       m_pts;
+    int                                m_orient = 1;
+    BOX2I                              m_box;
+    double                             m_cell = 1;
+    int                                m_nx = 1, m_ny = 1;
+    std::vector<std::vector<uint32_t>> m_cells;
+    std::vector<uint32_t>              m_stamp;
+    uint32_t                           m_generation = 0;
+};
+
+} // namespace
+
+
+/// @brief Triangulate a large outline in parallel pieces with exactly the coverage of one
+/// triangulation: the outline is simplified and decimated once (as for a single triangulation), cut
+/// into strips along diagonals between its own vertices (no point added, every boundary edge kept),
+/// and the pieces are ear-clipped without further simplification. A large plane with holes cannot
+/// be cut by the balanced partitioner, and ear clipping grows faster than linearly with the size.
+/// @return false if no cut was found or a piece failed (aDest unchanged: the caller falls back to the
+/// single triangulation)
+static bool triangulateInPieces( const SHAPE_LINE_CHAIN& aOutline, int aForOutline,
+                                 std::vector<std::unique_ptr<SHAPE_POLY_SET::TRIANGULATED_POLYGON>>& aDest,
+                                 const SHAPE_POLY_SET::TASK_SUBMITTER& aSubmitter )
+{
+    using TRI = SHAPE_POLY_SET::TRIANGULATED_POLYGON;
+
+    std::vector<VECTOR2I> ring;
+
+    {
+        TRI                   scratch( aForOutline );
+        POLYGON_TRIANGULATION prep( scratch );
+
+        if( !prep.PreparedRing( aOutline, ring ) )
+            return false;
+    }
+
+    constexpr size_t kPointsPerPiece = 10000;
+    const int        strips = (int) std::clamp<size_t>( ring.size() / kPointsPerPiece, 2, 32 );
+
+    std::vector<std::vector<uint32_t>> pieces = CHORD_SPLITTER( ring ).Split( strips );
+
+    if( pieces.size() < 2 )
+        return false;
+
+    const size_t count = pieces.size();
+
+    struct STATE
+    {
+        explicit STATE( size_t aCount ) :
+                claimed( new std::atomic<bool>[aCount] ),
+                done( new std::atomic<bool>[aCount] ),
+                ok( new std::atomic<bool>[aCount] ),
+                results( aCount )
+        {
+            for( size_t ii = 0; ii < aCount; ++ii )
+            {
+                claimed[ii].store( false );
+                done[ii].store( false );
+                ok[ii].store( false );
+            }
+        }
+
+        std::unique_ptr<std::atomic<bool>[]> claimed;
+        std::unique_ptr<std::atomic<bool>[]> done;
+        std::unique_ptr<std::atomic<bool>[]> ok;
+        std::vector<std::unique_ptr<TRI>>    results;
+    };
+
+    auto state = std::make_shared<STATE>( count );
+
+    // ring and pieces are captured by reference: every piece is claimed and finished before returning
+    auto run =
+            [state, &ring, &pieces, aForOutline]( size_t aPiece )
+            {
+                if( state->claimed[aPiece].exchange( true ) )
+                    return;
+
+                SHAPE_LINE_CHAIN chain;
+
+                for( uint32_t idx : pieces[aPiece] )
+                    chain.Append( ring[idx], true );
+
+                chain.SetClosed( true );
+                state->results[aPiece] = std::make_unique<TRI>( aForOutline );
+
+                POLYGON_TRIANGULATION tess( *state->results[aPiece] );
+                tess.SetRingPrepared( true );
+                state->ok[aPiece].store( tess.TesselatePolygon( chain, nullptr ) );
+                state->done[aPiece].store( true, std::memory_order_release );
+            };
+
+    for( size_t ii = 0; ii < count; ++ii )
+        aSubmitter( [run, ii]() { run( ii ); } );
+
+    for( size_t ii = 0; ii < count; ++ii )
+        run( ii );
+
+    bool allOk = true;
+
+    for( size_t ii = 0; ii < count; ++ii )
+    {
+        while( !state->done[ii].load( std::memory_order_acquire ) )
+            std::this_thread::yield();
+
+        allOk = allOk && state->ok[ii].load();
+    }
+
+
+    if( !allOk )
+        return false;
+
+    for( std::unique_ptr<TRI>& result : state->results )
+    {
+        if( result->GetTriangleCount() > 0 )
+            aDest.push_back( std::move( result ) );
+    }
+
+    return true;
+}
+
+
 void SHAPE_POLY_SET::cacheTriangulation( bool aSimplify,
                                          std::vector<std::unique_ptr<TRIANGULATED_POLYGON>>* aHintData,
                                          const TASK_SUBMITTER& aSubmitter )
@@ -3494,6 +3917,18 @@ void SHAPE_POLY_SET::cacheTriangulation( bool aSimplify,
 
                     {
                         const SHAPE_LINE_CHAIN& outline = polySet.Polygon( 0 ).front();
+
+                        constexpr int kTiledFromPoints = 20000;
+
+                        if( taskSubmitter && !hintData && outline.PointCount() >= kTiledFromPoints
+                            && triangulateInPieces( outline, forOutline, dest, taskSubmitter ) )
+                        {
+                            polySet.DeletePolygon( 0 );
+                            index++;
+                            triangulationValid = true;
+                            continue;
+                        }
+
                         TRIANGULATED_POLYGON    partitionScratch( forOutline );
                         POLYGON_TRIANGULATION   partitioner( partitionScratch );
                         size_t                  partitionLeaves = partitioner.suggestedPartitionLeafCount( outline );

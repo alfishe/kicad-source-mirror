@@ -1377,7 +1377,9 @@ void BOARD::CacheTriangulation( PROGRESS_REPORTER* aReporter, const std::vector<
     SHAPE_POLY_SET::TASK_SUBMITTER submitter =
             [&tp]( std::function<void()> aTask )
             {
-                tp.detach_task( std::move( aTask ) );
+                // the leaves of a large polygon first: queued behind the remaining zone tasks
+                // they would wait until their own parent task had done them one by one
+                tp.detach_task( std::move( aTask ), BS::pr::high );
             };
 
     // Per layer, not per zone; a plane repeated across inner layers is otherwise one thread
@@ -1389,6 +1391,14 @@ void BOARD::CacheTriangulation( PROGRESS_REPORTER* aReporter, const std::vector<
         for( PCB_LAYER_ID layer : zone->GetFilledLayers() )
             work.emplace_back( zone, layer );
     }
+
+    // the largest fills first: they bound the wall time
+    std::stable_sort( work.begin(), work.end(),
+                      []( const std::pair<ZONE*, PCB_LAYER_ID>& a, const std::pair<ZONE*, PCB_LAYER_ID>& b )
+                      {
+                          return a.first->GetFilledPolysList( a.second )->FullPointCount()
+                                 > b.first->GetFilledPolysList( b.second )->FullPointCount();
+                      } );
 
     std::vector<std::future<size_t>> returns;
 

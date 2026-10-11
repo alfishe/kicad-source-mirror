@@ -201,6 +201,19 @@ public:
 
         m_vertices_original_size = m_vertices.size();
 
+        if( m_ringPrepared )
+        {
+            firstVertex->updateList();
+
+            auto retval = earcutList( firstVertex );
+
+            if( retval && triangulationRefineEnabled() )
+                m_result.Refine();
+
+            m_vertices.clear();
+            return retval;
+        }
+
         if( VERTEX* simplified = simplifyList( firstVertex ) )
             firstVertex = simplified;
 
@@ -238,6 +251,50 @@ public:
             return retval;
         }
     }
+
+    /// @brief The ring ear clipping works on for aPoly: simplified and decimated exactly as
+    /// TesselatePolygon does. Pieces cut from it along diagonals (between its own vertices) and
+    /// triangulated with SetRingPrepared( true ) cover the same area with the same boundary edges.
+    /// @return false when aPoly is degenerate (fewer than three vertices left)
+    bool PreparedRing( const SHAPE_LINE_CHAIN& aPoly, std::vector<VECTOR2I>& aRing )
+    {
+        aRing.clear();
+        m_bbox = aPoly.BBox();
+
+        if( !m_bbox.GetWidth() || !m_bbox.GetHeight() )
+            return false;
+
+        VERTEX* firstVertex = createList( aPoly );
+
+        if( !firstVertex || firstVertex->prev == firstVertex->next )
+        {
+            m_vertices.clear();
+            return false;
+        }
+
+        if( VERTEX* simplified = simplifyList( firstVertex ) )
+            firstVertex = simplified;
+
+        firstVertex->updateList();
+
+        if( VERTEX* decimated = decimateList( firstVertex ) )
+            firstVertex = decimated;
+
+        VERTEX* v = firstVertex;
+
+        do
+        {
+            aRing.emplace_back( static_cast<int>( std::lround( v->x ) ), static_cast<int>( std::lround( v->y ) ) );
+            v = v->next;
+        } while( v != firstVertex );
+
+        m_vertices.clear();
+        return aRing.size() >= 3;
+    }
+
+    /// @brief The polygon given to TesselatePolygon is a piece of a PreparedRing: no simplification
+    /// or decimation again
+    void SetRingPrepared( bool aPrepared ) { m_ringPrepared = aPrepared; }
 
     std::vector<double> PartitionAreaFractionsForTesting( const SHAPE_LINE_CHAIN& aPoly,
                                                           size_t aTargetLeaves ) const
@@ -1552,6 +1609,7 @@ private:
     }
 
 private:
+    bool                                  m_ringPrepared = false;
     size_t                                m_vertices_original_size;
     SHAPE_POLY_SET::TRIANGULATED_POLYGON& m_result;
 };
