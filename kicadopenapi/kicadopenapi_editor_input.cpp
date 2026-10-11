@@ -1,5 +1,6 @@
 /// @file kicadopenapi_editor_input.cpp
 /// @brief Editor actions and injected input for the API (see kicadopenapi_editor_input.h).
+#include <kicadopenapi_annotations.h>
 #include <kicadopenapi_editor_input.h>
 #include <kicadopenapi_keepalive.h>
 
@@ -258,10 +259,17 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
 
         g_pointerMm = VECTOR2D( aStep[verb][0].get<double>(), aStep[verb][1].get<double>() );
 
+        const VECTOR2D world( aTarget.scale->mmToIU( g_pointerMm.x ), aTarget.scale->mmToIU( g_pointerMm.y ) );
+        auto           show = [&]( KOPENAPI_POINTER_EVENT aEvent )
+        {
+            KopenapiAnnotatePointer( aTarget.frame, world, aEvent );
+        };
+
         // the pointer arrives first, as a real one does before its button changes
         injectPointer( aTarget, client, mods );
         aTarget.controls->PointerMoved();
         dispatch( aTarget, INPUT::KIND::POINTER, 0, mods );
+        show( KOPENAPI_POINTER_EVENT::MOVE );
 
         const std::string v = verb;
 
@@ -270,6 +278,7 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
             g_heldButtons |= button;
             injectPointer( aTarget, client, mods );
             dispatch( aTarget, INPUT::KIND::BUTTON_DOWN, button, mods );
+            show( KOPENAPI_POINTER_EVENT::DOWN );
         }
 
         if( v == "up" || v == "click" || v == "dclick" )
@@ -277,6 +286,7 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
             g_heldButtons &= ~button;
             injectPointer( aTarget, client, mods );
             dispatch( aTarget, INPUT::KIND::BUTTON_UP, button, mods );
+            show( KOPENAPI_POINTER_EVENT::UP );
         }
 
         if( v == "dclick" )   // the toolkit's order: down, up, double click (held), up
@@ -284,9 +294,11 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
             g_heldButtons |= button;
             injectPointer( aTarget, client, mods );
             dispatch( aTarget, INPUT::KIND::BUTTON_DCLICK, button, mods );
+            show( KOPENAPI_POINTER_EVENT::DCLICK );
             g_heldButtons &= ~button;
             injectPointer( aTarget, client, mods );
             dispatch( aTarget, INPUT::KIND::BUTTON_UP, button, mods );
+            show( KOPENAPI_POINTER_EVENT::UP );
         }
 
         return {};
@@ -305,6 +317,16 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
         input.modifiers = mods;
         input.heldButtons = g_heldButtons;
         aTarget.dispatcher->DispatchInput( input );
+
+        wxString shown = wxString::FromUTF8( aStep["key"].get<std::string>() );
+
+        for( auto [bit, name] : { std::pair{ MD_CTRL, "Ctrl+" }, std::pair{ MD_ALT, "Alt+" }, std::pair{ MD_SHIFT, "Shift+" } } )
+        {
+            if( mods & bit )
+                shown = wxString( name ) + shown;
+        }
+
+        KopenapiAnnotatePointer( aTarget.frame, VECTOR2D(), KOPENAPI_POINTER_EVENT::KEY, shown );
         pump();
         return {};
     }

@@ -238,6 +238,24 @@ struct VIEW_OVERLAY::COMMAND_GLYPH_SIZE : public VIEW_OVERLAY::COMMAND
 };
 
 
+struct VIEW_OVERLAY::COMMAND_TEXT_JUSTIFY : public VIEW_OVERLAY::COMMAND
+{
+    COMMAND_TEXT_JUSTIFY( GR_TEXT_H_ALIGN_T aHorizontal, GR_TEXT_V_ALIGN_T aVertical ) :
+        m_horizontal( aHorizontal ),
+        m_vertical( aVertical )
+    { }
+
+    virtual void Execute( VIEW* aView ) const override
+    {
+        aView->GetGAL()->SetHorizontalJustify( m_horizontal );
+        aView->GetGAL()->SetVerticalJustify( m_vertical );
+    }
+
+    GR_TEXT_H_ALIGN_T m_horizontal;
+    GR_TEXT_V_ALIGN_T m_vertical;
+};
+
+
 struct VIEW_OVERLAY::COMMAND_BITMAP_TEXT : public VIEW_OVERLAY::COMMAND
 {
     COMMAND_BITMAP_TEXT( const wxString& aText, const VECTOR2I& aPosition,
@@ -392,6 +410,12 @@ void VIEW_OVERLAY::SetIsFill( bool aIsFillEnabled )
 void VIEW_OVERLAY::SetGlyphSize( const VECTOR2I& aSize )
 {
     m_commands.push_back( new COMMAND_GLYPH_SIZE( aSize ) );
+}
+
+
+void VIEW_OVERLAY::SetTextJustify( GR_TEXT_H_ALIGN_T aHorizontal, GR_TEXT_V_ALIGN_T aVertical )
+{
+    m_commands.push_back( new COMMAND_TEXT_JUSTIFY( aHorizontal, aVertical ) );
 }
 
 

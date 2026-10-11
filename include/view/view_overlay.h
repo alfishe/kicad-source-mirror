@@ -24,6 +24,7 @@
 
 #include <gal/color4d.h>
 #include <gal/gal.h>
+#include <font/text_attributes.h>
 #include <view/view_item.h>
 #include <vector>
 #include <deque>
@@ -69,6 +70,7 @@ public:
     struct COMMAND_POINT_POLYLINE;
 
     struct COMMAND_GLYPH_SIZE;
+    struct COMMAND_TEXT_JUSTIFY;
     struct COMMAND_BITMAP_TEXT;
 
     void Clear();
@@ -101,6 +103,9 @@ public:
     void SetFillColor( const COLOR4D& aColor );
     void SetStrokeColor( const COLOR4D& aColor );
     void SetGlyphSize( const VECTOR2I& aSize );
+
+    /// @brief Justification of the following BitmapText() calls
+    void SetTextJustify( GR_TEXT_H_ALIGN_T aHorizontal, GR_TEXT_V_ALIGN_T aVertical );
     void SetLineWidth( double aLineWidth );
 
     const COLOR4D& GetStrokeColor() const { return m_strokeColor; }
