@@ -520,6 +520,7 @@ OPENGL_GAL::~OPENGL_GAL()
 
         // Groups free their vertices through the cached manager, so they must go before it does
         m_groups.clear();
+        clearGroupIndex();
 
         delete m_compositor;
 
@@ -3022,6 +3023,23 @@ int OPENGL_GAL::BeginGroup()
     int                          groupNumber = getNewGroupNumber();
     m_groups.insert( std::make_pair( groupNumber, newItem ) );
 
+    if( m_groupIndex.empty() )
+        m_groupIndexBase = groupNumber;
+
+    if( unsigned( groupNumber ) < m_groupIndexBase )
+    {
+        rebuildGroupIndex();
+    }
+    else
+    {
+        const size_t slot = unsigned( groupNumber ) - m_groupIndexBase;
+
+        if( slot >= m_groupIndex.size() )
+            m_groupIndex.resize( slot + 1, nullptr );
+
+        m_groupIndex[slot] = newItem.get();
+    }
+
     return groupNumber;
 }
 
@@ -3035,35 +3053,74 @@ void OPENGL_GAL::EndGroup()
 
 void OPENGL_GAL::DrawGroup( int aGroupNumber )
 {
-    auto group = m_groups.find( aGroupNumber );
-
-    if( group != m_groups.end() )
-        m_cachedManager->DrawItem( *group->second );
+    if( VERTEX_ITEM* group = findGroup( aGroupNumber ) )
+        m_cachedManager->DrawItem( *group );
 }
 
 
 void OPENGL_GAL::ChangeGroupColor( int aGroupNumber, const COLOR4D& aNewColor )
 {
-    auto group = m_groups.find( aGroupNumber );
-
-    if( group != m_groups.end() )
-        m_cachedManager->ChangeItemColor( *group->second, aNewColor );
+    if( VERTEX_ITEM* group = findGroup( aGroupNumber ) )
+        m_cachedManager->ChangeItemColor( *group, aNewColor );
 }
 
 
 void OPENGL_GAL::ChangeGroupDepth( int aGroupNumber, int aDepth )
 {
-    auto group = m_groups.find( aGroupNumber );
-
-    if( group != m_groups.end() )
-        m_cachedManager->ChangeItemDepth( *group->second, aDepth );
+    if( VERTEX_ITEM* group = findGroup( aGroupNumber ) )
+        m_cachedManager->ChangeItemDepth( *group, aDepth );
 }
 
 
 void OPENGL_GAL::DeleteGroup( int aGroupNumber )
 {
     // Frees memory in the container as well
-    m_groups.erase( aGroupNumber );
+    if( m_groups.erase( aGroupNumber ) == 0 )
+        return;
+
+    m_groupIndex[unsigned( aGroupNumber ) - m_groupIndexBase] = nullptr;
+
+    // sparse window: rebuilt, but at most once per halving of the live groups (a rebuild that
+    // cannot narrow the window must not repeat on every delete)
+    if( m_groupIndex.size() > 2 * m_groups.size() + 65536
+        && ( m_groupIndexRebuildBelow == 0 || m_groups.size() <= m_groupIndexRebuildBelow ) )
+        rebuildGroupIndex();
+}
+
+
+void OPENGL_GAL::rebuildGroupIndex()
+{
+    m_groupIndex.clear();
+    m_groupIndexRebuildBelow = m_groups.size() / 2;
+
+    if( m_groups.empty() )
+        return;
+
+    unsigned int lo = std::numeric_limits<unsigned int>::max();
+    unsigned int hi = 0;
+
+    for( const auto& [number, item] : m_groups )
+    {
+        lo = std::min( lo, number );
+        hi = std::max( hi, number );
+    }
+
+    m_groupIndexBase = lo;
+    m_groupIndex.assign( size_t( hi - lo ) + 1, nullptr );
+
+    for( const auto& [number, item] : m_groups )
+        m_groupIndex[number - lo] = item.get();
+
+    m_groupIndex.shrink_to_fit();
+}
+
+
+void OPENGL_GAL::clearGroupIndex()
+{
+    m_groupIndex.clear();
+    m_groupIndex.shrink_to_fit();
+    m_groupIndexBase = 0;
+    m_groupIndexRebuildBelow = 0;
 }
 
 
@@ -3075,6 +3132,7 @@ bool OPENGL_GAL::DeleteAllGroups()
     // the container is emptied first, so the groups' items free nothing one by one
     m_cachedManager->Clear();
     m_groups.clear();
+    clearGroupIndex();
     return true;
 }
 
@@ -3088,6 +3146,7 @@ void OPENGL_GAL::ClearCache()
     m_bitmapCache = std::make_unique<GL_BITMAP_CACHE>();
 
     m_groups.clear();
+    clearGroupIndex();
 
     if( m_isInitialized )
         m_cachedManager->Clear();

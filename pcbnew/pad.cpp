@@ -2812,7 +2812,6 @@ double PAD::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 {
     PCB_PAINTER&         painter = static_cast<PCB_PAINTER&>( *aView->GetPainter() );
     PCB_RENDER_SETTINGS& renderSettings = *painter.GetSettings();
-    const BOARD*         board = GetBoard();
 
     // Reviewing a drill drawing with pads hidden is normal, so the symbols answer to the
     // map's own layer rather than to the pads meta control
@@ -2848,6 +2847,8 @@ double PAD::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 
     if( IsHoleLayer( aLayer ) )
     {
+        const BOARD* board = GetBoard();
+
         if( !board->GetVisibleLayers().Intersects( board->GetEnabledLayers(), LSET::PhysicalLayersMask() ) )
             return LOD_HIDE;
     }
@@ -2861,7 +2862,8 @@ double PAD::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
         }
         else
         {
-            const LSET& enabled = board->GetEnabledLayers();
+            const BOARD* board = GetBoard();
+            const LSET&  enabled = board->GetEnabledLayers();
             bool        flashed = false;
 
             // Hide netnames unless pad is flashed to a visible layer

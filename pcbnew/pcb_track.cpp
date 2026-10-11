@@ -2560,7 +2560,6 @@ double PCB_VIA::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 {
     PCB_PAINTER*         painter = static_cast<PCB_PAINTER*>( aView->GetPainter() );
     PCB_RENDER_SETTINGS* renderSettings = painter->GetSettings();
-    const BOARD*         board = GetBoard();
 
     // Reviewing a drill drawing with vias hidden is normal, so the symbols answer to the
     // map's own layer rather than to the vias meta control
@@ -2596,7 +2595,8 @@ double PCB_VIA::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 
     if( IsHoleLayer( aLayer ) )
     {
-        const LSET& visible = board ? board->GetVisibleLayers() : LSET::AllLayersMask();
+        const BOARD* board = GetBoard();
+        const LSET&  visible = board ? board->GetVisibleLayers() : LSET::AllLayersMask();
         const LSET& enabled = board ? board->GetEnabledLayers() : LSET::AllLayersMask();
 
         // Show a through via's hole if any physical layer is shown, a blind or micro via's hole
@@ -2624,20 +2624,29 @@ double PCB_VIA::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
         }
         else
         {
-            LSET visible;
+            const BOARD* board = GetBoard();
+            bool         flashed = false;
 
-            if( board )
+            if( !board )
             {
-                visible = board->GetVisibleLayers();
-                visible &= board->GetEnabledLayers();
+                flashed = FlashLayer( LSET::AllLayersMask() );
             }
             else
             {
-                visible = LSET::AllLayersMask();
+                const LSET& enabled = board->GetEnabledLayers();
+
+                for( PCB_LAYER_ID layer : board->GetVisibleLayers() )
+                {
+                    if( enabled.Contains( layer ) && FlashLayer( layer ) )
+                    {
+                        flashed = true;
+                        break;
+                    }
+                }
             }
 
             // Hide netnames unless pad is flashed to a visible layer
-            if( !FlashLayer( visible ) )
+            if( !flashed )
                 return LOD_HIDE;
         }
 

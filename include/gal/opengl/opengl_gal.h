@@ -417,6 +417,28 @@ private:
 
     GROUPS_MAP              m_groups;           ///< Stores information about VBO objects (groups)
     unsigned int            m_groupCounter;     ///< Counter used for generating keys for groups
+
+    /// Groups by number in the window [m_groupIndexBase, m_groupIndexBase + size): the draw path
+    /// finds a group without a hash lookup. Numbers are never reused, so the window is rebuilt
+    /// when it gets sparse (more than about twice the live groups)
+    std::vector<VERTEX_ITEM*> m_groupIndex;
+    unsigned int              m_groupIndexBase = 0;
+    size_t                    m_groupIndexRebuildBelow = 0; ///< live groups that allow the next rebuild (0: any)
+
+    /// @brief The group's vertex item, or nullptr
+    VERTEX_ITEM* findGroup( int aGroupNumber ) const
+    {
+        const unsigned int n = unsigned( aGroupNumber ) - m_groupIndexBase;
+        return aGroupNumber >= 0 && unsigned( aGroupNumber ) >= m_groupIndexBase && n < m_groupIndex.size()
+                       ? m_groupIndex[n]
+                       : nullptr;
+    }
+
+    /// @brief Index window rebuilt over the live groups
+    void rebuildGroupIndex();
+
+    /// @brief All groups gone: empty window
+    void clearGroupIndex();
     VERTEX_MANAGER*         m_currentManager;   ///< Currently used VERTEX_MANAGER (for storing
                                                 ///< VERTEX_ITEMs).
     VERTEX_MANAGER*         m_cachedManager;    ///< Container for storing cached VERTEX_ITEMs

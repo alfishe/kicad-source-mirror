@@ -29,7 +29,10 @@
 #include <functional>
 #include <limits>
 #include <queue>
+#include <type_traits>
 #include <utility>
+
+#include <core/prefetch.h>
 #include <vector>
 
 #include <geometry/rtree/rtree_node.h>
@@ -1750,6 +1753,14 @@ private:
 
         if( aNode->IsLeaf() )
         {
+            // the visitor reads every object found: their first cache lines are requested at once
+            // instead of one miss after another
+            if constexpr( std::is_pointer_v<DATATYPE> )
+            {
+                for( uint32_t m = mask; m; m &= m - 1 )
+                    KiPrefetch( aNode->data[std::countr_zero( m )] );
+            }
+
             while( mask )
             {
                 int i = std::countr_zero( mask );

@@ -271,8 +271,8 @@ double PCB_FIELD::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
     KIGFX::PCB_PAINTER*         painter = static_cast<KIGFX::PCB_PAINTER*>( aView->GetPainter() );
     KIGFX::PCB_RENDER_SETTINGS* renderSettings = painter->GetSettings();
 
-    if( GetParentFootprint() && GetParentFootprint()->IsSelected()
-            && renderSettings->m_ForceShowFieldsWhenFPSelected )
+    if( renderSettings->m_ForceShowFieldsWhenFPSelected && GetParentFootprint()
+            && GetParentFootprint()->IsSelected() )
     {
         return LOD_SHOW;
     }
