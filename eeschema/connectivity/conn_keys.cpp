@@ -25,6 +25,15 @@
 
 namespace SCH_CONNECTIVITY
 {
+void SESSION_KEYS::RankValues()
+{
+    if( m_instanceRanks.size() != m_instances.Size() )
+        m_instances.RankInto( m_instanceRanks );
+
+    if( m_nameRanks.size() != m_names.Size() )
+        m_names.RankInto( m_nameRanks );
+}
+
 NODE_ID SESSION_KEYS::InternNode( NODE_KEY aKey )
 {
     if( auto* name = std::get_if<NAME_KEY>( &aKey ) )
@@ -106,7 +115,7 @@ bool SESSION_KEYS::Less( const ITEM_KEY& aLeft, const ITEM_KEY& aRight ) const
     if( std::optional<bool> order = unsetIdLess( aLeft.inst, aRight.inst ) )
         return *order;
 
-    return Instance( aLeft.inst ) < Instance( aRight.inst );
+    return instanceLess( aLeft.inst, aRight.inst );
 }
 
 bool SESSION_KEYS::Less( const RECORD_KEY& aLeft, const RECORD_KEY& aRight ) const
@@ -117,7 +126,7 @@ bool SESSION_KEYS::Less( const RECORD_KEY& aLeft, const RECORD_KEY& aRight ) con
     if( std::optional<bool> order = unsetIdLess( aLeft.inst, aRight.inst ) )
         return *order;
 
-    return Instance( aLeft.inst ) < Instance( aRight.inst );
+    return instanceLess( aLeft.inst, aRight.inst );
 }
 
 bool SESSION_KEYS::Less( const RECORD_NODE& aLeft, const RECORD_NODE& aRight ) const
@@ -135,7 +144,7 @@ bool SESSION_KEYS::Less( const NAME_KEY& aLeft, const NAME_KEY& aRight ) const
         if( std::optional<bool> order = unsetIdLess( aLeft.inst, aRight.inst ) )
             return *order;
 
-        return Instance( aLeft.inst ) < Instance( aRight.inst );
+        return instanceLess( aLeft.inst, aRight.inst );
     }
 
     if( aLeft.text != aRight.text )

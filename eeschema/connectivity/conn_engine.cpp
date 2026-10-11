@@ -44,7 +44,9 @@ void ENGINE::Update( const SCH_SHEET_LIST& aPaths, uint64_t aTextEpoch, const BU
             clearStages( true );
 
         const auto frame = m_inputs.Capture( aPaths, aTextEpoch );
+        m_keys.RankValues();
         m_records.Update( frame, m_inputs, aAliases );
+        m_keys.RankValues();
         const auto& records = m_records.Records();
         const auto  bundles = m_partitioner.Build( RecordNodes( records, KIND::BUNDLE, m_keys ), m_keys );
         m_bundles.UpdateBatch( bundles, [&]( const auto& missing )

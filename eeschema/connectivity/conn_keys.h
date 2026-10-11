@@ -165,8 +165,18 @@ public:
     size_t           NodeCount() const { return m_nodes.Size(); }
     bool             NameLess( NAME_ID aLeft, NAME_ID aRight ) const
     {
+        if( aLeft < m_nameRanks.size() && aRight < m_nameRanks.size() )
+            return m_nameRanks[aLeft] < m_nameRanks[aRight];
+
         return m_names.Value( aLeft ).utf8 < m_names.Value( aRight ).utf8;
     }
+
+    /**
+     * Rank the interned instances and names in value order so the comparisons above compare integers
+     * instead of paths and strings. Call on the main thread after interning and before worker stages;
+     * ids interned later still compare by value.
+     */
+    void RankValues();
 
     bool Less( const ITEM_KEY& aLeft, const ITEM_KEY& aRight ) const;
     bool Less( const RECORD_KEY& aLeft, const RECORD_KEY& aRight ) const;
@@ -217,6 +227,16 @@ private:
         const VALUE& Value( uint32_t aId ) const { return *m_values.at( aId ); }
         size_t       Size() const { return m_values.size(); }
 
+        /// @brief The position of every id in the map's value order, indexed by id (ordered maps only).
+        void RankInto( std::vector<uint32_t>& aRanks ) const
+        {
+            aRanks.assign( m_values.size(), 0 );
+            uint32_t rank = 0;
+
+            for( const auto& [value, id] : m_ids )
+                aRanks[id] = rank++;
+        }
+
     private:
         MAP m_ids;
         // Both ordered and unordered maps keep key addresses stable during growth.
@@ -235,8 +255,18 @@ private:
         size_t operator()( const NODE_KEY& aKey ) const;
     };
 
+    bool instanceLess( INST_ID aLeft, INST_ID aRight ) const
+    {
+        if( aLeft < m_instanceRanks.size() && aRight < m_instanceRanks.size() )
+            return m_instanceRanks[aLeft] < m_instanceRanks[aRight];
+
+        return Instance( aLeft ) < Instance( aRight );
+    }
+
     INTERN_TABLE<KIID_PATH>     m_instances;
     INTERN_TABLE<INTERNED_NAME> m_names;
+    std::vector<uint32_t>       m_instanceRanks; ///< By INST_ID, see RankValues()
+    std::vector<uint32_t>       m_nameRanks;     ///< By NAME_ID, see RankValues()
 
     INTERN_TABLE<NODE_KEY, std::unordered_map<NODE_KEY, uint32_t, NODE_HASH>> m_nodes;
 };
