@@ -430,6 +430,13 @@ public:
 
     void IncrementTimeStamp();
 
+    /**
+     * Drop the caches DRC builds (item and zone R-trees, expression result caches) without
+     * marking the board changed.  Every user rebuilds or falls back when they are absent; a long
+     * lived process calls this after a DRC so the memory does not stay until the next one.
+     */
+    void ReleaseDRCCaches();
+
     int GetTimeStamp() const { return m_timeStamp.load( std::memory_order_acquire ); }
 
     /**
@@ -1900,6 +1907,9 @@ private:
     friend class PCB_EDIT_FRAME;
 
 private:
+    /// Clear the derived caches (m_CachesMutex held for writing)
+    void clearCachesLocked();
+
     /// the max distance between 2 end point to see them connected when building the board outlines
     int                 m_outlinesChainingEpsilon;
 

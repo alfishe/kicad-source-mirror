@@ -451,7 +451,20 @@ void BOARD::IncrementTimeStamp()
     std::unique_lock<std::shared_mutex> writeLock( m_CachesMutex );
 
     m_timeStamp++;
+    clearCachesLocked();
+}
 
+
+void BOARD::ReleaseDRCCaches()
+{
+    std::unique_lock<std::shared_mutex> writeLock( m_CachesMutex );
+
+    clearCachesLocked();
+}
+
+
+void BOARD::clearCachesLocked()
+{
     m_footprintCourtyardIndex.reset();
 
     if( !m_IntersectsAreaCache.Empty()

@@ -24,6 +24,7 @@
 #include <project_pcb.h>
 #include <tool/tool_manager.h>
 #include <tools/zone_filler_tool.h>
+#include <zone.h>
 
 
 static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
@@ -115,6 +116,17 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     DRC_REPORT     report( board, EDA_UNITS::MM, markers, unconnected, parity );
     nlohmann::json full = report.GetJsonReport();
+
+    // The R-trees and result caches DRC built stay until the next DRC otherwise (~230 MB on a
+    // large board); every other user rebuilds or falls back
+    board->ReleaseDRCCaches();
+
+    // The editor draws the solder mask bridges after a DRC; headless nothing does
+    if( !toolManager->GetView() && board->m_SolderMaskBridges )
+    {
+        for( PCB_LAYER_ID layer : { F_Mask, B_Mask } )
+            board->m_SolderMaskBridges->GetFill( layer )->RemoveAllContours();
+    }
 
     std::vector<nlohmann::json> violations;
 

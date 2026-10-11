@@ -104,6 +104,8 @@ private:
 
     void reportMaskApertureBridges();
 
+    void releaseRunData();
+
     void collectBridge( BOARD_ITEM* aItemA, BOARD_ITEM* aItemB, BOARD_ITEM* aItemC,
                         const VECTOR2I& aPos, PCB_LAYER_ID aLayer );
 
@@ -1016,6 +1018,16 @@ void DRC_TEST_PROVIDER_SOLDER_MASK::reportMaskApertureBridges()
 }
 
 
+void DRC_TEST_PROVIDER_SOLDER_MASK::releaseRunData()
+{
+    m_fullSolderMaskRTree.reset();
+    m_itemTree.reset();
+    std::unordered_map<PTR_PTR_CACHE_KEY, LSET>().swap( m_checkedPairs );
+    std::unordered_map<PTR_LAYER_CACHE_KEY, std::vector<MASK_APERTURE_ITEM>>().swap( m_maskApertureItems );
+    decltype( m_bridgeViolations )().swap( m_bridgeViolations );
+}
+
+
 bool DRC_TEST_PROVIDER_SOLDER_MASK::Run()
 {
     if( m_drcEngine->IsErrorLimitExceeded( DRCE_SILK_MASK_CLEARANCE )
@@ -1026,6 +1038,16 @@ bool DRC_TEST_PROVIDER_SOLDER_MASK::Run()
     }
 
     m_board = m_drcEngine->GetBoard();
+
+    // The trees and pair maps are rebuilt on every run: free them when the run ends, cancelled
+    // or not, instead of keeping them in this static provider until the next DRC
+    struct RELEASE_ON_EXIT
+    {
+        DRC_TEST_PROVIDER_SOLDER_MASK* provider;
+
+        ~RELEASE_ON_EXIT() { provider->releaseRunData(); }
+    } releaseOnExit{ this };
+
     m_webWidth = m_board->GetDesignSettings().m_SolderMaskMinWidth;
     m_maxError = m_board->GetDesignSettings().m_MaxError;
     m_largestClearance = 0;
