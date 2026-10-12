@@ -41,6 +41,7 @@
 #include <gp_GTrsf.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <Interface_Static.hxx>
+#include "kopenapi_occ.h"
 #include <STEPCAFControl_Reader.hxx>
 #include <STEPCAFControl_Writer.hxx>
 #include <TDF_LabelSequence.hxx>
@@ -153,18 +154,22 @@ bool shortenStep( const fs::path& aIn, const fs::path& aOut, const glm::mat4& aM
 {
     Handle( XCAFApp_Application ) app = XCAFApp_Application::GetApplication();
     Handle( TDocStd_Document ) doc;
-    app->NewDocument( "MDTV-XCAF", doc );
 
-    STEPCAFControl_Reader reader;
-    reader.SetColorMode( true );
-    reader.SetNameMode( true );
-    reader.SetLayerMode( true );
-
-    if( reader.ReadFile( aIn.string().c_str() ) != IFSelect_RetDone || !reader.Transfer( doc ) )
     {
-        aError = "cannot read " + aIn.string();
-        app->Close( doc );
-        return false;
+        std::lock_guard<std::mutex> lock( KopenapiStepTranslatorMutex() );
+        app->NewDocument( "MDTV-XCAF", doc );
+
+        STEPCAFControl_Reader reader;
+        reader.SetColorMode( true );
+        reader.SetNameMode( true );
+        reader.SetLayerMode( true );
+
+        if( reader.ReadFile( aIn.string().c_str() ) != IFSelect_RetDone || !reader.Transfer( doc ) )
+        {
+            aError = "cannot read " + aIn.string();
+            app->Close( doc );
+            return false;
+        }
     }
 
     // footprint frame -> model frame
@@ -343,15 +348,20 @@ bool shortenStep( const fs::path& aIn, const fs::path& aOut, const glm::mat4& aM
     std::error_code ec;
     fs::create_directories( aOut.parent_path(), ec );
 
-    STEPCAFControl_Writer writer;
-    writer.SetColorMode( true );
-    writer.SetNameMode( true );
-    writer.SetLayerMode( true );
-    Interface_Static::SetCVal( "write.step.unit", "MM" );
+    bool ok = false;
 
-    const bool ok = writer.Transfer( doc, STEPControl_AsIs ) && writer.Write( aOut.string().c_str() ) == IFSelect_RetDone;
+    {
+        std::lock_guard<std::mutex> lock( KopenapiStepTranslatorMutex() );
 
-    app->Close( doc );
+        STEPCAFControl_Writer writer;
+        writer.SetColorMode( true );
+        writer.SetNameMode( true );
+        writer.SetLayerMode( true );
+        Interface_Static::SetCVal( "write.step.unit", "MM" );
+
+        ok = writer.Transfer( doc, STEPControl_AsIs ) && writer.Write( aOut.string().c_str() ) == IFSelect_RetDone;
+        app->Close( doc );
+    }
 
     if( !ok )
         aError = "cannot write " + aOut.string();

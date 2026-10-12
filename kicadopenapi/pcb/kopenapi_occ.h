@@ -6,6 +6,7 @@
 #include <glm/glm.hpp>
 
 #include <filesystem>
+#include <mutex>
 #include <string>
 
 
@@ -31,5 +32,10 @@ struct KOPENAPI_MODEL_GEOMETRY
 /// @param aBody false measures the box only (bodyBottom / hasLeads unset)
 KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aStep, const glm::mat4& aMatrix,
                                                bool aBody = true );
+
+/// @brief The STEP translators (readers, writers, Interface_Static parameters, the XCAF
+/// application's documents) keep global state: every STEP read / write and XCAF document
+/// creation / close of the kicadopenapi holds this; the geometry work between them runs in parallel
+std::mutex& KopenapiStepTranslatorMutex();
 
 #endif

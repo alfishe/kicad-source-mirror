@@ -195,10 +195,8 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
     TopoDS_Shape model;
 
     {
-        // the STEP translator keeps global state: one reader at a time, the geometry after it runs
-        // in parallel
-        static std::mutex readMutex;
-        std::lock_guard<std::mutex> lock( readMutex );
+        // one translator at a time, the geometry after it runs in parallel
+        std::lock_guard<std::mutex> lock( KopenapiStepTranslatorMutex() );
 
         STEPControl_Reader reader;
 
@@ -396,4 +394,11 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
     g_cache[key.str()] = g;
     saveCache();
     return g;
+}
+
+
+std::mutex& KopenapiStepTranslatorMutex()
+{
+    static std::mutex s_mutex;
+    return s_mutex;
 }
