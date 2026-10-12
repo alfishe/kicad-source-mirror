@@ -696,7 +696,7 @@ class REMOTE_BAR : public wxFrame
 public:
     explicit REMOTE_BAR( wxTopLevelWindow* aParent ) :
             wxFrame( aParent, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize,
-                     wxFRAME_FLOAT_ON_PARENT | wxFRAME_NO_TASKBAR | wxBORDER_NONE | wxFRAME_TOOL_WINDOW ),
+                     KIPLATFORM::UI::DecorationWindowStyle() ),
             m_parent( aParent )
     {
         m_panel = new wxPanel( this );

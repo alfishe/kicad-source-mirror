@@ -208,6 +208,13 @@ nlohmann::json windowJson( wxTopLevelWindow* aWindow, KIWAY* aKiway )
     if( KIPLATFORM::UI::IsChildWindow( aWindow ) )
         out["child_window"] = true;
 
+    // the window system's order (0 = frontmost of the application) and level, where it tells
+    if( int order = -1, level = 0; KIPLATFORM::UI::GetWindowStacking( aWindow, order, level ) )
+    {
+        out["stack_order"] = order;
+        out["level"] = level;
+    }
+
     return out;
 }
 

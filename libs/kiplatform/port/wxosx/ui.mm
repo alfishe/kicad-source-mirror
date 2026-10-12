@@ -24,6 +24,7 @@
 
 #include <vector>
 
+#include <wx/frame.h>
 #include <wx/dialog.h>
 #include <wx/image.h>
 #include <wx/nonownedwnd.h>
@@ -145,6 +146,37 @@ void KIPLATFORM::UI::DetachChildWindow( wxNonOwnedWindow* aWindow )
 
     if( theWindow && [theWindow parentWindow] )
         [[theWindow parentWindow] removeChildWindow:theWindow];
+}
+
+
+long KIPLATFORM::UI::DecorationWindowStyle()
+{
+    return wxFRAME_NO_TASKBAR | wxBORDER_NONE;
+}
+
+
+bool KIPLATFORM::UI::GetWindowStacking( wxNonOwnedWindow* aWindow, int& aOrder, int& aLevel )
+{
+    NSWindow* theWindow = aWindow->GetWXWindow();
+
+    if( !theWindow )
+        return false;
+
+    aLevel = (int) [theWindow level];
+    aOrder = -1;
+
+    NSArray<NSWindow*>* ordered = [NSApp orderedWindows];
+
+    for( NSUInteger i = 0; i < [ordered count]; ++i )
+    {
+        if( [ordered objectAtIndex:i] == theWindow )
+        {
+            aOrder = (int) i;
+            break;
+        }
+    }
+
+    return true;
 }
 
 

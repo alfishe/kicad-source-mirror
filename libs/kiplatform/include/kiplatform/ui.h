@@ -102,6 +102,22 @@ namespace KIPLATFORM
          */
         bool IsChildWindow( wxNonOwnedWindow* aWindow );
 
+        /**
+         * Window styles for a decoration window that AttachChildWindow keeps on its parent: where
+         * the window system has child windows (macOS) a plain borderless window (a floating /
+         * tool window would order itself above every window); elsewhere one that floats on its
+         * owner.
+         */
+        long DecorationWindowStyle();
+
+        /**
+         * Where a window is in the window system's order: aOrder 0 = frontmost window of the
+         * application (-1 unknown), aLevel the window level (macOS; 0 elsewhere).
+         *
+         * @return false where the window system does not tell
+         */
+        bool GetWindowStacking( wxNonOwnedWindow* aWindow, int& aOrder, int& aLevel );
+
         /*
          * An ugly hack to fix an issue on OSX: cmd+c closes the dialog instead of copying the
          * text if a button with wxID_CANCEL is used in a wxStdDialogButtonSizer created by

@@ -20,6 +20,7 @@
 
 #include <kiplatform/ui.h>
 
+#include <wx/frame.h>
 #include <wx/choice.h>
 #include <wx/dataview.h>
 #include <wx/dialog.h>
@@ -280,6 +281,18 @@ void KIPLATFORM::UI::DetachChildWindow( wxNonOwnedWindow* aWindow )
 
 
 bool KIPLATFORM::UI::IsChildWindow( wxNonOwnedWindow* aWindow )
+{
+    return false;
+}
+
+
+long KIPLATFORM::UI::DecorationWindowStyle()
+{
+    return wxFRAME_FLOAT_ON_PARENT | wxFRAME_NO_TASKBAR | wxBORDER_NONE | wxFRAME_TOOL_WINDOW;
+}
+
+
+bool KIPLATFORM::UI::GetWindowStacking( wxNonOwnedWindow* aWindow, int& aOrder, int& aLevel )
 {
     return false;
 }
