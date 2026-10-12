@@ -15,14 +15,17 @@
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-// kicadopenapi: undo marks at the undo limit
+// kicadopenapi: undo marks at the undo limit, timed-out calls
 
 #include <boost/test/unit_test.hpp>
 
+#include <kicadopenapi_call_ticket.h>
 #include <kicadopenapi_undo.h>
 #include <undo_redo_container.h>
 
+#include <atomic>
 #include <memory>
+#include <thread>
 #include <vector>
 
 
@@ -209,6 +212,35 @@ BOOST_AUTO_TEST_CASE( MarkSurvivesUndoAndRedoButNotABranch )
     frame.Undo();
     frame.Edit();   // a different command where the mark's was
     BOOST_CHECK( !KopenapiUndoTarget( frame, mark, why ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( TicketExactlyOneSideWins )
+{
+    {
+        KOPENAPI_CALL_TICKET t;
+        BOOST_CHECK( t.Abandon() );
+        BOOST_CHECK( !t.Start() );   // a withdrawn call never runs
+        BOOST_CHECK_EQUAL( t.State(), KOPENAPI_CALL_TICKET::ABANDONED );
+    }
+    {
+        KOPENAPI_CALL_TICKET t;
+        BOOST_CHECK( t.Start() );
+        BOOST_CHECK( !t.Abandon() );   // a started call cannot be withdrawn
+        BOOST_CHECK_EQUAL( t.State(), KOPENAPI_CALL_TICKET::STARTED );
+    }
+
+    // racing: whichever wins, the other loses, every time
+    for( int i = 0; i < 2000; ++i )
+    {
+        KOPENAPI_CALL_TICKET t;
+        std::atomic<bool>    started{ false }, abandoned{ false };
+        std::thread          a( [&] { started = t.Start(); } );
+        std::thread          b( [&] { abandoned = t.Abandon(); } );
+        a.join();
+        b.join();
+        BOOST_REQUIRE( started != abandoned );
+    }
 }
 
 

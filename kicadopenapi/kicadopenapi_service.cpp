@@ -18,6 +18,8 @@
 #include <wx/utils.h>
 #include <fstream>
 #include <future>
+
+#include "kicadopenapi_call_ticket.h"
 #include <cmath>
 #include <mutex>
 #include <deque>
@@ -182,8 +184,10 @@ public:
 
 /// @brief Run aFn on the main (GUI/event-loop) thread and wait for its result on the calling HTTP
 /// worker.  The main thread never waits on HTTP threads.  If the service stops or the call
-/// exceeds CALL_TIMEOUT, the worker returns an error; a late closure still completes safely
-/// because it only touches shared state.
+/// exceeds its timeout, the worker returns an error, and what the caller is told matches what
+/// happens: a call that had not started is withdrawn and never runs ("not started"); one that had
+/// started runs to its end and its effect stands ("still running", see edit_log).  A late
+/// closure only touches shared state.
 static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAlive,
                                   const std::function<void()>&             aWaker,
                                   std::function<KOPENAPI_RESULT()>         aFn,
@@ -195,9 +199,18 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
     auto promise = std::make_shared<std::promise<KOPENAPI_RESULT>>();
     std::future<KOPENAPI_RESULT> future = promise->get_future();
 
+    auto ticket = std::make_shared<KOPENAPI_CALL_TICKET>();
+
     auto job = std::make_shared<std::function<void()>>(
-            [aAlive, promise, fn = std::move( aFn )]()
+            [aAlive, promise, ticket, fn = std::move( aFn )]()
             {
+                // The caller gave up before the call started: it must not run now
+                if( !ticket->Start() )
+                {
+                    promise->set_value( KOPENAPI_RESULT::Error( 504, "withdrawn before it started" ) );
+                    return;
+                }
+
                 if( !aAlive->load() )
                 {
                     promise->set_value( KOPENAPI_RESULT::Error( 503, "service stopping" ) );
@@ -229,11 +242,27 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
 
     while( future.wait_for( WAIT_SLICE ) != std::future_status::ready )
     {
-        if( !aAlive->load() )
-            return KOPENAPI_RESULT::Error( 503, "service stopping" );
+        const bool stopping = !aAlive->load();
 
-        if( std::chrono::steady_clock::now() > deadline )
-            return KOPENAPI_RESULT::Error( 504, "main thread did not complete the call in time" );
+        if( !stopping && std::chrono::steady_clock::now() <= deadline )
+            continue;
+
+        if( ticket->Abandon() )
+        {
+            return stopping ? KOPENAPI_RESULT::Error( 503, "service stopping; the call did not start and will not run" )
+                            : KOPENAPI_RESULT::Error( 504, "the main thread was busy for "
+                                                                   + std::to_string( aTimeout.count() )
+                                                                   + " s; the call did not start and will not run "
+                                                                     "(safe to retry)" );
+        }
+
+        // Started: it runs to its end on the main thread and its changes stand
+        return stopping ? KOPENAPI_RESULT::Error( 503, "service stopping while the call was running; it may "
+                                                       "have completed (edit_log)" )
+                        : KOPENAPI_RESULT::Error( 504, "the call started but did not finish within "
+                                                               + std::to_string( aTimeout.count() )
+                                                               + " s; it is still running and its changes "
+                                                                 "will stand: check edit_log before retrying" );
     }
 
     return future.get();
