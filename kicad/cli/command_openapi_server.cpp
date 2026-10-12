@@ -139,8 +139,17 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
                 waker.Wake();
             } );
 
+    // armed before the service starts: a /shutdown or a signal during the preload below is kept
+    g_openApiExitRequested.store( false );
+    auto oldSigInt = std::signal( SIGINT, openApiSignalHandler );
+    auto oldSigTerm = std::signal( SIGTERM, openApiSignalHandler );
+
     if( !service.Start( m_argParser.get<int>( ARG_PORT ) ) )
+    {
+        std::signal( SIGINT, oldSigInt );
+        std::signal( SIGTERM, oldSigTerm );
         return EXIT_CODES::ERR_UNKNOWN;
+    }
 
     // a document given on the command line opens before the first request is served: a board or
     // schematic, or both of a project
@@ -172,6 +181,8 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
         {
             wxFprintf( stderr, _( "Cannot open %s: give a .kicad_pcb, .kicad_sch or .kicad_pro\n" ), preload );
             service.Stop();
+            std::signal( SIGINT, oldSigInt );
+            std::signal( SIGTERM, oldSigTerm );
             return EXIT_CODES::ERR_ARGS;
         }
 
@@ -194,10 +205,6 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
     // Readiness for humans and scripts; the bridge uses the discovery file instead
     std::printf( "kicadopenapi headless server listening at http://127.0.0.1:%d\n", service.Port() );
     std::fflush( stdout );
-
-    g_openApiExitRequested.store( false );
-    auto oldSigInt = std::signal( SIGINT, openApiSignalHandler );
-    auto oldSigTerm = std::signal( SIGTERM, openApiSignalHandler );
 
     while( !g_openApiExitRequested.load() )
     {

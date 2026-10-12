@@ -46,7 +46,9 @@ private:
 };
 
 /// @brief Waits for an adapter's background library load with the UI alive
-KICOMMON_API void KopenapiWaitLibraries( LIBRARY_MANAGER_ADAPTER* aAdapter );
+/// (at most aTimeoutS: a load that stops progressing is left behind with a journal entry, the call
+/// goes on with the libraries loaded so far instead of the UI waiting forever)
+KICOMMON_API void KopenapiWaitLibraries( LIBRARY_MANAGER_ADAPTER* aAdapter, int aTimeoutS = 300 );
 
 
 /// @brief Progress reporter for KiCad algorithms that accept one (zone filler, DRC): no dialog,

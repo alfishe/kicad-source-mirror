@@ -6,6 +6,7 @@
 
 #include <wx/app.h>
 #include <wx/evtloop.h>
+#include <wx/log.h>
 #include <wx/thread.h>
 #include <wx/eventfilter.h>
 #include <wx/toplevel.h>
@@ -63,13 +64,22 @@ void KopenapiRunOffMain( const std::function<void()>& aWork )
 }
 
 
-void KopenapiWaitLibraries( LIBRARY_MANAGER_ADAPTER* aAdapter )
+void KopenapiWaitLibraries( LIBRARY_MANAGER_ADAPTER* aAdapter, int aTimeoutS )
 {
     if( !aAdapter )
         return;
 
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds( aTimeoutS );
+
     for( std::optional<float> p = aAdapter->AsyncLoadProgress(); p && *p < 1.0f; p = aAdapter->AsyncLoadProgress() )
     {
+        if( std::chrono::steady_clock::now() > deadline )
+        {
+            wxLogMessage( "libraries: the background load is at %.0f %% after %d s; going on without the rest",
+                          *p * 100.0, aTimeoutS );
+            return;   // BlockUntilLoaded would wait for it on the main thread
+        }
+
         KopenapiKeepUiAlive();
         std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
     }
