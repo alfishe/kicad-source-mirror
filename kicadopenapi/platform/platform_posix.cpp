@@ -15,6 +15,8 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <mutex>
+#include <set>
 #include <thread>
 
 extern char** environ;
@@ -44,15 +46,68 @@ void SetEnvPosix(const std::string& name, const std::string& value)
     setenv(name.c_str(), value.c_str(), 1);
 }
 
+namespace
+{
+/// Children started by the spawn functions here: only these are collected by ProcessAlive (a child
+/// someone else in the process started keeps its exit status for its owner)
+std::mutex      g_spawnedMutex;
+std::set<pid_t> g_spawned;
+
+void rememberSpawned(pid_t pid)
+{
+    std::lock_guard<std::mutex> lock(g_spawnedMutex);
+    g_spawned.insert(pid);
+}
+
+/// The child gets only the descriptors the file actions set up (stdin / stdout / stderr): an
+/// inherited listening socket or file would outlive us in it (a port kept busy after we exit)
+short closeInheritedDescriptors(posix_spawn_file_actions_t& actions)
+{
+#if defined(__APPLE__)
+    (void) actions;
+    return POSIX_SPAWN_CLOEXEC_DEFAULT;
+#elif defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34))
+    posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+    return 0;
+#else
+    (void) actions;
+    return 0;
+#endif
+}
+} // namespace
+
 bool ProcessAlivePosix(long pid)
 {
-    // Our own exited children stay zombies (kill() succeeds on them) until collected
-    int status = 0;
-    if (waitpid(static_cast<pid_t>(pid), &status, WNOHANG) == static_cast<pid_t>(pid))
+    const pid_t p = static_cast<pid_t>(pid);
+    bool        ours = false;
+
     {
-        return false;
+        std::lock_guard<std::mutex> lock(g_spawnedMutex);
+        ours = g_spawned.count(p) > 0;
     }
-    return kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+
+    if (ours)
+    {
+        // our exited children stay zombies (kill() succeeds on them) until collected
+        int status = 0;
+        if (waitpid(p, &status, WNOHANG) == p)
+        {
+            std::lock_guard<std::mutex> lock(g_spawnedMutex);
+            g_spawned.erase(p);
+            return false;
+        }
+    }
+    else
+    {
+        // another owner's child: look, do not collect
+        siginfo_t info{};
+        if (waitid(P_PID, static_cast<id_t>(p), &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == p)
+        {
+            return false;
+        }
+    }
+
+    return kill(p, 0) == 0 || errno == EPERM;
 }
 
 long SpawnDetachedPosix(const std::vector<std::string>& argv, const std::filesystem::path& logFile,
@@ -76,7 +131,7 @@ long SpawnDetachedPosix(const std::vector<std::string>& argv, const std::filesys
     sigaddset(&defaults, SIGTERM);
     sigaddset(&defaults, SIGHUP);
     posix_spawnattr_setsigdefault(&attr, &defaults);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | closeInheritedDescriptors(actions));
     posix_spawnattr_setpgroup(&attr, 0);
 
     std::vector<char*> args;
@@ -97,6 +152,7 @@ long SpawnDetachedPosix(const std::vector<std::string>& argv, const std::filesys
         error = "cannot start " + argv[0] + ": " + std::strerror(rc);
         return 0;
     }
+    rememberSpawned(pid);
     return static_cast<long>(pid);
 }
 
@@ -148,7 +204,7 @@ PipeProcess SpawnWithStdinPipePosix(const std::vector<std::string>& argv, const 
     sigaddset(&defaults, SIGTERM);
     sigaddset(&defaults, SIGHUP);
     posix_spawnattr_setsigdefault(&attr, &defaults);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | closeInheritedDescriptors(actions));
     posix_spawnattr_setpgroup(&attr, 0);
 
     std::vector<char*> args;
@@ -171,6 +227,7 @@ PipeProcess SpawnWithStdinPipePosix(const std::vector<std::string>& argv, const 
         error = "cannot start " + argv[0] + ": " + std::strerror(rc);
         return {};
     }
+    rememberSpawned(pid);
     return {static_cast<long>(pid), static_cast<std::intptr_t>(fds[1])};
 }
 
@@ -208,6 +265,11 @@ int WaitProcessPosix(long pid, int timeoutMs)
         const pid_t r = waitpid(static_cast<pid_t>(pid), &status, WNOHANG);
         if (r == static_cast<pid_t>(pid))
         {
+            {
+                std::lock_guard<std::mutex> lock(g_spawnedMutex);
+                g_spawned.erase(static_cast<pid_t>(pid));
+            }
+
             return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
         }
         if (r < 0)
