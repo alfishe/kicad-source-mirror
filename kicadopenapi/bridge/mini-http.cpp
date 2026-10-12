@@ -404,6 +404,14 @@ static HttpResult Send(const char* method, const std::string& host, int port, co
     std::string raw;
     char buffer[8192];
     bool complete = false;
+
+    // the headers are parsed once; the body is checked in place (no copy per recv: responses
+    // with images run to megabytes)
+    size_t    framingEnd = std::string::npos;
+    size_t    searchFrom = 0;
+    bool      chunkedBody = false;
+    long long bodyLength = -1;
+
     while (!complete)
     {
         int received = static_cast<int>(recv(sock, buffer, sizeof(buffer), 0));
@@ -424,37 +432,42 @@ static HttpResult Send(const char* method, const std::string& host, int port, co
         }
         raw.append(buffer, static_cast<size_t>(received));
 
-        const size_t headerEnd = raw.find("\r\n\r\n");
-        if (headerEnd == std::string::npos)
+        if (framingEnd == std::string::npos)
         {
-            continue; // headers not fully received yet
+            framingEnd = raw.find("\r\n\r\n", searchFrom);
+            if (framingEnd == std::string::npos)
+            {
+                searchFrom = raw.size() > 3 ? raw.size() - 3 : 0;
+                continue; // headers not fully received yet
+            }
+
+            const std::string framing = ToLower(raw.substr(0, framingEnd));
+            chunkedBody = framing.find("transfer-encoding: chunked") != std::string::npos;
+
+            const size_t lengthPos = framing.find("content-length:");
+            if (!chunkedBody && lengthPos != std::string::npos)
+            {
+                bodyLength = std::strtoll(framing.c_str() + lengthPos + 15, nullptr, 10);
+            }
         }
 
-        const std::string framing = ToLower(raw.substr(0, headerEnd));
-        if (framing.find("transfer-encoding: chunked") != std::string::npos)
+        const size_t bodySize = raw.size() - (framingEnd + 4);
+
+        if (chunkedBody)
         {
             // Terminal chunk "0\r\n\r\n" (no trailers are sent); a recv()
             // boundary may split it — the compare simply fails and the loop
             // waits for the remainder
-            const std::string chunked = raw.substr(headerEnd + 4);
-            if (chunked.size() >= 5 && chunked.compare(chunked.size() - 5, 5, "0\r\n\r\n") == 0)
+            if (bodySize >= 5 && raw.compare(raw.size() - 5, 5, "0\r\n\r\n") == 0)
             {
                 complete = true;
             }
         }
-        else
+        else if (bodyLength >= 0 && bodySize >= static_cast<size_t>(bodyLength))
         {
-            const size_t lengthPos = framing.find("content-length:");
-            if (lengthPos != std::string::npos)
-            {
-                const long long length = std::strtoll(framing.c_str() + lengthPos + 15, nullptr, 10);
-                if (length >= 0 && raw.size() >= headerEnd + 4 + static_cast<size_t>(length))
-                {
-                    complete = true;
-                }
-            }
-            // No framing header at all: only EOF ends the read (legacy path)
+            complete = true;
         }
+        // No framing header at all: only EOF ends the read (legacy path)
     }
     BRIDGE_CLOSE(sock);
 

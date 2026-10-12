@@ -142,7 +142,9 @@ static json invokeTool( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aArgs )
 }
 
 
-std::optional<json> KopenapiMcpHandle( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aMessage )
+namespace
+{
+std::optional<json> mcpHandle( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aMessage )
 {
     if( !aMessage.is_object() || aMessage.value( "jsonrpc", std::string() ) != "2.0"
         || !aMessage.contains( "method" ) || !aMessage["method"].is_string() )
@@ -198,4 +200,21 @@ std::optional<json> KopenapiMcpHandle( const KOPENAPI_MCP_CONTEXT& aCtx, const j
     }
 
     return rpcError( id, -32601, "method not found: " + method );
+}
+} // namespace
+
+
+std::optional<json> KopenapiMcpHandle( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aMessage )
+{
+    // a field of the wrong type (name: 5, protocolVersion: {}) is the client's error, not the
+    // server's: a JSON-RPC error with the request's id, never an HTTP 500
+    try
+    {
+        return mcpHandle( aCtx, aMessage );
+    }
+    catch( const json::exception& e )
+    {
+        const json id = aMessage.is_object() && aMessage.contains( "id" ) ? aMessage["id"] : json();
+        return rpcError( id, -32602, std::string( "invalid params: " ) + e.what() );
+    }
 }
