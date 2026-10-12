@@ -216,7 +216,12 @@ private:
 
     void renderOpaqueModels( const glm::mat4 &aCameraViewMatrix );
 
-    void renderExtrudedBodies( bool aTransparentPass );
+    void renderExtrudedBodies( bool aTransparentPass, bool aSelectedOnly = false );
+
+
+    /// @brief The selected / hovered parts drawn again with a depth bias towards the camera:
+    /// coincident faces of other parts cannot show through or flicker
+    void renderSelectionOnTop( const glm::mat4& aCameraViewMatrix );
 
     void renderTransparentModels( const glm::mat4 &aCameraViewMatrix );
 

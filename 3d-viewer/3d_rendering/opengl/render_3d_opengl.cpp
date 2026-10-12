@@ -950,6 +950,8 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
         glEnable( GL_LIGHTING );
     }
 
+    renderSelectionOnTop( cameraViewMatrix );
+
     // Render 3D arrows
     if( cfg.show_navigator )
         m_spheres_gizmo->render3dSpheresGizmo( m_camera.GetRotationMatrix() );
@@ -1358,7 +1360,61 @@ void RENDER_3D_OPENGL::renderOpaqueModels( const glm::mat4 &aCameraViewMatrix )
 }
 
 
-void RENDER_3D_OPENGL::renderExtrudedBodies( bool aTransparentPass )
+void RENDER_3D_OPENGL::renderSelectionOnTop( const glm::mat4& aCameraViewMatrix )
+{
+    if( !m_boardAdapter.m_IsBoardView || !m_boardAdapter.GetBoard() )
+        return;
+
+    const EDA_3D_VIEWER_SETTINGS::RENDER_SETTINGS& cfg = m_boardAdapter.m_Cfg->m_Render;
+    bool                                           any = false;
+
+    for( const FOOTPRINT* fp : m_boardAdapter.GetBoard()->Footprints() )
+    {
+        if( fp->IsSelected() || ( cfg.highlight_on_rollover && fp == m_currentRollOverItem ) )
+        {
+            any = true;
+            break;
+        }
+    }
+
+    if( !any )
+        return;
+
+    // Drawn again pulled slightly towards the camera: a face of another part lying in the same plane
+    // (stacked or alternative footprints) no longer wins the depth test pixel by pixel, parts really
+    // in front still hide it
+    GLint depthFunc = GL_LESS;
+    glGetIntegerv( GL_DEPTH_FUNC, &depthFunc );
+    glDepthFunc( GL_LEQUAL );
+    glEnable( GL_POLYGON_OFFSET_FILL );
+    glPolygonOffset( -1.0f, -4.0f );
+
+    const SFVEC3F            selColor = m_boardAdapter.GetColor( cfg.opengl_selection_color );
+    std::list<MODELTORENDER> renderList;
+
+    get3dModelsSelected( renderList, true, true, false, true );
+
+    if( !renderList.empty() )
+    {
+        glPushMatrix();
+        MODEL_3D::BeginDrawMulti( false );
+
+        for( const MODELTORENDER& mtr : renderList )
+            renderModel( aCameraViewMatrix, mtr, selColor, nullptr );
+
+        MODEL_3D::EndDrawMulti();
+        glPopMatrix();
+    }
+
+    renderExtrudedBodies( false, true );
+
+    glPolygonOffset( 0.0f, 0.0f );
+    glDisable( GL_POLYGON_OFFSET_FILL );
+    glDepthFunc( depthFunc );
+}
+
+
+void RENDER_3D_OPENGL::renderExtrudedBodies( bool aTransparentPass, bool aSelectedOnly )
 {
     EDA_3D_VIEWER_SETTINGS::RENDER_SETTINGS& extCfg = m_boardAdapter.m_Cfg->m_Render;
     const SFVEC3F                            extSelColor = m_boardAdapter.GetColor( extCfg.opengl_selection_color );
@@ -1388,6 +1444,9 @@ void RENDER_3D_OPENGL::renderExtrudedBodies( bool aTransparentPass )
             if( extCfg.highlight_on_rollover && fp == m_currentRollOverItem )
                 highlight = true;
         }
+
+        if( aSelectedOnly && !highlight )
+            continue;
 
         KIGFX::COLOR4D c = body->m_color;
 
