@@ -406,6 +406,7 @@ list( APPEND KICOMMON_SRCS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_parts.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_glow.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_history.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_args.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_checks.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_libraries.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_image.cpp

@@ -19,6 +19,7 @@
 #include <fstream>
 #include <future>
 
+#include "kicadopenapi_args.h"
 #include "kicadopenapi_call_ticket.h"
 #include <cmath>
 #include <mutex>
@@ -639,6 +640,18 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     if( method->guiOnly && ctx.headless )
         return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI" );
 
+    // unknown names first (a misspelt required name reads better as "did you mean"), then the
+    // required ones and the plain top-level types (short messages), then the whole inputSchema
+    // (nested types, enums, ranges)
+    if( const std::vector<std::string> known = KopenapiKnownArgs( method->inputSchema ); !known.empty() )
+    {
+        for( const auto& [key, value] : aArgs.items() )
+        {
+            if( std::find( known.begin(), known.end(), key ) == known.end() )
+                return KOPENAPI_RESULT::Error( 400, KopenapiValidateArgs( aName, method->inputSchema, aArgs ) );
+        }
+    }
+
     if( method->inputSchema.contains( "required" ) )
     {
         for( const nlohmann::json& field : method->inputSchema["required"] )
@@ -650,6 +663,10 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     }
 
     if( const std::string bad = checkArgs( method->inputSchema, aArgs ); !bad.empty() )
+        return KOPENAPI_RESULT::Error( 400, bad );
+
+    // unknown names, nested types, enums, ranges: the whole inputSchema
+    if( const std::string bad = KopenapiValidateArgs( aName, method->inputSchema, aArgs ); !bad.empty() )
         return KOPENAPI_RESULT::Error( 400, bad );
 
     // answered on the HTTP thread: works while the main thread is busy

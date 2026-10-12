@@ -15,10 +15,11 @@
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-// kicadopenapi: undo marks at the undo limit, timed-out calls
+// kicadopenapi: undo marks at the undo limit, timed-out calls, argument validation
 
 #include <boost/test/unit_test.hpp>
 
+#include <kicadopenapi_args.h>
 #include <kicadopenapi_call_ticket.h>
 #include <kicadopenapi_undo.h>
 #include <undo_redo_container.h>
@@ -241,6 +242,86 @@ BOOST_AUTO_TEST_CASE( TicketExactlyOneSideWins )
         b.join();
         BOOST_REQUIRE( started != abandoned );
     }
+}
+
+
+namespace
+{
+
+const nlohmann::json ROUTE_SCHEMA = R"json({
+    "type":"object", "required":["from"],
+    "properties":{
+        "from":{"type":"string"},
+        "layer":{"type":"string","default":"F.Cu"},
+        "mode":{"type":"string","enum":["walkaround","shove"]},
+        "width_mm":{"type":"number","minimum":0},
+        "points":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2}},
+        "dry_run":{"type":"boolean"}}})json"_json;
+
+} // namespace
+
+
+BOOST_AUTO_TEST_CASE( ArgsValid )
+{
+    BOOST_CHECK_EQUAL( KopenapiValidateArgs( "t_route", ROUTE_SCHEMA,
+                                             { { "from", "U1.3" }, { "layer", "B.Cu" }, { "mode", "shove" },
+                                               { "points", { { 1.0, 2.0 }, { 3, 4 } } } } ),
+                       "" );
+}
+
+
+BOOST_AUTO_TEST_CASE( ArgsUnknownNameSuggestsNearest )
+{
+    const std::string bad = KopenapiValidateArgs( "t_route", ROUTE_SCHEMA, { { "from", "U1.3" }, { "layers", "B.Cu" } } );
+
+    BOOST_CHECK( bad.find( "unknown argument 'layers'" ) != std::string::npos );
+    BOOST_CHECK( bad.find( "did you mean 'layer'" ) != std::string::npos );
+
+    const std::string far = KopenapiValidateArgs( "t_route", ROUTE_SCHEMA, { { "from", "U1.3" }, { "colour", 1 } } );
+    BOOST_CHECK( far.find( "unknown argument 'colour'" ) != std::string::npos );
+    BOOST_CHECK( far.find( "did you mean" ) == std::string::npos );
+}
+
+
+BOOST_AUTO_TEST_CASE( ArgsSchemaIsApplied )
+{
+    BOOST_CHECK( !KopenapiValidateArgs( "t_route", ROUTE_SCHEMA, { { "from", "U1.3" }, { "mode", "teleport" } } ).empty() );
+    BOOST_CHECK( !KopenapiValidateArgs( "t_route", ROUTE_SCHEMA, { { "from", "U1.3" }, { "width_mm", -1 } } ).empty() );
+    BOOST_CHECK( !KopenapiValidateArgs( "t_route", ROUTE_SCHEMA, { { "from", "U1.3" }, { "points", { { 1, "x" } } } } )
+                          .empty() );
+    BOOST_CHECK( !KopenapiValidateArgs( "t_route", ROUTE_SCHEMA, { { "layer", "F.Cu" } } ).empty() );   // required
+}
+
+
+BOOST_AUTO_TEST_CASE( ArgsIntegersAcceptIntegralNumbers )
+{
+    const nlohmann::json schema = R"json({"type":"object",
+                                          "properties":{"steps":{"type":"integer","minimum":1}}})json"_json;
+
+    BOOST_CHECK_EQUAL( KopenapiValidateArgs( "t_int", schema, { { "steps", 2 } } ), "" );
+    BOOST_CHECK_EQUAL( KopenapiValidateArgs( "t_int", schema, { { "steps", 2.0 } } ), "" );
+    BOOST_CHECK( !KopenapiValidateArgs( "t_int", schema, { { "steps", 2.5 } } ).empty() );
+    BOOST_CHECK( !KopenapiValidateArgs( "t_int", schema, { { "steps", 0 } } ).empty() );
+}
+
+
+BOOST_AUTO_TEST_CASE( ArgsOpenSchemasStayOpen )
+{
+    const nlohmann::json open = R"json({"type":"object","additionalProperties":true,
+                                        "properties":{"a":{"type":"string"}}})json"_json;
+    const nlohmann::json bare = R"json({"type":"object"})json"_json;
+
+    BOOST_CHECK_EQUAL( KopenapiValidateArgs( "t_open", open, { { "b", 1 } } ), "" );
+    BOOST_CHECK_EQUAL( KopenapiValidateArgs( "t_bare", bare, { { "anything", 1 } } ), "" );
+}
+
+
+BOOST_AUTO_TEST_CASE( ArgsFormatsAreNotChecked )
+{
+    const nlohmann::json withFormat = R"json({"type":"object",
+                                              "properties":{"path":{"type":"string","format":"uri"}}})json"_json;
+
+    BOOST_CHECK_EQUAL( KopenapiValidateArgs( "t_format", withFormat, { { "path", "/not a uri" } } ), "" );
 }
 
 
