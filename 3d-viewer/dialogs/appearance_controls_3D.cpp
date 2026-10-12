@@ -406,6 +406,14 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
     const std::map<int, COLOR4D>& colors = m_frame->GetAdapter().GetLayerColors();
     bool                          killFollow = false;
     bool                          doFastRefresh = false;    // true to just refresh the display
+    bool                          drawOnly = false;         // layer data unchanged: draw again
+
+    // Layers whose geometry does not depend on the others: hiding one, or showing one the last
+    // scene build had visible, only changes what is drawn (OpenGL; raytracing rebuilds its scene)
+    const bool opengl = m_frame->GetAdapter().m_Cfg->m_Render.engine == RENDER_ENGINE::OPENGL;
+
+    auto* oglRender = opengl ? dynamic_cast<RENDER_3D_OPENGL*>( m_frame->GetCanvas()->GetCurrentRender() )
+                             : nullptr;
 
     // Special-case controls
     switch( aLayer )
@@ -434,10 +442,6 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
         killFollow = true;
         break;
 
-    case LAYER_3D_BOARD:
-    case LAYER_3D_COPPER_TOP:
-    case LAYER_3D_COPPER_BOTTOM:
-    case LAYER_3D_PLATED_BARRELS:
     case LAYER_3D_SILKSCREEN_BOTTOM:
     case LAYER_3D_SILKSCREEN_TOP:
     case LAYER_3D_SOLDERMASK_BOTTOM:
@@ -452,6 +456,16 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
     case LAYER_3D_B_FAB:
     case LAYER_3D_F_COURTYARD:
     case LAYER_3D_B_COURTYARD:
+        drawOnly = oglRender && !oglRender->IsSceneLoading()
+                   && ( !isVisible || oglRender->LayerBuiltVisible( aLayer ) );
+        visibleLayers.set( aLayer, isVisible );
+        killFollow = true;
+        break;
+
+    case LAYER_3D_BOARD:
+    case LAYER_3D_COPPER_TOP:
+    case LAYER_3D_COPPER_BOTTOM:
+    case LAYER_3D_PLATED_BARRELS:
         visibleLayers.set( aLayer, isVisible );
         killFollow = true;
         break;
@@ -484,7 +498,11 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
 
     UpdateLayerCtls();
 
-    if( doFastRefresh && m_frame->GetAdapter().m_Cfg->m_Render.engine == RENDER_ENGINE::OPENGL )
+    if( drawOnly )
+    {
+        m_frame->GetCanvas()->Request_refresh();
+    }
+    else if( doFastRefresh && m_frame->GetAdapter().m_Cfg->m_Render.engine == RENDER_ENGINE::OPENGL )
     {
         RENDER_3D_OPENGL* renderer = static_cast<RENDER_3D_OPENGL*>( m_frame->GetCanvas()->GetCurrentRender() );
         renderer->Load3dModelsIfNeeded();

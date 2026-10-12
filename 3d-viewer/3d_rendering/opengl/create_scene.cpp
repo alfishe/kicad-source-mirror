@@ -832,6 +832,7 @@ void RENDER_3D_OPENGL::reload()
     OBJECT_2D_STATS::Instance().ResetStats();
 
     m_boardAdapter.InitSettings( m_activityReporter, m_warningReporter );
+    m_builtLayerFlags = m_boardAdapter.GetVisibleLayers();
 
     SFVEC3F camera_pos = m_boardAdapter.GetBoardCenter();
     m_camera.SetBoardLookAtPos( camera_pos );

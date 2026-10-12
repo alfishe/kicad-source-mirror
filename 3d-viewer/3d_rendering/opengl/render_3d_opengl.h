@@ -69,6 +69,10 @@ public:
 
     void JoinBgWorker() override;
     bool IsSceneLoading() const override { return m_sceneLoading; }
+
+    /// @brief Whether the last scene build saw this 3D layer visible (its geometry is complete, so
+    /// showing it again needs no rebuild; hidden layers are skipped when drawing)
+    bool LayerBuiltVisible( int aLayer3D ) const { return m_builtLayerFlags.test( aLayer3D ); }
     void StopBgWorker() override;
 
     void SetCurrentRollOverItem( BOARD_ITEM* aRollOverItem )
@@ -360,6 +364,7 @@ private:
     /// The models do not depend on board layers: a reload with the same material mode and model
     /// cache keeps them (a layer toggle would otherwise rebuild and upload every model again)
     bool                 m_keepModelsOnReload = false;
+    std::bitset<LAYER_3D_END> m_builtLayerFlags;   ///< see LayerBuiltVisible()
     MATERIAL_MODE        m_modelsMaterialMode = MATERIAL_MODE::NORMAL;
     const S3D_CACHE*     m_modelsCache = nullptr;
     std::map<std::vector<float>, glm::mat4>                m_3dModelMatrixMap;

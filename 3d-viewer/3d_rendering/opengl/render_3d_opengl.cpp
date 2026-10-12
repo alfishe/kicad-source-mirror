@@ -659,6 +659,10 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
         if( isMaskLayer )
             continue;
 
+        // built while visible and hidden since: kept for showing it again without a rebuild
+        if( !m_boardAdapter.Is3dLayerEnabled( layer, layerFlags ) )
+            continue;
+
         // Do not show inner layers when it is displaying the board and board body is opaque
         // enough: the time to create inner layers can be *really significant*.
         // So avoid creating them is they are not very visible
