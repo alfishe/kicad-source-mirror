@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -28,7 +29,8 @@ using CLOCK = std::chrono::steady_clock;
 
 constexpr int64_t MB = 1024 * 1024;
 constexpr int64_t MIN_FREED = 64 * MB;           ///< growth of footprint - live since the last trim
-constexpr auto    MIN_INTERVAL = std::chrono::seconds( 30 );
+constexpr auto    MIN_INTERVAL = std::chrono::seconds( 2 );
+constexpr double  MAX_DUTY = 0.02;                 ///< trim pauses may take this share of the time between trims
 constexpr auto    IDLE = std::chrono::milliseconds( 1000 );
 constexpr auto    IDLE_LONG_PAUSE = std::chrono::milliseconds( 3000 );
 constexpr double  LONG_PAUSE_MS = 150.0;
@@ -181,6 +183,7 @@ void trimLoop()
             continue;
 
         const int64_t floor = s.unusedAfterTrim;
+        const int64_t sinceTrimMs = s.trims > 0 ? msSince( s.lastTrim ) : std::numeric_limits<int64_t>::max();
         lock.unlock();
 
         // Memory the OS charges but nothing uses: what a trim can give back. The allocator's own
@@ -190,7 +193,12 @@ void trimLoop()
         const int64_t                               unused = process.footprint - allocator.live;
         bool                                        trimmed = false;
 
-        if( process.footprint >= 0 && allocator.live >= 0 && unused >= floor + MIN_FREED && idleFor( unused ) )
+        // rate by cost: a short cycle of loads and closes gets a trim per cycle, never a pause
+        // taking more than MAX_DUTY of the time
+        const bool affordable = predictedPauseMs( unused ) <= MAX_DUTY * static_cast<double>( sinceTrimMs );
+
+        if( process.footprint >= 0 && allocator.live >= 0 && unused >= floor + MIN_FREED && affordable
+                && idleFor( unused ) )
         {
             KOPENAPI_MEMORY::TrimNow( "auto" );
             trimmed = true;
