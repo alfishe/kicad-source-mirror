@@ -83,3 +83,7 @@ KOPENAPI_REGISTER( "sch_input",
                    "(select it and move it to / by); key, mods, wait_ms. No OS events or permissions involved. "
                    "Answers the active tool, pointer, held buttons, selection size; GUI only",
                    KopenapiEditorInputSchema(), true, h_sch_input );
+
+// Tool actions and input can change the document (drag, delete, a placed wire): each call
+// that does is a step in edit_log; calls that change nothing leave no entry (see AfterEdit)
+KOPENAPI_MARK_EDITING( "sch_action", "sch_input" );

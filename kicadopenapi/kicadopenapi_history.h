@@ -22,6 +22,11 @@ public:
     void AfterEdit( KOPENAPI_CONTEXT& aCtx, const KOPENAPI_RESULT& aResult );
 
     KOPENAPI_RESULT Log( const nlohmann::json& aArgs ) const;
+
+    /// @brief The undo-stack points of the open GUI documents and the history epoch (bumped when a
+    /// document is opened, closed, reverted or rolled back) as one string.  A call not marked
+    /// editing must leave it unchanged unless the epoch moved (the service checks and reports drift)
+    std::string UndoFingerprint( KOPENAPI_CONTEXT& aCtx ) const;
     KOPENAPI_RESULT Checkpoint( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs );
     KOPENAPI_RESULT Checkpoints() const;
     KOPENAPI_RESULT Rollback( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs );

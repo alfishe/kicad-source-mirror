@@ -97,3 +97,7 @@ KOPENAPI_REGISTER( "pcb_input",
                    "No OS events or permissions involved. Answers the "
                    "active tool, pointer, held buttons, routing in progress, track count, selection size; GUI only",
                    KopenapiEditorInputSchema(), true, h_pcb_input );
+
+// Tool actions and input can change the document (drag, delete, a finished route): each call
+// that does is a step in edit_log; calls that change nothing leave no entry (see AfterEdit)
+KOPENAPI_MARK_EDITING( "pcb_action", "pcb_input" );

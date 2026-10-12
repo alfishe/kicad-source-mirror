@@ -97,6 +97,7 @@ struct KOPENAPI_HISTORY::IMPL
     long                    snapshotCount = 0;
     std::optional<ENTRY>    pending;
     std::string             resetReason;
+    long                    epoch = 0;   ///< documents opened / closed / reverted / rolled back
 
     std::string snapshotDir()
     {
@@ -220,6 +221,34 @@ struct KOPENAPI_HISTORY::IMPL
         return done;
     }
 
+    /// @brief Whether a mark taken now would equal aBefore: true only when every document is a GUI
+    /// document whose undo stack has the same command on top (headless copies cannot tell cheaply)
+    bool unchangedSince( KOPENAPI_CONTEXT& aCtx, const MARK& aBefore )
+    {
+        if( aBefore.docs.empty() )
+            return false;
+
+        const auto histories = KOPENAPI_REGISTRY::Get().DocumentHistories();
+
+        for( const auto& [domain, doc] : aBefore.docs )
+        {
+            auto it = histories.find( domain );
+
+            if( !doc.undo || it == histories.end() || !it->second.undoMark )
+                return false;
+
+            std::optional<KOPENAPI_UNDO_MARK> now = it->second.undoMark( aCtx );
+
+            if( !now || now->top != doc.undo->top || now->dropped != doc.undo->dropped
+                || now->depth != doc.undo->depth )
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     /// @brief Keep marks of the last MAX_STEPS steps (headless copies cost disk)
     void trim()
     {
@@ -275,6 +304,11 @@ void KOPENAPI_HISTORY::AfterEdit( KOPENAPI_CONTEXT& aCtx, const KOPENAPI_RESULT&
     ENTRY entry = std::move( *d->pending );
     d->pending.reset();
     entry.status = aResult.status;
+
+    // A successful call that changed nothing (a pointer move, a zoom through pcb_action) is no
+    // step: it would only push real steps out of the log
+    if( aResult.status < 400 && d->unchangedSince( aCtx, entry.before ) )
+        return;
 
     if( aResult.status >= 400 && aResult.body.contains( "error" ) )
         entry.error = aResult.body["error"].value( "message", std::string() );
@@ -433,6 +467,7 @@ KOPENAPI_RESULT KOPENAPI_HISTORY::Rollback( KOPENAPI_CONTEXT& aCtx, const nlohma
                                        { "documents", documents } } };
     }
 
+    d->epoch++;   // the documents moved: calls running during this one are not "unmarked edits"
 
     // The undone steps leave the log; checkpoints after the target are dropped
     nlohmann::json undone = nlohmann::json::array();
@@ -469,9 +504,31 @@ KOPENAPI_RESULT KOPENAPI_HISTORY::Rollback( KOPENAPI_CONTEXT& aCtx, const nlohma
 }
 
 
+std::string KOPENAPI_HISTORY::UndoFingerprint( KOPENAPI_CONTEXT& aCtx ) const
+{
+    IMPL*       d = const_cast<KOPENAPI_HISTORY*>( this )->impl();
+    std::string fp = "e" + std::to_string( d->epoch ) + "|";
+
+    for( const auto& [domain, history] : KOPENAPI_REGISTRY::Get().DocumentHistories() )
+    {
+        if( !history.undoMark )
+            continue;
+
+        if( std::optional<KOPENAPI_UNDO_MARK> m = history.undoMark( aCtx ) )
+        {
+            fp += domain + ":" + std::to_string( m->depth ) + "/" + std::to_string( m->top ) + "/"
+                  + std::to_string( m->dropped ) + ";";
+        }
+    }
+
+    return fp;
+}
+
+
 void KOPENAPI_HISTORY::Reset( const std::string& aDomain, const std::string& aReason )
 {
     IMPL* d = impl();
+    d->epoch++;
 
     auto forget = [&]( MARK& aMark )
     {

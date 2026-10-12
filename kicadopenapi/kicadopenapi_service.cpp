@@ -703,6 +703,12 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
                           const std::string name = operation.substr( 4 );
                           const bool        editing = KOPENAPI_REGISTRY::Get().IsEditing( name );
 
+                          // A method not marked editing must not change a document: in the GUI that
+                          // is checked on the undo stacks, so a method that edits without the mark
+                          // (no history step, no rollback) is reported instead of going unnoticed
+                          const std::string undoBefore = editing ? std::string()
+                                                                 : KOPENAPI_HISTORY::Get().UndoFingerprint( ctxCopy );
+
                           if( editing )
                               KOPENAPI_HISTORY::Get().BeforeEdit( ctxCopy, name, args );
 
@@ -710,6 +716,13 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
 
                           if( editing )
                               KOPENAPI_HISTORY::Get().AfterEdit( ctxCopy, result );
+                          else if( const std::string undoAfter = KOPENAPI_HISTORY::Get().UndoFingerprint( ctxCopy );
+                                   undoAfter != undoBefore
+                                   && undoAfter.substr( 0, undoAfter.find( '|' ) )
+                                              == undoBefore.substr( 0, undoBefore.find( '|' ) ) )
+                              wxLogWarning( "api %s changed a document but is not marked editing "
+                                            "(KOPENAPI_MARK_EDITING): it is not in edit_log and cannot be "
+                                            "rolled back by step", name );
 
                           // Failed operations are journaled too (4xx warning, 5xx error)
                           if( result.status >= 400 )
