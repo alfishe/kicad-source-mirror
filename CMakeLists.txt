@@ -199,9 +199,9 @@ cmake_dependent_option( KICAD_MSVC_DYNDEOPT
 # Compiler options/tools
 ####################################
 
-set( KICAD_ALLOCATOR "system" CACHE STRING
-    "Process allocator: system, or jemalloc (Linux only; returns idle memory to the OS by itself)" )
-set_property( CACHE KICAD_ALLOCATOR PROPERTY STRINGS system jemalloc )
+set( KICAD_ALLOCATOR "auto" CACHE STRING
+    "Process allocator: auto (jemalloc on Linux without sanitizers, else system), system, jemalloc (Linux only, linked statically)" )
+set_property( CACHE KICAD_ALLOCATOR PROPERTY STRINGS auto system jemalloc )
 
 # Not supported by all platforms (for instance mingw)
 option( KICAD_SANITIZE_ADDRESS
@@ -1070,23 +1070,39 @@ find_package( nng REQUIRED )
 #
 # Allocator
 #
-if( KICAD_ALLOCATOR STREQUAL "jemalloc" )
+set( KICAD_ALLOCATOR_RESOLVED "${KICAD_ALLOCATOR}" )
+
+if( KICAD_ALLOCATOR_RESOLVED STREQUAL "auto" )
+    if( UNIX AND NOT APPLE AND NOT KICAD_SANITIZE_ADDRESS AND NOT KICAD_SANITIZE_THREADS )
+        set( KICAD_ALLOCATOR_RESOLVED "jemalloc" )
+    else()
+        set( KICAD_ALLOCATOR_RESOLVED "system" )
+    endif()
+endif()
+
+if( KICAD_ALLOCATOR_RESOLVED STREQUAL "jemalloc" )
     if( NOT ( UNIX AND NOT APPLE ) OR KICAD_SANITIZE_ADDRESS OR KICAD_SANITIZE_THREADS )
-        message( FATAL_ERROR "KICAD_ALLOCATOR=jemalloc: Linux only, not with sanitizers" )
+        message( FATAL_ERROR "KICAD_ALLOCATOR=jemalloc: Linux only, not with sanitizers (use system)" )
     endif()
 
-    find_package( PkgConfig REQUIRED )
-    pkg_check_modules( JEMALLOC REQUIRED jemalloc )
+    include( BuildJemalloc )
 
-    # every executable links it first and unconditionally, so it replaces malloc process-wide
-    foreach( dir ${JEMALLOC_LIBRARY_DIRS} )
-        string( APPEND CMAKE_EXE_LINKER_FLAGS " -L${dir}" )
+    # Every executable carries the whole archive (it replaces malloc even when the executable's own
+    # code never calls it) and exports the allocator, so shared libraries, dlopened kifaces and
+    # mallctl lookups (kicadopenapi/platform/platform_linux_jemalloc.cpp) all bind to it.
+    string( APPEND CMAKE_EXE_LINKER_FLAGS
+            " -Wl,--whole-archive ${JEMALLOC_STATIC_LIBRARY} -Wl,--no-whole-archive -lpthread -ldl -lm" )
+
+    foreach( sym malloc free calloc realloc posix_memalign aligned_alloc memalign valloc pvalloc
+                 malloc_usable_size mallctl mallctlnametomib mallctlbymib )
+        string( APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,--export-dynamic-symbol=${sym}" )
     endforeach()
 
-    string( APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,--push-state,--no-as-needed -ljemalloc -Wl,--pop-state" )
-    message( STATUS "Allocator: jemalloc ${JEMALLOC_VERSION}" )
-elseif( NOT KICAD_ALLOCATOR STREQUAL "system" )
-    message( FATAL_ERROR "KICAD_ALLOCATOR must be system or jemalloc" )
+    message( STATUS "Allocator: jemalloc ${JEMALLOC_VERSION} (vendored, static)" )
+elseif( KICAD_ALLOCATOR_RESOLVED STREQUAL "system" )
+    message( STATUS "Allocator: system" )
+else()
+    message( FATAL_ERROR "KICAD_ALLOCATOR must be auto, system or jemalloc" )
 endif()
 
 #================================================

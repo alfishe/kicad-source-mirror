@@ -1,15 +1,13 @@
 #if defined(__linux__)
 
-// jemalloc as the process allocator on Linux: linked in (KICAD_ALLOCATOR=jemalloc) or preloaded.
-// Found at run time through mallctl, so no build dependency on its headers.
+// jemalloc as the process allocator on Linux: linked in (KICAD_ALLOCATOR, thirdparty/jemalloc, its
+// settings compiled in) or preloaded. Found at run time through mallctl: no build dependency on it.
 
 #include "platform_linux.h"
 #include "platform.h"
 
-#include <cstdlib>
 #include <dlfcn.h>
 #include <string>
-#include <sys/types.h>
 
 namespace kopenapi::platform
 {
@@ -71,47 +69,6 @@ bool JemallocTrim()
     ctl( purge.c_str(), nullptr, nullptr, nullptr, 0 );
     return true;
 }
-
-
-#if defined( KICAD_ALLOCATOR_JEMALLOC )
-
-namespace
-{
-
-/// Idle memory goes back to the OS within about a second (POC-003): dirty pages decay after 1 s,
-/// no muzzy stage, a background thread does the purging. MALLOC_CONF set by the user wins.
-__attribute__( ( constructor ) ) void configureJemalloc()
-{
-    MALLCTL ctl = mallctlFn();
-
-    if( !ctl || std::getenv( "MALLOC_CONF" ) )
-        return;
-
-    ssize_t dirty = 1000;
-    ssize_t muzzy = 0;
-    ctl( "arenas.dirty_decay_ms", nullptr, nullptr, &dirty, sizeof( dirty ) );
-    ctl( "arenas.muzzy_decay_ms", nullptr, nullptr, &muzzy, sizeof( muzzy ) );
-
-    unsigned narenas = 0;
-    size_t   len = sizeof( narenas );
-
-    if( ctl( "arenas.narenas", &narenas, &len, nullptr, 0 ) == 0 )
-    {
-        for( unsigned i = 0; i < narenas; ++i )
-        {
-            const std::string arena = "arena." + std::to_string( i ) + ".";
-            ctl( ( arena + "dirty_decay_ms" ).c_str(), nullptr, nullptr, &dirty, sizeof( dirty ) );
-            ctl( ( arena + "muzzy_decay_ms" ).c_str(), nullptr, nullptr, &muzzy, sizeof( muzzy ) );
-        }
-    }
-
-    bool background = true;
-    ctl( "background_thread", nullptr, nullptr, &background, sizeof( background ) );
-}
-
-} // namespace
-
-#endif // KICAD_ALLOCATOR_JEMALLOC
 
 } // namespace kopenapi::platform
 

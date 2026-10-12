@@ -1,0 +1,2 @@
+# the release tree as shipped: names the root .gitignore excludes (configure, VERSION, ...) are sources here
+!*
