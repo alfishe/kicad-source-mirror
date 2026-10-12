@@ -187,10 +187,29 @@ namespace sul
             using type = std::vector<Block, Allocator>;
         };
 
+        // small_vector's own allocator_type differs between Boost versions (std::allocator, or
+        // small_vector_allocator up to 1.8x): the storage takes and returns the marker instead
+        template<typename Block, size_t N>
+        class inline_blocks : public boost::container::small_vector<Block, N>
+        {
+            using base = boost::container::small_vector<Block, N>;
+
+        public:
+            using allocator_type = inline_allocator<Block, N>;
+            using size_type = typename base::size_type;
+
+            inline_blocks() = default;
+            explicit inline_blocks(const allocator_type&) {}
+            inline_blocks(size_type n, const allocator_type&) : base(n) {}
+            inline_blocks(size_type n, const Block& v, const allocator_type&) : base(n, v) {}
+
+            allocator_type get_allocator() const noexcept { return allocator_type(); }
+        };
+
         template<typename Block, size_t N>
         struct block_storage<Block, inline_allocator<Block, N>>
         {
-            using type = boost::container::small_vector<Block, N, std::allocator<Block>>;
+            using type = inline_blocks<Block, N>;
         };
     } // namespace detail
 

@@ -117,12 +117,16 @@ wxWindow* commandWindow( wxEvent& aEvent );
 /// @brief Keys that only look: navigation, zoom, copy, find, escape
 bool isLookingKey( const wxKeyEvent& aEvent )
 {
+    // WXK_RAW_CONTROL equals WXK_CONTROL outside macOS: not a case label
+    if( aEvent.GetKeyCode() == WXK_RAW_CONTROL )
+        return true;
+
     switch( aEvent.GetKeyCode() )
     {
     case WXK_LEFT: case WXK_RIGHT: case WXK_UP: case WXK_DOWN:
     case WXK_PAGEUP: case WXK_PAGEDOWN: case WXK_HOME: case WXK_END:
     case WXK_TAB: case WXK_ESCAPE: case WXK_SHIFT: case WXK_CONTROL: case WXK_ALT:
-    case WXK_RAW_CONTROL: case WXK_F1: case WXK_F2: case WXK_F3: case WXK_F4:
+    case WXK_F1: case WXK_F2: case WXK_F3: case WXK_F4:
         return true;
     default:
         break;
