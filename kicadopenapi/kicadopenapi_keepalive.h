@@ -20,6 +20,10 @@ KICOMMON_API void KopenapiKeepUiAlive();
 KICOMMON_API void KopenapiRunOffMain( const std::function<void()>& aWork );
 
 
+#include <wx/toplevel.h>
+#include <wx/weakref.h>
+
+
 class LIBRARY_MANAGER_ADAPTER;
 class wxTopLevelWindow;
 
@@ -37,7 +41,8 @@ public:
     KOPENAPI_REMOTE_GUARD& operator=( const KOPENAPI_REMOTE_GUARD& ) = delete;
 
 private:
-    wxTopLevelWindow* m_window;
+    wxTopLevelWindow*            m_key;     ///< the filter's key (never dereferenced)
+    wxWeakRef<wxTopLevelWindow>  m_window;  ///< null once the window is gone (closed while held)
 };
 
 /// @brief Waits for an adapter's background library load with the UI alive

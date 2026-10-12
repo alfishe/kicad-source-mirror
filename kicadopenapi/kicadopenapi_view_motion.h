@@ -9,6 +9,7 @@
 #include <kicadopenapi_keepalive.h>
 #include <recording/kicadopenapi_recorder.h>
 #include <view/view.h>
+#include <wx/weakref.h>
 
 #include <functional>
 
@@ -84,24 +85,33 @@ inline void KopenapiAnimate( double aSeconds, const std::function<void( double )
 
 
 /// @brief Shows aTarget (internal units) in the canvas; over aAnimateMs with an ease-in-out motion
-inline void KopenapiMoveView( EDA_DRAW_PANEL_GAL* aCanvas, const BOX2D& aTarget, int aAnimateMs )
+/// @return false when the canvas (its editor) was closed during the motion
+inline bool KopenapiMoveView( EDA_DRAW_PANEL_GAL* aCanvas, const BOX2D& aTarget, int aAnimateMs )
 {
-    KIGFX::VIEW* view = aCanvas->GetView();
-    const BOX2D  from = view->GetViewport();
+    // the UI runs between the steps: the editor may be closed meanwhile
+    wxWeakRef<EDA_DRAW_PANEL_GAL> canvas( aCanvas );
+    const BOX2D                   from = aCanvas->GetView()->GetViewport();
 
     KopenapiAnimate( aAnimateMs / 1000.0,
                      [&]( double e )
                      {
+                         if( !canvas )
+                             return;
+
                          const auto mix = [e]( double a, double b ) { return a + ( b - a ) * e; };
-                         view->SetViewport( BOX2D( VECTOR2D( mix( from.GetX(), aTarget.GetX() ), mix( from.GetY(), aTarget.GetY() ) ),
-                                                   VECTOR2D( mix( from.GetWidth(), aTarget.GetWidth() ),
-                                                             mix( from.GetHeight(), aTarget.GetHeight() ) ) ) );
-                         aCanvas->Refresh();
+                         canvas->GetView()->SetViewport( BOX2D( VECTOR2D( mix( from.GetX(), aTarget.GetX() ), mix( from.GetY(), aTarget.GetY() ) ),
+                                                                VECTOR2D( mix( from.GetWidth(), aTarget.GetWidth() ),
+                                                                          mix( from.GetHeight(), aTarget.GetHeight() ) ) ) );
+                         canvas->Refresh();
                      } );
 
-    view->SetViewport( aTarget );
-    aCanvas->Refresh();
+    if( !canvas )
+        return false;
+
+    canvas->GetView()->SetViewport( aTarget );
+    canvas->Refresh();
     KopenapiKeepUiAlive();
+    return (bool) canvas;
 }
 
 #endif

@@ -73,8 +73,11 @@ static KOPENAPI_RESULT h_sch_view_zoom( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return KOPENAPI_RESULT::Error( 404, aArgs.contains( "refs" ) ? "none of refs is on this sheet" : "the sheet is empty" );
 
     area.Inflate( margin );
-    KopenapiMoveView( frame->GetCanvas(), BOX2D( area.GetOrigin(), area.GetSize() ),
-                      std::clamp( aArgs.value( "animate_ms", 600 ), 0, 5000 ) );
+    if( !KopenapiMoveView( frame->GetCanvas(), BOX2D( area.GetOrigin(), area.GetSize() ),
+                           std::clamp( aArgs.value( "animate_ms", 600 ), 0, 5000 ) ) )
+    {
+        return KOPENAPI_RESULT::Error( 409, "the editor was closed during the move" );
+    }
 
     const BOX2D v = frame->GetCanvas()->GetView()->GetViewport();
     auto        mm = []( double x ) { return std::round( x / schIUScale.IU_PER_MM * 100 ) / 100; };

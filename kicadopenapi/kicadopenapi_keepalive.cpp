@@ -118,12 +118,14 @@ REMOTE_FILTER& remoteFilter()
 } // namespace
 
 
-KOPENAPI_REMOTE_GUARD::KOPENAPI_REMOTE_GUARD( wxTopLevelWindow* aWindow ) : m_window( aWindow )
+KOPENAPI_REMOTE_GUARD::KOPENAPI_REMOTE_GUARD( wxTopLevelWindow* aWindow ) :
+        m_key( aWindow ),
+        m_window( aWindow )
 {
     if( !m_window || !wxThread::IsMain() )
         return;
 
-    auto& entry = remoteFilter().m_windows[m_window];
+    auto& entry = remoteFilter().m_windows[m_key];
 
     if( entry.first++ == 0 )
     {
@@ -135,14 +137,22 @@ KOPENAPI_REMOTE_GUARD::KOPENAPI_REMOTE_GUARD( wxTopLevelWindow* aWindow ) : m_wi
 
 KOPENAPI_REMOTE_GUARD::~KOPENAPI_REMOTE_GUARD()
 {
-    if( !m_window || !wxThread::IsMain() )
+    if( !m_key || !wxThread::IsMain() )
         return;
 
     auto& windows = remoteFilter().m_windows;
-    auto  it = windows.find( m_window );
+    auto  it = windows.find( m_key );
 
     if( it == windows.end() )
         return;
+
+    // the window closed while held: its entry goes (a new window at the same address must not
+    // inherit it), there is no title to restore
+    if( !m_window )
+    {
+        windows.erase( it );
+        return;
+    }
 
     if( --it->second.first == 0 )
     {

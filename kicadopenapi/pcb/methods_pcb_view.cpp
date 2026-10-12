@@ -339,8 +339,11 @@ static KOPENAPI_RESULT h_pcb_view_zoom( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     area.Inflate( margin );
-    KopenapiMoveView( frame->GetCanvas(), BOX2D( area.GetOrigin(), area.GetSize() ),
-                      std::clamp( aArgs.value( "animate_ms", 600 ), 0, 5000 ) );
+    if( !KopenapiMoveView( frame->GetCanvas(), BOX2D( area.GetOrigin(), area.GetSize() ),
+                           std::clamp( aArgs.value( "animate_ms", 600 ), 0, 5000 ) ) )
+    {
+        return KOPENAPI_RESULT::Error( 409, "the editor was closed during the move" );
+    }
 
     const BOX2D v = frame->GetCanvas()->GetView()->GetViewport();
     auto        mm = []( double x ) { return std::round( x / pcbIUScale.IU_PER_MM * 100 ) / 100; };
@@ -495,8 +498,13 @@ static KOPENAPI_RESULT h_view3d_camera( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     // frame the whole assembly in this pose (unless a zoom was asked for)
     nlohmann::json fit;
 
+    wxWeakRef<EDA_3D_VIEWER_FRAME> alive( frame );
+
     if( aArgs.value( "fit_assembly", true ) && !aArgs.contains( "zoom" ) )
         fit = fitTrajectory( frame, boardOf( aCtx ), {}, aArgs.value( "animate", true ) ? 0.5 : 0.0 );
+
+    if( !alive )
+        return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
 
     paint3d( frame );
     return KOPENAPI_RESULT::Ok( { { "camera", "set" }, { "fit", fit }, { "zoom", camera.GetZoom() } } );
@@ -520,9 +528,11 @@ static void stepMove( CAMERA& aCamera, const CAMERA_MOVE& aMove, double aFrom, d
 
 /// @brief Plays camera moves in order, each eased in and out, repainting as it goes (on video
 /// time while a recording runs)
+/// @return frames drawn, -1 when the viewer was closed meanwhile (the UI runs between the steps)
 static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE>& aMoves,
                       const FRAMING* aFollow = nullptr )
 {
+    wxWeakRef<EDA_3D_VIEWER_FRAME> alive( aFrame );
     CAMERA& camera = aFrame->GetCurrentCamera();
     int     frames = 0;
     double  start = 0;                                            // time into the moves at this move
@@ -532,9 +542,15 @@ static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE
     {
         double done = 0;
 
+        if( !alive )
+            return -1;
+
         KopenapiAnimate( move.seconds,
                          [&]( double e )
                          {
+                             if( !alive )
+                                 return;
+
                              stepMove( camera, move, done, e );
                              done = e;
 
@@ -553,7 +569,7 @@ static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE
         start += move.seconds;
     }
 
-    return frames;
+    return alive ? frames : -1;
 }
 
 
@@ -730,13 +746,21 @@ static nlohmann::json fitTrajectory( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard,
     if( std::abs( target - zoom0 ) / zoom0 < 0.01 )
         return info;
 
+    wxWeakRef<EDA_3D_VIEWER_FRAME> alive( aFrame );
+
     KopenapiAnimate( aSeconds,
                      [&]( double e )
                      {
+                         if( !alive )
+                             return;
+
                          const double want = zoom0 + ( target - zoom0 ) * e;
                          camera.Zoom( (float) ( camera.GetZoom() / want ) );
                          aFrame->GetCanvas()->DoRePaint();
                      } );
+
+    if( !alive )
+        return info;
 
     info["zoom_after"] = camera.GetZoom();
     info["reach_after"] = reach( camera, corners );
@@ -817,8 +841,13 @@ static KOPENAPI_RESULT h_view3d_animate( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     FRAMING        follow;
     const bool     following = aArgs.value( "framing", std::string( "follow" ) ) == "follow";
 
+    wxWeakRef<EDA_3D_VIEWER_FRAME> alive( frame );
+
     if( aArgs.value( "fit_assembly", true ) )
         fit = fitTrajectory( frame, boardOf( aCtx ), moves, 0.7, following ? &follow : nullptr );
+
+    if( !alive )
+        return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
 
     double total = 0;
 
@@ -826,6 +855,10 @@ static KOPENAPI_RESULT h_view3d_animate( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         total += m.seconds;
 
     const int frames = playMoves( frame, moves, follow.empty() ? nullptr : &follow );
+
+    if( frames < 0 )
+        return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
+
     return KOPENAPI_RESULT::Ok( { { "moves", moves.size() }, { "seconds", total }, { "frames", frames }, { "fit", fit } } );
 }
 
@@ -846,11 +879,20 @@ static KOPENAPI_RESULT h_view3d_orbit( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 
     FRAMING follow;
 
+    wxWeakRef<EDA_3D_VIEWER_FRAME> alive( frame );
+
     if( aArgs.value( "fit_assembly", true ) )
         fitTrajectory( frame, boardOf( aCtx ), { move }, 0.7,
                        aArgs.value( "framing", std::string( "follow" ) ) == "follow" ? &follow : nullptr );
 
+    if( !alive )
+        return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
+
     const int frames = playMoves( frame, { move }, follow.empty() ? nullptr : &follow );
+
+    if( frames < 0 )
+        return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
+
     return KOPENAPI_RESULT::Ok( { { "degrees", aArgs.value( "degrees", 360.0 ) }, { "seconds", move.seconds },
                                   { "frames", frames } } );
 }
