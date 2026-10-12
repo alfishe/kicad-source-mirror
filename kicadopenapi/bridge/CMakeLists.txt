@@ -44,6 +44,9 @@ if( APPLE AND DEFINED OSX_BUNDLE_BUILD_BIN_DIR )
         RUNTIME_OUTPUT_DIRECTORY ${OSX_BUNDLE_BUILD_BIN_DIR}
         )
 elseif( DEFINED KICAD_BIN )
+    set_target_properties( kicad-mcp-bridge PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/kicad
+        )
     install( TARGETS kicad-mcp-bridge
         DESTINATION ${KICAD_BIN}
         COMPONENT binary
