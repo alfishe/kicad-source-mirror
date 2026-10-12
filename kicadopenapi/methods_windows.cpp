@@ -7,6 +7,7 @@
 /// CaptureWindow, per OS), and the OpenGL canvases inside it, which that leaves blank, are read
 /// back by the kifaces that own them (KOPENAPI_REGISTER_CANVAS_CAPTURE) and pasted in place.
 /// No screen-recording permission, covered windows still capture.
+#include <kicadopenapi_progress.h>
 #include <kicadopenapi_capture.h>
 #include <kicadopenapi_image.h>
 #include <kicadopenapi_registry.h>
@@ -260,6 +261,21 @@ static KOPENAPI_RESULT h_window_capture( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     result["canvases"] = canvases;
     return KOPENAPI_RESULT::Ok( result );
 }
+
+
+static KOPENAPI_RESULT h_progress_dialogs( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
+{
+    return KOPENAPI_RESULT::Ok( KOPENAPI_PROGRESS::Snapshot( aArgs.value( "limit", 50 ) ) );
+}
+
+
+KOPENAPI_REGISTER( "progress_dialogs",
+                   "KiCad's progress windows (what a user waits on: loading libraries, schematic, board, "
+                   "3D, DRC, ...): the open ones (title, open for ms) and the recent ones with when they "
+                   "opened and closed (ms since process start, wall time) and their duration",
+                   R"json({"type":"object","properties":{
+                        "limit":{"type":"integer","default":50,"maximum":200}}})json"_json,
+                   false, h_progress_dialogs );
 
 
 KOPENAPI_REGISTER( "window_list",

@@ -20,6 +20,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <kicadopenapi_progress.h>
 #include <thread>
 #include <widgets/wx_event_utils.h>
 #include <widgets/wx_progress_reporters.h>
@@ -56,11 +57,13 @@ WX_PROGRESS_REPORTER::WX_PROGRESS_REPORTER( wxWindow* aParent, const wxString& a
     // with multithreaded setting of those values making a mess
     // the cop out is just to set the progress to "indeterminate"
     m_appProgressIndicator.Pulse();
+    KOPENAPI_PROGRESS::Opened( this, aTitle );
 }
 
 
 WX_PROGRESS_REPORTER::~WX_PROGRESS_REPORTER()
 {
+    KOPENAPI_PROGRESS::Closed( this );
 }
 
 

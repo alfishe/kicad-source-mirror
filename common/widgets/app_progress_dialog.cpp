@@ -20,6 +20,7 @@
 #include <wx/version.h>
 #include <wx/sizer.h>
 #include <widgets/app_progress_dialog.h>
+#include <kicadopenapi_progress.h>
 #include <widgets/wx_event_utils.h>
 
 APP_PROGRESS_DIALOG::APP_PROGRESS_DIALOG( const wxString& aTitle, const wxString& aMessage,
@@ -41,6 +42,14 @@ APP_PROGRESS_DIALOG::APP_PROGRESS_DIALOG( const wxString& aTitle, const wxString
 
     if( GetSizer() )
         GetSizer()->Fit( this );
+
+    KOPENAPI_PROGRESS::Opened( this, aTitle );
+}
+
+
+APP_PROGRESS_DIALOG::~APP_PROGRESS_DIALOG()
+{
+    KOPENAPI_PROGRESS::Closed( this );
 }
 
 

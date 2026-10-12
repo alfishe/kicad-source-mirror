@@ -40,6 +40,8 @@ public:
                          wxWindow* aParent = nullptr, bool aIndeterminateTaskBarStatus = false,
                          int aStyle = wxPD_APP_MODAL | wxPD_AUTO_HIDE );
 
+    ~APP_PROGRESS_DIALOG();
+
     virtual bool Update( int aValue, const wxString& aNewMsg = wxEmptyString,
                          bool* aSkip = nullptr ) override;
 

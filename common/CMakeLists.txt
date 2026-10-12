@@ -415,6 +415,7 @@ list( APPEND KICOMMON_SRCS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_capture.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_keepalive.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_memory.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_progress.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_memory.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_model_events.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_remote.cpp
