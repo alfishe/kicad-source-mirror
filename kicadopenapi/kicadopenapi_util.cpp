@@ -1,6 +1,7 @@
 #include "kicadopenapi_util.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -321,4 +322,17 @@ nlohmann::json KopenapiRankedPage( std::vector<std::pair<KOPENAPI_TEXT_MATCH, nl
     }
 
     return page;
+}
+
+
+wxString KopenapiCanonicalPath( const wxString& aPath )
+{
+    std::error_code             ec;
+    const std::filesystem::path in( aPath.ToStdString( wxConvUTF8 ) );
+    std::filesystem::path       out = std::filesystem::weakly_canonical( std::filesystem::absolute( in, ec ), ec );
+
+    if( ec || out.empty() )
+        return aPath;
+
+    return wxString::FromUTF8( out.string() );
 }

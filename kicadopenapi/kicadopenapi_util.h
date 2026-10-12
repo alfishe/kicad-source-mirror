@@ -4,6 +4,7 @@
 #define KICADOPENAPI_UTIL_H
 
 #include <string>
+#include <wx/string.h>
 
 #include <json_common.h>
 #include <kicommon.h>
@@ -11,6 +12,10 @@
 
 /// @brief Case-insensitive glob with '*' and '?'; an empty pattern matches everything
 KICOMMON_API bool KopenapiGlob( const std::string& aPattern, const std::string& aText );
+
+/// @brief The file's absolute path with symbolic links and "." / ".." resolved (as far as it
+/// exists): one spelling per file, so a project reached through another path is the same project
+KICOMMON_API wxString KopenapiCanonicalPath( const wxString& aPath );
 
 /// @brief Natural order: "R2" < "R10", case-insensitive
 KICOMMON_API bool KopenapiNaturalLess( const std::string& aA, const std::string& aB );

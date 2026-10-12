@@ -1,6 +1,7 @@
 /// @file methods_sch_documents.cpp
 /// @brief kicadopenapi schematic document methods: sch_open, sch_close, sch_save, sch_revert, and
 /// the "sch" document provider.  Compiled into the eeschema kiface; registered when it loads.
+#include <kicadopenapi_util.h>
 #include <kicadopenapi_lock.h>
 #include <kicadopenapi_service.h>
 #include "kopenapi_sch.h"
@@ -117,9 +118,10 @@ static std::string projectConflict( KOPENAPI_CONTEXT& aCtx, const wxFileName& aP
         if( doc.value( "domain", "" ) == "sch" )
             continue;
 
-        wxFileName other( wxString::FromUTF8( doc.value( "project", "" ) ) );
+        const wxString other = wxString::FromUTF8( doc.value( "project", "" ) );
 
-        if( !other.GetFullPath().IsEmpty() && !other.SameAs( aProject ) )
+        // canonical on both sides: a symbolic link or "." in a path is the same project
+        if( !other.IsEmpty() && KopenapiCanonicalPath( other ) != KopenapiCanonicalPath( aProject.GetFullPath() ) )
             return doc.value( "project", "" );
     }
 
@@ -213,7 +215,8 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     if( !aArgs["path"].is_string() || aArgs["path"].get<std::string>().empty() )
         return KOPENAPI_RESULT::Error( 400, "'path' must be a non-empty string" );
 
-    wxFileName schematic( wxString::FromUTF8( aArgs["path"].get<std::string>() ) );
+    // one spelling per file (symbolic links, "."): the project is found by this path
+    wxFileName schematic( KopenapiCanonicalPath( wxString::FromUTF8( aArgs["path"].get<std::string>() ) ) );
     schematic.MakeAbsolute();
 
     if( schematic.GetExt() == FILEEXT::ProjectFileExtension )
