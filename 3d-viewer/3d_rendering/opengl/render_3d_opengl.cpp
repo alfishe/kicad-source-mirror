@@ -1055,7 +1055,8 @@ void RENDER_3D_OPENGL::freeAllLists()
 
     m_triangles.clear();
 
-    DELETE_AND_FREE_MAP( m_3dModelMap )
+    if( !m_keepModelsOnReload )
+        DELETE_AND_FREE_MAP( m_3dModelMap )
 
     m_3dModelMatrixMap.clear();
 

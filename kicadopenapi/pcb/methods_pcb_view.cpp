@@ -24,6 +24,9 @@
 #include <3d_enums.h>
 #include <3d_canvas/board_adapter.h>
 #include <3d_rendering/raytracing/shapes3D/bbox_3d.h>
+#include <3d_rendering/render_3d_base.h>
+#include <dialogs/appearance_controls_3D.h>
+#include <layer_ids.h>
 
 #include <chrono>
 #include <map>
@@ -35,6 +38,9 @@
 #include <algorithm>
 
 
+static EDA_3D_VIEWER_FRAME* viewer3d( KOPENAPI_CONTEXT& aCtx, bool aOpen );
+
+
 static KOPENAPI_RESULT h_pcb_view_capture( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     const std::string editor = aArgs.value( "editor", std::string( "board" ) );
@@ -42,17 +48,10 @@ static KOPENAPI_RESULT h_pcb_view_capture( KOPENAPI_CONTEXT& aCtx, const nlohman
 
     if( editor == "3d" )
     {
-        auto* frame = aCtx.kiway ? dynamic_cast<EDA_3D_VIEWER_FRAME*>( aCtx.kiway->Player( FRAME_PCB_DISPLAY3D, false ) )
-                                 : nullptr;
-
         // open: true shows the board's 3D viewer first (View > 3D Viewer)
-        if( !frame && aArgs.value( "open", false ) && aCtx.kiway )
-        {
-            if( auto* board = dynamic_cast<PCB_BASE_FRAME*>( aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) ) )
-                frame = board->CreateAndShow3D_Frame();
-        }
+        EDA_3D_VIEWER_FRAME* frame = viewer3d( aCtx, aArgs.value( "open", false ) );
 
-        if( !frame || !frame->GetCanvas() || !frame->IsShown() )
+        if( !frame )
             return KOPENAPI_RESULT::Error( 409, "no 3D viewer window open (open: true opens it from the board editor)" );
 
         // Draw now (a just-opened viewer may not have painted yet), then read the frame buffer
@@ -371,12 +370,15 @@ static EDA_3D_VIEWER_FRAME* viewer3d( KOPENAPI_CONTEXT& aCtx, bool aOpen )
 {
     auto* frame = aCtx.kiway ? dynamic_cast<EDA_3D_VIEWER_FRAME*>( aCtx.kiway->Player( FRAME_PCB_DISPLAY3D, false ) )
                              : nullptr;
+    auto* board = aCtx.kiway ? dynamic_cast<PCB_BASE_FRAME*>( aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) )
+                             : nullptr;
 
-    if( !frame && aOpen && aCtx.kiway )
-    {
-        if( auto* board = dynamic_cast<PCB_BASE_FRAME*>( aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) ) )
-            frame = board->CreateAndShow3D_Frame();
-    }
+    // the board editor's viewer is its child window, not a KIWAY player
+    if( !frame && board )
+        frame = board->Get3DViewerFrame();
+
+    if( !frame && aOpen && board )
+        frame = board->CreateAndShow3D_Frame();
 
     return frame && frame->GetCanvas() && frame->IsShown() ? frame : nullptr;
 }
@@ -434,6 +436,82 @@ static void paint3d( EDA_3D_VIEWER_FRAME* aFrame )
 {
     aFrame->GetCanvas()->Request_refresh( true );
     KopenapiKeepUiAlive();
+}
+
+
+static const std::map<std::string, int>& view3dLayers()
+{
+    static const std::map<std::string, int> layers = {
+        { "board", LAYER_3D_BOARD },                     { "copper_top", LAYER_3D_COPPER_TOP },
+        { "copper_bottom", LAYER_3D_COPPER_BOTTOM },     { "plated_barrels", LAYER_3D_PLATED_BARRELS },
+        { "silkscreen_top", LAYER_3D_SILKSCREEN_TOP },   { "silkscreen_bottom", LAYER_3D_SILKSCREEN_BOTTOM },
+        { "soldermask_top", LAYER_3D_SOLDERMASK_TOP },   { "soldermask_bottom", LAYER_3D_SOLDERMASK_BOTTOM },
+        { "solderpaste", LAYER_3D_SOLDERPASTE },         { "adhesive", LAYER_3D_ADHESIVE },
+        { "user_comments", LAYER_3D_USER_COMMENTS },     { "user_drawings", LAYER_3D_USER_DRAWINGS },
+        { "user_eco1", LAYER_3D_USER_ECO1 },             { "user_eco2", LAYER_3D_USER_ECO2 },
+        { "fab_top", LAYER_3D_F_FAB },                   { "fab_bottom", LAYER_3D_B_FAB },
+        { "courtyard_top", LAYER_3D_F_COURTYARD },       { "courtyard_bottom", LAYER_3D_B_COURTYARD },
+        { "fp_text", LAYER_FP_TEXT },                    { "fp_references", LAYER_FP_REFERENCES },
+        { "fp_values", LAYER_FP_VALUES },                { "th_models", LAYER_3D_TH_MODELS },
+        { "smd_models", LAYER_3D_SMD_MODELS },           { "virtual_models", LAYER_3D_VIRTUAL_MODELS },
+        { "models_not_in_pos", LAYER_3D_MODELS_NOT_IN_POS }, { "models_dnp", LAYER_3D_MODELS_MARKED_DNP },
+        { "bounding_boxes", LAYER_3D_BOUNDING_BOXES },   { "off_board_silk", LAYER_3D_OFF_BOARD_SILK } };
+    return layers;
+}
+
+
+static KOPENAPI_RESULT h_view3d_layers( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    EDA_3D_VIEWER_FRAME* frame = viewer3d( aCtx, aArgs.value( "open", true ) );
+
+    if( !frame || !frame->GetAppearanceManager() )
+        return KOPENAPI_RESULT::Error( 409, "no 3D viewer (open: true opens it from the board editor)" );
+
+    const nlohmann::json set = aArgs.value( "set", nlohmann::json::object() );
+
+    for( const auto& [name, visible] : set.items() )
+    {
+        if( !view3dLayers().count( name ) || !visible.is_boolean() )
+            return KOPENAPI_RESULT::Error( 400, "set: {layer: true|false}, layers: see the answer's 'layers'" );
+    }
+
+    // the same path as a click in the viewer's Layers panel (presets, follow-board, reload)
+    for( const auto& [name, visible] : set.items() )
+        frame->GetAppearanceManager()->OnLayerVisibilityChanged( view3dLayers().at( name ), visible.get<bool>() );
+
+    const std::bitset<LAYER_3D_END> visibleLayers = frame->GetAdapter().GetVisibleLayers();
+    nlohmann::json                  layers = nlohmann::json::object();
+
+    for( const auto& [name, id] : view3dLayers() )
+        layers[name] = visibleLayers.test( id );
+
+    return KOPENAPI_RESULT::Ok( { { "layers", layers } } );
+}
+
+
+static KOPENAPI_RESULT h_view3d_status( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    EDA_3D_VIEWER_FRAME* frame = viewer3d( aCtx, aArgs.value( "open", false ) );
+
+    if( !frame || !frame->GetCanvas() || !frame->IsShown() )
+        return KOPENAPI_RESULT::Ok( { { "open", false }, { "ready", false } } );
+
+    EDA_3D_CANVAS*                         canvas = frame->GetCanvas();
+    const EDA_3D_CANVAS::RENDER_PROGRESS&  progress = canvas->GetRenderProgress();
+    const RENDER_3D_BASE*                  render = canvas->GetCurrentRender();
+    const bool reloadPending = canvas->IsReloadRequestPending();
+    const bool loading = render && render->IsSceneLoading();
+    const bool raytracing = canvas->GetBoardAdapter().m_Cfg->m_Render.engine == RENDER_ENGINE::RAYTRACING;
+
+    return KOPENAPI_RESULT::Ok( { { "open", true },
+                                  { "engine", raytracing ? "raytracing" : "opengl" },
+                                  { "reload_pending", reloadPending },
+                                  { "scene_loading", loading },
+                                  { "more_passes", progress.moreRequested },
+                                  { "frames", progress.frames },
+                                  { "last_frame_ms", progress.lastFrameMs },
+                                  { "ready", progress.frames > 0 && !reloadPending && !loading
+                                                     && !progress.moreRequested } } );
 }
 
 
@@ -909,6 +987,23 @@ KOPENAPI_REGISTER( "pcb_view_zoom",
                         "animate_ms":{"type":"integer","default":600,"maximum":5000,"description":"smooth camera move; 0 jumps"},
                         "side":{"type":"string","enum":["front","back","flip"],"description":"the side looked at: front (from above), back (from below, Flip Board View; bottom-side work), flip toggles; unchanged when absent"}}})json"_json,
                    true, h_pcb_view_zoom, 300 );   // animations record on video time: slow while recording
+
+KOPENAPI_REGISTER( "view3d_status",
+                   "3D viewer progress: open, engine, scene reload pending / loading (models), whether the "
+                   "renderer wants more passes (raytracing), frames shown and the last frame's time; "
+                   "ready = the final picture is on screen. open: true opens the viewer; GUI only",
+                   R"json({"type":"object","properties":{
+                        "open":{"type":"boolean","default":false}}})json"_json,
+                   true, h_view3d_status );
+
+KOPENAPI_REGISTER( "view3d_layers",
+                   "3D viewer layers: visibility of board, copper, silkscreen, soldermask, paste, user and fab "
+                   "layers, footprint texts and model kinds; set: {layer: true|false} applies them like clicks "
+                   "in the viewer's Layers panel; answers every layer's visibility; GUI only",
+                   R"json({"type":"object","properties":{
+                        "set":{"type":"object","additionalProperties":{"type":"boolean"}},
+                        "open":{"type":"boolean","default":true}}})json"_json,
+                   true, h_view3d_layers );
 
 KOPENAPI_REGISTER( "view3d_camera",
                    "3D viewer camera: preset view (top, bottom, left, right, front, back, fit; animated), "

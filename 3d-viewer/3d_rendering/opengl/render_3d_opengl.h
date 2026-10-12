@@ -356,6 +356,12 @@ private:
 
     // Caches
     std::map<wxString, std::shared_ptr<MODEL_3D_DEFERRED>> m_3dModelMap;
+
+    /// The models do not depend on board layers: a reload with the same material mode and model
+    /// cache keeps them (a layer toggle would otherwise rebuild and upload every model again)
+    bool                 m_keepModelsOnReload = false;
+    MATERIAL_MODE        m_modelsMaterialMode = MATERIAL_MODE::NORMAL;
+    const S3D_CACHE*     m_modelsCache = nullptr;
     std::map<std::vector<float>, glm::mat4>                m_3dModelMatrixMap;
 
     BOARD_ITEM*         m_currentRollOverItem;

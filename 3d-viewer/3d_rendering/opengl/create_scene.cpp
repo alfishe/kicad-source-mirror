@@ -22,6 +22,9 @@
 #include "render_3d_opengl.h"
 #include "../../3d_canvas/eda_3d_canvas.h"
 #include "../3d_placeholder_utils.h"
+#include <chrono>
+#include <map>
+#include <set>
 #include <3d_viewer_id.h>
 #include <board.h>
 #include <footprint.h>
@@ -815,11 +818,15 @@ void RENDER_3D_OPENGL::reload()
     // Ensure previous reload worker is finished before freeing/rebuilding render data.
     StopBgWorker();
 
+    m_keepModelsOnReload = m_boardAdapter.m_Cfg->m_Render.material_mode == m_modelsMaterialMode
+                           && m_boardAdapter.Get3dCacheManager() == m_modelsCache;
+
     // Drop hover BVH before layers are destroyed; LAYER_ITEM points into those OBJECT_2Ds.
     if( m_canvas )
         m_canvas->InvalidateRaytracingHitTesting();
 
     freeAllLists();
+    m_keepModelsOnReload = false;
     createPlaceholderModel();
 
     OBJECT_2D_STATS::Instance().ResetStats();
@@ -1923,71 +1930,123 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
     }
 #endif
 
-    S3D_CACHE* cacheMgr = m_boardAdapter.Get3dCacheManager();
+    S3D_CACHE*          cacheMgr = m_boardAdapter.Get3dCacheManager();
+    const MATERIAL_MODE materialMode = m_boardAdapter.m_Cfg->m_Render.material_mode;
+
+    if( materialMode != m_modelsMaterialMode || cacheMgr != m_modelsCache )
+    {
+        std::lock_guard lock( m_renderMutex );
+
+        for( auto& [file, model] : m_3dModelMap )
+            retireRenderPtr( model );   // GL objects go on the main thread
+
+        m_3dModelMap.clear();
+        m_modelsMaterialMode = materialMode;
+        m_modelsCache = cacheMgr;
+    }
+
+    std::set<wxString> used;
+    std::set<wxString> missing;   // not found this pass: every footprint using it would look again
+    std::map<wxString, wxString> basePaths;
+    auto                         lastRefresh = std::chrono::steady_clock::now();
 
     // Go for all footprints
     for( const FOOTPRINT* footprint : m_boardAdapter.GetBoard()->Footprints() )
     {
-        wxString libraryName = footprint->GetFPID().GetLibNickname();
-        wxString footprintBasePath = wxEmptyString;
-
-        if( m_boardAdapter.GetBoard()->GetProject() )
-        {
-            try
-            {
-                // FindRow() can throw an exception
-                std::optional<LIBRARY_TABLE_ROW*> fpRow =
-                    PROJECT_PCB::FootprintLibAdapter( m_boardAdapter.GetBoard()->GetProject() )
-                            ->GetRow( libraryName );
-
-                if( fpRow )
-                    footprintBasePath = LIBRARY_MANAGER::GetFullURI( *fpRow, true );
-            }
-            catch( ... )
-            {
-                // Do nothing if the libraryName is not found in lib table
-            }
-        }
+        bool added = false;
 
         for( const FP_3DMODEL& fp_model : footprint->Models() )
         {
-            if( fp_model.m_Show && !fp_model.m_Filename.empty() )
+            if( !fp_model.m_Show || fp_model.m_Filename.empty() )
+                continue;
+
+            used.insert( fp_model.m_Filename );
+
+            if( m_3dModelMap.contains( fp_model.m_Filename ) || missing.contains( fp_model.m_Filename ) )
+                continue;
+
+            const wxString libraryName = footprint->GetFPID().GetLibNickname();
+            auto           base = basePaths.find( libraryName );
+
+            if( base == basePaths.end() )
             {
-                if( m_activityReporter )
+                wxString footprintBasePath;
+
+                if( m_boardAdapter.GetBoard()->GetProject() )
                 {
-                    // Display the short filename of the 3D fp_model loaded:
-                    // (the full name is usually too long to be displayed)
-                    wxFileName fn( fp_model.m_Filename );
-                    m_activityReporter->Report( wxString::Format( _( "Loading %s..." ), fn.GetFullName() ) );
-                }
-
-                // Check if the fp_model is not present in our cache map
-                // (Not already loaded in memory)
-                if( !m_3dModelMap.contains( fp_model.m_Filename ) )
-                {
-                    // It is not present, try get it from cache
-                    std::vector<const EMBEDDED_FILES*> embeddedFilesStack;
-                    embeddedFilesStack.push_back( footprint->GetEmbeddedFiles() );
-                    embeddedFilesStack.push_back( m_boardAdapter.GetBoard()->GetEmbeddedFiles() );
-
-                    const S3DMODEL* modelPtr = cacheMgr->GetModel( fp_model.m_Filename, footprintBasePath,
-                                                                   std::move( embeddedFilesStack ) );
-
-                    // only add it if the return is not NULL
-                    if( modelPtr )
+                    try
                     {
-                        MATERIAL_MODE materialMode = m_boardAdapter.m_Cfg->m_Render.material_mode;
-                        auto          model = std::make_shared<MODEL_3D_DEFERRED>( *modelPtr, materialMode );
+                        // FindRow() can throw an exception
+                        std::optional<LIBRARY_TABLE_ROW*> fpRow =
+                                PROJECT_PCB::FootprintLibAdapter( m_boardAdapter.GetBoard()->GetProject() )
+                                        ->GetRow( libraryName );
 
-                        assignRenderMap( m_3dModelMap, fp_model.m_Filename, model );
+                        if( fpRow )
+                            footprintBasePath = LIBRARY_MANAGER::GetFullURI( *fpRow, true );
+                    }
+                    catch( ... )
+                    {
+                        // Do nothing if the libraryName is not found in lib table
                     }
                 }
+
+                base = basePaths.emplace( libraryName, footprintBasePath ).first;
+            }
+
+            if( m_activityReporter )
+            {
+                // Display the short filename of the 3D fp_model loaded:
+                // (the full name is usually too long to be displayed)
+                wxFileName fn( fp_model.m_Filename );
+                m_activityReporter->Report( wxString::Format( _( "Loading %s..." ), fn.GetFullName() ) );
+            }
+
+            std::vector<const EMBEDDED_FILES*> embeddedFilesStack;
+            embeddedFilesStack.push_back( footprint->GetEmbeddedFiles() );
+            embeddedFilesStack.push_back( m_boardAdapter.GetBoard()->GetEmbeddedFiles() );
+
+            const S3DMODEL* modelPtr = cacheMgr->GetModel( fp_model.m_Filename, base->second,
+                                                           std::move( embeddedFilesStack ) );
+
+            // only add it if the return is not NULL
+            if( modelPtr )
+            {
+                auto model = std::make_shared<MODEL_3D_DEFERRED>( *modelPtr, materialMode );
+                assignRenderMap( m_3dModelMap, fp_model.m_Filename, model );
+                added = true;
+            }
+            else
+            {
+                missing.insert( fp_model.m_Filename );
             }
 
             if( aStop.stop_requested() )
                 return;
         }
 
-        sendRefreshView();
+        if( added && std::chrono::steady_clock::now() - lastRefresh > std::chrono::milliseconds( 50 ) )
+        {
+            sendRefreshView();
+            lastRefresh = std::chrono::steady_clock::now();
+        }
     }
+
+    // models no footprint shows any more (kept from an earlier reload)
+    {
+        std::lock_guard lock( m_renderMutex );
+
+        for( auto it = m_3dModelMap.begin(); it != m_3dModelMap.end(); )
+        {
+            if( used.contains( it->first ) )
+            {
+                ++it;
+                continue;
+            }
+
+            retireRenderPtr( it->second );
+            it = m_3dModelMap.erase( it );
+        }
+    }
+
+    sendRefreshView();
 }

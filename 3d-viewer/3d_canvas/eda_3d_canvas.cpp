@@ -630,13 +630,18 @@ void EDA_3D_CANVAS::DoRePaint()
     {
         SwapBuffers();
         m_holdFrame = false;
+        m_renderProgress.frames++;
     }
+
+    m_renderProgress.moreRequested = requested_redraw;
 
     gl_mgr->UnlockCtx( m_glRC );
 
     // Calculation time in milliseconds
     const double calculation_time =
             std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - start_time ).count();
+
+    m_renderProgress.lastFrameMs = calculation_time;
 
     if( m_parentStatusBar )
     {

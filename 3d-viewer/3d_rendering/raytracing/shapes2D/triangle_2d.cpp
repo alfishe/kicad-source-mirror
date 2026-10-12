@@ -26,6 +26,12 @@
 #include "../ray.h"
 #include <wx/debug.h>
 #include <geometry/polygon_triangulation.h>
+#include <thread_pool.h>
+
+#include <algorithm>
+#include <cmath>
+#include <future>
+#include <vector>
 #include "../../../3d_fastmath.h"
 
 
@@ -114,6 +120,113 @@ bool TRIANGLE_2D::IsPointInside( const SFVEC2F& aPoint ) const
 }
 
 
+namespace
+{
+
+// Joining holes to their outline costs holes x vertices, so a board body with thousands of drill
+// holes took seconds. Cut into tiles, each piece has few holes; tiles run on the thread pool. The
+// seams add coplanar triangles only, which a 3D view cannot show.
+constexpr int TILED_MIN_HOLES = 256;
+constexpr int HOLES_PER_TILE = 48;
+
+struct TRIANGLE_PTS
+{
+    VECTOR2I a, b, c;
+};
+
+
+bool appendTriangulation( SHAPE_POLY_SET& aPoly, std::vector<TRIANGLE_PTS>& aOut )
+{
+    if( aPoly.OutlineCount() == 0 )
+        return true;
+
+    aPoly.CacheTriangulation();
+
+    if( aPoly.TriangulatedPolyCount() == 0 )
+        return false;
+
+    for( unsigned int j = 0; j < aPoly.TriangulatedPolyCount(); j++ )
+    {
+        const SHAPE_POLY_SET::TRIANGULATED_POLYGON* tri = aPoly.TriangulatedPolygon( j );
+
+        for( size_t i = 0; i < tri->GetTriangleCount(); i++ )
+        {
+            TRIANGLE_PTS t;
+            tri->GetTriangle( i, t.a, t.b, t.c );
+            aOut.push_back( t );
+        }
+    }
+
+    return true;
+}
+
+
+/// @return false when the polygon has too few holes to gain, or a tile failed (use the whole polygon)
+bool triangulateTiled( const SHAPE_POLY_SET& aPolyList, std::vector<TRIANGLE_PTS>& aOut )
+{
+    int holes = 0;
+
+    for( int i = 0; i < aPolyList.OutlineCount(); ++i )
+        holes += aPolyList.HoleCount( i );
+
+    if( holes < TILED_MIN_HOLES )
+        return false;
+
+    const BOX2I box = aPolyList.BBox();
+    const int   n = std::clamp( (int) std::ceil( std::sqrt( holes / (double) HOLES_PER_TILE ) ), 2, 32 );
+    const int64_t w = box.GetWidth(), h = box.GetHeight();
+
+    std::vector<std::vector<TRIANGLE_PTS>> parts( (size_t) n * n );
+    std::vector<char>                      ok( parts.size(), 0 );
+
+    auto tile = [&]( int aIndex )
+    {
+        const int     tx = aIndex % n, ty = aIndex / n;
+        const int64_t x0 = box.GetX() + w * tx / n, x1 = box.GetX() + w * ( tx + 1 ) / n;
+        const int64_t y0 = box.GetY() + h * ty / n, y1 = box.GetY() + h * ( ty + 1 ) / n;
+
+        SHAPE_POLY_SET rect;
+        rect.NewOutline();
+        rect.Append( (int) x0, (int) y0 );
+        rect.Append( (int) x1, (int) y0 );
+        rect.Append( (int) x1, (int) y1 );
+        rect.Append( (int) x0, (int) y1 );
+
+        SHAPE_POLY_SET piece;
+        piece.BooleanIntersection( aPolyList, rect );
+        ok[aIndex] = appendTriangulation( piece, parts[aIndex] );
+    };
+
+    // a pool worker waiting for its own pool's tasks could stall it: tiles run in line there
+    if( BS::this_thread::get_pool() )
+    {
+        for( int i = 0; i < (int) parts.size(); ++i )
+            tile( i );
+    }
+    else
+    {
+        thread_pool&                   tp = GetKiCadThreadPool();
+        std::vector<std::future<void>> done;
+
+        for( int i = 0; i < (int) parts.size(); ++i )
+            done.push_back( tp.submit_task( [&tile, i]() { tile( i ); } ) );
+
+        for( std::future<void>& f : done )
+            f.get();
+    }
+
+    if( std::find( ok.begin(), ok.end(), 0 ) != ok.end() )
+        return false;
+
+    for( std::vector<TRIANGLE_PTS>& part : parts )
+        aOut.insert( aOut.end(), part.begin(), part.end() );
+
+    return true;
+}
+
+} // namespace
+
+
 void ConvertPolygonToTriangles( const SHAPE_POLY_SET& aPolyList, CONTAINER_2D_BASE& aDstContainer,
                                 float aBiuTo3dUnitsScale, const BOARD_ITEM& aBoardItem )
 {
@@ -121,8 +234,27 @@ void ConvertPolygonToTriangles( const SHAPE_POLY_SET& aPolyList, CONTAINER_2D_BA
     VECTOR2I b;
     VECTOR2I c;
 
-    const_cast<SHAPE_POLY_SET&>( aPolyList ).CacheTriangulation();
     const double conver_d = (double)aBiuTo3dUnitsScale;
+
+    if( !aPolyList.IsTriangulationUpToDate() )
+    {
+        std::vector<TRIANGLE_PTS> tiled;
+
+        if( triangulateTiled( aPolyList, tiled ) )
+        {
+            for( const TRIANGLE_PTS& t : tiled )
+            {
+                aDstContainer.Add( new TRIANGLE_2D( SFVEC2F( t.a.x * conver_d, -t.a.y * conver_d ),
+                                                    SFVEC2F( t.b.x * conver_d, -t.b.y * conver_d ),
+                                                    SFVEC2F( t.c.x * conver_d, -t.c.y * conver_d ),
+                                                    aBoardItem ) );
+            }
+
+            return;
+        }
+    }
+
+    const_cast<SHAPE_POLY_SET&>( aPolyList ).CacheTriangulation();
 
     for( unsigned int j = 0; j < aPolyList.TriangulatedPolyCount(); j++ )
     {

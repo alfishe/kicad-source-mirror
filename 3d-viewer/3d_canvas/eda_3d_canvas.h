@@ -301,6 +301,17 @@ public:
     /// (no partial frames); for reloads requested programmatically
     void HoldFrameUntilLoaded() { m_holdFrame = true; }
 
+    /// @brief How far the picture got: frames put on screen, the last one's render time, and
+    /// whether the renderer asked for another pass (raytracing refinement, scene still loading)
+    struct RENDER_PROGRESS
+    {
+        uint64_t frames = 0;
+        double   lastFrameMs = 0.0;
+        bool     moreRequested = false;
+    };
+
+    const RENDER_PROGRESS& GetRenderProgress() const { return m_renderProgress; }
+
     void OnCloseWindow( wxCloseEvent& event );
 
 private:
@@ -406,6 +417,7 @@ private:
     wxGLContext*           m_glRC = nullptr;                    // Current OpenGL context
 
     bool                   m_holdFrame = false;   ///< see HoldFrameUntilLoaded()
+    RENDER_PROGRESS        m_renderProgress;      ///< see GetRenderProgress()
 
     /// RenderToImage() buffers, kept while the size stays: drawing target, its downsampled copy
     /// and the last complete frame (repeated while a reload builds the scene)
