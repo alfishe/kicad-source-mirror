@@ -38,6 +38,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <future>
+#include <wx/log.h>
 #include <thread>
 
 
@@ -266,6 +268,7 @@ public:
         m_captured = m_written = m_dropped = 0;
         m_captureMsTotal = m_captureMsMax = 0;
         m_error.clear();
+        m_taken = 0;
         m_stopReason.clear();
         m_markers = nlohmann::json::array();
         m_finishing = false;
@@ -273,7 +276,14 @@ public:
         m_startedUnixMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::system_clock::now().time_since_epoch() ).count();
 
-        m_thread = std::thread( [this]() { encodeLoop(); } );
+        std::promise<void> done;
+        m_threadDone = done.get_future();
+        m_thread = std::thread(
+                [this, done = std::move( done )]() mutable
+                {
+                    encodeLoop();
+                    done.set_value();
+                } );
         enqueue( first, 0 );
 
         if( !m_timer )
@@ -300,13 +310,25 @@ public:
         }
 
         m_cv.notify_all();
-        m_thread.join();
+        joinEncoder( false );
     }
 
     KOPENAPI_RESULT Stop( const std::string& aReason = "requested" )
     {
         if( !m_active )
             return KOPENAPI_RESULT::Error( 409, "no recording is running" );
+
+        // the UI runs while the encoder finishes: a second stop (KiCad closing) must not join twice
+        if( m_stopping )
+            return KOPENAPI_RESULT::Error( 409, "the recording is being stopped" );
+
+        m_stopping = true;
+
+        struct STOPPED
+        {
+            bool& flag;
+            ~STOPPED() { flag = false; }
+        } stopped{ m_stopping };
 
         m_timer->Stop();
         m_stopReason = aReason;
@@ -319,7 +341,7 @@ public:
         }
 
         m_cv.notify_all();
-        m_thread.join();
+        joinEncoder();
         m_active = false;
 
         nlohmann::json answer = status();
@@ -491,11 +513,8 @@ public:
         m_captureMsMax = std::max( m_captureMsMax, ms );
 
         // the encoder keeps up: on video time wait for it instead of skipping
-        if( m_videoClock )
-        {
-            std::unique_lock<std::mutex> lock( m_mutex );
-            m_cv.wait( lock, [this]() { return m_queue.size() < 3 || !m_error.empty(); } );
-        }
+        if( m_videoClock && !waitForRoom() )
+            return false;
 
         enqueue( image, aIndex );
         m_lastFrameWall = CLOCK::now();
@@ -630,10 +649,8 @@ public:
         m_captureMsMax = std::max( m_captureMsMax, ms );
 
         // the encoder keeps up: wait instead of dropping (this is video time, not wall time)
-        {
-            std::unique_lock<std::mutex> lock( m_mutex );
-            m_cv.wait( lock, [this]() { return m_queue.size() < 3 || !m_error.empty(); } );
-        }
+        if( !waitForRoom() )
+            return;
 
         enqueue( image, m_lastIndex + 1 );
         m_lastSync = CLOCK::now();
@@ -889,6 +906,7 @@ private:
 
                 frame = std::move( m_queue.front() );
                 m_queue.pop_front();
+                m_taken++;
             }
 
             m_cv.notify_all();   // a synced frame may be waiting for room
@@ -1001,6 +1019,76 @@ private:
     std::string                             m_stopReason;
 
     std::thread                             m_thread;
+    std::future<void>                       m_threadDone;
+    int64_t                                 m_taken = 0;    ///< frames the encoder took (m_mutex)
+    bool                                    m_stopping = false;
+
+    /// @brief Main thread: waits for room in the queue (video time never drops frames). An encoder
+    /// that takes no frame for ENCODER_STALL_S (ffmpeg hung) is aborted and the recording fails
+    /// instead of the UI waiting forever.
+    /// @return false when the recording failed
+    bool waitForRoom()
+    {
+        std::unique_lock<std::mutex> lock( m_mutex );
+        int64_t                      seen = m_taken;
+        auto                         progress = CLOCK::now();
+
+        while( m_queue.size() >= 3 && m_error.empty() )
+        {
+            m_cv.wait_for( lock, std::chrono::milliseconds( 200 ) );
+
+            if( m_taken != seen )
+            {
+                seen = m_taken;
+                progress = CLOCK::now();
+            }
+            else if( CLOCK::now() - progress > std::chrono::seconds( ENCODER_STALL_S ) )
+            {
+                m_error = "the encoder took no frame for " + std::to_string( ENCODER_STALL_S )
+                          + " s (ffmpeg hung?); the recording stopped";
+                m_queue.clear();
+                lock.unlock();
+                m_encoder->Abort();
+                return false;
+            }
+        }
+
+        return m_error.empty();
+    }
+
+    /// @brief Waits for the encoder thread (the UI alive meanwhile when aKeepUiAlive); an encoder
+    /// that does not finish in ENCODER_STOP_TIMEOUT_S (ffmpeg hung) is aborted, so its blocked
+    /// write fails and the thread ends
+    void joinEncoder( bool aKeepUiAlive = true )
+    {
+        if( m_threadDone.valid() )
+        {
+            const auto deadline = CLOCK::now() + std::chrono::seconds( ENCODER_STOP_TIMEOUT_S );
+
+            while( m_threadDone.wait_for( std::chrono::milliseconds( aKeepUiAlive ? 20 : 500 ) )
+                   != std::future_status::ready )
+            {
+                if( CLOCK::now() > deadline )
+                {
+                    wxLogMessage( "recording: the encoder did not finish in %d s, stopped (the file is lost)",
+                                  ENCODER_STOP_TIMEOUT_S );
+
+                    if( m_encoder )
+                        m_encoder->Abort();
+
+                    break;
+                }
+
+                if( aKeepUiAlive )
+                    KopenapiKeepUiAlive();
+            }
+        }
+
+        m_thread.join();
+    }
+
+    static constexpr int ENCODER_STOP_TIMEOUT_S = 120;
+    static constexpr int ENCODER_STALL_S = 10;
     std::mutex                              m_mutex;
     std::condition_variable                 m_cv;
     std::deque<FRAME>                       m_queue;      ///< guarded by m_mutex

@@ -75,6 +75,7 @@ public:
         m_log = logDir / ( "ffmpeg-" + std::to_string( kp::CurrentPid() ) + ".log" );
 
         m_process = kp::SpawnWithStdinPipe( argv, m_log, aError );
+        m_abortPid = m_process.pid;
         return m_process.pid != 0;
     }
 
@@ -106,6 +107,13 @@ public:
     }
 
 private:
+    void Abort() override
+    {
+        // the pipe's reader gone, the blocked write fails (EPIPE / broken pipe)
+        if( const long pid = m_abortPid.load() )
+            kp::KillProcess( pid );
+    }
+
     bool put( const uint8_t* aFrame, std::string& aError )
     {
         if( !kp::WritePipe( m_process.stdinHandle, aFrame, m_frameBytes ) )
@@ -126,9 +134,14 @@ private:
         kp::ClosePipe( m_process.stdinHandle );
         const int code = kp::WaitProcess( m_process.pid, 60000 );
 
+        // hung: stopped and collected (no zombie left behind)
         if( code == -1 )
+        {
             kp::KillProcess( m_process.pid );
+            kp::WaitProcess( m_process.pid, 5000 );
+        }
 
+        m_abortPid = 0;
         m_process = {};
 
         if( code != 0 )
@@ -144,6 +157,7 @@ private:
     std::filesystem::path   m_log;
     KOPENAPI_VIDEO_SETTINGS m_settings;
     kp::PipeProcess         m_process;
+    std::atomic<long>       m_abortPid{ 0 };      ///< ffmpeg's pid for Abort() from another thread
     size_t                  m_frameBytes = 0;
     int64_t                 m_written = 0;
     std::vector<uint8_t>    m_last;

@@ -46,6 +46,10 @@ public:
     /// @param aEndIndex the slot after the last one (the last frame lasts until then)
     /// @return false with aError set when the file could not be finished
     virtual bool Close( int64_t aEndIndex, std::string& aError ) = 0;
+
+    /// @brief From another thread, when Write / Close no longer return (the encoder stopped
+    /// taking frames): makes them fail at once. The file is lost.
+    virtual void Abort() {}
 };
 
 
