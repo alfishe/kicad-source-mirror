@@ -14,6 +14,8 @@
 #include <kiway.h>
 
 #include <algorithm>
+#include <string_view>
+#include <charconv>
 #include <cctype>
 #include <cstdio>
 #include <initializer_list>
@@ -161,6 +163,36 @@ const std::vector<std::pair<std::vector<std::string>, std::string>>& genericPart
 }
 
 
+/// @brief The decimal integer aText starts with (like sscanf "%d", but a number too long for an
+/// int is no number instead of undefined behaviour)
+/// @return the characters it takes, 0 when there is none
+size_t leadingInt( std::string_view aText, int& aValue )
+{
+    const auto [end, ec] = std::from_chars( aText.data(), aText.data() + aText.size(), aValue );
+    return ec == std::errc() ? size_t( end - aText.data() ) : 0;
+}
+
+
+/// @brief "<int><one char><int>" at the start of aText ("2x3", "1x04")
+bool intCharInt( std::string_view aText, int& aFirst, char& aSep, int& aSecond )
+{
+    const size_t a = leadingInt( aText, aFirst );
+
+    if( !a || a >= aText.size() )
+        return false;
+
+    aSep = aText[a];
+    return leadingInt( aText.substr( a + 1 ), aSecond ) > 0;
+}
+
+
+/// @brief aText is exactly a decimal integer
+bool wholeInt( std::string_view aText, int& aValue )
+{
+    return !aText.empty() && leadingInt( aText, aValue ) == aText.size();
+}
+
+
 /// @brief Rows x pins from "2x3", "1x04", "4 pin", "4-pin", "4pin", "4 way"; 0 when not given
 std::pair<int, int> connectorLayout( const std::vector<std::string>& aQuery )
 {
@@ -170,22 +202,19 @@ std::pair<int, int> connectorLayout( const std::vector<std::string>& aQuery )
         int                rows = 0, cols = 0;
         char               x = 0;
 
-        if( std::sscanf( w.c_str(), "%d%c%d", &rows, &x, &cols ) == 3 && x == 'x' && rows >= 1 && rows <= 2 && cols >= 1
-            && cols <= 40 )
-        {
+        if( intCharInt( w, rows, x, cols ) && x == 'x' && rows >= 1 && rows <= 2 && cols >= 1 && cols <= 40 )
             return { rows, cols };
-        }
 
-        char unit[16] = {};
+        const size_t     digits = leadingInt( w, cols );
+        const std::string unit = digits ? w.substr( digits ) : std::string();
 
-        if( std::sscanf( w.c_str(), "%d%15s", &cols, unit ) == 2 && cols >= 1 && cols <= 40
-            && ( !std::strcmp( unit, "pin" ) || !std::strcmp( unit, "-pin" ) || !std::strcmp( unit, "p" )
-                 || !std::strcmp( unit, "-way" ) || !std::strcmp( unit, "way" ) ) )
+        if( digits && cols >= 1 && cols <= 40
+            && ( unit == "pin" || unit == "-pin" || unit == "p" || unit == "-way" || unit == "way" ) )
         {
             return { 1, cols };
         }
 
-        if( std::sscanf( w.c_str(), "%d", &cols ) == 1 && std::to_string( cols ) == w && k + 1 < aQuery.size()
+        if( wholeInt( w, cols ) && std::to_string( cols ) == w && k + 1 < aQuery.size()
             && ( aQuery[k + 1] == "pin" || aQuery[k + 1] == "pins" || aQuery[k + 1] == "way" || aQuery[k + 1] == "position" )
             && cols >= 1 && cols <= 40 )
         {
@@ -255,7 +284,8 @@ bool looksLikeValue( const std::string& aWord )
         return false;
 
     // four digits are a chip size (0402, 0603, 1206, 2512), not a value
-    if( aWord.size() == 4 && std::all_of( aWord.begin(), aWord.end(), ::isdigit ) )
+    if( aWord.size() == 4
+        && std::all_of( aWord.begin(), aWord.end(), []( char c ) { return std::isdigit( (unsigned char) c ); } ) )
         return false;
 
     size_t k = 0;
@@ -291,10 +321,10 @@ std::vector<std::string> packageWordsOf( const std::vector<std::string>& aQuery 
         char x = 0;
         int  m = 0;
 
-        if( skip.count( w ) || looksLikeValue( w ) || std::sscanf( w.c_str(), "%d%c%d", &n, &x, &m ) == 3 )
+        if( skip.count( w ) || looksLikeValue( w ) || intCharInt( w, n, x, m ) )
             continue;
 
-        if( w.size() < 4 && std::sscanf( w.c_str(), "%d", &n ) == 1 && std::to_string( n ) == w )
+        if( w.size() < 4 && wholeInt( w, n ) && std::to_string( n ) == w )
             continue;   // a pin count (four digits are a chip size: 0603, 1206)
 
         if( w.size() > 3 && ( w.ends_with( "pin" ) || w.ends_with( "way" ) ) && std::isdigit( (unsigned char) w[0] ) )

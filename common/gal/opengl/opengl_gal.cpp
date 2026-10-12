@@ -980,8 +980,11 @@ bool OPENGL_GAL::GetScreenshot( wxImage& aDstImage )
         {
             std::vector<unsigned char> over( (size_t) w * h * 4 );
 
+            // each buffer is its own attachment: read the one SetBuffer selected, not the main one
+            GLint overlayRead = GL_COLOR_ATTACHMENT0;
             m_compositor->SetBuffer( m_overlayBuffer );
-            glReadBuffer( (GLenum) readBuffer );
+            glGetIntegerv( GL_DRAW_BUFFER, &overlayRead );
+            glReadBuffer( (GLenum) overlayRead );
             glReadPixels( 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, over.data() );
 
             // premultiplied overlay over the main buffer: c = o + m * ( 255 - a ) / 255, in an

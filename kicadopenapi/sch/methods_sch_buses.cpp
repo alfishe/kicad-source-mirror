@@ -31,6 +31,7 @@
 #include <map>
 #include <numeric>
 #include <set>
+#include <utility>
 
 using namespace kopenapi_sch;
 
@@ -186,7 +187,19 @@ std::vector<BUS_GROUP> collectBuses( SCHEMATIC* aSchematic )
         std::vector<size_t> parent( buses.size() );
         std::iota( parent.begin(), parent.end(), 0 );
 
-        std::function<size_t( size_t )> root = [&]( size_t i ) { return parent[i] == i ? i : parent[i] = root( parent[i] ); };
+        // iterative (a long chain of segments must not recurse), with path compression
+        auto root = [&]( size_t i )
+        {
+            size_t r = i;
+
+            while( parent[r] != r )
+                r = parent[r];
+
+            while( parent[i] != r )
+                i = std::exchange( parent[i], r );
+
+            return r;
+        };
 
         for( size_t i = 0; i < buses.size(); ++i )
         {
