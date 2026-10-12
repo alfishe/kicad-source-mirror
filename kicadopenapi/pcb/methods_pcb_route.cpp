@@ -699,10 +699,14 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     std::shared_ptr<CONNECTIVITY_DATA> connectivity = board->GetConnectivity();
     connectivity->RecalculateRatsnest();
 
+    // the ends are found again by id before each job: an earlier route (shove) or the UI kept
+    // alive between jobs may have removed or replaced them
     struct JOB
     {
         PAD*                  from;
         BOARD_CONNECTED_ITEM* to;
+        KIID                  fromId;
+        KIID                  toId;
         VECTOR2I              toPos;
         double                length;
         std::string           net;
@@ -743,7 +747,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             if( pa->Type() != PCB_PAD_T )
                 continue;   // track to track: later
 
-            jobs.push_back( { static_cast<PAD*>( pa ), pb, b->Pos(), (double) ( b->Pos() - a->Pos() ).EuclideanNorm(), name, power } );
+            jobs.push_back( { static_cast<PAD*>( pa ), pb, pa->m_Uuid, pb->m_Uuid, b->Pos(),
+                              (double) ( b->Pos() - a->Pos() ).EuclideanNorm(), name, power } );
         }
     }
 
@@ -762,9 +767,19 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     double            length = 0;
     int               vias = 0;
 
-    for( const JOB& job : jobs )
+    for( JOB& job : jobs )
     {
         KopenapiKeepUiAlive();
+
+        job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
+        job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+        if( !job.from || !job.to )
+        {
+            results.push_back( { { "net", job.net }, { "routed", false }, { "tries", 0 },
+                                 { "reason", "an end of the connection is gone (removed or replaced by an earlier route)" } } );
+            continue;
+        }
 
         nlohmann::json attempt;
         bool           ok = false;
