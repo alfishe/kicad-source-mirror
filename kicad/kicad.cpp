@@ -568,6 +568,11 @@ void PGM_KICAD::OnPgmExit()
         m_settings_manager->Save();
     }
 
+    // Projects go now, not in static destruction: their settings' nested objects store
+    // themselves on release through serializers whose static tables may be gone by then
+    if( m_settings_manager )
+        m_settings_manager->UnloadAllProjects();
+
     // Destroy PGM_KICAD earlier than wxApp and static destruction would
     Destroy();
     GetGitBackend()->Shutdown();

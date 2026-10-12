@@ -185,3 +185,8 @@ INSTALL( DIRECTORY
     DESTINATION ${KICAD_DATA}
     COMPONENT Runtime
 )
+
+# the generated protobuf code crashes under ASAN at startup (TypeId::name() on Apple clang)
+if( KICAD_SANITIZE_ADDRESS )
+    target_compile_options( kiapi PRIVATE -fno-sanitize=address )
+endif()

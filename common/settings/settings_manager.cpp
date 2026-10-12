@@ -1147,6 +1147,16 @@ bool SETTINGS_MANAGER::IsProjectLoaded( PROJECT* aProject ) const
 }
 
 
+void SETTINGS_MANAGER::UnloadAllProjects()
+{
+    for( const wxString& path : GetOpenProjects() )
+    {
+        if( PROJECT* project = GetProject( path ) )
+            UnloadProject( project, false );
+    }
+}
+
+
 bool SETTINGS_MANAGER::UnloadProject( PROJECT* aProject, bool aSave )
 {
     if( !aProject || !m_projects.count( aProject->GetProjectFullName() ) )

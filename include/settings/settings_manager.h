@@ -309,6 +309,12 @@ public:
     bool UnloadProject( PROJECT* aProject, bool aSave = true );
 
     /**
+     * Unload every project without saving it (program exit: what the destructor would do, done
+     * while the program's statics still exist).
+     */
+    void UnloadAllProjects();
+
+    /**
      * Helper for checking if we have a project open.
      *
      * @todo This should be deprecated along with Prj() once we support multiple projects fully.
