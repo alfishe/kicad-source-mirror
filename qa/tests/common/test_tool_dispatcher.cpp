@@ -24,6 +24,9 @@
 #include <tool/tool_manager.h>
 #include <tool/tool_interactive.h>
 #include <tool/action_menu.h>
+#include <view/view.h>
+#include <view/view_controls.h>
+#include <kiplatform/ui.h>
 
 #include <wx/display.h>
 #include <wx/evtloop.h>
@@ -177,6 +180,136 @@ BOOST_AUTO_TEST_CASE( RightClickOpensMenuWhileEventLoopYields )
 
     mgr.ProcessEvent( TOOL_EVENT( TC_MOUSE, TA_MOUSE_CLICK, BUT_RIGHT ) );
     BOOST_CHECK( tool->m_menuRan );
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+
+namespace
+{
+/// View controls with a pointer position the test sets (screen = world)
+class FAKE_VIEW_CONTROLS : public KIGFX::VIEW_CONTROLS
+{
+public:
+    explicit FAKE_VIEW_CONTROLS( KIGFX::VIEW* aView ) : KIGFX::VIEW_CONTROLS( aView ) {}
+
+    void PinCursorInsideNonAutoscrollArea( bool aWarpMouseCursor ) override {}
+    VECTOR2D GetMousePosition( bool aWorldCoordinates = true ) const override { return m_pos; }
+    VECTOR2D GetRawCursorPosition( bool aSnappingEnabled = true ) const override { return m_pos; }
+    VECTOR2D GetCursorPosition( bool aEnableSnapping ) const override { return m_pos; }
+    void SetCursorPosition( const VECTOR2D& aPosition, bool aWarpView = true, bool aTriggeredByArrows = false,
+                            long aArrowCommand = 0 ) override {}
+    void SetCrossHairCursorPosition( const VECTOR2D& aPosition, bool aWarpView = true ) override {}
+    void WarpMouseCursor( const VECTOR2D& aPosition, bool aWorldCoordinates = false,
+                          bool aWarpView = false ) override {}
+    void CenterOnCursor() override {}
+    void ShowCursor( bool aEnabled ) override {}     // the base draws through the view's GAL
+
+    VECTOR2D m_pos;
+};
+
+
+/// Records the mouse button events the tool manager delivers (motion left out)
+class INPUT_RECORDER : public TOOL_INTERACTIVE
+{
+public:
+    INPUT_RECORDER() : TOOL_INTERACTIVE( "test.inputRecorder" ) {}
+
+    void Reset( RESET_REASON aReason ) override {}
+
+    int Record( const TOOL_EVENT& aEvent )
+    {
+        if( aEvent.Category() == TC_MOUSE && aEvent.Action() != TA_MOUSE_MOTION )
+            m_events.push_back( aEvent.Action() );
+
+        return 0;
+    }
+
+    std::vector<int> m_events;
+
+private:
+    void setTransitions() override { Go( &INPUT_RECORDER::Record, TOOL_EVENT( TC_MOUSE, TA_ANY ) ); }
+};
+} // namespace
+
+
+/// The real mouse path: wx events into TOOL_DISPATCHER::DispatchWxEvent, the buttons held as the
+/// platform reports them (fed through the pointer gate, the physical mouse is not touched)
+struct WX_INPUT_FIXTURE
+{
+    WX_INPUT_FIXTURE() : controls( &view ), dispatcher( &mgr )
+    {
+        recorder = new INPUT_RECORDER();
+        mgr.SetEnvironment( nullptr, nullptr, &controls, nullptr, nullptr );
+        mgr.RegisterTool( recorder );
+        mgr.ResetTools( TOOL_BASE::RUN );
+        KIPLATFORM::UI::SetInjectedPointer( &pointer );
+    }
+
+    ~WX_INPUT_FIXTURE() { KIPLATFORM::UI::SetInjectedPointer( nullptr ); }
+
+    void send( wxEventType aType, int aX, int aY, bool aLeftHeld )
+    {
+        controls.m_pos = VECTOR2D( aX, aY );
+        pointer.screenPosition = wxPoint( aX, aY );
+        pointer.left = aLeftHeld;
+        KIPLATFORM::UI::SetInjectedPointer( &pointer );
+
+        wxMouseEvent event( aType );
+        event.SetPosition( wxPoint( aX, aY ) );
+        event.SetLeftDown( aLeftHeld );
+        dispatcher.DispatchWxEvent( event );
+    }
+
+    KIGFX::VIEW                      view;
+    FAKE_VIEW_CONTROLS               controls;
+    TOOL_MANAGER                     mgr;
+    TOOL_DISPATCHER                  dispatcher;
+    INPUT_RECORDER*                  recorder = nullptr;
+    KIPLATFORM::UI::INJECTED_POINTER pointer;
+};
+
+
+BOOST_FIXTURE_TEST_SUITE( ToolDispatcherWxInput, WX_INPUT_FIXTURE )
+
+BOOST_AUTO_TEST_CASE( Click )
+{
+    send( wxEVT_LEFT_DOWN, 100, 100, true );
+    send( wxEVT_LEFT_UP, 100, 100, false );
+
+    BOOST_CHECK( recorder->m_events == std::vector<int>( { TA_MOUSE_DOWN, TA_MOUSE_CLICK } ) );
+}
+
+BOOST_AUTO_TEST_CASE( Drag )
+{
+    send( wxEVT_LEFT_DOWN, 100, 100, true );
+    send( wxEVT_MOTION, 300, 100, true );
+    send( wxEVT_LEFT_UP, 300, 100, false );
+
+    BOOST_CHECK( recorder->m_events == std::vector<int>( { TA_MOUSE_DOWN, TA_MOUSE_DRAG, TA_MOUSE_UP } ) );
+}
+
+BOOST_AUTO_TEST_CASE( DoubleClick )
+{
+    send( wxEVT_LEFT_DOWN, 100, 100, true );
+    send( wxEVT_LEFT_UP, 100, 100, false );
+    send( wxEVT_LEFT_DCLICK, 100, 100, true );
+    send( wxEVT_LEFT_UP, 100, 100, false );
+
+    BOOST_CHECK( recorder->m_events == std::vector<int>( { TA_MOUSE_DOWN, TA_MOUSE_CLICK, TA_MOUSE_DBLCLICK } ) );
+}
+
+// The second press far from the first is a fast click-drag, not a double click
+BOOST_AUTO_TEST_CASE( FastClickDrag )
+{
+    send( wxEVT_LEFT_DOWN, 100, 100, true );
+    send( wxEVT_LEFT_UP, 100, 100, false );
+    send( wxEVT_LEFT_DCLICK, 300, 100, true );
+    send( wxEVT_MOTION, 400, 100, true );
+    send( wxEVT_LEFT_UP, 400, 100, false );
+
+    BOOST_CHECK( recorder->m_events
+                 == std::vector<int>( { TA_MOUSE_DOWN, TA_MOUSE_CLICK, TA_MOUSE_DOWN, TA_MOUSE_DRAG, TA_MOUSE_UP } ) );
 }
 
 BOOST_AUTO_TEST_SUITE_END()
