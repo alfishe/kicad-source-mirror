@@ -102,7 +102,7 @@ ProcessMemoryInfo ProcessMemory();
 /// @brief The system allocator: bytes in live blocks and bytes it holds from the OS; -1 when unknown
 struct AllocatorInfo
 {
-    const char* allocator = "unknown";   ///< macos-malloc, glibc, windows-heap
+    const char* allocator = "unknown";   ///< macos-malloc, glibc, jemalloc, windows-heap
     int64_t     live = -1;
     int64_t     mapped = -1;
     int64_t     peakLive = -1;

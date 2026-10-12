@@ -18,6 +18,7 @@ add_executable( kicad-mcp-bridge
     ${KOPENAPI_PLATFORM_DIR}/platform_posix.cpp
     ${KOPENAPI_PLATFORM_DIR}/platform_macos.cpp
     ${KOPENAPI_PLATFORM_DIR}/platform_linux.cpp
+    ${KOPENAPI_PLATFORM_DIR}/platform_linux_jemalloc.cpp
     ${KOPENAPI_PLATFORM_DIR}/platform_windows.cpp
     )
 
@@ -36,6 +37,8 @@ set_target_properties( kicad-mcp-bridge PROPERTIES
 
 if( WIN32 )
     target_link_libraries( kicad-mcp-bridge PRIVATE ws2_32 )
+else()
+    target_link_libraries( kicad-mcp-bridge PRIVATE ${CMAKE_DL_LIBS} )
 endif()
 
 # Inside the KiCad tree: ship next to kicad / kicad-cli (the bridge's default lookup)

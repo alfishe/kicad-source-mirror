@@ -199,6 +199,10 @@ cmake_dependent_option( KICAD_MSVC_DYNDEOPT
 # Compiler options/tools
 ####################################
 
+set( KICAD_ALLOCATOR "system" CACHE STRING
+    "Process allocator: system, or jemalloc (Linux only; returns idle memory to the OS by itself)" )
+set_property( CACHE KICAD_ALLOCATOR PROPERTY STRINGS system jemalloc )
+
 # Not supported by all platforms (for instance mingw)
 option( KICAD_SANITIZE_ADDRESS
     "Build KiCad with address sanitizer options. WARNING: Not compatible with gold linker"
@@ -1062,6 +1066,28 @@ if( KICAD_USE_SENTRY )
 endif()
 
 find_package( nng REQUIRED )
+
+#
+# Allocator
+#
+if( KICAD_ALLOCATOR STREQUAL "jemalloc" )
+    if( NOT ( UNIX AND NOT APPLE ) OR KICAD_SANITIZE_ADDRESS OR KICAD_SANITIZE_THREADS )
+        message( FATAL_ERROR "KICAD_ALLOCATOR=jemalloc: Linux only, not with sanitizers" )
+    endif()
+
+    find_package( PkgConfig REQUIRED )
+    pkg_check_modules( JEMALLOC REQUIRED jemalloc )
+
+    # every executable links it first and unconditionally, so it replaces malloc process-wide
+    foreach( dir ${JEMALLOC_LIBRARY_DIRS} )
+        string( APPEND CMAKE_EXE_LINKER_FLAGS " -L${dir}" )
+    endforeach()
+
+    string( APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,--push-state,--no-as-needed -ljemalloc -Wl,--pop-state" )
+    message( STATUS "Allocator: jemalloc ${JEMALLOC_VERSION}" )
+elseif( NOT KICAD_ALLOCATOR STREQUAL "system" )
+    message( FATAL_ERROR "KICAD_ALLOCATOR must be system or jemalloc" )
+endif()
 
 #================================================
 # Add the doxygen target

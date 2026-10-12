@@ -77,6 +77,10 @@ ProcessMemoryInfo ProcessMemoryLinux()
 AllocatorInfo AllocatorStatsLinux()
 {
     AllocatorInfo info;
+
+    if( JemallocStats( info ) )
+        return info;
+
 #if defined(__GLIBC__) && ( __GLIBC__ > 2 || ( __GLIBC__ == 2 && __GLIBC_MINOR__ >= 33 ) )
     info.allocator = "glibc";
     const struct mallinfo2 mi = mallinfo2();
@@ -88,6 +92,9 @@ AllocatorInfo AllocatorStatsLinux()
 
 int64_t AllocatorTrimLinux()
 {
+    if( JemallocTrim() )
+        return -1;
+
 #if defined(__GLIBC__)
     malloc_trim(0);
 #endif

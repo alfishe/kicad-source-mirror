@@ -18,6 +18,11 @@ AllocatorInfo AllocatorStatsLinux();
 int64_t AllocatorTrimLinux();
 void LowerCurrentThreadPriorityLinux();
 
+/// jemalloc (linked or preloaded), found through mallctl at run time
+bool JemallocActive();
+bool JemallocStats( AllocatorInfo& aInfo );
+bool JemallocTrim();
+
 } // namespace kopenapi::platform
 
 #endif // __linux__

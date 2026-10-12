@@ -427,8 +427,14 @@ list( APPEND KICOMMON_SRCS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_posix.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_macos.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_linux.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_linux_jemalloc.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_windows.cpp
 )
+
+if( KICAD_ALLOCATOR STREQUAL "jemalloc" )
+    set_source_files_properties( ${CMAKE_SOURCE_DIR}/kicadopenapi/platform/platform_linux_jemalloc.cpp
+                                 PROPERTIES COMPILE_DEFINITIONS KICAD_ALLOCATOR_JEMALLOC )
+endif()
 
 # native video encoders, one per OS (others record through ffmpeg)
 if( APPLE )
