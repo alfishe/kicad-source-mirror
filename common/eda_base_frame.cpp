@@ -1919,6 +1919,7 @@ void EDA_BASE_FRAME::initExitKey()
 
 void EDA_BASE_FRAME::ClearUndoRedoList()
 {
+    m_undoDropCount += GetUndoCommandCount();
     ClearUndoORRedoList( UNDO_LIST );
     ClearUndoORRedoList( REDO_LIST );
 }
@@ -1934,7 +1935,10 @@ void EDA_BASE_FRAME::PushCommandToUndoList( PICKED_ITEMS_LIST* aNewitem )
         int extraitems = GetUndoCommandCount() - m_undoRedoCountMax;
 
         if( extraitems > 0 )
+        {
+            m_undoDropCount += extraitems;
             ClearUndoORRedoList( UNDO_LIST, extraitems );
+        }
     }
 }
 

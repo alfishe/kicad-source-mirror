@@ -20,6 +20,7 @@
 #ifndef KICADOPENAPI_REGISTRY_H
 #define KICADOPENAPI_REGISTRY_H
 
+#include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <set>
@@ -68,15 +69,35 @@ using KOPENAPI_DOC_STATUS = std::function<nlohmann::json( KOPENAPI_CONTEXT& aCtx
 using KOPENAPI_DOC_RELEASE = std::function<void()>;
 
 
+/// @brief A point in a GUI editor's undo stack.  The depth alone does not name it: once the stack
+/// is at its limit every new command drops the oldest and the depth stays the same.  The command
+/// on top (its serial, PICKED_ITEMS_LIST::GetSerial()) names it while it is in the stack; an empty
+/// stack is named by how many commands the frame had dropped by then.
+struct KOPENAPI_UNDO_MARK
+{
+    int      depth = 0;     ///< undo commands at the mark (informational)
+    uint64_t top = 0;       ///< serial of the command on top; 0: the stack was empty
+    uint64_t dropped = 0;   ///< EDA_BASE_FRAME::GetUndoDropCount() at the mark
+};
+
+
 /// @brief How a kiface rolls its open document back (edit_log / checkpoint / rollback).  GUI editors
-/// have an undo stack: a mark is its depth and rolling back undoes down to it (every change
+/// have an undo stack: a mark names a point in it and rolling back undoes down to it (every change
 /// counts: API calls, the router, the netlist updater, edits by hand).  Headless documents have
 /// none: a mark is a copy of the document written into a directory, rolling back loads it again
 /// under the document's own path (unsaved).  Every function runs on the main thread.
+///
+/// Rolling back is exact or refused: undoTarget finds where a mark is in the stack now, and
+/// nothing is undone in any document unless every document's mark is found.
 struct KOPENAPI_DOC_HISTORY
 {
-    /// @brief Undo stack depth of the open GUI document; nullopt headless or when none is open
-    std::function<std::optional<int>( KOPENAPI_CONTEXT& )> undoDepth;
+    /// @brief The point in the undo stack of the open GUI document; nullopt headless or when none
+    std::function<std::optional<KOPENAPI_UNDO_MARK>( KOPENAPI_CONTEXT& )> undoMark;
+
+    /// @brief How deep the undo stack must be to be at aMark now; nullopt and aWhy when the stack no
+    /// longer reaches it (dropped at the limit, cleared, or replaced after an undo)
+    std::function<std::optional<int>( KOPENAPI_CONTEXT&, const KOPENAPI_UNDO_MARK& aMark, std::string& aWhy )>
+            undoTarget;
 
     /// @brief GUI: undo until the stack is that deep; false when it cannot get there
     std::function<bool( KOPENAPI_CONTEXT&, int aDepth )> undoTo;

@@ -614,6 +614,25 @@ public:
     int GetMaxUndoItems() const { return m_undoRedoCountMax; }
 
     /**
+     * @return The serial (PICKED_ITEMS_LIST::GetSerial()) of the undo command at \a aIndex
+     *         (0 = oldest), or 0 when there is none.
+     */
+    uint64_t GetUndoCommandSerial( int aIndex ) const
+    {
+        if( aIndex < 0 || aIndex >= (int) m_undoList.m_CommandsList.size() )
+            return 0;
+
+        return m_undoList.m_CommandsList[aIndex]->GetSerial();
+    }
+
+    /**
+     * @return How many undo commands this frame has dropped from the bottom of its undo list
+     *         (at the undo limit, or by ClearUndoRedoList()) since it was created.  Undo and
+     *         redo do not count: they move commands, they do not drop them.
+     */
+    uint64_t GetUndoDropCount() const { return m_undoDropCount; }
+
+    /**
      * Must be called after a model change in order to set the "modify" flag and do other
      * frame-specific processing.
      */
@@ -856,6 +875,7 @@ private:
     wxDateTime              m_autoSaveDeferredSince;
 
     int                     m_undoRedoCountMax;  // undo/Redo command Max depth
+    uint64_t                m_undoDropCount = 0; // undo commands dropped, see GetUndoDropCount()
 
     UNDO_REDO_CONTAINER     m_undoList;          // Objects list for the undo command (old data)
     UNDO_REDO_CONTAINER     m_redoList;          // Objects list for the redo command (old data)

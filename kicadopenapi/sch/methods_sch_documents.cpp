@@ -17,6 +17,7 @@
 #include <tool/actions.h>
 #include <sch_screen.h>
 #include <kicadopenapi_history.h>
+#include <kicadopenapi_undo.h>
 #include <pgm_base.h>
 #include <project.h>
 #include <sch_edit_frame.h>
@@ -395,14 +396,28 @@ static KOPENAPI_DOC_HISTORY history()
 {
     KOPENAPI_DOC_HISTORY h;
 
-    h.undoDepth = []( KOPENAPI_CONTEXT& aCtx ) -> std::optional<int>
+    h.undoMark = []( KOPENAPI_CONTEXT& aCtx ) -> std::optional<KOPENAPI_UNDO_MARK>
     {
         SCH_EDIT_FRAME* frame = guiFrame( aCtx, false );
 
         if( !frame || !KopenapiSchContext( aCtx ) )
             return std::nullopt;
 
-        return frame->GetUndoCommandCount();
+        return KopenapiUndoMark( *frame );
+    };
+
+    h.undoTarget = []( KOPENAPI_CONTEXT& aCtx, const KOPENAPI_UNDO_MARK& aMark,
+                       std::string& aWhy ) -> std::optional<int>
+    {
+        SCH_EDIT_FRAME* frame = guiFrame( aCtx, false );
+
+        if( !frame )
+        {
+            aWhy = "the editor window is closed";
+            return std::nullopt;
+        }
+
+        return KopenapiUndoTarget( *frame, aMark, aWhy );
     };
 
     h.undoTo = []( KOPENAPI_CONTEXT& aCtx, int aDepth )

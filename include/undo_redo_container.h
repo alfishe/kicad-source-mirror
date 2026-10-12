@@ -22,6 +22,7 @@
 #ifndef _CLASS_UNDOREDO_CONTAINER_H
 #define _CLASS_UNDOREDO_CONTAINER_H
 
+#include <cstdint>
 #include <core/typeinfo.h>
 #include <eda_item_flags.h>
 #include <functional>
@@ -127,6 +128,10 @@ class PICKED_ITEMS_LIST
 public:
     PICKED_ITEMS_LIST();
     ~PICKED_ITEMS_LIST();
+
+    /// A copy is a new command: it gets its own serial (see GetSerial())
+    PICKED_ITEMS_LIST( const PICKED_ITEMS_LIST& aOther );
+    PICKED_ITEMS_LIST& operator=( const PICKED_ITEMS_LIST& aOther );
 
     /**
      * Push \a aItem to the top of the list.
@@ -274,9 +279,18 @@ public:
     wxString GetDescription() const                     { return m_description; }
     void SetDescription( const wxString& aDescription ) { m_description = aDescription; }
 
+    /**
+     * @return A process-wide unique, never reused number given to this command when it was
+     *         created.  It stays with the command while it moves between the undo and redo
+     *         lists, so a point in an undo stack can be named by the command on top of it
+     *         even after the stack has dropped older commands at its limit.
+     */
+    uint64_t GetSerial() const { return m_serial; }
+
 private:
     wxString                 m_description;
     std::vector<ITEM_PICKER> m_ItemsList;
+    uint64_t                 m_serial;
 };
 
 

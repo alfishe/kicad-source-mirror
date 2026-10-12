@@ -18,11 +18,11 @@ namespace
 
 using CLOCK = std::chrono::system_clock;
 
-/// @brief One document's state at a mark: undo depth (GUI) or a copy (headless)
+/// @brief One document's state at a mark: a point in the undo stack (GUI) or a copy (headless)
 struct DOC_MARK
 {
-    std::optional<int> depth;
-    std::string        snapshot;   ///< directory with the copy
+    std::optional<KOPENAPI_UNDO_MARK> undo;
+    std::string                       snapshot;   ///< directory with the copy
 };
 
 /// @brief Every open document at one moment
@@ -146,10 +146,10 @@ struct KOPENAPI_HISTORY::IMPL
         {
             DOC_MARK doc;
 
-            if( history.undoDepth )
-                doc.depth = history.undoDepth( aCtx );
+            if( history.undoMark )
+                doc.undo = history.undoMark( aCtx );
 
-            if( !doc.depth && history.snapshot )
+            if( !doc.undo && history.snapshot )
             {
                 std::string dir = snapshotDir();
 
@@ -159,18 +159,46 @@ struct KOPENAPI_HISTORY::IMPL
                     removeDir( dir );
             }
 
-            if( doc.depth || !doc.snapshot.empty() )
+            if( doc.undo || !doc.snapshot.empty() )
                 m.docs[domain] = doc;
         }
 
         return m;
     }
 
-    /// @brief Bring every marked document back to the mark; per domain what happened
-    nlohmann::json restore( KOPENAPI_CONTEXT& aCtx, const MARK& aMark )
+    /// @brief Bring every marked document back to the mark; per domain what happened.  Exact or
+    /// refused: first every GUI mark is found in its undo stack, and when any is not, nothing is
+    /// undone anywhere and aRefused says why (a partly rolled back schematic / board pair would be
+    /// a state that never existed).
+    nlohmann::json restore( KOPENAPI_CONTEXT& aCtx, const MARK& aMark, std::string& aRefused )
     {
         nlohmann::json done = nlohmann::json::object();
         const auto     histories = KOPENAPI_REGISTRY::Get().DocumentHistories();
+        std::map<std::string, int> depths;
+
+        for( const auto& [domain, doc] : aMark.docs )
+        {
+            auto it = histories.find( domain );
+
+            if( it == histories.end() || !doc.undo )
+                continue;
+
+            std::string        why = "this document cannot locate undo marks";
+            std::optional<int> depth = it->second.undoTarget ? it->second.undoTarget( aCtx, *doc.undo, why )
+                                                             : std::nullopt;
+
+            if( !depth )
+            {
+                done[domain] = "not reachable: " + why;
+                aRefused += ( aRefused.empty() ? "" : "; " ) + domain + ": " + why;
+                continue;
+            }
+
+            depths[domain] = *depth;
+        }
+
+        if( !aRefused.empty() )
+            return done;
 
         for( const auto& [domain, doc] : aMark.docs )
         {
@@ -181,12 +209,12 @@ struct KOPENAPI_HISTORY::IMPL
 
             bool ok = false;
 
-            if( doc.depth && it->second.undoTo )
-                ok = it->second.undoTo( aCtx, *doc.depth );
+            if( doc.undo && it->second.undoTo )
+                ok = it->second.undoTo( aCtx, depths[domain] );
             else if( !doc.snapshot.empty() && it->second.restore )
                 ok = it->second.restore( aCtx, doc.snapshot );
 
-            done[domain] = ok ? ( doc.depth ? "undone in the editor" : "restored from the copy" ) : "failed";
+            done[domain] = ok ? ( doc.undo ? "undone in the editor" : "restored from the copy" ) : "failed";
         }
 
         return done;
@@ -319,7 +347,7 @@ KOPENAPI_RESULT KOPENAPI_HISTORY::Checkpoint( KOPENAPI_CONTEXT& aCtx, const nloh
     nlohmann::json docs = nlohmann::json::object();
 
     for( const auto& [domain, doc] : c.mark.docs )
-        docs[domain] = doc.depth ? "editor undo stack" : "copy";
+        docs[domain] = doc.undo ? "editor undo stack" : "copy";
 
     d->checkpoints.push_back( std::move( c ) );
     return KOPENAPI_RESULT::Ok( { { "name", name }, { "after_seq", d->checkpoints.back().afterSeq }, { "documents", docs } } );
@@ -392,7 +420,19 @@ KOPENAPI_RESULT KOPENAPI_HISTORY::Rollback( KOPENAPI_CONTEXT& aCtx, const nlohma
         what = std::to_string( steps ) + " step(s)";
     }
 
-    nlohmann::json documents = d->restore( aCtx, *target );
+    std::string    refused;
+    nlohmann::json documents = d->restore( aCtx, *target, refused );
+
+    // Not reachable: nothing was undone, the log and the checkpoints stay as they are
+    if( !refused.empty() )
+    {
+        return KOPENAPI_RESULT{ 409, { { "error", { { "code", 409 },
+                                                    { "message", "cannot roll back to " + what
+                                                                         + " exactly, nothing was undone: "
+                                                                         + refused } } },
+                                       { "documents", documents } } };
+    }
+
 
     // The undone steps leave the log; checkpoints after the target are dropped
     nlohmann::json undone = nlohmann::json::array();
@@ -503,7 +543,9 @@ KOPENAPI_REGISTER( "checkpoint_list", "Named checkpoints of this session with th
 KOPENAPI_REGISTER( "rollback",
                    "Roll the open schematic and board back to a checkpoint (by name) or N editing steps "
                    "(edit_log); GUI: undo in the editors (edits by hand since then are undone too), "
-                   "headless: the copies are loaded back (unsaved). Later log entries and checkpoints go",
+                   "headless: the copies are loaded back (unsaved). Later log entries and checkpoints go. "
+                   "Exact or refused (409, nothing undone): when an editor's undo stack no longer reaches "
+                   "the target (dropped at the undo limit, cleared, or replaced after an undo)",
                    R"json({"type":"object","properties":{
                         "checkpoint":{"type":"string"},
                         "steps":{"type":"integer","default":1}}})json"_json,

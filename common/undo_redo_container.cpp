@@ -23,6 +23,15 @@
 #include <eda_group.h>
 #include <undo_redo_container.h>
 
+#include <atomic>
+
+
+static uint64_t nextCommandSerial()
+{
+    static std::atomic<uint64_t> s_serial{ 0 };
+    return ++s_serial;
+}
+
 
 ITEM_PICKER::ITEM_PICKER()
 {
@@ -44,8 +53,25 @@ ITEM_PICKER::ITEM_PICKER( BASE_SCREEN* aScreen, EDA_ITEM* aItem, UNDO_REDO aUndo
 }
 
 
-PICKED_ITEMS_LIST::PICKED_ITEMS_LIST()
+PICKED_ITEMS_LIST::PICKED_ITEMS_LIST() :
+        m_serial( nextCommandSerial() )
 {
+}
+
+
+PICKED_ITEMS_LIST::PICKED_ITEMS_LIST( const PICKED_ITEMS_LIST& aOther ) :
+        m_description( aOther.m_description ),
+        m_ItemsList( aOther.m_ItemsList ),
+        m_serial( nextCommandSerial() )
+{
+}
+
+
+PICKED_ITEMS_LIST& PICKED_ITEMS_LIST::operator=( const PICKED_ITEMS_LIST& aOther )
+{
+    m_description = aOther.m_description;
+    m_ItemsList = aOther.m_ItemsList;
+    return *this;   // keeps its own serial
 }
 
 

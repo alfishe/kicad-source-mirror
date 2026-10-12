@@ -66,6 +66,7 @@ set( QA_COMMON_SRCS
     test_inplace_function.cpp
     test_item_realignment.cpp
     test_json_schema_validator.cpp
+    test_kicadopenapi.cpp
     test_ki_any.cpp
     test_library_tables.cpp
     test_local_history_autosave_walk.cpp
