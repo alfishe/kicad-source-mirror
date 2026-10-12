@@ -17,6 +17,7 @@
 #include <wx/weakref.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <deque>
@@ -101,7 +102,32 @@ struct ANNOTATION
     std::string       attach;               ///< item the point anchors and the area move with
     VECTOR2D          attachOrigin;         ///< that item's centre when attached
     VECTOR2D          attachShift;          ///< its move since then, as of the last redraw
+    std::array<double, 4> attachLinear{ 1, 0, 0, 1 };   ///< the item's linear map when attached
+    std::array<double, 4> attachTurn{ 1, 0, 0, 1 };     ///< its change since then (now * inverse( attached ))
+    VECTOR2D          attachCentre;         ///< its centre as of the last redraw
+
+    /// @brief Where aPoint (as placed at attach time) is now: turned with the item about its centre
+    VECTOR2D Attached( const VECTOR2D& aPoint ) const
+    {
+        const VECTOR2D v = aPoint - attachOrigin;
+        const auto&    m = attachTurn;
+        return attachCentre + VECTOR2D( m[0] * v.x + m[1] * v.y, m[2] * v.x + m[3] * v.y );
+    }
 };
+
+
+/// @brief a * inverse( b ) of 2x2 maps { xx, xy, yx, yy }; identity when b is singular
+std::array<double, 4> turnSince( const std::array<double, 4>& a, const std::array<double, 4>& b )
+{
+    const double det = b[0] * b[3] - b[1] * b[2];
+
+    if( std::abs( det ) < 1e-12 )
+        return { 1, 0, 0, 1 };
+
+    const std::array<double, 4> inv{ b[3] / det, -b[1] / det, -b[2] / det, b[0] / det };
+    return { a[0] * inv[0] + a[1] * inv[2], a[0] * inv[1] + a[1] * inv[3],
+             a[2] * inv[0] + a[3] * inv[2], a[2] * inv[1] + a[3] * inv[3] };
+}
 
 
 struct POINTER
@@ -280,15 +306,26 @@ void LAYER::drawAnnotation( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const BOX
         item.ref = aNote.attach;
 
         if( std::optional<BOX2D> box = resolve( item ) )
-            aNote.attachShift = box->Centre() - aNote.attachOrigin;
+        {
+            aNote.attachCentre = box->Centre();
+            aNote.attachShift = aNote.attachCentre - aNote.attachOrigin;
+
+            if( m_host.linear )
+            {
+                if( std::optional<std::array<double, 4>> now = m_host.linear( aNote.attach ) )
+                    aNote.attachTurn = turnSince( *now, aNote.attachLinear );
+            }
+        }
         else
+        {
             aNote.orphaned = true;
+        }
 
         if( target && !aNote.target.isItem )
-            target->Move( aNote.attachShift );
+            *target = BOX2D( aNote.Attached( aNote.target.point ), VECTOR2D( 0, 0 ) );
 
         if( to && !aNote.to.isItem )
-            to->Move( aNote.attachShift );
+            *to = BOX2D( aNote.Attached( aNote.to.point ), VECTOR2D( 0, 0 ) );
     }
 
     if( aNote.target.set && aNote.target.isItem && !target )
@@ -382,8 +419,19 @@ void LAYER::drawAnnotation( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const BOX
     {
         BOX2D box = aNote.area ? *aNote.area : *target;
 
+        // an attached area: its corners turned with the item, the box around them
         if( aNote.area && !aNote.attach.empty() )
-            box.Move( aNote.attachShift );
+        {
+            BOX2D turned( aNote.Attached( aNote.area->GetOrigin() ), VECTOR2D( 0, 0 ) );
+
+            for( const VECTOR2D& c : { VECTOR2D( aNote.area->GetRight(), aNote.area->GetTop() ),
+                                       VECTOR2D( aNote.area->GetLeft(), aNote.area->GetBottom() ), aNote.area->GetEnd() } )
+            {
+                turned.Merge( aNote.Attached( c ) );
+            }
+
+            box = turned;
+        }
 
         if( !aNote.area )
             box.Inflate( 10 * aPx );
@@ -648,6 +696,23 @@ std::string parseAnchor( const KOPENAPI_ANNOTATION_HOST& aHost, const nlohmann::
 }
 
 
+/// @brief Points given now are where they are relative to the item as it is now
+void attachBaseline( const KOPENAPI_ANNOTATION_HOST& aHost, ANNOTATION& aNote, const BOX2I& aItemBox )
+{
+    aNote.attachOrigin = VECTOR2D( aItemBox.Centre() );
+    aNote.attachCentre = aNote.attachOrigin;
+    aNote.attachShift = VECTOR2D( 0, 0 );
+    aNote.attachTurn = { 1, 0, 0, 1 };
+    aNote.attachLinear = { 1, 0, 0, 1 };
+
+    if( aHost.linear )
+    {
+        if( std::optional<std::array<double, 4>> m = aHost.linear( aNote.attach ) )
+            aNote.attachLinear = *m;
+    }
+}
+
+
 std::string applyFields( const KOPENAPI_ANNOTATION_HOST& aHost, const nlohmann::json& aSpec, ANNOTATION& aNote )
 {
     static const std::vector<std::string> kinds = { "highlight", "arrow", "label", "region", "spotlight", "step",
@@ -695,13 +760,23 @@ std::string applyFields( const KOPENAPI_ANNOTATION_HOST& aHost, const nlohmann::
         if( !aNote.attach.empty() && !aSpec.contains( "target" ) && !aSpec.contains( "to" ) && !aSpec.contains( "area" ) )
         {
             if( aNote.target.set && !aNote.target.isItem )
-                aNote.target.point += aNote.attachShift;
+                aNote.target.point = aNote.Attached( aNote.target.point );
 
             if( aNote.to.set && !aNote.to.isItem )
-                aNote.to.point += aNote.attachShift;
+                aNote.to.point = aNote.Attached( aNote.to.point );
 
             if( aNote.area )
-                aNote.area->Move( aNote.attachShift );
+            {
+                BOX2D turned( aNote.Attached( aNote.area->GetOrigin() ), VECTOR2D( 0, 0 ) );
+
+                for( const VECTOR2D& c : { VECTOR2D( aNote.area->GetRight(), aNote.area->GetTop() ),
+                                           VECTOR2D( aNote.area->GetLeft(), aNote.area->GetBottom() ), aNote.area->GetEnd() } )
+                {
+                    turned.Merge( aNote.Attached( c ) );
+                }
+
+                aNote.area = turned;
+            }
 
             aNote.attachShift = VECTOR2D( 0, 0 );
         }
@@ -718,8 +793,7 @@ std::string applyFields( const KOPENAPI_ANNOTATION_HOST& aHost, const nlohmann::
                 return "attach: no item '" + ref + "' (a reference or a uuid on the shown sheet / board)";
 
             aNote.attach = ref;
-            aNote.attachOrigin = VECTOR2D( box->Centre() );
-            aNote.attachShift = VECTOR2D( 0, 0 );
+            attachBaseline( aHost, aNote, *box );
         }
     }
 
@@ -729,10 +803,7 @@ std::string applyFields( const KOPENAPI_ANNOTATION_HOST& aHost, const nlohmann::
         && ( aSpec.contains( "target" ) || aSpec.contains( "to" ) || aSpec.contains( "area" ) ) )
     {
         if( std::optional<BOX2I> box = aHost.resolve ? aHost.resolve( aNote.attach ) : std::nullopt )
-        {
-            aNote.attachOrigin = VECTOR2D( box->Centre() );
-            aNote.attachShift = VECTOR2D( 0, 0 );
-        }
+            attachBaseline( aHost, aNote, *box );
     }
 
     if( aSpec.contains( "text" ) )

@@ -13,6 +13,7 @@
 #include <frame_type.h>
 #include <kiway.h>
 #include <pad.h>
+#include <trigo.h>
 #include <pcb_edit_frame.h>
 
 
@@ -101,6 +102,27 @@ std::optional<BOX2I> resolveBoardItem( PCB_EDIT_FRAME* aFrame, const std::string
 }
 
 
+/// @brief A footprint's or pad's rotation as a linear map (others have none)
+std::optional<std::array<double, 4>> boardItemLinear( PCB_EDIT_FRAME* aFrame, const std::string& aRef )
+{
+    BOARD_ITEM* item = KopenapiFindBoardItem( aFrame ? aFrame->GetBoard() : nullptr, aRef );
+    EDA_ANGLE   angle;
+
+    if( auto* fp = dynamic_cast<FOOTPRINT*>( item ) )
+        angle = fp->GetOrientation();
+    else if( auto* pad = dynamic_cast<PAD*>( item ) )
+        angle = pad->GetOrientation();
+    else
+        return std::nullopt;
+
+    // the board's own rotation convention: the basis vectors turned by RotatePoint
+    VECTOR2D ex( 1.0, 0.0 ), ey( 0.0, 1.0 );
+    RotatePoint( ex, angle );
+    RotatePoint( ey, angle );
+    return std::array<double, 4>{ ex.x, ey.x, ex.y, ey.y };
+}
+
+
 KOPENAPI_RESULT h_pcb_overlay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     auto* frame = aCtx.kiway ? dynamic_cast<PCB_EDIT_FRAME*>( aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) ) : nullptr;
@@ -115,6 +137,7 @@ KOPENAPI_RESULT h_pcb_overlay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aAr
     host.scale = &pcbIUScale;
     host.frame = frame;
     host.resolve = [frame]( const std::string& aRef ) { return resolveBoardItem( frame, aRef ); };
+    host.linear = [frame]( const std::string& aRef ) { return boardItemLinear( frame, aRef ); };
 
     return KopenapiAnnotate( host, aArgs );
 }

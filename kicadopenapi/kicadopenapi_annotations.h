@@ -15,6 +15,7 @@
 #include <math/vector2d.h>
 #include <wx/string.h>
 
+#include <array>
 #include <functional>
 #include <optional>
 #include <string>
@@ -31,6 +32,9 @@ struct KOPENAPI_ANNOTATION_HOST
     EDA_DRAW_FRAME*                                            frame = nullptr;
     /// @brief Item by uuid or reference designator: its bounding box (internal units), or nothing
     std::function<std::optional<BOX2I>( const std::string& aRef )> resolve;
+    /// @brief The item's linear map (rotation, mirroring) as { xx, xy, yx, yy }: a vector v in the
+    /// item's frame is ( xx * v.x + xy * v.y, yx * v.x + yy * v.y ); nothing when it has none
+    std::function<std::optional<std::array<double, 4>>( const std::string& aRef )> linear;
 };
 
 

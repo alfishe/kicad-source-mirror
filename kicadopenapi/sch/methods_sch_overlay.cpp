@@ -82,6 +82,19 @@ std::optional<BOX2I> resolveSchematicItem( SCH_EDIT_FRAME* aFrame, const std::st
 }
 
 
+/// @brief A symbol's orientation and mirroring as a linear map (others have none)
+std::optional<std::array<double, 4>> schematicItemLinear( SCH_EDIT_FRAME* aFrame, const std::string& aRef )
+{
+    auto* symbol = dynamic_cast<SCH_SYMBOL*>( KopenapiFindSchematicItem( aFrame, aRef ) );
+
+    if( !symbol )
+        return std::nullopt;
+
+    const TRANSFORM& t = symbol->GetTransform();
+    return std::array<double, 4>{ double( t.x1 ), double( t.y1 ), double( t.x2 ), double( t.y2 ) };
+}
+
+
 KOPENAPI_RESULT h_sch_overlay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     auto* frame = aCtx.kiway ? dynamic_cast<SCH_EDIT_FRAME*>( aCtx.kiway->Player( FRAME_SCH, false ) ) : nullptr;
@@ -96,6 +109,7 @@ KOPENAPI_RESULT h_sch_overlay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aAr
     host.scale = &schIUScale;
     host.frame = frame;
     host.resolve = [frame]( const std::string& aRef ) { return resolveSchematicItem( frame, aRef ); };
+    host.linear = [frame]( const std::string& aRef ) { return schematicItemLinear( frame, aRef ); };
 
     return KopenapiAnnotate( host, aArgs );
 }
