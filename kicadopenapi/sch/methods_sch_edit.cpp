@@ -309,14 +309,26 @@ void applyFields( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath, const nlohma
 /// @brief Annotate like the editor's "Annotate Schematic" with "keep existing annotation" (or reset):
 /// all sheets, by X position, first free number; power symbols get #PWR numbers.  Only symbols
 /// whose reference changes are touched (each recorded in the commit).
-int annotate( SCHEMATIC* aSchematic, SCH_COMMIT& aCommit, bool aReset )
+int annotate( SCHEMATIC* aSchematic, SCH_COMMIT& aCommit, bool aReset, bool aOverrideLocks = true, int* aLockedKept = nullptr )
 {
     SCH_SHEET_LIST               sheets = aSchematic->Hierarchy();
-    SCH_REFERENCE_LIST           references;
+    SCH_REFERENCE_LIST           all, references, keptLocked;
     SCH_MULTI_UNIT_REFERENCE_MAP locked;
 
-    sheets.GetSymbols( references, SYMBOL_FILTER_ALL );
+    sheets.GetSymbols( all, SYMBOL_FILTER_ALL );
     sheets.GetMultiUnitSymbols( locked, SYMBOL_FILTER_NON_POWER );
+
+    // a reset renumbers everything but the locked symbols: their references stay taken
+    for( size_t i = 0; i < all.GetCount(); ++i )
+    {
+        if( aReset && !aOverrideLocks && all[i].GetSymbol()->IsLocked() )
+            keptLocked.AddItem( all[i] );
+        else
+            references.AddItem( all[i] );
+    }
+
+    if( aLockedKept )
+        *aLockedKept = int( keptLocked.GetCount() );
 
     std::map<std::pair<SCH_SYMBOL*, wxString>, wxString> before;
 
@@ -331,7 +343,7 @@ int annotate( SCHEMATIC* aSchematic, SCH_COMMIT& aCommit, bool aReset )
 
     references.SetRefDesTracker( aSchematic->Settings().m_refDesTracker );
     references.SplitReferences();
-    references.AnnotateByOptions( SORT_BY_X_POSITION, INCREMENTAL_BY_REF, 0, locked, SCH_REFERENCE_LIST(), false );
+    references.AnnotateByOptions( SORT_BY_X_POSITION, INCREMENTAL_BY_REF, 0, locked, keptLocked, false );
 
     int changed = 0;
 
@@ -439,6 +451,33 @@ struct SCH_GLOW_TRAITS
 void glow( KIWAY* aKiway, const std::vector<KIID>& aItems )
 {
     KopenapiGlow<SCH_GLOW_TRAITS>( aKiway, aItems );
+}
+
+
+/// @brief 409 when a move dragged locked wiring along (items in aTouched other than the moved ones),
+/// unless the request overrides locks
+std::optional<KOPENAPI_RESULT> lockedDragged( SCH_SCREEN* aScreen, const std::vector<KIID>& aTouched,
+                                              const std::set<SCH_ITEM*>& aMoved, const nlohmann::json& aArgs )
+{
+    if( aArgs.value( "override_locks", false ) )
+        return std::nullopt;
+
+    const std::set<KIID> touched( aTouched.begin(), aTouched.end() );
+    nlohmann::json       locked = nlohmann::json::array();
+
+    for( SCH_ITEM* item : aScreen->Items() )
+    {
+        if( item->IsLocked() && !aMoved.count( item ) && touched.count( item->m_Uuid ) )
+            locked.push_back( str( item->m_Uuid.AsString() ) );
+    }
+
+    if( locked.empty() )
+        return std::nullopt;
+
+    KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 409, "the move would stretch locked wiring (sch_unlock it, or "
+                                                           "override_locks: true); nothing was changed" );
+    refused.body["locked"] = locked;
+    return refused;
 }
 
 
@@ -1414,6 +1453,12 @@ static KOPENAPI_RESULT h_sch_symbol_update( KOPENAPI_CONTEXT& aCtx, const nlohma
             drag.AddPointMove( before[pin->GetNumber()], pin->GetPosition(), at->symbol->IsPower() );
 
         warnings = drag.Apply( moved );
+
+        if( std::optional<KOPENAPI_RESULT> refused = lockedDragged( screen, moved, { at->symbol }, aArgs ) )
+        {
+            commit.Revert();
+            return *refused;
+        }
     }
 
     // Texts re-placed clear of the neighbours after a move / turn, or when asked
@@ -1552,6 +1597,13 @@ static KOPENAPI_RESULT h_sch_items_move( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
     drag.SetAnchors( anchors );
     nlohmann::json warnings = drag.Apply( touched );
+
+    if( std::optional<KOPENAPI_RESULT> refused = lockedDragged( screen, touched, anchors, aArgs ) )
+    {
+        commit.Revert();
+        return *refused;
+    }
+
     pushEdit( commit, context->GetSchematic(), _( "Move (API)" ), aCtx.kiway, touched );
 
     nlohmann::json result = { { "moved", anchors.size() }, { "touched", touched.size() } };
@@ -2741,10 +2793,12 @@ static KOPENAPI_RESULT h_sch_annotate( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
         return KopenapiNoSchematic();
 
     SCH_COMMIT commit( context->GetToolManager() );
-    const int  changed = annotate( context->GetSchematic(), commit, aArgs.value( "reset", false ) );
+    int        lockedKept = 0;
+    const int  changed = annotate( context->GetSchematic(), commit, aArgs.value( "reset", false ),
+                                   aArgs.value( "override_locks", false ), &lockedKept );
     pushEdit( commit, context->GetSchematic(), _( "Annotate (API)" ) );
 
-    return KOPENAPI_RESULT::Ok( { { "changed", changed } } );
+    return KOPENAPI_RESULT::Ok( { { "changed", changed }, { "locked_kept", lockedKept } } );
 }
 
 
@@ -2894,9 +2948,10 @@ KOPENAPI_REGISTER( "sch_no_connect",
 
 KOPENAPI_REGISTER( "sch_annotate",
                    std::string( "Annotate references (U1, R2...) over all sheets, by X position, first free "
-                                "number; keeps existing references unless reset; power symbols numbered "
-                                "#PWR." ) + EDIT_NOTE,
-                   R"json({"type":"object","properties":{"reset":{"type":"boolean","default":false}}})json"_json,
+                                "number; keeps existing references unless reset; a reset keeps the references "
+                                "of locked symbols (override_locks); power symbols numbered #PWR." ) + EDIT_NOTE,
+                   R"json({"type":"object","properties":{"reset":{"type":"boolean","default":false},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_annotate );
 
 #define SCH_LOCK_SCHEMA R"json({"type":"object","properties":{

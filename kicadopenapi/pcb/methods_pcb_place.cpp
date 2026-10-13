@@ -10,6 +10,7 @@
 #include "kopenapi_pcb.h"
 
 #include <kicadopenapi_registry.h>
+#include <netinfo.h>
 
 #include <api/pcb_context.h>
 #include <kicadopenapi_keepalive.h>
@@ -1210,6 +1211,154 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 /// @brief The parts of a group request: named ones, or (none named) every unlocked part with a pad on a
 /// small net of the anchor (at most max_net_pads pads on the board: a crystal and its capacitors,
 /// pull-ups, a feedback divider - not everything on the rails)
+/// @brief Decoupling capacitors of the anchor guessed from the schematic: two-pad C parts across two
+/// rails of the anchor, the ones drawn nearest to it on its sheet, as many per supply rail as the
+/// anchor has pads on it.  Appended to aParts; aNote says what was taken.
+std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnchor,
+                                              std::vector<FOOTPRINT*>& aParts, bool aOverrideLocks, nlohmann::json& aNote )
+{
+    std::optional<KOPENAPI_METHOD> list = KOPENAPI_REGISTRY::Get().Find( "sch_symbol_list" );
+
+    if( !list )
+        return KOPENAPI_RESULT::Error( 503, "decoupling: the schematic editor module is not loaded" );
+
+    struct SYMBOL_SPOT
+    {
+        std::string sheet;
+        double      x, y;
+    };
+
+    std::map<std::string, SYMBOL_SPOT> drawn;
+    nlohmann::json               query = { { "limit", 1000 } };
+
+    while( true )
+    {
+        KOPENAPI_RESULT page = list->handler( aCtx, query );
+
+        if( page.status != 200 )
+        {
+            return KOPENAPI_RESULT::Error( page.status == 409 ? 409 : 422,
+                                           "decoupling: schematic: the schematic is not open (sch_open), or name the "
+                                           "capacitors in parts" );
+        }
+
+        for( const nlohmann::json& row : page.body.value( "items", nlohmann::json::array() ) )
+        {
+            const std::string ref = row.value( "ref", std::string() );
+
+            if( !drawn.count( ref ) )
+                drawn[ref] = { row.value( "sheet", std::string() ), row.value( "x_mm", 0.0 ), row.value( "y_mm", 0.0 ) };
+        }
+
+        if( !page.body.contains( "next_cursor" ) || page.body["next_cursor"].is_null() )
+            break;
+
+        query["cursor"] = page.body["next_cursor"];
+    }
+
+    auto home = drawn.find( str( aAnchor->GetReference() ) );
+
+    if( home == drawn.end() )
+        return KOPENAPI_RESULT::Error( 422, "decoupling: " + str( aAnchor->GetReference() ) + " is not in the open schematic" );
+
+    // the anchor's rails as the schematic sees them (power / ground nets), ground told apart
+    std::set<int>                  rails, grounds;
+    std::optional<KOPENAPI_METHOD> subcircuit = KOPENAPI_REGISTRY::Get().Find( "sch_subcircuit" );
+
+    if( subcircuit )
+    {
+        KOPENAPI_RESULT block = subcircuit->handler( aCtx, { { "ref", str( aAnchor->GetReference() ) } } );
+
+        if( block.status == 200 )
+        {
+            for( const nlohmann::json& rail : block.body.value( "rails", nlohmann::json::array() ) )
+            {
+                if( NETINFO_ITEM* net = aBoard->FindNet( wxString::FromUTF8( rail.value( "net", std::string() ) ) ) )
+                {
+                    rails.insert( net->GetNetCode() );
+
+                    if( rail.value( "role", std::string() ) == "ground" )
+                        grounds.insert( net->GetNetCode() );
+                }
+            }
+        }
+    }
+
+    std::map<int, int> netPads, anchorPads;
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( PAD* pad : fp->Pads() )
+            netPads[pad->GetNetCode()]++;
+    }
+
+    for( PAD* pad : aAnchor->Pads() )
+    {
+        if( pad->GetNetCode() > 0 )
+            anchorPads[pad->GetNetCode()]++;
+    }
+
+    struct RAIL_CAPACITOR
+    {
+        FOOTPRINT* part;
+        int        supply;      // the rail of the two that is not ground
+        double     distance;
+    };
+
+    std::vector<RAIL_CAPACITOR> candidates;
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        const std::string ref = str( fp->GetReference() );
+
+        if( fp == aAnchor || fp->Pads().size() != 2 || ref.empty() || ref[0] != 'C' || ( fp->IsLocked() && !aOverrideLocks )
+            || std::find( aParts.begin(), aParts.end(), fp ) != aParts.end() )
+        {
+            continue;
+        }
+
+        const int a = fp->Pads()[0]->GetNetCode(), b = fp->Pads()[1]->GetNetCode();
+
+        // across two rails of the anchor
+        if( a == b || !anchorPads.count( a ) || !anchorPads.count( b ) || !rails.count( a ) || !rails.count( b ) )
+            continue;
+
+        auto at = drawn.find( ref );
+
+        if( at == drawn.end() || at->second.sheet != home->second.sheet )
+            continue;
+
+        const int supply = grounds.count( a ) && !grounds.count( b ) ? b
+                           : grounds.count( b ) && !grounds.count( a ) ? a
+                           : netPads[a] <= netPads[b] ? a : b;
+
+        candidates.push_back( { fp, supply,
+                                std::hypot( at->second.x - home->second.x, at->second.y - home->second.y ) } );
+    }
+
+    std::stable_sort( candidates.begin(), candidates.end(),
+                      []( const RAIL_CAPACITOR& x, const RAIL_CAPACITOR& y ) { return x.distance < y.distance; } );
+
+    std::map<int, int> taken;
+    nlohmann::json     chosen = nlohmann::json::array();
+
+    for( const RAIL_CAPACITOR& c : candidates )
+    {
+        if( taken[c.supply] >= anchorPads[c.supply] )
+            continue;
+
+        taken[c.supply]++;
+        aParts.push_back( c.part );
+        chosen.push_back( str( c.part->GetReference() ) );
+    }
+
+    aNote = { { "chosen", chosen }, { "candidates", candidates.size() },
+              { "by", "capacitors across two rails of the anchor, nearest to it on its schematic sheet, one per supply pad: "
+                      "a guess - check it, or name them in parts" } };
+    return std::nullopt;
+}
+
+
 std::optional<KOPENAPI_RESULT> groupParts( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, const nlohmann::json& aGroup,
                                            FOOTPRINT*& aAnchor, std::vector<FOOTPRINT*>& aParts, bool aOverrideLocks )
 {
@@ -1650,6 +1799,12 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
     if( resize )
     {
+        for( BOARD_ITEM* item : board->Drawings() )
+        {
+            if( item->GetLayer() == Edge_Cuts && item->IsLocked() )
+                return KOPENAPI_RESULT::Error( 409, "the board outline is locked: leave out width_mm / height_mm, or pcb_unlock it" );
+        }
+
         double w = aArgs.value( "width_mm", 0.0 ), h = aArgs.value( "height_mm", 0.0 );
 
         if( w <= 0 || h <= 0 )
@@ -1858,6 +2013,20 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( std::optional<std::string> wrong = nearOptions( aArgs, options ) )
         return KOPENAPI_RESULT::Error( 400, *wrong );
 
+    nlohmann::json decoupling;
+
+    if( aArgs.contains( "decoupling" ) )
+    {
+        if( aArgs["decoupling"] != "schematic" )
+            return KOPENAPI_RESULT::Error( 400, "decoupling: \"schematic\" (guess the anchor's rail capacitors from the open schematic)" );
+
+        if( std::optional<KOPENAPI_RESULT> error = addDecoupling( aCtx, board, anchor, parts, aArgs.value( "override_locks", false ),
+                                                                  decoupling ) )
+        {
+            return *error;
+        }
+    }
+
     const std::string side = aArgs.value( "side", std::string( "same" ) );
 
     if( side != "same" && side != "opposite" )
@@ -1872,6 +2041,9 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
     nlohmann::json    out = nlohmann::json::object();
 
     placeGroup( board, commit, anchor, parts, options, side == "opposite", out, moved );
+
+    if( !decoupling.is_null() )
+        out["decoupling"] = decoupling;
 
     if( moved.empty() )
     {
@@ -1911,7 +2083,8 @@ KOPENAPI_REGISTER( "pcb_place_group",
                    "(e.g. from sch_subcircuit); without it, every unlocked part (connectors aside) on a small "
                    "net of the anchor (max_net_pads); from_schematic: the members of the anchor's block in the "
                    "open schematic. A part bound to a member rather than to the anchor goes next to that "
-                   "member. side opposite: on the other side of the board, under the pads. "
+                   "member. decoupling: \"schematic\" adds the rail capacitors drawn nearest to the anchor (a guess, "
+                   "listed in the answer). side opposite: on the other side of the board, under the pads. "
                    "One undo step; answers per part the target pad, pad distance, position, and the "
                    "placement check",
                    R"json({"type":"object","required":["anchor"],"properties":{
@@ -1919,6 +2092,7 @@ KOPENAPI_REGISTER( "pcb_place_group",
                         "parts":{"type":"array","items":{"type":"string"}},
                         "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
                         "depth":{"type":"integer","description":"from_schematic: how far sch_subcircuit grows (default 2)"},
+                        "decoupling":{"type":"string","enum":["schematic"],"description":"add the anchor's decoupling capacitors guessed from the open schematic: C parts across two of its rails, nearest to it on its sheet, one per supply pad (the answer's decoupling.chosen lists them)"},
                         "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
                         "side":{"type":"string","enum":["same","opposite"],"default":"same"},
                         "gap_mm":{"type":"number","default":0.25,"description":"between courtyards"},

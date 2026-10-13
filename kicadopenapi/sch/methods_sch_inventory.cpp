@@ -448,6 +448,8 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
                                    { "in_bom", !sym->GetExcludedFromBOM( &path ) },
                                    { "on_board", !sym->GetExcludedFromBoard( &path ) },
                                    { "locked", sym->IsLocked() },
+                                   { "x_mm", sym->GetPosition().x / schIUScale.IU_PER_MM },
+                                   { "y_mm", sym->GetPosition().y / schIUScale.IU_PER_MM },
                                    { "uuid", str( sym->m_Uuid.AsString() ) } };
 
             if( !KopenapiGlob( refGlob, row["ref"] ) || !KopenapiGlob( valueGlob, row["value"] )

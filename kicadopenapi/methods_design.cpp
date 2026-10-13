@@ -472,7 +472,7 @@ static KOPENAPI_RESULT h_design_update_board( KOPENAPI_CONTEXT& aCtx, const nloh
     // 3. KiCad's Update PCB from Schematic
     nlohmann::json apply = { { "netlist", sch.body["netlist"] } };
 
-    for( const char* key : { "dry_run", "match", "delete_extra", "replace_footprints", "spread", "spread_width_mm" } )
+    for( const char* key : { "dry_run", "match", "delete_extra", "replace_footprints", "override_locks", "spread", "spread_width_mm" } )
     {
         if( aArgs.contains( key ) )
             apply[key] = aArgs[key];
@@ -504,7 +504,8 @@ KOPENAPI_REGISTER( "design_update_board",
                         "dry_run":{"type":"boolean","default":false},
                         "match":{"type":"string","enum":["uuid","reference"],"default":"uuid"},
                         "delete_extra":{"type":"boolean","default":true},
-                        "replace_footprints":{"type":"boolean","default":true}}})json"_json,
+                        "replace_footprints":{"type":"boolean","default":true},
+                        "override_locks":{"type":"boolean","default":false,"description":"locked footprints are not replaced or removed otherwise"}}})json"_json,
                    false, h_design_update_board, 600 );
 
 KOPENAPI_REGISTER( "design_parity",

@@ -326,6 +326,7 @@ static KOPENAPI_RESULT h_pcb_netlist_apply( KOPENAPI_CONTEXT& aCtx, const nlohma
     updater->SetDeleteUnusedFootprints( aArgs.value( "delete_extra", true ) );
     updater->SetReplaceFootprints( aArgs.value( "replace_footprints", true ) );
     updater->SetUpdateFields( true );
+    updater->SetOverrideLocks( aArgs.value( "override_locks", false ) );
 
     const bool success = updater->UpdateNetlist( netlist );
 
@@ -525,6 +526,16 @@ static KOPENAPI_RESULT h_pcb_outline_set( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     if( radius < 0 || toIU( radius ) * 2 > std::min( rect.GetWidth(), rect.GetHeight() ) )
         return KOPENAPI_RESULT::Error( 400, "corner_radius_mm: 0 .. half the shorter side" );
+
+    // a locked outline stays: the new one would replace it
+    if( !aArgs.value( "override_locks", false ) )
+    {
+        for( BOARD_ITEM* item : board->Drawings() )
+        {
+            if( item->GetLayer() == Edge_Cuts && item->IsLocked() )
+                return KOPENAPI_RESULT::Error( 409, "the board outline is locked (pcb_unlock, or override_locks: true)" );
+        }
+    }
 
     BOARD_COMMIT commit( context->GetToolManager() );
     int          removed = 0;
@@ -896,6 +907,7 @@ KOPENAPI_REGISTER( "pcb_netlist_apply",
                         "match":{"type":"string","enum":["uuid","reference"],"default":"uuid"},
                         "delete_extra":{"type":"boolean","default":true,"description":"remove footprints without a symbol"},
                         "replace_footprints":{"type":"boolean","default":true,"description":"swap footprints whose library id changed"},
+                        "override_locks":{"type":"boolean","default":false,"description":"locked footprints are not replaced or removed otherwise (their nets and fields are still updated)"},
                         "spread":{"type":"boolean","default":true},
                         "spread_width_mm":{"type":"number","default":80}}})json"_json,
                    false, h_pcb_netlist_apply, 600 );
@@ -910,7 +922,8 @@ KOPENAPI_REGISTER( "pcb_outline_set",
                         "fit":{"type":"boolean","default":false},
                         "margin_mm":{"type":"number","default":3},
                         "corner_radius_mm":{"type":"number","default":0},
-                        "line_width_mm":{"type":"number","default":0.1}}})json"_json,
+                        "line_width_mm":{"type":"number","default":0.1},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_outline_set );
 
 KOPENAPI_REGISTER( "pcb_rules_get",
