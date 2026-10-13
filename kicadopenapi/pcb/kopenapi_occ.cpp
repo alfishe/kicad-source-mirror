@@ -13,15 +13,21 @@
 #include <IFSelect_ReturnStatus.hxx>
 #include <Poly_Triangulation.hxx>
 #include <STEPControl_Reader.hxx>
+#include <StepRepr_RepresentationItem.hxx>
+#include <TCollection_HAsciiString.hxx>
+#include <TopTools_MapOfShape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
+#include <XSControl_TransferReader.hxx>
+#include <XSControl_WorkSession.hxx>
 #include <gp_GTrsf.hxx>
 #include <gp_Trsf.hxx>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -77,6 +83,14 @@ void loadCache()
         g.hasBody = j.value( "body", true );
         g.seat = j.value( "seat", 0.0 );
         g.hasSeat = j.contains( "seat" );
+
+        if( j.contains( "seat_at" ) )
+        {
+            g.seatAt[0] = j["seat_at"][0].get<double>();
+            g.seatAt[1] = j["seat_at"][1].get<double>();
+        }
+        g.hasNamedBody = j.contains( "named_body_bottom" );
+        g.namedBodyBottom = j.value( "named_body_bottom", 0.0 );
         g_cache[it.key()] = g;
     }
 }
@@ -92,7 +106,13 @@ void saveCache()
                      { "body_bottom", g.bodyBottom }, { "has_leads", g.hasLeads }, { "body", g.hasBody } };
 
         if( g.hasSeat )
+        {
             all[key]["seat"] = g.seat;
+            all[key]["seat_at"] = { g.seatAt[0], g.seatAt[1] };
+        }
+
+        if( g.hasNamedBody )
+            all[key]["named_body_bottom"] = g.namedBodyBottom;
     }
 
     std::error_code ec;
@@ -170,7 +190,8 @@ bool isRigid( const glm::mat4& aMatrix )
 
 
 KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aStep, const glm::mat4& aMatrix, bool aBody,
-                                               const std::vector<glm::vec3>& aHoles, double aThickness )
+                                               const std::vector<glm::vec3>& aHoles, double aThickness,
+                                               const std::vector<std::vector<glm::vec2>>& aBoard )
 {
     std::error_code    ec;
     std::ostringstream key;
@@ -187,7 +208,15 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
     for( const glm::vec3& h : aHoles )
         key << "|h" << std::round( h.x * 1e3 ) << ',' << std::round( h.y * 1e3 ) << ',' << std::round( h.z * 1e3 );
 
-    key << "|t" << std::round( aThickness * 1e3 ) << "|s2";
+    for( const std::vector<glm::vec2>& ring : aBoard )
+    {
+        key << "|e";
+
+        for( const glm::vec2& p : ring )
+            key << std::round( p.x * 1e3 ) << ',' << std::round( p.y * 1e3 ) << ';';
+    }
+
+    key << "|t" << std::round( aThickness * 1e3 ) << "|s4";
 
     const bool wantSeat = aBody;
 
@@ -207,7 +236,8 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
     const auto              t0 = std::chrono::steady_clock::now();
     KOPENAPI_MODEL_GEOMETRY g;
 
-    TopoDS_Shape model;
+    TopoDS_Shape        model;
+    TopTools_MapOfShape bodyFaces;      // faces of the solids the file names "body"
 
     {
         // one translator at a time, the geometry after it runs in parallel
@@ -223,6 +253,26 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
 
         reader.TransferRoots();
         model = reader.OneShape();
+
+        const Handle( XSControl_TransferReader ) transfer = reader.WS()->TransferReader();
+
+        for( TopExp_Explorer solids( model, TopAbs_SOLID ); solids.More(); solids.Next() )
+        {
+            const Handle( StepRepr_RepresentationItem ) entity =
+                    Handle( StepRepr_RepresentationItem )::DownCast( transfer->EntityFromShapeResult( solids.Current(), 1 ) );
+
+            if( entity.IsNull() || entity->Name().IsNull() )
+                continue;
+
+            std::string name = entity->Name()->ToCString();
+            std::transform( name.begin(), name.end(), name.begin(), []( unsigned char c ) { return std::tolower( c ); } );
+
+            if( name == "body" )
+            {
+                for( TopExp_Explorer f( solids.Current(), TopAbs_FACE ); f.More(); f.Next() )
+                    bodyFaces.Add( f.Current() );
+            }
+        }
     }
 
     // Into the footprint frame: a rigid matrix only locates the shape and its mesh nodes; any
@@ -277,6 +327,8 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
         const Handle( Poly_Triangulation ) tri = BRep_Tool::Triangulation( face, loc );
         FACE_BOX                         fb{ face, gp_XYZ( 1e9, 1e9, 1e9 ), gp_XYZ( -1e9, -1e9, -1e9 ), !tri.IsNull() };
 
+        const bool                       ofBody = bodyFaces.Contains( face );
+
         if( fb.meshed )
         {
             const gp_Trsf trsf = place * loc.Transformation();
@@ -301,6 +353,12 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
                 }
 
                 mesh.push_back( t );
+            }
+
+            if( (int) mesh.size() > first && ofBody )
+            {
+                g.namedBodyBottom = g.hasNamedBody ? std::min( g.namedBodyBottom, fb.lo.Z() ) : fb.lo.Z();
+                g.hasNamedBody = true;
             }
 
             if( (int) mesh.size() > first )
@@ -364,6 +422,28 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
         constexpr double HOLE_MARGIN_PART = 0.35;
         double           seat = std::numeric_limits<double>::max();
 
+        auto onBoard = [&]( double aX, double aY )
+        {
+            if( aBoard.empty() )
+                return true;
+
+            bool inside = false;
+
+            for( const std::vector<glm::vec2>& ring : aBoard )
+            {
+                for( size_t i = 0, j = ring.size() - 1; i < ring.size(); j = i++ )
+                {
+                    if( ( ring[i].y > aY ) != ( ring[j].y > aY )
+                        && aX < ( ring[j].x - ring[i].x ) * ( aY - ring[i].y ) / ( ring[j].y - ring[i].y ) + ring[i].x )
+                    {
+                        inside = !inside;
+                    }
+                }
+            }
+
+            return inside;
+        };
+
         for( const TRIANGLE& t : mesh )
         {
             for( const gp_XYZ& v : t )
@@ -385,8 +465,12 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
                     }
                 }
 
-                if( !inHole )
+                if( !inHole && onBoard( v.X(), v.Y() ) )
+                {
                     seat = v.Z();
+                    g.seatAt[0] = v.X();
+                    g.seatAt[1] = v.Y();
+                }
             }
         }
 

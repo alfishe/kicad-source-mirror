@@ -3,6 +3,8 @@
 /// pcb_model_seat.
 #include "kopenapi_pcb.h"
 #include "kopenapi_occ.h"
+
+#include <geometry/shape_poly_set.h>
 #include "kopenapi_model_warmup.h"
 
 #include <3d_math.h>
@@ -149,6 +151,72 @@ std::vector<glm::vec3> footprintHoles( const FOOTPRINT* aFp )
     }
 
     return holes;
+}
+
+
+/// @brief The board outline in the footprint's 3D frame (rings, mm) when the footprint reaches over
+/// the board edge; empty when it lies on the board (or the board has no outline)
+std::vector<std::vector<glm::vec2>> boardEdgeAt( const SHAPE_POLY_SET& aOutline, const FOOTPRINT* aFp )
+{
+    std::vector<std::vector<glm::vec2>> rings;
+
+    if( aOutline.OutlineCount() == 0 )
+        return rings;
+
+    // a model can reach further than its footprint's pads and graphics (a connector's flange)
+    BOX2I          box = aFp->GetBoundingBox( false );
+    SHAPE_POLY_SET over;
+
+    box.Inflate( pcbIUScale.mmToIU( 10.0 ) );
+
+    over.NewOutline();
+    over.Append( box.GetLeft(), box.GetTop() );
+    over.Append( box.GetRight(), box.GetTop() );
+    over.Append( box.GetRight(), box.GetBottom() );
+    over.Append( box.GetLeft(), box.GetBottom() );
+    over.BooleanSubtract( aOutline );
+
+    if( over.IsEmpty() )
+        return rings;
+
+    const VECTOR2I pos = aFp->GetPosition();
+
+    auto ring = [&]( const SHAPE_LINE_CHAIN& aChain )
+    {
+        rings.emplace_back();
+
+        for( const VECTOR2I& p : aChain.CPoints() )
+        {
+            VECTOR2D v( p - pos );
+            RotatePoint( v, -aFp->GetOrientation() );
+
+            const double x = v.x / pcbIUScale.IU_PER_MM;
+            const double y = v.y / pcbIUScale.IU_PER_MM;
+
+            rings.back().emplace_back( aFp->IsFlipped() ? -x : x, -y );
+        }
+    };
+
+    for( int i = 0; i < aOutline.OutlineCount(); i++ )
+    {
+        ring( aOutline.COutline( i ) );
+
+        for( int h = 0; h < aOutline.HoleCount( i ); h++ )
+            ring( aOutline.CHole( i, h ) );
+    }
+
+    return rings;
+}
+
+
+SHAPE_POLY_SET boardOutline( BOARD* aBoard )
+{
+    SHAPE_POLY_SET outline;
+
+    if( !aBoard->GetBoardPolygonOutlines( outline, true ) )
+        outline.RemoveAllContours();
+
+    return outline;
 }
 
 
@@ -331,6 +399,7 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
         return KopenapiNoBoard();
 
     BOARD*         board = context->GetBoard();
+    const SHAPE_POLY_SET outline = boardOutline( board );
     PROJECT*       project = board->GetProject();
     const double   thickness = board->GetDesignSettings().GetBoardThickness() / pcbIUScale.IU_PER_MM;
     const double   tolerance = aArgs.value( "tolerance_mm", 0.1 );
@@ -350,7 +419,8 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
     if( geometry )
     {
         // cut copies need only their box (seating is measured on the generic model)
-        std::vector<std::tuple<std::filesystem::path, glm::mat4, bool, std::vector<glm::vec3>>> jobs;
+        std::vector<std::tuple<std::filesystem::path, glm::mat4, bool, std::vector<glm::vec3>,
+                               std::vector<std::vector<glm::vec2>>>> jobs;
         std::set<std::string> queued;   // one job per file, placement and holes
 
         for( FOOTPRINT* fp : board->Footprints() )
@@ -361,7 +431,8 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                 continue;
             }
 
-            const std::vector<glm::vec3> holes = footprintHoles( fp );
+            const std::vector<glm::vec3>              holes = footprintHoles( fp );
+            const std::vector<std::vector<glm::vec2>> edge = boardEdgeAt( outline, fp );
 
             for( const FP_3DMODEL& m : fp->Models() )
             {
@@ -377,8 +448,14 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                 for( const glm::vec3& h : holes )
                     key << '|' << h.x << ',' << h.y << ',' << h.z;
 
+                if( !edge.empty() )
+                    key << "|edge" << str( fp->m_Uuid.AsString() );
+
                 if( std::filesystem::exists( file ) && queued.insert( key.str() ).second )
-                    jobs.emplace_back( file, matrix, body, body ? holes : std::vector<glm::vec3>() );
+                {
+                    jobs.emplace_back( file, matrix, body, body ? holes : std::vector<glm::vec3>(),
+                                       body ? edge : std::vector<std::vector<glm::vec2>>() );
+                }
             }
         }
 
@@ -399,8 +476,9 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                                                        {
                                                            for( size_t i = next++; i < jobs.size(); i = next++ )
                                                            {
-                                                               const auto& [file, matrix, body, holes] = jobs[i];
-                                                               KopenapiModelGeometry( file, matrix, body, holes, thickness );
+                                                               const auto& [file, matrix, body, holes, edge] = jobs[i];
+                                                               KopenapiModelGeometry( file, matrix, body, holes, thickness,
+                                                                                      edge );
                                                            }
                                                        } ) );
                     }
@@ -424,6 +502,7 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
         nlohmann::json issues = nlohmann::json::array();
         bool           shown = false;
         const std::vector<glm::vec3> holes = footprintHoles( fp );
+        const std::vector<std::vector<glm::vec2>> edge = boardEdgeAt( outline, fp );
         std::vector<size_t>          floating;   // issues of models above the board
         bool                         seated = false;
 
@@ -474,7 +553,7 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                 KopenapiRunOffMain(
                         [&]()
                         {
-                            g = KopenapiModelGeometry( measured, modelMatrix( m ), true, holes, thickness );
+                            g = KopenapiModelGeometry( measured, modelMatrix( m ), true, holes, thickness, edge );
                             shown = measured == file ? g : KopenapiModelGeometry( file, modelMatrix( m ), false );
                         } );
                 seconds += g.seconds + ( measured == file ? 0 : shown.seconds );   // prefetch misses only
@@ -514,6 +593,15 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                                     { "gap_mm", r2( gap ) },
                                     { "leads_below_board_mm", tht ? r2( std::max( 0.0, -shown.min[2] - thickness ) ) : 0.0 } };
 
+                    if( g.hasSeat )
+                    {
+                        const std::array<double, 3> at = toBoard( fp, g.seatAt[0], g.seatAt[1], g.seat, thickness );
+                        row["seat"]["lowest_at_mm"] = { r2( at[0] ), r2( at[1] ) };
+                    }
+
+                    if( !edge.empty() )
+                        row["seat"]["over_board_edge"] = true;
+
                     if( measured != file )
                         row["seat"]["measured_on"] = "generic model (this is a cut copy)";
 
@@ -535,16 +623,26 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                         const auto a1 = meta.a1_mm.value_or( std::make_pair( 0.38, 1.0 ) );
                         row["seat"]["expected_gap_mm"] = { a1.first, a1.second };
 
-                        if( gap < a1.first - tolerance )
+                        // a role-named model says where its body is: the shoulders rest on the board,
+                        // the body stands off by A1
+                        const double bodyGap = g.hasNamedBody ? std::round( g.namedBodyBottom * 100 ) / 100 : gap;
+
+                        if( g.hasNamedBody )
+                        {
+                            row["seat"]["body_gap_mm"] = r2( bodyGap );
+                            row["seat"]["body_from"] = "solid named body";
+                        }
+
+                        if( bodyGap < a1.first - tolerance )
                         {
                             seated = true;
-                            issues.push_back( "body " + mmText( gap ) + " mm over the board, below the package A1 "
+                            issues.push_back( "body " + mmText( bodyGap ) + " mm over the board, below the package A1 "
                                               + mmText( a1.first ) + " mm (model)" );
                         }
-                        else if( gap > a1.second + 0.5 )
+                        else if( g.hasNamedBody ? gap > 0.5 : bodyGap > a1.second + 0.5 )
                         {
                             floating.push_back( issues.size() );
-                            issues.push_back( "floating " + mmText( gap ) + " mm above the board, A1 at most "
+                            issues.push_back( "floating " + mmText( bodyGap ) + " mm above the board, A1 at most "
                                               + mmText( a1.second ) + " mm (pcb_model_seat)" );
                         }
                         else
@@ -616,6 +714,7 @@ static KOPENAPI_RESULT h_pcb_model_seat( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         return KopenapiNoBoard();
 
     BOARD*            board = context->GetBoard();
+    const SHAPE_POLY_SET outline = boardOutline( board );
     PROJECT*          project = board->GetProject();
     const std::string libId = aArgs.value( "lib_id", std::string() );
     std::set<std::string> refs;
@@ -640,6 +739,7 @@ static KOPENAPI_RESULT h_pcb_model_seat( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         // the footprint's models move together: its lowest one goes to the target, the others keep
         // their place on it (a chip on its socket)
         const std::vector<glm::vec3> holes = footprintHoles( fp );
+        const std::vector<std::vector<glm::vec2>> edge = boardEdgeAt( outline, fp );
         const double thickness = board->GetDesignSettings().GetBoardThickness() / pcbIUScale.IU_PER_MM;
         double       lowest = std::numeric_limits<double>::max();
 
@@ -650,7 +750,7 @@ static KOPENAPI_RESULT h_pcb_model_seat( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
             const std::filesystem::path file = resolveModel( m, project );
             KOPENAPI_MODEL_GEOMETRY     g;
-            KopenapiRunOffMain( [&]() { g = KopenapiModelGeometry( file, modelMatrix( m ), true, holes, thickness ); } );
+            KopenapiRunOffMain( [&]() { g = KopenapiModelGeometry( file, modelMatrix( m ), true, holes, thickness, edge ); } );
 
             if( g.ok )
                 lowest = std::min( lowest, g.hasSeat ? g.seat : ( isTht( fp ) && g.hasLeads ) ? g.bodyBottom : g.min[2] );
@@ -716,7 +816,10 @@ KOPENAPI_REGISTER( "pcb_models_inspect",
                    "the gap to the board and lead length below it; problems: missing file, no model, "
                    "floating, sunk. Seating class per model (<model>.meta.json mount.seat, else by name): "
                    "shoulder (DIP / SIP chips: gap = package A1, JEDEC >= 0.38 mm), free (TO-92, LEDs, "
-                   "HC-49: any height, footprint field mount_height_mm checks it), body (gap 0). Geometry "
+                   "HC-49: any height, footprint field mount_height_mm checks it), body (gap 0). A model "
+                   "whose STEP solids are named by role is measured on the solid named 'body' "
+                   "(seat.body_gap_mm); seat.lowest_at_mm is where the lowest point is; a part reaching "
+                   "over the board edge (seat.over_board_edge) may hang below the top beyond it. Geometry "
                    "by OpenCascade, cached",
                    R"json({"type":"object","properties":{
                         "refs":{"type":"array","items":{"type":"string"}},
