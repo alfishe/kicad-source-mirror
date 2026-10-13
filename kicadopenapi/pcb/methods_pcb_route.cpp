@@ -42,6 +42,8 @@
 #include <zone_filler.h>
 
 #include <chrono>
+#include <deque>
+#include <map>
 #include <thread>
 #include <cmath>
 #include <optional>
@@ -311,9 +313,9 @@ struct ROUTE_REQUEST
     PNS::PNS_MODE         mode = PNS::RM_Walkaround;
     bool                  dryRun = false;
 
-    /// @brief Through vias on the way: at each point the route changes to the given layer (a person
-    /// pressing V while routing)
-    std::vector<std::pair<VECTOR2I, PCB_LAYER_ID>> vias;
+    /// @brief Points on the way: with a layer the route drops a through via there and continues on
+    /// that layer (a person pressing V while routing); without one it fixes a corner there (a click)
+    std::vector<std::pair<VECTOR2I, std::optional<PCB_LAYER_ID>>> vias;
 };
 
 
@@ -390,8 +392,37 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     // Vias on the way: route to the point, drop a through via there, continue on the next layer
     PNS::PLACEMENT_ALGO* placer = router->Placer();
 
-    for( const auto& [at, layer] : aReq.vias )
+    for( const auto& [at, viaLayer] : aReq.vias )
     {
+        if( !viaLayer )
+        {
+            // a corner: route to the point and fix what is there, on the same layer
+            router->Move( at, nullptr );
+            router->Move( at, nullptr );
+
+            const bool there = placer->CurrentEnd() == at;
+
+            // FixRoute answers whether the route is finished: here it only fixes what leads to the point
+            if( there )
+                router->FixRoute( at, nullptr, false, false );
+
+            if( !there || !router->RoutingInProgress() )
+            {
+                const VECTOR2I end = placer->CurrentEnd();
+                router->StopRouting();
+                iface->Staged().Revert();
+                aOut["routed"] = false;
+                aOut["reason"] = "blocked before the waypoint at " + std::to_string( toMm( at.x ) ) + ", "
+                                 + std::to_string( toMm( at.y ) );
+                aOut["stopped_at_mm"] = { toMm( end.x ), toMm( end.y ) };
+                return false;
+            }
+
+            continue;
+        }
+
+        const PCB_LAYER_ID layer = *viaLayer;
+
         PNS::SIZES_SETTINGS viaSizes( router->Sizes() );
         viaSizes.SetViaType( VIATYPE::THROUGH );
         viaSizes.ClearLayerPairs();
@@ -630,6 +661,28 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
         return KOPENAPI_RESULT::Error( 400, "mode: walkaround (go around obstacles) or shove (push other tracks)" );
 
     req.mode = modeName == "shove" ? PNS::RM_Shove : PNS::RM_Walkaround;
+
+    for( const nlohmann::json& w : aArgs.value( "waypoints", nlohmann::json::array() ) )
+    {
+        const nlohmann::json at = w.is_object() ? w.value( "at", nlohmann::json() ) : w;
+
+        if( !at.is_array() || at.size() != 2 || !at[0].is_number() || !at[1].is_number() )
+            return KOPENAPI_RESULT::Error( 400, "waypoints: [x_mm, y_mm] (a corner) or {at: [x_mm, y_mm], layer: \"B.Cu\"} "
+                                                "(a via there, the route continues on that layer)" );
+
+        std::optional<PCB_LAYER_ID> viaLayer;
+
+        if( w.is_object() && w.contains( "layer" ) )
+        {
+            viaLayer = w["layer"].is_string() ? parseLayer( board, w["layer"].get<std::string>() ) : std::nullopt;
+
+            if( !viaLayer )
+                return KOPENAPI_RESULT::Error( 400, "waypoints: layer is an enabled copper layer" );
+        }
+
+        req.vias.emplace_back( VECTOR2I( pcbIUScale.mmToIU( at[0].get<double>() ), pcbIUScale.mmToIU( at[1].get<double>() ) ),
+                               viaLayer );
+    }
 
     nlohmann::json    result = { { "from", aArgs["from"] } };
     std::vector<KIID> added;
@@ -1200,17 +1253,744 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 }
 
 
+namespace
+{
+
+nlohmann::json trackJson( BOARD* aBoard, PCB_TRACK* aTrack )
+{
+    nlohmann::json row = { { "uuid", str( aTrack->m_Uuid.AsString() ) },
+                           { "net", str( UnescapeString( aTrack->GetNetname() ) ) } };
+
+    if( aTrack->Type() == PCB_VIA_T )
+    {
+        PCB_VIA* via = static_cast<PCB_VIA*>( aTrack );
+        row["kind"] = "via";
+        row["at_mm"] = { toMm( via->GetPosition().x ), toMm( via->GetPosition().y ) };
+        row["layers"] = { str( aBoard->GetLayerName( via->TopLayer() ) ), str( aBoard->GetLayerName( via->BottomLayer() ) ) };
+        row["diameter_mm"] = toMm( via->GetWidth( via->TopLayer() ) );
+        row["drill_mm"] = toMm( via->GetDrillValue() );
+    }
+    else
+    {
+        row["kind"] = aTrack->Type() == PCB_ARC_T ? "arc" : "track";
+        row["from_mm"] = { toMm( aTrack->GetStart().x ), toMm( aTrack->GetStart().y ) };
+        row["to_mm"] = { toMm( aTrack->GetEnd().x ), toMm( aTrack->GetEnd().y ) };
+        row["layer"] = str( aBoard->GetLayerName( aTrack->GetLayer() ) );
+        row["width_mm"] = toMm( aTrack->GetWidth() );
+        row["length_mm"] = toMm( aTrack->GetLength() );
+    }
+
+    if( aTrack->IsLocked() )
+        row["locked"] = true;
+
+    return row;
+}
+
+
+/// @brief The tracks and vias that join two pads of one net: the shortest chain of items touching end
+/// to end (through other pads of the net too); empty when the pads are not joined by copper
+std::vector<PCB_TRACK*> copperBetween( BOARD* aBoard, PAD* aFrom, PAD* aTo )
+{
+    std::vector<PCB_TRACK*> items;
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        if( track->GetNetCode() == aFrom->GetNetCode() )
+            items.push_back( track );
+    }
+
+    auto ends = []( PCB_TRACK* aTrack ) -> std::vector<VECTOR2I>
+    {
+        if( aTrack->Type() == PCB_VIA_T )
+            return { aTrack->GetPosition() };
+
+        return { aTrack->GetStart(), aTrack->GetEnd() };
+    };
+
+    // items by end point; pads of the net with the items ending on them
+    std::map<std::pair<int, int>, std::vector<size_t>> atPoint;
+
+    for( size_t i = 0; i < items.size(); i++ )
+    {
+        for( const VECTOR2I& e : ends( items[i] ) )
+            atPoint[{ e.x, e.y }].push_back( i );
+    }
+
+    auto touches = []( PAD* aPad, PCB_TRACK* aTrack, const VECTOR2I& aEnd )
+    {
+        return ( aPad->GetLayerSet() & aTrack->GetLayerSet() ).any() && aPad->HitTest( aEnd, 0 );
+    };
+
+    std::vector<std::pair<PAD*, std::vector<size_t>>> pads;
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( PAD* pad : fp->Pads() )
+        {
+            if( pad->GetNetCode() != aFrom->GetNetCode() )
+                continue;
+
+            pads.emplace_back( pad, std::vector<size_t>() );
+
+            for( size_t i = 0; i < items.size(); i++ )
+            {
+                for( const VECTOR2I& e : ends( items[i] ) )
+                {
+                    if( touches( pad, items[i], e ) )
+                    {
+                        pads.back().second.push_back( i );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<std::vector<size_t>> padsOf( items.size() );
+
+    for( size_t p = 0; p < pads.size(); p++ )
+    {
+        for( size_t i : pads[p].second )
+            padsOf[i].push_back( p );
+    }
+
+    const size_t        none = items.size();
+    std::vector<size_t> parent( items.size(), none );
+    std::vector<bool>   seen( items.size(), false );
+    std::deque<size_t>  queue;
+    std::set<size_t>    goal;
+
+    for( const auto& [pad, list] : pads )
+    {
+        if( pad == aFrom )
+        {
+            for( size_t i : list )
+            {
+                seen[i] = true;
+                queue.push_back( i );
+            }
+        }
+        else if( pad == aTo )
+        {
+            goal.insert( list.begin(), list.end() );
+        }
+    }
+
+    while( !queue.empty() )
+    {
+        const size_t at = queue.front();
+        queue.pop_front();
+
+        if( goal.count( at ) )
+        {
+            std::vector<PCB_TRACK*> path;
+
+            for( size_t i = at; i != none; i = parent[i] )
+                path.push_back( items[i] );
+
+            return path;
+        }
+
+        auto visit = [&]( size_t aNext )
+        {
+            if( !seen[aNext] && ( items[aNext]->GetLayerSet() & items[at]->GetLayerSet() ).any() )
+            {
+                seen[aNext] = true;
+                parent[aNext] = at;
+                queue.push_back( aNext );
+            }
+        };
+
+        for( const VECTOR2I& e : ends( items[at] ) )
+        {
+            for( size_t next : atPoint[{ e.x, e.y }] )
+                visit( next );
+        }
+
+        // through a pad of the net (not the two asked for): everything else ending on it
+        for( size_t p : padsOf[at] )
+        {
+            if( pads[p].first == aFrom || pads[p].first == aTo )
+                continue;
+
+            for( size_t next : pads[p].second )
+            {
+                if( !seen[next] )
+                {
+                    seen[next] = true;
+                    parent[next] = at;
+                    queue.push_back( next );
+                }
+            }
+        }
+    }
+
+    return {};
+}
+
+
+std::optional<BOX2I> regionOf( const nlohmann::json& aArgs )
+{
+    if( !aArgs.contains( "region" ) )
+        return std::nullopt;
+
+    const nlohmann::json& r = aArgs["region"];
+
+    if( !r.is_array() || r.size() != 4 || !r[0].is_number() || !r[1].is_number() || !r[2].is_number() || !r[3].is_number() )
+        return std::nullopt;
+
+    BOX2I box( VECTOR2I( pcbIUScale.mmToIU( r[0].get<double>() ), pcbIUScale.mmToIU( r[1].get<double>() ) ), VECTOR2I( 0, 0 ) );
+    box.SetEnd( VECTOR2I( pcbIUScale.mmToIU( r[2].get<double>() ), pcbIUScale.mmToIU( r[3].get<double>() ) ) );
+    box.Normalize();
+    return box;
+}
+
+
+/// @brief The tracks / vias a request names: uuids, or the ones passing every filter given (nets, between,
+/// region, layer, kinds).  aError is set when the request is wrong.
+std::vector<PCB_TRACK*> selectTracks( BOARD* aBoard, const nlohmann::json& aArgs, bool aNeedSelector, nlohmann::json& aMissing,
+                                      std::optional<KOPENAPI_RESULT>& aError )
+{
+    std::vector<PCB_TRACK*> out;
+
+    if( aArgs.contains( "uuids" ) )
+    {
+        if( !aArgs["uuids"].is_array() )
+        {
+            aError = KOPENAPI_RESULT::Error( 400, "uuids: track / via uuids (pcb_track_list)" );
+            return out;
+        }
+
+        std::map<std::string, PCB_TRACK*> byId;
+
+        for( PCB_TRACK* track : aBoard->Tracks() )
+            byId[str( track->m_Uuid.AsString() )] = track;
+
+        for( const nlohmann::json& u : aArgs["uuids"] )
+        {
+            auto it = u.is_string() ? byId.find( u.get<std::string>() ) : byId.end();
+
+            if( it == byId.end() )
+                aMissing.push_back( u );
+            else
+                out.push_back( it->second );
+        }
+
+        return out;
+    }
+
+    std::set<int> nets;
+
+    if( aArgs.contains( "net" ) && !aArgs.contains( "nets" ) && !aArgs["net"].is_string() )
+    {
+        aError = KOPENAPI_RESULT::Error( 400, "net: a net name" );
+        return out;
+    }
+
+    nlohmann::json netNames = aArgs.value( "nets", nlohmann::json::array() );
+
+    if( aArgs.contains( "net" ) && aArgs["net"].is_string() )
+        netNames.push_back( aArgs["net"] );
+
+    for( const nlohmann::json& n : netNames )
+    {
+        NETINFO_ITEM* net = n.is_string() ? aBoard->FindNet( wxString::FromUTF8( n.get<std::string>() ) ) : nullptr;
+
+        if( !net )
+        {
+            aError = KOPENAPI_RESULT::Error( 404, "no such net: " + n.dump() + " (pcb_net_list)" );
+            return out;
+        }
+
+        nets.insert( net->GetNetCode() );
+    }
+
+    std::optional<std::set<PCB_TRACK*>> between;
+
+    if( aArgs.contains( "between" ) )
+    {
+        const nlohmann::json& b = aArgs["between"];
+        std::optional<PAD*>   a = b.is_array() && b.size() == 2 && b[0].is_string() ? findPad( aBoard, b[0].get<std::string>() )
+                                                                                    : std::nullopt;
+        std::optional<PAD*>   z = a && b[1].is_string() ? findPad( aBoard, b[1].get<std::string>(), *a, *a ) : std::nullopt;
+
+        if( !a || !z )
+        {
+            aError = KOPENAPI_RESULT::Error( 404, "between: two pads [\"REF.PAD\", \"REF.PAD\"]" );
+            return out;
+        }
+
+        if( ( *a )->GetNetCode() != ( *z )->GetNetCode() || ( *a )->GetNetCode() <= 0 )
+        {
+            aError = KOPENAPI_RESULT::Error( 422, "between: the two pads are not on one net" );
+            return out;
+        }
+
+        const std::vector<PCB_TRACK*> path = copperBetween( aBoard, *a, *z );
+        between = std::set<PCB_TRACK*>( path.begin(), path.end() );
+    }
+
+    if( aArgs.contains( "region" ) && !regionOf( aArgs ) )
+    {
+        aError = KOPENAPI_RESULT::Error( 400, "region: [x0_mm, y0_mm, x1_mm, y1_mm]" );
+        return out;
+    }
+
+    const std::optional<BOX2I> region = regionOf( aArgs );
+    const bool                 touching = aArgs.value( "region_mode", std::string( "inside" ) ) == "touching";
+    std::optional<PCB_LAYER_ID> layer;
+
+    if( aArgs.contains( "layer" ) )
+    {
+        layer = aArgs["layer"].is_string() ? parseLayer( aBoard, aArgs["layer"].get<std::string>() ) : std::nullopt;
+
+        if( !layer )
+        {
+            aError = KOPENAPI_RESULT::Error( 400, "layer: an enabled copper layer" );
+            return out;
+        }
+    }
+
+    std::set<std::string> kinds;
+
+    for( const nlohmann::json& k : aArgs.value( "kinds", nlohmann::json::array() ) )
+    {
+        if( !k.is_string() || ( k != "track" && k != "via" ) )
+        {
+            aError = KOPENAPI_RESULT::Error( 400, "kinds: track, via" );
+            return out;
+        }
+
+        kinds.insert( k.get<std::string>() );
+    }
+
+    if( aNeedSelector && nets.empty() && !between && !region )
+    {
+        aError = KOPENAPI_RESULT::Error( 400, "say which copper: uuids, net / nets, between [\"REF.PAD\", \"REF.PAD\"] or "
+                                              "region [x0, y0, x1, y1] (layer and kinds narrow it further)" );
+        return out;
+    }
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        const bool isVia = track->Type() == PCB_VIA_T;
+
+        if( !nets.empty() && !nets.count( track->GetNetCode() ) )
+            continue;
+
+        if( between && !between->count( track ) )
+            continue;
+
+        if( !kinds.empty() && !kinds.count( isVia ? "via" : "track" ) )
+            continue;
+
+        if( layer && !track->IsOnLayer( *layer ) )
+            continue;
+
+        if( region )
+        {
+            const BOX2I box = track->GetBoundingBox();
+
+            if( touching ? !region->Intersects( box ) : !region->Contains( box ) )
+                continue;
+        }
+
+        out.push_back( track );
+    }
+
+    return out;
+}
+
+} // namespace
+
+
+static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*                         board = context->GetBoard();
+    nlohmann::json                 missing = nlohmann::json::array();
+    std::optional<KOPENAPI_RESULT> error;
+    std::vector<PCB_TRACK*>        tracks = selectTracks( board, aArgs, false, missing, error );
+
+    if( error )
+        return *error;
+
+    const size_t   limit = size_t( std::clamp( aArgs.value( "limit", 500 ), 1, 5000 ) );
+    const size_t   offset = size_t( std::max( 0, aArgs.value( "offset", 0 ) ) );
+    nlohmann::json items = nlohmann::json::array();
+    double         length = 0;
+    int            vias = 0;
+
+    for( size_t i = 0; i < tracks.size(); i++ )
+    {
+        if( tracks[i]->Type() == PCB_VIA_T )
+            vias++;
+        else
+            length += tracks[i]->GetLength();
+
+        if( i >= offset && items.size() < limit )
+            items.push_back( trackJson( board, tracks[i] ) );
+    }
+
+    nlohmann::json out = { { "items", items }, { "total", tracks.size() }, { "vias", vias },
+                           { "length_mm", toMm( length ) }, { "missing", missing } };
+
+    if( offset + items.size() < tracks.size() )
+        out["next_offset"] = offset + items.size();
+
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
+static KOPENAPI_RESULT h_pcb_tracks_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    if( std::optional<KOPENAPI_RESULT> busy = guiRouting() )
+        return *busy;
+
+    BOARD*                         board = context->GetBoard();
+    nlohmann::json                 missing = nlohmann::json::array();
+    std::optional<KOPENAPI_RESULT> error;
+    std::vector<PCB_TRACK*>        selected = selectTracks( board, aArgs, true, missing, error );
+
+    if( error )
+        return *error;
+
+    const bool               overrideLocks = aArgs.value( "override_locks", false );
+    const bool               dryRun = aArgs.value( "dry_run", false );
+    std::vector<PCB_TRACK*>  doomed;
+    nlohmann::json           locked = nlohmann::json::array();
+    std::map<std::string, nlohmann::json> byNet;
+    double                   length = 0;
+    int                      tracks = 0, vias = 0;
+
+    for( PCB_TRACK* track : selected )
+    {
+        if( track->IsLocked() && !overrideLocks )
+        {
+            locked.push_back( str( track->m_Uuid.AsString() ) );
+            continue;
+        }
+
+        doomed.push_back( track );
+
+        nlohmann::json& net = byNet[str( UnescapeString( track->GetNetname() ) )];
+
+        if( net.is_null() )
+            net = { { "tracks", 0 }, { "vias", 0 }, { "length_mm", 0.0 } };
+
+        if( track->Type() == PCB_VIA_T )
+        {
+            vias++;
+            net["vias"] = net["vias"].get<int>() + 1;
+        }
+        else
+        {
+            tracks++;
+            length += track->GetLength();
+            net["tracks"] = net["tracks"].get<int>() + 1;
+            net["length_mm"] = net["length_mm"].get<double>() + toMm( track->GetLength() );
+        }
+    }
+
+    nlohmann::json out = { { "deleted", { { "tracks", tracks }, { "vias", vias }, { "length_mm", toMm( length ) } } },
+                           { "by_net", byNet }, { "missing", missing }, { "locked_skipped", locked },
+                           { "applied", false } };
+
+    if( doomed.empty() )
+    {
+        out["reason"] = !locked.empty() ? "everything selected is locked (override_locks: true)"
+                        : aArgs.contains( "between" ) ? "no copper joins these two pads"
+                                                      : "nothing matches";
+        return KOPENAPI_RESULT::Ok( out );
+    }
+
+    if( dryRun )
+    {
+        nlohmann::json uuids = nlohmann::json::array();
+
+        for( PCB_TRACK* track : doomed )
+            uuids.push_back( str( track->m_Uuid.AsString() ) );
+
+        out["uuids"] = uuids;
+        return KOPENAPI_RESULT::Ok( out );
+    }
+
+    BOARD_COMMIT commit( context->GetToolManager() );
+
+    for( PCB_TRACK* track : doomed )
+        commit.Remove( track );
+
+    commit.Push( _( "Delete tracks (API)" ) );
+
+    bool filledZones = false;
+
+    for( ZONE* zone : board->Zones() )
+        filledZones |= zone->IsFilled();
+
+    if( filledZones && aArgs.value( "refill_zones", false ) )
+    {
+        BOARD_COMMIT fillCommit( context->GetToolManager() );
+        ZONE_FILLER  filler( board, &fillCommit );
+        KOPENAPI_KEEPALIVE_REPORTER reporter;
+        filler.SetProgressReporter( &reporter );
+        std::vector<ZONE*> zones( board->Zones().begin(), board->Zones().end() );
+
+        if( filler.Fill( zones ) )
+            fillCommit.Push( _( "Fill zones (API)" ) );
+        else
+            fillCommit.Revert();
+
+        out["zones_refilled"] = true;
+    }
+    else if( filledZones )
+    {
+        out["note"] = "zone fills still show the removed copper's clearance: pcb_zones_fill (or refill_zones: true)";
+    }
+
+    board->BuildConnectivity();
+    board->GetConnectivity()->RecalculateRatsnest();
+    showRoutes( aCtx, {} );
+
+    out["applied"] = true;
+    out["unrouted_left"] = board->GetConnectivity()->GetUnconnectedCount( false );
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
+static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    if( std::optional<KOPENAPI_RESULT> busy = guiRouting() )
+        return *busy;
+
+    BOARD* board = context->GetBoard();
+
+    // the path: a pad, points, a pad; a point may carry "via": the layer the track continues on
+    struct STEP
+    {
+        VECTOR2I                    at;
+        std::optional<PCB_LAYER_ID> via;
+    };
+
+    std::vector<STEP> steps;
+    NETINFO_ITEM*     net = nullptr;
+    PAD*              fromPad = nullptr;
+    PAD*              toPad = nullptr;
+
+    if( aArgs.contains( "from" ) )
+    {
+        std::optional<PAD*> pad = aArgs["from"].is_string() ? findPad( board, aArgs["from"].get<std::string>() ) : std::nullopt;
+
+        if( !pad )
+            return KOPENAPI_RESULT::Error( 404, "from: REF.PAD of an existing pad" );
+
+        fromPad = *pad;
+        net = fromPad->GetNet();
+        steps.push_back( { fromPad->GetPosition(), std::nullopt } );
+    }
+
+    if( aArgs.contains( "net" ) )
+    {
+        NETINFO_ITEM* named = aArgs["net"].is_string() ? board->FindNet( wxString::FromUTF8( aArgs["net"].get<std::string>() ) )
+                                                       : nullptr;
+
+        if( !named )
+            return KOPENAPI_RESULT::Error( 404, "no such net (pcb_net_list)" );
+
+        if( net && net != named )
+            return KOPENAPI_RESULT::Error( 422, "'from' is on net " + str( UnescapeString( net->GetNetname() ) ) + ", not on " + aArgs["net"].get<std::string>() );
+
+        net = named;
+    }
+
+    if( !net || net->GetNetCode() <= 0 )
+        return KOPENAPI_RESULT::Error( 400, "give the net: 'from' (REF.PAD on a net) or 'net'" );
+
+    for( const nlohmann::json& p : aArgs.value( "points", nlohmann::json::array() ) )
+    {
+        const nlohmann::json at = p.is_object() ? p.value( "at", nlohmann::json() ) : p;
+
+        if( !at.is_array() || at.size() != 2 || !at[0].is_number() || !at[1].is_number() )
+            return KOPENAPI_RESULT::Error( 400, "points: [x_mm, y_mm] or {at: [x_mm, y_mm], via: \"B.Cu\"} (a via there, "
+                                                "the track continues on that layer)" );
+
+        STEP step{ VECTOR2I( pcbIUScale.mmToIU( at[0].get<double>() ), pcbIUScale.mmToIU( at[1].get<double>() ) ), std::nullopt };
+
+        if( p.is_object() && p.contains( "via" ) )
+        {
+            step.via = p["via"].is_string() ? parseLayer( board, p["via"].get<std::string>() ) : std::nullopt;
+
+            if( !step.via )
+                return KOPENAPI_RESULT::Error( 400, "points: via is an enabled copper layer" );
+        }
+
+        steps.push_back( step );
+    }
+
+    if( aArgs.contains( "to" ) )
+    {
+        std::optional<PAD*> pad = aArgs["to"].is_string() ? findPad( board, aArgs["to"].get<std::string>(), fromPad, fromPad )
+                                                          : std::nullopt;
+
+        if( !pad )
+            return KOPENAPI_RESULT::Error( 404, "to: REF.PAD of an existing pad" );
+
+        if( ( *pad )->GetNetCode() != net->GetNetCode() )
+            return KOPENAPI_RESULT::Error( 422, "'to' is not on net " + str( UnescapeString( net->GetNetname() ) ) );
+
+        toPad = *pad;
+        steps.push_back( { toPad->GetPosition(), std::nullopt } );
+    }
+
+    if( steps.size() < 2 )
+        return KOPENAPI_RESULT::Error( 400, "a track needs two points at least: from / points / to" );
+
+    PCB_LAYER_ID layer = F_Cu;
+
+    if( aArgs.contains( "layer" ) )
+    {
+        std::optional<PCB_LAYER_ID> named = aArgs["layer"].is_string() ? parseLayer( board, aArgs["layer"].get<std::string>() )
+                                                                       : std::nullopt;
+
+        if( !named )
+            return KOPENAPI_RESULT::Error( 400, "layer: an enabled copper layer, e.g. F.Cu, B.Cu" );
+
+        layer = *named;
+    }
+    else if( fromPad && !fromPad->IsOnLayer( F_Cu ) )
+    {
+        layer = B_Cu;   // an SMD pad on the bottom
+    }
+
+    if( fromPad && !fromPad->IsOnLayer( layer ) )
+        return KOPENAPI_RESULT::Error( 422, "'from' pad is not on " + str( board->GetLayerName( layer ) ) );
+
+    NETCLASS*  netclass = net->GetNetClass();
+    const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+    const int  width = aArgs.contains( "width_mm" ) && aArgs["width_mm"].is_number()
+                               ? pcbIUScale.mmToIU( aArgs["width_mm"].get<double>() )
+                               : netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : pcbIUScale.mmToIU( 0.25 );
+    const int  viaDia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
+    const int  viaDrill = netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
+
+    if( width < bds.m_TrackMinWidth )
+        return KOPENAPI_RESULT::Error( 422, "width_mm is below the board's minimum track width "
+                                                    + std::to_string( toMm( bds.m_TrackMinWidth ) ).substr( 0, 5 ) + " mm" );
+
+    std::vector<std::unique_ptr<PCB_TRACK>> made;
+    std::vector<BOARD_CONNECTED_ITEM*>      changed;
+    double                                  length = 0;
+    int                                     vias = 0;
+    nlohmann::json                          segments = nlohmann::json::array();
+
+    for( size_t i = 1; i < steps.size(); i++ )
+    {
+        if( steps[i].at != steps[i - 1].at )
+        {
+            auto track = std::make_unique<PCB_TRACK>( board );
+            track->SetStart( steps[i - 1].at );
+            track->SetEnd( steps[i].at );
+            track->SetWidth( width );
+            track->SetLayer( layer );
+            track->SetNet( net );
+            length += track->GetLength();
+            segments.push_back( { { "from", { toMm( track->GetStart().x ), toMm( track->GetStart().y ) } },
+                                  { "to", { toMm( track->GetEnd().x ), toMm( track->GetEnd().y ) } },
+                                  { "layer", str( board->GetLayerName( layer ) ) }, { "width_mm", toMm( width ) } } );
+            changed.push_back( track.get() );
+            made.push_back( std::move( track ) );
+        }
+
+        if( steps[i].via && *steps[i].via != layer )
+        {
+            auto via = std::make_unique<PCB_VIA>( board );
+            via->SetViaType( VIATYPE::THROUGH );
+            via->SetPosition( steps[i].at );
+            via->SetWidth( PADSTACK::ALL_LAYERS, viaDia );
+            via->SetDrill( viaDrill );
+            via->SetLayerPair( F_Cu, B_Cu );
+            via->SetNet( net );
+            vias++;
+            changed.push_back( via.get() );
+            made.push_back( std::move( via ) );
+            layer = *steps[i].via;
+        }
+    }
+
+    if( made.empty() )
+        return KOPENAPI_RESULT::Error( 400, "the points are all the same: nothing to add" );
+
+    if( toPad && !toPad->IsOnLayer( layer ) )
+        return KOPENAPI_RESULT::Error( 422, "the track arrives on " + str( board->GetLayerName( layer ) ) + ", 'to' pad is not on it "
+                                                    "(add a point with via before it)" );
+
+    nlohmann::json out = { { "net", str( UnescapeString( net->GetNetname() ) ) }, { "segments", segments },
+                           { "length_mm", toMm( length ) }, { "vias", vias }, { "width_mm", toMm( width ) },
+                           { "applied", false } };
+
+    const nlohmann::json violations = guard( board, changed, {} );
+
+    if( !violations.empty() )
+    {
+        KOPENAPI_RESULT rejected = KOPENAPI_RESULT::Error( 422, "rejected by the guard: this copper would touch another net" );
+        rejected.body["violations"] = violations;
+        rejected.body["segments"] = segments;
+        return rejected;
+    }
+
+    if( aArgs.value( "dry_run", false ) )
+        return KOPENAPI_RESULT::Ok( out );
+
+    BOARD_COMMIT      commit( context->GetToolManager() );
+    std::vector<KIID> added;
+    nlohmann::json    uuids = nlohmann::json::array();
+
+    for( std::unique_ptr<PCB_TRACK>& item : made )
+    {
+        added.push_back( item->m_Uuid );
+        uuids.push_back( str( item->m_Uuid.AsString() ) );
+        commit.Add( item.release() );
+    }
+
+    commit.Push( _( "Add track (API)" ) );
+    board->BuildConnectivity();
+    board->GetConnectivity()->RecalculateRatsnest();
+    showRoutes( aCtx, added );
+
+    out["applied"] = true;
+    out["uuids"] = uuids;
+    out["unrouted_left"] = board->GetConnectivity()->GetUnconnectedCount( false );
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
 KOPENAPI_REGISTER( "pcb_route_connection",
                    "EXPERIMENTAL. Route one connection with KiCad's push-and-shove router, as a person "
                    "does in the editor: from a pad (REF.PAD) to a pad of the same net, or to the nearest "
                    "unconnected point of its net; layer, mode walkaround / shove; track width and clearance "
-                   "from the board's rules. A guard rejects routes whose copper would touch another net. "
+                   "from the board's rules; waypoints steer it (corners, vias with a layer change). A guard "
+                   "rejects routes whose copper would touch another net. Undo one route: pcb_tracks_delete "
+                   "(between its pads). "
                    "dry_run: measure only (geometry, length, detour, vias, shoved items), nothing changes",
                    R"json({"type":"object","required":["from"],"properties":{
                         "from":{"type":"string","description":"REF.PAD"},
                         "to":{"type":"string","description":"REF.PAD on the same net; default: nearest unconnected"},
                         "layer":{"type":"string","default":"F.Cu"},
                         "mode":{"type":"string","enum":["walkaround","shove"],"default":"walkaround"},
+                        "waypoints":{"type":"array","description":"points to pass in order: [x_mm, y_mm] fixes a corner there; {at: [x_mm, y_mm], layer: 'B.Cu'} drops a through via there and continues on that layer","items":{}},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_route_connection, 120 );
 
@@ -1239,4 +2019,55 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    R"json({"type":"object","properties":{"net":{"type":"string","default":"GND"}}})json"_json,
                    false, h_pcb_stitch, 300 );
 
-KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch" );
+KOPENAPI_REGISTER( "pcb_track_list",
+                   "Tracks and vias with their uuids: all, or of nets, in a region, on a layer, or the copper "
+                   "joining two pads (between); per item kind, net, ends / position, layer(s), width, length; "
+                   "totals (count, vias, length)",
+                   R"json({"type":"object","properties":{
+                        "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
+                        "between":{"type":"array","items":{"type":"string"},"description":"[\"REF.PAD\", \"REF.PAD\"]: the chain of tracks / vias joining these two pads of one net"},
+                        "region":{"type":"array","items":{"type":"number"},"description":"[x0_mm, y0_mm, x1_mm, y1_mm]"},
+                        "region_mode":{"type":"string","enum":["inside","touching"],"default":"inside"},
+                        "layer":{"type":"string"},
+                        "kinds":{"type":"array","items":{"type":"string","enum":["track","via"]}},
+                        "uuids":{"type":"array","items":{"type":"string"}},
+                        "limit":{"type":"integer","default":500},"offset":{"type":"integer","default":0}}})json"_json,
+                   false, h_pcb_track_list );
+
+KOPENAPI_REGISTER( "pcb_tracks_delete",
+                   "Remove tracks and vias in one undo step: by uuids, or the ones passing every filter given - "
+                   "net / nets (unroute them), between two pads (undo one connection: the copper joining them), "
+                   "region, layer, kinds. Pads, zones and footprints are never touched; locked copper is kept "
+                   "(override_locks). dry_run lists what would go. Answers what was removed per net and the "
+                   "connections now open (unrouted_left); route again with pcb_route / pcb_route_connection / "
+                   "pcb_track_add",
+                   R"json({"type":"object","properties":{
+                        "uuids":{"type":"array","items":{"type":"string"},"description":"exactly these (pcb_track_list); the filters below are ignored"},
+                        "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
+                        "between":{"type":"array","items":{"type":"string"},"description":"[\"REF.PAD\", \"REF.PAD\"]"},
+                        "region":{"type":"array","items":{"type":"number"},"description":"[x0_mm, y0_mm, x1_mm, y1_mm]"},
+                        "region_mode":{"type":"string","enum":["inside","touching"],"default":"inside","description":"inside: wholly in the region; touching: any part in it"},
+                        "layer":{"type":"string"},
+                        "kinds":{"type":"array","items":{"type":"string","enum":["track","via"]}},
+                        "refill_zones":{"type":"boolean","default":false},
+                        "override_locks":{"type":"boolean","default":false},
+                        "dry_run":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_tracks_delete, 300 );
+
+KOPENAPI_REGISTER( "pcb_track_add",
+                   "Lay a track by hand along given points (no router): from a pad and / or to a pad (their "
+                   "centres) through points in mm; a point with via continues on that layer through a via. "
+                   "Width and via size from the net's class unless width_mm is given. The same guard as the "
+                   "router: copper that would touch another net is refused (422 with the violations), nothing "
+                   "is added then. One undo step; dry_run checks only",
+                   R"json({"type":"object","properties":{
+                        "from":{"type":"string","description":"REF.PAD: start at its centre, on its net"},
+                        "to":{"type":"string","description":"REF.PAD of the same net: end at its centre"},
+                        "net":{"type":"string","description":"needed without 'from'"},
+                        "points":{"type":"array","description":"[x_mm, y_mm] or {at: [x_mm, y_mm], via: 'B.Cu'}","items":{}},
+                        "layer":{"type":"string","description":"start layer; default F.Cu (B.Cu from a bottom SMD pad)"},
+                        "width_mm":{"type":"number"},
+                        "dry_run":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_track_add );
+
+KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_track_add" );
