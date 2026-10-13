@@ -64,6 +64,14 @@
 
 #include <BRep_Tool.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <ShapeFix_Edge.hxx>
+#include <ShapeFix_Face.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
+#include <OSD_Parallel.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <TopExp.hxx>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <TopoDS.hxx>
 #include <TopoDS_Shape.hxx>
@@ -129,6 +137,8 @@ bool processLabel( const TDF_Label& aLabel, DATA& aData, SGNODE* aParent,
                   std::vector< SGNODE* >* aItems );
 
 
+void prepareFaces( const TopoDS_Shape& aShape, DATA& aData );
+
 bool processFace( const TopoDS_Face& face, DATA& data, SGNODE* parent,
                   std::vector< SGNODE* >* items, Quantity_ColorRGBA* color );
 
@@ -152,6 +162,11 @@ struct DATA
     NODEMAP  shapes;    // SGNODE lists representing a TopoDS_SOLID / COMPOUND
     COLORMAP colors;    // SGAPPEARANCE nodes
     FACEMAP  faces;     // SGSHAPE items representing a TopoDS_FACE
+
+    /// Meshed copies of faces whose edges lacked curves on the face (prepareFaces())
+    std::unordered_map<const TopoDS_TShape*, TopoDS_Face> preparedFaces;
+
+    int droppedFaces = 0;   ///< faces left without a mesh
     bool renderBoth;    // set TRUE if we're processing IGES
     bool hasSolid;      // set TRUE if there is no parent SOLID
     S3D::MODEL_IMPORT_OPTIONS options;
@@ -629,7 +644,7 @@ bool readIGES( Handle( TDocStd_Document ) & m_doc, const char* fname )
 }
 
 
-bool readSTEP( Handle( TDocStd_Document ) & m_doc, const char* fname, double aLinearDeflection )
+bool readSTEP( Handle( TDocStd_Document ) & m_doc, const char* fname, double aLinearDeflection, bool aHeal )
 {
     wxLogTrace( MASK_OCE, wxT( "Reading step file %s" ), fname );
 
@@ -671,6 +686,14 @@ bool readSTEP( Handle( TDocStd_Document ) & m_doc, const char* fname, double aLi
         return false;
 #endif
 
+#if OCC_VERSION_HEX >= 0x070800
+    // Without shape healing (~90 % of the transfer time): what meshing needs from it, the edges'
+    // curves on their faces, is added in prepareFaces(); a model that still loses faces is read
+    // again with healing (LoadModel)
+    if( !aHeal )
+        reader.SetShapeProcessFlags( ShapeProcess::OperationsFlags() );
+#endif
+
     // set other translation options
     reader.SetColorMode( true );  // use model colors
     reader.SetNameMode( false );  // don't use label names
@@ -688,7 +711,7 @@ bool readSTEP( Handle( TDocStd_Document ) & m_doc, const char* fname, double aLi
 
 
 bool readSTEPZ( Handle( TDocStd_Document ) & m_doc, const char* aFileName, const S3D::MODEL_IMPORT_OPTIONS& aOptions,
-                MODEL_IMPORT_STATUS* aStatus )
+                MODEL_IMPORT_STATUS* aStatus , bool aHeal)
 {
     wxFileName fname( wxString::FromUTF8Unchecked( aFileName ) );
     wxFFileInputStream ifile( fname.GetFullPath() );
@@ -798,13 +821,14 @@ bool readSTEPZ( Handle( TDocStd_Document ) & m_doc, const char* aFileName, const
             return false;
     }
 
-    bool retval = readSTEP( m_doc, outFile.GetFullPath().mb_str(), aOptions.stepLinearDeflection );
+    bool retval = readSTEP( m_doc, outFile.GetFullPath().mb_str(), aOptions.stepLinearDeflection, aHeal );
 
     return retval;
 }
 
 
-SCENEGRAPH* LoadModel( char const* filename, const S3D::MODEL_IMPORT_OPTIONS* aOptions, MODEL_IMPORT_STATUS* aStatus )
+static SCENEGRAPH* loadModel( char const* filename, const S3D::MODEL_IMPORT_OPTIONS* aOptions,
+                              MODEL_IMPORT_STATUS* aStatus, bool aHeal, bool& aIncomplete )
 {
     DATA data;
 
@@ -836,13 +860,13 @@ SCENEGRAPH* LoadModel( char const* filename, const S3D::MODEL_IMPORT_OPTIONS* aO
         break;
 
     case FMT_STEP:
-        if( !readSTEP( data.m_doc, filename, data.options.stepLinearDeflection ) )
+        if( !readSTEP( data.m_doc, filename, data.options.stepLinearDeflection, aHeal ) )
             return nullptr;
 
         break;
 
     case FMT_STPZ:
-        if( !readSTEPZ( data.m_doc, filename, data.options, aStatus ) )
+        if( !readSTEPZ( data.m_doc, filename, data.options, aStatus, aHeal ) )
             return nullptr;
 
         break;
@@ -864,6 +888,24 @@ SCENEGRAPH* LoadModel( char const* filename, const S3D::MODEL_IMPORT_OPTIONS* aO
     // retrieve all free shapes
     NCollection_Sequence<TDF_Label> frshapes;
     data.m_assy->GetFreeShapes( frshapes );
+
+    if( data.IsCanceled() )
+        return nullptr;
+
+    // Mesh every face once, in parallel, before the scene is built: processFace() then finds the
+    // triangulation in place.  Whole shapes also share edge discretisation between faces.
+    for( int i = 1; i <= frshapes.Length(); i++ )
+    {
+        const TopoDS_Shape shape = data.m_assy->GetShape( frshapes.Value( i ) );
+
+        if( !shape.IsNull() )
+        {
+            prepareFaces( shape, data );
+
+            BRepMesh_IncrementalMesh mesh( shape, data.options.stepLinearDeflection, false,
+                                           glm::radians( data.options.stepAngularDeflectionDegrees ), true );
+        }
+    }
 
     if( data.IsCanceled() )
         return nullptr;
@@ -893,6 +935,12 @@ SCENEGRAPH* LoadModel( char const* filename, const S3D::MODEL_IMPORT_OPTIONS* aO
         return nullptr;
     }
 
+    if( !aHeal && data.droppedFaces > 0 && ( modelFmt == FMT_STEP || modelFmt == FMT_STPZ ) )
+    {
+        aIncomplete = true;     // the scene goes with data
+        return nullptr;
+    }
+
     SCENEGRAPH* scene = (SCENEGRAPH*)data.scene;
 
     // DEBUG: WRITE OUT VRML2 FILE TO CONFIRM STRUCTURE
@@ -915,6 +963,18 @@ SCENEGRAPH* LoadModel( char const* filename, const S3D::MODEL_IMPORT_OPTIONS* aO
 
     // set to NULL to prevent automatic destruction of the scene data
     data.scene = nullptr;
+
+    return scene;
+}
+
+
+SCENEGRAPH* LoadModel( char const* filename, const S3D::MODEL_IMPORT_OPTIONS* aOptions, MODEL_IMPORT_STATUS* aStatus )
+{
+    bool        incomplete = false;
+    SCENEGRAPH* scene = loadModel( filename, aOptions, aStatus, false, incomplete );
+
+    if( incomplete )
+        scene = loadModel( filename, aOptions, aStatus, true, incomplete );
 
     return scene;
 }
@@ -1215,6 +1275,80 @@ bool processLabel( const TDF_Label& aLabel, DATA& aData, SGNODE* aParent,
 }
 
 
+/// STEP files often carry edges with 3D curves only; the mesher needs each edge's curve on the
+/// face's surface (the part of OpenCascade's shape healing meshing depends on).  Faces missing
+/// one get a copy with the curves added (fully healed if that is not enough) and meshed, in
+/// parallel (copies share no edges).
+void prepareFaces( const TopoDS_Shape& aShape, DATA& aData )
+{
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes( aShape, TopAbs_FACE, faces );
+
+    std::vector<TopoDS_Face>              todo;
+    std::unordered_set<const TopoDS_TShape*> queued;   // instances share one face definition
+
+    for( int i = 1; i <= faces.Extent(); i++ )
+    {
+        const TopoDS_Face& face = TopoDS::Face( faces( i ) );
+
+        if( aData.preparedFaces.count( face.TShape().get() ) || queued.count( face.TShape().get() ) )
+            continue;
+
+        for( TopExp_Explorer edges( face, TopAbs_EDGE ); edges.More(); edges.Next() )
+        {
+            double first, last;
+
+            if( BRep_Tool::CurveOnSurface( TopoDS::Edge( edges.Current() ), face, first, last ).IsNull() )
+            {
+                todo.push_back( face );
+                queued.insert( face.TShape().get() );
+                break;
+            }
+        }
+    }
+
+    if( todo.empty() )
+        return;
+
+    std::vector<TopoDS_Face> prepared( todo.size() );
+    const double             linDeflection = aData.options.stepLinearDeflection;
+    const double             angDeflection = glm::radians( aData.options.stepAngularDeflectionDegrees );
+
+    OSD_Parallel::For( 0, (int) todo.size(),
+                       [&]( int i )
+                       {
+                           TopoDS_Face   copy = TopoDS::Face( BRepBuilderAPI_Copy( todo[i] ).Shape() );
+                           ShapeFix_Edge fixer;
+
+                           for( TopExp_Explorer edges( copy, TopAbs_EDGE ); edges.More(); edges.Next() )
+                           {
+                               const TopoDS_Edge& edge = TopoDS::Edge( edges.Current() );
+                               double             first, last;
+
+                               if( BRep_Tool::CurveOnSurface( edge, copy, first, last ).IsNull() )
+                                   fixer.FixAddPCurve( edge, copy, BRep_Tool::IsClosed( edge, copy ) );
+                           }
+
+                           BRepMesh_IncrementalMesh( copy, linDeflection, false, angDeflection );
+                           TopLoc_Location loc;
+
+                           if( BRep_Tool::Triangulation( copy, loc ).IsNull() )
+                           {
+                               // still not meshable: full healing of this face
+                               ShapeFix_Face healer( copy );
+                               healer.Perform();
+                               copy = healer.Face();
+                               BRepMesh_IncrementalMesh( copy, linDeflection, false, angDeflection );
+                           }
+
+                           prepared[i] = copy;
+                       } );
+
+    for( size_t i = 0; i < todo.size(); i++ )
+        aData.preparedFaces[todo[i].TShape().get()] = prepared[i];
+}
+
+
 bool processFace( const TopoDS_Face& face, DATA& data, SGNODE* parent, std::vector<SGNODE*>* items,
                   Quantity_ColorRGBA* color )
 {
@@ -1270,6 +1404,14 @@ bool processFace( const TopoDS_Face& face, DATA& data, SGNODE* parent, std::vect
     TopLoc_Location loc;
     bool isTessellate (false);
     Handle( Poly_Triangulation ) triangulation = BRep_Tool::Triangulation( face, loc );
+
+    if( auto prepared = data.preparedFaces.find( face.TShape().get() ); prepared != data.preparedFaces.end() )
+    {
+        // the copy carries the mesh; the instance placement stays the face's own
+        TopLoc_Location copyLoc;
+        triangulation = BRep_Tool::Triangulation( prepared->second, copyLoc );
+        loc = face.Location();
+    }
     const double linDeflection = data.options.stepLinearDeflection;
 
     if( triangulation.IsNull() || triangulation->Deflection() > linDeflection + Precision::Confusion() )
@@ -1285,8 +1427,23 @@ bool processFace( const TopoDS_Face& face, DATA& data, SGNODE* parent, std::vect
     if( data.IsCanceled() )
         return false;
 
+    if( triangulation.IsNull() )
+    {
+        // read without healing: heal this face alone and mesh it again
+        ShapeFix_Face fixer( face );
+        fixer.Perform();
+        const TopoDS_Face healed = fixer.Face();
+
+        BRepMesh_IncrementalMesh( healed, linDeflection, false,
+                                  glm::radians( data.options.stepAngularDeflectionDegrees ) );
+        triangulation = BRep_Tool::Triangulation( healed, loc );
+    }
+
     if( triangulation.IsNull() == true )
+    {
+        data.droppedFaces++;
         return false;
+    }
 
     Quantity_ColorRGBA lcolor;
 
