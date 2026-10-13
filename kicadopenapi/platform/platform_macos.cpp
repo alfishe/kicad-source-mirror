@@ -3,6 +3,7 @@
 #include "platform_macos.h"
 #include "platform.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <libproc.h>
@@ -118,9 +119,11 @@ AllocatorInfo AllocatorStatsMacOS()
     {
         malloc_statistics_t stats{};
         malloc_zone_statistics((malloc_zone_t*) zones[i], &stats);
+        // a zone can report less reserved (or a lower peak) than it has in use: large blocks are
+        // counted in size_in_use only
         info.live += (int64_t) stats.size_in_use;
-        info.mapped += (int64_t) stats.size_allocated;
-        info.peakLive += (int64_t) stats.max_size_in_use;
+        info.mapped += (int64_t) std::max(stats.size_allocated, stats.size_in_use);
+        info.peakLive += (int64_t) std::max(stats.max_size_in_use, stats.size_in_use);
     }
 
     return info;
