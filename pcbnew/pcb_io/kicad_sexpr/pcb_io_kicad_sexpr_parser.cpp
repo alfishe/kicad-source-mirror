@@ -4482,7 +4482,10 @@ PCB_TEXT* PCB_IO_KICAD_SEXPR_PARSER::parsePCB_TEXT( BOARD_ITEM* aParent, PCB_TEX
         if( !text->IsVisible() && text->Type() == PCB_TEXT_T )
         {
             wxString fieldName = GetUserFieldName( parentFP->GetFields().size(), UNTRANSLATED );
-            return new PCB_FIELD( *text.get(), FIELD_T::USER, fieldName );
+            PCB_FIELD* field = new PCB_FIELD( *text.get(), FIELD_T::USER, fieldName );
+
+            field->SetUuidDirect( text->m_Uuid );
+            return field;
         }
     }
     else
@@ -6077,6 +6080,13 @@ FOOTPRINT* PCB_IO_KICAD_SEXPR_PARSER::parseFOOTPRINT_unchecked( wxArrayString* a
 
     std::unique_ptr<FOOTPRINT> footprint = std::make_unique<FOOTPRINT>( m_board );
 
+    // Fields the file gives no id for (mandatory ones it does not list, properties without a uuid)
+    // get one derived from the footprint's id, so that every load yields the same ids
+    std::vector<std::pair<PCB_FIELD*, KIID>> generatedFieldIds;
+
+    for( PCB_FIELD* mandatory : footprint->GetFields() )
+        generatedFieldIds.emplace_back( mandatory, mandatory->m_Uuid );
+
     footprint->SetInitialComments( aInitialComments );
 
     if( m_board )
@@ -6333,6 +6343,7 @@ FOOTPRINT* PCB_IO_KICAD_SEXPR_PARSER::parseFOOTPRINT_unchecked( wxArrayString* a
             {
                 field = new PCB_FIELD( footprint.get(), FIELD_T::USER, pName );
                 footprint->Add( field );
+                generatedFieldIds.emplace_back( field, field->m_Uuid );
 
                 field->SetText( pValue );
                 field->SetLayer( footprint->GetLayer() == F_Cu ? F_Fab : B_Fab );
@@ -7036,6 +7047,15 @@ FOOTPRINT* PCB_IO_KICAD_SEXPR_PARSER::parseFOOTPRINT_unchecked( wxArrayString* a
     footprint->SetAttributes( attributes );
 
     footprint->SetFPID( fpid );
+
+    for( const auto& [field, generated] : generatedFieldIds )
+    {
+        if( field->m_Uuid == generated )
+        {
+            field->SetUuidDirect( KIID::FromName( footprint->m_Uuid.AsStdString() + "/field/"
+                                                  + std::string( field->GetName( false ).utf8_str() ) ) );
+        }
+    }
 
     return footprint.release();
 }

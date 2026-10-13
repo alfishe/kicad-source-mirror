@@ -20,9 +20,15 @@
 #include <qa_utils/wx_utils/unit_test_utils.h>
 #include <boost/test/data/test_case.hpp>
 
+#include <map>
+#include <set>
+
 #include <board.h>
 #include <kiid.h>
 #include <footprint.h>
+#include <pcb_field.h>
+#include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr_parser.h>
+#include <richio.h>
 #include <pcbnew_utils/board_file_utils.h>
 #include <pcbnew_utils/board_test_utils.h>
 #include <settings/settings_manager.h>
@@ -95,4 +101,70 @@ BOOST_DATA_TEST_CASE( FootprintLoadSave,
 
     KI_TEST::LoadAndTestBoardFile( testCase.m_BoardFileRelativePath, true, doBoardTest,
                                    testCase.m_ExpectedBoardVersion );
+}
+
+// Footprint fields have the same ids on every load: the file's where it has them, derived ones otherwise
+BOOST_AUTO_TEST_CASE( FieldsWithoutIdLoadWithStableIds )
+{
+    const std::string data = R"(
+(kicad_pcb (version 20241229) (generator "test") (generator_version "9.0")
+  (general (thickness 1.6))
+  (paper "A4")
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (35 "F.Fab" user) (25 "Edge.Cuts" user))
+  (setup (pad_to_mask_clearance 0))
+  (net 0 "")
+  (footprint "lib:fp" (layer "F.Cu")
+    (uuid "11111111-2222-4333-8444-555555555555")
+    (at 10 10)
+    (property "Reference" "R1" (at 0 -1 0) (layer "F.Fab")
+      (uuid "aaaaaaaa-2222-4333-8444-555555555555")
+      (effects (font (size 1 1) (thickness 0.15))))
+    (property "Value" "10k" (at 0 1 0) (layer "F.Fab")
+      (effects (font (size 1 1) (thickness 0.15))))
+    (property "MPN" "X" (at 0 2 0) (layer "F.Fab")
+      (effects (font (size 1 1) (thickness 0.15))))
+    (fp_text user "note" (at 0 3 0) (layer "F.Fab") (hide yes)
+      (uuid "bbbbbbbb-2222-4333-8444-555555555555")
+      (effects (font (size 1 1) (thickness 0.15))))
+  )
+)
+)";
+
+    auto fieldIds = [&]()
+    {
+        STRING_LINE_READER        reader( data, wxT( "stable field ids" ) );
+        PCB_IO_KICAD_SEXPR_PARSER parser( &reader, nullptr, nullptr );
+        std::unique_ptr<BOARD>    board( dynamic_cast<BOARD*>( parser.Parse() ) );
+
+        BOOST_REQUIRE( board && board->Footprints().size() == 1 );
+
+        std::map<wxString, KIID> ids;
+
+        for( PCB_FIELD* field : board->Footprints().front()->GetFields() )
+            ids[field->GetName( false )] = field->m_Uuid;
+
+        return ids;
+    };
+
+    const std::map<wxString, KIID> first = fieldIds();
+    const std::map<wxString, KIID> second = fieldIds();
+
+    BOOST_REQUIRE( first.size() >= 5 );
+    BOOST_CHECK( first == second );
+    BOOST_CHECK( first.at( wxS( "Reference" ) ) == KIID( "aaaaaaaa-2222-4333-8444-555555555555" ) );
+
+    // a hidden footprint text becomes a field and keeps the id it has in the file
+    bool hiddenTextKeepsId = false;
+
+    for( const auto& [name, id] : first )
+        hiddenTextKeepsId |= id == KIID( "bbbbbbbb-2222-4333-8444-555555555555" );
+
+    BOOST_CHECK( hiddenTextKeepsId );
+
+    std::set<KIID> distinct;
+
+    for( const auto& [name, id] : first )
+        distinct.insert( id );
+
+    BOOST_CHECK_EQUAL( distinct.size(), first.size() );
 }
