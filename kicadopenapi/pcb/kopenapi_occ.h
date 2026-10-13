@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <vector>
 
 
 /// @brief Geometry of one 3D model placed by its model matrix, in the footprint's 3D frame
@@ -21,6 +22,8 @@ struct KOPENAPI_MODEL_GEOMETRY
     double      bodyBottom = 0;   ///< lowest z where the body starts (above leads / pins)
     bool        hasLeads = false; ///< thin parts (pins) reach below the body
     bool        hasBody = false;  ///< bodyBottom and hasLeads are measured (not for a box-only request)
+    double      seat = 0;         ///< lowest z outside the given drill holes: where it rests (needs aHoles)
+    bool        hasSeat = false;
     double      seconds = 0;      ///< time spent (0 when cached)
 };
 
@@ -30,8 +33,12 @@ struct KOPENAPI_MODEL_GEOMETRY
 /// @param aStep STEP file
 /// @param aMatrix model matrix (footprint frame)
 /// @param aBody false measures the box only (bodyBottom / hasLeads unset)
+/// @param aHoles the footprint's drill holes (x, y, radius in the footprint frame, mm): only through
+/// them may the part cross the board; measures seat
+/// @param aThickness board thickness (mm): below the board's bottom anything goes (clips, splayed legs)
 KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aStep, const glm::mat4& aMatrix,
-                                               bool aBody = true );
+                                               bool aBody = true, const std::vector<glm::vec3>& aHoles = {},
+                                               double aThickness = 1.6 );
 
 /// @brief The STEP translators (readers, writers, Interface_Static parameters, the XCAF
 /// application's documents) keep global state: every STEP read / write and XCAF document

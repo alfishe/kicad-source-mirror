@@ -25,6 +25,7 @@
 #include <cmath>
 #include <fstream>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <vector>
@@ -74,6 +75,8 @@ void loadCache()
         g.bodyBottom = j.value( "body_bottom", 0.0 );
         g.hasLeads = j.value( "has_leads", false );
         g.hasBody = j.value( "body", true );
+        g.seat = j.value( "seat", 0.0 );
+        g.hasSeat = j.contains( "seat" );
         g_cache[it.key()] = g;
     }
 }
@@ -87,6 +90,9 @@ void saveCache()
     {
         all[key] = { { "min", { g.min[0], g.min[1], g.min[2] } }, { "max", { g.max[0], g.max[1], g.max[2] } },
                      { "body_bottom", g.bodyBottom }, { "has_leads", g.hasLeads }, { "body", g.hasBody } };
+
+        if( g.hasSeat )
+            all[key]["seat"] = g.seat;
     }
 
     std::error_code ec;
@@ -163,7 +169,8 @@ bool isRigid( const glm::mat4& aMatrix )
 } // namespace
 
 
-KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aStep, const glm::mat4& aMatrix, bool aBody )
+KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aStep, const glm::mat4& aMatrix, bool aBody,
+                                               const std::vector<glm::vec3>& aHoles, double aThickness )
 {
     std::error_code    ec;
     std::ostringstream key;
@@ -177,11 +184,19 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
             key << '|' << std::round( aMatrix[c][r] * 1e4 );
     }
 
+    for( const glm::vec3& h : aHoles )
+        key << "|h" << std::round( h.x * 1e3 ) << ',' << std::round( h.y * 1e3 ) << ',' << std::round( h.z * 1e3 );
+
+    key << "|t" << std::round( aThickness * 1e3 ) << "|s2";
+
+    const bool wantSeat = aBody;
+
     {
         std::lock_guard<std::mutex> lock( g_cacheMutex );
         loadCache();
 
-        if( auto it = g_cache.find( key.str() ); it != g_cache.end() && ( it->second.hasBody || !aBody ) )
+        if( auto it = g_cache.find( key.str() );
+            it != g_cache.end() && ( it->second.hasBody || !aBody ) && ( it->second.hasSeat || !wantSeat ) )
         {
             KOPENAPI_MODEL_GEOMETRY g = it->second;
             g.seconds = 0;
@@ -337,6 +352,46 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
     {
         g.min[a] = lo.Coord( a + 1 );
         g.max[a] = hi.Coord( a + 1 );
+    }
+
+    if( wantSeat )
+    {
+        // Seat: the lowest point within the board's thickness or above it, outside the drill holes
+        // (pins, pegs and tails go through them; clips and splayed legs below the board are fine).
+        // A hole's margin covers mesh deflection and, growing with the hole, snap-in board locks
+        // modelled relaxed (wider than the hole they are squeezed into)
+        constexpr double HOLE_MARGIN = 0.1;
+        constexpr double HOLE_MARGIN_PART = 0.35;
+        double           seat = std::numeric_limits<double>::max();
+
+        for( const TRIANGLE& t : mesh )
+        {
+            for( const gp_XYZ& v : t )
+            {
+                if( v.Z() >= seat || v.Z() < -aThickness )
+                    continue;
+
+                bool inHole = false;
+
+                for( const glm::vec3& h : aHoles )
+                {
+                    const double dx = v.X() - h.x, dy = v.Y() - h.y;
+                    const double r = h.z + std::max( HOLE_MARGIN, HOLE_MARGIN_PART * h.z );
+
+                    if( dx * dx + dy * dy <= r * r )
+                    {
+                        inHole = true;
+                        break;
+                    }
+                }
+
+                if( !inHole )
+                    seat = v.Z();
+            }
+        }
+
+        g.seat = seat == std::numeric_limits<double>::max() ? g.min[2] : std::round( seat * 100 ) / 100;
+        g.hasSeat = true;
     }
 
     if( aBody )

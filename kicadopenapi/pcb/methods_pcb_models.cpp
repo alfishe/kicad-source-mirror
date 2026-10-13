@@ -25,6 +25,7 @@
 #include <cmath>
 #include <filesystem>
 #include <algorithm>
+#include <limits>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -119,6 +120,31 @@ std::array<double, 3> toBoard( const FOOTPRINT* aFp, double aX, double aY, doubl
     const VECTOR2I pos = aFp->GetPosition();
 
     return { ( v.x + pos.x ) / pcbIUScale.IU_PER_MM, ( v.y + pos.y ) / pcbIUScale.IU_PER_MM, z };
+}
+
+
+/// @brief The footprint's drill holes in its 3D frame (inverse of toBoard): x, y, radius in mm
+std::vector<glm::vec3> footprintHoles( const FOOTPRINT* aFp )
+{
+    std::vector<glm::vec3> holes;
+    const VECTOR2I         pos = aFp->GetPosition();
+
+    for( const PAD* pad : aFp->Pads() )
+    {
+        if( !pad->HasHole() )
+            continue;
+
+        VECTOR2D v( pad->GetPosition() - pos );
+        RotatePoint( v, -aFp->GetOrientation() );
+
+        const double x = v.x / pcbIUScale.IU_PER_MM;
+        const double y = v.y / pcbIUScale.IU_PER_MM;
+        const VECTOR2I drill = pad->GetDrillSize();
+
+        holes.emplace_back( aFp->IsFlipped() ? -x : x, -y, std::max( drill.x, drill.y ) / 2.0 / pcbIUScale.IU_PER_MM );
+    }
+
+    return holes;
 }
 
 
@@ -271,8 +297,8 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
     if( geometry )
     {
         // cut copies need only their box (seating is measured on the generic model)
-        std::vector<std::tuple<std::filesystem::path, glm::mat4, bool>> jobs;
-        std::set<std::string>                                           queued;   // one job per file and placement
+        std::vector<std::tuple<std::filesystem::path, glm::mat4, bool, std::vector<glm::vec3>>> jobs;
+        std::set<std::string> queued;   // one job per file, placement and holes
 
         for( FOOTPRINT* fp : board->Footprints() )
         {
@@ -282,18 +308,24 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                 continue;
             }
 
+            const std::vector<glm::vec3> holes = footprintHoles( fp );
+
             for( const FP_3DMODEL& m : fp->Models() )
             {
                 const std::filesystem::path file = resolveModel( m, project );
                 const glm::mat4             matrix = modelMatrix( m );
+                const bool                  body = !m.m_Filename.Contains( wxS( "/.trimmed/" ) );
                 std::ostringstream          key;
                 key << file.string();
 
                 for( int i = 0; i < 16; ++i )
                     key << '|' << matrix[i / 4][i % 4];
 
+                for( const glm::vec3& h : holes )
+                    key << '|' << h.x << ',' << h.y << ',' << h.z;
+
                 if( std::filesystem::exists( file ) && queued.insert( key.str() ).second )
-                    jobs.emplace_back( file, matrix, !m.m_Filename.Contains( wxS( "/.trimmed/" ) ) );
+                    jobs.emplace_back( file, matrix, body, body ? holes : std::vector<glm::vec3>() );
             }
         }
 
@@ -314,8 +346,8 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                                                        {
                                                            for( size_t i = next++; i < jobs.size(); i = next++ )
                                                            {
-                                                               const auto& [file, matrix, body] = jobs[i];
-                                                               KopenapiModelGeometry( file, matrix, body );
+                                                               const auto& [file, matrix, body, holes] = jobs[i];
+                                                               KopenapiModelGeometry( file, matrix, body, holes, thickness );
                                                            }
                                                        } ) );
                     }
@@ -338,6 +370,9 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
         nlohmann::json models = nlohmann::json::array();
         nlohmann::json issues = nlohmann::json::array();
         bool           shown = false;
+        const std::vector<glm::vec3> holes = footprintHoles( fp );
+        std::vector<size_t>          floating;   // issues of models above the board
+        bool                         seated = false;
 
         for( const FP_3DMODEL& m : fp->Models() )
         {
@@ -386,7 +421,7 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                 KopenapiRunOffMain(
                         [&]()
                         {
-                            g = KopenapiModelGeometry( measured, modelMatrix( m ) );
+                            g = KopenapiModelGeometry( measured, modelMatrix( m ), true, holes, thickness );
                             shown = measured == file ? g : KopenapiModelGeometry( file, modelMatrix( m ), false );
                         } );
                 seconds += g.seconds + ( measured == file ? 0 : shown.seconds );   // prefetch misses only
@@ -412,15 +447,16 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                         }
                     }
 
-                    // seating: THT bodies rest on the board, SMD parts' lowest point on the pads
+                    // seating: nothing but what goes through the drill holes may reach below the
+                    // board's top (z = 0 in the footprint frame)
                     const bool   tht = isTht( fp ) && g.hasLeads;
-                    const double rest = tht ? g.bodyBottom : g.min[2];
-                    const double gap = rest;   // the board's top surface is z = 0 in the footprint frame
+                    const double rest = g.hasSeat ? g.seat : ( tht ? g.bodyBottom : g.min[2] );
+                    const double gap = rest;
 
                     row["bbox_board_mm"] = { { "min", { r2( lo[0] ), r2( lo[1] ), r2( lo[2] ) } },
                                              { "max", { r2( hi[0] ), r2( hi[1] ), r2( hi[2] ) } } };
                     row["height_mm"] = r2( shown.max[2] - std::max( 0.0, shown.min[2] ) );
-                    row["seat"] = { { "rests_on", tht ? "body" : "lowest point" },
+                    row["seat"] = { { "rests_on", g.hasSeat ? "lowest point outside the holes" : tht ? "body" : "lowest point" },
                                     { "body_bottom_mm", r2( g.bodyBottom ) },
                                     { "gap_mm", r2( gap ) },
                                     { "leads_below_board_mm", tht ? r2( std::max( 0.0, -shown.min[2] - thickness ) ) : 0.0 } };
@@ -429,7 +465,14 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                         row["seat"]["measured_on"] = "generic model (this is a cut copy)";
 
                     if( gap > tolerance )
+                    {
+                        floating.push_back( issues.size() );
                         issues.push_back( "floating " + std::to_string( r2( gap ) ).substr( 0, 4 ) + " mm above the board (pcb_model_seat)" );
+                    }
+                    else if( gap >= -tolerance )
+                    {
+                        seated = true;
+                    }
                     else if( gap < -tolerance )
                         issues.push_back( "sunk " + std::to_string( r2( -gap ) ).substr( 0, 4 ) + " mm into the board (pcb_model_seat)" );
                 }
@@ -440,6 +483,13 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
 
         if( !shown )
             issues.push_back( "no 3D model shown" );
+
+        // a part standing on another model of its footprint (a chip on its socket) rests on that
+        if( seated && !floating.empty() )
+        {
+            for( auto it = floating.rbegin(); it != floating.rend(); ++it )
+                issues.erase( issues.begin() + *it );
+        }
 
         problems += issues.empty() ? 0 : 1;
 
@@ -488,23 +538,31 @@ static KOPENAPI_RESULT h_pcb_model_seat( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
         bool modified = false;
 
+        // the footprint's models move together: its lowest one goes to the target, the others keep
+        // their place on it (a chip on its socket)
+        const std::vector<glm::vec3> holes = footprintHoles( fp );
+        const double thickness = board->GetDesignSettings().GetBoardThickness() / pcbIUScale.IU_PER_MM;
+        double       lowest = std::numeric_limits<double>::max();
+
         for( FP_3DMODEL& m : fp->Models() )
         {
-            if( m.m_Filename.Contains( wxS( "/.trimmed/" ) ) )
-                continue;   // cut copies follow their generic model (re-cut below)
+            if( !m.m_Show || m.m_Filename.Contains( wxS( "/.trimmed/" ) ) )
+                continue;
 
             const std::filesystem::path file = resolveModel( m, project );
             KOPENAPI_MODEL_GEOMETRY     g;
-            KopenapiRunOffMain( [&]() { g = KopenapiModelGeometry( file, modelMatrix( m ) ); } );
+            KopenapiRunOffMain( [&]() { g = KopenapiModelGeometry( file, modelMatrix( m ), true, holes, thickness ); } );
 
-            if( !g.ok )
-                continue;
+            if( g.ok )
+                lowest = std::min( lowest, g.hasSeat ? g.seat : ( isTht( fp ) && g.hasLeads ) ? g.bodyBottom : g.min[2] );
+        }
 
-            const double rest = ( isTht( fp ) && g.hasLeads ) ? g.bodyBottom : g.min[2];
-            const double dz = target - rest;
+        const double dz = lowest == std::numeric_limits<double>::max() ? 0.0 : target - lowest;
 
-            if( std::abs( dz ) < 0.005 )
-                continue;
+        for( FP_3DMODEL& m : fp->Models() )
+        {
+            if( std::abs( dz ) < 0.005 || m.m_Filename.Contains( wxS( "/.trimmed/" ) ) )
+                continue;   // cut copies follow their generic model (re-cut below)
 
             if( !modified )
                 commit.Modify( fp );
