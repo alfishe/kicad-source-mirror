@@ -9,6 +9,8 @@
 /// a placement matrix inside the outline, ratsnest cost).
 #include "kopenapi_pcb.h"
 
+#include <kicadopenapi_registry.h>
+
 #include <api/pcb_context.h>
 #include <kicadopenapi_keepalive.h>
 #include <autorouter/ar_autoplacer.h>
@@ -1012,8 +1014,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         int              ownNets = 0;   // of them, nets with few pads (not the rails)
     };
 
-    std::vector<MEMBER> members;
-    nlohmann::json      unplaced = nlohmann::json::array();
+    std::vector<MEMBER>     members;
+    std::vector<FOOTPRINT*> indirect;   // no net in common with the anchor: placed at a member they share one with
+    nlohmann::json          unplaced = nlohmann::json::array();
 
     for( FOOTPRINT* part : aParts )
     {
@@ -1028,17 +1031,18 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             }
         }
 
-        if( member.nets.empty() )
-        {
-            unplaced.push_back( { { "ref", str( part->GetReference() ) },
-                                  { "reason", "shares no net with " + str( aAnchor->GetReference() ) } } );
-            continue;
-        }
-
         std::stable_sort( member.nets.begin(), member.nets.end(), [&]( int a, int b ) { return netPads[a] < netPads[b]; } );
 
         for( int net : member.nets )
             member.ownNets += netPads[net] <= 4 ? 1 : 0;
+
+        // one rail in common is no bond with the anchor (everything shares ground): such a part
+        // belongs to a member, if to anything; two nets in common is a part across the anchor's pins
+        if( member.ownNets == 0 && member.nets.size() < 2 )
+        {
+            indirect.push_back( part );
+            continue;
+        }
 
         members.push_back( member );
     }
@@ -1057,8 +1061,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
                           return a.area > b.area;
                       } );
 
-    std::set<PAD*> taken;
-    nlohmann::json placed = nlohmann::json::array();
+    std::set<PAD*>          taken;
+    nlohmann::json          placed = nlohmann::json::array();
+    std::vector<FOOTPRINT*> done;
 
     for( const MEMBER& member : members )
     {
@@ -1106,6 +1111,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         member.part->SetAttributes( member.part->GetAttributes() & ~FP_JUST_ADDED );
         aMoved.push_back( member.part->m_Uuid );
+        done.push_back( member.part );
 
         nlohmann::json row = nearJson( placement, target );
         row["ref"] = str( member.part->GetReference() );
@@ -1114,6 +1120,85 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         row["rotation_deg"] = member.part->GetOrientation().AsDegrees();
         row["side"] = member.part->IsFlipped() ? "bottom" : "top";
         placed.push_back( row );
+    }
+
+    // parts bound to a member, not to the anchor (the second capacitor of a filter, a LED behind its
+    // resistor): next to the member's pad on their common net (not a rail), until none is left
+    bool progress = true;
+
+    while( progress && !indirect.empty() )
+    {
+        progress = false;
+
+        for( auto it = indirect.begin(); it != indirect.end(); )
+        {
+            FOOTPRINT* part = *it;
+            PAD*       target = nullptr;
+
+            for( FOOTPRINT* host : done )
+            {
+                for( PAD* hostPad : host->Pads() )
+                {
+                    if( hostPad->GetNetCode() <= 0 || netPads[hostPad->GetNetCode()] > 4 )
+                        continue;
+
+                    for( PAD* pad : part->Pads() )
+                    {
+                        if( pad->GetNetCode() == hostPad->GetNetCode()
+                            && ( !target || netPads[hostPad->GetNetCode()] < netPads[target->GetNetCode()] ) )
+                        {
+                            target = hostPad;
+                        }
+                    }
+                }
+            }
+
+            if( !target )
+            {
+                ++it;
+                continue;
+            }
+
+            aCommit.Modify( part );
+
+            if( ( aAnchor->IsFlipped() != part->IsFlipped() ) != aOpposite )
+                part->Flip( part->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );
+
+            NEAR_OPTIONS options = aOptions;
+            options.partPad.clear();
+
+            const NEAR_PLACEMENT placement = placeNear( aBoard, part, target, options );
+
+            if( placement.ok )
+            {
+                part->SetAttributes( part->GetAttributes() & ~FP_JUST_ADDED );
+                aMoved.push_back( part->m_Uuid );
+                done.push_back( part );
+
+                nlohmann::json row = nearJson( placement, target );
+                row["ref"] = str( part->GetReference() );
+                row["x_mm"] = toMm( part->GetPosition().x );
+                row["y_mm"] = toMm( part->GetPosition().y );
+                row["rotation_deg"] = part->GetOrientation().AsDegrees();
+                row["side"] = part->IsFlipped() ? "bottom" : "top";
+                row["via"] = str( target->GetParentFootprint()->GetReference() );
+                placed.push_back( row );
+            }
+            else
+            {
+                unplaced.push_back( { { "ref", str( part->GetReference() ) }, { "reason", placement.reason } } );
+            }
+
+            it = indirect.erase( it );
+            progress = true;
+        }
+    }
+
+    for( FOOTPRINT* part : indirect )
+    {
+        unplaced.push_back( { { "ref", str( part->GetReference() ) },
+                              { "reason", "shares no net with " + str( aAnchor->GetReference() )
+                                                  + " or a placed part of the block (rails aside)" } } );
     }
 
     aOut["anchor"] = str( aAnchor->GetReference() );
@@ -1125,13 +1210,48 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 /// @brief The parts of a group request: named ones, or (none named) every unlocked part with a pad on a
 /// small net of the anchor (at most max_net_pads pads on the board: a crystal and its capacitors,
 /// pull-ups, a feedback divider - not everything on the rails)
-std::optional<KOPENAPI_RESULT> groupParts( BOARD* aBoard, const nlohmann::json& aGroup, FOOTPRINT*& aAnchor,
-                                           std::vector<FOOTPRINT*>& aParts, bool aOverrideLocks )
+std::optional<KOPENAPI_RESULT> groupParts( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, const nlohmann::json& aGroup,
+                                           FOOTPRINT*& aAnchor, std::vector<FOOTPRINT*>& aParts, bool aOverrideLocks )
 {
     aAnchor = aGroup.is_object() ? findFootprint( aBoard, aGroup.value( "anchor", std::string() ) ) : nullptr;
 
     if( !aAnchor )
         return KOPENAPI_RESULT::Error( 404, "anchor: the reference of the block's main part" );
+
+    if( aGroup.value( "from_schematic", false ) && !aGroup.contains( "parts" ) )
+    {
+        std::optional<KOPENAPI_METHOD> subcircuit = KOPENAPI_REGISTRY::Get().Find( "sch_subcircuit" );
+
+        if( !subcircuit )
+            return KOPENAPI_RESULT::Error( 503, "from_schematic: the schematic editor module is not loaded" );
+
+        nlohmann::json query = { { "ref", str( aAnchor->GetReference() ) } };
+
+        if( aGroup.contains( "depth" ) )
+            query["depth"] = aGroup["depth"];
+
+        KOPENAPI_RESULT block = subcircuit->handler( aCtx, query );
+
+        if( block.status != 200 )
+        {
+            return KOPENAPI_RESULT::Error( block.status == 409 ? 409 : 422,
+                                           "from_schematic: sch_subcircuit failed for " + str( aAnchor->GetReference() ) + " ("
+                                                   + block.body.dump().substr( 0, 200 ) + "); open the schematic (sch_open) or name the parts" );
+        }
+
+        for( const nlohmann::json& part : block.body.value( "parts", nlohmann::json::array() ) )
+        {
+            if( part.value( "kind", std::string() ) != "member" )
+                continue;
+
+            FOOTPRINT* fp = findFootprint( aBoard, part.value( "ref", std::string() ) );
+
+            if( fp && fp != aAnchor && ( !fp->IsLocked() || aOverrideLocks ) && !isConnector( fp ) )
+                aParts.push_back( fp );
+        }
+
+        return std::nullopt;
+    }
 
     if( aGroup.contains( "parts" ) )
     {
@@ -1229,6 +1349,32 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         if( fp->IsLocked() && !aArgs.value( "override_locks", false ) )
             return KOPENAPI_RESULT::Error( 409, str( fp->GetReference() ) + " is locked (override_locks: true)" );
 
+        if( m.contains( "with" ) )
+        {
+            if( !m["with"].is_array() )
+                return KOPENAPI_RESULT::Error( 400, "with: references of the parts that keep their place relative to this one" );
+
+            for( const nlohmann::json& ref : m["with"] )
+            {
+                FOOTPRINT* carried = ref.is_string() ? findFootprint( board, ref.get<std::string>() ) : nullptr;
+
+                if( !carried || carried == fp )
+                    return KOPENAPI_RESULT::Error( 404, "with: no such footprint (or the moved one itself): " + ref.dump() );
+
+                if( carried->IsLocked() && !aArgs.value( "override_locks", false ) )
+                    return KOPENAPI_RESULT::Error( 409, str( carried->GetReference() ) + " is locked (override_locks: true)" );
+
+                for( const nlohmann::json& other : aArgs["moves"] )
+                {
+                    if( other.is_object() && other.value( "ref", std::string() ) == ref.get<std::string>() )
+                        return KOPENAPI_RESULT::Error( 400, ref.get<std::string>() + " is carried (with) and moved on its own: one of the two" );
+                }
+            }
+
+            if( m.contains( "side" ) && ( m["side"] == "bottom" ) != fp->IsFlipped() )
+                return KOPENAPI_RESULT::Error( 400, "with: not together with a change of side (move the parts, then place the block again)" );
+        }
+
         nlohmann::json move = m;
 
         if( m.contains( "near" ) )
@@ -1295,9 +1441,44 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
                                                                          "rotation; place it with rotation_deg" );
     };
 
+    // parts carried with a moved one: the same turn about its origin and the same shift
+    std::map<FOOTPRINT*, nlohmann::json> carriedWith;
+
+    auto carry = [&]( FOOTPRINT* aFp, const nlohmann::json& aMove, const VECTOR2I& aFrom, const EDA_ANGLE& aAngleBefore )
+    {
+        if( !aMove.contains( "with" ) )
+            return;
+
+        const EDA_ANGLE turn = aFp->GetOrientation() - aAngleBefore;
+        const VECTOR2I  shift = aFp->GetPosition() - aFrom;
+        nlohmann::json  rows = nlohmann::json::array();
+
+        for( const nlohmann::json& ref : aMove["with"] )
+        {
+            FOOTPRINT* carried = findFootprint( board, ref.get<std::string>() );
+
+            commit.Modify( carried );
+
+            if( !turn.IsZero() )
+                carried->Rotate( aFrom, turn );
+
+            carried->Move( shift );
+            carried->SetAttributes( carried->GetAttributes() & ~FP_JUST_ADDED );
+            moved.push_back( carried->m_Uuid );
+            rows.push_back( { { "ref", str( carried->GetReference() ) }, { "x_mm", toMm( carried->GetPosition().x ) },
+                              { "y_mm", toMm( carried->GetPosition().y ) },
+                              { "rotation_deg", carried->GetOrientation().AsDegrees() } } );
+        }
+
+        carriedWith[aFp] = rows;
+    };
+
     for( auto& [fp, m] : plan )
     {
         commit.Modify( fp );
+
+        const VECTOR2I  posBefore = fp->GetPosition();
+        const EDA_ANGLE angleBefore = fp->GetOrientation();
 
         if( m.contains( "side" ) && ( m["side"] == "bottom" ) != fp->IsFlipped() )
             fp->Flip( fp->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );   // as the editor flips a part
@@ -1338,6 +1519,7 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
             nearPlaced[fp] = nearJson( placement, target );
             fp->SetAttributes( fp->GetAttributes() & ~FP_JUST_ADDED );
             moved.push_back( fp->m_Uuid );
+            carry( fp, m, posBefore, angleBefore );
             continue;
         }
 
@@ -1365,6 +1547,7 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         fp->SetPosition( pos );
         fp->SetAttributes( fp->GetAttributes() & ~FP_JUST_ADDED );   // placed now: connectivity counts it
         moved.push_back( fp->m_Uuid );
+        carry( fp, m, posBefore, angleBefore );
     }
 
     commit.Push( _( "Move footprints (API)" ) );
@@ -1379,7 +1562,12 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         std::set<const FOOTPRINT*> movedFps;
 
         for( auto& [fp, m] : plan )
+        {
             movedFps.insert( fp );
+
+            for( const nlohmann::json& ref : m.value( "with", nlohmann::json::array() ) )
+                movedFps.insert( findFootprint( board, ref.get<std::string>() ) );
+        }
 
         report = placementReport( board, &movedFps );
     }
@@ -1401,6 +1589,9 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
 
         if( nearPlaced.count( fp ) )
             row["near"] = nearPlaced[fp];
+
+        if( carriedWith.count( fp ) )
+            row["with"] = carriedWith[fp];
 
         if( m.contains( "facing" ) )
         {
@@ -1621,7 +1812,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         std::vector<FOOTPRINT*> parts;
         NEAR_OPTIONS            options;
 
-        if( groupParts( board, group, anchor, parts, false ) || nearOptions( group, options ) )
+        if( groupParts( aCtx, board, group, anchor, parts, false ) || nearOptions( group, options ) )
         {
             notes.push_back( "group skipped (anchor / parts not found or locked): " + group.dump() );
             continue;
@@ -1661,7 +1852,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
     std::vector<FOOTPRINT*> parts;
     NEAR_OPTIONS            options;
 
-    if( std::optional<KOPENAPI_RESULT> error = groupParts( board, aArgs, anchor, parts, aArgs.value( "override_locks", false ) ) )
+    if( std::optional<KOPENAPI_RESULT> error = groupParts( aCtx, board, aArgs, anchor, parts, aArgs.value( "override_locks", false ) ) )
         return *error;
 
     if( std::optional<std::string> wrong = nearOptions( aArgs, options ) )
@@ -1673,8 +1864,8 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
         return KOPENAPI_RESULT::Error( 400, "side: same (as the anchor) or opposite (under it, on the other side of the board)" );
 
     if( parts.empty() )
-        return KOPENAPI_RESULT::Error( 422, "no parts: none named and none on a small net of " + str( anchor->GetReference() )
-                                                    + " (name them: parts)" );
+        return KOPENAPI_RESULT::Error( 422, "no parts: none named, none found in the schematic block and none on a small net of "
+                                                    + str( anchor->GetReference() ) + " (name them: parts)" );
 
     BOARD_COMMIT      commit( context->GetToolManager() );
     std::vector<KIID> moved;
@@ -1718,12 +1909,16 @@ KOPENAPI_REGISTER( "pcb_place_group",
                    "decoupling capacitors - each at its own supply pin (a part between two nets of the "
                    "anchor takes a free supply pad with the nearest ground pad). parts: the references "
                    "(e.g. from sch_subcircuit); without it, every unlocked part (connectors aside) on a small "
-                   "net of the anchor (max_net_pads). side opposite: on the other side of the board, under the pads. "
+                   "net of the anchor (max_net_pads); from_schematic: the members of the anchor's block in the "
+                   "open schematic. A part bound to a member rather than to the anchor goes next to that "
+                   "member. side opposite: on the other side of the board, under the pads. "
                    "One undo step; answers per part the target pad, pad distance, position, and the "
                    "placement check",
                    R"json({"type":"object","required":["anchor"],"properties":{
                         "anchor":{"type":"string","description":"reference of the main part; it does not move"},
                         "parts":{"type":"array","items":{"type":"string"}},
+                        "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
+                        "depth":{"type":"integer","description":"from_schematic: how far sch_subcircuit grows (default 2)"},
                         "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
                         "side":{"type":"string","enum":["same","opposite"],"default":"same"},
                         "gap_mm":{"type":"number","default":0.25,"description":"between courtyards"},
@@ -1738,12 +1933,14 @@ KOPENAPI_REGISTER( "pcb_footprint_move",
                    "rotation_deg or facing (connectors: mating side towards left / right / up / down), side "
                    "top / bottom; or near: \"U1.7\" - next to that pad of another part, as close as the "
                    "courtyards allow, turned so the part's pad on that net faces it (no coordinates to "
-                   "compute; a whole block: pcb_place_group); locked ones need override_locks; answers where they are now and the "
+                   "compute; a whole block: pcb_place_group); with: parts that move and turn together with it (a "
+                   "placed block as one); locked ones need override_locks; answers where they are now and the "
                    "placement check of the moved footprints (overlaps, outside the board, airwire length; report: "
                    "full for the whole board)",
                    R"json({"type":"object","required":["moves"],"properties":{
                         "moves":{"type":"array","items":{"type":"object","required":["ref"],"properties":{
                             "ref":{"type":"string"},"x_mm":{"type":"number"},"y_mm":{"type":"number"},
+                            "with":{"type":"array","items":{"type":"string"},"description":"references that keep their place relative to this footprint: they turn about its origin and shift with it (a placed block moves as one)"},
                             "near":{"type":"string","description":"REF.PAD of another part: place this one next to that pad (instead of x_mm / y_mm); with side bottom / top it may sit under the pad on the other side"},
                             "near_pad":{"type":"string","description":"near: the pad of this part to bring to the target (default: its pad on the target's net)"},
                             "near_direction":{"type":"string","enum":["auto","left","right","up","down"],"default":"auto","description":"near: which way from the target pad (on the board); auto tries all four, the side the pad is on first"},
