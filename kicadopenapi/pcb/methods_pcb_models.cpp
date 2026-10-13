@@ -6,6 +6,9 @@
 #include "kopenapi_model_warmup.h"
 
 #include <3d_math.h>
+#include <3d_rendering/lead_clip.h>
+#include <pcb_field.h>
+#include <wx/filename.h>
 #include <board_design_settings.h>
 #include <common.h>
 #include <kicadopenapi_keepalive.h>
@@ -164,6 +167,55 @@ bool isTht( const FOOTPRINT* aFp )
 double r2( double v )
 {
     return std::round( v * 100 ) / 100;
+}
+
+
+/// @brief How a part mounts (proposal 2026-10-13-mounting-metadata): from the model's
+/// <model>.meta.json `mount.seat`, else by footprint / model name
+/// shoulder: rests on lead shoulders (DIP / SIP chips), body gap = package A1;
+/// free: height set at assembly (TO-92, radial LEDs, HC-49 crystals); body: on the body / stand-offs
+std::string seatClass( const FOOTPRINT* aFp, const FP_3DMODEL& aModel, const MODEL_MOUNT_META& aMeta, bool aTht,
+                       std::string& aFrom )
+{
+    if( aMeta.found && !aMeta.seat.empty() )
+    {
+        aFrom = "meta";
+        return aMeta.seat;
+    }
+
+    aFrom = "name";
+
+    if( !aTht )
+        return "body";
+
+    const wxString name = ( aFp->GetFPID().GetLibItemName().wx_str() + wxS( " " )
+                            + wxFileName( aModel.m_Filename ).GetName() ).Upper();
+
+    if( name.Contains( wxS( "SOCKET" ) ) )
+        return "body";
+
+    if( name.Contains( wxS( "DIP" ) ) || name.StartsWith( wxS( "SIP" ) ) || name.Contains( wxS( " SIP" ) ) )
+        return "shoulder";
+
+    for( const wxString& free : { wxS( "TO-92" ), wxS( "TO92" ), wxS( "TO-18" ), wxS( "LED_D" ), wxS( "LED_THT" ),
+                                  wxS( "HC-49" ), wxS( "HC49" ) } )
+    {
+        if( name.Contains( free ) )
+            return "free";
+    }
+
+    return "body";
+}
+
+
+std::optional<double> fieldMm( const FOOTPRINT* aFp, const wxString& aName )
+{
+    double value = 0.0;
+
+    if( const PCB_FIELD* field = aFp->GetField( aName ); field && field->GetText().ToCDouble( &value ) )
+        return value;
+
+    return std::nullopt;
 }
 
 } // namespace
@@ -465,17 +517,63 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                     if( measured != file )
                         row["seat"]["measured_on"] = "generic model (this is a cut copy)";
 
-                    if( gap > tolerance )
+                    const MODEL_MOUNT_META meta = ReadModelMountMeta( wxString::FromUTF8( file.string() ) );
+                    std::string            from;
+                    const std::string      cls = seatClass( fp, m, meta, tht, from );
+                    auto mmText = []( double v ) { return std::to_string( r2( v ) ).substr( 0, 4 ); };
+
+                    row["seat"]["class"] = cls;
+                    row["seat"]["class_from"] = from;
+
+                    if( gap < -tolerance )
+                    {
+                        issues.push_back( "sunk " + mmText( -gap ) + " mm into the board (pcb_model_seat)" );
+                    }
+                    else if( cls == "shoulder" )
+                    {
+                        // JEDEC MS-001 / MS-010 / MS-011: A1 >= 0.38 mm, no upper limit; 1.0 when unknown
+                        const auto a1 = meta.a1_mm.value_or( std::make_pair( 0.38, 1.0 ) );
+                        row["seat"]["expected_gap_mm"] = { a1.first, a1.second };
+
+                        if( gap < a1.first - tolerance )
+                        {
+                            seated = true;
+                            issues.push_back( "body " + mmText( gap ) + " mm over the board, below the package A1 "
+                                              + mmText( a1.first ) + " mm (model)" );
+                        }
+                        else if( gap > a1.second + 0.5 )
+                        {
+                            floating.push_back( issues.size() );
+                            issues.push_back( "floating " + mmText( gap ) + " mm above the board, A1 at most "
+                                              + mmText( a1.second ) + " mm (pcb_model_seat)" );
+                        }
+                        else
+                        {
+                            seated = true;
+                        }
+                    }
+                    else if( cls == "free" )
+                    {
+                        seated = true;
+
+                        if( std::optional<double> height = fieldMm( fp, wxS( "mount_height_mm" ) ) )
+                        {
+                            row["seat"]["expected_gap_mm"] = *height;
+
+                            if( std::abs( gap - *height ) > std::max( tolerance, 0.25 ) )
+                                issues.push_back( "stands " + mmText( gap ) + " mm over the board, mount_height_mm "
+                                                  + mmText( *height ) + " (pcb_model_seat)" );
+                        }
+                    }
+                    else if( gap > tolerance )
                     {
                         floating.push_back( issues.size() );
-                        issues.push_back( "floating " + std::to_string( r2( gap ) ).substr( 0, 4 ) + " mm above the board (pcb_model_seat)" );
+                        issues.push_back( "floating " + mmText( gap ) + " mm above the board (pcb_model_seat)" );
                     }
-                    else if( gap >= -tolerance )
+                    else
                     {
                         seated = true;
                     }
-                    else if( gap < -tolerance )
-                        issues.push_back( "sunk " + std::to_string( r2( -gap ) ).substr( 0, 4 ) + " mm into the board (pcb_model_seat)" );
                 }
             }
 
@@ -616,7 +714,10 @@ KOPENAPI_REGISTER( "pcb_models_inspect",
                    "exists), shown, trimmed, offset / rotation / scale, bounding box on the board (mm, z "
                    "up from the top surface), height, seating (THT: body bottom; SMD: lowest point) with "
                    "the gap to the board and lead length below it; problems: missing file, no model, "
-                   "floating, sunk. Geometry by OpenCascade, cached",
+                   "floating, sunk. Seating class per model (<model>.meta.json mount.seat, else by name): "
+                   "shoulder (DIP / SIP chips: gap = package A1, JEDEC >= 0.38 mm), free (TO-92, LEDs, "
+                   "HC-49: any height, footprint field mount_height_mm checks it), body (gap 0). Geometry "
+                   "by OpenCascade, cached",
                    R"json({"type":"object","properties":{
                         "refs":{"type":"array","items":{"type":"string"}},
                         "lib_id":{"type":"string"},
