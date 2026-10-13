@@ -61,6 +61,23 @@ namespace S3D
 
     void FREE_SMESH( SMESH& aMesh) noexcept;
     void FREE_S3DMODEL( S3DMODEL& aModel );
+
+    /**
+     * While alive, nodes named on this thread are indexed by name, so the references of a cache
+     * file being read resolve without searching the whole graph for each (quadratic in nodes).
+     */
+    class READ_INDEX_SCOPE
+    {
+    public:
+        READ_INDEX_SCOPE();
+        ~READ_INDEX_SCOPE();
+    };
+
+    /**
+     * Node referenced by name while reading a cache file: from the read index when one is active
+     * and the name is unique, else aFrom->FindNode( aName, aFrom ).
+     */
+    SGNODE* FindReadNode( SGNODE* aFrom, const char* aName );
 }
 
 

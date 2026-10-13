@@ -179,6 +179,15 @@ bool triangulateTiled( const SHAPE_POLY_SET& aPolyList, std::vector<TRIANGLE_PTS
     std::vector<std::vector<TRIANGLE_PTS>> parts( (size_t) n * n );
     std::vector<char>                      ok( parts.size(), 0 );
 
+    // each tile clips only the contours whose box reaches into it (not the whole board each time)
+    std::vector<std::vector<BOX2I>> boxes( aPolyList.OutlineCount() );
+
+    for( int i = 0; i < aPolyList.OutlineCount(); ++i )
+    {
+        for( const SHAPE_LINE_CHAIN& chain : aPolyList.CPolygon( i ) )
+            boxes[i].push_back( chain.BBox() );
+    }
+
     auto tile = [&]( int aIndex )
     {
         const int     tx = aIndex % n, ty = aIndex / n;
@@ -192,8 +201,28 @@ bool triangulateTiled( const SHAPE_POLY_SET& aPolyList, std::vector<TRIANGLE_PTS
         rect.Append( (int) x1, (int) y1 );
         rect.Append( (int) x0, (int) y1 );
 
+        const BOX2I    tileBox( VECTOR2I( (int) x0, (int) y0 ), VECTOR2I( (int) ( x1 - x0 ), (int) ( y1 - y0 ) ) );
+        SHAPE_POLY_SET near;
+
+        for( int i = 0; i < aPolyList.OutlineCount(); ++i )
+        {
+            if( !boxes[i][0].Intersects( tileBox ) )
+                continue;
+
+            const SHAPE_POLY_SET::POLYGON& poly = aPolyList.CPolygon( i );
+            SHAPE_POLY_SET::POLYGON        kept{ poly[0] };
+
+            for( size_t h = 1; h < poly.size(); ++h )
+            {
+                if( boxes[i][h].Intersects( tileBox ) )
+                    kept.push_back( poly[h] );
+            }
+
+            near.AddPolygon( kept );
+        }
+
         SHAPE_POLY_SET piece;
-        piece.BooleanIntersection( aPolyList, rect );
+        piece.BooleanIntersection( near, rect );
         ok[aIndex] = appendTriangulation( piece, parts[aIndex] );
     };
 

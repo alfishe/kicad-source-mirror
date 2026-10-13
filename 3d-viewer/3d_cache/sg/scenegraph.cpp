@@ -543,7 +543,7 @@ bool SCENEGRAPH::ReadCache( std::istream& aFile, SGNODE* parentNode )
             return false;
         }
 
-        SGNODE* sp = FindNode( name.c_str(), this );
+        SGNODE* sp = S3D::FindReadNode( this, name.c_str() );
 
         if( !sp )
         {
@@ -608,7 +608,7 @@ bool SCENEGRAPH::ReadCache( std::istream& aFile, SGNODE* parentNode )
             return false;
         }
 
-        SGNODE* sp = FindNode( name.c_str(), this );
+        SGNODE* sp = S3D::FindReadNode( this, name.c_str() );
 
         if( !sp )
         {

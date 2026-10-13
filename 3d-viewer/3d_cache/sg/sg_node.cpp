@@ -18,6 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <unordered_map>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -148,12 +149,54 @@ const char* SGNODE::GetName( void )
 }
 
 
+namespace
+{
+// name -> node of the cache file being read on this thread; nullptr marks a repeated name
+thread_local std::unordered_map<std::string, SGNODE*>* t_readIndex = nullptr;
+} // namespace
+
+
+S3D::READ_INDEX_SCOPE::READ_INDEX_SCOPE()
+{
+    t_readIndex = new std::unordered_map<std::string, SGNODE*>();
+}
+
+
+S3D::READ_INDEX_SCOPE::~READ_INDEX_SCOPE()
+{
+    delete t_readIndex;
+    t_readIndex = nullptr;
+}
+
+
+SGNODE* S3D::FindReadNode( SGNODE* aFrom, const char* aName )
+{
+    if( t_readIndex && aName )
+    {
+        auto it = t_readIndex->find( aName );
+
+        if( it != t_readIndex->end() && it->second )
+            return it->second;
+    }
+
+    return aFrom->FindNode( aName, aFrom );
+}
+
+
 void SGNODE::SetName( const char* aName )
 {
     if( nullptr == aName || 0 == aName[0] )
         getNodeName( m_SGtype, m_Name );
     else
         m_Name = aName;
+
+    if( t_readIndex )
+    {
+        auto [it, added] = t_readIndex->emplace( m_Name, this );
+
+        if( !added && it->second != this )
+            it->second = nullptr;
+    }
 }
 
 

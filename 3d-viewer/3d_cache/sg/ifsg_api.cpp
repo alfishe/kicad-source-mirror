@@ -342,7 +342,12 @@ SGNODE* S3D::ReadCache( const char* aFileName, void* aPluginMgr,
 
     } while( 0 );
 
-    bool rval = np->ReadCache( file, nullptr );
+    bool rval = false;
+
+    {
+        S3D::READ_INDEX_SCOPE index;
+        rval = np->ReadCache( file, nullptr );
+    }
     CLOSE_STREAM( file );
 
     if( !rval )

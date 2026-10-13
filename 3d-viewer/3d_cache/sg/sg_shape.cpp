@@ -500,7 +500,7 @@ bool SGSHAPE::ReadCache( std::istream& aFile, SGNODE* parentNode )
             return false;
         }
 
-        SGNODE* np = FindNode( name.c_str(), this );
+        SGNODE* np = S3D::FindReadNode( this, name.c_str() );
 
         if( !np )
         {
@@ -563,7 +563,7 @@ bool SGSHAPE::ReadCache( std::istream& aFile, SGNODE* parentNode )
             return false;
         }
 
-        SGNODE* np = FindNode( name.c_str(), this );
+        SGNODE* np = S3D::FindReadNode( this, name.c_str() );
 
         if( !np )
         {
