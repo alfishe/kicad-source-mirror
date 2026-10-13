@@ -33,6 +33,7 @@
 #include <kicad_gl/gl_context_mgr.h>
 #include <3d_math.h>
 #include <glm/geometric.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <lset.h>
 #include <pgm_base.h>
 #include <math/util.h>      // for KiROUND
@@ -596,7 +597,8 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
 
     // Set projection and modelview matrixes
     glMatrixMode( GL_PROJECTION );
-    glLoadMatrixf( glm::value_ptr( m_camera.GetProjectionMatrix() ) );
+
+    glLoadMatrixf( glm::value_ptr( projectionMatrix() ) );
     glMatrixMode( GL_MODELVIEW );
     glLoadIdentity();
     glLoadMatrixf( glm::value_ptr( m_camera.GetViewMatrix() ) );
@@ -1084,6 +1086,82 @@ void RENDER_3D_OPENGL::freeAllLists()
     DELETE_AND_FREE_MAP( m_extrudedBodyLists )
     DELETE_AND_FREE_MAP( m_extrudedPadLists )
     DELETE_AND_FREE_MAP( m_extrudedPegLists )
+}
+
+
+void RENDER_3D_OPENGL::updateSceneBounds()
+{
+    BBOX_3D bounds( m_boardAdapter.GetBBox() );
+
+    if( const BOARD* board = m_boardAdapter.GetBoard() )
+    {
+        // every footprint, whatever the footprint filters show: a superset never clips
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            const glm::mat4 fpMatrix = m_boardAdapter.GetFootprintMatrix( *fp );
+
+            for( const FP_3DMODEL& sM : fp->Models() )
+            {
+                auto it = m_3dModelMap.find( sM.m_Filename );
+
+                if( !sM.m_Show || sM.m_Filename.empty() || it == m_3dModelMap.end() || !it->second )
+                    continue;
+
+                std::shared_ptr<MODEL_3D> model;
+
+                try
+                {
+                    model = it->second->MakeOrGet();
+                }
+                catch( const std::runtime_error& )
+                {
+                }
+
+                if( !model || !model->GetBBox().IsInitialized() )
+                    continue;
+
+                const glm::mat4 mtx = fpMatrix
+                                      * CalcModelMatrix( SFVEC3F( sM.m_Offset.x, sM.m_Offset.y, sM.m_Offset.z ),
+                                                         SFVEC3F( sM.m_Rotation.x, sM.m_Rotation.y, sM.m_Rotation.z ),
+                                                         SFVEC3F( sM.m_Scale.x, sM.m_Scale.y, sM.m_Scale.z ) );
+                const SFVEC3F& lo = model->GetBBox().Min();
+                const SFVEC3F& hi = model->GetBBox().Max();
+
+                for( int corner = 0; corner < 8; corner++ )
+                {
+                    const SFVEC3F p( corner & 1 ? hi.x : lo.x, corner & 2 ? hi.y : lo.y, corner & 4 ? hi.z : lo.z );
+                    bounds.Union( SFVEC3F( mtx * glm::vec4( p, 1.0f ) ) );
+                }
+            }
+        }
+    }
+
+    m_sceneBounds = bounds;
+    m_sceneBoundsValid = true;
+}
+
+
+glm::mat4 RENDER_3D_OPENGL::projectionMatrix()
+{
+    // With the camera's fixed 0.1 near plane a 24 bit depth buffer resolves only several
+    // micrometres at the default distance: surface details such as laser marks a few um over a
+    // package top fight with the surface beneath. Planes around the scene resolve far finer.
+    if( m_camera.GetProjection() != PROJECTION_TYPE::PERSPECTIVE || m_sceneLoading )
+        return m_camera.GetProjectionMatrix();
+
+    if( !m_sceneBoundsValid )
+        updateSceneBounds();
+
+    if( !m_sceneBounds.IsInitialized() )
+        return m_camera.GetProjectionMatrix();
+
+    const CAMERA_FRUSTUM& frustum = m_camera.GetFrustum();
+    const float radius = glm::length( m_sceneBounds.Max() - m_sceneBounds.Min() ) * 0.5f;
+    const float dist = glm::length( m_camera.GetPos() - m_sceneBounds.GetCenter() );
+    const float nearD = std::max( frustum.nearD, ( dist - radius ) * 0.5f );
+    const float farD = std::max( nearD * 2.0f, dist + radius * 1.1f );
+
+    return glm::perspective( glm::radians( frustum.angle ), frustum.ratio, nearD, farD );
 }
 
 

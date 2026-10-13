@@ -185,6 +185,12 @@ private:
      */
     void load3dModels( std::stop_token aStop = std::stop_token() );
 
+    /// Bounds of the board and every footprint model in 3D units (render thread, after a reload).
+    void updateSceneBounds();
+
+    /// The camera's projection with near / far planes fitted to the scene (perspective).
+    glm::mat4 projectionMatrix();
+
     void createPlaceholderModel();
     struct MODELTORENDER
     {
@@ -369,6 +375,8 @@ private:
     /// The models do not depend on board layers: a reload with the same material mode and model
     /// cache keeps them (a layer toggle would otherwise rebuild and upload every model again)
     bool                 m_keepModelsOnReload = false;
+    BBOX_3D              m_sceneBounds;
+    std::atomic<bool>    m_sceneBoundsValid{ false };
     std::bitset<LAYER_3D_END> m_builtLayerFlags;   ///< see LayerBuiltVisible()
     MATERIAL_MODE        m_modelsMaterialMode = MATERIAL_MODE::NORMAL;
     const S3D_CACHE*     m_modelsCache = nullptr;

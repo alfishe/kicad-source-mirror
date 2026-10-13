@@ -822,6 +822,8 @@ void RENDER_3D_OPENGL::reload()
     // Ensure previous reload worker is finished before freeing/rebuilding render data.
     StopBgWorker();
 
+    m_sceneBoundsValid = false;
+
     m_keepModelsOnReload = m_boardAdapter.m_Cfg->m_Render.material_mode == m_modelsMaterialMode
                            && m_boardAdapter.Get3dCacheManager() == m_modelsCache;
 
@@ -1914,6 +1916,7 @@ void RENDER_3D_OPENGL::Load3dModelsIfNeeded()
         return;
 
     load3dModels();
+    m_sceneBoundsValid = false;
 }
 
 
