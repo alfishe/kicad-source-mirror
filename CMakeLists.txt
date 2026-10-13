@@ -1223,3 +1223,38 @@ if( APPLE )
 
     add_subdirectory( signing )
 endif()
+
+# Dev bundle (build dir): signed once, after every binary target.  Signing from a POST_BUILD step of
+# the kicad target ran while modules were still being linked into the bundle: the build failed at
+# random, or a module was signed from its previous contents and written back over the new one.
+if( APPLE )
+    function( kicad_collect_binary_targets aDir aOut )
+        get_property( targets DIRECTORY "${aDir}" PROPERTY BUILDSYSTEM_TARGETS )
+        get_property( subdirs DIRECTORY "${aDir}" PROPERTY SUBDIRECTORIES )
+        set( found )
+
+        foreach( target IN LISTS targets )
+            get_target_property( type ${target} TYPE )
+            get_target_property( excluded ${target} EXCLUDE_FROM_ALL )
+
+            if( type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$" AND NOT excluded )
+                list( APPEND found ${target} )
+            endif()
+        endforeach()
+
+        foreach( subdir IN LISTS subdirs )
+            kicad_collect_binary_targets( "${subdir}" nested )
+            list( APPEND found ${nested} )
+        endforeach()
+
+        set( ${aOut} ${found} PARENT_SCOPE )
+    endfunction()
+
+    kicad_collect_binary_targets( "${CMAKE_SOURCE_DIR}" KICAD_BINARY_TARGETS )
+
+    add_custom_target( kicad_dev_bundle_sign ALL
+        COMMAND codesign --force --deep --sign - "$<TARGET_BUNDLE_DIR:kicad>"
+        COMMENT "Signing the build-dir KiCad.app"
+        VERBATIM )
+    add_dependencies( kicad_dev_bundle_sign ${KICAD_BINARY_TARGETS} )
+endif()
