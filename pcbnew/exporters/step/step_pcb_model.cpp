@@ -139,6 +139,13 @@
 #include <GC_MakeCircle.hxx>
 
 #include <RWGltf_CafWriter.hxx>
+#include <RWGltf_GltfMaterialMap.hxx>
+#include <StepData_StepModel.hxx>
+#include <StepVisual_ColourRgb.hxx>
+#include <TDF_ChildIterator.hxx>
+#include <TDF_LabelMap.hxx>
+#include <XCAFPrs_Style.hxx>
+#include <XSControl_WorkSession.hxx>
 #include <StlAPI_Writer.hxx>
 
 #include "glb_utils.h"
@@ -3625,6 +3632,7 @@ bool STEP_PCB_MODEL::getModelLabel( const wxString& aBaseName, const wxString& a
 
     MODEL3D_FORMAT_TYPE modelFmt = fileType( fileNameUTF8.c_str() );
     TCollection_ExtendedString partname( aBaseName.utf8_str() );
+    std::vector<STEP_NAMED_COLOUR> colourNames;
 
     switch( modelFmt )
     {
@@ -3639,7 +3647,8 @@ bool STEP_PCB_MODEL::getModelLabel( const wxString& aBaseName, const wxString& a
         break;
 
     case FMT_STEP:
-        if( !readSTEP( doc, fileNameUTF8.c_str() ) )
+        if( !readSTEP( doc, fileNameUTF8.c_str(),
+                       m_outFmt == OUTPUT_FORMAT::FMT_OUT_GLTF ? &colourNames : nullptr ) )
         {
             m_reporter->Report( wxString::Format( wxT( "readSTEP() failed on filename '%s'." ), aFileName ),
                                 RPT_SEVERITY_ERROR );
@@ -3862,6 +3871,9 @@ bool STEP_PCB_MODEL::getModelLabel( const wxString& aBaseName, const wxString& a
         return false;
     }
 
+    if( m_outFmt == OUTPUT_FORMAT::FMT_OUT_GLTF )
+        assignModelMaterials( aLabel, colourNames );
+
     // attach the PART NAME ( base filename: note that in principle
     // different models may have the same base filename )
     TDataStd_Name::Set( aLabel, partname );
@@ -3986,7 +3998,8 @@ bool STEP_PCB_MODEL::readIGES( Handle( TDocStd_Document )& doc, const char* fnam
 }
 
 
-bool STEP_PCB_MODEL::readSTEP( Handle( TDocStd_Document )& doc, const char* fname )
+bool STEP_PCB_MODEL::readSTEP( Handle( TDocStd_Document )& doc, const char* fname,
+                               std::vector<STEP_NAMED_COLOUR>* aColourNames )
 {
     STEPCAFControl_Reader reader;
     IFSelect_ReturnStatus stat  = reader.ReadFile( fname );
@@ -4024,7 +4037,107 @@ bool STEP_PCB_MODEL::readSTEP( Handle( TDocStd_Document )& doc, const char* fnam
         return false;
     }
 
+    if( aColourNames )
+    {
+        Handle( StepData_StepModel ) model = reader.Reader().StepModel();
+
+        for( Standard_Integer i = 1; !model.IsNull() && i <= model->NbEntities(); i++ )
+        {
+            Handle( StepVisual_ColourRgb ) rgb = Handle( StepVisual_ColourRgb )::DownCast( model->Value( i ) );
+
+            if( rgb.IsNull() || rgb->Name().IsNull() || rgb->Name()->Length() == 0 )
+                continue;
+
+            // decoded as the STEP reader does (sRGB values)
+            Quantity_Color col( std::min( rgb->Red(), 1.0 ), std::min( rgb->Green(), 1.0 ),
+                                std::min( rgb->Blue(), 1.0 ), Quantity_TOC_sRGB );
+
+            aColourNames->push_back( { col.Red(), col.Green(), col.Blue(), rgb->Name()->ToCString() } );
+        }
+    }
+
     return true;
+}
+
+
+void STEP_PCB_MODEL::assignModelMaterials( const TDF_Label& aRoot, const std::vector<STEP_NAMED_COLOUR>& aNames )
+{
+    Handle( XCAFDoc_ShapeTool )       shapeTool = XCAFDoc_DocumentTool::ShapeTool( m_doc->Main() );
+    Handle( XCAFDoc_ColorTool )       colorTool = XCAFDoc_DocumentTool::ColorTool( m_doc->Main() );
+    Handle( XCAFDoc_VisMaterialTool ) visMatTool = XCAFDoc_DocumentTool::VisMaterialTool( m_doc->Main() );
+
+    // every coloured shape gets its own material: a face without one would inherit its solid's
+    auto materialFor =
+            [&]( const Quantity_Color& aColour ) -> TDF_Label
+            {
+                std::string             name;
+                std::optional<STEP_PBR> pbr;
+
+                for( const STEP_NAMED_COLOUR& named : aNames )
+                {
+                    if( std::abs( named.red - aColour.Red() ) < 1e-4 && std::abs( named.green - aColour.Green() ) < 1e-4
+                        && std::abs( named.blue - aColour.Blue() ) < 1e-4 )
+                    {
+                        name = named.name;
+
+                        if( ( pbr = PbrFromColourName( named.name ) ) )
+                            break;
+                    }
+                }
+
+                if( !pbr && ( pbr = PbrFromColour( aColour.Red(), aColour.Green(), aColour.Blue() ) ) && name.empty() )
+                    name = pbr->guess;
+
+                if( !pbr )
+                    pbr = STEP_PBR();
+
+                if( name.empty() )
+                    name = "dielectric";
+
+                const std::string key = name + '|' + std::to_string( pbr->metallic ) + '|'
+                                        + std::to_string( pbr->roughness ) + '|' + std::to_string( pbr->alpha );
+
+                if( auto it = m_modelMaterials.find( key ); it != m_modelMaterials.end() )
+                    return it->second;
+
+                Handle( XCAFDoc_VisMaterial ) vismat = new XCAFDoc_VisMaterial;
+                XCAFDoc_VisMaterialPBR        pbrMat;
+                pbrMat.BaseColor = Quantity_ColorRGBA( aColour, (float) pbr->alpha );
+                pbrMat.Metallic = (float) pbr->metallic;
+                pbrMat.Roughness = (float) pbr->roughness;
+                vismat->SetPbrMaterial( pbrMat );
+
+                TDF_Label label = visMatTool->AddMaterial( vismat, TCollection_AsciiString( name.c_str() ) );
+                m_modelMaterials[key] = label;
+                return label;
+            };
+
+    TDF_LabelMap                          seen;
+    std::function<void( const TDF_Label& )> visit =
+            [&]( const TDF_Label& aLabel )
+            {
+                if( !seen.Add( aLabel ) )
+                    return;
+
+                Quantity_Color colour;
+
+                if( !visMatTool->IsSetShapeMaterial( aLabel )
+                    && ( colorTool->GetColor( aLabel, XCAFDoc_ColorSurf, colour )
+                         || colorTool->GetColor( aLabel, XCAFDoc_ColorGen, colour ) ) )
+                {
+                    visMatTool->SetShapeMaterial( aLabel, materialFor( colour ) );
+                }
+
+                TDF_Label referred;
+
+                if( shapeTool->GetReferredShape( aLabel, referred ) )
+                    visit( referred );
+
+                for( TDF_ChildIterator it( aLabel ); it.More(); it.Next() )
+                    visit( it.Value() );
+            };
+
+    visit( aRoot );
 }
 
 
@@ -4107,6 +4220,50 @@ bool STEP_PCB_MODEL::performMeshing( Handle( XCAFDoc_ShapeTool ) & aShapeTool )
 }
 
 
+namespace
+{
+
+/// glTF materials named after the document's materials ("copper", "tin_bright"), not "mat_<n>"
+class NAMED_GLTF_MATERIAL_MAP : public RWGltf_GltfMaterialMap
+{
+public:
+    using RWGltf_GltfMaterialMap::RWGltf_GltfMaterialMap;
+
+    void DefineMaterial( const XCAFPrs_Style& aStyle, const TCollection_AsciiString& aKey,
+                         const TCollection_AsciiString& aName ) override
+    {
+        Handle( TDataStd_Name ) name;
+
+        if( !aStyle.Material().IsNull() && !aStyle.Material()->Label().IsNull()
+            && aStyle.Material()->Label().FindAttribute( TDataStd_Name::GetID(), name ) )
+        {
+            RWGltf_GltfMaterialMap::DefineMaterial( aStyle, aKey, TCollection_AsciiString( name->Get() ) );
+            return;
+        }
+
+        RWGltf_GltfMaterialMap::DefineMaterial( aStyle, aKey, aName );
+    }
+};
+
+
+class NAMED_MATERIALS_GLTF_WRITER : public RWGltf_CafWriter
+{
+public:
+    using RWGltf_CafWriter::RWGltf_CafWriter;
+
+protected:
+    bool writeBinData( const Handle( TDocStd_Document ) & aDocument, const TDF_LabelSequence& aRoots,
+                       const TColStd_MapOfAsciiString* aLabelFilter, const Message_ProgressRange& aProgress ) override
+    {
+        myMaterialMap = new NAMED_GLTF_MATERIAL_MAP( myFile, 0 );
+        myMaterialMap->SetDefaultStyle( myDefaultStyle );
+        return RWGltf_CafWriter::writeBinData( aDocument, aRoots, aLabelFilter, aProgress );
+    }
+};
+
+} // namespace
+
+
 bool STEP_PCB_MODEL::WriteGLTF( const wxString& aFileName )
 {
     /*if( !isBoardOutlineValid() )
@@ -4124,9 +4281,20 @@ bool STEP_PCB_MODEL::WriteGLTF( const wxString& aFileName )
     wxFileName fn( aFileName );
 
     const char* tmpGltfname = "$tempfile$.glb";
-    RWGltf_CafWriter cafWriter( tmpGltfname, true );
+    NAMED_MATERIALS_GLTF_WRITER cafWriter( tmpGltfname, true );
 
     cafWriter.SetTransformationFormat( RWGltf_WriterTrsfFormat_Compact );
+
+    // shapes with only a colour: dielectric (the glTF default for an absent factor is bare metal)
+    Handle( XCAFDoc_VisMaterial ) defaultMat = new XCAFDoc_VisMaterial;
+    XCAFDoc_VisMaterialPBR        defaultPbr;
+    defaultPbr.Metallic = 0.0f;
+    defaultPbr.Roughness = 0.55f;
+    defaultMat->SetPbrMaterial( defaultPbr );
+
+    XCAFPrs_Style defaultStyle;
+    defaultStyle.SetMaterial( defaultMat );
+    cafWriter.SetDefaultStyle( defaultStyle );
     cafWriter.ChangeCoordinateSystemConverter().SetInputLengthUnit( 0.001 );
     cafWriter.ChangeCoordinateSystemConverter().SetInputCoordinateSystem(
             RWMesh_CoordinateSystem_Zup );

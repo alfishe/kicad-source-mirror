@@ -37,6 +37,8 @@
 #include <board_stackup_manager/board_stackup.h>
 #include <reporter.h>
 
+#include "step_materials.h"
+
 /**
  * Default distance between points to treat them as separate ones (mm)
  * 0.001 mm or less is a reasonable value. A too large value creates issues by
@@ -359,7 +361,8 @@ private:
                            const VECTOR3D& aOrientation, TopLoc_Location& aLocation );
 
     bool readIGES( Handle( TDocStd_Document ) & aDoc, const char* aFname );
-    bool readSTEP( Handle( TDocStd_Document ) & aDoc, const char* aFname );
+    bool readSTEP( Handle( TDocStd_Document ) & aDoc, const char* aFname,
+                   std::vector<STEP_NAMED_COLOUR>* aColourNames = nullptr );
     bool readVRML( Handle( TDocStd_Document ) & aDoc, const char* aFname );
 
     bool performMeshing( Handle( XCAFDoc_ShapeTool ) & aShapeTool );
@@ -368,6 +371,10 @@ private:
                              const VECTOR3D& aScale );
 
     bool CompressSTEP( wxString& inputFile, wxString& outputFile );
+
+    /// Physically based materials for the coloured shapes of a model (mesh exports): by the
+    /// STEP colour name, else guessed from the colour, else dielectric (named after the colour).
+    void assignModelMaterials( const TDF_Label& aRoot, const std::vector<STEP_NAMED_COLOUR>& aNames );
 
     Handle( XCAFApp_Application )   m_app;
     Handle( TDocStd_Document )      m_doc;
@@ -379,6 +386,7 @@ private:
     bool                            m_extraPadThickness; // add extra thickness to pads
     std::vector<TDF_Label>          m_pcb_labels;       // labels for the PCB model (one by main outline)
     MODEL_MAP                       m_models;           // map of file names to model labels
+    std::map<std::string, TDF_Label> m_modelMaterials;  // model materials by appearance key
     int                             m_components;       // number of successfully loaded components;
     double                          m_precision;        // model (length unit) numeric precision
     double                          m_angleprec;        // angle numeric precision

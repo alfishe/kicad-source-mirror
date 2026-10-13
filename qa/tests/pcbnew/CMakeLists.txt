@@ -54,6 +54,7 @@ set( QA_PCBNEW_SRCS
     test_convert_tool.cpp
     test_generator_load_save.cpp
     test_glb_utils.cpp
+    test_step_materials.cpp
     test_graphics_load_save.cpp
     test_graphic_extend.cpp
     test_graphic_trim.cpp
