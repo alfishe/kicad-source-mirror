@@ -19,7 +19,10 @@
  */
 
 
+#include <algorithm>
 #include <cstdarg>
+#include <cstdint>
+#include <limits>
 #include <config.h> // HAVE_FGETC_NOLOCK
 
 #include <kiplatform/io.h>
@@ -128,8 +131,9 @@ void LINE_READER::expandCapacity( unsigned aNewsize )
 {
     // m_length can equal maxLineLength and nothing breaks, there's room for
     // the terminating nul. cannot go over this.
-    if( aNewsize > m_maxLineLength+1 )
-        aNewsize = m_maxLineLength+1;
+    // computed wide: a limit of UINT_MAX (no limit) must not wrap to 0
+    if( uint64_t( aNewsize ) > uint64_t( m_maxLineLength ) + 1 )
+        aNewsize = m_maxLineLength + 1;
 
     if( aNewsize > m_capacity )
     {
@@ -226,8 +230,11 @@ char* FILE_LINE_READER::readBlockLine()
         if( size_t( m_length ) + take > m_maxLineLength )
             THROW_IO_ERROR( _( "Maximum line length exceeded" ) );
 
-        while( size_t( m_length ) + take > m_capacity )
-            expandCapacity( m_capacity * 2 );
+        if( size_t( m_length ) + take + 1 > m_capacity )
+        {
+            const uint64_t want = std::max<uint64_t>( uint64_t( m_capacity ) * 2, uint64_t( m_length ) + take + 1 );
+            expandCapacity( unsigned( std::min<uint64_t>( want, std::numeric_limits<unsigned>::max() ) ) );
+        }
 
         memcpy( m_line + m_length, begin, take );
         m_length += take;

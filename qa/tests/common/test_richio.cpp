@@ -30,6 +30,10 @@
 #define wxUSE_BASE64 1
 #include <wx/base64.h>
 #include <wx/mstream.h>
+#include <wx/filename.h>
+#include <wx/wxcrt.h>
+
+#include <limits>
 
 
 BOOST_AUTO_TEST_SUITE( RichIO )
@@ -138,6 +142,41 @@ BOOST_AUTO_TEST_CASE( NestedPrintIndentsItsOutput )
 
     BOOST_CHECK_EQUAL( fmt.GetString(), "      (net 42)" );
     BOOST_CHECK_EQUAL( written, 14 );
+}
+
+
+/**
+ * A reader without a line limit (UINT_MAX) reads a line longer than the default limit; with a small
+ * limit the line is refused with an error.  The limit + 1 used to wrap to 0 and the buffer was
+ * not grown before the copy.
+ */
+BOOST_AUTO_TEST_CASE( LongLineWithoutLimit )
+{
+    const wxString    path = wxFileName::CreateTempFileName( wxS( "kicad_richio" ) );
+    const std::string line( 20 * 1024 * 1024, 'x' );
+
+    {
+        FILE* fp = wxFopen( path, wxS( "wb" ) );
+        BOOST_REQUIRE( fp );
+        fwrite( line.data(), 1, line.size(), fp );
+        fputs( "\nend\n", fp );
+        fclose( fp );
+    }
+
+    {
+        FILE_LINE_READER reader( path, 0, std::numeric_limits<unsigned>::max() );
+        BOOST_REQUIRE( reader.ReadLine() );
+        BOOST_CHECK_EQUAL( reader.Length(), line.size() + 1 );
+        BOOST_REQUIRE( reader.ReadLine() );
+        BOOST_CHECK_EQUAL( std::string( reader.Line() ), "end\n" );
+    }
+
+    {
+        FILE_LINE_READER reader( path, 0, 1024 );
+        BOOST_CHECK_THROW( reader.ReadLine(), IO_ERROR );
+    }
+
+    wxRemoveFile( path );
 }
 
 
