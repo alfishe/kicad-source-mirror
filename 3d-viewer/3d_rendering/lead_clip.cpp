@@ -23,6 +23,7 @@
 
 #include "lead_clip.h"
 
+#include <limits>
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -75,8 +76,13 @@ MODEL_MOUNT_META ReadModelMountMeta( const wxString& aModelPath )
                 meta.below_board = m.value( "below_board", false );
                 meta.formed = m.value( "formed", "" );
 
-                if( m.contains( "a1_mm" ) && m["a1_mm"].is_array() && m["a1_mm"].size() == 2 )
-                    meta.a1_mm = std::make_pair( m["a1_mm"][0].get<double>(), m["a1_mm"][1].get<double>() );
+                // [min, max]; max null: no upper limit
+                if( m.contains( "a1_mm" ) && m["a1_mm"].is_array() && m["a1_mm"].size() == 2 && m["a1_mm"][0].is_number() )
+                {
+                    meta.a1_mm = std::make_pair( m["a1_mm"][0].get<double>(),
+                                                 m["a1_mm"][1].is_number() ? m["a1_mm"][1].get<double>()
+                                                                           : std::numeric_limits<double>::infinity() );
+                }
 
                 if( m.contains( "seat_z_mm" ) && m["seat_z_mm"].is_number() )
                     meta.seat_z_mm = m["seat_z_mm"].get<double>();

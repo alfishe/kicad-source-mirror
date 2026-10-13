@@ -624,15 +624,39 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                     row["seat"]["class"] = cls;
                     row["seat"]["class_from"] = from;
 
-                    if( gap < -tolerance )
+                    if( meta.below_board )
+                        row["seat"]["below_board"] = true;
+
+                    if( !meta.socket_ref.empty() )
+                        row["seat"]["socket_ref"] = meta.socket_ref;
+
+                    if( !meta.formed.empty() )
+                        row["seat"]["formed"] = meta.formed;
+
+                    if( gap < -tolerance && !meta.below_board )
                     {
                         issues.push_back( "sunk " + mmText( -gap ) + " mm into the board (pcb_model_seat)" );
                     }
+                    else if( gap < -tolerance || cls == "socket" )
+                    {
+                        // below the board by design (an edge connector's flange), or held by its socket
+                        seated = true;
+                    }
                     else if( cls == "shoulder" )
                     {
-                        // JEDEC MS-001 / MS-010 / MS-011: A1 >= 0.38 mm, no upper limit; 1.0 when unknown
-                        const auto a1 = meta.a1_mm.value_or( std::make_pair( 0.38, 1.0 ) );
-                        row["seat"]["expected_gap_mm"] = { a1.first, a1.second };
+                        // By name (a DIP): JEDEC MS-001 / MS-010 / MS-011, A1 >= 0.38 mm; 1.0 at most when
+                        // unknown.  From the model's metadata: the limits it gives, none when it gives
+                        // none (a part resting on its shoulders with the body on the board)
+                        const auto a1 = meta.a1_mm ? *meta.a1_mm
+                                        : from == "name" ? std::make_pair( 0.38, 1.0 )
+                                                         : std::make_pair( 0.0, std::numeric_limits<double>::infinity() );
+
+                        if( meta.a1_mm || from == "name" )
+                        {
+                            row["seat"]["expected_gap_mm"] = { nlohmann::json( a1.first ),
+                                                               std::isfinite( a1.second ) ? nlohmann::json( a1.second )
+                                                                                          : nlohmann::json() };
+                        }
 
                         // a role-named model says where its body is: the shoulders rest on the board,
                         // the body stands off by A1
@@ -825,9 +849,11 @@ KOPENAPI_REGISTER( "pcb_models_inspect",
                    "exists), shown, trimmed, offset / rotation / scale, bounding box on the board (mm, z "
                    "up from the top surface), height, seating (THT: body bottom; SMD: lowest point) with "
                    "the gap to the board and lead length below it; problems: missing file, no model, "
-                   "floating, sunk. Seating class per model (<model>.meta.json mount.seat, else by name): "
+                   "floating, sunk. Seating class per model (<model>.meta.json mount: seat, a1_mm [min, max | "
+                   "null], below_board, socket_ref, formed; else by name): "
                    "shoulder (DIP / SIP chips: gap = package A1, JEDEC >= 0.38 mm), free (TO-92, LEDs, "
-                   "HC-49, upright TO-220 / TO-247 ...: any height, footprint field mount_height_mm checks it), body (gap 0). A model "
+                   "HC-49, upright TO-220 / TO-247 ...: any height, footprint field mount_height_mm checks it), body (gap 0), "
+                   "socket (held by the socket under it); below_board: geometry under the board top is by design. A model "
                    "whose STEP solids are named by role is measured on the solid named 'body' "
                    "(seat.body_gap_mm); seat.lowest_at_mm is where the lowest point is; a part reaching "
                    "over the board edge (seat.over_board_edge) may hang below the top beyond it. Geometry "
