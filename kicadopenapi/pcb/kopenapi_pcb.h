@@ -9,6 +9,8 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <vector>
 #include <string>
 
 #include <math/box2.h>
@@ -60,6 +62,14 @@ class BOARD_ITEM;
 
 /// @brief A board item by uuid, a footprint by reference, a pad as REF.NUMBER; nullptr if none
 BOARD_ITEM* KopenapiFindBoardItem( BOARD* aBoard, const std::string& aRef );
+
+class PCB_TRACK;
+
+/// @brief The tracks / vias a request names: uuids, or the ones passing every filter given (net / nets,
+/// between two pads, region + region_mode, layer, kinds).  aNeedSelector: no filter at all is an
+/// error.  aError is set when the request is wrong; aMissing gets unknown uuids.
+std::vector<PCB_TRACK*> KopenapiSelectTracks( BOARD* aBoard, const nlohmann::json& aArgs, bool aNeedSelector,
+                                              nlohmann::json& aMissing, std::optional<KOPENAPI_RESULT>& aError );
 
 /// @brief The item's extent as a user sees it (a footprint without its texts)
 BOX2I KopenapiBoardItemBox( const BOARD_ITEM* aItem );

@@ -1604,6 +1604,13 @@ std::vector<PCB_TRACK*> selectTracks( BOARD* aBoard, const nlohmann::json& aArgs
 } // namespace
 
 
+std::vector<PCB_TRACK*> KopenapiSelectTracks( BOARD* aBoard, const nlohmann::json& aArgs, bool aNeedSelector,
+                                              nlohmann::json& aMissing, std::optional<KOPENAPI_RESULT>& aError )
+{
+    return selectTracks( aBoard, aArgs, aNeedSelector, aMissing, aError );
+}
+
+
 static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );

@@ -240,8 +240,9 @@ static KOPENAPI_RESULT h_pcb_silk_tidy( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     for( const nlohmann::json& r : aArgs.value( "refs", nlohmann::json::array() ) )
         refs.insert( r.get<std::string>() );
 
-    // largest parts first: they have the fewest good spots
+    // largest parts first: they have the fewest good spots; a locked footprint keeps its reference text
     std::vector<FOOTPRINT*> order;
+    int                     lockedKept = 0;
 
     for( FOOTPRINT* fp : board->Footprints() )
     {
@@ -250,7 +251,10 @@ static KOPENAPI_RESULT h_pcb_silk_tidy( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( ref.IsVisible() && ref.IsOnLayer( fp->IsFlipped() ? B_SilkS : F_SilkS )
             && ( refs.empty() || refs.count( str( fp->GetReference() ) ) ) )
         {
-            order.push_back( fp );
+            if( ( fp->IsLocked() || ref.IsLocked() ) && !aArgs.value( "override_locks", false ) )
+                lockedKept++;
+            else
+                order.push_back( fp );
         }
     }
 
@@ -416,7 +420,7 @@ static KOPENAPI_RESULT h_pcb_silk_tidy( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
-    return KOPENAPI_RESULT::Ok( { { "moved", moved }, { "unresolved", unresolved }, { "kept", kept },
+    return KOPENAPI_RESULT::Ok( { { "moved", moved }, { "unresolved", unresolved }, { "kept", kept }, { "locked_kept", lockedKept },
                                   { "dry_run", dryRun } } );
 }
 
@@ -888,6 +892,7 @@ KOPENAPI_REGISTER( "pcb_silk_tidy",
                         "gap_mm":{"type":"number","default":0.15},
                         "max_distance_mm":{"type":"number","default":4.0},
                         "dry_run":{"type":"boolean","default":false},
+                        "override_locks":{"type":"boolean","default":false,"description":"also move the reference texts of locked footprints (kept otherwise: locked_kept)"},
                         "explain":{"type":"boolean","default":false,"description":"answer the text box and what it hits (mm)"}}})json"_json,
                    false, h_pcb_silk_tidy, 120 );
 

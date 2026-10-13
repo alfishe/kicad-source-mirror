@@ -447,6 +447,7 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
                                    { "dnp", sym->GetDNP( &path ) },
                                    { "in_bom", !sym->GetExcludedFromBOM( &path ) },
                                    { "on_board", !sym->GetExcludedFromBoard( &path ) },
+                                   { "locked", sym->IsLocked() },
                                    { "uuid", str( sym->m_Uuid.AsString() ) } };
 
             if( !KopenapiGlob( refGlob, row["ref"] ) || !KopenapiGlob( valueGlob, row["value"] )

@@ -288,6 +288,7 @@ static nlohmann::json footprintRow( const FOOTPRINT* aFp )
              { "type", footprintType( aFp ) },
              { "pads", aFp->Pads().size() },
              { "dnp", aFp->IsDNP() },
+             { "locked", aFp->IsLocked() },
              { "uuid", str( aFp->m_Uuid.AsString() ) } };
 }
 
@@ -633,6 +634,7 @@ static KOPENAPI_RESULT h_pcb_netlist( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
                                 { "footprint", str( fp->GetFPIDAsString() ) },
                                 { "board_only", fp->IsBoardOnly() },
                                 { "dnp", fp->IsDNP() },
+                                { "locked", fp->IsLocked() },
                                 { "uuid", str( fp->m_Uuid.AsString() ) } } );
 
         for( PAD* pad : fp->Pads() )

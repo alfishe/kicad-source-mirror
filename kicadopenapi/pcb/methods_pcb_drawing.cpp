@@ -19,6 +19,7 @@
 #include <tool/tool_manager.h>
 
 #include <cmath>
+#include <optional>
 
 
 namespace
@@ -316,6 +317,29 @@ std::vector<BOARD_ITEM*> drawingsByUuid( BOARD* aBoard, const nlohmann::json& aU
     return out;
 }
 
+
+/// @brief 409 naming the locked ones among aItems, unless the request overrides locks
+std::optional<KOPENAPI_RESULT> lockedRefusal( const std::vector<BOARD_ITEM*>& aItems, const nlohmann::json& aArgs )
+{
+    if( aArgs.value( "override_locks", false ) )
+        return std::nullopt;
+
+    nlohmann::json locked = nlohmann::json::array();
+
+    for( BOARD_ITEM* item : aItems )
+    {
+        if( item->IsLocked() )
+            locked.push_back( str( item->m_Uuid.AsString() ) );
+    }
+
+    if( locked.empty() )
+        return std::nullopt;
+
+    KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 409, "locked items are in the request (pcb_unlock, or override_locks: true)" );
+    refused.body["locked"] = locked;
+    return refused;
+}
+
 } // namespace
 
 
@@ -341,6 +365,9 @@ static KOPENAPI_RESULT h_pcb_drawing_list( KOPENAPI_CONTEXT& aCtx, const nlohman
 
         nlohmann::json row = { { "uuid", str( item->m_Uuid.AsString() ) }, { "layer", layer },
                                { "bbox_mm", rectMm( item->GetBoundingBox() ) } };
+
+        if( item->IsLocked() )
+            row["locked"] = true;
 
         if( auto* t = dynamic_cast<PCB_TEXT*>( item ) )
         {
@@ -399,6 +426,9 @@ static KOPENAPI_RESULT h_pcb_item_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( items.empty() )
         return KOPENAPI_RESULT::Error( 404, "no board drawing with these uuids" );
 
+    if( std::optional<KOPENAPI_RESULT> refused = lockedRefusal( items, aArgs ) )
+        return *refused;
+
     BOARD_COMMIT commit( context->GetToolManager() );
 
     for( BOARD_ITEM* item : items )
@@ -435,6 +465,9 @@ static KOPENAPI_RESULT h_pcb_items_move( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( items.empty() )
         return KOPENAPI_RESULT::Error( 404, "no board drawing with these uuids" );
 
+    if( std::optional<KOPENAPI_RESULT> refused = lockedRefusal( items, aArgs ) )
+        return *refused;
+
     const VECTOR2I delta( toIU( aArgs.value( "dx_mm", 0.0 ) ), toIU( aArgs.value( "dy_mm", 0.0 ) ) );
     BOARD_COMMIT   commit( context->GetToolManager() );
     std::vector<KIID> ids;
@@ -467,6 +500,9 @@ static KOPENAPI_RESULT h_pcb_text_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     if( !t )
         return KOPENAPI_RESULT::Error( 404, "uuid: a board text (pcb_drawing_list kind text)" );
+
+    if( std::optional<KOPENAPI_RESULT> refused = lockedRefusal( found, aArgs ) )
+        return *refused;
 
     BOARD_COMMIT commit( context->GetToolManager() );
     commit.Modify( t );
@@ -524,9 +560,11 @@ KOPENAPI_REGISTER( "pcb_drawing_list",
                    false, h_pcb_drawing_list );
 
 KOPENAPI_REGISTER( "pcb_item_delete",
-                   "Delete board drawings (texts, shapes) by uuid (pcb_drawing_list); one undo step",
+                   "Delete board drawings (texts, shapes) by uuid (pcb_drawing_list); one undo step; locked "
+                   "ones refuse (409) unless override_locks",
                    R"json({"type":"object","required":["uuids"],"properties":{
-                        "uuids":{"type":"array","items":{"type":"string"}}}})json"_json,
+                        "uuids":{"type":"array","items":{"type":"string"}},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_item_delete );
 
 KOPENAPI_REGISTER( "pcb_items_move",
@@ -534,7 +572,8 @@ KOPENAPI_REGISTER( "pcb_items_move",
                    "one undo step; answers their box",
                    R"json({"type":"object","required":["uuids"],"properties":{
                         "uuids":{"type":"array","items":{"type":"string"}},
-                        "dx_mm":{"type":"number","default":0},"dy_mm":{"type":"number","default":0}}})json"_json,
+                        "dx_mm":{"type":"number","default":0},"dy_mm":{"type":"number","default":0},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_items_move );
 
 KOPENAPI_REGISTER( "pcb_text_update",
@@ -547,7 +586,8 @@ KOPENAPI_REGISTER( "pcb_text_update",
                         "x_mm":{"type":"number"},"y_mm":{"type":"number"},
                         "dx_mm":{"type":"number"},"dy_mm":{"type":"number"},
                         "size_mm":{"type":"number"},"width_mm":{"type":"number"},"thickness_mm":{"type":"number"},
-                        "angle_deg":{"type":"number"},"bold":{"type":"boolean"}}})json"_json,
+                        "angle_deg":{"type":"number"},"bold":{"type":"boolean"},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_text_update );
 
 

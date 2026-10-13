@@ -1358,6 +1358,9 @@ static KOPENAPI_RESULT h_sch_symbol_update( KOPENAPI_CONTEXT& aCtx, const nlohma
     if( !at )
         return KOPENAPI_RESULT::Error( status, error );
 
+    if( at->symbol->IsLocked() && !aArgs.value( "override_locks", false ) )
+        return KOPENAPI_RESULT::Error( 409, "the symbol is locked (sch_unlock, or override_locks: true)" );
+
     int orientation = -1;
 
     if( aArgs.contains( "rotation" ) || aArgs.contains( "mirror" ) )
@@ -1499,6 +1502,24 @@ static KOPENAPI_RESULT h_sch_items_move( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         return KOPENAPI_RESULT::Error( 404, "not on this sheet: " + missing.dump() );
     }
 
+    if( !aArgs.value( "override_locks", false ) )
+    {
+        nlohmann::json locked = nlohmann::json::array();
+
+        for( SCH_ITEM* item : anchors )
+        {
+            if( item->IsLocked() )
+                locked.push_back( str( item->m_Uuid.AsString() ) );
+        }
+
+        if( !locked.empty() )
+        {
+            KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 409, "locked items are in the request (sch_unlock, or override_locks: true)" );
+            refused.body["locked"] = locked;
+            return refused;
+        }
+    }
+
     SCH_COMMIT        commit( context->GetToolManager() );
     SHEET_DRAG        drag( commit, screen, *sheet );
     std::vector<KIID> touched;
@@ -1562,6 +1583,8 @@ static KOPENAPI_RESULT h_sch_item_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     SCH_COMMIT     commit( context->GetToolManager() );
     nlohmann::json deleted = nlohmann::json::array();
+    nlohmann::json lockedKept = nlohmann::json::array();
+    const bool     overrideLocks = aArgs.value( "override_locks", false );
     SCH_SCREENS    screens( context->GetSchematic()->Root() );
 
     for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
@@ -1576,10 +1599,24 @@ static KOPENAPI_RESULT h_sch_item_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
         for( SCH_ITEM* item : hits )
         {
-            deleted.push_back( str( item->m_Uuid.AsString() ) );
             wanted.erase( str( item->m_Uuid.AsString() ) );
+
+            if( item->IsLocked() && !overrideLocks )
+            {
+                lockedKept.push_back( str( item->m_Uuid.AsString() ) );
+                continue;
+            }
+
+            deleted.push_back( str( item->m_Uuid.AsString() ) );
             commit.Remove( item, screen );
         }
+    }
+
+    if( deleted.empty() && !lockedKept.empty() )
+    {
+        KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 409, "the items are locked (sch_unlock, or override_locks: true)" );
+        refused.body["locked"] = lockedKept;
+        return refused;
     }
 
     if( deleted.empty() )
@@ -1592,7 +1629,112 @@ static KOPENAPI_RESULT h_sch_item_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann
     for( const std::string& u : wanted )
         missing.push_back( u );
 
-    return KOPENAPI_RESULT::Ok( { { "deleted", deleted }, { "not_found", missing } } );
+    return KOPENAPI_RESULT::Ok( { { "deleted", deleted }, { "not_found", missing }, { "locked_kept", lockedKept } } );
+}
+
+
+/// @brief sch_lock / sch_unlock: the lock flag of symbols (every unit and instance of a reference) and of
+/// items by uuid on any sheet
+static KOPENAPI_RESULT schSetLocked( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, bool aLock )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    std::set<std::string> refs, uuids;
+
+    for( const nlohmann::json& r : aArgs.value( "refs", nlohmann::json::array() ) )
+    {
+        if( r.is_string() )
+            refs.insert( r.get<std::string>() );
+    }
+
+    for( const nlohmann::json& u : aArgs.value( "uuids", nlohmann::json::array() ) )
+    {
+        if( u.is_string() )
+            uuids.insert( u.get<std::string>() );
+    }
+
+    if( refs.empty() && uuids.empty() )
+        return KOPENAPI_RESULT::Error( 400, "say what: refs (symbols by reference, all their units) or uuids (sch_item_list, sch_symbol_list)" );
+
+    SCHEMATIC*            schematic = context->GetSchematic();
+    SCH_COMMIT            commit( context->GetToolManager() );
+    std::set<SCH_ITEM*>   seen;
+    std::set<std::string> foundRefs, foundUuids;
+    int                   changed = 0, already = 0;
+    std::vector<KIID>     touched;
+
+    for( const SCH_SHEET_PATH& path : schematic->Hierarchy() )
+    {
+        SCH_SCREEN* screen = path.LastScreen();
+
+        for( SCH_ITEM* item : screen->Items() )
+        {
+            bool wanted = uuids.count( str( item->m_Uuid.AsString() ) ) > 0;
+
+            if( wanted )
+                foundUuids.insert( str( item->m_Uuid.AsString() ) );
+
+            if( item->Type() == SCH_SYMBOL_T )
+            {
+                const std::string ref = str( static_cast<SCH_SYMBOL*>( item )->GetRef( &path, false ) );
+
+                if( refs.count( ref ) )
+                {
+                    wanted = true;
+                    foundRefs.insert( ref );
+                }
+            }
+
+            if( !wanted || !seen.insert( item ).second )
+                continue;
+
+            if( item->IsLocked() == aLock )
+            {
+                already++;
+                continue;
+            }
+
+            commit.Modify( item, screen );
+            item->SetLocked( aLock );
+            touched.push_back( item->m_Uuid );
+            changed++;
+        }
+    }
+
+    nlohmann::json missing = nlohmann::json::array();
+
+    for( const std::string& r : refs )
+    {
+        if( !foundRefs.count( r ) )
+            missing.push_back( r );
+    }
+
+    for( const std::string& u : uuids )
+    {
+        if( !foundUuids.count( u ) )
+            missing.push_back( u );
+    }
+
+    if( changed )
+        pushEdit( commit, schematic, aLock ? _( "Lock (API)" ) : _( "Unlock (API)" ), aCtx.kiway, touched );
+
+    return KOPENAPI_RESULT::Ok( { { aLock ? "locked" : "unlocked", changed }, { "already", already }, { "missing", missing },
+                                  { "applied", changed > 0 } } );
+}
+
+
+static KOPENAPI_RESULT h_sch_lock( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    return schSetLocked( aCtx, aArgs, true );
+}
+
+
+static KOPENAPI_RESULT h_sch_unlock( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    return schSetLocked( aCtx, aArgs, false );
 }
 
 
@@ -2339,6 +2481,9 @@ static KOPENAPI_RESULT h_sch_item_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 continue;
         }
 
+        if( item->IsLocked() )
+            row["locked"] = true;
+
         row["type"] = type;
         row["uuid"] = str( item->m_Uuid.AsString() );
         rows.push_back( std::move( row ) );
@@ -2648,7 +2793,8 @@ KOPENAPI_REGISTER( "sch_symbol_update",
                         "mirror":{"type":"string","enum":["none","x","y"]},
                         "dnp":{"type":"boolean"},"in_bom":{"type":"boolean"},"on_board":{"type":"boolean"},
                         "field_positions":{"type":"object","description":"per field name: {x_mm, y_mm}, \"hide\" or \"show\""},
-                        "autoplace_fields":{"type":"boolean","default":false,"description":"re-place reference / value text clear of other parts, texts and wires (done anyway after a move)"}}})json"_json,
+                        "autoplace_fields":{"type":"boolean","default":false,"description":"re-place reference / value text clear of other parts, texts and wires (done anyway after a move)"},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_symbol_update );
 
 KOPENAPI_REGISTER( "sch_items_move",
@@ -2659,13 +2805,15 @@ KOPENAPI_REGISTER( "sch_items_move",
                    R"json({"type":"object","required":["uuids"],"properties":{
                         "uuids":{"type":"array","items":{"type":"string"}},
                         "dx_mm":{"type":"number","default":0},"dy_mm":{"type":"number","default":0},
-                        "sheet":{"type":"string"}}})json"_json,
+                        "sheet":{"type":"string"},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_items_move );
 
 KOPENAPI_REGISTER( "sch_item_delete",
                    std::string( "Delete schematic items (symbols, labels, wires, no-connects...) by uuid." ) + EDIT_NOTE,
                    R"json({"type":"object","required":["uuids"],"properties":{
-                        "uuids":{"type":"array","items":{"type":"string"}}}})json"_json,
+                        "uuids":{"type":"array","items":{"type":"string"}},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_item_delete );
 
 KOPENAPI_REGISTER( "sch_connect",
@@ -2751,4 +2899,17 @@ KOPENAPI_REGISTER( "sch_annotate",
                    R"json({"type":"object","properties":{"reset":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_annotate );
 
-KOPENAPI_MARK_EDITING( "sch_symbol_add", "sch_symbol_update", "sch_items_move", "sch_item_delete", "sch_connect", "sch_wire", "sch_power_add", "sch_label_add", "sch_no_connect", "sch_annotate" );
+#define SCH_LOCK_SCHEMA R"json({"type":"object","properties":{
+                        "refs":{"type":"array","items":{"type":"string"},"description":"symbols by reference: every unit and sheet instance"},
+                        "uuids":{"type":"array","items":{"type":"string"},"description":"any items (symbols, wires, labels, junctions, sheets) on any sheet"}}})json"_json
+
+KOPENAPI_REGISTER( "sch_lock",
+                   "Lock schematic items (KiCad's lock flag, saved with the sheets): symbols by reference, any "
+                   "item by uuid. Locked items are not changed by sch_symbol_update, sch_items_move or "
+                   "sch_item_delete (409 naming them) unless override_locks; the editor does not select "
+                   "them for moving either. One undo step",
+                   SCH_LOCK_SCHEMA, false, h_sch_lock );
+
+KOPENAPI_REGISTER( "sch_unlock", "Unlock schematic items (refs, uuids); one undo step", SCH_LOCK_SCHEMA, false, h_sch_unlock );
+
+KOPENAPI_MARK_EDITING( "sch_symbol_add", "sch_symbol_update", "sch_items_move", "sch_item_delete", "sch_connect", "sch_wire", "sch_power_add", "sch_label_add", "sch_no_connect", "sch_annotate", "sch_lock", "sch_unlock" );
