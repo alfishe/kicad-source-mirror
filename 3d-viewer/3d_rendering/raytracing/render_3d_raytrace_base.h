@@ -132,7 +132,8 @@ protected:
     bool addExtrudedBodyToRaytracer( CONTAINER_3D& aDstContainer, const FOOTPRINT* aFootprint );
     void addModels( CONTAINER_3D& aDstContainer, const S3DMODEL* a3DModel,
                     const glm::mat4& aModelMatrix, float aFPOpacity,
-                    bool aSkipMaterialInformation, BOARD_ITEM* aBoardItem );
+                    bool aSkipMaterialInformation, BOARD_ITEM* aBoardItem,
+                    const struct LEAD_CLIP* aLeadClip = nullptr );
 
     MODEL_MATERIALS* getModelMaterial( const S3DMODEL* a3DModel );
 

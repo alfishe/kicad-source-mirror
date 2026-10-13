@@ -1165,6 +1165,31 @@ glm::mat4 RENDER_3D_OPENGL::projectionMatrix()
 }
 
 
+std::optional<LEAD_CLIP> RENDER_3D_OPENGL::leadClip( const FOOTPRINT* aFootprint, const wxString& aModelFile,
+                                                    const glm::mat4& aModelWorld )
+{
+    if( !m_boardAdapter.m_Cfg->m_Render.clip_tht_leads )
+        return std::nullopt;
+
+    const std::pair<const FOOTPRINT*, wxString> key( aFootprint, aModelFile );
+
+    if( auto it = m_leadClips.find( key ); it != m_leadClips.end() )
+        return it->second;
+
+    std::optional<LEAD_CLIP> clip;
+
+    {
+        std::lock_guard<std::recursive_mutex> lock( m_renderMutex );
+
+        if( auto it = m_modelMount.find( aModelFile ); it != m_modelMount.end() )
+            clip = ComputeLeadClip( m_boardAdapter, *aFootprint, aModelWorld, it->second.first, it->second.second ).m_clip;
+    }
+
+    m_leadClips[key] = clip;
+    return clip;
+}
+
+
 void RENDER_3D_OPENGL::releaseRetiredRenderPtrs()
 {
     std::vector<std::shared_ptr<void>> retired;
@@ -1336,7 +1361,8 @@ void RENDER_3D_OPENGL::get3dModelsFromFootprint( std::list<MODELTORENDER> &aDstR
                     aDstRenderList.emplace_back( modelworldMatrix, modelPtr,
                                                  aRenderTransparentOnly ? sM.m_Opacity : 1.0f,
                                                  aRenderTransparentOnly,
-                                                 aFootprint->IsSelected() || aIsSelected );
+                                                 aFootprint->IsSelected() || aIsSelected,
+                                                 leadClip( aFootprint, sM.m_Filename, modelworldMatrix ) );
                 }
             }
         }
@@ -1659,11 +1685,26 @@ void RENDER_3D_OPENGL::renderModel( const glm::mat4 &aCameraViewMatrix,
 
     const glm::mat4 modelviewMatrix = aCameraViewMatrix * aModelToRender.m_modelWorldMat;
 
+    if( aModelToRender.m_leadClip )
+    {
+        // the plane is given in world coordinates: set it under the view matrix alone
+        const LEAD_CLIP& clip = *aModelToRender.m_leadClip;
+        const GLdouble   plane[4] = { 0.0, 0.0, clip.m_keepAbove ? 1.0 : -1.0,
+                                      clip.m_keepAbove ? -clip.m_z : clip.m_z };
+
+        glLoadMatrixf( glm::value_ptr( aCameraViewMatrix ) );
+        glClipPlane( GL_CLIP_PLANE0, plane );
+        glEnable( GL_CLIP_PLANE0 );
+    }
+
     glLoadMatrixf( glm::value_ptr( modelviewMatrix ) );
 
     aModelToRender.m_model->Draw( aModelToRender.m_isTransparent, aModelToRender.m_opacity,
                                   aModelToRender.m_isSelected, aSelColor,
                                   &aModelToRender.m_modelWorldMat, aCameraWorldPos );
+
+    if( aModelToRender.m_leadClip )
+        glDisable( GL_CLIP_PLANE0 );
 
     if( cfg.show_model_bbox )
     {

@@ -276,6 +276,7 @@ EDA_3D_VIEWER_SETTINGS::EDA_3D_VIEWER_SETTINGS() :
                                             &m_Render.opengl_copper_thickness, false ) );
     m_params.emplace_back( new PARAM<bool>( "render.opengl_show_model_bbox",
                                             &m_Render.show_model_bbox, false ) );
+    m_params.emplace_back( new PARAM<bool>( "render.clip_tht_leads", &m_Render.clip_tht_leads, true ) );
     m_params.emplace_back( new PARAM<bool>( "render.opengl_show_off_board_silk",
                                             &m_Render.show_off_board_silk, false ) );
     m_params.emplace_back( new PARAM<bool>( "render.opengl_highlight_on_rollover",

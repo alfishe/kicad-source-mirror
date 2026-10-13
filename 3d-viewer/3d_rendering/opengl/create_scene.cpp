@@ -823,6 +823,7 @@ void RENDER_3D_OPENGL::reload()
     StopBgWorker();
 
     m_sceneBoundsValid = false;
+    m_leadClips.clear();
 
     m_keepModelsOnReload = m_boardAdapter.m_Cfg->m_Render.material_mode == m_modelsMaterialMode
                            && m_boardAdapter.Get3dCacheManager() == m_modelsCache;
@@ -1949,6 +1950,7 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
             retireRenderPtr( model );   // GL objects go on the main thread
 
         m_3dModelMap.clear();
+        m_modelMount.clear();
         m_modelsMaterialMode = materialMode;
         m_modelsCache = cacheMgr;
     }
@@ -2089,12 +2091,20 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
             embeddedFilesStack.push_back( footprint->GetEmbeddedFiles() );
             embeddedFilesStack.push_back( m_boardAdapter.GetBoard()->GetEmbeddedFiles() );
 
+            const wxString modelPath = cacheMgr->GetResolver()->ResolvePath( fp_model.m_Filename, basePath,
+                                                                             embeddedFilesStack );
             const S3DMODEL* modelPtr = cacheMgr->GetModel( fp_model.m_Filename, basePath,
                                                            std::move( embeddedFilesStack ) );
 
             // only add it if the return is not NULL
             if( modelPtr )
             {
+                {
+                    std::lock_guard lock( m_renderMutex );
+                    m_modelMount[fp_model.m_Filename] = { ModelSamplePoints( *modelPtr ),
+                                                          ReadModelMountMeta( modelPath ) };
+                }
+
                 auto model = std::make_shared<MODEL_3D_DEFERRED>( *modelPtr, materialMode );
                 assignRenderMap( m_3dModelMap, fp_model.m_Filename, model );
                 added = true;
@@ -2128,6 +2138,7 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
             }
 
             retireRenderPtr( it->second );
+            m_modelMount.erase( it->first );
             it = m_3dModelMap.erase( it );
         }
     }

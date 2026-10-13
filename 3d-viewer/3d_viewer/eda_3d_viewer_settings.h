@@ -95,6 +95,7 @@ public:
         bool opengl_render_bbox_only_OnMove;
         bool opengl_copper_thickness;
         bool show_model_bbox;
+        bool clip_tht_leads;             ///< cut through-hole leads to the standard protrusion
         bool show_off_board_silk;
         bool highlight_on_rollover;
         KIGFX::COLOR4D opengl_selection_color;

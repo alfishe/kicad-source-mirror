@@ -26,6 +26,7 @@
 #include "../render_3d_base.h"
 #include "layer_triangles.h"
 #include "3d_spheres_gizmo.h"
+#include "../lead_clip.h"
 
 #include "../raytracing/shapes2D/polygon_2d.h"
 #include "../raytracing/shapes2D/triangle_2d.h"
@@ -191,6 +192,10 @@ private:
     /// The camera's projection with near / far planes fitted to the scene (perspective).
     glm::mat4 projectionMatrix();
 
+    /// Lead clip of a footprint's model (cached until the next reload).
+    std::optional<LEAD_CLIP> leadClip( const FOOTPRINT* aFootprint, const wxString& aModelFile,
+                                       const glm::mat4& aModelWorld );
+
     void createPlaceholderModel();
     struct MODELTORENDER
     {
@@ -199,17 +204,20 @@ private:
         float m_opacity;
         bool m_isTransparent;
         bool m_isSelected;
+        std::optional<LEAD_CLIP> m_leadClip;
 
         MODELTORENDER( glm::mat4 aModelWorldMat,
                        std::shared_ptr<MODEL_3D> aModel,
                        float aOpacity,
                        bool aIsTransparent,
-                       bool aIsSelected ) :
+                       bool aIsSelected,
+                       std::optional<LEAD_CLIP> aLeadClip = std::nullopt ) :
                        m_modelWorldMat( std::move( aModelWorldMat ) ),
                        m_model( std::move( aModel ) ),
                        m_opacity( aOpacity ),
                        m_isTransparent( aIsTransparent ),
-                       m_isSelected( aIsSelected )
+                       m_isSelected( aIsSelected ),
+                       m_leadClip( aLeadClip )
         {
         }
     };
@@ -376,6 +384,12 @@ private:
     /// cache keeps them (a layer toggle would otherwise rebuild and upload every model again)
     bool                 m_keepModelsOnReload = false;
     BBOX_3D              m_sceneBounds;
+
+    /// Per model file: sample points and mount metadata, for the lead clip
+    std::map<wxString, std::pair<std::vector<SFVEC3F>, MODEL_MOUNT_META>> m_modelMount;
+
+    /// Lead clip per footprint model, computed on first draw after a reload
+    std::map<std::pair<const FOOTPRINT*, wxString>, std::optional<LEAD_CLIP>> m_leadClips;
     std::atomic<bool>    m_sceneBoundsValid{ false };
     std::bitset<LAYER_3D_END> m_builtLayerFlags;   ///< see LayerBuiltVisible()
     MATERIAL_MODE        m_modelsMaterialMode = MATERIAL_MODE::NORMAL;

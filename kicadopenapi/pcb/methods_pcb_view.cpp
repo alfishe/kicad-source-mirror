@@ -25,11 +25,20 @@
 #include <3d_canvas/board_adapter.h>
 #include <3d_rendering/raytracing/shapes3D/bbox_3d.h>
 #include <3d_rendering/render_3d_base.h>
+#include <3d_rendering/lead_clip.h>
+#include <3d_cache/3d_cache.h>
+#include <3d_math.h>
+#include <filename_resolver.h>
+#include <footprint_library_adapter.h>
+#include <project.h>
+#include <project_pcb.h>
+#include <plugins/3dapi/c3dmodel.h>
 #include <dialogs/appearance_controls_3D.h>
 #include <layer_ids.h>
 
 #include <chrono>
 #include <map>
+#include <set>
 #include <cmath>
 #include <thread>
 
@@ -515,6 +524,110 @@ static KOPENAPI_RESULT h_view3d_status( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 }
 
 
+static KOPENAPI_RESULT h_view3d_lead_clips( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    EDA_3D_VIEWER_FRAME* frame = viewer3d( aCtx, aArgs.value( "open", true ) );
+
+    if( !frame || !frame->GetCanvas() || !frame->GetAdapter().GetBoard() )
+        return KOPENAPI_RESULT::Error( 409, "no 3D viewer window open (open: true opens it from the board editor)" );
+
+    BOARD_ADAPTER& adapter = frame->GetAdapter();
+    S3D_CACHE*     cache = adapter.Get3dCacheManager();
+    const BOARD*   board = adapter.GetBoard();
+
+    if( !cache )
+        return KOPENAPI_RESULT::Error( 409, "no 3D model cache" );
+
+    const bool all = aArgs.value( "all", false );
+    std::set<wxString> refs;
+
+    if( aArgs.contains( "refs" ) )
+    {
+        for( const auto& r : aArgs["refs"] )
+            refs.insert( wxString::FromUTF8( r.get<std::string>() ) );
+    }
+
+    std::map<const S3DMODEL*, std::vector<SFVEC3F>> points;
+    nlohmann::json                                 out = nlohmann::json::array();
+    std::map<std::string, int>                     counts;
+
+    for( const FOOTPRINT* fp : board->Footprints() )
+    {
+        if( !refs.empty() && !refs.contains( fp->GetReference() ) )
+            continue;
+
+        wxString basePath;
+
+        if( board->GetProject() )
+        {
+            try
+            {
+                if( std::optional<LIBRARY_TABLE_ROW*> row =
+                            PROJECT_PCB::FootprintLibAdapter( board->GetProject() )->GetRow( fp->GetFPID().GetLibNickname() ) )
+                {
+                    basePath = LIBRARY_MANAGER::GetFullURI( *row, true );
+                }
+            }
+            catch( ... )
+            {
+            }
+        }
+
+        const glm::mat4 fpMatrix = adapter.GetFootprintMatrix( *fp );
+
+        for( const FP_3DMODEL& model : fp->Models() )
+        {
+            if( !model.m_Show || model.m_Filename.empty() )
+                continue;
+
+            std::vector<const EMBEDDED_FILES*> embedded{ fp->GetEmbeddedFiles(), board->GetEmbeddedFiles() };
+            const wxString  path = cache->GetResolver()->ResolvePath( model.m_Filename, basePath, embedded );
+            const S3DMODEL* s3d = cache->GetModel( model.m_Filename, basePath, std::move( embedded ) );
+
+            if( !s3d )
+                continue;
+
+            auto pts = points.find( s3d );
+
+            if( pts == points.end() )
+                pts = points.emplace( s3d, ModelSamplePoints( *s3d ) ).first;
+
+            const glm::mat4 world = fpMatrix
+                                    * CalcModelMatrix( SFVEC3F( model.m_Offset.x, model.m_Offset.y, model.m_Offset.z ),
+                                                       SFVEC3F( model.m_Rotation.x, model.m_Rotation.y, model.m_Rotation.z ),
+                                                       SFVEC3F( model.m_Scale.x, model.m_Scale.y, model.m_Scale.z ) );
+            const MODEL_MOUNT_META meta = ReadModelMountMeta( path );
+            const LEAD_CLIP_RESULT r = ComputeLeadClip( adapter, *fp, world, pts->second, meta );
+
+            static const char* const names[] = { "clipped", "within_limits", "below_board_by_design",
+                                                 "body_below_board", "pegs_below_board", "no_holes" };
+            const std::string status = names[(int) r.m_status];
+            counts[status]++;
+
+            if( !all && ( r.m_status == LEAD_CLIP_STATUS::NO_HOLES || r.m_status == LEAD_CLIP_STATUS::WITHIN_LIMITS ) )
+                continue;
+
+            nlohmann::json item = { { "ref", fp->GetReference().ToStdString() },
+                                    { "model", wxFileName( model.m_Filename ).GetFullName().ToStdString() },
+                                    { "status", status },
+                                    { "depth_mm", std::round( r.m_depthMm * 100.0 ) / 100.0 },
+                                    { "peg_depth_mm", std::round( r.m_pegDepthMm * 100.0 ) / 100.0 },
+                                    { "cut_to_mm", r.m_targetMm },
+                                    { "meta", meta.found } };
+
+            if( meta.found )
+                item["seat"] = meta.seat;
+
+            out.push_back( item );
+        }
+    }
+
+    return KOPENAPI_RESULT::Ok( { { "enabled", adapter.m_Cfg->m_Render.clip_tht_leads },
+                                  { "counts", counts },
+                                  { "models", out } } );
+}
+
+
 static KOPENAPI_RESULT h_view3d_camera( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     EDA_3D_VIEWER_FRAME* frame = viewer3d( aCtx, aArgs.value( "open", true ) );
@@ -995,6 +1108,17 @@ KOPENAPI_REGISTER( "view3d_status",
                    R"json({"type":"object","properties":{
                         "open":{"type":"boolean","default":false}}})json"_json,
                    true, h_view3d_status );
+
+KOPENAPI_REGISTER( "view3d_lead_clips",
+                   "Through-hole lead cut of the 3D viewer per footprint model: leads past the maximum protrusion "
+                   "(IPC-A-610 Class 2: 2.5 mm; footprint field protrusion_mm) are cut to 1.0 mm unless something other than leads "
+                   "hangs below the board or the model's <model>.meta.json says mount.below_board. Lists clipped "
+                   "and left-whole models (all: every model) with the depth past the board; GUI only",
+                   R"json({"type":"object","properties":{
+                        "refs":{"type":"array","items":{"type":"string"}},
+                        "all":{"type":"boolean","default":false},
+                        "open":{"type":"boolean","default":true}}})json"_json,
+                   true, h_view3d_lead_clips );
 
 KOPENAPI_REGISTER( "view3d_layers",
                    "3D viewer layers: visibility of board, copper, silkscreen, soldermask, paste, user and fab "

@@ -46,6 +46,8 @@
 #include <pcb_track.h>
 
 #include <base_units.h>
+#include <filename_resolver.h>
+#include "../lead_clip.h"
 #include <core/profile.h>        // To use GetRunningMicroSecs or another profiling utility
 
 /**
@@ -2251,6 +2253,9 @@ void RENDER_3D_RAYTRACE_BASE::load3DModels( CONTAINER_3D& aDstContainer, bool aS
     }
 
     // Go for all footprints
+    std::map<const S3DMODEL*, std::vector<SFVEC3F>> modelPoints;
+    const bool                                       clipLeads = m_boardAdapter.m_Cfg->m_Render.clip_tht_leads;
+
     for( FOOTPRINT* fp : m_boardAdapter.GetBoard()->Footprints() )
     {
         if( aStop.stop_requested() )
@@ -2306,6 +2311,10 @@ void RENDER_3D_RAYTRACE_BASE::load3DModels( CONTAINER_3D& aDstContainer, bool aS
                 embeddedFilesStack.push_back( fp->GetEmbeddedFiles() );
                 embeddedFilesStack.push_back( m_boardAdapter.GetBoard()->GetEmbeddedFiles() );
 
+                const wxString modelPath = clipLeads ? cacheMgr->GetResolver()->ResolvePath( model.m_Filename,
+                                                                                             footprintBasePath,
+                                                                                             embeddedFilesStack )
+                                                     : wxString();
                 const S3DMODEL* modelPtr = cacheMgr->GetModel( model.m_Filename, footprintBasePath,
                                                                std::move( embeddedFilesStack ) );
 
@@ -2317,8 +2326,21 @@ void RENDER_3D_RAYTRACE_BASE::load3DModels( CONTAINER_3D& aDstContainer, bool aS
                             SFVEC3F( model.m_Rotation.x, model.m_Rotation.y, model.m_Rotation.z ),
                             SFVEC3F( model.m_Scale.x, model.m_Scale.y, model.m_Scale.z ) );
 
+                    std::optional<LEAD_CLIP> clip;
+
+                    if( clipLeads )
+                    {
+                        auto points = modelPoints.find( modelPtr );
+
+                        if( points == modelPoints.end() )
+                            points = modelPoints.emplace( modelPtr, ModelSamplePoints( *modelPtr ) ).first;
+
+                        clip = ComputeLeadClip( m_boardAdapter, *fp, modelMatrix, points->second,
+                                                ReadModelMountMeta( modelPath ) ).m_clip;
+                    }
+
                     addModels( aDstContainer, modelPtr, modelMatrix, (float) model.m_Opacity,
-                               aSkipMaterialInformation, fp );
+                               aSkipMaterialInformation, fp, clip ? &*clip : nullptr );
                 }
                 else if( showMissing && !placeholderAdded )
                 {
@@ -2442,7 +2464,8 @@ MODEL_MATERIALS* RENDER_3D_RAYTRACE_BASE::getModelMaterial( const S3DMODEL* a3DM
 
 void RENDER_3D_RAYTRACE_BASE::addModels( CONTAINER_3D& aDstContainer, const S3DMODEL* a3DModel,
                                          const glm::mat4& aModelMatrix, float aFPOpacity,
-                                         bool aSkipMaterialInformation, BOARD_ITEM* aBoardItem )
+                                         bool aSkipMaterialInformation, BOARD_ITEM* aBoardItem,
+                                         const LEAD_CLIP* aLeadClip )
 {
     // Validate a3DModel pointers
     wxASSERT( a3DModel != nullptr );
@@ -2523,9 +2546,23 @@ void RENDER_3D_RAYTRACE_BASE::addModels( CONTAINER_3D& aDstContainer, const S3DM
                         const SFVEC3F& n2 = mesh.m_Normals[idx2];
 
                         // Transform vertex with the model matrix
-                        const SFVEC3F vt0 = SFVEC3F( aModelMatrix * glm::vec4( v0, 1.0f ) );
-                        const SFVEC3F vt1 = SFVEC3F( aModelMatrix * glm::vec4( v1, 1.0f ) );
-                        const SFVEC3F vt2 = SFVEC3F( aModelMatrix * glm::vec4( v2, 1.0f ) );
+                        SFVEC3F vt0 = SFVEC3F( aModelMatrix * glm::vec4( v0, 1.0f ) );
+                        SFVEC3F vt1 = SFVEC3F( aModelMatrix * glm::vec4( v1, 1.0f ) );
+                        SFVEC3F vt2 = SFVEC3F( aModelMatrix * glm::vec4( v2, 1.0f ) );
+
+                        if( aLeadClip )
+                        {
+                            // lead ends past the cut: whole triangles dropped, crossing ones pulled
+                            // up to the plane (lead walls are vertical: their ends close flat)
+                            if( aLeadClip->Below( vt0 ) && aLeadClip->Below( vt1 ) && aLeadClip->Below( vt2 ) )
+                                continue;
+
+                            for( SFVEC3F* v : { &vt0, &vt1, &vt2 } )
+                            {
+                                if( aLeadClip->Below( *v ) )
+                                    v->z = aLeadClip->m_z;
+                            }
+                        }
 
                         const SFVEC3F nt0 = glm::normalize( SFVEC3F( normalMatrix * n0 ) );
                         const SFVEC3F nt1 = glm::normalize( SFVEC3F( normalMatrix * n1 ) );
