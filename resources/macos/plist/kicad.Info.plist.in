@@ -15,6 +15,24 @@
                 <key>LSHandlerRank</key>                <string>Owner</string>
             </dict>
             <dict>
+                <key>CFBundleTypeRole</key>             <string>Editor</string>
+                <key>CFBundleTypeIconFile</key>         <string>kicad_doc.icns</string>
+                <key>CFBundleTypeExtensions</key>       <array>
+                                                            <string>kicad_sch</string>
+                                                        </array>
+                <key>CFBundleTypeName</key>             <string>KiCad schematic</string>
+                <key>LSHandlerRank</key>                <string>Alternate</string>
+            </dict>
+            <dict>
+                <key>CFBundleTypeRole</key>             <string>Editor</string>
+                <key>CFBundleTypeIconFile</key>         <string>kicad_doc.icns</string>
+                <key>CFBundleTypeExtensions</key>       <array>
+                                                            <string>kicad_pcb</string>
+                                                        </array>
+                <key>CFBundleTypeName</key>             <string>KiCad board</string>
+                <key>LSHandlerRank</key>                <string>Alternate</string>
+            </dict>
+            <dict>
                 <key>CFBundleTypeRole</key>         <string>None</string>
                 <key>CFBundleTypeExtensions</key>
                     <array>
