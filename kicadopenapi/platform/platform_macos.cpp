@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <sys/qos.h>
 #include <sys/resource.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 namespace kopenapi::platform
@@ -33,6 +34,35 @@ std::filesystem::path ExecutablePathMacOS()
     std::error_code ec;
     std::filesystem::path exe = std::filesystem::canonical(buffer, ec);
     return ec ? std::filesystem::path() : exe;
+}
+
+SystemMemoryInfo SystemMemoryMacOS()
+{
+    SystemMemoryInfo info;
+    uint64_t         memsize = 0;
+    size_t           len = sizeof( memsize );
+
+    if( sysctlbyname( "hw.memsize", &memsize, &len, nullptr, 0 ) == 0 )
+        info.total = (int64_t) memsize;
+
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+
+    if( host_statistics64( mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count ) == KERN_SUCCESS )
+    {
+        vm_size_t page = 0;
+        host_page_size( mach_host_self(), &page );
+        info.available = (int64_t) ( vm.free_count + vm.inactive_count + vm.purgeable_count ) * (int64_t) page;
+    }
+
+    // the kernel's own view: 1 normal, 2 warning, 4 critical
+    int level = 0;
+    len = sizeof( level );
+
+    if( sysctlbyname( "kern.memorystatus_vm_pressure_level", &level, &len, nullptr, 0 ) == 0 )
+        info.pressure = level >= 4 ? 2 : level >= 2 ? 1 : 0;
+
+    return info;
 }
 
 ProcessMemoryInfo ProcessMemoryMacOS()

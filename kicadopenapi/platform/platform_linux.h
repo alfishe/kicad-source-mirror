@@ -14,6 +14,8 @@ std::filesystem::path ExecutablePathLinux();
 struct ProcessMemoryInfo;
 struct AllocatorInfo;
 ProcessMemoryInfo ProcessMemoryLinux();
+struct SystemMemoryInfo;
+SystemMemoryInfo SystemMemoryLinux();
 AllocatorInfo AllocatorStatsLinux();
 int64_t AllocatorTrimLinux();
 void LowerCurrentThreadPriorityLinux();

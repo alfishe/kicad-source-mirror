@@ -335,6 +335,22 @@ std::vector<HANDLE> processHeaps()
 }
 } // namespace
 
+SystemMemoryInfo SystemMemoryWindows()
+{
+    SystemMemoryInfo info;
+    MEMORYSTATUSEX   status{};
+    status.dwLength = sizeof( status );
+
+    if( GlobalMemoryStatusEx( &status ) )
+    {
+        info.total = (int64_t) status.ullTotalPhys;
+        info.available = (int64_t) status.ullAvailPhys;
+        info.pressure = status.dwMemoryLoad >= 95 ? 2 : status.dwMemoryLoad >= 85 ? 1 : 0;
+    }
+
+    return info;
+}
+
 ProcessMemoryInfo ProcessMemoryWindows()
 {
     ProcessMemoryInfo info;

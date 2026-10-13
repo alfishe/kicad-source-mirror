@@ -99,6 +99,17 @@ struct ProcessMemoryInfo
 /// @brief A few microseconds; safe on any thread
 ProcessMemoryInfo ProcessMemory();
 
+/// @brief The machine's memory: physical RAM, what is still available, and the OS's pressure level
+struct SystemMemoryInfo
+{
+    int64_t total = -1;       ///< physical RAM (bytes)
+    int64_t available = -1;   ///< free + reclaimable (bytes), -1 when unknown
+    int     pressure = 0;     ///< 0 normal, 1 warning, 2 critical
+};
+
+/// @brief A few microseconds; safe on any thread
+SystemMemoryInfo SystemMemory();
+
 /// @brief The system allocator: bytes in live blocks and bytes it holds from the OS; -1 when unknown
 struct AllocatorInfo
 {

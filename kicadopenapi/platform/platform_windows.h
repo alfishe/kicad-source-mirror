@@ -31,6 +31,8 @@ int WaitProcessWindows(long pid, int timeoutMs);
 struct ProcessMemoryInfo;
 struct AllocatorInfo;
 ProcessMemoryInfo ProcessMemoryWindows();
+struct SystemMemoryInfo;
+SystemMemoryInfo SystemMemoryWindows();
 AllocatorInfo AllocatorStatsWindows();
 int64_t AllocatorTrimWindows();
 void LowerCurrentThreadPriorityWindows();

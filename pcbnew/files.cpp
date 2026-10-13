@@ -20,6 +20,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <pcb/kopenapi_model_warmup.h>
 #include <string>
 #include <vector>
 
@@ -484,6 +485,8 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     wxString   fullFileName( aFileSet[0] );
     wxFileName wx_filename( fullFileName );
     wxString   msg;
+
+    KopenapiStopWarmModels();   // the earlier board's models: their project may go
 
     if( Kiface().IsSingle() )
         KIPLATFORM::APP::RegisterApplicationRestart( fullFileName );
@@ -986,6 +989,8 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
 
     if( KISTATUSBAR* statusBar = dynamic_cast<KISTATUSBAR*>( GetStatusBar() ) )
         statusBar->AddWarningMessages( "load", loadReporter.GetMessages() );
+
+    KopenapiWarmModels( GetBoard() );   // the 3D viewer then finds its models loaded
 
     return true;
 }

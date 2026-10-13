@@ -3,6 +3,7 @@
 /// pcb_model_seat.
 #include "kopenapi_pcb.h"
 #include "kopenapi_occ.h"
+#include "kopenapi_model_warmup.h"
 
 #include <3d_math.h>
 #include <board_design_settings.h>
@@ -623,6 +624,41 @@ KOPENAPI_REGISTER( "pcb_models_inspect",
                         "geometry":{"type":"boolean","default":true,"description":"false: files and placement only (fast)"},
                         "tolerance_mm":{"type":"number","default":0.1}}})json"_json,
                    false, h_pcb_models_inspect, 600 );
+
+static KOPENAPI_RESULT h_pcb_models_warmup( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    const std::string action = aArgs.value( "action", std::string( "status" ) );
+
+    if( action == "start" )
+    {
+        std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+        if( !context )
+            return KopenapiNoBoard();
+
+        KopenapiWarmModels( context->GetBoard() );
+    }
+    else if( action == "stop" )
+    {
+        KopenapiStopWarmModels();
+    }
+    else if( action != "status" )
+    {
+        return KOPENAPI_RESULT::Error( 400, "action: status, start or stop" );
+    }
+
+    return KOPENAPI_RESULT::Ok( KopenapiWarmModelsStatus() );
+}
+
+
+KOPENAPI_REGISTER( "pcb_models_warmup",
+                   "Background warm-up of the 3D model cache (GUI: started when a board opens, so the 3D "
+                   "viewer finds its models loaded): status (running, models, done, bytes read, why it "
+                   "stopped: memory pressure / process footprint / budget), start, stop",
+                   R"json({"type":"object","properties":{
+                        "action":{"type":"string","enum":["status","start","stop"],"default":"status"}}})json"_json,
+                   false, h_pcb_models_warmup );
+
 
 KOPENAPI_REGISTER( "pcb_model_seat",
                    "Seat 3D models on the board: moves the model's z offset so a THT body rests on the "

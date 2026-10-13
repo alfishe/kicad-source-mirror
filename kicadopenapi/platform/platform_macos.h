@@ -17,6 +17,8 @@ std::filesystem::path ExecutablePathMacOS();
 struct ProcessMemoryInfo;
 struct AllocatorInfo;
 ProcessMemoryInfo ProcessMemoryMacOS();
+struct SystemMemoryInfo;
+SystemMemoryInfo SystemMemoryMacOS();
 AllocatorInfo AllocatorStatsMacOS();
 int64_t AllocatorTrimMacOS();
 void LowerCurrentThreadPriorityMacOS();

@@ -23,6 +23,37 @@ std::filesystem::path ExecutablePathLinux()
     return ec ? std::filesystem::path() : exe;
 }
 
+SystemMemoryInfo SystemMemoryLinux()
+{
+    SystemMemoryInfo info;
+    FILE*            meminfo = std::fopen("/proc/meminfo", "r");
+
+    if (!meminfo)
+        return info;
+
+    char line[256];
+
+    while (std::fgets(line, sizeof(line), meminfo))
+    {
+        long long kb = 0;
+
+        if (std::sscanf(line, "MemTotal: %lld kB", &kb) == 1)
+            info.total = (int64_t) kb * 1024;
+        else if (std::sscanf(line, "MemAvailable: %lld kB", &kb) == 1)
+            info.available = (int64_t) kb * 1024;
+    }
+
+    std::fclose(meminfo);
+
+    if (info.total > 0 && info.available >= 0)
+    {
+        const double share = (double) info.available / (double) info.total;
+        info.pressure = share < 0.05 ? 2 : share < 0.15 ? 1 : 0;
+    }
+
+    return info;
+}
+
 ProcessMemoryInfo ProcessMemoryLinux()
 {
     ProcessMemoryInfo info;

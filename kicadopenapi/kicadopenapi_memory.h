@@ -29,6 +29,16 @@ public:
     /// @param aTrigger is recorded with the result ("api", "auto").
     /// @return { before, after, released, allocator_reported, ms }
     static nlohmann::json TrimNow( const std::string& aTrigger );
+
+    /// @brief Background work that grows memory should stop: the OS reports pressure, or this
+    /// process holds more than aProcessShare of the machine's RAM
+    static bool UnderPressure( double aProcessShare );
+
+    /// @brief Physical RAM of the machine (bytes), -1 when unknown
+    static int64_t SystemTotal();
+
+    /// @brief The calling thread at background priority (for work nobody waits on)
+    static void LowerThreadPriority();
 };
 
 #endif

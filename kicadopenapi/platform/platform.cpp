@@ -248,6 +248,19 @@ ProcessMemoryInfo ProcessMemory()
 #endif
 }
 
+SystemMemoryInfo SystemMemory()
+{
+#if defined(_WIN32)
+    return SystemMemoryWindows();
+#elif defined(__APPLE__)
+    return SystemMemoryMacOS();
+#elif defined(__linux__)
+    return SystemMemoryLinux();
+#else
+    return {};
+#endif
+}
+
 AllocatorInfo AllocatorStats()
 {
 #if defined(_WIN32)

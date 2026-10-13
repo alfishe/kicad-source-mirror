@@ -263,6 +263,30 @@ void KOPENAPI_MEMORY::StopAutoTrim()
 }
 
 
+bool KOPENAPI_MEMORY::UnderPressure( double aProcessShare )
+{
+    const kopenapi::platform::SystemMemoryInfo system = kopenapi::platform::SystemMemory();
+
+    if( system.pressure > 0 )
+        return true;
+
+    return system.total > 0
+           && kopenapi::platform::ProcessMemory().footprint > (int64_t) ( (double) system.total * aProcessShare );
+}
+
+
+int64_t KOPENAPI_MEMORY::SystemTotal()
+{
+    return kopenapi::platform::SystemMemory().total;
+}
+
+
+void KOPENAPI_MEMORY::LowerThreadPriority()
+{
+    kopenapi::platform::LowerCurrentThreadPriority();
+}
+
+
 nlohmann::json KOPENAPI_MEMORY::Summary()
 {
     const kopenapi::platform::ProcessMemoryInfo process = kopenapi::platform::ProcessMemory();
@@ -276,6 +300,11 @@ nlohmann::json KOPENAPI_MEMORY::Summary()
                                                : nlohmann::json() } };
 
     const EMBEDDED_FILES::DATA_STATS embedded = EMBEDDED_FILES::GetDataStats();
+
+    const kopenapi::platform::SystemMemoryInfo system = kopenapi::platform::SystemMemory();
+    out["system"] = { { "total", orNull( system.total ) },
+                      { "available", orNull( system.available ) },
+                      { "pressure", system.pressure == 2 ? "critical" : system.pressure == 1 ? "warning" : "normal" } };
 
     out["caches"] = { { "embedded_files", { { "resident_bytes", embedded.residentBytes },
                                             { "resident_files", embedded.residentFiles },
