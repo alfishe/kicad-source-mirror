@@ -30,6 +30,7 @@
 #include <eeschema_test_utils.h>
 
 #include <deque>
+#include <set>
 #include <eeschema_helpers.h>
 #include <locale_io.h>
 #include <sch_screen.h>
@@ -62,4 +63,37 @@ BOOST_AUTO_TEST_CASE( Issue18346JunctionFixupOnLoad )
     BOOST_CHECK_MESSAGE( needed == 0,
                          "Normal load path left " << needed
                          << " junction(s) missing; FixupJunctionsAfterImport did not run" );
+}
+
+
+// The junctions and wire segments the repair adds have the same ids on every load
+BOOST_AUTO_TEST_CASE( JunctionFixupOnLoadGivesStableIds )
+{
+    LOCALE_IO dummy;
+
+    wxString schPath = wxString::FromUTF8( KI_TEST::GetEeschemaTestDataDir() ) +
+                       wxS( "issue18346.kicad_sch" );
+
+    auto itemIds = [&]()
+    {
+        std::unique_ptr<SCHEMATIC> sch( EESCHEMA_HELPERS::LoadSchematic( schPath, true, true ) );
+        BOOST_REQUIRE( sch != nullptr );
+
+        std::set<KIID> ids;
+        SCH_SCREENS    screens( sch->Root() );
+
+        for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+        {
+            for( SCH_ITEM* item : screen->Items() )
+                ids.insert( item->m_Uuid );
+        }
+
+        return ids;
+    };
+
+    const std::set<KIID> first = itemIds();
+    const std::set<KIID> second = itemIds();
+
+    BOOST_REQUIRE( !first.empty() );
+    BOOST_CHECK( first == second );
 }

@@ -1962,13 +1962,21 @@ int SCHEMATIC::FixupJunctionsAfterImport( const std::function<void( SCH_LINE*, S
         {
             count++;
 
+            // Ids derived from the sheet and the point: every load of the same file yields the same items
+            const std::string where = "/" + std::to_string( point.x ) + "," + std::to_string( point.y );
+
             SCH_JUNCTION* junction = new SCH_JUNCTION( point );
+            const_cast<KIID&>( junction->m_Uuid ) =
+                    KIID::FromName( screen->GetUuid().AsStdString() + "/junction" + where );
             screen->Append( junction );
 
             // Breakup wires
             for( SCH_LINE* wire : screen->GetBusesAndWires( point, true ) )
             {
-                SCH_LINE* newSegment = wire->NonGroupAware_BreakAt( point );
+                const KIID segmentId = KIID::FromName( wire->m_Uuid.AsStdString() + "/split" + where );
+                SCH_LINE*  newSegment = wire->NonGroupAware_BreakAt( point );
+
+                const_cast<KIID&>( newSegment->m_Uuid ) = segmentId;
                 screen->Append( newSegment );
 
                 if( aOnSplit )
