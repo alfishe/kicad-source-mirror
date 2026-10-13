@@ -28,6 +28,7 @@
 #include <geometry/shape_utils.h>
 #include <footprint.h>
 #include <mmh3_hash.h>
+#include <pad.h>
 #include <pcb_field.h>
 #include <pcb_shape.h>
 
@@ -378,6 +379,47 @@ BOOST_AUTO_TEST_CASE( FootprintUpdateFieldsRestoresMissingMandatoryField )
     BOOST_REQUIRE_EQUAL( added.size(), 1 );
     BOOST_CHECK( added.front() == std::as_const( fp ).GetField( FIELD_T::VALUE ) );
     BOOST_CHECK( added.front() != orphan.get() );
+}
+
+
+// The cached bounding box follows a rotation and a flip without anything else bumping the board
+// time stamp
+BOOST_AUTO_TEST_CASE( FootprintBoundingBoxFollowsRotateAndFlip )
+{
+    BOARD      board;
+    FOOTPRINT* fp = new FOOTPRINT( &board );
+
+    board.Add( fp );
+    fp->SetPosition( VECTOR2I( pcbIUScale.mmToIU( 100.0 ), pcbIUScale.mmToIU( 100.0 ) ) );
+
+    PAD* pad = new PAD( fp );
+    pad->SetAttribute( PAD_ATTRIB::SMD );
+    pad->SetLayerSet( PAD::SMDMask() );
+    pad->SetSize( PADSTACK::ALL_LAYERS, VECTOR2I( pcbIUScale.mmToIU( 1.0 ), pcbIUScale.mmToIU( 1.0 ) ) );
+    fp->Add( pad );
+    pad->SetPosition( fp->GetPosition() + VECTOR2I( pcbIUScale.mmToIU( 10.0 ), pcbIUScale.mmToIU( 4.0 ) ) );
+    board.IncrementTimeStamp();
+
+    auto uncached = [&]()
+    {
+        std::unique_ptr<FOOTPRINT> copy( static_cast<FOOTPRINT*>( fp->Clone() ) );
+        copy->SetParent( nullptr );
+        return copy->GetBoundingBox();
+    };
+
+    BOOST_REQUIRE( fp->GetBoundingBox() == uncached() );
+
+    fp->Rotate( fp->GetPosition(), ANGLE_90 );
+    BOOST_CHECK( fp->GetBoundingBox() == uncached() );
+
+    fp->SetOrientation( ANGLE_180 );
+    BOOST_CHECK( fp->GetBoundingBox() == uncached() );
+
+    fp->Flip( fp->GetPosition(), FLIP_DIRECTION::TOP_BOTTOM );
+    BOOST_CHECK( fp->GetBoundingBox() == uncached() );
+
+    fp->Flip( fp->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );
+    BOOST_CHECK( fp->GetBoundingBox() == uncached() );
 }
 
 

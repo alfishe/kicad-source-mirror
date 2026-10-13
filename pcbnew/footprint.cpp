@@ -3533,7 +3533,10 @@ void FOOTPRINT::Flip( const VECTOR2I& aCentre, FLIP_DIRECTION aFlipDirection )
         Rotate( aCentre, ANGLE_180 );
 
     if( m_geometry_cache )
+    {
+        m_geometry_cache->bounding_box_timestamp = 0;
         m_geometry_cache->text_excluded_bbox_timestamp = 0;
+    }
 
     m_flipped = ( GetLayer() == B_Cu );
 }
@@ -3746,7 +3749,10 @@ void FOOTPRINT::SetOrientation( const EDA_ANGLE& aNewAngle )
     }
 
     if( m_geometry_cache )
+    {
+        m_geometry_cache->bounding_box_timestamp = 0;
         m_geometry_cache->text_excluded_bbox_timestamp = 0;
+    }
 
     if( m_courtyard_cache )
     {
