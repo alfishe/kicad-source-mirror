@@ -356,6 +356,8 @@ char const* KICAD_PLUGIN_LDR_3D::GetFileFilter( int aIndex )
 
 bool KICAD_PLUGIN_LDR_3D::CanRender( void )
 {
+    std::lock_guard<std::mutex> lock( m_stateMutex );
+
     m_error.clear();
 
     if( !ok && !reopen() )
@@ -383,26 +385,34 @@ bool KICAD_PLUGIN_LDR_3D::CanRender( void )
 
 SCENEGRAPH* KICAD_PLUGIN_LDR_3D::Load( char const* aFileName )
 {
-    m_error.clear();
+    PLUGIN_3D_LOAD load = nullptr;
 
-    if( !ok && !reopen() )
     {
-        if( m_error.empty() )
-            m_error = "[INFO] no open plugin / plugin could not be opened";
+        std::lock_guard<std::mutex> lock( m_stateMutex );
 
-        return nullptr;
+        m_error.clear();
+
+        if( !ok && !reopen() )
+        {
+            if( m_error.empty() )
+                m_error = "[INFO] no open plugin / plugin could not be opened";
+
+            return nullptr;
+        }
+
+        if( nullptr == m_load )
+        {
+            m_error = "[BUG] Load is not linked";
+
+            wxLogTrace( tracePluginLoader, wxT( "%s:%s:%d\n"
+                                                "%s" ),
+                        __FILE__, __FUNCTION__, __LINE__, m_error );;
+
+            return nullptr;
+        }
+
+        load = m_load;
     }
 
-    if( nullptr == m_load )
-    {
-        m_error = "[BUG] Load is not linked";
-
-        wxLogTrace( tracePluginLoader, wxT( "%s:%s:%d\n"
-                                            "%s" ),
-                    __FILE__, __FUNCTION__, __LINE__, m_error );;
-
-        return nullptr;
-    }
-
-    return m_load( aFileName );
+    return load( aFileName );
 }

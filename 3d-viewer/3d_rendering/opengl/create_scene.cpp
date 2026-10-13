@@ -23,6 +23,9 @@
 #include "../../3d_canvas/eda_3d_canvas.h"
 #include "../3d_placeholder_utils.h"
 #include <chrono>
+#include <thread>
+#include <algorithm>
+#include <atomic>
 #include <map>
 #include <set>
 #include <3d_viewer_id.h>
@@ -37,6 +40,7 @@
 #include <project_pcb.h>
 #include <geometry/shape_poly_set.h>
 #include <thread_pool.h>
+#include <filename_resolver.h>
 
 
 void RENDER_3D_OPENGL::addObjectTriangles( const FILLED_CIRCLE_2D*                aCircle,
@@ -1951,6 +1955,108 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
     std::map<wxString, wxString> basePaths;
     auto                         lastRefresh = std::chrono::steady_clock::now();
 
+    auto basePathOf = [&]( const FOOTPRINT* aFootprint ) -> const wxString&
+    {
+        const wxString libraryName = aFootprint->GetFPID().GetLibNickname();
+        auto           base = basePaths.find( libraryName );
+
+        if( base == basePaths.end() )
+        {
+            wxString footprintBasePath;
+
+            if( m_boardAdapter.GetBoard()->GetProject() )
+            {
+                try
+                {
+                    // FindRow() can throw an exception
+                    std::optional<LIBRARY_TABLE_ROW*> fpRow =
+                            PROJECT_PCB::FootprintLibAdapter( m_boardAdapter.GetBoard()->GetProject() )
+                                    ->GetRow( libraryName );
+
+                    if( fpRow )
+                        footprintBasePath = LIBRARY_MANAGER::GetFullURI( *fpRow, true );
+                }
+                catch( ... )
+                {
+                    // Do nothing if the libraryName is not found in lib table
+                }
+            }
+
+            base = basePaths.emplace( libraryName, footprintBasePath ).first;
+        }
+
+        return base->second;
+    };
+
+    // Models not loaded yet are read in parallel first (STEP parsing dominates a cold load); the
+    // loop below then finds them in the model cache
+    {
+        std::set<wxString>                                        queued;
+        std::vector<std::tuple<wxString, wxString, const FOOTPRINT*>> work;
+
+        for( const FOOTPRINT* footprint : m_boardAdapter.GetBoard()->Footprints() )
+        {
+            for( const FP_3DMODEL& fp_model : footprint->Models() )
+            {
+                if( fp_model.m_Show && !fp_model.m_Filename.empty() && !m_3dModelMap.contains( fp_model.m_Filename )
+                    && queued.insert( fp_model.m_Filename ).second )
+                {
+                    work.emplace_back( fp_model.m_Filename, basePathOf( footprint ), footprint );
+                }
+            }
+        }
+
+        if( work.size() > 1 )
+        {
+            if( m_activityReporter )
+                m_activityReporter->Report( wxString::Format( _( "Loading %zu 3D models..." ), work.size() ) );
+
+            // the largest files first: the load is as long as its slowest model; a few at a time,
+            // more only make every model slower (allocator and OpenCascade contention)
+            auto sizeOf = [&]( const wxString& aFile, const wxString& aBase ) -> wxULongLong
+            {
+                const wxString path = cacheMgr->GetResolver()->ResolvePath( aFile, aBase, {} );
+                return path.empty() ? wxULongLong( 0 ) : wxFileName::GetSize( path );
+            };
+
+            std::vector<std::pair<wxULongLong, size_t>> order;
+
+            for( size_t i = 0; i < work.size(); ++i )
+                order.emplace_back( sizeOf( std::get<0>( work[i] ), std::get<1>( work[i] ) ), i );
+
+            std::sort( order.begin(), order.end(),
+                       []( const auto& a, const auto& b ) { return a.first > b.first; } );
+
+            const BOARD*        board = m_boardAdapter.GetBoard();
+            std::atomic<size_t> next{ 0 };
+            const size_t        workers = std::min<size_t>( order.size(),
+                                                            std::max( 2u, std::thread::hardware_concurrency() / 4 ) );
+
+            auto worker = [&]()
+            {
+                for( size_t k = next++; k < order.size() && !aStop.stop_requested(); k = next++ )
+                {
+                    const auto& [file, basePath, footprint] = work[order[k].second];
+                    std::vector<const EMBEDDED_FILES*> embedded{ footprint->GetEmbeddedFiles(),
+                                                                 board->GetEmbeddedFiles() };
+                    cacheMgr->GetModel( file, basePath, std::move( embedded ) );
+                }
+            };
+
+            thread_pool&                   tp = GetKiCadThreadPool();
+            std::vector<std::future<void>> done;
+
+            for( size_t i = 0; i < workers; ++i )
+                done.push_back( tp.submit_task( worker ) );
+
+            for( std::future<void>& f : done )
+                f.get();
+
+            if( aStop.stop_requested() )
+                return;
+        }
+    }
+
     // Go for all footprints
     for( const FOOTPRINT* footprint : m_boardAdapter.GetBoard()->Footprints() )
     {
@@ -1966,33 +2072,7 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
             if( m_3dModelMap.contains( fp_model.m_Filename ) || missing.contains( fp_model.m_Filename ) )
                 continue;
 
-            const wxString libraryName = footprint->GetFPID().GetLibNickname();
-            auto           base = basePaths.find( libraryName );
-
-            if( base == basePaths.end() )
-            {
-                wxString footprintBasePath;
-
-                if( m_boardAdapter.GetBoard()->GetProject() )
-                {
-                    try
-                    {
-                        // FindRow() can throw an exception
-                        std::optional<LIBRARY_TABLE_ROW*> fpRow =
-                                PROJECT_PCB::FootprintLibAdapter( m_boardAdapter.GetBoard()->GetProject() )
-                                        ->GetRow( libraryName );
-
-                        if( fpRow )
-                            footprintBasePath = LIBRARY_MANAGER::GetFullURI( *fpRow, true );
-                    }
-                    catch( ... )
-                    {
-                        // Do nothing if the libraryName is not found in lib table
-                    }
-                }
-
-                base = basePaths.emplace( libraryName, footprintBasePath ).first;
-            }
+            const wxString& basePath = basePathOf( footprint );
 
             if( m_activityReporter )
             {
@@ -2006,7 +2086,7 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
             embeddedFilesStack.push_back( footprint->GetEmbeddedFiles() );
             embeddedFilesStack.push_back( m_boardAdapter.GetBoard()->GetEmbeddedFiles() );
 
-            const S3DMODEL* modelPtr = cacheMgr->GetModel( fp_model.m_Filename, base->second,
+            const S3DMODEL* modelPtr = cacheMgr->GetModel( fp_model.m_Filename, basePath,
                                                            std::move( embeddedFilesStack ) );
 
             // only add it if the return is not NULL

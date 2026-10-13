@@ -55,6 +55,8 @@
 
 #include <STEPControl_Reader.hxx>
 #include <STEPCAFControl_Reader.hxx>
+#include <STEPCAFControl_Controller.hxx>
+#include <mutex>
 
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ColorTool.hxx>
@@ -80,6 +82,9 @@
 #include <TDF_Tool.hxx>
 #include <TDataStd_Name.hxx>
 #include <Standard_Version.hxx>
+#if OCC_VERSION_HEX >= 0x070800
+#include <DESTEP_Parameters.hxx>
+#endif
 
 #include "plugins/3dapi/ifsg_all.h"
 
@@ -93,6 +98,30 @@ typedef std::map<COLORKEY, IFSG_APPEARANCE>          COLORMAP;
 typedef std::map<std::string, SGNODE*>               FACEMAP;
 typedef std::map<std::string, std::vector<SGNODE*>>  NODEMAP;
 typedef std::pair<std::string, std::vector<SGNODE*>> NODEITEM;
+
+namespace
+{
+// Interface_Static (translation parameters) and the XCAF application are process-wide in
+// OpenCascade: changing them, or creating / closing documents, is serialized; reading and meshing
+// a model is not, so several models load in parallel.
+std::mutex& occGlobalsMutex()
+{
+    static std::mutex s_mutex;
+    return s_mutex;
+}
+
+
+void initStepControllerOnce()
+{
+    static std::once_flag s_once;
+    std::call_once( s_once, []()
+                    {
+                        std::lock_guard<std::mutex> lock( occGlobalsMutex() );
+                        STEPCAFControl_Controller::Init();
+                    } );
+}
+} // namespace
+
 
 struct DATA;
 
@@ -221,8 +250,13 @@ struct DATA
         if( scene )
             S3D::DestroyNode(scene);
 
-        if( !m_app.IsNull() && !m_doc.IsNull() && m_app->CanClose( m_doc ) == CDM_CCS_OK )
-            m_app->Close( m_doc );
+        if( !m_app.IsNull() && !m_doc.IsNull() )
+        {
+            std::lock_guard<std::mutex> lock( occGlobalsMutex() );
+
+            if( m_app->CanClose( m_doc ) == CDM_CCS_OK )
+                m_app->Close( m_doc );
+        }
     }
 
     // find collection of tagged nodes
@@ -566,6 +600,8 @@ void addItems( SGNODE* parent, std::vector< SGNODE* >* lp )
 
 bool readIGES( Handle( TDocStd_Document ) & m_doc, const char* fname )
 {
+    std::lock_guard<std::mutex> lock( occGlobalsMutex() );
+
     IGESCAFControl_Reader reader;
     IFSelect_ReturnStatus stat  = reader.ReadFile( fname );
     reader.PrintCheckLoad( false, IFSelect_ItemsByEntity );
@@ -598,6 +634,29 @@ bool readSTEP( Handle( TDocStd_Document ) & m_doc, const char* fname, double aLi
     wxLogTrace( MASK_OCE, wxT( "Reading step file %s" ), fname );
 
     STEPCAFControl_Reader reader;
+
+#if OCC_VERSION_HEX >= 0x070800
+    // the reader's own parameters: no process-wide state, models load in parallel
+    initStepControllerOnce();
+
+    DESTEP_Parameters params;
+
+    {
+        std::lock_guard<std::mutex> lock( occGlobalsMutex() );
+        params.InitFromStatic();
+    }
+
+    // user-defined shape precision (the default 0.0001 gives too many triangles)
+    params.ReadPrecisionMode = DESTEP_Parameters::ReadMode_Precision_User;
+    params.ReadPrecisionVal = aLinearDeflection;
+
+    IFSelect_ReturnStatus stat = reader.ReadFile( fname, params );
+
+    if( stat != IFSelect_RetDone )
+        return false;
+#else
+    std::lock_guard<std::mutex> lock( occGlobalsMutex() );
+
     IFSelect_ReturnStatus stat  = reader.ReadFile( fname );
 
     if( stat != IFSelect_RetDone )
@@ -610,6 +669,7 @@ bool readSTEP( Handle( TDocStd_Document ) & m_doc, const char* fname, double aLi
     // Set the shape conversion precision (default 0.0001 has too many triangles)
     if( !Interface_Static::SetRVal( "read.precision.val", aLinearDeflection ) )
         return false;
+#endif
 
     // set other translation options
     reader.SetColorMode( true );  // use model colors
@@ -754,7 +814,11 @@ SCENEGRAPH* LoadModel( char const* filename, const S3D::MODEL_IMPORT_OPTIONS* aO
     data.status = aStatus;
 
     data.m_app = XCAFApp_Application::GetApplication();
-    data.m_app->NewDocument( "MDTV-XCAF", data.m_doc );
+
+    {
+        std::lock_guard<std::mutex> lock( occGlobalsMutex() );
+        data.m_app->NewDocument( "MDTV-XCAF", data.m_doc );
+    }
     FormatType modelFmt = fileType( filename );
 
     if( ( data.options.format == S3D::MODEL_IMPORT_FORMAT::STEP && modelFmt != FMT_STEP && modelFmt != FMT_STPZ )

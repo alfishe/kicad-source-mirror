@@ -29,6 +29,8 @@
 
 #include "../pluginldr.h"
 
+#include <mutex>
+
 class SCENEGRAPH;
 
 // typedefs of the functions exported by the 3D Plugin Class
@@ -78,6 +80,10 @@ private:
     PLUGIN_3D_GET_FILE_FILTER       m_getFileFilter;
     PLUGIN_3D_CAN_RENDER            m_canRender;
     PLUGIN_3D_LOAD                  m_load;
+
+    /// Reopening the library and m_error are shared: callers on several threads (models loaded in
+    /// parallel) take it for that part only, the plugin's own Load runs unlocked
+    std::mutex                      m_stateMutex;
 };
 
 #endif  // PLUGINMGR3D_H

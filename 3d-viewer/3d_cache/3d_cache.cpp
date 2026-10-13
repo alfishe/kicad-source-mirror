@@ -21,6 +21,7 @@
 
 #define GLM_FORCE_RADIANS
 
+#include <condition_variable>
 #include <mutex>
 #include <utility>
 
@@ -51,6 +52,12 @@
 #define MASK_3D_CACHE "3D_CACHE"
 
 static std::mutex mutex3D_cache;
+
+// Models are read (hash, cache file or plugin) without holding mutex3D_cache, so several load at
+// once; an entry being read is marked loading and other callers for it wait. Calls inside load()
+// are counted: flushing waits for none, as entries must not go while a reader holds one.
+static std::condition_variable cv3D_cache;
+static int                     busy3D_cache = 0;
 
 
 static bool checkTag( const char* aTag, void* aPluginMgrPtr )
@@ -85,6 +92,9 @@ private:
     S3D_CACHE_ENTRY& operator=( const S3D_CACHE_ENTRY& source ) = delete;
 
     wxString m_CacheBaseName;  // base name of cache file
+
+public:
+    bool          loading = false;   ///< being read by another thread (mutex3D_cache, cv3D_cache)
 };
 
 
@@ -193,7 +203,18 @@ SCENEGRAPH* S3D_CACHE::load( const wxString& aModelFile, const wxString& aBasePa
     }
 
     // check cache if file is already loaded
-    std::lock_guard<std::mutex> lock( mutex3D_cache );
+    std::unique_lock<std::mutex> lock( mutex3D_cache );
+
+    ++busy3D_cache;
+
+    struct BUSY
+    {
+        ~BUSY()
+        {
+            --busy3D_cache;
+            cv3D_cache.notify_all();
+        }
+    } busy;   // runs with the lock held (declared after it, destroyed before it)
 
     auto finishEntry = [&]( S3D_CACHE_ENTRY* ep ) -> SCENEGRAPH*
     {
@@ -220,6 +241,9 @@ SCENEGRAPH* S3D_CACHE::load( const wxString& aModelFile, const wxString& aBasePa
 
     if( mi != m_CacheMap.end() )
     {
+        S3D_CACHE_ENTRY* entry = mi->second;
+        cv3D_cache.wait( lock, [entry]() { return !entry->loading; } );
+
         wxFileName fname( full3Dpath );
 
         if( fname.FileExists() )    // Only check if file exists. If not, it will
@@ -260,7 +284,7 @@ SCENEGRAPH* S3D_CACHE::load( const wxString& aModelFile, const wxString& aBasePa
 
     // a cache item does not exist; search the Filename->Cachename map
     S3D_CACHE_ENTRY* ep = nullptr;
-    checkCache( full3Dpath, &ep );
+    checkCache( full3Dpath, &ep, lock );
     return finishEntry( ep );
 }
 
@@ -272,39 +296,16 @@ SCENEGRAPH* S3D_CACHE::Load( const wxString& aModelFile, const wxString& aBasePa
 }
 
 
-SCENEGRAPH* S3D_CACHE::checkCache( const wxString& aFileName, S3D_CACHE_ENTRY** aCachePtr )
+SCENEGRAPH* S3D_CACHE::checkCache( const wxString& aFileName, S3D_CACHE_ENTRY** aCachePtr,
+                                   std::unique_lock<std::mutex>& aLock )
 {
     if( aCachePtr )
         *aCachePtr = nullptr;
 
-    HASH_128    hashSum;
+    // registered first (an entry without data also stops further attempts at a broken file),
+    // read without the lock
     S3D_CACHE_ENTRY* ep = new S3D_CACHE_ENTRY;
     m_CacheList.push_back( ep );
-    wxFileName fname( aFileName );
-    ep->modTime = fname.GetModificationTime();
-
-    if( !getHash( aFileName, hashSum ) || m_CacheDir.empty() )
-    {
-        // just in case we can't get a hash digest (for example, on access issues)
-        // or we do not have a configured cache file directory, we create an
-        // entry to prevent further attempts at loading the file
-
-        if( m_CacheMap.emplace( aFileName, ep ).second == false )
-        {
-            wxLogTrace( MASK_3D_CACHE, wxT( "%s:%s:%d\n * [BUG] duplicate entry in map file; key = '%s'" ),
-                        __FILE__, __FUNCTION__, __LINE__, aFileName );
-
-            m_CacheList.pop_back();
-            delete ep;
-        }
-        else
-        {
-            if( aCachePtr )
-                *aCachePtr = ep;
-        }
-
-        return nullptr;
-    }
 
     if( m_CacheMap.emplace( aFileName, ep ).second == false )
     {
@@ -319,21 +320,44 @@ SCENEGRAPH* S3D_CACHE::checkCache( const wxString& aFileName, S3D_CACHE_ENTRY** 
     if( aCachePtr )
         *aCachePtr = ep;
 
-    ep->SetHash( hashSum );
+    ep->loading = true;
+    aLock.unlock();
 
-    wxString bname = ep->GetCacheBaseName();
-    wxString cachename = m_CacheDir + bname + wxT( ".3dc" );
+    HASH_128   hashSum;
+    wxFileName fname( aFileName );
+    ep->modTime = fname.GetModificationTime();
 
-    if( !ADVANCED_CFG::GetCfg().m_Skip3DModelFileCache && wxFileName::FileExists( cachename )
-        && loadCacheData( ep ) )
+    if( getHash( aFileName, hashSum ) && !m_CacheDir.empty() )
     {
-        return ep->sceneData;
+        ep->SetHash( hashSum );
+
+        wxString bname = ep->GetCacheBaseName();
+        wxString cachename = m_CacheDir + bname + wxT( ".3dc" );
+
+        if( ADVANCED_CFG::GetCfg().m_Skip3DModelFileCache || !wxFileName::FileExists( cachename )
+            || !loadCacheData( ep ) )
+        {
+            // only the OpenCascade plugin (STEP / IGES) reads several models at once
+            static std::mutex otherPlugins;
+            const wxString    ext = fname.GetExt().Lower();
+            const bool        parallel = ext == wxT( "step" ) || ext == wxT( "stp" ) || ext == wxT( "stpz" )
+                                         || ext == wxT( "iges" ) || ext == wxT( "igs" );
+
+            std::unique_lock<std::mutex> pluginLock( otherPlugins, std::defer_lock );
+
+            if( !parallel )
+                pluginLock.lock();
+
+            ep->sceneData = m_Plugins->Load3DModel( aFileName, ep->pluginInfo );
+
+            if( !ADVANCED_CFG::GetCfg().m_Skip3DModelFileCache && nullptr != ep->sceneData )
+                saveCacheData( ep );
+        }
     }
 
-    ep->sceneData = m_Plugins->Load3DModel( aFileName, ep->pluginInfo );
-
-    if( !ADVANCED_CFG::GetCfg().m_Skip3DModelFileCache && nullptr != ep->sceneData )
-        saveCacheData( ep );
+    aLock.lock();
+    ep->loading = false;
+    cv3D_cache.notify_all();
 
     return ep->sceneData;
 }
@@ -527,7 +551,8 @@ bool S3D_CACHE::SetProject( PROJECT* aProject )
 
     if( m_FNResolver->SetProject( aProject, &hasChanged ) && hasChanged )
     {
-        std::lock_guard<std::mutex> lock( mutex3D_cache );
+        std::unique_lock<std::mutex> lock( mutex3D_cache );
+        cv3D_cache.wait( lock, []() { return busy3D_cache == 0; } );
 
         m_CacheMap.clear();
 
@@ -569,7 +594,8 @@ std::list< wxString > const* S3D_CACHE::GetFileFilters() const
 
 void S3D_CACHE::FlushCache( bool closePlugins )
 {
-    std::lock_guard<std::mutex> lock( mutex3D_cache );
+    std::unique_lock<std::mutex> lock( mutex3D_cache );
+    cv3D_cache.wait( lock, []() { return busy3D_cache == 0; } );
 
     std::list< S3D_CACHE_ENTRY* >::iterator sCL = m_CacheList.begin();
     std::list< S3D_CACHE_ENTRY* >::iterator eCL = m_CacheList.end();

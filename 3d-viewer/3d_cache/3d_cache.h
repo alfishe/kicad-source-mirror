@@ -154,7 +154,9 @@ private:
      * @param aCachePtr is an optional return address for cache entry pointer.
      * @return SCENEGRAPH object associated with file name or NULL on error.
      */
-    SCENEGRAPH* checkCache( const wxString& aFileName, S3D_CACHE_ENTRY** aCachePtr = nullptr );
+    /// Registers the entry and reads it with aLock (on mutex3D_cache) released meanwhile
+    SCENEGRAPH* checkCache( const wxString& aFileName, S3D_CACHE_ENTRY** aCachePtr,
+                            std::unique_lock<std::mutex>& aLock );
 
     /**
      * Calculate the SHA1 hash of the given file.
