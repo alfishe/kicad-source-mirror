@@ -272,6 +272,17 @@ std::string seatClass( const FOOTPRINT* aFp, const FP_3DMODEL& aModel, const MOD
             return "free";
     }
 
+    // upright leaded power packages stand on their lead shoulders at whatever height they are soldered
+    if( name.Contains( wxS( "VERTICAL" ) ) )
+    {
+        for( const wxString& upright : { wxS( "TO-220" ), wxS( "TO-247" ), wxS( "TO-126" ), wxS( "TO-218" ), wxS( "TO-251" ),
+                                         wxS( "TO-262" ), wxS( "TO-264" ), wxS( "TO-3P" ) } )
+        {
+            if( name.Contains( upright ) )
+                return "free";
+        }
+    }
+
     return "body";
 }
 
@@ -816,7 +827,7 @@ KOPENAPI_REGISTER( "pcb_models_inspect",
                    "the gap to the board and lead length below it; problems: missing file, no model, "
                    "floating, sunk. Seating class per model (<model>.meta.json mount.seat, else by name): "
                    "shoulder (DIP / SIP chips: gap = package A1, JEDEC >= 0.38 mm), free (TO-92, LEDs, "
-                   "HC-49: any height, footprint field mount_height_mm checks it), body (gap 0). A model "
+                   "HC-49, upright TO-220 / TO-247 ...: any height, footprint field mount_height_mm checks it), body (gap 0). A model "
                    "whose STEP solids are named by role is measured on the solid named 'body' "
                    "(seat.body_gap_mm); seat.lowest_at_mm is where the lowest point is; a part reaching "
                    "over the board edge (seat.over_board_edge) may hang below the top beyond it. Geometry "
