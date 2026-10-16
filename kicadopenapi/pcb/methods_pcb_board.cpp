@@ -801,6 +801,9 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
             if( c.contains( "nets" ) && !c["nets"].is_array() )
                 return KOPENAPI_RESULT::Error( 400, "nets: array of net names or patterns (*, ?)" );
+
+            if( c.value( "delete", false ) && c.value( "name", std::string() ) == str( NETCLASS::Default ) )
+                return KOPENAPI_RESULT::Error( 400, "the Default class cannot be deleted" );
         }
     }
 
@@ -829,6 +832,45 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         {
             const wxString           name = wxString::FromUTF8( c["name"].get<std::string>() );
             std::shared_ptr<NETCLASS> netclass;
+
+            // the class's patterns, or the patterns of other classes naming the same nets, go
+            auto dropPatterns = [&]( const std::function<bool( const wxString&, const wxString& )>& aDrop )
+            {
+                auto& assignments = net->GetNetclassPatternAssignments();
+                std::vector<std::pair<std::unique_ptr<EDA_COMBINED_MATCHER>, wxString>> kept;
+
+                for( auto& [matcher, cls] : assignments )
+                {
+                    if( !aDrop( matcher->GetPattern(), cls ) )
+                        kept.emplace_back( std::move( matcher ), cls );
+                }
+
+                net->SetNetclassPatternAssignments( std::move( kept ) );
+            };
+
+            if( c.value( "delete", false ) )
+            {
+                dropPatterns( [&]( const wxString&, const wxString& aClass ) { return aClass == name; } );
+
+                std::map<wxString, std::shared_ptr<NETCLASS>> classes = net->GetNetclasses();
+                classes.erase( name );
+                net->SetNetclasses( classes );
+                continue;
+            }
+
+            if( c.contains( "nets" ) )
+            {
+                std::set<wxString> named;
+
+                for( const nlohmann::json& pattern : c["nets"] )
+                {
+                    if( pattern.is_string() )
+                        named.insert( wxString::FromUTF8( pattern.get<std::string>() ) );
+                }
+
+                dropPatterns( [&]( const wxString& aPattern, const wxString& aClass )
+                              { return aClass == name || named.count( aPattern ); } );
+            }
 
             if( name == NETCLASS::Default )
             {
@@ -946,7 +988,8 @@ KOPENAPI_REGISTER( "pcb_rules_set",
                             "name":{"type":"string"},"clearance_mm":{"type":"number"},"track_width_mm":{"type":"number"},
                             "via_diameter_mm":{"type":"number"},"via_drill_mm":{"type":"number"},
                             "diff_pair_width_mm":{"type":"number"},"diff_pair_gap_mm":{"type":"number"},
-                            "nets":{"type":"array","items":{"type":"string"}}}}}}})json"_json,
+                            "nets":{"type":"array","items":{"type":"string"},"description":"the class's nets / patterns: replaces its earlier ones, and the nets leave other classes; [] empties it"},
+                            "delete":{"type":"boolean","description":"remove this class and its net patterns"}}}}}})json"_json,
                    false, h_pcb_rules_set );
 
 KOPENAPI_MARK_EDITING( "pcb_netlist_apply", "pcb_outline_set", "pcb_rules_set" );
