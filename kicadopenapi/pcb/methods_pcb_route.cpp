@@ -18,6 +18,8 @@
 #include <board_commit.h>
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
+#include <geometry/shape_circle.h>
+#include <geometry/shape_segment.h>
 #include <connectivity/connectivity_data.h>
 #include <ratsnest/ratsnest_data.h>
 #include <footprint.h>
@@ -381,7 +383,7 @@ static std::optional<KOPENAPI_RESULT> guiRouting()
 }
 
 
-bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
+bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
 {
     BOARD*     board = aContext.GetBoard();
     const auto started = std::chrono::steady_clock::now();
@@ -496,6 +498,7 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
                 aOut["reason"] = "blocked before the waypoint at " + std::to_string( toMm( at.x ) ) + ", "
                                  + std::to_string( toMm( at.y ) );
                 aOut["stopped_at_mm"] = { toMm( end.x ), toMm( end.y ) };
+                aOut["toward_mm"] = { toMm( at.x ), toMm( at.y ) };
                 return false;
             }
 
@@ -536,6 +539,7 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
             aOut["routed"] = false;
             aOut["reason"] = "blocked before the via at " + std::to_string( toMm( at.x ) ) + ", " + std::to_string( toMm( at.y ) );
             aOut["stopped_at_mm"] = { toMm( end.x ), toMm( end.y ) };
+                aOut["toward_mm"] = { toMm( at.x ), toMm( at.y ) };
             return false;
         }
 
@@ -707,6 +711,87 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     aOut["routed"] = true;
     aOut["applied"] = true;
     return true;
+}
+
+
+/// @brief What stands in the way of a route that stopped: copper of other nets on its layer that the
+/// path from the stop point toward its aim (the target, or the via / corner it was heading for)
+/// crosses within 5 mm, or that lies within 1 mm of the stop point; nearest first, at most three
+/// (pads by REF.PAD, tracks and vias by net)
+nlohmann::json blockersAt( BOARD* aBoard, const VECTOR2I& aAt, const VECTOR2I& aAim, PCB_LAYER_ID aLayer, int aNetCode,
+                           int aHalfWidth )
+{
+    std::vector<std::pair<int, nlohmann::json>> found;
+    const int      near = pcbIUScale.mmToIU( 1.0 );
+    const VECTOR2I dir = aAim - aAt;
+    const double   len = dir.EuclideanNorm();
+    const int      look = pcbIUScale.mmToIU( 5.0 );
+    const VECTOR2I end = len > look ? aAt + VECTOR2I( KiROUND( (double) dir.x * look / len ), KiROUND( (double) dir.y * look / len ) )
+                                    : aAim;
+    const SHAPE_SEGMENT path( aAt, end, 2 * aHalfWidth );
+    const SHAPE_CIRCLE  probe( aAt, 0 );
+
+    BOX2I area( aAt, VECTOR2I( 0, 0 ) );
+    area.Merge( end );
+    area.Inflate( near + aHalfWidth );
+
+    auto consider = [&]( BOARD_CONNECTED_ITEM* aItem, nlohmann::json aWhat )
+    {
+        if( aItem->GetNetCode() == aNetCode || !aItem->IsOnLayer( aLayer ) || !area.Intersects( aItem->GetBoundingBox() ) )
+            return;
+
+        std::shared_ptr<SHAPE> shape = aItem->GetEffectiveShape( aLayer );
+        int                    actual = 0;
+
+        if( shape->Collide( &path, 0 ) || shape->Collide( &probe, near ) )
+        {
+            shape->Collide( &probe, std::numeric_limits<int>::max() / 2, &actual );
+            aWhat["net"] = str( UnescapeString( aItem->GetNetname() ) );
+            aWhat["distance_mm"] = toMm( actual );
+            found.emplace_back( actual, aWhat );
+        }
+    };
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( PAD* pad : fp->Pads() )
+            consider( pad, { { "pad", str( fp->GetReference() ) + "." + str( pad->GetNumber() ) } } );
+    }
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+        consider( track, { { "type", track->Type() == PCB_VIA_T ? "via" : "track" }, { "uuid", str( track->m_Uuid.AsString() ) } } );
+
+    std::stable_sort( found.begin(), found.end(), []( const auto& x, const auto& y ) { return x.first < y.first; } );
+
+    nlohmann::json out = nlohmann::json::array();
+
+    for( size_t k = 0; k < found.size() && k < 3; ++k )
+        out.push_back( found[k].second );
+
+    return out;
+}
+
+
+/// @brief routeOneImpl, and for a route that stopped short what stands there (blocked_by)
+bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
+{
+    const bool ok = routeOneImpl( aContext, aReq, aOut, aAdded );
+
+    auto point = []( const nlohmann::json& aMm )
+    { return VECTOR2I( pcbIUScale.mmToIU( aMm[0].get<double>() ), pcbIUScale.mmToIU( aMm[1].get<double>() ) ); };
+
+    if( !ok && aOut.contains( "stopped_at_mm" ) && aReq.from )
+    {
+        const VECTOR2I at = point( aOut["stopped_at_mm"] );
+        const VECTOR2I aim = aOut.contains( "toward_mm" ) ? point( aOut["toward_mm"] )
+                             : aOut.contains( "target_mm" ) ? point( aOut["target_mm"] ) : at;
+        const int      half = pcbIUScale.mmToIU( aOut.value( "track_width_mm", 0.2 ) ) / 2
+                         + pcbIUScale.mmToIU( aOut.value( "clearance_mm", 0.2 ) );
+
+        aOut["blocked_by"] = blockersAt( aContext.GetBoard(), at, aim, aReq.layer, aReq.from->GetNetCode(), half );
+    }
+
+    return ok;
 }
 
 
@@ -1551,8 +1636,11 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         {
             row["reason"] = attempt.value( "reason", std::string() );
 
-            if( attempt.contains( "violations" ) )
-                row["violations"] = attempt["violations"];
+            for( const char* key : { "violations", "stopped_at_mm", "blocked_by" } )
+            {
+                if( attempt.contains( key ) )
+                    row[key] = attempt[key];
+            }
         }
 
         rowOf[index] = (int) results.size();
@@ -1609,6 +1697,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                     row["routed"] = true;
                     row.erase( "reason" );
                     row.erase( "violations" );
+                    row.erase( "stopped_at_mm" );
+                    row.erase( "blocked_by" );
                     row["retried"] = true;
                     row["layer"] = attempt["layer"];
                     row["mode"] = attempt["mode"];
@@ -1720,6 +1810,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 row["routed"] = true;
                 row.erase( "reason" );
                 row.erase( "violations" );
+                row.erase( "stopped_at_mm" );
+                row.erase( "blocked_by" );
                 row["after_rip_up"] = true;
                 row["layer"] = attempt["layer"];
                 row["mode"] = attempt["mode"];
