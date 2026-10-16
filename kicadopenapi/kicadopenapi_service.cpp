@@ -26,6 +26,9 @@
 #include <deque>
 #include <thread>
 
+// A body sent without "Content-Type: application/json" (curl -d, Python urllib) is taken as a form,
+// whose limit would be 8 KB: a netlist or a long query would get 413.  The same limit as JSON.
+#define CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH ( 100 * 1024 * 1024 )
 #include <httplib.h>
 
 #include <kiway.h>
