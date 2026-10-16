@@ -155,17 +155,19 @@ int netClearance( BOARD_CONNECTED_ITEM* aItem, int aFloor )
 /// of another net - pads, tracks, vias, filled zones; removed items do not count.  The clearance is
 /// the board's rule for the pair (DRC engine: custom rules, net classes, board minimum), as DRC and
 /// the router see it.  aZonesYield: the caller refills the zones afterwards, so other nets' fills give
-/// way and do not count.
+/// way and do not count.  aStaged: copper of the same call that is not on the board yet.
 nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& aChanged,
-                      const std::set<BOARD_ITEM*>& aRemoved, bool aZonesYield = false )
+                      const std::set<BOARD_ITEM*>& aRemoved, bool aZonesYield = false,
+                      const std::vector<BOARD_CONNECTED_ITEM*>* aStaged = nullptr )
 {
     nlohmann::json               violations = nlohmann::json::array();
     const BOARD_DESIGN_SETTINGS& ds = aBoard->GetDesignSettings();
     const int                    floor = ds.m_MinClearance;
     std::shared_ptr<DRC_ENGINE>  drc = ds.m_DRCEngine;
 
-    // no pair needs more than this: shapes farther apart are never asked for their rule
-    const int widest = std::max( { ds.GetBiggestClearanceValue(), floor, 1 } );
+    // no pair needs more than this (copper or hole clearance): shapes farther apart are never asked
+    // for their rule
+    const int widest = std::max( { ds.GetBiggestClearanceValue(), floor, ds.m_HoleClearance, 1 } );
 
     auto required = [&]( BOARD_ITEM* aA, BOARD_ITEM* aB, PCB_LAYER_ID aLayer ) -> int
     {
@@ -202,6 +204,10 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
 
     for( BOARD_CONNECTED_ITEM* other : aChanged )
         others.push_back( other );
+
+    // copper of the same call not on the board yet (a commit not pushed)
+    if( aStaged )
+        others.insert( others.end(), aStaged->begin(), aStaged->end() );
 
     auto describe = [&]( BOARD_CONNECTED_ITEM* aItem )
     {
@@ -248,6 +254,40 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
                                             { "other", describe( other ) },
                                             { "distance_mm", toMm( actual ) },
                                             { "required_mm", toMm( need + 1 ) } } );
+                    continue;
+                }
+
+                // copper to a drilled hole (a via's, a through pad's) of the other: the board's hole
+                // clearance, either way round
+                for( const auto& [copper, holed, copperShape] :
+                     { std::tuple<BOARD_ITEM*, BOARD_ITEM*, SHAPE*>{ item, other, shape.get() },
+                       std::tuple<BOARD_ITEM*, BOARD_ITEM*, SHAPE*>{ other, item, otherShape.get() } } )
+                {
+                    std::shared_ptr<SHAPE_SEGMENT> hole = holed->HasHole() ? holed->GetEffectiveHoleShape() : nullptr;
+
+                    if( !hole )
+                        continue;
+
+                    int holeNeed = ds.m_HoleClearance;
+
+                    if( drc )
+                    {
+                        DRC_CONSTRAINT c = drc->EvalRules( HOLE_CLEARANCE_CONSTRAINT, copper, holed, layer );
+
+                        if( c.GetValue().HasMin() )
+                            holeNeed = c.GetValue().Min();
+                    }
+
+                    if( holeNeed > 0 && copperShape->Collide( hole.get(), holeNeed - 1, &actual ) )
+                    {
+                        violations.push_back( { { "layer", str( aBoard->GetLayerName( layer ) ) },
+                                                { "new", describe( item ) },
+                                                { "other", describe( other ) },
+                                                { "hole", true },
+                                                { "distance_mm", toMm( actual ) },
+                                                { "required_mm", toMm( holeNeed ) } } );
+                        break;
+                    }
                 }
             }
 
@@ -1190,6 +1230,54 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         layers.push_back( *layer );
     }
 
+    // plane layers (type power in the stack-up) carry no signals: a track there would cut the plane
+    nlohmann::json planeLayers = nlohmann::json::array();
+
+    if( !aArgs.value( "plane_layers", false ) )
+    {
+        // a plane: type power in the stack-up, or a layer more than half of which one pour covers
+        double boardArea = 0;
+        {
+            SHAPE_POLY_SET outline;
+
+            if( board->GetBoardPolygonOutlines( outline, true ) )
+                boardArea = outline.Area();
+        }
+
+        auto isPlane = [&]( PCB_LAYER_ID aLayer )
+        {
+            if( board->GetLayerType( aLayer ) == LT_POWER )
+                return true;
+
+            if( IsExternalCopperLayer( aLayer ) || boardArea <= 0 )
+                return false;   // outer layers with a pour still carry signals
+
+            std::map<int, double> covered;   // net -> pour area on this layer
+
+            for( ZONE* zone : board->Zones() )
+            {
+                if( !zone->GetIsRuleArea() && zone->IsOnLayer( aLayer ) )
+                    covered[zone->GetNetCode()] += zone->Outline()->Area();
+            }
+
+            return std::any_of( covered.begin(), covered.end(),
+                                [&]( const auto& c ) { return c.second > 0.5 * boardArea; } );
+        };
+
+        std::erase_if( layers, [&]( PCB_LAYER_ID aLayer )
+                       {
+                           if( !isPlane( aLayer ) )
+                               return false;
+
+                           planeLayers.push_back( str( board->GetLayerName( aLayer ) ) );
+                           return true;
+                       } );
+
+        if( layers.empty() )
+            return KOPENAPI_RESULT::Error( 422, "every given layer is a plane layer (type power): give signal layers, or "
+                                                "plane_layers: true" );
+    }
+
     const std::string order = aArgs.value( "order", std::string( "short_first" ) );
     const bool        dryRun = aArgs.value( "dry_run", false );
     const int         stepMs = std::clamp( aArgs.value( "step_ms", 0 ), 0, 5000 );
@@ -1389,6 +1477,55 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         NETCLASS*  netclass = info->GetNetClass();
         const bool power = netclass && netclass->GetName() != NETCLASS::Default;
 
+        // a fanned-out ball is reached at its via (any layer), not at the ball (its own layer only)
+        std::vector<PCB_VIA*> netVias;
+
+        for( PCB_TRACK* t : board->Tracks() )
+        {
+            if( t->Type() == PCB_VIA_T && t->GetNetCode() == code )
+                netVias.push_back( static_cast<PCB_VIA*>( t ) );
+        }
+
+        auto fannedVia = [&]( BOARD_CONNECTED_ITEM* aItem, const VECTOR2I& aAnchor ) -> PCB_VIA*
+        {
+            // a track with an end on a via (the stub of a dog-bone): the via
+            if( aItem->Type() == PCB_TRACE_T || aItem->Type() == PCB_ARC_T )
+            {
+                const PCB_TRACK* t = static_cast<PCB_TRACK*>( aItem );
+
+                for( PCB_VIA* v : netVias )
+                {
+                    for( const VECTOR2I& end : { aAnchor, t->GetStart(), t->GetEnd() } )
+                    {
+                        if( ( v->GetPosition() - end ).EuclideanNorm() <= pcbIUScale.mmToIU( 0.01 ) )
+                            return v;
+                    }
+                }
+
+                return nullptr;
+            }
+
+            if( aItem->Type() != PCB_PAD_T || static_cast<PAD*>( aItem )->GetAttribute() != PAD_ATTRIB::SMD )
+                return nullptr;
+
+            const VECTOR2I at = aItem->GetPosition();
+            const BOX2I    pad = aItem->GetBoundingBox();
+            const int      reach = std::max( pad.GetWidth(), pad.GetHeight() ) + pcbIUScale.mmToIU( 0.45 );
+
+            for( PCB_VIA* v : netVias )
+            {
+                if( ( v->GetPosition() - at ).EuclideanNorm() > reach )
+                    continue;
+
+                const auto joined = connectivity->GetConnectedItems( v );
+
+                if( std::find( joined.begin(), joined.end(), aItem ) != joined.end() )
+                    return v;
+            }
+
+            return nullptr;
+        };
+
         for( const CN_EDGE& edge : rn->GetEdges() )
         {
             std::shared_ptr<const CN_ANCHOR> a = edge.GetSourceNode(), b = edge.GetTargetNode();
@@ -1398,25 +1535,32 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
             BOARD_CONNECTED_ITEM* pa = a->Parent();
             BOARD_CONNECTED_ITEM* pb = b->Parent();
+            VECTOR2I              posA = a->Pos(), posB = b->Pos();
+
+            if( PCB_VIA* v = fannedVia( pa, posA ) )
+                pa = v, posA = v->GetPosition();
+
+            if( PCB_VIA* v = fannedVia( pb, posB ) )
+                pb = v, posB = v->GetPosition();
 
             if( pa->Type() != PCB_PAD_T )
-                std::swap( a, b ), std::swap( pa, pb );
+                std::swap( pa, pb ), std::swap( posA, posB );
 
             if( pa->Type() != PCB_PAD_T )
             {
-                // two pieces of the net's copper with a gap between (tracks / vias): routed after the
-                // pad connections, from the end of one to the other
+                // two pieces of the net's copper with a gap between (tracks / vias, a fanned-out ball's
+                // via): routed after the pad connections, from the end of one to the other
                 if( ( pa->Type() == PCB_TRACE_T || pa->Type() == PCB_ARC_T || pa->Type() == PCB_VIA_T )
                     && ( pb->Type() == PCB_TRACE_T || pb->Type() == PCB_ARC_T || pb->Type() == PCB_VIA_T ) )
                 {
-                    gaps.push_back( { pa->m_Uuid, pb->m_Uuid, a->Pos(), b->Pos(), name } );
+                    gaps.push_back( { pa->m_Uuid, pb->m_Uuid, posA, posB, name } );
                 }
 
                 continue;
             }
 
-            jobs.push_back( { static_cast<PAD*>( pa ), pb, pa->m_Uuid, pb->m_Uuid, b->Pos(),
-                              (double) ( b->Pos() - a->Pos() ).EuclideanNorm(), name, power } );
+            jobs.push_back( { static_cast<PAD*>( pa ), pb, pa->m_Uuid, pb->m_Uuid, posB,
+                              (double) ( posB - posA ).EuclideanNorm(), name, power } );
         }
     }
 
@@ -2210,9 +2354,16 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         auto* a = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( gap.a, true ) );
         auto* b = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( gap.b, true ) );
 
+        auto kind = []( BOARD_ITEM* aItem ) -> std::string
+        {
+            return !aItem ? "gone" : aItem->Type() == PCB_VIA_T ? "via" : aItem->Type() == PCB_PAD_T ? "pad" : "track";
+        };
+
         nlohmann::json row = { { "net", gap.net },
                                { "gap", { { "from_mm", { toMm( gap.aPos.x ), toMm( gap.aPos.y ) } },
-                                          { "to_mm", { toMm( gap.bPos.x ), toMm( gap.bPos.y ) } } } },
+                                          { "to_mm", { toMm( gap.bPos.x ), toMm( gap.bPos.y ) } },
+                                          { "from", kind( board->ResolveItem( gap.a, true ) ) },
+                                          { "to", kind( board->ResolveItem( gap.b, true ) ) } } },
                                { "routed", false },
                                { "tries", 0 } };
 
@@ -2392,6 +2543,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                   { "rip_up", { { "tried", rippedTried }, { "won", rippedOk } } },
                                   { "stubs_removed", stubs },
                                   { "kept_out_under", keptOut },
+                                  { "plane_layers_skipped", planeLayers },
                                   { "dry_run", dryRun },
                                   { "unrouted_left", dryRun ? connections - routed : (int) connectivity->GetUnconnectedCount( false ) },
                                   { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
@@ -3584,6 +3736,396 @@ static KOPENAPI_RESULT h_pcb_via_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 }
 
 
+/// @brief Fan an area-array package (BGA, LGA) out as the reference designs do: a dog-bone per ball -
+/// a short track from the ball to a through via on the diagonal between four balls, pointing away
+/// from the package centre (quadrant fan-out), another diagonal when that spot is taken.  Balls of
+/// single-pad nets are left alone, and so are the outer rings that leave on the ball's layer.  Via and
+/// stub sizes follow the pitch unless given; the guard and the board's minimums apply; pours give way
+/// and are refilled; one undo step.
+static KOPENAPI_RESULT h_pcb_fanout( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*         board = context->GetBoard();
+    const wxString ref = wxString::FromUTF8( aArgs.value( "ref", std::string() ) );
+    FOOTPRINT*     fp = nullptr;
+
+    for( FOOTPRINT* f : board->Footprints() )
+    {
+        if( f->GetReference() == ref )
+            fp = f;
+    }
+
+    if( !fp )
+        return KOPENAPI_RESULT::Error( 404, "ref: no footprint " + aArgs.value( "ref", std::string() ) );
+
+    std::vector<PAD*> balls;
+
+    for( PAD* pad : fp->Pads() )
+    {
+        if( pad->GetAttribute() == PAD_ATTRIB::SMD )
+            balls.push_back( pad );
+    }
+
+    if( balls.size() < 9 )
+        return KOPENAPI_RESULT::Error( 422, "not an area-array package (fewer than 9 SMD pads)" );
+
+    // the pitch: the median distance to the nearest ball
+    std::vector<double> nearest;
+
+    for( PAD* a : balls )
+    {
+        double best = std::numeric_limits<double>::max();
+
+        for( PAD* b : balls )
+        {
+            if( a != b )
+                best = std::min( best, double( ( a->GetPosition() - b->GetPosition() ).EuclideanNorm() ) );
+        }
+
+        nearest.push_back( best );
+    }
+
+    std::nth_element( nearest.begin(), nearest.begin() + nearest.size() / 2, nearest.end() );
+    const int pitch = KiROUND( nearest[nearest.size() / 2] );
+
+    BOX2I span( balls.front()->GetPosition(), VECTOR2I( 0, 0 ) );
+
+    for( PAD* b : balls )
+        span.Merge( b->GetPosition() );
+
+    const VECTOR2I centre = span.Centre();
+    const int      cols = KiROUND( double( span.GetWidth() ) / pitch );
+    const int      rows = KiROUND( double( span.GetHeight() ) / pitch );
+
+    // an array: balls on most points of a grid of three or more rows and columns (DDR packages leave a
+    // corridor in the middle), and inside its outer ring too (a small QFN / QFP ring fills half its grid)
+    int inner = 0;
+
+    for( PAD* b : balls )
+    {
+        const VECTOR2I d = b->GetPosition() - span.GetOrigin();
+
+        if( d.x > pitch / 2 && d.y > pitch / 2 && span.GetWidth() - d.x > pitch / 2 && span.GetHeight() - d.y > pitch / 2 )
+            inner++;
+    }
+
+    if( cols < 2 || rows < 2 || double( balls.size() ) / ( ( cols + 1 ) * ( rows + 1 ) ) < 0.4
+        || double( inner ) / ( ( cols - 1 ) * ( rows - 1 ) ) < 0.25 )
+        return KOPENAPI_RESULT::Error( 422, "not an area-array package (pads on a ring, or too few rows): a QFP / QFN fans out "
+                                            "with pcb_route" );
+
+    // sizes from the pitch (the reference designs: 0.5 mm 0.28 / 0.15, 0.8 mm 0.4 - 0.5 / 0.2 - 0.25,
+    // 1.0 mm 0.5 / 0.2), the board's minimums as a floor
+    const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+    const double                 pitchMm = pitch / pcbIUScale.IU_PER_MM;
+    const double defDia = pitchMm < 0.6 ? 0.3 : pitchMm < 0.7 ? 0.35 : pitchMm < 0.9 ? 0.45 : 0.5;
+    const double defDrill = pitchMm < 0.6 ? 0.15 : pitchMm < 0.9 ? 0.2 : 0.25;
+    // the board's rules at a via between the balls (custom rules under a BGA count): smallest via,
+    // drill and ring, and the clearance a via of one net keeps to a ball of another
+    int minDia = bds.m_ViasMinSize, minDrill = bds.m_MinThroughDrill, minRing = bds.m_ViasMinAnnularWidth;
+    int clearance = std::max( bds.m_MinClearance, 1 );
+    int ballRadius = 0;
+
+    for( PAD* b : balls )
+        ballRadius = std::max( ballRadius, (int) std::max( b->GetBoundingBox().GetWidth(), b->GetBoundingBox().GetHeight() ) / 2 );
+
+    if( std::shared_ptr<DRC_ENGINE> drc = bds.m_DRCEngine )
+    {
+        PAD*    a = balls.front();
+        PAD*    other = nullptr;
+
+        for( PAD* b : balls )
+        {
+            if( b->GetNetCode() != a->GetNetCode() )
+                other = b;
+        }
+
+        PCB_VIA probe( board );
+        probe.SetViaType( VIATYPE::THROUGH );
+        probe.SetLayerPair( F_Cu, B_Cu );
+        probe.SetPosition( a->GetPosition() + VECTOR2I( pitch / 2, pitch / 2 ) );
+        probe.SetNet( a->GetNet() );
+
+        auto minOf = [&]( DRC_CONSTRAINT_T aType, const BOARD_ITEM* aOther, int aFallback )
+        {
+            DRC_CONSTRAINT c = drc->EvalRules( aType, &probe, aOther, F_Cu );
+            return c.GetValue().HasMin() ? c.GetValue().Min() : aFallback;
+        };
+
+        minDia = minOf( VIA_DIAMETER_CONSTRAINT, nullptr, minDia );
+        minDrill = minOf( HOLE_SIZE_CONSTRAINT, nullptr, minDrill );
+        minRing = minOf( ANNULAR_WIDTH_CONSTRAINT, nullptr, minRing );
+
+        if( other )
+            clearance = std::max( 1, minOf( CLEARANCE_CONSTRAINT, other, clearance ) );
+    }
+
+    // the room between four balls: half the diagonal holds half the via, a ball and the clearance
+    const int room = KiROUND( pitch / M_SQRT2 );
+    const int fitDia = 2 * ( room - ballRadius - clearance );
+
+    int viaDia = aArgs.contains( "via_diameter_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", defDia ) )
+                                                   : std::max( minDia, std::min( pcbIUScale.mmToIU( defDia ), fitDia ) );
+    int viaDrill = aArgs.contains( "via_drill_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", defDrill ) )
+                                                    : std::max( minDrill, std::min( pcbIUScale.mmToIU( defDrill ), viaDia - 2 * std::max( minRing, 1 ) ) );
+
+    // vias already under the package: the design's own size (the most common one), when its rules allow it
+    if( !aArgs.contains( "via_diameter_mm" ) && !aArgs.contains( "via_drill_mm" ) )
+    {
+        std::map<std::pair<int, int>, int> sizes;
+        BOX2I                              under = span;
+        under.Inflate( pitch );
+
+        for( PCB_TRACK* t : board->Tracks() )
+        {
+            if( t->Type() == PCB_VIA_T && under.Contains( t->GetPosition() ) )
+            {
+                PCB_VIA* v = static_cast<PCB_VIA*>( t );
+                sizes[{ v->GetWidth( F_Cu ), v->GetDrillValue() }]++;
+            }
+        }
+
+        if( !sizes.empty() )
+        {
+            const auto common = std::max_element( sizes.begin(), sizes.end(),
+                                                  []( const auto& x, const auto& y ) { return x.second < y.second; } );
+
+            const auto [dia, drill] = common->first;
+
+            if( dia <= fitDia && dia >= minDia && drill >= minDrill && drill + 2 * minRing <= dia )
+            {
+                viaDia = dia;
+                viaDrill = drill;
+            }
+        }
+    }
+
+    if( viaDia > fitDia )
+        return KOPENAPI_RESULT::Error( 422, "a via of " + std::to_string( toMm( viaDia ) ).substr( 0, 5 ) + " mm does not fit between the "
+                                                    "balls (pitch " + std::to_string( toMm( pitch ) ).substr( 0, 5 ) + " mm, ball "
+                                                    + std::to_string( toMm( 2 * ballRadius ) ).substr( 0, 5 ) + " mm, clearance "
+                                                    + std::to_string( toMm( clearance ) ).substr( 0, 5 ) + " mm: at most "
+                                                    + std::to_string( toMm( std::max( 0, fitDia ) ) ).substr( 0, 5 ) + " mm), the board's "
+                                                    "rules allow down to " + std::to_string( toMm( minDia ) ).substr( 0, 5 ) + " mm: a rule for "
+                                                    "smaller vias / clearance under the package, or via-in-pad (not built yet)" );
+
+    if( viaDia < minDia || viaDrill < minDrill || viaDrill + 2 * minRing > viaDia )
+        return KOPENAPI_RESULT::Error( 422, "via " + std::to_string( toMm( viaDia ) ).substr( 0, 5 ) + " / "
+                                                    + std::to_string( toMm( viaDrill ) ).substr( 0, 5 )
+                                                    + " mm is below the board's rules (diameter / drill / ring): lower "
+                                                      "constraints in pcb_rules_set, or give via_diameter_mm / via_drill_mm" );
+
+    const int defaultDirect = pitchMm >= 0.75 ? 1 : 0;
+    const int direct = std::clamp( aArgs.value( "outer_rings_direct", defaultDirect ), 0, 20 );
+    const bool dryRun = aArgs.value( "dry_run", false );
+    const std::string zoneMode = aArgs.value( "zones", std::string( "refill" ) );
+
+    if( zoneMode != "refill" && zoneMode != "keep" )
+        return KOPENAPI_RESULT::Error( 400, "zones: refill (pour fills give way, refilled after) or keep" );
+
+    std::set<std::string> onlyNets;
+
+    for( const nlohmann::json& n : aArgs.value( "nets", nlohmann::json::array() ) )
+    {
+        if( n.is_string() )
+            onlyNets.insert( n.get<std::string>() );
+    }
+
+    // pads per net on the board: a ball on a net of its own has nothing to reach
+    std::map<int, int> netPads;
+
+    for( FOOTPRINT* f : board->Footprints() )
+    {
+        for( PAD* pad : f->Pads() )
+            netPads[pad->GetNetCode()]++;
+    }
+
+    std::set<std::pair<int, int>> spots;   // via spots taken (this call and vias already there)
+
+    for( PCB_TRACK* t : board->Tracks() )
+    {
+        if( t->Type() == PCB_VIA_T )
+            spots.insert( { t->GetPosition().x, t->GetPosition().y } );
+    }
+
+    BOARD_COMMIT              commit( context->GetToolManager() );
+    std::vector<KIID>         added;
+    std::vector<BOARD_CONNECTED_ITEM*> staged;   // vias and stubs of this call, owned by the commit
+    std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> planned;   // the same in a dry run
+    nlohmann::json            placed = nlohmann::json::array();
+    nlohmann::json            skipped = nlohmann::json::array();
+    std::map<std::string, int> why;
+    const int                 half = pitch / 2;
+
+    // inner rings first: they have the fewest choices
+    std::vector<std::pair<int, PAD*>> order;
+
+    for( PAD* b : balls )
+    {
+        const int col = KiROUND( double( b->GetPosition().x - span.GetLeft() ) / pitch );
+        const int row = KiROUND( double( b->GetPosition().y - span.GetTop() ) / pitch );
+        order.emplace_back( std::min( { col, row, cols - col, rows - row } ), b );
+    }
+
+    std::stable_sort( order.begin(), order.end(), []( const auto& x, const auto& y ) { return x.first > y.first; } );
+
+    auto skip = [&]( PAD* aBall, int aRing, const std::string& aWhy )
+    {
+        skipped.push_back( { { "ball", str( fp->GetReference() ) + "." + str( aBall->GetNumber() ) }, { "ring", aRing }, { "reason", aWhy } } );
+        why[aWhy]++;
+    };
+
+    for( const auto& [ring, ball] : order )
+    {
+        const std::string net = str( UnescapeString( ball->GetNetname() ) );
+
+        if( ball->GetNetCode() <= 0 || netPads[ball->GetNetCode()] < 2 )
+        {
+            skip( ball, ring, "no other pad on its net" );
+            continue;
+        }
+
+        if( !onlyNets.empty() && !onlyNets.count( net ) )
+            continue;
+
+        if( ring < direct )
+        {
+            skip( ball, ring, "outer ring: leaves on its layer (outer_rings_direct)" );
+            continue;
+        }
+
+        const PCB_LAYER_ID layer = ball->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
+        const VECTOR2I     at = ball->GetPosition();
+        const int          sx = at.x >= centre.x ? 1 : -1;
+        const int          sy = at.y >= centre.y ? 1 : -1;
+        const VECTOR2I     dirs[4] = { { sx, sy }, { sx, -sy }, { -sx, sy }, { -sx, -sy } };
+        bool               done = false;
+        std::string        last = "every diagonal spot taken";
+
+        NETCLASS* netclass = ball->GetEffectiveNetClass();
+        int       width = aArgs.contains( "width_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "width_mm", 0.1 ) )
+                                                       : ( netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : bds.m_TrackMinWidth );
+        width = std::max( bds.m_TrackMinWidth, std::min( width, fitDia ) );   // the stub passes two balls as the via does
+
+        // a rule of the net's own (impedance-controlled pairs) may want a wider track
+        if( std::shared_ptr<DRC_ENGINE> drc = bds.m_DRCEngine; drc && !aArgs.contains( "width_mm" ) )
+        {
+            PCB_TRACK probe( board );
+            probe.SetStart( ball->GetPosition() );
+            probe.SetEnd( ball->GetPosition() + VECTOR2I( half, half ) );
+            probe.SetLayer( ball->IsOnLayer( F_Cu ) ? F_Cu : B_Cu );
+            probe.SetNet( ball->GetNet() );
+            DRC_CONSTRAINT c = drc->EvalRules( TRACK_WIDTH_CONSTRAINT, &probe, nullptr, probe.GetLayer() );
+
+            if( c.GetValue().HasMin() )
+                width = std::max( width, c.GetValue().Min() );
+        }
+
+        for( const VECTOR2I& d : dirs )
+        {
+            const VECTOR2I spot = at + VECTOR2I( d.x * half, d.y * half );
+
+            if( spots.count( { spot.x, spot.y } ) )
+                continue;
+
+            auto via = std::make_unique<PCB_VIA>( board );
+            via->SetViaType( VIATYPE::THROUGH );
+            via->SetPosition( spot );
+            via->SetWidth( PADSTACK::ALL_LAYERS, viaDia );
+            via->SetDrill( viaDrill );
+            via->SetLayerPair( F_Cu, B_Cu );
+            via->SetNet( ball->GetNet() );
+
+            auto stub = std::make_unique<PCB_TRACK>( board );
+            stub->SetStart( at );
+            stub->SetEnd( spot );
+            stub->SetWidth( width );
+            stub->SetLayer( layer );
+            stub->SetNet( ball->GetNet() );
+
+            const nlohmann::json violations = guard( board, { via.get(), stub.get() }, {}, zoneMode == "refill", &staged );
+
+            if( !violations.empty() )
+            {
+                last = "the spots near it touch other copper (" + violations[0]["other"].dump() + ")";
+                continue;
+            }
+
+            spots.insert( { spot.x, spot.y } );
+            placed.push_back( { { "ball", str( fp->GetReference() ) + "." + str( ball->GetNumber() ) },
+                                { "net", net },
+                                { "ring", ring },
+                                { "via_mm", { toMm( spot.x ), toMm( spot.y ) } },
+                                { "outward", d.x == sx && d.y == sy } } );
+
+            staged.push_back( via.get() );
+            staged.push_back( stub.get() );
+
+            if( !dryRun )
+            {
+                added.push_back( via->m_Uuid );
+                added.push_back( stub->m_Uuid );
+                commit.Add( via.release() );
+                commit.Add( stub.release() );
+            }
+            else
+            {
+                planned.push_back( std::move( via ) );
+                planned.push_back( std::move( stub ) );
+            }
+
+            done = true;
+            break;
+        }
+
+        if( !done )
+            skip( ball, ring, last.substr( 0, 400 ) );
+    }
+
+    if( !dryRun && !added.empty() )
+    {
+        commit.Push( _( "Fan out (API)" ) );
+
+        if( zoneMode == "refill" )
+            refillPours( *context, board );
+
+        board->BuildConnectivity();
+        board->GetConnectivity()->RecalculateRatsnest();
+        showRoutes( aCtx, added );
+    }
+    else
+    {
+        commit.Revert();
+    }
+
+    nlohmann::json reasons = nlohmann::json::object();
+
+    for( const auto& [w, n] : why )
+        reasons[w] = n;
+
+    int outward = 0;
+
+    for( const nlohmann::json& p : placed )
+        outward += p["outward"].get<bool>() ? 1 : 0;
+
+    return KOPENAPI_RESULT::Ok( { { "ref", str( fp->GetReference() ) },
+                                  { "pitch_mm", toMm( pitch ) },
+                                  { "via", { { "diameter_mm", toMm( viaDia ) }, { "drill_mm", toMm( viaDrill ) } } },
+                                  { "outer_rings_direct", direct },
+                                  { "fanned", placed.size() },
+                                  { "outward", outward },
+                                  { "skipped", skipped.size() },
+                                  { "skipped_by_reason", reasons },
+                                  { "applied", !dryRun && !added.empty() },
+                                  { "balls", placed },
+                                  { "skipped_balls", skipped } } );
+}
+
+
 KOPENAPI_REGISTER( "pcb_route_connection",
                    "EXPERIMENTAL. Route one connection with KiCad's push-and-shove router, as a person "
                    "does in the editor: from a pad (REF.PAD) to a pad of the same net, or to the nearest "
@@ -3624,6 +4166,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
+                        "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); parts with pads inside the ring (exposed pad, BGA) stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (0.65 mm or closer) is routed at the Default class width (not below the board minimum), the rest of its net at its class width; the row says necked_from_mm"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
@@ -3715,4 +4258,24 @@ KOPENAPI_REGISTER( "pcb_via_add",
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_via_add );
 
-KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_track_add", "pcb_via_add" );
+KOPENAPI_REGISTER( "pcb_fanout",
+                   "Fan an area-array package (BGA / LGA) out before routing, as the reference designs do: per "
+                   "ball a short track to a through via on the diagonal between four balls, pointing away from "
+                   "the package centre (quadrant dog-bone; another diagonal when that spot is taken). Balls of "
+                   "nets with no other pad are left alone, so are the outer rings that leave on their layer "
+                   "(outer_rings_direct: default 1 at 0.75 mm pitch and coarser, 0 finer). Via size: given, or "
+                   "the one most used under the package when the rules allow it, or from the pitch (0.5 mm "
+                   "0.3 / 0.15, 0.65 mm 0.35 / 0.2, 0.8 mm 0.45 / 0.2, 1.0 mm 0.5 / 0.25); stub width the net class's (width_mm to set); the guard and the board's minimums "
+                   "apply; pours give way and are refilled; one undo step; dry_run plans only. Answers per ball "
+                   "(via spot, ring, outward) and the skipped ones with the reason; then pcb_route from the vias",
+                   R"json({"type":"object","required":["ref"],"properties":{
+                        "ref":{"type":"string"},
+                        "nets":{"type":"array","items":{"type":"string"},"description":"only these nets"},
+                        "outer_rings_direct":{"type":"integer","minimum":0},
+                        "via_diameter_mm":{"type":"number"},"via_drill_mm":{"type":"number"},
+                        "width_mm":{"type":"number"},
+                        "zones":{"type":"string","enum":["refill","keep"],"default":"refill"},
+                        "dry_run":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_fanout, 300 );
+
+KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_track_add", "pcb_via_add", "pcb_fanout" );
