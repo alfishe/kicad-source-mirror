@@ -704,6 +704,7 @@ struct NEAR_OPTIONS
     std::optional<double> rotationDeg;      ///< fixed; else the four turns in the target footprint's frame
     std::string           direction = "auto";
     std::string           partPad;          ///< pad number of the part to bring to the target; else by net
+    double                hostRingMm = 0;   ///< keep this far from the target footprint's courtyard (fan-out room)
 };
 
 struct NEAR_PLACEMENT
@@ -785,7 +786,12 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
             continue;
 
         SHAPE_POLY_SET area = courtyard( fp );
-        const BOX2I    box = area.BBox();
+
+        // the target's package keeps a ring free for the tracks leaving its pins
+        if( fp == host && aOptions.hostRingMm > 0 )
+            area.Inflate( toIU( aOptions.hostRingMm ), CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, ARC_HIGH_DEF );
+
+        const BOX2I box = area.BBox();
 
         if( box.Intersects( around ) )
             obstacles.emplace_back( std::move( area ), box );
@@ -960,9 +966,10 @@ nlohmann::json nearJson( const NEAR_PLACEMENT& aPlacement, PAD* aTarget )
 }
 
 
-std::optional<std::string> nearOptions( const nlohmann::json& aFrom, NEAR_OPTIONS& aOptions )
+std::optional<std::string> nearOptions( const nlohmann::json& aFrom, NEAR_OPTIONS& aOptions, double aDefaultGap = 0.25 )
 {
-    aOptions.gapMm = aFrom.value( "gap_mm", 0.25 );
+    aOptions.gapMm = aFrom.value( "gap_mm", aDefaultGap );
+    aOptions.hostRingMm = aFrom.value( "fanout_ring_mm", -1.0 );
     aOptions.maxMm = aFrom.value( "max_mm", 25.0 );
     aOptions.direction = aFrom.value( "near_direction", std::string( "auto" ) );
     aOptions.partPad = aFrom.value( "near_pad", std::string() );
@@ -980,6 +987,22 @@ std::optional<std::string> nearOptions( const nlohmann::json& aFrom, NEAR_OPTION
         return "gap_mm 0 … 10, max_mm up to 200";
 
     return std::nullopt;
+}
+
+
+/// @brief Pads 0.65 mm apart or closer (QFP, QFN, LGA, BGA)
+bool finePitch( FOOTPRINT* aFootprint )
+{
+    for( PAD* a : aFootprint->Pads() )
+    {
+        for( PAD* b : aFootprint->Pads() )
+        {
+            if( a != b && ( a->GetPosition() - b->GetPosition() ).EuclideanNorm() <= toIU( 0.65 ) )
+                return true;
+        }
+    }
+
+    return false;
 }
 
 
@@ -1102,7 +1125,17 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         NEAR_OPTIONS options = aOptions;
         options.partPad.clear();
 
-        const NEAR_PLACEMENT placement = placeNear( aBoard, member.part, target, options );
+        // a fine-pitch anchor (0.65 mm or less) keeps a ring for its fan-out, unless asked otherwise
+        if( options.hostRingMm < 0 )
+            options.hostRingMm = finePitch( aAnchor ) ? 0.6 : 0.0;
+
+        NEAR_PLACEMENT placement = placeNear( aBoard, member.part, target, options );
+
+        if( !placement.ok && options.hostRingMm > 0 )
+        {
+            options.hostRingMm = 0;   // no room with the ring: as close as the courtyards allow
+            placement = placeNear( aBoard, member.part, target, options );
+        }
 
         if( !placement.ok )
         {
@@ -1540,6 +1573,8 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
             if( std::optional<std::string> wrong = nearOptions( m, options ) )
                 return KOPENAPI_RESULT::Error( 400, *wrong );
 
+            options.hostRingMm = std::max( 0.0, options.hostRingMm );
+
             if( m.contains( "x_mm" ) || m.contains( "y_mm" ) || m.contains( "edge" ) )
                 return KOPENAPI_RESULT::Error( 400, "near places the part itself: leave out x_mm / y_mm / edge" );
         }
@@ -1656,6 +1691,7 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
             NEAR_OPTIONS options;
 
             nearOptions( m, options );
+            options.hostRingMm = std::max( 0.0, options.hostRingMm );
 
             const NEAR_PLACEMENT placement = placeNear( board, fp, target, options );
 
@@ -1841,7 +1877,8 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         edges = board->GetBoardEdgesBoundingBox();
     }
 
-    // 2. Connectors along the edges: left, right, top, bottom in turn, courtyard inset 0.5 mm
+    // 2. Connectors along the edges: left, right, top, bottom in turn, courtyard inset 0.5 mm; a
+    //    connector whose mating side is known turns to face out over its edge
     std::vector<FOOTPRINT*> rest;
     std::vector<KIID>       placed;
     const int               inset = toIU( 0.5 );
@@ -1857,23 +1894,53 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         }
 
         commit.Modify( fp );
-        const BOX2I box = courtyard( fp ).BBox();
+        const int s = side++ % 4;
+
+        if( std::optional<PANEL_EDGE> edge = panelEdge( fp ) )
+        {
+            static const double want[4] = { 180, 0, 270, 90 };   // left, right, up, down: facing out
+            const double        now = std::atan2( edge->second.y, edge->second.x ) * 180.0 / M_PI;
+            fp->SetOrientation( fp->GetOrientation() + EDA_ANGLE( now - want[s], DEGREES_T ) );
+        }
+
+        const BOX2I    box = courtyard( fp ).BBox();
         const VECTOR2I toOrigin = fp->GetPosition() - box.GetOrigin();
-        const int      s = side++ % 4;
         int&           offset = along[s];
         VECTOR2I       corner;
 
+        // on the top / bottom edges the connectors start from the middle outwards
+        const int middleX = edges.Centre().x - (int) box.GetWidth() / 2;
+
         if( s == 0 )
-            corner = VECTOR2I( edges.GetLeft() + inset, edges.GetTop() + inset + offset );
+            corner = VECTOR2I( edges.GetLeft() + inset, edges.Centre().y - (int) box.GetHeight() / 2 + offset );
         else if( s == 1 )
-            corner = VECTOR2I( edges.GetRight() - inset - (int) box.GetWidth(), edges.GetTop() + inset + offset );
+            corner = VECTOR2I( edges.GetRight() - inset - (int) box.GetWidth(), edges.Centre().y - (int) box.GetHeight() / 2 + offset );
         else if( s == 2 )
-            corner = VECTOR2I( edges.GetLeft() + inset + offset, edges.GetTop() + inset );
+            corner = VECTOR2I( middleX + offset, edges.GetTop() + inset );
         else
-            corner = VECTOR2I( edges.GetLeft() + inset + offset, edges.GetBottom() - inset - (int) box.GetHeight() );
+            corner = VECTOR2I( middleX + offset, edges.GetBottom() - inset - (int) box.GetHeight() );
 
         offset += ( s < 2 ? box.GetHeight() : box.GetWidth() ) + toIU( 1.0 );
         fp->SetPosition( corner + toOrigin );
+
+        // a connector with a known front: its panel line on the edge (the body inside, the mating face out)
+        if( std::optional<PANEL_EDGE> edge = panelEdge( fp ) )
+        {
+            const VECTOR2I line = edge->first.Center();
+            VECTOR2I       shift( 0, 0 );
+
+            if( s == 0 )
+                shift.x = edges.GetLeft() - line.x;
+            else if( s == 1 )
+                shift.x = edges.GetRight() - line.x;
+            else if( s == 2 )
+                shift.y = edges.GetTop() - line.y;
+            else
+                shift.y = edges.GetBottom() - line.y;
+
+            fp->Move( shift );
+        }
+
         fp->SetAttributes( fp->GetAttributes() & ~FP_JUST_ADDED );
         placed.push_back( fp->m_Uuid );
     }
@@ -1882,6 +1949,100 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     {
         commit.Push( _( "Connectors to the edges (API)" ) );
         commit = BOARD_COMMIT( context->GetToolManager() );
+    }
+
+    // 2b. The main parts of the given groups spread over the board (largest nearest the middle),
+    //     their parts left to the groups below; the autoplacer gets the others
+    std::set<FOOTPRINT*> anchors, members;
+
+    for( const nlohmann::json& group : aArgs.value( "groups", nlohmann::json::array() ) )
+    {
+        FOOTPRINT*              anchor = nullptr;
+        std::vector<FOOTPRINT*> parts;
+
+        if( groupParts( aCtx, board, group, anchor, parts, false ) )
+            continue;
+
+        if( !isConnector( anchor ) && !anchor->IsLocked() )
+            anchors.insert( anchor );
+
+        for( FOOTPRINT* part : parts )
+            members.insert( part );
+    }
+
+    if( !anchors.empty() )
+    {
+        std::vector<FOOTPRINT*> order( anchors.begin(), anchors.end() );
+
+        std::sort( order.begin(), order.end(),
+                   [&]( FOOTPRINT* x, FOOTPRINT* y )
+                   {
+                       const double ax = courtyard( x ).Area(), ay = courtyard( y ).Area();
+                       return ax != ay ? ax > ay : str( x->GetReference() ) < str( y->GetReference() );
+                   } );
+
+        BOX2I inner = edges;
+        inner.Inflate( -toIU( 3.0 ) );
+
+        // the main parts stay out of the strips the connectors took along the edges
+        int left = inner.GetLeft(), right = inner.GetRight(), top = inner.GetTop(), bottom = inner.GetBottom();
+
+        for( FOOTPRINT* fp : all )
+        {
+            if( !isConnector( fp ) || !aArgs.value( "connectors_to_edge", true ) )
+                continue;
+
+            const BOX2I c = courtyard( fp ).BBox();
+            const int   room = toIU( 2.0 ), near = toIU( 1.0 );
+
+            if( c.GetLeft() <= edges.GetLeft() + near )
+                left = std::max( left, c.GetRight() + room );
+            else if( c.GetRight() >= edges.GetRight() - near )
+                right = std::min( right, c.GetLeft() - room );
+            else if( c.GetTop() <= edges.GetTop() + near )
+                top = std::max( top, c.GetBottom() + room );
+            else if( c.GetBottom() >= edges.GetBottom() - near )
+                bottom = std::min( bottom, c.GetTop() - room );
+        }
+
+        // a board too small for the strips keeps the plain inner box
+        if( right - left > toIU( 5.0 ) && bottom - top > toIU( 5.0 ) )
+        {
+            inner.SetOrigin( left, top );
+            inner.SetEnd( right, bottom );
+        }
+
+        const int cols = std::max( 1, (int) std::ceil( std::sqrt( order.size() * double( inner.GetWidth() ) / std::max<double>( 1.0, inner.GetHeight() ) ) ) );
+        const int rows = std::max( 1, (int) std::ceil( order.size() / double( cols ) ) );
+
+        std::vector<VECTOR2I> cells;
+
+        for( int r = 0; r < rows; ++r )
+        {
+            for( int c = 0; c < cols; ++c )
+                cells.emplace_back( inner.GetLeft() + (int) ( ( c + 0.5 ) * inner.GetWidth() / cols ),
+                                    inner.GetTop() + (int) ( ( r + 0.5 ) * inner.GetHeight() / rows ) );
+        }
+
+        std::stable_sort( cells.begin(), cells.end(),
+                          [&]( const VECTOR2I& x, const VECTOR2I& y )
+                          { return ( x - inner.Centre() ).EuclideanNorm() < ( y - inner.Centre() ).EuclideanNorm(); } );
+
+        for( size_t i = 0; i < order.size(); ++i )
+        {
+            FOOTPRINT* fp = order[i];
+            commit.Modify( fp );
+            fp->Move( cells[i] - courtyard( fp ).BBox().Centre() );
+            fp->SetAttributes( fp->GetAttributes() & ~FP_JUST_ADDED );
+            placed.push_back( fp->m_Uuid );
+        }
+
+        commit.Push( _( "Main parts spread (API)" ) );
+        commit = BOARD_COMMIT( context->GetToolManager() );
+
+        rest.erase( std::remove_if( rest.begin(), rest.end(),
+                                    [&]( FOOTPRINT* fp ) { return anchors.count( fp ) || members.count( fp ); } ),
+                    rest.end() );
     }
 
     // 3. The rest: KiCad's autoplacer (matrix inside the outline, ratsnest cost); footprints a
@@ -1967,7 +2128,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         std::vector<FOOTPRINT*> parts;
         NEAR_OPTIONS            options;
 
-        if( groupParts( aCtx, board, group, anchor, parts, false ) || nearOptions( group, options ) )
+        if( groupParts( aCtx, board, group, anchor, parts, false ) || nearOptions( group, options, 0.5 ) )
         {
             notes.push_back( "group skipped (anchor / parts not found or locked): " + group.dump() );
             continue;
@@ -2010,7 +2171,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( std::optional<KOPENAPI_RESULT> error = groupParts( aCtx, board, aArgs, anchor, parts, aArgs.value( "override_locks", false ) ) )
         return *error;
 
-    if( std::optional<std::string> wrong = nearOptions( aArgs, options ) )
+    if( std::optional<std::string> wrong = nearOptions( aArgs, options, 0.5 ) )
         return KOPENAPI_RESULT::Error( 400, *wrong );
 
     nlohmann::json decoupling;
@@ -2095,7 +2256,8 @@ KOPENAPI_REGISTER( "pcb_place_group",
                         "decoupling":{"type":"string","enum":["schematic"],"description":"add the anchor's decoupling capacitors guessed from the open schematic: C parts across two of its rails, nearest to it on its sheet, one per supply pad (the answer's decoupling.chosen lists them)"},
                         "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
                         "side":{"type":"string","enum":["same","opposite"],"default":"same"},
-                        "gap_mm":{"type":"number","default":0.25,"description":"between courtyards"},
+                        "gap_mm":{"type":"number","default":0.5,"description":"between courtyards (room for a track between the parts)"},
+                        "fanout_ring_mm":{"type":"number","description":"keep this far from the anchor's courtyard (room for the tracks leaving its pins); default 0.6 for a fine-pitch anchor (pads 0.65 mm apart or closer), else 0; parts that find no place with it come as close as the courtyards allow"},
                         "max_mm":{"type":"number","default":25,"description":"how far from the anchor's pad a part may end up"},
                         "override_locks":{"type":"boolean","default":false},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
