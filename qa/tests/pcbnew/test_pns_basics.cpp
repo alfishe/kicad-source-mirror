@@ -684,6 +684,41 @@ BOOST_AUTO_TEST_CASE( PCBViaBackdrillCloneRetainsData )
  * INNER_LAYERS SOLID on 2-layer boards. This test verifies the layer range behavior
  * that motivated the fix.
  */
+/**
+ * The router meets obstacles in an order of their own, not in the order of their addresses:
+ * NODE::CheckColliding answers the first of a std::set<OBSTACLE>, NearestObstacle keeps the first
+ * of equally near ones.  Ordered by address, the same board routed differently from run to run.
+ */
+BOOST_AUTO_TEST_CASE( PNSObstacleOrderIgnoresAddresses )
+{
+    PNS::SEGMENT head( SEG( VECTOR2I( 0, 0 ), VECTOR2I( 1000, 0 ) ), nullptr );
+
+    for( int trial = 0; trial < 20; ++trial )
+    {
+        // the right-hand segment allocated first: usually the lower address
+        std::vector<std::unique_ptr<PNS::SEGMENT>> keep;
+        keep.push_back( std::make_unique<PNS::SEGMENT>( SEG( VECTOR2I( 5000, 0 ), VECTOR2I( 6000, 0 ) ), nullptr ) );
+        keep.push_back( std::make_unique<PNS::SEGMENT>( SEG( VECTOR2I( 2000, 0 ), VECTOR2I( 3000, 0 ) ), nullptr ) );
+
+        if( trial % 2 )
+            std::swap( keep[0], keep[1] );
+
+        std::set<PNS::OBSTACLE> obstacles;
+
+        for( const std::unique_ptr<PNS::SEGMENT>& seg : keep )
+        {
+            PNS::OBSTACLE o;
+            o.m_head = &head;
+            o.m_item = seg.get();
+            obstacles.insert( o );
+        }
+
+        BOOST_CHECK_EQUAL( static_cast<const PNS::SEGMENT*>( obstacles.begin()->m_item )->Seg().A.x, 2000 );
+        BOOST_CHECK( PNS::StableItemLess( keep[trial % 2 ? 0 : 1].get(), keep[trial % 2 ? 1 : 0].get() ) );
+    }
+}
+
+
 BOOST_AUTO_TEST_CASE( PNSLayerRangeSwapBehavior )
 {
     // On a 2-layer board with FRONT_INNER_BACK mode, BoardCopperLayerCount() returns 2.

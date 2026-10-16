@@ -207,7 +207,11 @@ ITEM* TOPOLOGY::NearestUnconnectedItem( const JOINT* aStart, int* aAnchor, int a
     int best_dist = INT_MAX;
     ITEM* best = nullptr;
 
-    for( ITEM* item : disconnected )
+    // in an order of their own: of two at the same distance the same one wins on every run
+    std::vector<ITEM*> candidates( disconnected.begin(), disconnected.end() );
+    std::sort( candidates.begin(), candidates.end(), StableItemLess );
+
+    for( ITEM* item : candidates )
     {
         if( item->OfKind( aKindMask ) )
         {
@@ -1068,6 +1072,8 @@ bool TOPOLOGY::AssembleDiffPair( ITEM* aStart, DIFF_PAIR& aPair )
         if( item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) && item->Layers() == startItem->Layers() )
             nItems.push_back( item );
     }
+
+    std::sort( nItems.begin(), nItems.end(), StableItemLess );   // the same pick on every run
 
     LINKED_ITEM* refItem = nullptr;
     LINKED_ITEM* coupledItem = nullptr;

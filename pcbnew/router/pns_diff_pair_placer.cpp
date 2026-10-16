@@ -606,9 +606,14 @@ bool DIFF_PAIR_PLACER::findDpEndingPrimitives( NODE* aWorld, const VECTOR2I& aP,
         return false;
     }
 
-    std::set<ITEM*> coupledItems;
+    std::set<ITEM*> coupledSet;
 
-    aWorld->AllItemsInNet( coupledNet, coupledItems );
+    aWorld->AllItemsInNet( coupledNet, coupledSet );
+
+    // in an order of their own: of two at the same distance the same one wins on every run
+    std::vector<ITEM*> coupledItems( coupledSet.begin(), coupledSet.end() );
+    std::sort( coupledItems.begin(), coupledItems.end(), StableItemLess );
+
     double bestDist = std::numeric_limits<double>::max();
     bool   found = false;
 

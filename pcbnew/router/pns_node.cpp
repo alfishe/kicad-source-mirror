@@ -264,6 +264,65 @@ struct NODE::DEFAULT_OBSTACLE_VISITOR : public OBSTACLE_VISITOR
 };
 
 
+bool StableItemLess( const ITEM* aA, const ITEM* aB )
+{
+    if( aA == aB )
+        return false;
+
+    if( !aA || !aB )
+        return !aA;
+
+    if( aA->Kind() != aB->Kind() )
+        return aA->Kind() < aB->Kind();
+
+    // where they are (a new track's uuid is random: geometry first)
+    const SHAPE* sa = aA->Shape( aA->Layers().Start() );
+    const SHAPE* sb = aB->Shape( aB->Layers().Start() );
+
+    if( sa && sb )
+    {
+        const BOX2I ba = sa->BBox();
+        const BOX2I bb = sb->BBox();
+
+        if( ba.GetLeft() != bb.GetLeft() )
+            return ba.GetLeft() < bb.GetLeft();
+
+        if( ba.GetTop() != bb.GetTop() )
+            return ba.GetTop() < bb.GetTop();
+
+        if( ba.GetRight() != bb.GetRight() )
+            return ba.GetRight() < bb.GetRight();
+
+        if( ba.GetBottom() != bb.GetBottom() )
+            return ba.GetBottom() < bb.GetBottom();
+    }
+    else if( !sa != !sb )
+    {
+        return !sa;
+    }
+
+    if( aA->Layers().Start() != aB->Layers().Start() )
+        return aA->Layers().Start() < aB->Layers().Start();
+
+    if( aA->Layers().End() != aB->Layers().End() )
+        return aA->Layers().End() < aB->Layers().End();
+
+    const LINKED_ITEM* la = dynamic_cast<const LINKED_ITEM*>( aA );
+    const LINKED_ITEM* lb = dynamic_cast<const LINKED_ITEM*>( aB );
+
+    if( la && lb && la->Uid() != lb->Uid() )
+        return la->Uid() < lb->Uid();
+
+    const BOARD_ITEM* pa = aA->Parent();
+    const BOARD_ITEM* pb = aB->Parent();
+
+    if( pa && pb && pa->m_Uuid != pb->m_Uuid )
+        return pa->m_Uuid < pb->m_Uuid;
+
+    return (uintptr_t) aA < (uintptr_t) aB;
+}
+
+
 int NODE::QueryColliding( const ITEM* aItem, NODE::OBSTACLES& aObstacles,
                           const COLLISION_SEARCH_OPTIONS& aOpts ) const
 {
@@ -1270,7 +1329,18 @@ void NODE::FinalizeBulkAdd()
 void NODE::FixupVirtualVias()
 {
     const SEGMENT* locked_seg = nullptr;
-    std::vector<VVIA*> vvias;
+
+    // made after the walk over the joints, in an order of their own (the joint map's order follows
+    // the addresses of the nets: the router's ids and the index would differ from run to run)
+    struct VVIA_SPEC
+    {
+        VECTOR2I   pos;
+        int        layer;
+        int        width;
+        NET_HANDLE net;
+    };
+
+    std::vector<VVIA_SPEC> vvias;
 
     for( auto& jointPair : m_joints )
     {
@@ -1334,8 +1404,7 @@ void NODE::FixupVirtualVias()
         {
             // fixme: the hull margin here is an ugly temporary workaround. The real fix
             // is to use octagons for via force propagation.
-            vvias.push_back( new VVIA( joint.Pos(), joint.Layers().Start(),
-                                       max_w + 2 * PNS_HULL_MARGIN, joint.Net() ) );
+            vvias.push_back( { joint.Pos(), joint.Layers().Start(), max_w + 2 * PNS_HULL_MARGIN, joint.Net() } );
         }
 
         if( is_locked )
@@ -1344,15 +1413,27 @@ void NODE::FixupVirtualVias()
                                         locked_seg->Seg().B :
                                         locked_seg->Seg().A;
 
-            vvias.push_back( new VVIA( secondPos, joint.Layers().Start(),
-                                       max_w + 2 * PNS_HULL_MARGIN, joint.Net() ) );
+            vvias.push_back( { secondPos, joint.Layers().Start(), max_w + 2 * PNS_HULL_MARGIN, joint.Net() } );
         }
     }
 
-    for( auto vvia : vvias )
-    {
-        Add( ItemCast<VIA>( std::unique_ptr<VVIA>( vvia ) ) );
-    }
+    std::sort( vvias.begin(), vvias.end(),
+               []( const VVIA_SPEC& a, const VVIA_SPEC& b )
+               {
+                   if( a.pos.x != b.pos.x )
+                       return a.pos.x < b.pos.x;
+
+                   if( a.pos.y != b.pos.y )
+                       return a.pos.y < b.pos.y;
+
+                   if( a.layer != b.layer )
+                       return a.layer < b.layer;
+
+                   return a.width < b.width;
+               } );
+
+    for( const VVIA_SPEC& v : vvias )
+        Add( ItemCast<VIA>( std::make_unique<VVIA>( v.pos, v.layer, v.width, v.net ) ) );
 }
 
 
@@ -1573,6 +1654,10 @@ void NODE::GetUpdatedItems( ITEM_VECTOR& aRemoved, ITEM_VECTOR& aAdded )
 
     for( ITEM* item : *m_index )
         aAdded.push_back( item );
+
+    // both sets are ordered by address: the board would take the items in another order each run
+    std::sort( aRemoved.begin(), aRemoved.end(), StableItemLess );
+    std::sort( aAdded.begin(), aAdded.end(), StableItemLess );
 }
 
 

@@ -82,6 +82,10 @@ struct CONSTRAINT
 };
 
 
+/// A strict order of router items that does not depend on where they sit in memory: kind, bounding
+/// box, layers, the router's own id; the board item's uuid and the address only last
+bool StableItemLess( const ITEM* aA, const ITEM* aB );
+
 /**
  * Hold an object colliding with another object, along with some useful data about the collision.
  */
@@ -100,13 +104,14 @@ struct OBSTACLE
         return m_head == other.m_head && m_item == other.m_item;
     }
 
+    /// The same order on every run (the first obstacle met and ties of the nearest one follow it):
+    /// by the items' own identity, their addresses only last
     bool operator<(const OBSTACLE& other) const
     {
-        if( (uintptr_t)m_head < (uintptr_t)other.m_head )
-            return true;
-        else if ( m_head == other.m_head )
-            return (uintptr_t)m_item < (uintptr_t)other.m_item;
-        return false;
+        if( m_head != other.m_head )
+            return StableItemLess( m_head, other.m_head );
+
+        return m_item != other.m_item && StableItemLess( m_item, other.m_item );
     }
 };
 

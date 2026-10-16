@@ -21,6 +21,9 @@
 
 #include "pns_index.h"
 #include "pns_router.h"
+#include "pns_node.h"
+
+#include <algorithm>
 
 namespace PNS {
 
@@ -74,9 +77,32 @@ void INDEX::BuildSpatialIndex()
         }
     }
 
-    // Bulk load each sub-index
+    // Bulk load each sub-index, the items in an order of their own (m_allItems is ordered by address:
+    // the tree, and with it the order queries meet obstacles in, would differ from run to run)
+    auto before = []( const std::pair<ITEM*, BOX2I>& a, const std::pair<ITEM*, BOX2I>& b )
+    {
+        const BOX2I& p = a.second;
+        const BOX2I& q = b.second;
+
+        if( p.GetLeft() != q.GetLeft() )
+            return p.GetLeft() < q.GetLeft();
+
+        if( p.GetTop() != q.GetTop() )
+            return p.GetTop() < q.GetTop();
+
+        if( p.GetRight() != q.GetRight() )
+            return p.GetRight() < q.GetRight();
+
+        if( p.GetBottom() != q.GetBottom() )
+            return p.GetBottom() < q.GetBottom();
+
+        return StableItemLess( a.first, b.first );
+    };
+
     for( auto& [layerId, items] : layerItems )
     {
+        std::stable_sort( items.begin(), items.end(), before );
+
         if( static_cast<size_t>( layerId ) < m_subIndices.size() )
             m_subIndices[layerId]->BulkLoad( items );
     }
