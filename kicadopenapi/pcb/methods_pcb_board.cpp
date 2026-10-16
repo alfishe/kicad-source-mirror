@@ -176,18 +176,18 @@ std::string footprintState( FOOTPRINT* aFootprint )
     return state;
 }
 
+} // namespace
+
 
 /// @brief No drawing frame on a board: an empty drawing sheet next to it, and a page that fits the
 /// board plus 10 mm (as the barycenter conversions do)
-void fitPage( BOARD* aBoard, const BOX2I& aOutline )
+void KopenapiFitPage( BOARD* aBoard, const BOX2I& aOutline )
 {
     PAGE_INFO page( PAGE_SIZE_TYPE::User );
     page.SetWidthMils( std::max( 1000.0, pcbIUScale.IUToMils( aOutline.GetRight() ) + 10.0 * 1000.0 / 25.4 ) );
     page.SetHeightMils( std::max( 1000.0, pcbIUScale.IUToMils( aOutline.GetBottom() ) + 10.0 * 1000.0 / 25.4 ) );
     aBoard->SetPageSettings( page );
 }
-
-} // namespace
 
 
 static KOPENAPI_RESULT h_pcb_new( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
@@ -262,7 +262,7 @@ static KOPENAPI_RESULT h_pcb_new( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         board.SetCopperLayerCount( layers );
 
         if( !frame )
-            fitPage( &board, BOX2I( VECTOR2I( 0, 0 ), VECTOR2I( toIU( 100 ), toIU( 80 ) ) ) );
+            KopenapiFitPage( &board, BOX2I( VECTOR2I( 0, 0 ), VECTOR2I( toIU( 100 ), toIU( 80 ) ) ) );
 
         board.SetEnabledLayers( board.GetEnabledLayers() | LSET::AllCuMask( layers ) );
         PCB_IO_KICAD_SEXPR().SaveBoard( fn.GetFullPath(), board );
@@ -564,7 +564,7 @@ static KOPENAPI_RESULT h_pcb_outline_set( KOPENAPI_CONTEXT& aCtx, const nlohmann
     // A frameless board's page follows its outline
     if( board->GetPageSettings().GetType() == PAGE_SIZE_TYPE::User )
     {
-        fitPage( board, rect );
+        KopenapiFitPage( board, rect );
 
         if( auto* frame = PCB_GLOW_TRAITS::Frame( aCtx.headless ? nullptr : aCtx.kiway ) )
         {

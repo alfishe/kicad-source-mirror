@@ -29,6 +29,10 @@ std::shared_ptr<PCB_CONTEXT> KopenapiPcbContext( KOPENAPI_CONTEXT& aCtx );
 /// @brief 409 "no board open" result for methods that need one
 KOPENAPI_RESULT KopenapiNoBoard();
 
+/// @brief A frameless board's page (User size) fitted to its outline plus 10 mm: plots and renders
+/// draw the page
+void KopenapiFitPage( BOARD* aBoard, const BOX2I& aOutline );
+
 class PCB_BASE_FRAME;
 
 /// @brief Refresh the board's open 3D viewer after an edit: the current picture stays until the

@@ -1875,6 +1875,10 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         commit.Push( _( "Board outline (API)" ) );
         commit = BOARD_COMMIT( context->GetToolManager() );
         edges = board->GetBoardEdgesBoundingBox();
+
+        // a frameless board's page follows its outline (as pcb_outline_set does)
+        if( board->GetPageSettings().GetType() == PAGE_SIZE_TYPE::User )
+            KopenapiFitPage( board, edges );
     }
 
     // 2. Connectors along the edges: left, right, top, bottom in turn, courtyard inset 0.5 mm; a
