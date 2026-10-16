@@ -331,7 +331,25 @@ static KOPENAPI_RESULT h_pcb_netlist_apply( KOPENAPI_CONTEXT& aCtx, const nlohma
     const bool success = updater->UpdateNetlist( netlist );
 
     if( !dryRun && success )
+    {
         context->OnNetlistChanged( *updater );
+
+        // new nets take their classes from the patterns set before (pcb_rules_set ahead of the
+        // netlist), and the rule engine sees them
+        board->SynchronizeNetsAndNetClasses( false );
+
+        if( std::shared_ptr<DRC_ENGINE> engine = board->GetDesignSettings().m_DRCEngine )
+        {
+            try
+            {
+                engine->InitEngine( board->GetDesignRulesPath() );
+            }
+            catch( const PARSE_ERROR& )
+            {
+                // a broken custom rules file: reported by pcb_drc
+            }
+        }
+    }
 
     // New footprints: in rows beside the board (right of the outline or the other parts), sorted
     // by reference, so they do not lie on each other before placement
@@ -920,6 +938,30 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     context->SetContentModified();
 
     nlohmann::json result = rulesJson( board );
+
+    // values the board's minimums override: KiCad's router and DRC use the larger one
+    nlohmann::json warnings = nlohmann::json::array();
+
+    auto below = [&]( const wxString& aClass, const std::shared_ptr<NETCLASS>& aCls )
+    {
+        if( aCls->HasTrackWidth() && aCls->GetTrackWidth() < bds.m_TrackMinWidth )
+            warnings.push_back( "class " + str( aClass ) + ": track_width_mm " + std::to_string( toMm( aCls->GetTrackWidth() ) )
+                                + " is below the board's minimum " + std::to_string( toMm( bds.m_TrackMinWidth ) )
+                                + ": tracks come out that wide (lower constraints.min_track_width_mm)" );
+
+        if( aCls->HasClearance() && aCls->GetClearance() < bds.m_MinClearance )
+            warnings.push_back( "class " + str( aClass ) + ": clearance_mm " + std::to_string( toMm( aCls->GetClearance() ) )
+                                + " is below the board's minimum " + std::to_string( toMm( bds.m_MinClearance ) )
+                                + ": the minimum holds (lower constraints.min_clearance_mm)" );
+    };
+
+    below( NETCLASS::Default, net->GetDefaultNetclass() );
+
+    for( const auto& [cname, cls] : net->GetNetclasses() )
+        below( cname, cls );
+
+    if( !warnings.empty() )
+        result["warnings"] = warnings;
     result["note"] = "net classes and constraints are saved with the board's project (pcb_save)";
     return KOPENAPI_RESULT::Ok( result );
 }
