@@ -30,6 +30,9 @@
 #include <map>
 #include <vector>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <wx/filename.h>
 #include <wx/log.h>
 #include <wx/stdpaths.h>
@@ -167,6 +170,9 @@ struct DATA
     std::unordered_map<const TopoDS_TShape*, TopoDS_Face> preparedFaces;
 
     int droppedFaces = 0;   ///< faces left without a mesh
+    int meshedFaces = 0;    ///< faces with a mesh in the scene
+    int pcurveFaces = 0;    ///< faces whose edges got curves on the face added
+    int healedFaces = 0;    ///< faces that needed ShapeFix_Face to mesh
     bool renderBoth;    // set TRUE if we're processing IGES
     bool hasSolid;      // set TRUE if there is no parent SOLID
     S3D::MODEL_IMPORT_OPTIONS options;
@@ -830,7 +836,8 @@ bool readSTEPZ( Handle( TDocStd_Document ) & m_doc, const char* aFileName, const
 static SCENEGRAPH* loadModel( char const* filename, const S3D::MODEL_IMPORT_OPTIONS* aOptions,
                               MODEL_IMPORT_STATUS* aStatus, bool aHeal, bool& aIncomplete )
 {
-    DATA data;
+    const auto start = std::chrono::steady_clock::now();
+    DATA       data;
 
     if( aOptions )
         data.options = *aOptions;
@@ -933,6 +940,14 @@ static SCENEGRAPH* loadModel( char const* filename, const S3D::MODEL_IMPORT_OPTI
     if( !ret )
     {
         return nullptr;
+    }
+
+    // per-model load figures on stderr (wxLogTrace prints nothing where wxWidgets has no debug level)
+    if( std::getenv( "KICAD_OCE_STATS" ) )
+    {
+        std::fprintf( stderr, "OCESTATS %s ms=%d heal=%d faces=%d pcurve=%d healed=%d dropped=%d\n", filename,
+                      (int) std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - start ).count(),
+                      aHeal ? 1 : 0, data.meshedFaces, data.pcurveFaces, data.healedFaces, data.droppedFaces );
     }
 
     if( !aHeal && data.droppedFaces > 0 && ( modelFmt == FMT_STEP || modelFmt == FMT_STPZ ) )
@@ -1311,6 +1326,7 @@ void prepareFaces( const TopoDS_Shape& aShape, DATA& aData )
         return;
 
     std::vector<TopoDS_Face> prepared( todo.size() );
+    std::atomic<int>         healed = 0;
     const double             linDeflection = aData.options.stepLinearDeflection;
     const double             angDeflection = glm::radians( aData.options.stepAngularDeflectionDegrees );
 
@@ -1339,6 +1355,7 @@ void prepareFaces( const TopoDS_Shape& aShape, DATA& aData )
                                healer.Perform();
                                copy = healer.Face();
                                BRepMesh_IncrementalMesh( copy, linDeflection, false, angDeflection );
+                               healed++;
                            }
 
                            prepared[i] = copy;
@@ -1346,6 +1363,9 @@ void prepareFaces( const TopoDS_Shape& aShape, DATA& aData )
 
     for( size_t i = 0; i < todo.size(); i++ )
         aData.preparedFaces[todo[i].TShape().get()] = prepared[i];
+
+    aData.pcurveFaces += (int) todo.size();
+    aData.healedFaces += healed;
 }
 
 
@@ -1433,6 +1453,7 @@ bool processFace( const TopoDS_Face& face, DATA& data, SGNODE* parent, std::vect
         ShapeFix_Face fixer( face );
         fixer.Perform();
         const TopoDS_Face healed = fixer.Face();
+        data.healedFaces++;
 
         BRepMesh_IncrementalMesh( healed, linDeflection, false,
                                   glm::radians( data.options.stepAngularDeflectionDegrees ) );
@@ -1444,6 +1465,8 @@ bool processFace( const TopoDS_Face& face, DATA& data, SGNODE* parent, std::vect
         data.droppedFaces++;
         return false;
     }
+
+    data.meshedFaces++;
 
     Quantity_ColorRGBA lcolor;
 

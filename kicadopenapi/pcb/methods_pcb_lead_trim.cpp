@@ -32,6 +32,8 @@
 
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
+#include <TopoDS_Compound.hxx>
+#include <BRep_Builder.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBndLib.hxx>
@@ -187,7 +189,7 @@ bool shortenStep( const fs::path& aIn, const fs::path& aOut, const glm::mat4& aM
     Handle( XCAFDoc_ShapeTool ) shapes = XCAFDoc_DocumentTool::ShapeTool( doc->Main() );
     Handle( XCAFDoc_ColorTool ) colors = XCAFDoc_DocumentTool::ColorTool( doc->Main() );
     std::set<int>               done;
-    const double                big = 1000.0;
+    std::vector<std::string>    failed;   // shapes left uncut, with the reason
 
     auto faceColour = [&]( const TDF_Label& aLabel, const TopoDS_Shape& aFace, Quantity_ColorRGBA& aColour ) -> bool
     {
@@ -279,12 +281,6 @@ bool shortenStep( const fs::path& aIn, const fs::path& aOut, const glm::mat4& aM
         const double slabLow = z0 + tip;
         const double slabHigh = slabLow + shift;
 
-        auto below = [&]( double aZ )
-        {
-            TopoDS_Shape b = BRepPrimAPI_MakeBox( gp_Pnt( -big, -big, -big ), gp_Pnt( big, big, aZ ) ).Shape();
-            return BRepBuilderAPI_GTransform( b, toProto, true ).Shape();
-        };
-
         COLOURS colours;
 
         for( TopExp_Explorer f( shape, TopAbs_FACE ); f.More(); f.Next() )
@@ -295,34 +291,93 @@ bool shortenStep( const fs::path& aIn, const fs::path& aOut, const glm::mat4& aM
                 colours.Bind( f.Current(), c );
         }
 
-        BRepAlgoAPI_Cut    upper( shape, below( slabHigh ) );
-        BRepAlgoAPI_Common tipPart( shape, below( slabLow ) );
-
-        if( !upper.IsDone() || !tipPart.IsDone() )
-            return;
-
         // the tip moves up by the slab's height (along the footprint's z, seen from the prototype)
         gp_XYZ from( 0, 0, 0 ), to( 0, 0, shift );
         toProto.Transforms( from );
         toProto.Transforms( to );
         gp_Trsf lift;
         lift.SetTranslation( gp_Vec( to - from ) );
-        BRepBuilderAPI_Transform moved( tipPart.Shape(), lift, true );
 
-        COLOURS upperColours, tipColours, movedColours, joined;
-        carry( colours, upper, upperColours );
-        carry( colours, tipPart, tipColours );
-        carry( tipColours, moved, movedColours );
+        TopoDS_Shape result;
+        COLOURS      joined;
+        std::string  why;
 
-        BRepAlgoAPI_Fuse fuse( upper.Shape(), moved.Shape() );
+        // cut with a box around the shape first (a 0.4 mm lead against a box metres wide is missed
+        // without an error), with a wide one when that fails
+        auto attempt = [&]( double aMargin ) -> bool
+        {
+            auto below = [&]( double aZ )
+            {
+                TopoDS_Shape b = BRepPrimAPI_MakeBox( gp_Pnt( x0 - aMargin, y0 - aMargin, z0 - aMargin ),
+                                                      gp_Pnt( x1 + aMargin, y1 + aMargin, aZ ) ).Shape();
+                return BRepBuilderAPI_GTransform( b, toProto, true ).Shape();
+            };
 
-        if( !fuse.IsDone() )
+            BRepAlgoAPI_Cut    upper( shape, below( slabHigh ) );
+            BRepAlgoAPI_Common tipPart( shape, below( slabLow ) );
+
+            if( !upper.IsDone() || !tipPart.IsDone() )
+            {
+                why = "the cut at the slab failed";
+                return false;
+            }
+
+            BRepBuilderAPI_Transform moved( tipPart.Shape(), lift, true );
+            BRepAlgoAPI_Fuse         fuse( upper.Shape(), moved.Shape() );
+            TopoDS_Shape             joinedShape;
+
+            if( fuse.IsDone() )
+            {
+                joinedShape = fuse.Shape();
+            }
+            else
+            {
+                // the tip touches the rest face to face: kept side by side when they do not fuse
+                TopoDS_Compound compound;
+                BRep_Builder    builder;
+                builder.MakeCompound( compound );
+                builder.Add( compound, upper.Shape() );
+                builder.Add( compound, moved.Shape() );
+                joinedShape = compound;
+            }
+
+            Bnd_Box after;
+            BRepBndLib::AddOptimal( BRepBuilderAPI_GTransform( joinedShape, toFootprint, true ).Shape(), after, false, false );
+
+            if( after.IsVoid() || after.CornerMin().Z() < aTarget - 0.05 )
+            {
+                why = "still reaches " + std::to_string( after.IsVoid() ? z0 : after.CornerMin().Z() ).substr( 0, 6 )
+                      + " mm after the cut (target " + std::to_string( aTarget ).substr( 0, 6 ) + ")";
+                return false;
+            }
+
+            COLOURS upperColours, tipColours, movedColours;
+            carry( colours, upper, upperColours );
+            carry( colours, tipPart, tipColours );
+            carry( tipColours, moved, movedColours );
+
+            if( fuse.IsDone() )
+            {
+                carry( upperColours, fuse, joined );
+                carry( movedColours, fuse, joined );
+            }
+            else
+            {
+                for( const COLOURS* part : { &upperColours, &movedColours } )
+                    for( COLOURS::Iterator it( *part ); it.More(); it.Next() )
+                        joined.Bind( it.Key(), it.Value() );
+            }
+
+            result = joinedShape;
+            return true;
+        };
+
+        if( !attempt( 1.0 ) && !attempt( 1000.0 ) )
+        {
+            failed.push_back( "shape " + std::to_string( aLabel.Tag() ) + ": " + why );
             return;
+        }
 
-        carry( upperColours, fuse, joined );
-        carry( movedColours, fuse, joined );
-
-        const TopoDS_Shape result = fuse.Shape();
         shapes->SetShape( aLabel, result );
 
         for( TopExp_Explorer f( result, TopAbs_FACE ); f.More(); f.Next() )
@@ -342,6 +397,15 @@ bool shortenStep( const fs::path& aIn, const fs::path& aOut, const glm::mat4& aM
 
     for( int i = 1; i <= roots.Length(); ++i )
         walk( roots.Value( i ), gp_Trsf() );
+
+    if( !failed.empty() )
+    {
+        aError = "leads not shortened (" + failed.front() + ( failed.size() > 1 ? ", +" + std::to_string( failed.size() - 1 ) + " more" : "" )
+                 + "): the generic model is kept";
+        std::lock_guard<std::mutex> lock( KopenapiStepTranslatorMutex() );
+        app->Close( doc );
+        return false;
+    }
 
     shapes->UpdateAssemblies();
 
