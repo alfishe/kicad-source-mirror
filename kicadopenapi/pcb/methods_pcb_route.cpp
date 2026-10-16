@@ -504,6 +504,18 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
 
         const PCB_LAYER_ID layer = *viaLayer;
 
+        // a via with no track before it (at the point the route stands on) ends the routing in PNS,
+        // and moving on from there uses a placer that has let go of its world
+        if( placer->CurrentStart() == at )
+        {
+            router->StopRouting();
+            iface->Staged().Revert();
+            aOut["routed"] = false;
+            aOut["reason"] = "the via at " + std::to_string( toMm( at.x ) ) + ", " + std::to_string( toMm( at.y ) )
+                             + " is where the route already stands (its start): move it along the way";
+            return false;
+        }
+
         PNS::SIZES_SETTINGS viaSizes( router->Sizes() );
         viaSizes.SetViaType( VIATYPE::THROUGH );
         viaSizes.ClearLayerPairs();
@@ -793,8 +805,17 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
                 return KOPENAPI_RESULT::Error( 400, "waypoints: layer is an enabled copper layer" );
         }
 
-        req.vias.emplace_back( VECTOR2I( pcbIUScale.mmToIU( at[0].get<double>() ), pcbIUScale.mmToIU( at[1].get<double>() ) ),
-                               viaLayer );
+        const VECTOR2I point( pcbIUScale.mmToIU( at[0].get<double>() ), pcbIUScale.mmToIU( at[1].get<double>() ) );
+
+        // a via at the corner just before it: the via's leg reaches that point anyway
+        if( viaLayer && !req.vias.empty() && !req.vias.back().second && req.vias.back().first == point )
+            req.vias.pop_back();
+
+        // the same point twice: once
+        if( !req.vias.empty() && req.vias.back().first == point && req.vias.back().second == viaLayer )
+            continue;
+
+        req.vias.emplace_back( point, viaLayer );
     }
 
     nlohmann::json    result = { { "from", aArgs["from"] } };
