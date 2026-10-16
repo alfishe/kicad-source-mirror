@@ -267,6 +267,12 @@ nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::v
 } // namespace
 
 
+nlohmann::json KopenapiZoneIslands( BOARD* aBoard, ZONE* aZone )
+{
+    return islandsOf( aBoard, aZone );
+}
+
+
 static KOPENAPI_RESULT h_pcb_zone_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );

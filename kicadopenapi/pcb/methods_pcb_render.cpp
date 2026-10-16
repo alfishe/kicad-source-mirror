@@ -8,6 +8,7 @@
 
 #include <api/pcb_context.h>
 #include <board.h>
+#include <zone.h>
 #include <lset.h>
 #include <jobs/job_export_pcb_png.h>
 #include <jobs/job_pcb_render.h>
@@ -105,6 +106,47 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     const wxString out = tempPng();
     job.SetConfiguredOutputPath( out );
 
+    // zones: filled (as plotted), outline (each fill drawn as its edge: what is under a pour shows),
+    // hidden; the fills are swapped for the render only and put back
+    const std::string zoneMode = aArgs.value( "zones", std::string( "filled" ) );
+
+    if( zoneMode != "filled" && zoneMode != "outline" && zoneMode != "hidden" )
+        return KOPENAPI_RESULT::Error( 400, "zones: filled, outline or hidden" );
+
+    std::vector<std::tuple<ZONE*, PCB_LAYER_ID, SHAPE_POLY_SET>> saved;
+
+    if( zoneMode != "filled" )
+    {
+        const int edge = std::max( pcbIUScale.mmToIU( 0.1 ), KiROUND( 2.0 * 25.4 / dpi * pcbIUScale.IU_PER_MM ) );
+
+        for( ZONE* zone : board->Zones() )
+        {
+            for( PCB_LAYER_ID layer : zone->GetLayerSet().Seq() )
+            {
+                if( !zone->HasFilledPolysForLayer( layer ) )
+                    continue;
+
+                const SHAPE_POLY_SET fill = *zone->GetFilledPolysList( layer );
+                SHAPE_POLY_SET       shown;
+
+                if( zoneMode == "outline" )
+                {
+                    // fills are stored fractured (holes joined to the outline): deflate the real shape
+                    SHAPE_POLY_SET whole = fill;
+                    whole.Unfracture();
+                    SHAPE_POLY_SET inner = whole;
+                    inner.Deflate( edge, CORNER_STRATEGY::ROUND_ALL_CORNERS, ARC_HIGH_DEF );
+                    shown = whole;
+                    shown.BooleanSubtract( inner );
+                    shown.Fracture();
+                }
+
+                saved.emplace_back( zone, layer, fill );
+                zone->SetFilledPolysList( layer, shown );
+            }
+        }
+    }
+
     WX_STRING_REPORTER reporter;
     int                status;
 
@@ -112,6 +154,9 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         BOARD_OVERRIDE live( board );
         status = aCtx.kiway->ProcessJob( KIWAY::FACE_PCB, &job, &reporter );
     }
+
+    for( auto& [zone, layer, fill] : saved )
+        zone->SetFilledPolysList( layer, fill );
 
     // a region in board millimetres: cut from the whole page (the export draws the page)
     const nlohmann::json region = aArgs.value( "region", nlohmann::json() );
@@ -438,7 +483,8 @@ KOPENAPI_REGISTER( "pcb_render",
                         "drawing_sheet":{"type":"boolean","default":false},
                         "mirror":{"type":"boolean","default":false},
                         "black_and_white":{"type":"boolean","default":false},
-                        "theme":{"type":"string"}}})json"_json,
+                        "theme":{"type":"string"},
+                        "zones":{"type":"string","enum":["filled","outline","hidden"],"default":"filled","description":"outline: each pour drawn as its edge (the tracks and pads under it show); hidden: no pours"}}})json"_json,
                    false, h_pcb_render, 300 );
 
 KOPENAPI_REGISTER( "pcb_render_3d",

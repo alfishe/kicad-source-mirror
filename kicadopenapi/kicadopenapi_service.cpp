@@ -622,6 +622,38 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invoke( const std::string& aName,
 }
 
 
+/// Every point of an answer also as at_mm [x, y] (the routing and DRC answers' shape): an object
+/// with numeric x_mm and y_mm gets it, unless it is a rectangle (width_mm) or has one already
+static void addPoints( nlohmann::json& aJson, int aDepth )
+{
+    if( aDepth > 64 )
+        return;
+
+    if( aJson.is_object() )
+    {
+        if( !aJson.contains( "at_mm" ) && !aJson.contains( "width_mm" ) && aJson.contains( "x_mm" )
+            && aJson.contains( "y_mm" ) && aJson["x_mm"].is_number() && aJson["y_mm"].is_number() )
+        {
+            aJson["at_mm"] = { aJson["x_mm"], aJson["y_mm"] };
+        }
+
+        for( auto& [key, value] : aJson.items() )
+        {
+            if( value.is_structured() )
+                addPoints( value, aDepth + 1 );
+        }
+    }
+    else if( aJson.is_array() )
+    {
+        for( nlohmann::json& value : aJson )
+        {
+            if( value.is_structured() )
+                addPoints( value, aDepth + 1 );
+        }
+    }
+}
+
+
 KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&    aName,
                                                            const nlohmann::json& aArgs,
                                                            const std::string&    aCaller ) const
@@ -733,6 +765,9 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
                               KOPENAPI_HISTORY::Get().BeforeEdit( ctxCopy, name, args );
 
                           KOPENAPI_RESULT result = handler( ctxCopy, args );
+
+                          if( result.status < 400 )
+                              addPoints( result.body, 0 );
 
                           if( editing )
                               KOPENAPI_HISTORY::Get().AfterEdit( ctxCopy, result );

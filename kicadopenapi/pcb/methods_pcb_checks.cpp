@@ -8,6 +8,9 @@
 /// zones are refilled only when asked (that does change the board).
 #include "kopenapi_pcb.h"
 
+#include <map>
+#include <set>
+
 #include <api/pcb_context.h>
 #include <kicadopenapi_keepalive.h>
 #include <board.h>
@@ -18,6 +21,7 @@
 #include <drc/drc_engine.h>
 #include <drc/drc_item.h>
 #include <drc/drc_report.h>
+#include <footprint.h>
 #include <footprint_library_adapter.h>
 #include <kicadopenapi_checks.h>
 #include <pcb_marker.h>
@@ -133,13 +137,80 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     for( const nlohmann::json& v : full.value( "violations", nlohmann::json::array() ) )
         violations.push_back( v );
 
+    // where the marker is (the report gives the items' positions only: a zone island's item is at
+    // the zone's anchor, its marker on the island)
+    for( int i = 0; i < markers->GetCount() && i < (int) violations.size(); ++i )
+    {
+        if( const MARKER_BASE* marker = markers->GetItem( i )->GetParent() )
+            violations[i]["at_mm"] = { pcbIUScale.IUTomm( marker->GetPos().x ), pcbIUScale.IUTomm( marker->GetPos().y ) };
+    }
+
+    // a footprint's own violations (all its items in one footprint: a library part's pads against its
+    // own pegs) left out when asked: true for every footprint, or a list of references
+    const nlohmann::json within = aArgs.value( "exclude_within_footprint", nlohmann::json( false ) );
+    nlohmann::json       excluded = nlohmann::json::array();
+
+    if( within.is_array() || ( within.is_boolean() && within.get<bool>() ) )
+    {
+        std::set<wxString> refs;
+
+        if( within.is_array() )
+        {
+            for( const nlohmann::json& r : within )
+            {
+                if( r.is_string() )
+                    refs.insert( wxString::FromUTF8( r.get<std::string>() ) );
+            }
+        }
+
+        std::map<std::string, FOOTPRINT*> owner;
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            owner[fp->m_Uuid.AsStdString()] = fp;
+            fp->RunOnChildren( [&]( BOARD_ITEM* aChild ) { owner[aChild->m_Uuid.AsStdString()] = fp; }, RECURSE_MODE::RECURSE );
+        }
+
+        std::vector<nlohmann::json> kept;
+
+        for( nlohmann::json& v : violations )
+        {
+            FOOTPRINT* fp = nullptr;
+            bool       one = !v.value( "items", nlohmann::json::array() ).empty();
+
+            for( const nlohmann::json& item : v.value( "items", nlohmann::json::array() ) )
+            {
+                auto it = owner.find( item.value( "uuid", std::string() ) );
+
+                if( it == owner.end() || ( fp && fp != it->second ) )
+                {
+                    one = false;
+                    break;
+                }
+
+                fp = it->second;
+            }
+
+            if( one && ( refs.empty() || refs.count( fp->GetReference() ) ) )
+                excluded.push_back( { { "ref", fp->GetReference().ToStdString() }, { "type", v.value( "type", std::string() ) } } );
+            else
+                kept.push_back( std::move( v ) );
+        }
+
+        violations.swap( kept );
+    }
+
     std::vector<nlohmann::json> unrouted;
 
     for( const nlohmann::json& v : full.value( "unconnected_items", nlohmann::json::array() ) )
         unrouted.push_back( v );
 
-    return KOPENAPI_RESULT::Ok(
-            KopenapiCheckResult( violations, unrouted, full.value( "ignored_checks", nlohmann::json::array() ), aArgs ) );
+    nlohmann::json result = KopenapiCheckResult( violations, unrouted, full.value( "ignored_checks", nlohmann::json::array() ), aArgs );
+
+    if( !excluded.empty() )
+        result["excluded_within_footprint"] = excluded;
+
+    return KOPENAPI_RESULT::Ok( result );
 }
 
 
@@ -151,5 +222,6 @@ KOPENAPI_REGISTER( "pcb_drc",
                    "(changes the board). For schematic parity use design_parity",
                    KopenapiCheckSchema( R"json({
                         "refill_zones":{"type":"boolean","default":false,"description":"refill all zones first (modifies the board)"},
-                        "all_track_errors":{"type":"boolean","default":true,"description":"report every track error (deterministic); false = one per track like the CLI default, which varies between runs"}})json"_json ),
+                        "all_track_errors":{"type":"boolean","default":true,"description":"report every track error (deterministic); false = one per track like the CLI default, which varies between runs"},
+                        "exclude_within_footprint":{"oneOf":[{"type":"boolean"},{"type":"array","items":{"type":"string"}}],"default":false,"description":"leave out violations whose items all belong to one footprint (a library part against itself, e.g. pads near its own pegs): true for every footprint or a list of references; they are listed in excluded_within_footprint"}})json"_json ),
                    false, h_pcb_drc, 600 );

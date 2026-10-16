@@ -33,6 +33,12 @@ KOPENAPI_RESULT KopenapiNoBoard();
 /// draw the page
 void KopenapiFitPage( BOARD* aBoard, const BOX2I& aOutline );
 
+class ZONE;
+
+/// @brief A zone's fill pieces per layer when a layer has more than one: box, area, the net's pads,
+/// vias and tracks on each (an island with no via is cut off)
+nlohmann::json KopenapiZoneIslands( BOARD* aBoard, ZONE* aZone );
+
 class PCB_BASE_FRAME;
 
 /// @brief Refresh the board's open 3D viewer after an edit: the current picture stays until the

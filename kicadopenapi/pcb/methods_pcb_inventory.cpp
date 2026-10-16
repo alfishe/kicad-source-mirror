@@ -503,7 +503,8 @@ static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     return KOPENAPI_RESULT::Ok( { { "name", netName( net->GetNetname() ) },
                                   { "code", net->GetNetCode() },
                                   { "class", netClass },
-                                  { "pads", padList },
+                                  { "pads", padList.size() },
+                                  { "pad_list", padList },
                                   { "footprints", naturalSorted( a.footprints ) },
                                   { "routing",
                                     { { "length_mm", mm( a.length ) },
@@ -587,9 +588,31 @@ static KOPENAPI_RESULT h_pcb_footprint_get( KOPENAPI_CONTEXT& aCtx, const nlohma
     nlohmann::json padList = nlohmann::json::array();
     std::set<std::string> nets;
 
+    // which side of the part each pad is on, as placed (after rotation and flip): from the centre of
+    // the pads' extent; west / east / north / south (north is up on the board), centre for a pad
+    // near the middle (an exposed pad)
+    BOX2I padExtent;
+
+    for( const PAD* pad : pads )
+        padExtent.Merge( pad->GetPosition() );
+
+    const VECTOR2I padCentre = padExtent.Centre();
+
     for( const PAD* pad : pads )
     {
-        padList.push_back( padJson( pad, false ) );
+        nlohmann::json  row = padJson( pad, false );
+        const VECTOR2I  d = pad->GetPosition() - padCentre;
+        const double    rx = padExtent.GetWidth() > 0 ? double( d.x ) / padExtent.GetWidth() : 0;
+        const double    ry = padExtent.GetHeight() > 0 ? double( d.y ) / padExtent.GetHeight() : 0;
+
+        if( pads.size() > 1 )
+        {
+            row["side"] = std::abs( rx ) < 0.2 && std::abs( ry ) < 0.2 ? "centre"
+                          : std::abs( rx ) >= std::abs( ry )          ? ( rx < 0 ? "west" : "east" )
+                                                                       : ( ry < 0 ? "north" : "south" );
+        }
+
+        padList.push_back( row );
 
         if( pad->GetNetCode() > 0 )
             nets.insert( netName( pad->GetNetname() ) );
@@ -706,7 +729,8 @@ KOPENAPI_REGISTER( "pcb_net_list",
                    false, h_pcb_net_list );
 
 KOPENAPI_REGISTER( "pcb_net_get",
-                   "Net card: every pad (ref.pin, function, pin type), footprints, net class rules, routed "
+                   "Net card: every pad in pad_list (ref.pin, function, pin type; pads is their count, as in "
+                   "pcb_footprint_get), footprints, net class rules, routed "
                    "length per layer, vias, zones, unrouted connections, inferred role (power/ground/clock/"
                    "reset/diff_pair/interface) with basis; look up by name, code or pin REF.PAD",
                    R"json({"type":"object","properties":{
@@ -717,7 +741,8 @@ KOPENAPI_REGISTER( "pcb_net_get",
 
 KOPENAPI_REGISTER( "pcb_footprint_get",
                    "Footprint card: fields, library description, position/side/rotation, attributes, "
-                   "bounding box, every pad with its net/function/size/drill, nets, 3D models",
+                   "bounding box, every pad with its net/function/size/drill and side (west / east / north / south of "
+                   "the part as placed, after rotation and flip; centre for a middle pad), nets, 3D models",
                    R"json({"type":"object","properties":{
                         "ref":{"type":"string","description":"reference designator, e.g. U3 (must be unique)"},
                         "uuid":{"type":"string","description":"footprint uuid from pcb_footprint_list"}}})json"_json,
