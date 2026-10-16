@@ -371,6 +371,11 @@ nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>*
                               { "airwires", edgesCount },
                               { "ok", overlaps.empty() && outside.empty() && problems.empty() && hasOutline } };
 
+    if( !overhanging.empty() )
+        report["edge_overhang_note"] = "connectors placed with their mating side over the board edge on purpose (the "
+                                       "opening at the edge, the body's front beyond it, as the footprint draws it): "
+                                       "not outside_board; edge_offset_mm in pcb_footprint_move sets it back";
+
     if( hasOutline )
         report["board_mm"] = { toMm( edges.GetWidth() ), toMm( edges.GetHeight() ) };
     else
@@ -1116,6 +1121,38 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             }
         }
 
+        // a small part already placed on that net (a crystal before its load capacitors): next to
+        // its pad rather than across it at the anchor's
+        PAD* viaPad = nullptr;
+        int  netPads = 0;   // a small net only (a crystal's, 2 - 4 pads): never a rail
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            for( PAD* pad : fp->Pads() )
+                netPads += pad->GetNetCode() == net;
+        }
+
+        for( FOOTPRINT* placedPart : netPads <= 4 ? done : std::vector<FOOTPRINT*>() )
+        {
+            if( placedPart->Pads().size() > 4 )
+                continue;
+
+            for( PAD* pad : placedPart->Pads() )
+            {
+                if( pad->GetNetCode() == net && !taken.count( pad ) )
+                {
+                    viaPad = pad;
+                    break;
+                }
+            }
+
+            if( viaPad )
+                break;
+        }
+
+        if( viaPad )
+            target = viaPad;
+
         taken.insert( target );
         aCommit.Modify( member.part );
 
@@ -1149,6 +1186,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         nlohmann::json row = nearJson( placement, target );
         row["ref"] = str( member.part->GetReference() );
+
+        if( viaPad )
+            row["via"] = str( viaPad->GetParentFootprint()->GetReference() );
         row["x_mm"] = toMm( member.part->GetPosition().x );
         row["y_mm"] = toMm( member.part->GetPosition().y );
         row["rotation_deg"] = member.part->GetOrientation().AsDegrees();

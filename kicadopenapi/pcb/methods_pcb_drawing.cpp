@@ -5,6 +5,9 @@
 /// commit per call, the new items glow in the GUI.
 #include "kopenapi_pcb.h"
 
+#include <footprint.h>
+#include <pcb_field.h>
+
 #include <api/pcb_context.h>
 #include <board.h>
 #include <board_commit.h>
@@ -494,12 +497,45 @@ static KOPENAPI_RESULT h_pcb_text_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
         return KopenapiNoBoard();
 
     nlohmann::json           missing = nlohmann::json::array();
-    std::vector<BOARD_ITEM*> found = drawingsByUuid( context->GetBoard(), nlohmann::json::array( { aArgs.value( "uuid", std::string() ) } ),
-                                                     missing );
-    auto*                    t = found.empty() ? nullptr : dynamic_cast<PCB_TEXT*>( found.front() );
+    std::vector<BOARD_ITEM*> found;
+    PCB_TEXT*                t = nullptr;
 
-    if( !t )
-        return KOPENAPI_RESULT::Error( 404, "uuid: a board text (pcb_drawing_list kind text)" );
+    if( aArgs.contains( "ref" ) )
+    {
+        // a footprint's field: its reference (default), value or another by name
+        const wxString ref = wxString::FromUTF8( aArgs.value( "ref", std::string() ) );
+        const wxString name = wxString::FromUTF8( aArgs.value( "field", std::string( "Reference" ) ) );
+
+        for( FOOTPRINT* fp : context->GetBoard()->Footprints() )
+        {
+            if( fp->GetReference() != ref )
+                continue;
+
+            for( PCB_FIELD* field : fp->GetFields() )
+            {
+                if( field->GetName().CmpNoCase( name ) == 0 )
+                    t = field;
+            }
+
+            found.push_back( fp );
+        }
+
+        if( found.empty() )
+            return KOPENAPI_RESULT::Error( 404, "ref: no footprint " + aArgs.value( "ref", std::string() ) );
+
+        if( !t )
+            return KOPENAPI_RESULT::Error( 404, "field: " + aArgs.value( "ref", std::string() ) + " has no field "
+                                                        + aArgs.value( "field", std::string( "Reference" ) ) );
+    }
+    else
+    {
+        found = drawingsByUuid( context->GetBoard(), nlohmann::json::array( { aArgs.value( "uuid", std::string() ) } ), missing );
+        t = found.empty() ? nullptr : dynamic_cast<PCB_TEXT*>( found.front() );
+
+        if( !t )
+            return KOPENAPI_RESULT::Error( 404, "uuid: a board text (pcb_drawing_list kind text), or ref (+ field) for a "
+                                                "footprint's reference / value" );
+    }
 
     if( std::optional<KOPENAPI_RESULT> refused = lockedRefusal( found, aArgs ) )
         return *refused;
@@ -527,6 +563,9 @@ static KOPENAPI_RESULT h_pcb_text_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( aArgs.contains( "angle_deg" ) )
         t->SetTextAngle( EDA_ANGLE( aArgs["angle_deg"].get<double>(), DEGREES_T ) );
 
+    if( aArgs.contains( "visible" ) )
+        t->SetVisible( aArgs.value( "visible", true ) );
+
     if( aArgs.contains( "bold" ) )
         t->SetBold( aArgs["bold"].get<bool>() );
 
@@ -545,6 +584,7 @@ static KOPENAPI_RESULT h_pcb_text_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     std::shared_ptr<SHAPE_COMPOUND> ink = t->GetEffectiveTextShape( false );
     return KOPENAPI_RESULT::Ok( { { "uuid", str( t->m_Uuid.AsString() ) },
+                                  { "visible", t->IsVisible() },
                                   { "bbox_mm", rectMm( t->GetBoundingBox() ) },
                                   { "ink_mm", rectMm( ink && !ink->Shapes().empty() ? ink->BBox() : t->GetBoundingBox() ) } } );
 }
@@ -577,11 +617,15 @@ KOPENAPI_REGISTER( "pcb_items_move",
                    false, h_pcb_items_move );
 
 KOPENAPI_REGISTER( "pcb_text_update",
-                   "Edit a board text by uuid: text, position (x_mm / y_mm or dx_mm / dy_mm), height "
+                   "Edit a board text by uuid, or a footprint's reference / value (ref, field): text, visible, "
+                   "position (x_mm / y_mm or dx_mm / dy_mm), height "
                    "(size_mm keeps the glyph proportions and stroke ratio), glyph width (narrower / wider), "
                    "stroke, angle, bold; answers its boxes (check with pcb_silk_fit / pcb_drc)",
-                   R"json({"type":"object","required":["uuid"],"properties":{
+                   R"json({"type":"object","properties":{
                         "uuid":{"type":"string"},
+                        "ref":{"type":"string","description":"a footprint: edit its field (instead of uuid)"},
+                        "field":{"type":"string","default":"Reference"},
+                        "visible":{"type":"boolean"},
                         "text":{"type":"string"},
                         "x_mm":{"type":"number"},"y_mm":{"type":"number"},
                         "dx_mm":{"type":"number"},"dy_mm":{"type":"number"},

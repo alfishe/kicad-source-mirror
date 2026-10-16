@@ -113,15 +113,44 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         status = aCtx.kiway->ProcessJob( KIWAY::FACE_PCB, &job, &reporter );
     }
 
+    // a region in board millimetres: cut from the whole page (the export draws the page)
+    const nlohmann::json region = aArgs.value( "region", nlohmann::json() );
+    const bool           byRegion = region.is_array() && region.size() == 4;
+
+    if( !region.is_null() && !byRegion )
+        return KOPENAPI_RESULT::Error( 400, "region: [x0_mm, y0_mm, x1_mm, y1_mm]" );
+
     wxImage         image;
-    KOPENAPI_RESULT read = readImage( out, status, reporter.GetMessages(), aArgs.value( "crop", true ), dpi / 6, image );
+    KOPENAPI_RESULT read = readImage( out, status, reporter.GetMessages(), byRegion ? false : aArgs.value( "crop", true ),
+                                      dpi / 6, image );
 
     if( read.status != 200 )
         return read;
 
+    if( byRegion )
+    {
+        const double pageMm = board->GetPageSettings().GetWidthMils() * 25.4 / 1000.0;
+        const double scale = pageMm > 0 ? image.GetWidth() / pageMm : dpi / 25.4;   // pixels per mm
+        const double x0 = std::min( region[0].get<double>(), region[2].get<double>() );
+        const double y0 = std::min( region[1].get<double>(), region[3].get<double>() );
+        const double x1 = std::max( region[0].get<double>(), region[2].get<double>() );
+        const double y1 = std::max( region[1].get<double>(), region[3].get<double>() );
+        wxRect       want( KiROUND( x0 * scale ), KiROUND( y0 * scale ), KiROUND( ( x1 - x0 ) * scale ), KiROUND( ( y1 - y0 ) * scale ) );
+        want.Intersect( wxRect( 0, 0, image.GetWidth(), image.GetHeight() ) );
+
+        if( want.IsEmpty() )
+            return KOPENAPI_RESULT::Error( 422, "region lies outside the page" );
+
+        image = image.GetSubImage( want );
+    }
+
     nlohmann::json result = KopenapiImageResult( image );
     result["layers"] = layers;
     result["dpi"] = dpi;
+
+    if( byRegion )
+        result["region_mm"] = region;
+
     return KOPENAPI_RESULT::Ok( result );
 }
 
@@ -405,6 +434,7 @@ KOPENAPI_REGISTER( "pcb_render",
                         "layers":{"type":"string","default":"front","description":"preset front/back/copper/assembly or layer list"},
                         "dpi":{"type":"integer","default":150,"minimum":30,"maximum":1200},
                         "crop":{"type":"boolean","default":true},
+                        "region":{"type":"array","items":{"type":"number"},"description":"[x0_mm, y0_mm, x1_mm, y1_mm]: only this part of the board (raise dpi to see detail)"},
                         "drawing_sheet":{"type":"boolean","default":false},
                         "mirror":{"type":"boolean","default":false},
                         "black_and_white":{"type":"boolean","default":false},

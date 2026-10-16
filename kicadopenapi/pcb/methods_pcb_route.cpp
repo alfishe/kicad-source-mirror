@@ -3099,10 +3099,10 @@ std::vector<PCB_TRACK*> selectTracks( BOARD* aBoard, const nlohmann::json& aArgs
         kinds.insert( k.get<std::string>() );
     }
 
-    if( aNeedSelector && nets.empty() && !between && !region )
+    if( aNeedSelector && nets.empty() && !between && !region && !aArgs.value( "all", false ) )
     {
-        aError = KOPENAPI_RESULT::Error( 400, "say which copper: uuids, net / nets, between [\"REF.PAD\", \"REF.PAD\"] or "
-                                              "region [x0, y0, x1, y1] (layer and kinds narrow it further)" );
+        aError = KOPENAPI_RESULT::Error( 400, "say which copper: uuids, net / nets, between [\"REF.PAD\", \"REF.PAD\"], "
+                                              "region [x0, y0, x1, y1] or all: true (layer and kinds narrow it further)" );
         return out;
     }
 
@@ -3671,6 +3671,7 @@ KOPENAPI_REGISTER( "pcb_tracks_delete",
                    R"json({"type":"object","properties":{
                         "uuids":{"type":"array","items":{"type":"string"},"description":"exactly these (pcb_track_list); the filters below are ignored"},
                         "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
+                        "all":{"type":"boolean","description":"every track and via (unlocked) - with layer / kinds to narrow"},
                         "between":{"type":"array","items":{"type":"string"},"description":"[\"REF.PAD\", \"REF.PAD\"]"},
                         "region":{"type":"array","items":{"type":"number"},"description":"[x0_mm, y0_mm, x1_mm, y1_mm]"},
                         "region_mode":{"type":"string","enum":["inside","touching"],"default":"inside","description":"inside: wholly in the region; touching: any part in it"},

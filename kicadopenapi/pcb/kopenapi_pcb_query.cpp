@@ -28,7 +28,9 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <set>
+#include <sstream>
 #include <unordered_map>
 
 
@@ -482,8 +484,45 @@ std::vector<std::string> suggestions( const std::string& aMessage )
 using PROGRAM = std::shared_ptr<KOPENAPI_QUERY_UCODE>;
 
 
-PROGRAM compile( const std::string& aExpression, COMPILE_ERROR& aError )
+/// @brief Plain numbers in inRect( ... ) / touchesRect( ... ) are millimetres: KiCad's expression
+/// grammar takes a function argument as a string or a number with units only
+std::string withRectUnits( const std::string& aExpression )
 {
+    static const std::regex call( R"(((?:inRect|touchesRect)\s*\()([^()]*)(\)))" );
+    static const std::regex bare( R"(^\s*-?\d+(?:\.\d+)?\s*$)" );
+
+    std::string out;
+    auto        from = aExpression.cbegin();
+
+    for( std::sregex_iterator it( aExpression.begin(), aExpression.end(), call ), end; it != end; ++it )
+    {
+        const std::smatch& m = *it;
+        out.append( from, m[0].first );
+        out += m[1].str();
+
+        std::stringstream args( m[2].str() );
+        std::string       arg;
+        bool              first = true;
+
+        while( std::getline( args, arg, ',' ) )
+        {
+            out += ( first ? "" : "," ) + arg + ( std::regex_match( arg, bare ) ? "mm" : "" );
+            first = false;
+        }
+
+        out += m[3].str();
+        from = m[0].second;
+    }
+
+    out.append( from, aExpression.cend() );
+    return out;
+}
+
+
+PROGRAM compile( const std::string& aRawExpression, COMPILE_ERROR& aError )
+{
+    const std::string aExpression = withRectUnits( aRawExpression );
+
     static std::list<std::pair<std::string, PROGRAM>>                                           lru;
     static std::unordered_map<std::string, std::list<std::pair<std::string, PROGRAM>>::iterator> index;
 
