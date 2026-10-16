@@ -17,6 +17,7 @@
 #include <board.h>
 #include <board_commit.h>
 #include <board_design_settings.h>
+#include <drc/drc_engine.h>
 #include <connectivity/connectivity_data.h>
 #include <ratsnest/ratsnest_data.h>
 #include <footprint.h>
@@ -148,13 +149,39 @@ int netClearance( BOARD_CONNECTED_ITEM* aItem, int aFloor )
 
 
 /// @brief Gross errors in a staged route: new or moved copper (aChanged) within the clearance of copper
-/// of another net - pads, tracks, vias, filled zones; removed items do not count.  aZonesYield: the
-/// caller refills the zones afterwards, so other nets' fills give way and do not count.
+/// of another net - pads, tracks, vias, filled zones; removed items do not count.  The clearance is
+/// the board's rule for the pair (DRC engine: custom rules, net classes, board minimum), as DRC and
+/// the router see it.  aZonesYield: the caller refills the zones afterwards, so other nets' fills give
+/// way and do not count.
 nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& aChanged,
                       const std::set<BOARD_ITEM*>& aRemoved, bool aZonesYield = false )
 {
-    nlohmann::json violations = nlohmann::json::array();
-    const int      floor = aBoard->GetDesignSettings().m_MinClearance;
+    nlohmann::json               violations = nlohmann::json::array();
+    const BOARD_DESIGN_SETTINGS& ds = aBoard->GetDesignSettings();
+    const int                    floor = ds.m_MinClearance;
+    std::shared_ptr<DRC_ENGINE>  drc = ds.m_DRCEngine;
+
+    // no pair needs more than this: shapes farther apart are never asked for their rule
+    const int widest = std::max( { ds.GetBiggestClearanceValue(), floor, 1 } );
+
+    auto required = [&]( BOARD_ITEM* aA, BOARD_ITEM* aB, PCB_LAYER_ID aLayer ) -> int
+    {
+        if( drc )
+        {
+            DRC_CONSTRAINT c = drc->EvalRules( CLEARANCE_CONSTRAINT, aA, aB, aLayer );
+
+            if( c.GetValue().HasMin() )
+                return std::max( c.GetValue().Min(), 0 );
+        }
+
+        auto cl = []( BOARD_ITEM* aItem, int aFloor )
+        {
+            BOARD_CONNECTED_ITEM* bci = dynamic_cast<BOARD_CONNECTED_ITEM*>( aItem );
+            return bci ? netClearance( bci, aFloor ) : aFloor;
+        };
+
+        return std::max( cl( aA, floor ), cl( aB, floor ) );
+    };
 
     std::vector<BOARD_CONNECTED_ITEM*> others;
 
@@ -188,7 +215,8 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
 
     for( BOARD_CONNECTED_ITEM* item : aChanged )
     {
-        const int clearance = netClearance( item, floor );
+        BOX2I reach = item->GetBoundingBox();
+        reach.Inflate( widest );
 
         for( PCB_LAYER_ID layer : item->GetLayerSet().CuStack() )
         {
@@ -196,14 +224,21 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
 
             for( BOARD_CONNECTED_ITEM* other : others )
             {
-                if( other == item || other->GetNetCode() == item->GetNetCode() || !other->IsOnLayer( layer ) )
+                if( other == item || other->GetNetCode() == item->GetNetCode() || !other->IsOnLayer( layer )
+                    || !reach.Intersects( other->GetBoundingBox() ) )
+                {
+                    continue;
+                }
+
+                std::shared_ptr<SHAPE> otherShape = other->GetEffectiveShape( layer );
+
+                if( !shape->Collide( otherShape.get(), widest - 1 ) )
                     continue;
 
-                const int need = std::max( clearance, netClearance( other, floor ) ) - 1;
+                const int need = required( item, other, layer ) - 1;
+                int       actual = 0;
 
-                int actual = 0;
-
-                if( shape->Collide( other->GetEffectiveShape( layer ).get(), need, &actual ) )
+                if( need >= 0 && shape->Collide( otherShape.get(), need, &actual ) )
                 {
                     violations.push_back( { { "layer", str( aBoard->GetLayerName( layer ) ) },
                                             { "new", describe( item ) },
@@ -215,12 +250,15 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
 
             for( ZONE* zone : aBoard->Zones() )
             {
-                if( ( aZonesYield && !zone->GetIsRuleArea() ) || zone->GetNetCode() == item->GetNetCode() || !zone->IsOnLayer( layer ) || !zone->HasFilledPolysForLayer( layer ) )
+                if( ( aZonesYield && !zone->GetIsRuleArea() ) || zone->GetNetCode() == item->GetNetCode() || !zone->IsOnLayer( layer )
+                    || !zone->HasFilledPolysForLayer( layer ) || !reach.Intersects( zone->GetBoundingBox() ) )
+                {
                     continue;
+                }
 
                 const std::shared_ptr<SHAPE_POLY_SET>& fill = zone->GetFilledPolysList( layer );
 
-                if( fill && fill->Collide( shape.get(), std::max( clearance, netClearance( zone, floor ) ) - 1 ) )
+                if( fill && fill->Collide( shape.get(), required( item, zone, layer ) - 1 ) )
                 {
                     violations.push_back( { { "layer", str( aBoard->GetLayerName( layer ) ) },
                                             { "new", describe( item ) },
@@ -380,6 +418,7 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     router->SetInterface( iface.get() );
     router->LoadSettings( &settings );
     router->SyncWorld();
+    const auto synced = std::chrono::steady_clock::now();
     router->SetMode( aReq.diffPair ? PNS::PNS_MODE_ROUTE_DIFF_PAIR : PNS::PNS_MODE_ROUTE_SINGLE );
 
     PNS::ITEM* startItem = router->GetWorld()->FindItemByParent( aReq.from );
@@ -614,7 +653,9 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
             changed.push_back( connected );
     }
 
+    const auto           routedAt = std::chrono::steady_clock::now();
     const nlohmann::json violations = guard( board, changed, iface->m_removed );
+    const auto           guardedAt = std::chrono::steady_clock::now();
     const double         direct = ( target - start ).EuclideanNorm();
 
     aOut["segments"] = segments;
@@ -624,7 +665,10 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
                         { "segments", segments.size() },
                         { "vias", vias },
                         { "shoved_items", iface->m_modified.size() + iface->m_removed.size() },
-                        { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() } };
+                        { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
+                        { "sync_ms", std::chrono::duration_cast<std::chrono::milliseconds>( synced - started ).count() },
+                        { "route_ms", std::chrono::duration_cast<std::chrono::milliseconds>( routedAt - synced ).count() },
+                        { "guard_ms", std::chrono::duration_cast<std::chrono::milliseconds>( guardedAt - routedAt ).count() } };
 
     if( !violations.empty() )
     {
@@ -855,6 +899,10 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     if( style != "direct" && style != "rail" )
         return KOPENAPI_RESULT::Error( 400, "style: direct or rail" );
+
+    // attempts per connection and pass: a count, not a time (the same board routes the same way);
+    // on a big board an attempt costs about a second
+    const int maxTries = std::clamp( aArgs.value( "max_tries", 120 ), 1, 10000 );
 
     const std::string diffPairs = aArgs.value( "diff_pairs", std::string( "auto" ) );
 
@@ -1122,7 +1170,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             {
                 for( PCB_LAYER_ID layer : layers )
                 {
-                    if( ok || rail || !way.from->IsOnLayer( layer ) || !way.to->IsOnLayer( layer ) )
+                    if( ok || aTries >= maxTries || rail || !way.from->IsOnLayer( layer ) || !way.to->IsOnLayer( layer ) )
                         continue;
 
                     ROUTE_REQUEST req{ way.from, way.to, way.toPos, layer, mode, dryRun, {} };
@@ -1179,7 +1227,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 {
                     for( const VECTOR2I& vb : ends )
                     {
-                        if( ok || budget-- <= 0 )
+                        if( ok || aTries >= maxTries || budget-- <= 0 )
                             break;
 
                         ROUTE_REQUEST req{ way.from, way.to, way.toPos, start, PNS::RM_Walkaround, dryRun, {} };
@@ -1197,6 +1245,10 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             if( ok )
                 break;
         }
+
+        if( !ok && aTries >= maxTries )
+            aAttempt["reason"] = "gave up after " + std::to_string( aTries ) + " tries (max_tries); last: "
+                                 + aAttempt.value( "reason", std::string( "-" ) );
 
         return ok;
     };
@@ -2933,6 +2985,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
+                        "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
                         "style":{"type":"string","enum":["direct","rail"],"default":"direct","description":"rail (power nets): every connection leaves its pads through a via next to them and runs on the second layer"},
                         "step_ms":{"type":"integer","default":0,"description":"GUI: draw each route and wait this long before the next (for watching / recording)"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
