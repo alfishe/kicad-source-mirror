@@ -350,7 +350,7 @@ struct ROUTE_GLOW_TRAITS
 
 struct ROUTE_REQUEST
 {
-    PAD*                  from = nullptr;
+    BOARD_CONNECTED_ITEM* from = nullptr;     ///< a pad, or a track / via to go on from
     BOARD_CONNECTED_ITEM* to = nullptr;        ///< nullptr: the nearest unconnected anchor of the net
     VECTOR2I              toPos;
     PCB_LAYER_ID          layer = F_Cu;
@@ -367,6 +367,9 @@ struct ROUTE_REQUEST
 
     /// @brief A narrower track than the net's class gives (> 0): the connection meets a fine-pitch pad
     int neckWidth = 0;
+
+    /// @brief Where on `from` the route starts (a track's end); its position when not given
+    std::optional<VECTOR2I> fromPos;
 
     /// @brief A pair's cursor path (a single route found first): the pair follows it
     std::vector<VECTOR2I> guide;
@@ -436,7 +439,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         return false;
     }
 
-    const VECTOR2I      start = aReq.from->GetPosition();
+    const VECTOR2I      start = aReq.fromPos.value_or( aReq.from->GetPosition() );
     PNS::SIZES_SETTINGS sizes( router->Sizes() );
     iface->SetStartLayerFromPCBNew( aReq.layer );
     iface->ImportSizes( sizes, startItem, nullptr, start );
@@ -866,6 +869,111 @@ std::optional<PCB_LAYER_ID> parseLayer( BOARD* aBoard, const std::string& aName 
 } // namespace
 
 
+/// @brief The board's pours (filled, not rule areas) refilled in one undo step: after copper was
+/// laid through fills that gave way
+void refillPours( PCB_CONTEXT& aContext, BOARD* aBoard )
+{
+    std::vector<ZONE*> zones;
+
+    for( ZONE* zone : aBoard->Zones() )
+    {
+        if( zone->IsFilled() && !zone->GetIsRuleArea() && !zone->IsTeardropArea() )
+            zones.push_back( zone );
+    }
+
+    if( zones.empty() )
+        return;
+
+    BOARD_COMMIT                fillCommit( aContext.GetToolManager() );
+    ZONE_FILLER                 filler( aBoard, &fillCommit );
+    KOPENAPI_KEEPALIVE_REPORTER reporter;
+    filler.SetProgressReporter( &reporter );
+
+    if( filler.Fill( zones ) )
+        fillCommit.Push( _( "Fill zones (API)" ) );
+    else
+        fillCommit.Revert();
+
+    aBoard->BuildConnectivity();
+    aBoard->GetConnectivity()->RecalculateRatsnest();
+}
+
+
+/// @brief Pour fills out of the way for one route (the router's world takes a fill as copper of its
+/// net: nothing would cross it), put back after - refilled when copper was laid, as they were
+/// otherwise (a dry run, a failure: no undo step, nothing changes)
+class FILL_HOLD
+{
+public:
+    FILL_HOLD( BOARD* aBoard, bool aActive ) : m_board( aBoard )
+    {
+        if( !aActive )
+            return;
+
+        for( ZONE* zone : aBoard->Zones() )
+        {
+            if( !zone->IsFilled() || zone->GetIsRuleArea() || zone->IsTeardropArea() )
+                continue;
+
+            SAVED saved{ zone, {} };
+
+            for( PCB_LAYER_ID layer : zone->GetLayerSet().Seq() )
+            {
+                if( zone->HasFilledPolysForLayer( layer ) )
+                    saved.fills.emplace_back( layer, *zone->GetFilledPolysList( layer ) );
+            }
+
+            m_saved.push_back( std::move( saved ) );
+            zone->UnFill();
+        }
+
+        if( !m_saved.empty() )
+            aBoard->BuildConnectivity();
+    }
+
+    ~FILL_HOLD() { Restore(); }
+
+    bool Active() const { return !m_saved.empty(); }
+
+    void Restore()
+    {
+        for( SAVED& saved : m_saved )
+        {
+            for( const auto& [layer, fill] : saved.fills )
+                saved.zone->SetFilledPolysList( layer, fill );
+
+            saved.zone->SetIsFilled( true );
+        }
+
+        if( !m_saved.empty() )
+            m_board->BuildConnectivity();
+
+        m_saved.clear();
+    }
+
+    /// @brief The old fills back first (the fill step's undo copy is the board as it was), then
+    /// KiCad's filler around the new copper
+    void Refill( PCB_CONTEXT& aContext )
+    {
+        const bool any = Active();
+        Restore();
+
+        if( any )
+            refillPours( aContext, m_board );
+    }
+
+private:
+    struct SAVED
+    {
+        ZONE*                                               zone;
+        std::vector<std::pair<PCB_LAYER_ID, SHAPE_POLY_SET>> fills;
+    };
+
+    BOARD*             m_board;
+    std::vector<SAVED> m_saved;
+};
+
+
 static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -949,13 +1057,28 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
         req.vias.emplace_back( point, viaLayer );
     }
 
+    const std::string zoneMode = aArgs.value( "zones", std::string( "refill" ) );
+
+    if( zoneMode != "refill" && zoneMode != "keep" )
+        return KOPENAPI_RESULT::Error( 400, "zones: refill (pour fills give way, refilled after) or keep" );
+
     nlohmann::json    result = { { "from", aArgs["from"] } };
     std::vector<KIID> added;
 
     if( aArgs.contains( "to" ) )
         result["to"] = aArgs["to"];
 
-    routeOne( *context, req, result, added );
+    {
+        FILL_HOLD hold( board, zoneMode == "refill" );
+
+        routeOne( *context, req, result, added );
+
+        if( result.value( "applied", false ) && hold.Active() )
+        {
+            hold.Refill( *context );
+            result["zones_refilled"] = true;
+        }
+    }
 
     if( result.value( "applied", false ) )
     {
@@ -1094,6 +1217,106 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             unfill.Push( _( "Unfill zones for routing (API)" ) );
     }
 
+    // Under the parts (avoid): inside the ring of pads of a quad package (QFP, QFN, LGA) no track and
+    // no via of this call - such tracks can wall its other pins in.  Temporary rule areas on the
+    // part's side for the call; parts with pads inside the ring (exposed pad, BGA) are left open
+    const std::string underParts = aArgs.value( "under_parts", std::string( "allow" ) );
+
+    if( underParts != "avoid" && underParts != "allow" )
+        return KOPENAPI_RESULT::Error( 400, "under_parts: avoid (no tracks inside a part's ring of pads) or allow" );
+
+    struct TEMP_KEEPOUTS
+    {
+        BOARD*             board;
+        std::vector<ZONE*> zones;
+
+        ~TEMP_KEEPOUTS()
+        {
+            for( ZONE* zone : zones )
+            {
+                board->Remove( zone );
+                delete zone;
+            }
+        }
+    } keepouts{ board, {} };
+
+    nlohmann::json keptOut = nlohmann::json::array();
+
+    if( underParts == "avoid" )
+    {
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            if( fp->Pads().size() < 8 )
+                continue;
+
+            BOX2I centres;
+            int   padLength = 0;
+            bool  first = true;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( first )
+                    centres = BOX2I( pad->GetPosition(), VECTOR2I( 0, 0 ) );
+                else
+                    centres.Merge( pad->GetPosition() );
+
+                first = false;
+                const BOX2I pb = pad->GetBoundingBox();
+                padLength = std::max( { padLength, (int) pb.GetWidth(), (int) pb.GetHeight() } );
+            }
+
+            BOX2I inner = centres;
+            inner.Inflate( -( padLength / 2 + pcbIUScale.mmToIU( 0.1 ) ) );
+
+            if( inner.GetWidth() <= 0 || inner.GetHeight() <= 0 )
+                continue;
+
+            // pads on all four sides (a quad package); two rows (SOIC, headers) leave room between
+            int sides[4] = { 0, 0, 0, 0 };
+
+            for( PAD* pad : fp->Pads() )
+            {
+                const VECTOR2I c = pad->GetPosition();
+                const bool     spanX = c.x >= inner.GetLeft() && c.x <= inner.GetRight();
+                const bool     spanY = c.y >= inner.GetTop() && c.y <= inner.GetBottom();
+                sides[0] += c.x < inner.GetLeft() && spanY;
+                sides[1] += c.x > inner.GetRight() && spanY;
+                sides[2] += c.y < inner.GetTop() && spanX;
+                sides[3] += c.y > inner.GetBottom() && spanX;
+            }
+
+            if( std::any_of( std::begin( sides ), std::end( sides ), []( int n ) { return n < 2; } ) )
+                continue;
+
+            if( std::any_of( fp->Pads().begin(), fp->Pads().end(),
+                             [&]( PAD* pad ) { return inner.Contains( pad->GetPosition() ); } ) )
+            {
+                continue;
+            }
+
+            auto* zone = new ZONE( board );
+            zone->SetIsRuleArea( true );
+            zone->SetDoNotAllowTracks( true );
+            zone->SetDoNotAllowVias( true );
+            zone->SetDoNotAllowPads( false );
+            zone->SetDoNotAllowFootprints( false );
+            zone->SetDoNotAllowZoneFills( false );
+            zone->SetLayerSet( LSET( { fp->GetLayer() == B_Cu ? B_Cu : F_Cu } ) );
+
+            SHAPE_LINE_CHAIN rect;
+            rect.Append( inner.GetLeft(), inner.GetTop() );
+            rect.Append( inner.GetRight(), inner.GetTop() );
+            rect.Append( inner.GetRight(), inner.GetBottom() );
+            rect.Append( inner.GetLeft(), inner.GetBottom() );
+            rect.SetClosed( true );
+            zone->AddPolygon( rect );
+
+            board->Add( zone );
+            keepouts.zones.push_back( zone );
+            keptOut.push_back( str( fp->GetReference() ) );
+        }
+    }
+
     // The airwires to route: pad-to-pad (or pad-to-track) connections of the ratsnest
     board->BuildConnectivity();
     std::shared_ptr<CONNECTIVITY_DATA> connectivity = board->GetConnectivity();
@@ -1115,6 +1338,17 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     };
 
     std::vector<JOB> jobs;
+
+    struct GAP
+    {
+        KIID        a;
+        KIID        b;
+        VECTOR2I    aPos;
+        VECTOR2I    bPos;
+        std::string net;
+    };
+
+    std::vector<GAP> gaps;
 
     for( int code = 1; code < (int) board->GetNetCount(); ++code )
     {
@@ -1146,7 +1380,17 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 std::swap( a, b ), std::swap( pa, pb );
 
             if( pa->Type() != PCB_PAD_T )
-                continue;   // track to track: later
+            {
+                // two pieces of the net's copper with a gap between (tracks / vias): routed after the
+                // pad connections, from the end of one to the other
+                if( ( pa->Type() == PCB_TRACE_T || pa->Type() == PCB_ARC_T || pa->Type() == PCB_VIA_T )
+                    && ( pb->Type() == PCB_TRACE_T || pb->Type() == PCB_ARC_T || pb->Type() == PCB_VIA_T ) )
+                {
+                    gaps.push_back( { pa->m_Uuid, pb->m_Uuid, a->Pos(), b->Pos(), name } );
+                }
+
+                continue;
+            }
 
             jobs.push_back( { static_cast<PAD*>( pa ), pb, pa->m_Uuid, pb->m_Uuid, b->Pos(),
                               (double) ( b->Pos() - a->Pos() ).EuclideanNorm(), name, power } );
@@ -1935,6 +2179,82 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             break;
     }
 
+    // Gaps between two pieces of a net's copper: from the end of one piece to the other
+    for( const GAP& gap : gaps )
+    {
+        KopenapiKeepUiAlive();
+
+        auto* a = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( gap.a, true ) );
+        auto* b = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( gap.b, true ) );
+
+        nlohmann::json row = { { "net", gap.net },
+                               { "gap", { { "from_mm", { toMm( gap.aPos.x ), toMm( gap.aPos.y ) } },
+                                          { "to_mm", { toMm( gap.bPos.x ), toMm( gap.bPos.y ) } } } },
+                               { "routed", false },
+                               { "tries", 0 } };
+
+        if( !a || !b )
+        {
+            row["reason"] = "an end of the gap is gone (taken out by a route of this call)";
+            results.push_back( row );
+            continue;
+        }
+
+        const auto joined = board->GetConnectivity()->GetConnectedItems( a );
+
+        if( std::find( joined.begin(), joined.end(), b ) != joined.end() )
+        {
+            row["routed"] = true;
+            row["joined_by_earlier_route"] = true;
+            row["length_mm"] = 0.0;
+            results.push_back( row );
+            continue;
+        }
+
+        nlohmann::json attempt;
+        int            tries = 0;
+        bool           ok = false;
+
+        for( PNS::PNS_MODE mode : { PNS::RM_Walkaround, PNS::RM_Shove } )
+        {
+            for( PCB_LAYER_ID layer : layers )
+            {
+                if( ok || tries >= maxTries || !a->IsOnLayer( layer ) || !b->IsOnLayer( layer ) )
+                    continue;
+
+                ROUTE_REQUEST req{ a, b, gap.bPos, layer, mode, dryRun, {} };
+                req.fromPos = gap.aPos;
+                attempt = nlohmann::json::object();
+                tries++;
+                ok = routeOne( *context, req, attempt, added );
+            }
+        }
+
+        row["routed"] = ok;
+        row["tries"] = tries;
+
+        if( ok )
+        {
+            row["layer"] = attempt["layer"];
+            row["mode"] = attempt["mode"];
+            row["width_mm"] = attempt["track_width_mm"];
+            row["length_mm"] = attempt["metrics"]["length_mm"];
+            row["vias"] = attempt["metrics"].value( "vias", 0 );
+        }
+        else
+        {
+            row["reason"] = tries ? attempt.value( "reason", std::string() ) : "the two pieces share no routing layer";
+
+            for( const char* key : { "violations", "stopped_at_mm", "blocked_by" } )
+            {
+                if( attempt.contains( key ) )
+                    row[key] = attempt[key];
+            }
+        }
+
+        results.push_back( row );
+    }
+
     if( !unfilled.empty() )
     {
         BOARD_COMMIT fillCommit( context->GetToolManager() );
@@ -2033,7 +2353,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         }
     }
 
-    const int connections = (int) ( jobs.size() - trunks.size() );
+    const int connections = (int) ( jobs.size() - trunks.size() + gaps.size() );
 
     if( stepMs == 0 )
         showRoutes( aCtx, added );
@@ -2048,6 +2368,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                   { "vias", vias },
                                   { "rip_up", { { "tried", rippedTried }, { "won", rippedOk } } },
                                   { "stubs_removed", stubs },
+                                  { "kept_out_under", keptOut },
                                   { "dry_run", dryRun },
                                   { "unrouted_left", dryRun ? connections - routed : (int) connectivity->GetUnconnectedCount( false ) },
                                   { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
@@ -3106,7 +3427,12 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                            { "length_mm", toMm( length ) }, { "vias", vias }, { "width_mm", toMm( width ) },
                            { "applied", false } };
 
-    const nlohmann::json violations = guard( board, changed, {} );
+    const std::string zoneMode = aArgs.value( "zones", std::string( "refill" ) );
+
+    if( zoneMode != "refill" && zoneMode != "keep" )
+        return KOPENAPI_RESULT::Error( 400, "zones: refill (pour fills give way, refilled after) or keep" );
+
+    const nlohmann::json violations = guard( board, changed, {}, zoneMode == "refill" );
 
     if( !violations.empty() )
     {
@@ -3133,6 +3459,14 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     commit.Push( _( "Add track (API)" ) );
     board->BuildConnectivity();
     board->GetConnectivity()->RecalculateRatsnest();
+
+    if( zoneMode == "refill" )
+    {
+        refillPours( *context, board );
+        out["zones_refilled"] = std::any_of( board->Zones().begin(), board->Zones().end(),
+                                             []( ZONE* z ) { return z->IsFilled() && !z->GetIsRuleArea(); } );
+    }
+
     showRoutes( aCtx, added );
 
     out["applied"] = true;
@@ -3156,6 +3490,7 @@ KOPENAPI_REGISTER( "pcb_route_connection",
                         "layer":{"type":"string","default":"F.Cu"},
                         "mode":{"type":"string","enum":["walkaround","shove"],"default":"walkaround"},
                         "waypoints":{"type":"array","description":"points to pass in order: [x_mm, y_mm] fixes a corner there; {at: [x_mm, y_mm], layer: 'B.Cu'} drops a through via there and continues on that layer","items":{}},
+                        "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills give way while routing and are refilled around the route; keep: the route must clear the fills"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_route_connection, 120 );
 
@@ -3180,6 +3515,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
+                        "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); parts with pads inside the ring (exposed pad, BGA) stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (0.65 mm or closer) is routed at the Default class width (not below the board minimum), the rest of its net at its class width; the row says necked_from_mm"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
                         "style":{"type":"string","enum":["direct","rail"],"default":"direct","description":"rail (power nets): every connection leaves its pads through a via next to them and runs on the second layer"},
@@ -3248,6 +3584,7 @@ KOPENAPI_REGISTER( "pcb_track_add",
                         "points":{"type":"array","description":"[x_mm, y_mm] or {at: [x_mm, y_mm], via: 'B.Cu'}","items":{}},
                         "layer":{"type":"string","description":"start layer; default F.Cu (B.Cu from a bottom SMD pad)"},
                         "width_mm":{"type":"number"},
+                        "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills of other nets give way (the guard does not count them) and are refilled around the track; keep: the track must clear the fills"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_track_add );
 
