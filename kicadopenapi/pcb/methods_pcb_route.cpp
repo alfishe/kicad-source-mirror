@@ -18,6 +18,7 @@
 #include <board_commit.h>
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
+#include <project/net_settings.h>
 #include <geometry/shape_circle.h>
 #include <geometry/shape_segment.h>
 #include <connectivity/connectivity_data.h>
@@ -364,6 +365,9 @@ struct ROUTE_REQUEST
     /// net are found next to them by KiCad's diff-pair router (net names ending in +/- or P/N)
     bool diffPair = false;
 
+    /// @brief A narrower track than the net's class gives (> 0): the connection meets a fine-pitch pad
+    int neckWidth = 0;
+
     /// @brief A pair's cursor path (a single route found first): the pair follows it
     std::vector<VECTOR2I> guide;
 };
@@ -437,6 +441,12 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     iface->SetStartLayerFromPCBNew( aReq.layer );
     iface->ImportSizes( sizes, startItem, nullptr, start );
     sizes.AddLayerPair( iface->GetPNSLayerFromBoardLayer( F_Cu ), iface->GetPNSLayerFromBoardLayer( B_Cu ) );
+
+    if( aReq.neckWidth > 0 && aReq.neckWidth < sizes.TrackWidth() )
+    {
+        aOut["necked_from_mm"] = toMm( sizes.TrackWidth() );
+        sizes.SetTrackWidth( aReq.neckWidth );
+    }
 
     // a pair without diff-pair rules: the track width, the gap the clearance
     if( aReq.diffPair && sizes.DiffPairWidth() <= 0 )
@@ -1012,6 +1022,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     const std::string diffPairs = aArgs.value( "diff_pairs", std::string( "auto" ) );
 
+    if( aArgs.value( "neck_down", std::string( "auto" ) ) != "auto" && aArgs.value( "neck_down", std::string( "auto" ) ) != "off" )
+        return KOPENAPI_RESULT::Error( 400, "neck_down: auto (connections at fine-pitch pads at the Default width) or off" );
+
     if( diffPairs != "auto" && diffPairs != "off" )
         return KOPENAPI_RESULT::Error( 400, "diff_pairs: auto (nets named as a pair routed coupled) or off" );
     size_t            glowFrom = 0;
@@ -1125,6 +1138,28 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         }
 
         return best;
+    };
+
+    // Neck-down: a connection with an end on a fine-pitch pad (0.65 mm or closer to the next) is
+    // routed at the Default class width (not below the board's minimum) - a wide power class does
+    // not fit between such pads; the rest of the net keeps its width
+    const std::string neckDown = aArgs.value( "neck_down", std::string( "auto" ) );
+    const int         neckWidth = std::max( board->GetDesignSettings().m_TrackMinWidth,
+                                            board->GetDesignSettings().m_NetSettings->GetDefaultNetclass()->HasTrackWidth()
+                                                    ? board->GetDesignSettings().m_NetSettings->GetDefaultNetclass()->GetTrackWidth()
+                                                    : 0 );
+
+    auto neckFor = [&]( PAD* aFrom, BOARD_CONNECTED_ITEM* aTo ) -> int
+    {
+        const double fine = pcbIUScale.mmToIU( 0.65 );
+
+        if( neckDown != "auto" )
+            return 0;
+
+        if( pitchOf( aFrom ) <= fine || ( aTo && aTo->Type() == PCB_PAD_T && pitchOf( static_cast<PAD*>( aTo ) ) <= fine ) )
+            return neckWidth;
+
+        return 0;
     };
 
     if( order == "dense_first" )
@@ -1280,6 +1315,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                         continue;
 
                     ROUTE_REQUEST req{ way.from, way.to, way.toPos, layer, mode, dryRun, {} };
+                    req.neckWidth = neckFor( way.from, way.to );
                     aAttempt = nlohmann::json::object();
                     aTries++;
                     ok = routeOne( *context, req, aAttempt, added );
@@ -1337,6 +1373,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                             break;
 
                         ROUTE_REQUEST req{ way.from, way.to, way.toPos, start, PNS::RM_Walkaround, dryRun, {} };
+                        req.neckWidth = neckFor( way.from, way.to );
                         req.vias = { { va, cross }, { vb, arrive } };
                         aAttempt = nlohmann::json::object();
                         aTries++;
@@ -1628,9 +1665,13 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             done[index] = true;
             row["layer"] = attempt["layer"];
             row["mode"] = attempt["mode"];
+            row["width_mm"] = attempt["track_width_mm"];
             row["length_mm"] = attempt["metrics"]["length_mm"];
             row["vias"] = attempt["metrics"].value( "vias", 0 );
             row["detour"] = attempt["metrics"]["detour"];
+
+            if( attempt.contains( "necked_from_mm" ) )
+                row["necked_from_mm"] = attempt["necked_from_mm"];
         }
         else
         {
@@ -1766,12 +1807,17 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             std::vector<std::unique_ptr<PCB_TRACK>> saved;
             BOARD_COMMIT                            rip( context->GetToolManager() );
 
+            std::set<PCB_TRACK*> taken;   // victims of one net can share copper: each piece once
+
             for( const auto& [d, other] : crossing )
             {
                 victims.push_back( other );
 
                 for( PCB_TRACK* t : chainOf( jobs[other] ) )
                 {
+                    if( !taken.insert( t ).second )
+                        continue;
+
                     saved.emplace_back( static_cast<PCB_TRACK*>( t->Clone() ) );
                     rip.Remove( t );
                 }
@@ -3098,6 +3144,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
+                        "neck_down":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (0.65 mm or closer) is routed at the Default class width (not below the board minimum), the rest of its net at its class width; the row says necked_from_mm"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
                         "style":{"type":"string","enum":["direct","rail"],"default":"direct","description":"rail (power nets): every connection leaves its pads through a via next to them and runs on the second layer"},
                         "step_ms":{"type":"integer","default":0,"description":"GUI: draw each route and wait this long before the next (for watching / recording)"},
