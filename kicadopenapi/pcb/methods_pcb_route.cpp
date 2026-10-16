@@ -648,6 +648,42 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         return false;
     }
 
+    // After a shove PNS can hand back a copy of a segment it left where it was (the copy has the
+    // original's parent, the original is not removed): the board has that copper already
+    for( auto it = iface->m_added.begin(); it != iface->m_added.end(); )
+    {
+        if( ( *it )->Type() != PCB_TRACE_T )
+        {
+            ++it;
+            continue;
+        }
+
+        PCB_TRACK* fresh = static_cast<PCB_TRACK*>( *it );
+        bool       twin = false;
+
+        for( PCB_TRACK* other : board->Tracks() )
+        {
+            if( other->Type() == PCB_TRACE_T && !iface->m_removed.count( other ) && other->GetNetCode() == fresh->GetNetCode()
+                && other->GetLayer() == fresh->GetLayer() && other->GetWidth() == fresh->GetWidth()
+                && ( ( other->GetStart() == fresh->GetStart() && other->GetEnd() == fresh->GetEnd() )
+                     || ( other->GetStart() == fresh->GetEnd() && other->GetEnd() == fresh->GetStart() ) ) )
+            {
+                twin = true;
+                break;
+            }
+        }
+
+        if( twin )
+        {
+            iface->Staged().Unstage( fresh, nullptr );
+            it = iface->m_added.erase( it );
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
     std::vector<BOARD_CONNECTED_ITEM*> changed;
     nlohmann::json                     segments = nlohmann::json::array();
     double                             length = 0;
