@@ -434,6 +434,24 @@ static std::optional<KOPENAPI_RESULT> guiRouting()
 }
 
 
+/// @brief Where a pcb_route call's time goes, over every attempt (the failed ones too)
+struct ROUTE_PROFILE
+{
+    int    attempts = 0;
+    double syncMs = 0;    ///< the router's world built from the board
+    double totalMs = 0;   ///< whole attempts (world, routing, guard, commit)
+};
+
+static ROUTE_PROFILE s_routeProfile;
+
+
+static double msSince( std::chrono::steady_clock::time_point aFrom,
+                       std::chrono::steady_clock::time_point aTo = std::chrono::steady_clock::now() )
+{
+    return std::chrono::duration<double, std::milli>( aTo - aFrom ).count();
+}
+
+
 bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
 {
     BOARD*     board = aContext.GetBoard();
@@ -472,6 +490,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     router->LoadSettings( &settings );
     router->SyncWorld();
     const auto synced = std::chrono::steady_clock::now();
+    s_routeProfile.syncMs += msSince( started, synced );
     router->SetMode( aReq.diffPair ? PNS::PNS_MODE_ROUTE_DIFF_PAIR : PNS::PNS_MODE_ROUTE_SINGLE );
 
     PNS::ITEM* startItem = router->GetWorld()->FindItemByParent( aReq.from );
@@ -876,7 +895,11 @@ nlohmann::json blockersAt( BOARD* aBoard, const VECTOR2I& aAt, const VECTOR2I& a
 /// @brief routeOneImpl, and for a route that stopped short what stands there (blocked_by)
 bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
 {
+    const auto started = std::chrono::steady_clock::now();
     const bool ok = routeOneImpl( aContext, aReq, aOut, aAdded );
+
+    s_routeProfile.attempts++;
+    s_routeProfile.totalMs += msSince( started );
 
     auto point = []( const nlohmann::json& aMm )
     { return VECTOR2I( pcbIUScale.mmToIU( aMm[0].get<double>() ), pcbIUScale.mmToIU( aMm[1].get<double>() ) ); };
@@ -1265,6 +1288,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     BOARD* board = context->GetBoard();
     const auto started = std::chrono::steady_clock::now();
+    s_routeProfile = {};
 
     std::set<std::string> nets;
 
@@ -1533,6 +1557,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         std::string           net;
         bool                  power;
         bool                  trunk = false;   ///< a differential pair's trunk, not an airwire
+        double                ms = 0;          ///< time of every try for it, rip-up re-routes too
     };
 
     std::vector<JOB> jobs;
@@ -1828,6 +1853,13 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     // other route as it is (rip-up attempts must be revertible).
     auto tryRoute = [&]( JOB& aJob, nlohmann::json& aAttempt, int& aTries, bool aShove, bool aBothWays ) -> bool
     {
+        struct TIMED
+        {
+            JOB&                                  job;
+            std::chrono::steady_clock::time_point from = std::chrono::steady_clock::now();
+            ~TIMED() { job.ms += msSince( from ); }
+        } timed{ aJob };
+
         bool ok = false;
 
         // both ways (retries) when the far end is a pad too: the walkaround finds other paths from the
@@ -2663,6 +2695,12 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     connectivity = board->GetConnectivity();
     connectivity->RecalculateRatsnest();
 
+    for( size_t k = 0; k < jobs.size(); k++ )
+    {
+        if( rowOf[k] >= 0 && results[rowOf[k]].is_object() )
+            results[rowOf[k]]["ms"] = std::round( jobs[k].ms );
+    }
+
     return KOPENAPI_RESULT::Ok( { { "connections", connections },
                                   { "routed", routed },
                                   { "failed", connections - routed },
@@ -2675,6 +2713,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                   { "dry_run", dryRun },
                                   { "unrouted_left", dryRun ? connections - routed : (int) connectivity->GetUnconnectedCount( false ) },
                                   { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
+                                  { "profile", { { "attempts", s_routeProfile.attempts },
+                                                 { "sync_ms", std::round( s_routeProfile.syncMs ) },
+                                                 { "route_ms", std::round( s_routeProfile.totalMs - s_routeProfile.syncMs ) } } },
                                   { "results", results } } );
 }
 
@@ -4363,7 +4404,9 @@ KOPENAPI_REGISTER( "pcb_route",
                    "and clearance), one by one if that fails (row diff_pair tells); "
                    "every route passes the net-merge guard; copper of this call that ends nowhere is removed "
                    "(stubs_removed); a row still routed at the end is joined by copper; per connection "
-                   "routed / reason, totals (routed, length, vias, unrouted left); dry_run routes nothing",
+                   "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
+                   "profile (attempts; sync_ms: building the router's world for each; route_ms: the rest); "
+                   "dry_run routes nothing",
                    R"json({"type":"object","properties":{
                         "nets":{"type":"array","items":{"type":"string"}},
                         "layers":{"type":"array","items":{"type":"string"},"default":["F.Cu","B.Cu"]},
