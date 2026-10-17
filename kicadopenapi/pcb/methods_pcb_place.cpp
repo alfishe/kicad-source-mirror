@@ -710,6 +710,7 @@ struct NEAR_OPTIONS
     std::string           direction = "auto";
     std::string           partPad;          ///< pad number of the part to bring to the target; else by net
     double                hostRingMm = 0;   ///< keep this far from the target footprint's courtyard (fan-out room)
+    bool                  gapGiven = false; ///< gap_mm asked for (else a default that may be narrowed)
 };
 
 struct NEAR_PLACEMENT
@@ -974,6 +975,7 @@ nlohmann::json nearJson( const NEAR_PLACEMENT& aPlacement, PAD* aTarget )
 std::optional<std::string> nearOptions( const nlohmann::json& aFrom, NEAR_OPTIONS& aOptions, double aDefaultGap = 0.25 )
 {
     aOptions.gapMm = aFrom.value( "gap_mm", aDefaultGap );
+    aOptions.gapGiven = aFrom.contains( "gap_mm" );
     aOptions.hostRingMm = aFrom.value( "fanout_ring_mm", -1.0 );
     aOptions.maxMm = aFrom.value( "max_mm", 25.0 );
     aOptions.direction = aFrom.value( "near_direction", std::string( "auto" ) );
@@ -1164,13 +1166,19 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         // a fine-pitch anchor (0.65 mm or less) keeps a ring for its fan-out, unless asked otherwise
         if( options.hostRingMm < 0 )
-            options.hostRingMm = finePitch( aAnchor ) ? 0.6 : 0.0;
+            options.hostRingMm = finePitch( aAnchor ) ? 1.0 : 0.0;
 
         NEAR_PLACEMENT placement = placeNear( aBoard, member.part, target, options );
 
         if( !placement.ok && options.hostRingMm > 0 )
         {
             options.hostRingMm = 0;   // no room with the ring: as close as the courtyards allow
+            placement = placeNear( aBoard, member.part, target, options );
+        }
+
+        if( !placement.ok && !options.gapGiven && options.gapMm > 0.5 )
+        {
+            options.gapMm = 0.5;      // no room with the default gap: the narrow one
             placement = placeNear( aBoard, member.part, target, options );
         }
 
@@ -2172,7 +2180,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         std::vector<FOOTPRINT*> parts;
         NEAR_OPTIONS            options;
 
-        if( groupParts( aCtx, board, group, anchor, parts, false ) || nearOptions( group, options, 0.5 ) )
+        if( groupParts( aCtx, board, group, anchor, parts, false ) || nearOptions( group, options, 1.0 ) )
         {
             notes.push_back( "group skipped (anchor / parts not found or locked): " + group.dump() );
             continue;
@@ -2215,7 +2223,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( std::optional<KOPENAPI_RESULT> error = groupParts( aCtx, board, aArgs, anchor, parts, aArgs.value( "override_locks", false ) ) )
         return *error;
 
-    if( std::optional<std::string> wrong = nearOptions( aArgs, options, 0.5 ) )
+    if( std::optional<std::string> wrong = nearOptions( aArgs, options, 1.0 ) )
         return KOPENAPI_RESULT::Error( 400, *wrong );
 
     nlohmann::json decoupling;
@@ -2300,8 +2308,8 @@ KOPENAPI_REGISTER( "pcb_place_group",
                         "decoupling":{"type":"string","enum":["schematic"],"description":"add the anchor's decoupling capacitors guessed from the open schematic: C parts across two of its rails, nearest to it on its sheet, one per supply pad (the answer's decoupling.chosen lists them)"},
                         "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
                         "side":{"type":"string","enum":["same","opposite"],"default":"same"},
-                        "gap_mm":{"type":"number","default":0.5,"description":"between courtyards (room for a track between the parts)"},
-                        "fanout_ring_mm":{"type":"number","description":"keep this far from the anchor's courtyard (room for the tracks leaving its pins); default 0.6 for a fine-pitch anchor (pads 0.65 mm apart or closer), else 0; parts that find no place with it come as close as the courtyards allow"},
+                        "gap_mm":{"type":"number","default":1.0,"description":"between courtyards (room for tracks between the parts; TC-13 2 layers: 0.5 mm routed 68 of 81, 1.0 mm 73); by default a part that finds no place at 1.0 mm takes 0.5"},
+                        "fanout_ring_mm":{"type":"number","description":"keep this far from the anchor's courtyard (room for the tracks leaving its pins); default 1.0 for a fine-pitch anchor (pads 0.65 mm apart or closer), else 0; parts that find no place with it come as close as the courtyards allow"},
                         "max_mm":{"type":"number","default":25,"description":"how far from the anchor's pad a part may end up"},
                         "override_locks":{"type":"boolean","default":false},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
