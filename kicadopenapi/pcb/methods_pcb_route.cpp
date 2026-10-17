@@ -438,6 +438,7 @@ static std::optional<KOPENAPI_RESULT> guiRouting()
 struct ROUTE_PROFILE
 {
     int    attempts = 0;
+    int    deadLegsSkipped = 0;   ///< tries not made: their first leg had failed to reach that via
     double syncMs = 0;    ///< the router's world built from the board
     double totalMs = 0;   ///< whole attempts (world, routing, guard, commit)
 };
@@ -1939,6 +1940,20 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             const std::vector<VECTOR2I> starts = spots( way.from, from, way.toPos );
             const std::vector<VECTOR2I> ends = spots( way.to, way.toPos, from );
 
+            // a route that stopped short of its first via: that leg (from the pad, on the start
+            // layer) fails whatever comes after the via, so no other try through that spot is made
+            std::set<std::pair<int, int>> deadFirstVia;
+
+            auto stoppedBefore = [&]( const VECTOR2I& aVia )
+            {
+                if( !aAttempt.contains( "toward_mm" ) || aAttempt.value( "routed", false ) )
+                    return false;
+
+                const nlohmann::json& t = aAttempt["toward_mm"];
+                return std::abs( pcbIUScale.mmToIU( t[0].get<double>() ) - aVia.x ) <= 1
+                       && std::abs( pcbIUScale.mmToIU( t[1].get<double>() ) - aVia.y ) <= 1;
+            };
+
             // ends on different layers: one via, near the far end first (the start leaves on its
             // own layer), then near the start
             if( arrive != start )
@@ -1952,12 +1967,21 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                         if( ok || aTries >= maxTries || budget-- <= 0 )
                             break;
 
+                        if( deadFirstVia.count( { v.x, v.y } ) )
+                        {
+                            s_routeProfile.deadLegsSkipped++;
+                            continue;
+                        }
+
                         ROUTE_REQUEST req{ way.from, way.to, way.toPos, start, PNS::RM_Walkaround, dryRun, {} };
                         req.neckWidth = neckFor( way.from, way.to );
                         req.vias = { { v, arrive } };
                         aAttempt = nlohmann::json::object();
                         aTries++;
                         ok = routeOne( *context, req, aAttempt, added );
+
+                        if( !ok && stoppedBefore( v ) )
+                            deadFirstVia.insert( { v.x, v.y } );
                     }
                 }
 
@@ -1976,6 +2000,12 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 {
                     for( const VECTOR2I& vb : ends )
                     {
+                        if( deadFirstVia.count( { va.x, va.y } ) )
+                        {
+                            s_routeProfile.deadLegsSkipped++;
+                            break;
+                        }
+
                         if( ok || aTries >= maxTries || budget-- <= 0 )
                             break;
 
@@ -1985,6 +2015,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                         aAttempt = nlohmann::json::object();
                         aTries++;
                         ok = routeOne( *context, req, aAttempt, added );
+
+                        if( !ok && stoppedBefore( va ) )
+                            deadFirstVia.insert( { va.x, va.y } );
                     }
                 }
 
@@ -2714,6 +2747,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                   { "unrouted_left", dryRun ? connections - routed : (int) connectivity->GetUnconnectedCount( false ) },
                                   { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
                                   { "profile", { { "attempts", s_routeProfile.attempts },
+                                                 { "dead_legs_skipped", s_routeProfile.deadLegsSkipped },
                                                  { "sync_ms", std::round( s_routeProfile.syncMs ) },
                                                  { "route_ms", std::round( s_routeProfile.totalMs - s_routeProfile.syncMs ) } } },
                                   { "results", results } } );
