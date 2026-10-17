@@ -417,6 +417,11 @@ bool shortenStep( const fs::path& aIn, const fs::path& aOut, const glm::mat4& aM
     {
         std::lock_guard<std::mutex> lock( KopenapiStepTranslatorMutex() );
 
+        // AP242: faces given as triangles only (TRIANGULATED_FACE, e.g. a part's marking) are kept;
+        // AP214 drops them.  The schema is process-wide: put back after this file
+        const std::string schema = Interface_Static::CVal( "write.step.schema" );
+        Interface_Static::SetCVal( "write.step.schema", "AP242DIS" );
+
         STEPCAFControl_Writer writer;
         writer.SetColorMode( true );
         writer.SetNameMode( true );
@@ -424,6 +429,7 @@ bool shortenStep( const fs::path& aIn, const fs::path& aOut, const glm::mat4& aM
         Interface_Static::SetCVal( "write.step.unit", "MM" );
 
         ok = writer.Transfer( doc, STEPControl_AsIs ) && writer.Write( aOut.string().c_str() ) == IFSelect_RetDone;
+        Interface_Static::SetCVal( "write.step.schema", schema.c_str() );
         app->Close( doc );
     }
 
@@ -506,7 +512,7 @@ nlohmann::json apply( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const TRIM_
             for( int i = 0; i < 16; ++i )
                 key << std::round( glm::value_ptr( matrix )[i] * 1e4 ) << ',';
 
-            key << std::round( plane * 1e3 );
+            key << std::round( plane * 1e3 ) << "|ap242";   // the writer's format: copies made before are made again
 
             std::ostringstream name;
             name << source.stem().string() << '-' << std::hex << std::hash<std::string>{}( key.str() ) << ".step";
