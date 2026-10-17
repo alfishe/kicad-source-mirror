@@ -432,3 +432,22 @@ KOPENAPI_REGISTER( "api_trace",
                         "method":{"type":"string","description":"glob on the method name"},
                         "slower_ms":{"type":"number","description":"only calls that took longer (queued + run)"}}})json"_json,
                    false, h_api_trace );
+
+
+static KOPENAPI_RESULT h_api_call_result( KOPENAPI_CONTEXT&, const nlohmann::json& )
+{
+    // the service answers api_call_result itself, on the HTTP thread (see invokeParsed)
+    return KOPENAPI_RESULT::Error( 500, "api_call_result is served by the service" );
+}
+
+
+KOPENAPI_REGISTER( "api_call_result",
+                   "The result of a call that outlived its time limit: such a call answers 504 with a "
+                   "call_id and runs on; this gives its result once it has finished (status and body of "
+                   "the call itself, plus call_id, method, running: false; then it is forgotten), or "
+                   "running: true and running_s while it runs. wait_s waits up to that long (max 600). "
+                   "Answers even while KiCad is busy. The last 64 such calls are kept",
+                   R"json({"type":"object","required":["call_id"],"properties":{
+                        "call_id":{"type":"string","description":"from the 504 of the call"},
+                        "wait_s":{"type":"integer","minimum":0,"maximum":600,"default":0}}})json"_json,
+                   false, h_api_call_result );

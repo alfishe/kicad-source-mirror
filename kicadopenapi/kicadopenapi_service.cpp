@@ -24,6 +24,7 @@
 #include <cmath>
 #include <mutex>
 #include <deque>
+#include <map>
 #include <thread>
 
 // A body sent without "Content-Type: application/json" (curl -d, Python urllib) is taken as a form,
@@ -46,6 +47,111 @@ static const char* const KOPENAPI_HOST_ADDR = "127.0.0.1";
 /// will move to async jobs.
 static constexpr std::chrono::seconds CALL_TIMEOUT( 15 );
 static constexpr std::chrono::milliseconds WAIT_SLICE( 20 );
+
+
+/// @brief A method's timeout; env KICAD_OPENAPI_CALL_TIMEOUT_S lowers every one of them (tests of
+/// the late-call path with ordinary methods)
+static std::chrono::seconds callTimeout( int aMethodSec )
+{
+    static const int cap = []
+    {
+        const char* env = std::getenv( "KICAD_OPENAPI_CALL_TIMEOUT_S" );
+        return env ? std::atoi( env ) : 0;
+    }();
+
+    const int sec = std::max( aMethodSec, 1 );
+    return std::chrono::seconds( cap > 0 ? std::min( sec, cap ) : sec );
+}
+
+
+/// @brief Calls that outlived their timeout and run on: the 504 names them (call_id), their result
+/// waits here for api_call_result.  The newest LATE_KEEP are kept, finished ones dropped first.
+struct LATE_CALL
+{
+    std::string                           method;
+    std::chrono::steady_clock::time_point since;
+    std::shared_future<KOPENAPI_RESULT>   result;
+};
+
+static std::mutex                         s_lateMutex;
+static std::map<uint64_t, LATE_CALL>      s_lateCalls;
+static uint64_t                           s_lateSeq = 0;
+static constexpr size_t                   LATE_KEEP = 64;
+
+
+static std::string keepLateCall( const std::string& aMethod, std::shared_future<KOPENAPI_RESULT> aResult )
+{
+    std::lock_guard<std::mutex> lock( s_lateMutex );
+    const uint64_t              id = ++s_lateSeq;
+
+    s_lateCalls[id] = { aMethod, std::chrono::steady_clock::now(), std::move( aResult ) };
+
+    while( s_lateCalls.size() > LATE_KEEP )
+    {
+        auto drop = std::find_if( s_lateCalls.begin(), s_lateCalls.end(),
+                                  []( const auto& aEntry )
+                                  {
+                                      return aEntry.second.result.wait_for( std::chrono::seconds( 0 ) )
+                                             == std::future_status::ready;
+                                  } );
+        s_lateCalls.erase( drop != s_lateCalls.end() ? drop : s_lateCalls.begin() );
+    }
+
+    return "call-" + std::to_string( id );
+}
+
+
+/// @brief api_call_result: the result of a call that outlived its timeout (once; then forgotten),
+/// or that it still runs.  wait_s waits for it on this HTTP thread.
+static KOPENAPI_RESULT lateCallResult( const nlohmann::json& aArgs )
+{
+    const std::string callId = aArgs.value( "call_id", std::string() );
+    uint64_t          id = 0;
+
+    if( callId.rfind( "call-", 0 ) == 0 )
+        id = std::strtoull( callId.c_str() + 5, nullptr, 10 );
+
+    std::shared_future<KOPENAPI_RESULT> result;
+    std::string                         method;
+    std::chrono::steady_clock::time_point since;
+
+    {
+        std::lock_guard<std::mutex> lock( s_lateMutex );
+        auto                        it = s_lateCalls.find( id );
+
+        if( it == s_lateCalls.end() )
+            return KOPENAPI_RESULT::Error( 404, "no call '" + callId + "': unknown, or its result was already taken" );
+
+        result = it->second.result;
+        method = it->second.method;
+        since = it->second.since;
+    }
+
+    const int waitS = std::clamp( aArgs.value( "wait_s", 0 ), 0, 600 );
+
+    if( result.wait_for( std::chrono::seconds( waitS ) ) != std::future_status::ready )
+    {
+        const double running = std::chrono::duration<double>( std::chrono::steady_clock::now() - since ).count();
+        return KOPENAPI_RESULT::Ok( { { "call_id", callId }, { "method", method }, { "running", true },
+                                      { "running_s", std::round( running * 10 ) / 10 } } );
+    }
+
+    {
+        std::lock_guard<std::mutex> lock( s_lateMutex );
+        s_lateCalls.erase( id );
+    }
+
+    KOPENAPI_RESULT done = result.get();
+
+    if( done.body.is_object() )
+    {
+        done.body["call_id"] = callId;
+        done.body["method"] = method;
+        done.body["running"] = false;
+    }
+
+    return done;
+}
 
 namespace fs = std::filesystem;
 
@@ -195,13 +301,14 @@ public:
 static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAlive,
                                   const std::function<void()>&             aWaker,
                                   std::function<KOPENAPI_RESULT()>         aFn,
-                                  std::chrono::seconds                     aTimeout = CALL_TIMEOUT )
+                                  std::chrono::seconds                     aTimeout = CALL_TIMEOUT,
+                                  const std::string&                       aMethod = std::string() )
 {
     if( !wxTheApp )
         return KOPENAPI_RESULT::Error( 503, "no application event loop" );
 
     auto promise = std::make_shared<std::promise<KOPENAPI_RESULT>>();
-    std::future<KOPENAPI_RESULT> future = promise->get_future();
+    std::shared_future<KOPENAPI_RESULT> future = promise->get_future().share();
 
     auto ticket = std::make_shared<KOPENAPI_CALL_TICKET>();
 
@@ -261,12 +368,18 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
         }
 
         // Started: it runs to its end on the main thread and its changes stand
-        return stopping ? KOPENAPI_RESULT::Error( 503, "service stopping while the call was running; it may "
-                                                       "have completed (edit_log)" )
-                        : KOPENAPI_RESULT::Error( 504, "the call started but did not finish within "
-                                                               + std::to_string( aTimeout.count() )
-                                                               + " s; it is still running and its changes "
-                                                                 "will stand: check edit_log before retrying" );
+        if( stopping )
+            return KOPENAPI_RESULT::Error( 503, "service stopping while the call was running; it may "
+                                                "have completed (edit_log)" );
+
+        const std::string callId = keepLateCall( aMethod, future );
+        KOPENAPI_RESULT   late = KOPENAPI_RESULT::Error( 504, "the call started but did not finish within "
+                                                                  + std::to_string( aTimeout.count() )
+                                                                  + " s; it is still running and its changes "
+                                                                    "will stand: api_call_result {call_id: \""
+                                                                  + callId + "\"} gives its result" );
+        late.body["call_id"] = callId;
+        return late;
     }
 
     return future.get();
@@ -711,6 +824,9 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     if( aName == "memory_summary" )
         return KOPENAPI_RESULT::Ok( KOPENAPI_MEMORY::Summary() );
 
+    if( aName == "api_call_result" )
+        return lateCallResult( aArgs );
+
     KOPENAPI_CONTEXT ctxCopy = ctx;
     KOPENAPI_HANDLER handler = method->handler;
     nlohmann::json   args = aArgs;
@@ -797,7 +913,7 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
 
                           return result;
                       },
-                      std::chrono::seconds( std::max( method->timeoutSec, 1 ) ) );
+                      callTimeout( method->timeoutSec ), aName );
 
     if( !tracing )
         return outcome;
