@@ -439,11 +439,37 @@ struct ROUTE_PROFILE
 {
     int    attempts = 0;
     int    deadLegsSkipped = 0;   ///< tries not made: their first leg had failed to reach that via
+    int    viaSpotsBlocked = 0;   ///< via spots left out: a via there would touch another net
+    int    ripUpsSkipped = 0;     ///< rip-ups not repeated: nothing changed since the same one failed
     double syncMs = 0;    ///< the router's world built from the board
+    double moveMs = 0;    ///< the router's path search (every Move of the head)
     double totalMs = 0;   ///< whole attempts (world, routing, guard, commit)
+
+    struct TALLY
+    {
+        int    tries = 0;
+        int    routed = 0;
+        double ms = 0;
+    };
+
+    std::map<std::string, TALLY> byKind;     ///< walkaround / shove / one_via / two_vias
+    std::map<std::string, TALLY> byFailure;  ///< failed attempts by reason (places cut off)
+    std::map<std::string, TALLY> byPass;     ///< first pass, retry from both ends, rip-up
+    std::string                  pass = "first";
 };
 
 static ROUTE_PROFILE s_routeProfile;
+
+
+static nlohmann::json tallies( const std::map<std::string, ROUTE_PROFILE::TALLY>& aTallies )
+{
+    nlohmann::json out = nlohmann::json::object();
+
+    for( const auto& [name, t] : aTallies )
+        out[name] = { { "tries", t.tries }, { "routed", t.routed }, { "ms", std::round( t.ms ) } };
+
+    return out;
+}
 
 
 static double msSince( std::chrono::steady_clock::time_point aFrom,
@@ -555,6 +581,13 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         return false;
     }
 
+    auto move = [&]( const VECTOR2I& aAt, PNS::ITEM* aItem )
+    {
+        const auto from = std::chrono::steady_clock::now();
+        router->Move( aAt, aItem );
+        s_routeProfile.moveMs += msSince( from );
+    };
+
     // Vias on the way: route to the point, drop a through via there, continue on the next layer
     PNS::PLACEMENT_ALGO* placer = router->Placer();
 
@@ -563,8 +596,8 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         if( !viaLayer )
         {
             // a corner: route to the point and fix what is there, on the same layer
-            router->Move( at, nullptr );
-            router->Move( at, nullptr );
+            move( at, nullptr );
+            move( at, nullptr );
 
             const bool there = placer->CurrentEnd() == at;
 
@@ -611,8 +644,8 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         if( !router->IsPlacingVia() )
             router->ToggleViaPlacement();
 
-        router->Move( at, nullptr );
-        router->Move( at, nullptr );
+        move( at, nullptr );
+        move( at, nullptr );
 
         if( placer->CurrentEnd() != at )
         {
@@ -675,7 +708,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
             for( int k = 1; k <= steps; ++k )
             {
                 if( leg + 1 < path.size() || k < steps )
-                    router->Move( from + ( to - from ) * k / steps, nullptr );
+                    move( from + ( to - from ) * k / steps, nullptr );
             }
         }
     }
@@ -687,7 +720,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     do
     {
         previous = placer->CurrentEnd();
-        router->Move( target, targetItem );
+        move( target, targetItem );
     } while( placer->CurrentEnd() != previous && --tries );
 
     // At the target point and on one of its layers (an SMD pad is on one side only): what the
@@ -899,8 +932,32 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     const auto started = std::chrono::steady_clock::now();
     const bool ok = routeOneImpl( aContext, aReq, aOut, aAdded );
 
+    const double ms = msSince( started );
     s_routeProfile.attempts++;
-    s_routeProfile.totalMs += msSince( started );
+    s_routeProfile.totalMs += ms;
+
+    const std::string kind = aReq.vias.size() >= 2 ? "two_vias"
+                             : aReq.vias.size() == 1 ? "one_via"
+                             : aReq.mode == PNS::RM_Shove ? "shove" : "walkaround";
+    for( ROUTE_PROFILE::TALLY* t : { &s_routeProfile.byKind[kind], &s_routeProfile.byPass[s_routeProfile.pass] } )
+    {
+        t->tries++;
+        t->routed += ok;
+        t->ms += ms;
+    }
+
+    if( !ok )
+    {
+        std::string reason = aOut.value( "reason", std::string( "-" ) );
+        size_t      at = reason.find( " at " );
+
+        if( at != std::string::npos )
+            reason.resize( at );
+
+        ROUTE_PROFILE::TALLY& f = s_routeProfile.byFailure[reason];
+        f.tries++;
+        f.ms += ms;
+    }
 
     auto point = []( const nlohmann::json& aMm )
     { return VECTOR2I( pcbIUScale.mmToIU( aMm[0].get<double>() ), pcbIUScale.mmToIU( aMm[1].get<double>() ) ); };
@@ -1779,6 +1836,32 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         return false;
     };
 
+    // a via of the end's net (the smallest the router could use there) would touch copper of
+    // another net (pads, tracks, vias; the board's rule for each pair): the router's walkaround cannot
+    // place it, a try through it is wasted
+    auto viaBlocked = [&]( BOARD_CONNECTED_ITEM* aEnd, const VECTOR2I& aAt )
+    {
+        int       dia = ds.GetCurrentViaSize();
+        int       drill = ds.GetCurrentViaDrill();
+        NETCLASS* netclass = aEnd->GetEffectiveNetClass();
+
+        if( netclass && netclass->HasViaDiameter() )
+            dia = std::min( dia, netclass->GetViaDiameter() );
+
+        if( netclass && netclass->HasViaDrill() )
+            drill = std::min( drill, netclass->GetViaDrill() );
+
+        PCB_VIA via( board );
+        via.SetPosition( aAt );
+        via.SetViaType( VIATYPE::THROUGH );
+        via.SetLayerPair( F_Cu, B_Cu );
+        via.SetWidth( PADSTACK::ALL_LAYERS, dia );
+        via.SetDrill( drill );
+        via.SetNet( aEnd->GetNet() );
+
+        return !guard( board, { &via }, {}, true ).empty();
+    };
+
     // Via spots to leave an end: out of the package first (away from its body, past the pad's end,
     // a little to either side), then around the end; nearest the other end first within each kind
     auto spots = [&]( BOARD_CONNECTED_ITEM* aEnd, const VECTOR2I& aPos, const VECTOR2I& aToward )
@@ -1829,8 +1912,22 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         auto byTarget = [&]( const VECTOR2I& x, const VECTOR2I& y )
         { return ( x - aToward ).EuclideanNorm() < ( y - aToward ).EuclideanNorm(); };
 
-        outward.erase( std::remove_if( outward.begin(), outward.end(), holeClash ), outward.end() );
-        around.erase( std::remove_if( around.begin(), around.end(), holeClash ), around.end() );
+        auto unusable = [&]( const VECTOR2I& aAt )
+        {
+            if( holeClash( aAt ) )
+                return true;
+
+            if( viaBlocked( aEnd, aAt ) )
+            {
+                s_routeProfile.viaSpotsBlocked++;
+                return true;
+            }
+
+            return false;
+        };
+
+        outward.erase( std::remove_if( outward.begin(), outward.end(), unusable ), outward.end() );
+        around.erase( std::remove_if( around.begin(), around.end(), unusable ), around.end() );
         std::stable_sort( around.begin(), around.end(), byTarget );
 
         std::vector<VECTOR2I> out;
@@ -1852,7 +1949,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     // Every way to route one connection: on a layer both ends are on (walkaround, then shove),
     // then out through a via near each end and across on another layer.  aShove false keeps every
     // other route as it is (rip-up attempts must be revertible).
-    auto tryRoute = [&]( JOB& aJob, nlohmann::json& aAttempt, int& aTries, bool aShove, bool aBothWays ) -> bool
+    auto tryRoute = [&]( JOB& aJob, nlohmann::json& aAttempt, int& aTries, bool aShove, bool aBothWays,
+                         bool aForward = true ) -> bool
     {
         struct TIMED
         {
@@ -1876,6 +1974,10 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
         if( aBothWays && aJob.to->Type() == PCB_PAD_T )
             ways.push_back( { static_cast<PAD*>( aJob.to ), aJob.from, aJob.from->GetPosition() } );
+
+        // aForward false: the forward way is known to fail
+        if( !aForward )
+            ways.erase( ways.begin() );
 
         for( PNS::PNS_MODE mode : { PNS::RM_Walkaround, PNS::RM_Shove } )
         {
@@ -1941,8 +2043,11 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             const std::vector<VECTOR2I> ends = spots( way.to, way.toPos, from );
 
             // a route that stopped short of its first via: that leg (from the pad, on the start
-            // layer) fails whatever comes after the via, so no other try through that spot is made
+            // layer) fails whatever comes after the via, so no other try through that spot is made;
+            // one that passed every via and stopped short of the target: the last leg (from the last
+            // via, on the arriving layer) fails whatever came before it
             std::set<std::pair<int, int>> deadFirstVia;
+            std::set<std::pair<int, int>> deadLastVia;
 
             auto stoppedBefore = [&]( const VECTOR2I& aVia )
             {
@@ -1952,6 +2057,12 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 const nlohmann::json& t = aAttempt["toward_mm"];
                 return std::abs( pcbIUScale.mmToIU( t[0].get<double>() ) - aVia.x ) <= 1
                        && std::abs( pcbIUScale.mmToIU( t[1].get<double>() ) - aVia.y ) <= 1;
+            };
+
+            auto stoppedAfter = [&]()
+            {
+                return !aAttempt.value( "routed", false ) && aAttempt.contains( "target_mm" )
+                       && aAttempt.contains( "stopped_at_mm" ) && !aAttempt.contains( "toward_mm" );
             };
 
             // ends on different layers: one via, near the far end first (the start leaves on its
@@ -1967,7 +2078,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                         if( ok || aTries >= maxTries || budget-- <= 0 )
                             break;
 
-                        if( deadFirstVia.count( { v.x, v.y } ) )
+                        if( deadFirstVia.count( { v.x, v.y } ) || deadLastVia.count( { v.x, v.y } ) )
                         {
                             s_routeProfile.deadLegsSkipped++;
                             continue;
@@ -1982,6 +2093,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
                         if( !ok && stoppedBefore( v ) )
                             deadFirstVia.insert( { v.x, v.y } );
+                        else if( !ok && stoppedAfter() )
+                            deadLastVia.insert( { v.x, v.y } );
                     }
                 }
 
@@ -2006,8 +2119,16 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                             break;
                         }
 
-                        if( ok || aTries >= maxTries || budget-- <= 0 )
+                        if( ok || aTries >= maxTries || budget <= 0 )
                             break;
+
+                        if( deadLastVia.count( { vb.x, vb.y } ) )
+                        {
+                            s_routeProfile.deadLegsSkipped++;
+                            continue;
+                        }
+
+                        budget--;
 
                         ROUTE_REQUEST req{ way.from, way.to, way.toPos, start, PNS::RM_Walkaround, dryRun, {} };
                         req.neckWidth = neckFor( way.from, way.to );
@@ -2018,6 +2139,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
                         if( !ok && stoppedBefore( va ) )
                             deadFirstVia.insert( { va.x, va.y } );
+                        else if( !ok && stoppedAfter() )
+                            deadLastVia.insert( { vb.x, vb.y } );
                     }
                 }
 
@@ -2334,6 +2457,11 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     const int ripRounds = dryRun ? 0 : std::clamp( aArgs.value( "rip_up", 2 ), 0, 6 );
     int       rippedOk = 0, rippedTried = 0;
 
+    // a failed rip-up puts everything back exactly: until another route changes the board, the
+    // same rip-up fails again
+    int              boardVersion = 0;
+    std::vector<int> ripFailedAt( jobs.size(), -1 );
+
     auto chainOf = [&]( JOB& aJob ) -> std::vector<PCB_TRACK*>
     {
         PAD* a = dynamic_cast<PAD*>( board->ResolveItem( aJob.fromId, true ) );
@@ -2369,9 +2497,14 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 nlohmann::json attempt;
                 int            tries = 0;
 
-                if( tryRoute( job, attempt, tries, false, true ) )
+                s_routeProfile.pass = "retry";
+
+                // until a rip-up has moved routes, the board has only gained copper since the first
+                // pass: the forward way failed there already
+                if( tryRoute( job, attempt, tries, false, true, rippedOk > 0 ) )
                 {
                     progress = true;
+                    boardVersion++;
                     done[index] = true;
 
                     nlohmann::json& row = results[rowOf[index]];
@@ -2435,6 +2568,12 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             if( crossing.empty() )
                 continue;
 
+            if( ripFailedAt[index] == boardVersion )
+            {
+                s_routeProfile.ripUpsSkipped++;
+                continue;
+            }
+
             std::sort( crossing.begin(), crossing.end() );
 
             if( crossing.size() > 3 )
@@ -2468,6 +2607,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
             nlohmann::json attempt;
             int            tries = 0;
+            s_routeProfile.pass = "rip_up";
             bool           ok = tryRoute( job, attempt, tries, false, true );
             nlohmann::json victimAttempts = nlohmann::json::array();
 
@@ -2490,6 +2630,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             {
                 rippedOk++;
                 progress = true;
+                boardVersion++;
                 done[index] = true;
 
                 nlohmann::json& row = results[rowOf[index]];
@@ -2533,6 +2674,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
             undo.Push( _( "Rip up undone (API)" ) );
             board->GetConnectivity()->RecalculateRatsnest();
+            ripFailedAt[index] = boardVersion;
         }
 
         if( !progress )
@@ -2540,6 +2682,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     }
 
     // Gaps between two pieces of a net's copper: from the end of one piece to the other
+    s_routeProfile.pass = "gaps";
+
     for( const GAP& gap : gaps )
     {
         KopenapiKeepUiAlive();
@@ -2748,8 +2892,14 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                   { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
                                   { "profile", { { "attempts", s_routeProfile.attempts },
                                                  { "dead_legs_skipped", s_routeProfile.deadLegsSkipped },
+                                                 { "via_spots_blocked", s_routeProfile.viaSpotsBlocked },
+                                                 { "rip_ups_skipped", s_routeProfile.ripUpsSkipped },
                                                  { "sync_ms", std::round( s_routeProfile.syncMs ) },
-                                                 { "route_ms", std::round( s_routeProfile.totalMs - s_routeProfile.syncMs ) } } },
+                                                 { "move_ms", std::round( s_routeProfile.moveMs ) },
+                                                 { "route_ms", std::round( s_routeProfile.totalMs - s_routeProfile.syncMs ) },
+                                                 { "by_kind", tallies( s_routeProfile.byKind ) },
+                                                 { "failed_by", tallies( s_routeProfile.byFailure ) },
+                                                 { "by_pass", tallies( s_routeProfile.byPass ) } } },
                                   { "results", results } } );
 }
 
@@ -4439,7 +4589,10 @@ KOPENAPI_REGISTER( "pcb_route",
                    "every route passes the net-merge guard; copper of this call that ends nowhere is removed "
                    "(stubs_removed); a row still routed at the end is joined by copper; per connection "
                    "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
-                   "profile (attempts; sync_ms: building the router's world for each; route_ms: the rest); "
+                   "profile (attempts; dead_legs_skipped / via_spots_blocked / rip_ups_skipped: tries not made; sync_ms: building the router's world for each; move_ms: the path search; "
+                   "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
+                   "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
+                   "rip_up, gaps); "
                    "dry_run routes nothing",
                    R"json({"type":"object","properties":{
                         "nets":{"type":"array","items":{"type":"string"}},
