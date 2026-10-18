@@ -10,6 +10,7 @@
 /// and metrics of what the router would do, for comparing variants.
 #include <advanced_config.h>
 #include "kopenapi_pcb.h"
+#include "route_plan.h"
 
 #include <api/pcb_context.h>
 #include <kicadopenapi_keepalive.h>
@@ -418,6 +419,9 @@ struct ROUTE_REQUEST
 
     /// @brief A pair's cursor path (a single route found first): the pair follows it
     std::vector<VECTOR2I> guide;
+
+    /// @brief The points come from the global plan (PlanRoute)
+    bool planned = false;
 };
 
 
@@ -443,6 +447,9 @@ struct ROUTE_PROFILE
     int    viaSpotsBlocked = 0;   ///< via spots left out: a via there would touch another net
     int    ripUpsSkipped = 0;     ///< rip-ups not repeated: nothing changed since the same one failed
     int    pairsStuck = 0;        ///< pair tries ended early: nothing placed after the first steps
+    int    plans = 0;             ///< global plans made (PlanRoute)
+    int    plansFound = 0;        ///< ... that found a way
+    double planMs = 0;
     double syncMs = 0;    ///< the router's world built from the board
     double moveMs = 0;    ///< the router's path search (every Move of the head)
     double totalMs = 0;   ///< whole attempts (world, routing, guard, commit)
@@ -956,8 +963,10 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     s_routeProfile.attempts++;
     s_routeProfile.totalMs += ms;
 
-    const std::string kind = aReq.vias.size() >= 2 ? "two_vias"
-                             : aReq.vias.size() == 1 ? "one_via"
+    const size_t      viaCount = std::count_if( aReq.vias.begin(), aReq.vias.end(), []( const auto& v ) { return v.second.has_value(); } );
+    const std::string kind = aReq.planned ? "planned"
+                             : viaCount >= 2 ? "two_vias"
+                             : viaCount == 1 ? "one_via"
                              : aReq.mode == PNS::RM_Shove ? "shove" : "walkaround";
     for( ROUTE_PROFILE::TALLY* t : { &s_routeProfile.byKind[kind], &s_routeProfile.byPass[s_routeProfile.pass] } )
     {
@@ -1965,6 +1974,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     std::vector<KIID> added;
     const bool rail = style == "rail";
     const bool viasAllowed = aArgs.value( "vias", true ) && layers.size() >= 2;
+    const bool planning = aArgs.value( "plan", true );
 
     // Every way to route one connection: on a layer both ends are on (walkaround, then shove),
     // then out through a via near each end and across on another layer.  aShove false keeps every
@@ -1999,6 +2009,48 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         if( !aForward )
             ways.erase( ways.begin() );
 
+        // the global plan: a way over the free space of the layers, the router follows its corners
+        int  planned = -1;   // -1 no plan made, 0 none found, 1 found
+        auto planTry = [&]()
+        {
+            if( ok || !planning || rail || ways.empty() || aTries >= maxTries )
+                return;
+
+            const WAY& way = ways.front();
+            NETCLASS*  netclass = way.from->GetEffectiveNetClass();
+            int        width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : ds.GetCurrentTrackWidth();
+            int        dia = ds.GetCurrentViaSize();
+            int        drill = ds.GetCurrentViaDrill();
+
+            if( netclass && netclass->HasViaDiameter() )
+                dia = std::min( dia, netclass->GetViaDiameter() );
+
+            if( netclass && netclass->HasViaDrill() )
+                drill = std::min( drill, netclass->GetViaDrill() );
+
+            if( const int neck = neckFor( way.from, way.to ); neck > 0 && neck < width )
+                width = neck;
+
+            ROUTE_PLAN_REQUEST planReq{ board, way.from, way.to, way.toPos, layers, width, viasAllowed ? dia : 0, drill };
+            const ROUTE_PLAN   plan = PlanRoute( planReq );
+
+            s_routeProfile.plans++;
+            s_routeProfile.plansFound += plan.found;
+            planned = plan.found ? 1 : 0;
+            s_routeProfile.planMs += plan.ms;
+
+            if( plan.found )
+            {
+                ROUTE_REQUEST req{ way.from, way.to, way.toPos, plan.startLayer, PNS::RM_Walkaround, dryRun, {} };
+                req.neckWidth = neckFor( way.from, way.to );
+                req.vias = plan.points;
+                req.planned = true;
+                aAttempt = nlohmann::json::object();
+                aTries++;
+                ok = routeOne( *context, req, aAttempt, added );
+            }
+        };
+
         for( PNS::PNS_MODE mode : { PNS::RM_Walkaround, PNS::RM_Shove } )
         {
             if( mode == PNS::RM_Shove && !aShove )
@@ -2027,8 +2079,19 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                              + ( viasAllowed ? "" : " (vias: false; a via is needed)" ) } };
         }
 
+        if( !ok )
+            planTry();
+
         if( ok || !viasAllowed )
             return ok;
+
+        // the plan searched every way over the free space around the connection and found none:
+        // the escape spots below find none either (they only try fewer ways)
+        if( planned == 0 )
+        {
+            aAttempt["plan"] = "no way over the free space around the connection";
+            return false;
+        }
 
         for( const WAY& way : ways )
         {
@@ -2474,7 +2537,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         {
             row["reason"] = attempt.value( "reason", std::string() );
 
-            for( const char* key : { "violations", "stopped_at_mm", "blocked_by" } )
+            for( const char* key : { "violations", "stopped_at_mm", "blocked_by", "plan" } )
             {
                 if( attempt.contains( key ) )
                     row[key] = attempt[key];
@@ -2790,7 +2853,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         {
             row["reason"] = tries ? attempt.value( "reason", std::string() ) : "the two pieces share no routing layer";
 
-            for( const char* key : { "violations", "stopped_at_mm", "blocked_by" } )
+            for( const char* key : { "violations", "stopped_at_mm", "blocked_by", "plan" } )
             {
                 if( attempt.contains( key ) )
                     row[key] = attempt[key];
@@ -2929,6 +2992,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                                  { "via_spots_blocked", s_routeProfile.viaSpotsBlocked },
                                                  { "rip_ups_skipped", s_routeProfile.ripUpsSkipped },
                                                  { "pairs_stuck", s_routeProfile.pairsStuck },
+                                                 { "plans", s_routeProfile.plans },
+                                                 { "plans_found", s_routeProfile.plansFound },
+                                                 { "plan_ms", std::round( s_routeProfile.planMs ) },
                                                  { "sync_ms", std::round( s_routeProfile.syncMs ) },
                                                  { "move_ms", std::round( s_routeProfile.moveMs ) },
                                                  { "route_ms", std::round( s_routeProfile.totalMs - s_routeProfile.syncMs ) },
@@ -4625,7 +4691,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "(stubs_removed); a row still routed at the end is joined by copper; per connection "
                    "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
                    "profile (attempts; dead_legs_skipped / via_spots_blocked / rip_ups_skipped: tries not made; "
-                   "pairs_stuck: pair tries ended when nothing was placed after 3 steps; sync_ms: building the router's world for each; move_ms: the path search; "
+                   "pairs_stuck: pair tries ended when nothing was placed after 3 steps; plans / plans_found / plan_ms: global plans; sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
                    "rip_up, gaps); "
@@ -4641,6 +4707,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); parts with pads inside the ring (exposed pad, BGA) stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (0.65 mm or closer) is routed no wider than that pad's narrow side (not below the Default class width or the board minimum) when its class is wider; the rest of its net at its class width; the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
+                        "plan":{"type":"boolean","default":true,"description":"a connection the router does not find on a layer is planned over the free space (grid search with vias, the board's clearances), the router follows the plan; no plan found: no escape-spot tries either (row plan tells)"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
                         "style":{"type":"string","enum":["direct","rail"],"default":"direct","description":"rail (power nets): every connection leaves its pads through a via next to them and runs on the second layer"},
                         "step_ms":{"type":"integer","default":0,"description":"GUI: draw each route and wait this long before the next (for watching / recording)"},
