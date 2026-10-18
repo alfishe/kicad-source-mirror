@@ -50,6 +50,7 @@
 #include <limits>
 #include <deque>
 #include <map>
+#include <tuple>
 #include <thread>
 #include <cmath>
 #include <optional>
@@ -441,6 +442,7 @@ struct ROUTE_PROFILE
     int    deadLegsSkipped = 0;   ///< tries not made: their first leg had failed to reach that via
     int    viaSpotsBlocked = 0;   ///< via spots left out: a via there would touch another net
     int    ripUpsSkipped = 0;     ///< rip-ups not repeated: nothing changed since the same one failed
+    int    pairsStuck = 0;        ///< pair tries ended early: nothing placed after the first steps
     double syncMs = 0;    ///< the router's world built from the board
     double moveMs = 0;    ///< the router's path search (every Move of the head)
     double totalMs = 0;   ///< whole attempts (world, routing, guard, commit)
@@ -699,17 +701,35 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         path.insert( path.end(), aReq.guide.begin(), aReq.guide.end() );
         path.push_back( target );
 
-        for( size_t leg = 1; leg < path.size(); ++leg )
+        // a pair that has not left its start pads after a few steps does not fit there: each further
+        // step only searches the same gateways again (seconds each on a dense board)
+        constexpr int STUCK_STEPS = 3;
+        int           empty = 0;
+
+        for( size_t leg = 1; leg < path.size() && empty < STUCK_STEPS; ++leg )
         {
             const VECTOR2I from = path[leg - 1];
             const VECTOR2I to = path[leg];
             const int      steps = std::max( 1, (int) ( ( to - from ).EuclideanNorm() / pcbIUScale.mmToIU( 1.0 ) ) );
 
-            for( int k = 1; k <= steps; ++k )
+            for( int k = 1; k <= steps && empty < STUCK_STEPS; ++k )
             {
                 if( leg + 1 < path.size() || k < steps )
+                {
                     move( from + ( to - from ) * k / steps, nullptr );
+                    empty = placer->HasPlacedAnything() ? 0 : empty + 1;
+                }
             }
+        }
+
+        if( empty >= STUCK_STEPS )
+        {
+            router->StopRouting();
+            iface->Staged().Revert();
+            s_routeProfile.pairsStuck++;
+            aOut["routed"] = false;
+            aOut["reason"] = "the pair did not leave its start pads";
+            return false;
         }
     }
 
@@ -2297,6 +2317,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             PAD* const trunkEnds[2][2] = { { job.from, static_cast<PAD*>( job.to ) },
                                            { static_cast<PAD*>( job.to ), job.from } };
 
+            // the guiding single route is the same whatever the pair's mode: found once per end and layer
+            std::map<std::tuple<PAD*, PAD*, int>, std::vector<VECTOR2I>> guides;
+
             for( PNS::PNS_MODE mode : { PNS::RM_Walkaround, PNS::RM_Shove } )
             {
                 for( PCB_LAYER_ID layer : layers )
@@ -2309,12 +2332,23 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                         ROUTE_REQUEST req{ a, b, b->GetPosition(), layer, mode, dryRun, {} };
                         req.diffPair = true;
 
-                        ROUTE_REQUEST     probe{ a, b, b->GetPosition(), layer, PNS::RM_Walkaround, true, {} };
-                        nlohmann::json    probeOut;
-                        std::vector<KIID> none;
+                        const auto key = std::make_tuple( a, b, (int) layer );
+                        auto       guide = guides.find( key );
 
-                        if( routeOne( *context, probe, probeOut, none ) )
-                            req.guide = segmentPath( probeOut.value( "segments", nlohmann::json::array() ), a->GetPosition() );
+                        if( guide == guides.end() )
+                        {
+                            ROUTE_REQUEST     probe{ a, b, b->GetPosition(), layer, PNS::RM_Walkaround, true, {} };
+                            nlohmann::json    probeOut;
+                            std::vector<KIID> none;
+                            std::vector<VECTOR2I> path;
+
+                            if( routeOne( *context, probe, probeOut, none ) )
+                                path = segmentPath( probeOut.value( "segments", nlohmann::json::array() ), a->GetPosition() );
+
+                            guide = guides.emplace( key, path ).first;
+                        }
+
+                        req.guide = guide->second;
 
                         pairAttempt = nlohmann::json::object();
                         pairTries++;
@@ -2894,6 +2928,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                                  { "dead_legs_skipped", s_routeProfile.deadLegsSkipped },
                                                  { "via_spots_blocked", s_routeProfile.viaSpotsBlocked },
                                                  { "rip_ups_skipped", s_routeProfile.ripUpsSkipped },
+                                                 { "pairs_stuck", s_routeProfile.pairsStuck },
                                                  { "sync_ms", std::round( s_routeProfile.syncMs ) },
                                                  { "move_ms", std::round( s_routeProfile.moveMs ) },
                                                  { "route_ms", std::round( s_routeProfile.totalMs - s_routeProfile.syncMs ) },
@@ -4589,7 +4624,8 @@ KOPENAPI_REGISTER( "pcb_route",
                    "every route passes the net-merge guard; copper of this call that ends nowhere is removed "
                    "(stubs_removed); a row still routed at the end is joined by copper; per connection "
                    "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
-                   "profile (attempts; dead_legs_skipped / via_spots_blocked / rip_ups_skipped: tries not made; sync_ms: building the router's world for each; move_ms: the path search; "
+                   "profile (attempts; dead_legs_skipped / via_spots_blocked / rip_ups_skipped: tries not made; "
+                   "pairs_stuck: pair tries ended when nothing was placed after 3 steps; sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
                    "rip_up, gaps); "
