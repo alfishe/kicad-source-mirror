@@ -484,6 +484,7 @@ struct ROUTE_PROFILE
     std::map<std::string, TALLY> byFailure;  ///< failed attempts by reason (places cut off)
     std::map<std::string, TALLY> byPass;     ///< first pass, retry from both ends, rip-up
     std::string                  pass = "first";
+    std::set<int>                shovedNets;   ///< nets of other copper a committed route moved
 };
 
 static ROUTE_PROFILE s_routeProfile;
@@ -956,8 +957,38 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         return true;
     }
 
+    const NETINFO_ITEM* coupled = aReq.diffPair ? board->DpCoupledNet( aReq.from->GetNet() ) : nullptr;
+
+    auto otherNet = [&]( const BOARD_ITEM* aItem ) -> int
+    {
+        const BOARD_CONNECTED_ITEM* connected = dynamic_cast<const BOARD_CONNECTED_ITEM*>( aItem );
+
+        if( !connected || connected->GetNetCode() <= 0 || connected->GetNetCode() == aReq.from->GetNetCode()
+            || ( coupled && connected->GetNetCode() == coupled->GetNetCode() ) )
+        {
+            return 0;
+        }
+
+        return connected->GetNetCode();
+    };
+
     for( BOARD_ITEM* item : iface->m_added )
         aAdded.push_back( item->m_Uuid );
+
+    for( BOARD_ITEM* item : iface->m_added )
+    {
+        if( int net = otherNet( item ) )
+            s_routeProfile.shovedNets.insert( net );
+    }
+
+    for( const auto* items : { &iface->m_modified, &iface->m_removed } )
+    {
+        for( BOARD_ITEM* item : *items )
+        {
+            if( int net = otherNet( item ) )
+                s_routeProfile.shovedNets.insert( net );
+        }
+    }
 
     iface->Staged().Push( _( "Route (API)" ) );
     board->GetConnectivity()->RecalculateRatsnest();
@@ -1449,6 +1480,23 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     const auto started = std::chrono::steady_clock::now();
     s_routeProfile = {};
 
+    // each net's copper before the call (pieces, length): what shove moved of other nets is told
+    auto copperOf = [&]()
+    {
+        std::map<int, std::pair<int, double>> copper;
+
+        for( PCB_TRACK* track : board->Tracks() )
+        {
+            std::pair<int, double>& net = copper[track->GetNetCode()];
+            net.first++;
+            net.second += track->Type() == PCB_VIA_T ? 0.0 : track->GetLength();
+        }
+
+        return copper;
+    };
+
+    const std::map<int, std::pair<int, double>> copperBefore = copperOf();
+
     std::set<std::string> nets;
 
     for( const nlohmann::json& n : aArgs.value( "nets", nlohmann::json::array() ) )
@@ -1835,13 +1883,28 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         }
     }
 
+    // equal keys by where the ends are: the board's item order follows uuids, random for a board
+    // built by pcb_netlist_apply
+    auto byPlace = []( const JOB& x, const JOB& y )
+    {
+        const VECTOR2I xf = x.from->GetPosition(), yf = y.from->GetPosition();
+
+        if( xf != yf )
+            return xf.x != yf.x ? xf.x < yf.x : xf.y < yf.y;
+
+        return x.toPos.x != y.toPos.x ? x.toPos.x < y.toPos.x : x.toPos.y < y.toPos.y;
+    };
+
     std::stable_sort( jobs.begin(), jobs.end(),
                       [&]( const JOB& x, const JOB& y )
                       {
                           if( order == "power_first" && x.power != y.power )
                               return x.power;
 
-                          return x.length < y.length;
+                          if( x.length != y.length )
+                              return x.length < y.length;
+
+                          return byPlace( x, y );
                       } );
 
     // dense_first: connections at fine-pitch pads (0.65 mm or less to the next pad) before the rest
@@ -1900,7 +1963,10 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                               const bool fy = pitchOf( y.from ) <= fine
                                               || ( y.to->Type() == PCB_PAD_T && pitchOf( static_cast<PAD*>( y.to ) ) <= fine );
 
-                              return fx != fy ? fx : x.length < y.length;
+                              if( fx != fy )
+                                  return fx;
+
+                              return x.length != y.length ? x.length < y.length : byPlace( x, y );
                           } );
     }
 
@@ -3207,6 +3273,17 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         board->BuildConnectivity();
     }
 
+    // nets of the call: copper of other nets that a shove laid again is theirs and stays
+    std::set<int> callNets;
+
+    for( const JOB& job : jobs )
+    {
+        callNets.insert( job.from->GetNetCode() );
+
+        if( NETINFO_ITEM* coupled = job.trunk ? board->DpCoupledNet( job.from->GetNet() ) : nullptr )
+            callNets.insert( coupled->GetNetCode() );
+    }
+
     // copper of this call that leads nowhere (left by rip-ups, router slivers) taken out
     int stubs = 0;
 
@@ -3221,7 +3298,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         {
             PCB_TRACK* track = dynamic_cast<PCB_TRACK*>( board->ResolveItem( id, true ) );
 
-            if( !track || track->IsLocked() )
+            if( !track || track->IsLocked() || !callNets.count( track->GetNetCode() ) )
                 continue;
 
             if( conn->TestTrackEndpointDangling( track, true ) )
@@ -3304,7 +3381,28 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             results[rowOf[k]]["ms"] = std::round( jobs[k].ms );
     }
 
+    // other nets whose copper the routes pushed aside and that did not come back as they were
+    nlohmann::json                              moved = nlohmann::json::array();
+    const std::map<int, std::pair<int, double>> copperAfter = copperOf();
+
+    for( int net : s_routeProfile.shovedNets )
+    {
+        auto before = copperBefore.find( net );
+        auto after = copperAfter.find( net );
+        const std::pair<int, double> b = before != copperBefore.end() ? before->second : std::pair<int, double>( 0, 0.0 );
+        const std::pair<int, double> a = after != copperAfter.end() ? after->second : std::pair<int, double>( 0, 0.0 );
+
+        if( callNets.count( net ) || ( b.first == a.first && std::abs( a.second - b.second ) < 1.0 ) )
+            continue;
+
+        NETINFO_ITEM* info = board->FindNet( net );
+        moved.push_back( { { "net", info ? str( info->GetNetname() ) : std::to_string( net ) },
+                           { "pieces", { b.first, a.first } },
+                           { "length_mm", { toMm( b.second ), toMm( a.second ) } } } );
+    }
+
     return KOPENAPI_RESULT::Ok( { { "connections", connections },
+                                  { "other_nets_moved", moved },
                                   { "routed", routed },
                                   { "failed", connections - routed },
                                   { "length_mm", std::round( length * 1000.0 ) / 1000.0 },
@@ -5021,7 +5119,9 @@ KOPENAPI_REGISTER( "pcb_route",
                    "routed coupled by KiCad's diff-pair router (width / gap from the rules, else track width "
                    "and clearance), one by one if that fails (row diff_pair tells); "
                    "every route passes the net-merge guard; copper of this call that ends nowhere is removed "
-                   "(stubs_removed); a row still routed at the end is joined by copper; per connection "
+                   "(stubs_removed); copper of nets outside the call that shove pushed aside is listed "
+                   "(other_nets_moved: pieces and length before / after); a row still routed at the end is "
+                   "joined by copper; per connection "
                    "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
                    "profile (attempts; dead_legs_skipped / via_spots_blocked / rip_ups_skipped / rip_ups_walled: tries not made; "
                    "rip_ups_planned: rip-ups whose routes a plan chose; "
