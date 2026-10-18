@@ -9,6 +9,8 @@
 #include <api/pcb_context.h>
 #include <board.h>
 #include <board_design_settings.h>
+#include <footprint.h>
+#include <pcb_track.h>
 #include <page_info.h>
 #include <zone.h>
 #include <lset.h>
@@ -69,8 +71,8 @@ struct PAGE_WINDOW
 };
 
 
-/// @brief What one plotted image costs: the plotter draws into a surface of the window (a page
-/// is at least an inch a side), the image is read back, cut and encoded
+/// @brief What one plotted image costs: the plotter draws into a surface of the window, the
+/// image is read back and encoded
 struct RENDER_COST
 {
     int    width = 0;    ///< the plotter's surface, pixels
@@ -105,8 +107,8 @@ RENDER_COST renderCost( const BOARD* aBoard, const BOX2I& aWindow, int aDpi, int
     const double inchIU = pcbIUScale.IU_PER_MILS * 1000.0;
     RENDER_COST  cost;
 
-    cost.width = KiROUND( std::max( aWindow.GetWidth() / inchIU, 1.0 ) * aDpi );
-    cost.height = KiROUND( std::max( aWindow.GetHeight() / inchIU, 1.0 ) * aDpi );
+    cost.width = std::max( 1, KiROUND( aWindow.GetWidth() / inchIU * aDpi ) );
+    cost.height = std::max( 1, KiROUND( aWindow.GetHeight() / inchIU * aDpi ) );
     cost.megapixels = (double) cost.width * cost.height / 1e6;
 
     const size_t items = aBoard->Tracks().size() + aBoard->Drawings().size() + aBoard->Zones().size()
@@ -122,8 +124,8 @@ RENDER_COST renderCost( const BOARD* aBoard, const BOX2I& aWindow, int aDpi, int
 KOPENAPI_RESULT tooBig( const RENDER_COST& aCost, const BOX2I& aWindow, int aDpi )
 {
     const double inchIU = pcbIUScale.IU_PER_MILS * 1000.0;
-    const double wIn = std::max( aWindow.GetWidth() / inchIU, 1.0 );
-    const double hIn = std::max( aWindow.GetHeight() / inchIU, 1.0 );
+    const double wIn = aWindow.GetWidth() / inchIU;
+    const double hIn = aWindow.GetHeight() / inchIU;
     const int    maxDpi = (int) std::min( { std::sqrt( RENDER_MAX_MEGAPIXELS * 1e6 / ( wIn * hIn ) ),
                                             RENDER_MAX_SIDE / wIn, RENDER_MAX_SIDE / hIn } );
     const double fitMm = std::sqrt( RENDER_MAX_MEGAPIXELS * 1e6 ) / aDpi * 25.4;
@@ -136,6 +138,56 @@ KOPENAPI_RESULT tooBig( const RENDER_COST& aCost, const BOX2I& aWindow, int aDpi
     error["max_dpi_for_this_window"] = maxDpi;
     error["max_square_region_mm_at_this_dpi"] = std::round( std::min( fitMm, RENDER_MAX_SIDE * 25.4 / aDpi ) * 10 ) / 10;
     return result;
+}
+
+
+/// @brief The box of what these layers draw: items on other layers (a fab note, a part parked
+/// off the board) do not widen the image
+BOX2I drawnBox( const BOARD* aBoard, const LSET& aLayers )
+{
+    BOX2I box;
+
+    auto take = [&]( BOARD_ITEM* aItem )
+    {
+        const EDA_TEXT* text = dynamic_cast<const EDA_TEXT*>( aItem );
+
+        if( ( aItem->GetLayerSet() & aLayers ).any() && !( text && !text->IsVisible() ) )
+            box.Merge( aItem->GetBoundingBox() );
+    };
+
+    for( BOARD_ITEM* item : aBoard->Drawings() )
+        take( item );
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+        take( track );
+
+    for( ZONE* zone : aBoard->Zones() )
+        take( zone );
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+        fp->RunOnChildren( [&]( BOARD_ITEM* aChild ) { take( aChild ); }, RECURSE_MODE::RECURSE );
+
+    return box;
+}
+
+
+/// @brief Layers named in a comma-separated list (unknown names left to the plot job)
+LSET layersOf( const std::string& aList )
+{
+    LSET     set;
+    wxString rest = wxString::FromUTF8( aList );
+
+    while( !rest.IsEmpty() )
+    {
+        const int id = LSET::NameToLayer( rest.BeforeFirst( ',' ).Trim().Trim( false ) );
+
+        if( id >= 0 )
+            set.set( id );
+
+        rest = rest.AfterFirst( ',' );
+    }
+
+    return set;
 }
 
 
@@ -219,7 +271,7 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     }
     else if( !sheet )
     {
-        window = board->ComputeBoundingBox( false, false );
+        window = drawnBox( board, layersOf( layers ) );
         window.Inflate( pcbIUScale.mmToIU( 25.4 / 6 ) );   // the crop's margin (a sixth of an inch)
     }
 
@@ -322,7 +374,7 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     if( read.status != 200 )
         return read;
 
-    // a page is at least an inch a side: the window is the image's top left
+    // the window is the image (rounded to whole pixels)
     const double pxPerIU = dpi / ( pcbIUScale.IU_PER_MILS * 1000.0 );
     wxRect       want( 0, 0, KiROUND( window.GetWidth() * pxPerIU ), KiROUND( window.GetHeight() * pxPerIU ) );
     want.Intersect( wxRect( 0, 0, image.GetWidth(), image.GetHeight() ) );
@@ -504,8 +556,16 @@ static KOPENAPI_RESULT h_pcb_render_layers( KOPENAPI_CONTEXT& aCtx, const nlohma
     const int  dpi = std::clamp( aArgs.value( "dpi", 100 ), 30, 600 );
     const bool outline = aArgs.value( "outline", true );
 
-    // the board with the crop's margin, not the page
-    BOX2I window = board->ComputeBoundingBox( false, false );
+    // what the layers draw with the crop's margin, not the page
+    LSET drawn;
+
+    for( PCB_LAYER_ID layer : wanted )
+        drawn.set( layer );
+
+    if( outline )
+        drawn.set( Edge_Cuts );
+
+    BOX2I window = drawnBox( board, drawn );
     window.Inflate( pcbIUScale.mmToIU( 25.4 / 6 ) );
 
     if( window.GetWidth() <= 0 || window.GetHeight() <= 0 )
