@@ -20,6 +20,15 @@ struct ROUTE_PLAN_REQUEST
     int                       trackWidth = 0;
     int                       viaDiameter = 0;     ///< 0: no layer changes
     int                       viaDrill = 0;
+
+    /// @brief Copper the plan may cross at a cost: routes that can be taken out and routed again
+    struct SOFT
+    {
+        std::vector<BOARD_CONNECTED_ITEM*> copper;
+        int                                cellCost = 0;   ///< per cell of its clearance crossed (a straight step is 10)
+    };
+
+    std::vector<SOFT> soft;
 };
 
 /// @brief A route through free space: corners on a layer, and through vias where it changes layer
@@ -30,6 +39,8 @@ struct ROUTE_PLAN
 
     /// @brief The points after the start pad: a corner (no layer) or a via to that layer
     std::vector<std::pair<VECTOR2I, std::optional<PCB_LAYER_ID>>> points;
+
+    std::vector<int> crossed;   ///< the soft copper the path runs through (indexes into the request's soft)
 
     int    vias = 0;
     double length = 0;     ///< board units, along the cells

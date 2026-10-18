@@ -446,6 +446,8 @@ struct ROUTE_PROFILE
     int    deadLegsSkipped = 0;   ///< tries not made: their first leg had failed to reach that via
     int    viaSpotsBlocked = 0;   ///< via spots left out: a via there would touch another net
     int    ripUpsSkipped = 0;     ///< rip-ups not repeated: nothing changed since the same one failed
+    int    ripUpsWalled = 0;      ///< rip-ups not made: no plan even through the routes of this call
+    int    ripUpsPlanned = 0;     ///< rip-ups whose routes to take out a plan chose (the rest: the nearest in the corridor)
     int    pairsStuck = 0;        ///< pair tries ended early: nothing placed after the first steps
     int    plans = 0;             ///< global plans made (PlanRoute)
     int    plansFound = 0;        ///< ... that found a way
@@ -1976,6 +1978,35 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     const bool viasAllowed = aArgs.value( "vias", true ) && layers.size() >= 2;
     const bool planning = aArgs.value( "plan", true );
 
+    auto planRequest = [&]( PAD* aFrom, BOARD_CONNECTED_ITEM* aTo, const VECTOR2I& aToPos )
+    {
+        NETCLASS* netclass = aFrom->GetEffectiveNetClass();
+        int       width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : ds.GetCurrentTrackWidth();
+        int       dia = ds.GetCurrentViaSize();
+        int       drill = ds.GetCurrentViaDrill();
+
+        if( netclass && netclass->HasViaDiameter() )
+            dia = std::min( dia, netclass->GetViaDiameter() );
+
+        if( netclass && netclass->HasViaDrill() )
+            drill = std::min( drill, netclass->GetViaDrill() );
+
+        if( const int neck = neckFor( aFrom, aTo ); neck > 0 && neck < width )
+            width = neck;
+
+        return ROUTE_PLAN_REQUEST{ board, aFrom, aTo, aToPos, layers, width, viasAllowed ? dia : 0, drill, {} };
+    };
+
+    auto makePlan = [&]( const ROUTE_PLAN_REQUEST& aReq )
+    {
+        const ROUTE_PLAN plan = PlanRoute( aReq );
+
+        s_routeProfile.plans++;
+        s_routeProfile.plansFound += plan.found;
+        s_routeProfile.planMs += plan.ms;
+        return plan;
+    };
+
     // Every way to route one connection: on a layer both ends are on (walkaround, then shove),
     // then out through a via near each end and across on another layer.  aShove false keeps every
     // other route as it is (rip-up attempts must be revertible).
@@ -2016,28 +2047,10 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             if( ok || !planning || rail || ways.empty() || aTries >= maxTries )
                 return;
 
-            const WAY& way = ways.front();
-            NETCLASS*  netclass = way.from->GetEffectiveNetClass();
-            int        width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : ds.GetCurrentTrackWidth();
-            int        dia = ds.GetCurrentViaSize();
-            int        drill = ds.GetCurrentViaDrill();
+            const WAY&       way = ways.front();
+            const ROUTE_PLAN plan = makePlan( planRequest( way.from, way.to, way.toPos ) );
 
-            if( netclass && netclass->HasViaDiameter() )
-                dia = std::min( dia, netclass->GetViaDiameter() );
-
-            if( netclass && netclass->HasViaDrill() )
-                drill = std::min( drill, netclass->GetViaDrill() );
-
-            if( const int neck = neckFor( way.from, way.to ); neck > 0 && neck < width )
-                width = neck;
-
-            ROUTE_PLAN_REQUEST planReq{ board, way.from, way.to, way.toPos, layers, width, viasAllowed ? dia : 0, drill };
-            const ROUTE_PLAN   plan = PlanRoute( planReq );
-
-            s_routeProfile.plans++;
-            s_routeProfile.plansFound += plan.found;
             planned = plan.found ? 1 : 0;
-            s_routeProfile.planMs += plan.ms;
 
             if( plan.found )
             {
@@ -2550,14 +2563,19 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     // Rip-up and retry: for a connection that failed, take out the routes of this call that cross
     // its corridor, route it, route them again; if anything of that fails, everything goes back
-    // as it was (walkaround only: nothing else is pushed aside, so the restore is exact)
+    // as it was (walkaround only: no other net is pushed aside; the copper of the nets it touched
+    // is put back from copies)
     const int ripRounds = dryRun ? 0 : std::clamp( aArgs.value( "rip_up", 2 ), 0, 6 );
     int       rippedOk = 0, rippedTried = 0;
 
-    // a failed rip-up puts everything back exactly: until another route changes the board, the
-    // same rip-up fails again
-    int              boardVersion = 0;
-    std::vector<int> ripFailedAt( jobs.size(), -1 );
+    // the rip-ups that failed, by board version and the routes taken out; how often each route has
+    // been taken out (its copper costs a plan more each time)
+    int                                                        boardVersion = 0;
+    std::vector<std::set<std::pair<int, std::vector<size_t>>>> ripFailed( jobs.size() );
+    std::vector<int>                                           ripHistory( jobs.size(), 0 );
+    constexpr int                                              RIP_CELL_COST = 30;
+    constexpr size_t                                           MAX_VICTIMS = 4;
+    constexpr int                                              RIP_PICKS = 3;
 
     auto chainOf = [&]( JOB& aJob ) -> std::vector<PCB_TRACK*>
     {
@@ -2620,158 +2638,291 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 }
             }
 
-            // copper of the pairs' trunks is never taken out
-            std::set<PCB_TRACK*> trunkCopper;
+            // The routes to take out: the ones a plan crosses when their copper may be crossed at a
+            // cost that rises each time a route has been taken out (it gives way less readily); else
+            // (no such plan on the grid, which is stricter than the router; a plan through free space
+            // alone, which the router missed; no planning) the nearest three in the corridor
+            bool corridorTaken = false;
 
-            for( size_t t = 0; t < trunks.size(); ++t )
+            auto pickVictims = [&]() -> std::vector<size_t>
             {
-                if( done[t] )
+                // copper of the pairs' trunks is never taken out (looked up for each pick: a failed
+                // rip-up puts copies back)
+                std::set<PCB_TRACK*> trunkCopper;
+
+                for( size_t t = 0; t < trunks.size(); ++t )
                 {
-                    for( PCB_TRACK* track : chainOf( jobs[t] ) )
-                        trunkCopper.insert( track );
-                }
-            }
-
-            // routes of this call in the corridor of the failed connection, the nearest three
-            BOX2I corridor( job.from->GetPosition(), VECTOR2I( 0, 0 ) );
-            corridor.Merge( job.toPos );
-            corridor.Inflate( pcbIUScale.mmToIU( 1.5 ) );
-
-            std::vector<std::pair<double, size_t>> crossing;
-
-            for( size_t other = 0; other < jobs.size(); ++other )
-            {
-                if( !done[other] || partner[other] >= 0 || jobs[other].to->Type() != PCB_PAD_T
-                    || results[rowOf[other]].value( "joined_by_earlier_route", false ) )
-                {
-                    continue;   // pairs stay; a joined airwire has no copper of its own
-                }
-
-                const std::vector<PCB_TRACK*> chain = chainOf( jobs[other] );
-
-                if( std::any_of( chain.begin(), chain.end(), [&]( PCB_TRACK* t ) { return trunkCopper.count( t ); } ) )
-                    continue;
-
-                for( PCB_TRACK* t : chain )
-                {
-                    if( !t->IsLocked() && t->GetBoundingBox().Intersects( corridor ) )
+                    if( done[t] )
                     {
-                        crossing.emplace_back( ( t->GetBoundingBox().Centre() - corridor.Centre() ).EuclideanNorm(), other );
-                        break;
+                        for( PCB_TRACK* track : chainOf( jobs[t] ) )
+                            trunkCopper.insert( track );
                     }
                 }
-            }
 
-            if( crossing.empty() )
-                continue;
+                // routes of this call that can be taken out and routed again, with their copper
+                std::vector<std::pair<size_t, std::vector<PCB_TRACK*>>> movable;
 
-            if( ripFailedAt[index] == boardVersion )
-            {
-                s_routeProfile.ripUpsSkipped++;
-                continue;
-            }
-
-            std::sort( crossing.begin(), crossing.end() );
-
-            if( crossing.size() > 3 )
-                crossing.resize( 3 );
-
-            rippedTried++;
-
-            // take them out, keeping copies to put back
-            std::vector<size_t>                     victims;
-            std::vector<std::unique_ptr<PCB_TRACK>> saved;
-            BOARD_COMMIT                            rip( context->GetToolManager() );
-
-            std::set<PCB_TRACK*> taken;   // victims of one net can share copper: each piece once
-
-            for( const auto& [d, other] : crossing )
-            {
-                victims.push_back( other );
-
-                for( PCB_TRACK* t : chainOf( jobs[other] ) )
+                for( size_t other = 0; other < jobs.size(); ++other )
                 {
-                    if( !taken.insert( t ).second )
+                    if( !done[other] || partner[other] >= 0 || jobs[other].to->Type() != PCB_PAD_T
+                        || results[rowOf[other]].value( "joined_by_earlier_route", false )
+                        || jobs[other].from->GetNetCode() == job.from->GetNetCode() )
+                    {
+                        continue;   // pairs stay; a joined airwire has no copper of its own; the own net is no obstacle
+                    }
+
+                    std::vector<PCB_TRACK*> chain = chainOf( jobs[other] );
+
+                    if( chain.empty()
+                        || std::any_of( chain.begin(), chain.end(),
+                                        [&]( PCB_TRACK* t ) { return trunkCopper.count( t ) || t->IsLocked(); } ) )
+                    {
                         continue;
+                    }
 
-                    saved.emplace_back( static_cast<PCB_TRACK*>( t->Clone() ) );
-                    rip.Remove( t );
+                    movable.emplace_back( other, std::move( chain ) );
                 }
-            }
 
-            rip.Push( _( "Rip up (API)" ) );
-            const size_t firstNew = added.size();
+                if( movable.empty() )
+                    return {};
 
-            nlohmann::json attempt;
-            int            tries = 0;
-            s_routeProfile.pass = "rip_up";
-            bool           ok = tryRoute( job, attempt, tries, false, true );
-            nlohmann::json victimAttempts = nlohmann::json::array();
+                if( planning && !rail && !corridorTaken )
+                {
+                    ROUTE_PLAN_REQUEST req = planRequest( job.from, job.to, job.toPos );
 
-            for( size_t v : victims )
+                    for( const auto& [other, chain] : movable )
+                    {
+                        ROUTE_PLAN_REQUEST::SOFT soft;
+                        soft.copper.assign( chain.begin(), chain.end() );
+                        soft.cellCost = RIP_CELL_COST * ( 1 + 2 * ripHistory[other] );
+                        req.soft.push_back( std::move( soft ) );
+                    }
+
+                    const ROUTE_PLAN plan = makePlan( req );
+
+                    // walled in by copper that cannot move
+                    if( !plan.found )
+                    {
+                        s_routeProfile.ripUpsWalled++;
+                        return {};
+                    }
+
+                    if( !plan.crossed.empty() && plan.crossed.size() <= MAX_VICTIMS )
+                    {
+                        std::vector<size_t> out;
+
+                        for( int k : plan.crossed )
+                            out.push_back( movable[k].first );
+
+                        s_routeProfile.ripUpsPlanned++;
+                        return out;
+                    }
+                }
+                else if( corridorTaken )
+                {
+                    return {};
+                }
+
+                corridorTaken = true;
+
+                BOX2I corridor( job.from->GetPosition(), VECTOR2I( 0, 0 ) );
+                corridor.Merge( job.toPos );
+                corridor.Inflate( pcbIUScale.mmToIU( 1.5 ) );
+
+                std::vector<std::pair<double, size_t>> crossing;
+
+                for( const auto& [other, chain] : movable )
+                {
+                    for( PCB_TRACK* t : chain )
+                    {
+                        if( t->GetBoundingBox().Intersects( corridor ) )
+                        {
+                            crossing.emplace_back( ( t->GetBoundingBox().Centre() - corridor.Centre() ).EuclideanNorm(), other );
+                            break;
+                        }
+                    }
+                }
+
+                std::sort( crossing.begin(), crossing.end() );
+
+                if( crossing.size() > 3 )
+                    crossing.resize( 3 );
+
+                std::vector<size_t> out;
+
+                for( const auto& [d, other] : crossing )
+                    out.push_back( other );
+
+                return out;
+            };
+
+            for( int pick = 0; pick < RIP_PICKS && !done[index]; ++pick )
             {
-                if( !ok )
+                std::vector<size_t> victims = pickVictims();
+
+                if( victims.empty() )
                     break;
 
-                JOB& victim = jobs[v];
-                victim.from = dynamic_cast<PAD*>( board->ResolveItem( victim.fromId, true ) );
-                victim.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( victim.toId, true ) );
-                nlohmann::json again;
-                int            againTries = 0;
+                std::sort( victims.begin(), victims.end() );
 
-                ok = victim.from && victim.to && tryRoute( victim, again, againTries, false, true );
-                victimAttempts.push_back( again );
-            }
-
-            if( ok )
-            {
-                rippedOk++;
-                progress = true;
-                boardVersion++;
-                done[index] = true;
-
-                nlohmann::json& row = results[rowOf[index]];
-                row["routed"] = true;
-                row.erase( "reason" );
-                row.erase( "violations" );
-                row.erase( "stopped_at_mm" );
-                row.erase( "blocked_by" );
-                row["after_rip_up"] = true;
-                row["layer"] = attempt["layer"];
-                row["mode"] = attempt["mode"];
-                row["length_mm"] = attempt["metrics"]["length_mm"];
-                row["vias"] = attempt["metrics"].value( "vias", 0 );
-                row["detour"] = attempt["metrics"]["detour"];
-
-                for( size_t k = 0; k < victims.size(); ++k )
+                // a failed rip-up puts everything back exactly: until another route changes the
+                // board, the same one fails again
+                if( ripFailed[index].count( { boardVersion, victims } ) )
                 {
-                    nlohmann::json& vrow = results[rowOf[victims[k]]];
-                    vrow["rerouted"] = true;
-                    vrow["length_mm"] = victimAttempts[k]["metrics"]["length_mm"];
-                    vrow["vias"] = victimAttempts[k]["metrics"].value( "vias", 0 );
-                    vrow["layer"] = victimAttempts[k]["layer"];
+                    s_routeProfile.ripUpsSkipped++;
+                    break;
                 }
 
-                continue;
+                rippedTried++;
+
+                for( size_t v : victims )
+                    ripHistory[v]++;
+
+                // the copper of every net the rip-up touches as it is now, to put back: the router
+                // also merges and trims the copper of the net it routes, not only adds to it
+                std::set<int> touched = { job.from->GetNetCode() };
+
+                for( size_t other : victims )
+                    touched.insert( jobs[other].from->GetNetCode() );
+
+                std::vector<std::unique_ptr<PCB_TRACK>> saved;
+
+                for( PCB_TRACK* t : board->Tracks() )
+                {
+                    if( touched.count( t->GetNetCode() ) )
+                        saved.emplace_back( static_cast<PCB_TRACK*>( t->Clone() ) );
+                }
+
+                // take them out
+                BOARD_COMMIT         rip( context->GetToolManager() );
+                std::set<PCB_TRACK*> taken;   // victims of one net can share copper: each piece once
+
+                for( size_t other : victims )
+                {
+                    for( PCB_TRACK* t : chainOf( jobs[other] ) )
+                    {
+                        if( taken.insert( t ).second )
+                            rip.Remove( t );
+                    }
+                }
+
+                rip.Push( _( "Rip up (API)" ) );
+                const size_t firstNew = added.size();
+
+                nlohmann::json attempt;
+                int            tries = 0;
+                s_routeProfile.pass = "rip_up";
+                bool           ok = tryRoute( job, attempt, tries, false, true );
+                nlohmann::json victimAttempts = nlohmann::json::array();
+
+                for( size_t v : victims )
+                {
+                    if( !ok )
+                        break;
+
+                    JOB& victim = jobs[v];
+                    victim.from = dynamic_cast<PAD*>( board->ResolveItem( victim.fromId, true ) );
+                    victim.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( victim.toId, true ) );
+                    nlohmann::json again;
+                    int            againTries = 0;
+
+                    ok = victim.from && victim.to && tryRoute( victim, again, againTries, false, true );
+                    victimAttempts.push_back( again );
+                }
+
+                // a victim's copper can be shared with other connections of its net: one left cut is
+                // routed again too
+                std::vector<size_t> cut;
+
+                for( size_t k = 0; ok && k < jobs.size(); ++k )
+                {
+                    if( !done[k] || k == index || jobs[k].trunk || partner[k] >= 0 || rowOf[k] < 0
+                        || std::find( victims.begin(), victims.end(), k ) != victims.end()
+                        || !results[rowOf[k]].value( "routed", false ) )
+                    {
+                        continue;
+                    }
+
+                    if( std::none_of( victims.begin(), victims.end(),
+                                      [&]( size_t v ) { return jobs[v].net == jobs[k].net; } ) )
+                    {
+                        continue;
+                    }
+
+                    auto* a = dynamic_cast<PAD*>( board->ResolveItem( jobs[k].fromId, true ) );
+                    auto* b = dynamic_cast<PAD*>( board->ResolveItem( jobs[k].toId, true ) );
+
+                    if( !a || !b )
+                        continue;
+
+                    const auto joined = board->GetConnectivity()->GetConnectedItems( a );
+
+                    if( std::find( joined.begin(), joined.end(), b ) != joined.end() )
+                        continue;
+
+                    JOB& again = jobs[k];
+                    again.from = a;
+                    again.to = b;
+                    nlohmann::json attemptAgain;
+                    int            triesAgain = 0;
+
+                    ok = tryRoute( again, attemptAgain, triesAgain, false, true );
+                    cut.push_back( k );
+                }
+
+                if( ok )
+                {
+                    rippedOk++;
+                    progress = true;
+                    boardVersion++;
+                    done[index] = true;
+
+                    nlohmann::json& row = results[rowOf[index]];
+                    row["routed"] = true;
+                    row.erase( "reason" );
+                    row.erase( "violations" );
+                    row.erase( "stopped_at_mm" );
+                    row.erase( "blocked_by" );
+                    row["after_rip_up"] = true;
+                    row["layer"] = attempt["layer"];
+                    row["mode"] = attempt["mode"];
+                    row["length_mm"] = attempt["metrics"]["length_mm"];
+                    row["vias"] = attempt["metrics"].value( "vias", 0 );
+                    row["detour"] = attempt["metrics"]["detour"];
+
+                    for( size_t k = 0; k < victims.size(); ++k )
+                    {
+                        nlohmann::json& vrow = results[rowOf[victims[k]]];
+                        vrow["rerouted"] = true;
+                        vrow["length_mm"] = victimAttempts[k]["metrics"]["length_mm"];
+                        vrow["vias"] = victimAttempts[k]["metrics"].value( "vias", 0 );
+                        vrow["layer"] = victimAttempts[k]["layer"];
+                    }
+
+                    for( size_t k : cut )
+                        results[rowOf[k]]["rerouted"] = true;
+
+                    break;
+                }
+
+                // put everything back: the copper of those nets out, the copies in
+                BOARD_COMMIT undo( context->GetToolManager() );
+
+                for( PCB_TRACK* t : board->Tracks() )
+                {
+                    if( touched.count( t->GetNetCode() ) )
+                        undo.Remove( t );
+                }
+
+                added.resize( firstNew );
+
+                for( std::unique_ptr<PCB_TRACK>& t : saved )
+                    undo.Add( t.release() );
+
+                undo.Push( _( "Rip up undone (API)" ) );
+                board->GetConnectivity()->RecalculateRatsnest();
+                ripFailed[index].insert( { boardVersion, victims } );
             }
-
-            // put everything back: the new copper out, the copies in
-            BOARD_COMMIT undo( context->GetToolManager() );
-
-            for( size_t k = firstNew; k < added.size(); ++k )
-            {
-                if( BOARD_ITEM* item = board->ResolveItem( added[k], true ) )
-                    undo.Remove( item );
-            }
-
-            added.resize( firstNew );
-
-            for( std::unique_ptr<PCB_TRACK>& t : saved )
-                undo.Add( t.release() );
-
-            undo.Push( _( "Rip up undone (API)" ) );
-            board->GetConnectivity()->RecalculateRatsnest();
-            ripFailedAt[index] = boardVersion;
         }
 
         if( !progress )
@@ -2991,6 +3142,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                                  { "dead_legs_skipped", s_routeProfile.deadLegsSkipped },
                                                  { "via_spots_blocked", s_routeProfile.viaSpotsBlocked },
                                                  { "rip_ups_skipped", s_routeProfile.ripUpsSkipped },
+                                                 { "rip_ups_planned", s_routeProfile.ripUpsPlanned },
+                                                 { "rip_ups_walled", s_routeProfile.ripUpsWalled },
                                                  { "pairs_stuck", s_routeProfile.pairsStuck },
                                                  { "plans", s_routeProfile.plans },
                                                  { "plans_found", s_routeProfile.plansFound },
@@ -4683,14 +4836,17 @@ KOPENAPI_REGISTER( "pcb_route",
                    "dense_first); a failed connection is tried on the next layer, then in shove mode, then "
                    "out of its package through vias (fan-out spots past the pads first) across every other "
                    "given layer; then retry rounds: first from both ends, then rip-up (the routes of this "
-                   "call in its way are taken out, it is routed, they are routed again - or all goes back); "
+                   "call a plan crosses - each costs the plan more every time it was taken out - else the nearest "
+                   "in its corridor, are taken out, it is routed, they are routed again - or all goes back; none "
+                   "when no plan exists even through them); "
                    "nets named as a differential pair (+/-, P/N suffix) between the same two footprints are "
                    "routed coupled by KiCad's diff-pair router (width / gap from the rules, else track width "
                    "and clearance), one by one if that fails (row diff_pair tells); "
                    "every route passes the net-merge guard; copper of this call that ends nowhere is removed "
                    "(stubs_removed); a row still routed at the end is joined by copper; per connection "
                    "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
-                   "profile (attempts; dead_legs_skipped / via_spots_blocked / rip_ups_skipped: tries not made; "
+                   "profile (attempts; dead_legs_skipped / via_spots_blocked / rip_ups_skipped / rip_ups_walled: tries not made; "
+                   "rip_ups_planned: rip-ups whose routes a plan chose; "
                    "pairs_stuck: pair tries ended when nothing was placed after 3 steps; plans / plans_found / plan_ms: global plans; sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
@@ -4701,7 +4857,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "layers":{"type":"array","items":{"type":"string"},"default":["F.Cu","B.Cu"]},
                         "order":{"type":"string","enum":["short_first","power_first","dense_first"],"default":"short_first","description":"dense_first: connections at fine-pitch pads (<= 0.65 mm) first"},
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
-                        "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again; all back if that fails)"},
+                        "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again, up to 3 choices of them per connection and round; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},

@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <functional>
 #include <queue>
+#include <set>
+#include <unordered_map>
 
 namespace
 {
@@ -44,8 +46,9 @@ struct PLAN_GRID
         return aX >= 0 && aY >= 0 && aX < nx && aY < ny;
     }
 
-    /// @brief Every cell whose centre is within aInflate of the shape
-    void Mark( const SHAPE& aShape, int aInflate, std::vector<uint8_t>& aCells, size_t aOffset = 0 ) const
+    /// @brief Visit every cell whose centre is within aInflate of the shape and aSkip does not pass over
+    template <typename SKIP, typename VISIT>
+    void Each( const SHAPE& aShape, int aInflate, size_t aOffset, SKIP aSkip, VISIT aVisit ) const
     {
         BOX2I bb = aShape.BBox();   // BBox( clearance ) of a compound shape (a pad) leaves the clearance out
         bb.Inflate( aInflate );
@@ -58,11 +61,58 @@ struct PLAN_GRID
         {
             for( int x = x0; x <= x1; ++x )
             {
-                uint8_t& c = aCells[aOffset + Index( x, y )];
+                const size_t i = aOffset + Index( x, y );
 
-                if( !c && aShape.Collide( Centre( x, y ), aInflate ) )
-                    c = 1;
+                if( !aSkip( i ) && aShape.Collide( Centre( x, y ), aInflate ) )
+                    aVisit( i );
             }
+        }
+    }
+
+    /// @brief Every cell whose centre is within aInflate of the shape
+    void Mark( const SHAPE& aShape, int aInflate, std::vector<uint8_t>& aCells, size_t aOffset = 0 ) const
+    {
+        Each( aShape, aInflate, aOffset, [&]( size_t i ) { return aCells[i] != 0; },
+              [&]( size_t i ) { aCells[i] = 1; } );
+    }
+};
+
+
+/// @brief Soft copper over the cells of a grid: the first owner of a cell here, any others in more
+struct OWNERS
+{
+    std::vector<int32_t>                             first;
+    std::unordered_map<size_t, std::vector<int32_t>> more;
+
+    void Add( size_t aIndex, int32_t aOwner )
+    {
+        int32_t& o = first[aIndex];
+
+        if( o < 0 )
+        {
+            o = aOwner;
+        }
+        else if( o != aOwner )
+        {
+            std::vector<int32_t>& m = more[aIndex];
+
+            if( std::find( m.begin(), m.end(), aOwner ) == m.end() )
+                m.push_back( aOwner );
+        }
+    }
+
+    template <typename F>
+    void ForEach( size_t aIndex, F aF ) const
+    {
+        if( first[aIndex] < 0 )
+            return;
+
+        aF( first[aIndex] );
+
+        if( auto it = more.find( aIndex ); it != more.end() )
+        {
+            for( int32_t o : it->second )
+                aF( o );
         }
     }
 };
@@ -135,6 +185,41 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     const int            escape = pcbIUScale.mmToIU( 0.8 );
     constexpr int        ESCAPE_COST = 30;
 
+    // soft copper marks owners instead of blocking
+    const bool                                 anySoft = !aReq.soft.empty();
+    OWNERS                                     trackSoft{ std::vector<int32_t>( anySoft ? cells * L : 0, -1 ), {} };
+    OWNERS                                     viaSoft{ std::vector<int32_t>( anySoft ? cells : 0, -1 ), {} };
+    std::unordered_map<const BOARD_ITEM*, int> softOf;
+    int                                        softNow = -1;   // the owner of the copper being marked, -1 hard
+
+    for( size_t k = 0; k < aReq.soft.size(); ++k )
+    {
+        for( BOARD_CONNECTED_ITEM* item : aReq.soft[k].copper )
+            softOf[item] = (int) k;
+    }
+
+    auto put = [&]( const SHAPE& aShape, int aInflate, std::vector<uint8_t>& aHard, OWNERS& aSoft, size_t aOffset )
+    {
+        if( softNow < 0 )
+        {
+            grid.Mark( aShape, aInflate, aHard, aOffset );
+            return;
+        }
+
+        grid.Each( aShape, aInflate, aOffset, [&]( size_t i ) { return aHard[i] != 0; },
+                   [&]( size_t i ) { aSoft.Add( i, softNow ); } );
+    };
+
+    auto softCost = [&]( const OWNERS& aSoft, size_t aIndex )
+    {
+        int c = 0;
+
+        if( anySoft )
+            aSoft.ForEach( aIndex, [&]( int32_t o ) { c += aReq.soft[o].cellCost; } );
+
+        return c;
+    };
+
     // the board's rule for our net against an item, as DRC and the router see it
     PCB_TRACK probeTrack( board );
     probeTrack.SetNetCode( net );
@@ -193,8 +278,8 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             if( std::shared_ptr<SHAPE> s = aShape( layer ) )
             {
                 probeTrack.SetLayer( layer );
-                grid.Mark( *s, rule( CLEARANCE_CONSTRAINT, &probeTrack, aItem, layer, floor ) + halfWidth + slack, track,
-                           (size_t) l * cells );
+                put( *s, rule( CLEARANCE_CONSTRAINT, &probeTrack, aItem, layer, floor ) + halfWidth + slack, track,
+                     trackSoft, (size_t) l * cells );
             }
         }
 
@@ -207,7 +292,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                 continue;
 
             if( std::shared_ptr<SHAPE> s = aShape( layer ) )
-                grid.Mark( *s, rule( CLEARANCE_CONSTRAINT, &probeVia, aItem, layer, floor ) + viaRadius + slack, via );
+                put( *s, rule( CLEARANCE_CONSTRAINT, &probeVia, aItem, layer, floor ) + viaRadius + slack, via, viaSoft, 0 );
         }
     };
 
@@ -278,6 +363,9 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         if( !t->GetBoundingBox().Intersects( region ) )
             continue;
 
+        if( auto it = softOf.find( t ); it != softOf.end() && ( t->GetNetCode() != net || net <= 0 ) )
+            softNow = it->second;
+
         if( t->GetNetCode() != net || net <= 0 )
         {
             copperObstacle( t,
@@ -293,8 +381,10 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         if( t->Type() == PCB_VIA_T && vias )
         {
             std::shared_ptr<SHAPE_SEGMENT> hole = static_cast<PCB_VIA*>( t )->GetEffectiveHoleShape();
-            grid.Mark( *hole, ds.m_HoleToHoleMin + aReq.viaDrill / 2 + slack, via );
+            put( *hole, ds.m_HoleToHoleMin + aReq.viaDrill / 2 + slack, via, viaSoft, 0 );
         }
+
+        softNow = -1;
     }
 
     for( BOARD_ITEM* item : board->Drawings() )
@@ -494,7 +584,8 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
 
             const int turn = ( dirIn[s] >= 0 && dirIn[s] != d ) ? 6 : 0;
             const int near = nearPad[base + grid.Index( x2, y2 )] ? ESCAPE_COST : 0;
-            relax( l * (int) cells + grid.Index( x2, y2 ), ( ( d & 1 ) ? 14 : 10 ) + turn + near, (int8_t) d );
+            const int cross = softCost( trackSoft, base + grid.Index( x2, y2 ) );
+            relax( l * (int) cells + grid.Index( x2, y2 ), ( ( d & 1 ) ? 14 : 10 ) + turn + near + cross, (int8_t) d );
         }
 
         if( vias && !via[c] )
@@ -502,7 +593,10 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             for( int l2 = 0; l2 < L; ++l2 )
             {
                 if( l2 != l && !track[(size_t) l2 * cells + c] )
-                    relax( l2 * (int) cells + c, viaCost, -1 );
+                {
+                    relax( l2 * (int) cells + c,
+                           viaCost + softCost( viaSoft, c ) + softCost( trackSoft, (size_t) l2 * cells + c ), -1 );
+                }
             }
         }
     }
@@ -520,6 +614,22 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
 
     plan.found = true;
     plan.startLayer = aReq.layers[path.front() / (int) cells];
+
+    if( anySoft )
+    {
+        std::set<int> crossed;
+        auto          take = [&]( int32_t o ) { crossed.insert( o ); };
+
+        for( size_t k = 0; k < path.size(); ++k )
+        {
+            trackSoft.ForEach( path[k], take );
+
+            if( k > 0 && path[k] / (int) cells != path[k - 1] / (int) cells )
+                viaSoft.ForEach( path[k] % (int) cells, take );
+        }
+
+        plan.crossed.assign( crossed.begin(), crossed.end() );
+    }
 
     int8_t runDir = -1;
 
