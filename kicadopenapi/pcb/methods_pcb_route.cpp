@@ -33,6 +33,7 @@
 #include <netclass.h>
 #include <pad.h>
 #include <pcb_edit_frame.h>
+#include <pcb_shape.h>
 #include <pcb_track.h>
 #include <router/pns_kicad_iface.h>
 #include <router/pns_placement_algo.h>
@@ -390,6 +391,19 @@ struct ROUTE_GLOW_TRAITS
 };
 
 
+/// @brief The way out of a fine-pitch pad on the edge of its package whose connection is still to be
+/// routed: room for a track and a via in front of the pad; copper of another net across it walls
+/// the pad in (a short connection around the pad row is the usual culprit)
+struct ESCAPE_FRONT
+{
+    PAD*                pad = nullptr;
+    PCB_LAYER_ID        layer = F_Cu;
+    SHAPE_SEGMENT       shape;
+    std::vector<size_t> jobs;          ///< the connections at the pad
+    bool                open = true;   ///< false once they are all routed
+};
+
+
 struct ROUTE_REQUEST
 {
     BOARD_CONNECTED_ITEM* from = nullptr;     ///< a pad, or a track / via to go on from
@@ -422,6 +436,9 @@ struct ROUTE_REQUEST
 
     /// @brief The points come from the global plan (PlanRoute)
     bool planned = false;
+
+    /// @brief Ways out of pads kept open: a route putting copper of another net across one is refused
+    const std::vector<ESCAPE_FRONT>* fronts = nullptr;
 };
 
 
@@ -505,8 +522,10 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     settings.SetMode( aReq.mode );
 
     // The same result on every run: the router's wall-clock limits (made for a hand on the mouse) are
-    // lifted for the call, its iteration limits bound the work
-    settings.SetShoveTimeLimit( 10000 );
+    // lifted for the call, its iteration limits bound the work (a shove through a dense row can take
+    // 50 ms an iteration: the editor's 250 would run past any clock)
+    settings.SetShoveTimeLimit( 60000 );
+    settings.SetShoveIterationLimit( 100 );
 
     struct CLUSTER_TIMEOUT
     {
@@ -523,10 +542,40 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         ~RESTORE_ROUTER() { PNS::ROUTER::SetInstance( previous ); }
     } restoreRouter;
 
+    std::vector<std::unique_ptr<PCB_SHAPE>> frontItems;   // the ways out kept open, as the router sees them
+
     auto router = std::make_unique<PNS::ROUTER>();
     router->SetInterface( iface.get() );
     router->LoadSettings( &settings );
     router->SyncWorld();
+
+    // a way out of another net's pad kept open is that net's copper to the router: it walks around
+    if( aReq.fronts && !aReq.diffPair )
+    {
+        for( const ESCAPE_FRONT& front : *aReq.fronts )
+        {
+            if( !front.open || front.pad->GetNetCode() == aReq.from->GetNetCode() )
+                continue;
+
+            auto item = std::make_unique<PCB_SHAPE>( board, SHAPE_T::SEGMENT );
+            item->SetStart( front.shape.GetSeg().A );
+            item->SetEnd( front.shape.GetSeg().B );
+            item->SetWidth( front.shape.GetWidth() );
+            item->SetLayer( front.layer );
+            item->SetNet( front.pad->GetNet() );
+
+            auto solid = std::make_unique<PNS::SOLID>();
+            solid->SetLayer( iface->GetPNSLayerFromBoardLayer( front.layer ) );
+            solid->SetNet( front.pad->GetNet() );
+            solid->SetParent( item.get() );
+            solid->SetShape( front.shape.Clone() );
+            solid->SetPos( front.shape.GetSeg().Center() );
+            solid->SetRoutable( false );
+            router->GetWorld()->Add( std::move( solid ) );
+            frontItems.push_back( std::move( item ) );
+        }
+    }
+
     const auto synced = std::chrono::steady_clock::now();
     s_routeProfile.syncMs += msSince( started, synced );
     router->SetMode( aReq.diffPair ? PNS::PNS_MODE_ROUTE_DIFF_PAIR : PNS::PNS_MODE_ROUTE_SINGLE );
@@ -855,6 +904,27 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     const auto           routedAt = std::chrono::steady_clock::now();
     const nlohmann::json violations = guard( board, changed, iface->m_removed );
     const auto           guardedAt = std::chrono::steady_clock::now();
+
+    if( aReq.fronts && !aReq.diffPair )
+    {
+        for( BOARD_CONNECTED_ITEM* item : changed )
+        {
+            for( const ESCAPE_FRONT& front : *aReq.fronts )
+            {
+                if( !front.open || front.pad->GetNetCode() == item->GetNetCode() || !item->IsOnLayer( front.layer )
+                    || !item->GetEffectiveShape( front.layer )->Collide( &front.shape, 0 ) )
+                {
+                    continue;
+                }
+
+                iface->Staged().Revert();
+                aOut["routed"] = false;
+                aOut["reason"] = "refused: the route would wall in the way out of "
+                                 + str( front.pad->GetParentFootprint()->GetReference() ) + "." + str( front.pad->GetNumber() );
+                return false;
+            }
+        }
+    }
     const double         direct = ( target - start ).EuclideanNorm();
 
     aOut["segments"] = segments;
@@ -1978,6 +2048,17 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     const bool viasAllowed = aArgs.value( "vias", true ) && layers.size() >= 2;
     const bool planning = aArgs.value( "plan", true );
 
+    // ways out of fine-pitch pads kept open while their connections wait (filled once the jobs are
+    // final, below); open while a connection at the pad is not routed
+    std::vector<ESCAPE_FRONT> fronts;
+    const std::vector<bool>*  doneOf = nullptr;
+
+    auto refreshFronts = [&]()
+    {
+        for( ESCAPE_FRONT& front : fronts )
+            front.open = std::any_of( front.jobs.begin(), front.jobs.end(), [&]( size_t k ) { return !( *doneOf )[k]; } );
+    };
+
     auto planRequest = [&]( PAD* aFrom, BOARD_CONNECTED_ITEM* aTo, const VECTOR2I& aToPos )
     {
         NETCLASS* netclass = aFrom->GetEffectiveNetClass();
@@ -1994,7 +2075,15 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         if( const int neck = neckFor( aFrom, aTo ); neck > 0 && neck < width )
             width = neck;
 
-        return ROUTE_PLAN_REQUEST{ board, aFrom, aTo, aToPos, layers, width, viasAllowed ? dia : 0, drill, {} };
+        ROUTE_PLAN_REQUEST req{ board, aFrom, aTo, aToPos, layers, width, viasAllowed ? dia : 0, drill, {}, {} };
+
+        for( const ESCAPE_FRONT& front : fronts )
+        {
+            if( front.open && front.pad->GetNetCode() != aFrom->GetNetCode() )
+                req.keepOut.emplace_back( front.layer, front.shape );
+        }
+
+        return req;
     };
 
     auto makePlan = [&]( const ROUTE_PLAN_REQUEST& aReq )
@@ -2021,6 +2110,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         } timed{ aJob };
 
         bool ok = false;
+
+        if( doneOf )
+            refreshFronts();
 
         // both ways (retries) when the far end is a pad too: the walkaround finds other paths from the
         // other end; the first pass goes one way only, the other end's detours crowd later routes
@@ -2055,6 +2147,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             if( plan.found )
             {
                 ROUTE_REQUEST req{ way.from, way.to, way.toPos, plan.startLayer, PNS::RM_Walkaround, dryRun, {} };
+                req.fronts = &fronts;
                 req.neckWidth = neckFor( way.from, way.to );
                 req.vias = plan.points;
                 req.planned = true;
@@ -2064,11 +2157,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             }
         };
 
-        for( PNS::PNS_MODE mode : { PNS::RM_Walkaround, PNS::RM_Shove } )
+        // on a layer both ends are on: walkaround, then the plan, then shove (slow when it fails: last)
+        auto onLayers = [&]( PNS::PNS_MODE aMode )
         {
-            if( mode == PNS::RM_Shove && !aShove )
-                continue;
-
             for( const WAY& way : ways )
             {
                 for( PCB_LAYER_ID layer : layers )
@@ -2076,14 +2167,17 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                     if( ok || aTries >= maxTries || rail || !way.from->IsOnLayer( layer ) || !way.to->IsOnLayer( layer ) )
                         continue;
 
-                    ROUTE_REQUEST req{ way.from, way.to, way.toPos, layer, mode, dryRun, {} };
+                    ROUTE_REQUEST req{ way.from, way.to, way.toPos, layer, aMode, dryRun, {} };
+                    req.fronts = &fronts;
                     req.neckWidth = neckFor( way.from, way.to );
                     aAttempt = nlohmann::json::object();
                     aTries++;
                     ok = routeOne( *context, req, aAttempt, added );
                 }
             }
-        }
+        };
+
+        onLayers( PNS::RM_Walkaround );
 
         if( !ok && aAttempt.is_null() )
         {
@@ -2094,6 +2188,15 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
         if( !ok )
             planTry();
+
+        if( !ok && aShove )
+        {
+            const nlohmann::json before = aAttempt;   // what the plan's try (or the walkaround) found
+            onLayers( PNS::RM_Shove );
+
+            if( !ok && !before.is_null() )
+                aAttempt = before;
+        }
 
         if( ok || !viasAllowed )
             return ok;
@@ -2181,6 +2284,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                         }
 
                         ROUTE_REQUEST req{ way.from, way.to, way.toPos, start, PNS::RM_Walkaround, dryRun, {} };
+                        req.fronts = &fronts;
                         req.neckWidth = neckFor( way.from, way.to );
                         req.vias = { { v, arrive } };
                         aAttempt = nlohmann::json::object();
@@ -2227,6 +2331,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                         budget--;
 
                         ROUTE_REQUEST req{ way.from, way.to, way.toPos, start, PNS::RM_Walkaround, dryRun, {} };
+                        req.fronts = &fronts;
                         req.neckWidth = neckFor( way.from, way.to );
                         req.vias = { { va, cross }, { vb, arrive } };
                         aAttempt = nlohmann::json::object();
@@ -2357,6 +2462,79 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     nlohmann::json    results = nlohmann::json::array();
     std::vector<int>  rowOf( jobs.size(), -1 );
     std::vector<bool> done( jobs.size(), false );
+
+    // Ways out of the fine-pitch pads on the edges of their packages (pads inside the ring of an area
+    // array are left to the fan-out): from the pad's end outward, room for a track or a via
+    if( aArgs.value( "escapes", true ) && !rail )
+    {
+        const double         fine = pcbIUScale.mmToIU( 0.65 );
+        const int            depth = 2 * std::max( ds.m_MinClearance, 0 ) + ds.GetCurrentViaSize();
+        std::map<PAD*, std::vector<size_t>> frontsOf;
+
+        for( size_t k = 0; k < jobs.size(); ++k )
+        {
+            if( partner[k] >= 0 )
+                continue;
+
+            for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[k].from ), jobs[k].to } )
+            {
+                PAD* pad = dynamic_cast<PAD*>( end );
+
+                if( !pad || !pad->GetParentFootprint() )
+                    continue;
+
+                if( auto it = frontsOf.find( pad ); it != frontsOf.end() )
+                {
+                    for( size_t f : it->second )
+                        fronts[f].jobs.push_back( k );
+
+                    continue;
+                }
+
+                frontsOf[pad];
+                const double pitch = pitchOf( pad );
+
+                if( pitch > fine )
+                    continue;
+
+                FOOTPRINT* fp = pad->GetParentFootprint();
+                BOX2I      ring = fp->Pads().front()->GetBoundingBox();
+
+                for( PAD* q : fp->Pads() )
+                    ring.Merge( q->GetBoundingBox() );
+
+                const BOX2I    box = pad->GetBoundingBox();
+                const VECTOR2I d = pad->GetPosition() - ring.Centre();
+                const bool     horizontal = (double) std::abs( d.x ) * ring.GetHeight() >= (double) std::abs( d.y ) * ring.GetWidth();
+                const VECTOR2I dir = horizontal ? VECTOR2I( d.x >= 0 ? 1 : -1, 0 ) : VECTOR2I( 0, d.y >= 0 ? 1 : -1 );
+                const int      half = horizontal ? box.GetWidth() / 2 : box.GetHeight() / 2;
+                const int      across = horizontal ? box.GetHeight() : box.GetWidth();
+                const int      toEdge = horizontal ? ( dir.x > 0 ? ring.GetRight() - box.GetRight() : box.GetLeft() - ring.GetLeft() )
+                                                   : ( dir.y > 0 ? ring.GetBottom() - box.GetBottom() : box.GetTop() - ring.GetTop() );
+
+                if( toEdge > pitch / 2 || depth <= across )
+                    continue;
+
+                const VECTOR2I tip = box.Centre() + dir * half;
+
+                for( PCB_LAYER_ID layer : layers )
+                {
+                    if( !pad->IsOnLayer( layer ) || !pad->FlashLayer( layer ) )
+                        continue;
+
+                    ESCAPE_FRONT front;
+                    front.pad = pad;
+                    front.layer = layer;
+                    front.shape = SHAPE_SEGMENT( tip + dir * ( across / 2 ), tip + dir * ( depth - across / 2 ), across );
+                    front.jobs.push_back( k );
+                    frontsOf[pad].push_back( fronts.size() );
+                    fronts.push_back( std::move( front ) );
+                }
+            }
+        }
+
+        doneOf = &done;
+    }
 
     for( size_t index = 0; index < jobs.size(); ++index )
     {
@@ -4863,6 +5041,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); parts with pads inside the ring (exposed pad, BGA) stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (0.65 mm or closer) is routed no wider than that pad's narrow side (not below the Default class width or the board minimum) when its class is wider; the rest of its net at its class width; the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
+                        "escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (0.65 mm or closer) on the edge of its package is kept open while its connection waits: room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},
                         "plan":{"type":"boolean","default":true,"description":"a connection the router does not find on a layer is planned over the free space (grid search with vias, the board's clearances), the router follows the plan; no plan found: no escape-spot tries either (row plan tells)"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
                         "style":{"type":"string","enum":["direct","rail"],"default":"direct","description":"rail (power nets): every connection leaves its pads through a via next to them and runs on the second layer"},

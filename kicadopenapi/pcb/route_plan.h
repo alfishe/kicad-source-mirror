@@ -1,5 +1,6 @@
 #pragma once
 
+#include <geometry/shape_segment.h>
 #include <layer_ids.h>
 #include <math/vector2d.h>
 #include <optional>
@@ -29,6 +30,9 @@ struct ROUTE_PLAN_REQUEST
     };
 
     std::vector<SOFT> soft;
+
+    /// @brief No track of this connection across these (ways out of other nets' pads kept open)
+    std::vector<std::pair<PCB_LAYER_ID, SHAPE_SEGMENT>> keepOut;
 };
 
 /// @brief A route through free space: corners on a layer, and through vias where it changes layer

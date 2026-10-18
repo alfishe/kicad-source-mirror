@@ -12,6 +12,7 @@
 #include <pad.h>
 #include <pcb_shape.h>
 #include <pcb_track.h>
+#include <trigo.h>
 #include <zone.h>
 
 #include <algorithm>
@@ -263,6 +264,24 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
 
     const LSET copper = LSET::AllCuMask( board->GetCopperLayerCount() );
 
+    // copper of other nets near the ends, kept with its clearance for the exact way out of each end
+    struct NEAR_END
+    {
+        std::shared_ptr<SHAPE> shape;
+        int                    clearance;
+        int                    layer;
+        int                    owner;   ///< soft copper's owner, -1 hard
+    };
+
+    std::vector<NEAR_END> nearEnds;
+    const int             reach = pcbIUScale.mmToIU( 1.0 );
+    BOX2I                 endBoxes[2] = { aReq.from->GetBoundingBox(), aReq.to->GetBoundingBox() };
+
+    for( BOX2I& box : endBoxes )
+        box.Inflate( reach + pcbIUScale.mmToIU( 1.0 ) );
+
+    auto nearAnEnd = [&]( const BOX2I& aBox ) { return aBox.Intersects( endBoxes[0] ) || aBox.Intersects( endBoxes[1] ); };
+
     // copper of another net (or of none) on the routing layers and, for vias, on every copper layer
     auto copperObstacle = [&]( BOARD_ITEM* aItem, const std::function<std::shared_ptr<SHAPE>( PCB_LAYER_ID )>& aShape )
     {
@@ -278,8 +297,11 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             if( std::shared_ptr<SHAPE> s = aShape( layer ) )
             {
                 probeTrack.SetLayer( layer );
-                put( *s, rule( CLEARANCE_CONSTRAINT, &probeTrack, aItem, layer, floor ) + halfWidth + slack, track,
-                     trackSoft, (size_t) l * cells );
+                const int clearance = rule( CLEARANCE_CONSTRAINT, &probeTrack, aItem, layer, floor );
+                put( *s, clearance + halfWidth + slack, track, trackSoft, (size_t) l * cells );
+
+                if( nearAnEnd( s->BBox() ) )
+                    nearEnds.push_back( { s, clearance, l, softNow } );
             }
         }
 
@@ -443,6 +465,20 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                         } );
     }
 
+    for( const auto& [layer, shape] : aReq.keepOut )
+    {
+        for( int l = 0; l < L; ++l )
+        {
+            if( aReq.layers[l] != layer || !shape.BBox().Intersects( region ) )
+                continue;
+
+            grid.Mark( shape, halfWidth + slack, track, (size_t) l * cells );
+
+            if( nearAnEnd( shape.BBox() ) )
+                nearEnds.push_back( { std::make_shared<SHAPE_SEGMENT>( shape ), 0, l, -1 } );
+        }
+    }
+
     // no via on the end pads themselves: the route leaves a pad on a track
     if( vias )
     {
@@ -502,7 +538,105 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         }
     }
 
-    if( starts.empty() || goals.empty() )
+    // The way out of a pad end on the grid can be shut by the grid alone (a fine-pitch pad's way out
+    // between its neighbours, off the cell centres): along each axis of the pad, the first free cell
+    // a straight run from the pad's centre reaches with its clearance to every other net's copper
+    struct ESCAPE
+    {
+        VECTOR2I         at;
+        int              cost;
+        std::vector<int> owners;
+    };
+
+    auto escapesOf = [&]( BOARD_CONNECTED_ITEM* aEnd, const VECTOR2I& aPos )
+    {
+        std::vector<std::pair<int, ESCAPE>> out;   // state, escape
+        PAD*                                pad = dynamic_cast<PAD*>( aEnd );
+
+        if( !pad )
+            return out;
+
+        for( int l = 0; l < L; ++l )
+        {
+            const PCB_LAYER_ID layer = aReq.layers[l];
+
+            if( !pad->IsOnLayer( layer ) || !pad->FlashLayer( layer ) )
+                continue;
+
+            const VECTOR2I size = pad->GetSize( layer );
+
+            for( int axis = 0; axis < 4; ++axis )
+            {
+                VECTOR2D     dir( axis == 0 ? 1 : axis == 1 ? -1 : 0, axis == 2 ? 1 : axis == 3 ? -1 : 0 );
+                const double half = ( axis < 2 ? size.x : size.y ) / 2.0;
+                RotatePoint( dir, pad->GetOrientation() );
+
+                for( double d = half; d <= half + reach; d += cell )
+                {
+                    const VECTOR2I at = aPos + VECTOR2I( KiROUND( dir.x * d ), KiROUND( dir.y * d ) );
+                    int            x, y;
+
+                    if( !grid.CellOf( at, x, y ) )
+                        break;
+
+                    const SHAPE_SEGMENT run( aPos, at, aReq.trackWidth );
+                    bool                clean = true;
+                    std::vector<int>    owners;
+
+                    for( const NEAR_END& n : nearEnds )
+                    {
+                        if( n.layer != l || !n.shape->Collide( &run, n.clearance ) )
+                            continue;
+
+                        if( n.owner < 0 )
+                        {
+                            clean = false;
+                            break;
+                        }
+
+                        if( std::find( owners.begin(), owners.end(), n.owner ) == owners.end() )
+                            owners.push_back( n.owner );
+                    }
+
+                    if( !clean )
+                        break;   // a longer run holds this one
+
+                    const size_t state = (size_t) l * cells + grid.Index( x, y );
+
+                    if( track[state] )
+                        continue;
+
+                    int cost = (int) ( 10.0 * d / cell );
+
+                    for( int o : owners )
+                        cost += aReq.soft[o].cellCost * 8;
+
+                    out.push_back( { (int) state, ESCAPE{ at, cost, owners } } );
+                    break;
+                }
+            }
+        }
+
+        return out;
+    };
+
+    std::unordered_map<int, ESCAPE> startEscapes, goalEscapes;
+
+    for( auto& [state, esc] : escapesOf( aReq.from, fromPos ) )
+    {
+        if( auto it = startEscapes.find( state ); it == startEscapes.end() || it->second.cost > esc.cost )
+            startEscapes[state] = esc;
+    }
+
+    for( auto& [state, esc] : escapesOf( aReq.to, aReq.toPos ) )
+    {
+        if( auto it = goalEscapes.find( state ); it == goalEscapes.end() || it->second.cost > esc.cost )
+            goalEscapes[state] = esc;
+
+        isGoal[state] = 1;
+    }
+
+    if( ( starts.empty() && startEscapes.empty() ) || ( goals.empty() && goalEscapes.empty() ) )
         return finish();
 
     // A*: a straight step 10, a diagonal 14 (in cells), a turn 6, beside another net's pad 30 more,
@@ -528,6 +662,15 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     {
         g[s] = 0;
         open.emplace( heuristic( s ), s );
+    }
+
+    for( const auto& [s, esc] : startEscapes )
+    {
+        if( esc.cost < g[s] )
+        {
+            g[s] = esc.cost;
+            open.emplace( g[s] + heuristic( s ), s );
+        }
     }
 
     int       reached = -1;
@@ -615,10 +758,29 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     plan.found = true;
     plan.startLayer = aReq.layers[path.front() / (int) cells];
 
+    // the run out of an end, when the path starts or ends at the end of one
+    const auto  startEscape = startEscapes.find( path.front() );
+    const auto  goalEscape = goalEscapes.find( reached );
+    const bool  fromEscape = startEscape != startEscapes.end()
+                            && std::find( starts.begin(), starts.end(), path.front() ) == starts.end();
+    const bool  toEscape = goalEscape != goalEscapes.end() && std::find( goals.begin(), goals.end(), reached ) == goals.end();
+
+    if( fromEscape )
+    {
+        plan.points.emplace_back( startEscape->second.at, std::nullopt );
+        plan.length += ( startEscape->second.at - fromPos ).EuclideanNorm();
+    }
+
     if( anySoft )
     {
         std::set<int> crossed;
         auto          take = [&]( int32_t o ) { crossed.insert( o ); };
+
+        for( const auto& [escape, used] : { std::pair( startEscape, fromEscape ), std::pair( goalEscape, toEscape ) } )
+        {
+            if( used )
+                crossed.insert( escape->second.owners.begin(), escape->second.owners.end() );
+        }
 
         for( size_t k = 0; k < path.size(); ++k )
         {
@@ -659,6 +821,12 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
            && ( plan.points.back().first - aReq.toPos ).EuclideanNorm() < cell )
     {
         plan.points.pop_back();
+    }
+
+    if( toEscape )
+    {
+        plan.points.emplace_back( goalEscape->second.at, std::nullopt );
+        plan.length += ( goalEscape->second.at - aReq.toPos ).EuclideanNorm();
     }
 
     return finish();
