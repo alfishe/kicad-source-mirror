@@ -25,7 +25,9 @@
 #include <qa_utils/wx_utils/unit_test_utils.h>
 
 // Code under test
+#include <thread>
 #include <vector>
+#include <font/glyph.h>
 #include <font/stroke_font.h>
 
 /**
@@ -73,6 +75,59 @@ BOOST_AUTO_TEST_CASE( TabCheck )
         BOOST_CHECK_MESSAGE( output1.x == output2.x, "Incorrect tab size for \n\t'" <<
                              text1.ToStdString() << "' and\n\t'" << text2.ToStdString() << "'" );
     }
+
+    delete font;
+}
+
+
+/**
+ * Glyphs parsed on first use, from several threads at once, match the bounding boxes the font
+ * measures texts with, and measuring alone does not need them.
+ */
+BOOST_AUTO_TEST_CASE( GlyphsOnFirstUse )
+{
+    KIFONT::STROKE_FONT* font = KIFONT::STROKE_FONT::LoadFont( wxEmptyString );
+    const unsigned       count = font->GetGlyphCount();
+
+    BOOST_REQUIRE_GT( count, 60000u );
+
+    BOX2I    bbox;
+    VECTOR2I end = font->GetTextAsGlyphs( &bbox, nullptr, wxS( "Ab\u4e2d" ), VECTOR2I( 1000, 1000 ),
+                                          VECTOR2I( 0, 0 ), ANGLE_0, false, VECTOR2I( 0, 0 ), 0 );
+    BOOST_CHECK_GT( end.x, 0 );
+
+    std::vector<int>         mismatches( 8, 0 );
+    std::vector<std::thread> threads;
+
+    for( int t = 0; t < 8; t++ )
+    {
+        threads.emplace_back(
+                [&, t]()
+                {
+                    for( unsigned i = t; i < count; i += 8 )
+                    {
+                        const KIFONT::STROKE_GLYPH* glyph = font->GetGlyph( i );
+
+                        if( !glyph
+                            || const_cast<KIFONT::STROKE_GLYPH*>( glyph )->BoundingBox()
+                                       != font->GetGlyphBoundingBox( i ) )
+                        {
+                            mismatches[t]++;
+                        }
+                    }
+                } );
+    }
+
+    for( std::thread& thread : threads )
+        thread.join();
+
+    for( int t = 0; t < 8; t++ )
+        BOOST_CHECK_EQUAL( mismatches[t], 0 );
+
+    const KIFONT::STROKE_GLYPH* a = font->GetGlyph( 'A' - ' ' );
+    BOOST_REQUIRE( a );
+    BOOST_CHECK_EQUAL( a->size(), 2u );    // the slants in one stroke, the bar
+    BOOST_CHECK_EQUAL( font->GetGlyph( count ), nullptr );
 
     delete font;
 }

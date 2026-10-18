@@ -44,10 +44,15 @@ static constexpr double STROKE_FONT_SCALE = 1.0 / 21.0;
 static constexpr int FONT_OFFSET = -8;
 
 
-bool                                g_defaultFontInitialized = false;
-std::vector<std::shared_ptr<GLYPH>> g_defaultFontGlyphs;
-std::vector<BOX2D>*                 g_defaultFontGlyphBoundingBoxes;
-std::mutex                          g_defaultFontLoadMutex;
+/// Glyphs are parsed a block at a time, when a text first draws one of the block's glyphs.
+static constexpr unsigned GLYPH_BLOCK = 256;
+
+static const char* const*                   g_defaultFontData = nullptr;
+static std::vector<std::shared_ptr<GLYPH>>  g_defaultFontGlyphs;
+static std::unique_ptr<std::once_flag[]>    g_defaultFontBlocks;
+static std::vector<BOX2D>*                  g_defaultFontGlyphBoundingBoxes = nullptr;
+static double                               g_defaultFontMaxGlyphWidth = 0.0;
+static std::once_flag                       g_defaultFontLoaded;
 
 
 STROKE_FONT::STROKE_FONT() :
@@ -74,116 +79,140 @@ STROKE_FONT* STROKE_FONT::LoadFont( const wxString& aFontName )
 }
 
 
-void buildGlyphBoundingBox( std::shared_ptr<STROKE_GLYPH>& aGlyph, double aGlyphWidth )
+/**
+ * Parse one glyph of the stroke font: its bounding box, and its strokes when \a aGlyph is given.
+ *
+ * In stroke font, coordinates values are coded as <value> + 'R', where <value> is an ASCII char.
+ * The first two values are the glyph's start and end X; " R" raises the pen.
+ * Note:
+ *  * the stroke coordinates are stored in reduced form (-1.0 to +1.0), and the actual size is
+ *    stroke coordinate * glyph size
+ *  * a few shapes have a height slightly bigger than 1.0 ( like '{' '[' )
+ *  * FONT_OFFSET is here for historical reasons, due to the way the stroke font was built.
+ *    It allows shapes coordinates like W M ... to be >= 0.  Only shapes like j y have
+ *    coordinates < 0.
+ */
+static BOX2D parseGlyph( const char* aData, STROKE_GLYPH* aGlyph )
 {
-    VECTOR2D min( 0, 0 );
-    VECTOR2D max( aGlyphWidth, 0 );
+    if( !aData[0] || !aData[1] )
+        return BOX2D();
 
-    for( const std::vector<VECTOR2D>& pointList : *aGlyph )
+    double glyphStartX = ( aData[0] - 'R' ) * STROKE_FONT_SCALE;
+    double glyphWidth = ( aData[1] - 'R' ) * STROKE_FONT_SCALE - glyphStartX;
+    double minY = 0.0;
+    double maxY = 0.0;
+
+    if( aGlyph )
     {
-        for( const VECTOR2D& point : pointList )
+        int strokes = 0;
+
+        for( int i = 2; aData[i]; i += 2 )
         {
-            min.y = std::min( min.y, point.y );
-            max.y = std::max( max.y, point.y );
+            if( aData[i] == ' ' && aData[i + 1] == 'R' )
+                strokes++;
         }
+
+        aGlyph->reserve( strokes + 1 );
     }
 
-    aGlyph->SetBoundingBox( BOX2D( min, max - min ) );
+    bool penIsDown = false;
+
+    for( int i = 2; aData[i]; i += 2 )
+    {
+        if( aData[i] == ' ' && aData[i + 1] == 'R' )
+        {
+            if( aGlyph )
+                aGlyph->RaisePen();
+
+            penIsDown = false;
+            continue;
+        }
+
+        VECTOR2D point( ( aData[i] - 'R' ) * STROKE_FONT_SCALE - glyphStartX,
+                        ( aData[i + 1] - 'R' + FONT_OFFSET ) * STROKE_FONT_SCALE );
+
+        minY = std::min( minY, point.y );
+        maxY = std::max( maxY, point.y );
+
+        if( !aGlyph )
+            continue;
+
+        if( !penIsDown )
+        {
+            // Most strokes have two or three points: reserve what this one has
+            size_t count = 0;
+
+            for( int k = i; aData[k] && !( aData[k] == ' ' && aData[k + 1] == 'R' ); k += 2 )
+                count++;
+
+            aGlyph->StartStroke( count );
+            penIsDown = true;
+        }
+
+        aGlyph->AddPoint( point );
+    }
+
+    BOX2D bbox( VECTOR2D( 0.0, minY ), VECTOR2D( glyphWidth, maxY - minY ) );
+
+    if( aGlyph )
+    {
+        aGlyph->Finalize();
+        aGlyph->SetBoundingBox( bbox );
+    }
+
+    return bbox;
 }
 
 
 void STROKE_FONT::loadNewStrokeFont( const char* const aNewStrokeFont[], int aNewStrokeFontSize )
 {
-    // Protect the initialization sequence against multiple entries
-    std::lock_guard<std::mutex> lock( g_defaultFontLoadMutex );
-
-    if( !g_defaultFontInitialized )
-    {
-        g_defaultFontGlyphs.reserve( aNewStrokeFontSize );
-
-        g_defaultFontGlyphBoundingBoxes = new std::vector<BOX2D>;
-        g_defaultFontGlyphBoundingBoxes->reserve( aNewStrokeFontSize );
-
-        for( int j = 0; j < aNewStrokeFontSize; j++ )
-        {
-            std::shared_ptr<STROKE_GLYPH> glyph = std::make_shared<STROKE_GLYPH>();
-
-            double glyphStartX = 0.0;
-            double glyphEndX = 0.0;
-            double glyphWidth = 0.0;
-            int    strokes = 0;
-            int    i = 0;
-
-            while( aNewStrokeFont[j][i] )
+    // Only the bounding boxes now (texts are measured far more often than drawn, and most
+    // of the font's 65,000 glyphs are never drawn): the glyphs themselves on first use.
+    std::call_once( g_defaultFontLoaded,
+            [&]()
             {
-                if( aNewStrokeFont[j][i] == ' ' && aNewStrokeFont[j][i+1] == 'R' )
-                    strokes++;
+                g_defaultFontData = aNewStrokeFont;
+                g_defaultFontGlyphs.resize( aNewStrokeFontSize );
+                g_defaultFontBlocks.reset(
+                        new std::once_flag[( aNewStrokeFontSize + GLYPH_BLOCK - 1 ) / GLYPH_BLOCK] );
 
-                i += 2;
-            }
+                g_defaultFontGlyphBoundingBoxes = new std::vector<BOX2D>;
+                g_defaultFontGlyphBoundingBoxes->reserve( aNewStrokeFontSize );
 
-            glyph->reserve( strokes + 1 );
-
-            i = 0;
-
-            while( aNewStrokeFont[j][i] )
-            {
-                VECTOR2D point( 0.0, 0.0 );
-                char     coordinate[2] = { 0, };
-
-                for( int k : { 0, 1 } )
-                    coordinate[k] = aNewStrokeFont[j][i + k];
-
-                if( i < 2 )
+                for( int j = 0; j < aNewStrokeFontSize; j++ )
                 {
-                    // The first two values contain the width of the char
-                    glyphStartX = ( coordinate[0] - 'R' ) * STROKE_FONT_SCALE;
-                    glyphEndX   = ( coordinate[1] - 'R' ) * STROKE_FONT_SCALE;
-                    glyphWidth  = glyphEndX - glyphStartX;
+                    BOX2D bbox = parseGlyph( aNewStrokeFont[j], nullptr );
+                    g_defaultFontGlyphBoundingBoxes->push_back( bbox );
+                    g_defaultFontMaxGlyphWidth = std::max( g_defaultFontMaxGlyphWidth, bbox.GetWidth() );
                 }
-                else if( ( coordinate[0] == ' ' ) && ( coordinate[1] == 'R' ) )
-                {
-                    glyph->RaisePen();
-                }
-                else
-                {
-                    // In stroke font, coordinates values are coded as <value> + 'R', where
-                    // <value> is an ASCII char.
-                    // therefore every coordinate description of the Hershey format has an offset,
-                    // it has to be subtracted
-                    // Note:
-                    //  * the stroke coordinates are stored in reduced form (-1.0 to +1.0),
-                    //    and the actual size is stroke coordinate * glyph size
-                    //  * a few shapes have a height slightly bigger than 1.0 ( like '{' '[' )
-                    point.x = (double) ( coordinate[0] - 'R' ) * STROKE_FONT_SCALE - glyphStartX;
-
-                    // FONT_OFFSET is here for historical reasons, due to the way the stroke font
-                    // was built. It allows shapes coordinates like W M ... to be >= 0
-                    // Only shapes like j y have coordinates < 0
-                    point.y = (double) ( coordinate[1] - 'R' + FONT_OFFSET ) * STROKE_FONT_SCALE;
-
-                    glyph->AddPoint( point );
-                }
-
-                i += 2;
-            }
-
-            glyph->Finalize();
-
-            // Compute the bounding box of the glyph
-            buildGlyphBoundingBox( glyph, glyphWidth );
-            g_defaultFontGlyphBoundingBoxes->emplace_back( glyph->BoundingBox() );
-            g_defaultFontGlyphs.push_back( glyph );
-            m_maxGlyphWidth = std::max( m_maxGlyphWidth, glyphWidth );
-        }
-
-        g_defaultFontInitialized = true;
-    }
+            } );
 
     m_glyphs = &g_defaultFontGlyphs;
     m_glyphBoundingBoxes = g_defaultFontGlyphBoundingBoxes;
+    m_maxGlyphWidth = g_defaultFontMaxGlyphWidth;
     m_fontName = KICAD_FONT_NAME;
     m_fontFileName = wxEmptyString;
+}
+
+
+STROKE_GLYPH* STROKE_FONT::glyph( unsigned aIndex ) const
+{
+    unsigned block = aIndex / GLYPH_BLOCK;
+
+    std::call_once( g_defaultFontBlocks[block],
+            [block]()
+            {
+                unsigned end = std::min<size_t>( ( block + 1 ) * GLYPH_BLOCK, g_defaultFontGlyphs.size() );
+
+                for( unsigned j = block * GLYPH_BLOCK; j < end; j++ )
+                {
+                    auto glyph = std::make_shared<STROKE_GLYPH>();
+                    parseGlyph( g_defaultFontData[j], glyph.get() );
+                    g_defaultFontGlyphs[j] = std::move( glyph );
+                }
+            } );
+
+    return static_cast<STROKE_GLYPH*>( ( *m_glyphs )[aIndex].get() );
 }
 
 
@@ -251,15 +280,14 @@ VECTOR2I STROKE_FONT::GetTextAsGlyphs( BOX2I* aBBox, std::vector<std::unique_ptr
                 dd = (signed) c - ' ';
             }
 
-            STROKE_GLYPH* source = static_cast<STROKE_GLYPH*>( m_glyphs->at( dd ).get() );
-
             if( aGlyphs )
             {
+                STROKE_GLYPH* source = glyph( dd );
                 aGlyphs->push_back( source->Transform( glyphSize, cursor, tilt, aAngle, aMirror,
                                                        aOrigin ) );
             }
 
-            VECTOR2D glyphExtents = source->BoundingBox().GetEnd();
+            VECTOR2D glyphExtents = ( *m_glyphBoundingBoxes )[dd].GetEnd();
 
             glyphExtents *= glyphSize;
 
@@ -291,7 +319,7 @@ const STROKE_GLYPH* STROKE_FONT::GetGlyph( unsigned aIndex ) const
     if( !m_glyphs || aIndex >= m_glyphs->size() )
         return nullptr;
 
-    return static_cast<const STROKE_GLYPH*>( m_glyphs->at( aIndex ).get() );
+    return glyph( aIndex );
 }
 
 

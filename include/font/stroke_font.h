@@ -100,6 +100,9 @@ private:
      */
     void loadNewStrokeFont( const char* const aNewStrokeFont[], int aNewStrokeFontSize );
 
+    /// The glyph at \a aIndex (in range), parsed with its block on first use.
+    STROKE_GLYPH* glyph( unsigned aIndex ) const;
+
 private:
     static constexpr double m_superSubSize = 0.8;
     static constexpr double m_subscriptBaselineOffset = 0.15;

@@ -36,14 +36,18 @@ STROKE_GLYPH::STROKE_GLYPH( const STROKE_GLYPH& aGlyph )
 }
 
 
+void STROKE_GLYPH::StartStroke( size_t aPointCount )
+{
+    emplace_back();
+    back().reserve( aPointCount );
+    m_penIsDown = true;
+}
+
+
 void STROKE_GLYPH::AddPoint( const VECTOR2D& aPoint )
 {
     if( !m_penIsDown )
-    {
-        emplace_back();
-        back().reserve( 16 );   // This handles all but 359 strokes (out of over 328,000)
-        m_penIsDown = true;
-    }
+        StartStroke( 16 );
 
     back().push_back( aPoint );
 }

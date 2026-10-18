@@ -106,6 +106,7 @@ public:
 
     bool IsStroke() const override { return true; }
 
+    void StartStroke( size_t aPointCount );
     void AddPoint( const VECTOR2D& aPoint );
     void RaisePen();
     void Finalize();
