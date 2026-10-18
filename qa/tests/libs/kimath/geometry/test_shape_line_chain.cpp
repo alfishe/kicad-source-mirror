@@ -21,6 +21,8 @@
 #include <geometry/shape_line_chain.h>
 #include <trigo.h>
 
+#include <random>
+
 #include <qa_utils/geometry/geometry.h>
 #include <qa_utils/numeric.h>
 #include <qa_utils/wx_utils/unit_test_utils.h>
@@ -1926,6 +1928,65 @@ BOOST_AUTO_TEST_CASE( SelfIntersecting_LargeWithCrossing )
     chain.Append( VECTOR2I( 5000, -10000 ) );
 
     BOOST_CHECK( chain.SelfIntersecting().has_value() );
+}
+
+
+BOOST_AUTO_TEST_CASE( SelfIntersecting_FirstHitMatchesPairScan )
+{
+    // Long chains take the sweep path; the hit must be the first (s1, s2) of a plain scan
+    std::mt19937 rng( 1234 );
+
+    for( int trial = 0; trial < 400; trial++ )
+    {
+        const int        n = 33 + trial % 120;
+        const int        span = trial % 2 ? 100000 : 3000;
+        SHAPE_LINE_CHAIN chain;
+        VECTOR2I         p( 0, 0 );
+
+        for( int i = 0; i < n; i++ )
+        {
+            chain.Append( p );
+
+            if( i % 7 == 3 )
+                p.x += 1;
+            else
+                p += VECTOR2I( (int) ( rng() % span ) - span / 2, (int) ( rng() % span ) - span / 2 );
+        }
+
+        chain.SetClosed( trial % 3 == 0 );
+
+        const int segCount = chain.SegmentCount();
+        int       want1 = -1, want2 = -1;
+
+        for( int s1 = 0; s1 < segCount && want1 < 0; s1++ )
+        {
+            const SEG a = chain.CSegment( s1 );
+
+            for( int s2 = s1 + 1; s2 < segCount; s2++ )
+            {
+                const SEG b = chain.CSegment( s2 );
+                const bool wrap = chain.IsClosed() && s1 == 0 && s2 == segCount - 1;
+
+                if( ( s1 + 1 != s2 && a.Contains( b.A ) ) || ( a.Contains( b.B ) && !wrap )
+                    || a.Intersect( b, true ) )
+                {
+                    want1 = s1;
+                    want2 = s2;
+                    break;
+                }
+            }
+        }
+
+        const std::optional<SHAPE_LINE_CHAIN::INTERSECTION> got = chain.SelfIntersecting();
+
+        BOOST_REQUIRE_EQUAL( got.has_value(), want1 >= 0 );
+
+        if( got )
+        {
+            BOOST_CHECK_EQUAL( got->index_our, want1 );
+            BOOST_CHECK_EQUAL( got->index_their, want2 );
+        }
+    }
 }
 
 

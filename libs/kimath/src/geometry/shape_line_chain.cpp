@@ -2160,70 +2160,106 @@ const std::optional<SHAPE_LINE_CHAIN::INTERSECTION> SHAPE_LINE_CHAIN::SelfInters
         return next < ptCount ? next : 0;
     };
 
-    for( int s1 = 0; s1 < segCount; s1++ )
+    auto testPair = [&]( int s1, int s2 ) -> std::optional<INTERSECTION>
     {
         const VECTOR2I& a1 = m_points[s1];
         const VECTOR2I& b1 = m_points[endIdx( s1 )];
+        const VECTOR2I& a2 = m_points[s2];
+        const VECTOR2I& b2 = m_points[endIdx( s2 )];
 
         // Expand by 2 to account for Contains() tolerance (SquaredDistance <= 3)
-        const int s1MinX = std::min( a1.x, b1.x ) - 2;
-        const int s1MaxX = std::max( a1.x, b1.x ) + 2;
-        const int s1MinY = std::min( a1.y, b1.y ) - 2;
-        const int s1MaxY = std::max( a1.y, b1.y ) + 2;
-
-        for( int s2 = s1 + 1; s2 < segCount; s2++ )
+        if( std::max( a1.x, b1.x ) + 2 < std::min( a2.x, b2.x )
+            || std::max( a2.x, b2.x ) < std::min( a1.x, b1.x ) - 2
+            || std::max( a1.y, b1.y ) + 2 < std::min( a2.y, b2.y )
+            || std::max( a2.y, b2.y ) < std::min( a1.y, b1.y ) - 2 )
         {
-            const VECTOR2I& a2 = m_points[s2];
-            const VECTOR2I& b2 = m_points[endIdx( s2 )];
+            return std::nullopt;
+        }
 
-            const int s2MinX = std::min( a2.x, b2.x );
-            const int s2MaxX = std::max( a2.x, b2.x );
+        const SEG seg1( a1, b1, s1 );
+        INTERSECTION is;
+        is.index_our = s1;
+        is.index_their = s2;
 
-            if( s1MaxX < s2MinX || s2MaxX < s1MinX )
-                continue;
+        if( s1 + 1 != s2 && seg1.Contains( a2 ) )
+        {
+            is.p = a2;
+            return is;
+        }
+        else if( seg1.Contains( b2 ) &&
+                 // for closed polylines, the ending point of the
+                 // last segment == starting point of the first segment
+                 // this is a normal case, not self intersecting case
+                 !( closed && s1 == 0 && s2 == segCount - 1 ) )
+        {
+            is.p = b2;
+            return is;
+        }
+        else if( OPT_VECTOR2I p = seg1.Intersect( SEG( a2, b2, s2 ), true ) )
+        {
+            is.p = *p;
+            return is;
+        }
 
-            const int s2MinY = std::min( a2.y, b2.y );
-            const int s2MaxY = std::max( a2.y, b2.y );
+        return std::nullopt;
+    };
 
-            if( s1MaxY < s2MinY || s2MaxY < s1MinY )
-                continue;
-
-            const SEG seg1( a1, b1, s1 );
-
-            if( s1 + 1 != s2 && seg1.Contains( a2 ) )
+    // Short chains: plain pair scan
+    if( segCount <= 32 )
+    {
+        for( int s1 = 0; s1 < segCount; s1++ )
+        {
+            for( int s2 = s1 + 1; s2 < segCount; s2++ )
             {
-                INTERSECTION is;
-                is.index_our = s1;
-                is.index_their = s2;
-                is.p = a2;
-                return is;
-            }
-            else if( seg1.Contains( b2 ) &&
-                     // for closed polylines, the ending point of the
-                     // last segment == starting point of the first segment
-                     // this is a normal case, not self intersecting case
-                     !( closed && s1 == 0 && s2 == segCount - 1 ) )
-            {
-                INTERSECTION is;
-                is.index_our = s1;
-                is.index_their = s2;
-                is.p = b2;
-                return is;
-            }
-            else
-            {
-                OPT_VECTOR2I p = seg1.Intersect( SEG( a2, b2, s2 ), true );
-
-                if( p )
-                {
-                    INTERSECTION is;
-                    is.index_our = s1;
-                    is.index_their = s2;
-                    is.p = *p;
+                if( std::optional<INTERSECTION> is = testPair( s1, s2 ) )
                     return is;
-                }
             }
         }
+
+        return std::optional<INTERSECTION>();
+    }
+
+    // Long chains: sweep by minX for the pairs whose boxes touch, then test them in the
+    // (s1, s2) order of the plain scan so the first hit is the same
+    thread_local std::vector<SEG_EXTENT>         sorted;
+    thread_local std::vector<std::pair<int, int>> pairs;
+
+    sorted.resize( segCount );
+    pairs.clear();
+
+    for( int i = 0; i < segCount; i++ )
+    {
+        const VECTOR2I& pa = m_points[i];
+        const VECTOR2I& pb = m_points[endIdx( i )];
+        sorted[i] = { std::min( pa.x, pb.x ), std::max( pa.x, pb.x ),
+                      std::min( pa.y, pb.y ), std::max( pa.y, pb.y ), i };
+    }
+
+    std::sort( sorted.begin(), sorted.end(),
+               []( const SEG_EXTENT& a, const SEG_EXTENT& b ) { return a.minX < b.minX; } );
+
+    for( int i = 0; i < segCount; i++ )
+    {
+        const SEG_EXTENT& e1 = sorted[i];
+
+        for( int j = i + 1; j < segCount && sorted[j].minX <= e1.maxX + 2; j++ )
+        {
+            const SEG_EXTENT& e2 = sorted[j];
+
+            if( e1.maxY + 2 < e2.minY || e2.maxY + 2 < e1.minY )
+                continue;
+
+            pairs.emplace_back( std::min( e1.segIdx, e2.segIdx ),
+                                std::max( e1.segIdx, e2.segIdx ) );
+        }
+    }
+
+    std::sort( pairs.begin(), pairs.end() );
+
+    for( const auto& [s1, s2] : pairs )
+    {
+        if( std::optional<INTERSECTION> is = testPair( s1, s2 ) )
+            return is;
     }
 
     return std::optional<INTERSECTION>();
