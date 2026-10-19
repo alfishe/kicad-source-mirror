@@ -2,6 +2,7 @@
 /// @brief kicadopenapi PCB document methods: pcb_open, pcb_close, pcb_save, pcb_revert, and the
 /// "pcb" document provider.  Compiled into the pcbnew kiface; registered when it loads.
 #include <kicadopenapi_util.h>
+#include <kicadopenapi_legacy_save.h>
 #include <kicadopenapi_lock.h>
 #include <kicadopenapi_service.h>
 #include "kopenapi_pcb.h"
@@ -14,6 +15,11 @@
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 #include <richio.h>
 #include <board_loader.h>
+#include <board_design_settings.h>
+#include <api/board/board_rules.pb.h>
+#include <drc/drc_exclusion.h>
+#include <drc/drc_item.h>
+#include <pcb_marker.h>
 #include <kiway.h>
 #include <tool/tool_manager.h>
 #include <tool/actions.h>
@@ -98,15 +104,30 @@ static std::string projectConflict( KOPENAPI_CONTEXT& aCtx, const wxFileName& aP
 }
 
 
-static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& aBoard )
+static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& aBoard, const nlohmann::json& aArgs )
 {
     wxFileName projectFile( aBoard );
     projectFile.SetExt( FILEEXT::ProjectFileExtension );
 
     if( std::string other = projectConflict( aCtx, projectFile ); !other.empty() )
     {
-        return KOPENAPI_RESULT::Error( 409, "this process serves project " + other
-                                                    + "; start another instance for a different project" );
+        if( !aArgs.value( "switch_project", false ) )
+        {
+            return KOPENAPI_RESULT::Error( 409, "this process serves project " + other
+                                                        + "; sch_close first, pass switch_project: true, or start "
+                                                          "another instance for a different project" );
+        }
+
+        // the other project's schematic goes first, as sch_close would close it
+        std::optional<KOPENAPI_METHOD> close = KOPENAPI_REGISTRY::Get().Find( "sch_close" );
+
+        if( !close )
+            return KOPENAPI_RESULT::Error( 500, "sch_close is not available in this process" );
+
+        KOPENAPI_RESULT closed = close->handler( aCtx, { { "discard", aArgs.value( "discard", false ) } } );
+
+        if( closed.status >= 400 )
+            return closed;
     }
 
     // Drop the current board first: activating another project destroys the old PROJECT,
@@ -145,8 +166,21 @@ static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& a
     if( !board )
         return KOPENAPI_RESULT::Error( 422, "board could not be loaded" );
 
+    // As the editor does: a legacy .brd is saved in the current format under a .kicad_pcb name
+    const bool legacy = aBoard.GetExt() == FILEEXT::LegacyPcbFileExtension;
+
+    if( legacy )
+    {
+        wxFileName current( aBoard );
+        current.SetExt( FILEEXT::KiCadPcbFileExtension );
+        board->SetFileName( current.GetFullPath() );
+    }
+
     s_headless = std::make_shared<HEADLESS_PCB_CONTEXT>(
             std::move( board ), project, GetAppSettings<PCBNEW_SETTINGS>( "pcbnew" ), aCtx.kiway );
+
+    if( legacy )
+        s_headless->SetContentModified( true );
 
     return KOPENAPI_RESULT::Ok( documentStatus( aCtx ) );
 }
@@ -194,11 +228,11 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     wxFileName board( KopenapiCanonicalPath( wxString::FromUTF8( aArgs["path"].get<std::string>() ) ) );
     board.MakeAbsolute();
 
-    if( board.GetExt() == FILEEXT::ProjectFileExtension )
+    if( board.GetExt() == FILEEXT::ProjectFileExtension || board.GetExt() == FILEEXT::LegacyProjectFileExtension )
         board.SetExt( FILEEXT::KiCadPcbFileExtension );
 
-    if( board.GetExt() != FILEEXT::KiCadPcbFileExtension )
-        return KOPENAPI_RESULT::Error( 400, "expected a .kicad_pcb or .kicad_pro file" );
+    if( board.GetExt() != FILEEXT::KiCadPcbFileExtension && board.GetExt() != FILEEXT::LegacyPcbFileExtension )
+        return KOPENAPI_RESULT::Error( 400, "expected a .kicad_pcb (or a KiCad 4 .brd) or a .kicad_pro / .pro file" );
 
     if( !board.FileExists() )
         return KOPENAPI_RESULT::Error( 404, "file not found: " + board.GetFullPath().ToStdString() );
@@ -217,7 +251,7 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     }
 
     if( aCtx.headless )
-        return openHeadless( aCtx, board );
+        return openHeadless( aCtx, board, aArgs );
 
     // a file another process has open: opened only when asked (no modal question)
     KICAD_OPENAPI_SERVICE::SetOverrideLock( aArgs.value( "override_lock", false ) );
@@ -260,12 +294,157 @@ static KOPENAPI_RESULT h_pcb_close( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 }
 
 
+/// @brief A copy of the open board (and its project and rules) at aTarget, for an earlier KiCad.
+/// The open document keeps its file and modified state.
+/// DRC exclusions as 10.0 stores them: [ "key|x|y|...", comment ] (PCB_MARKER::SerializeToString of 10.0)
+static nlohmann::json legacyDrcExclusions( const BOARD& aBoard )
+{
+    nlohmann::json out = nlohmann::json::array();
+
+    for( const DRC_EXCLUSION& exclusion : aBoard.GetDesignSettings().m_DrcExclusions )
+    {
+        std::unique_ptr<PCB_MARKER> marker( PCB_MARKER::FromProto( exclusion.ToProto().marker() ) );
+
+        if( !marker || !marker->GetRCItem() )
+            continue;
+
+        std::shared_ptr<RC_ITEM> item = marker->GetRCItem();
+        const int                code = item->GetErrorCode();
+        const VECTOR2I           pos = marker->GetPos();
+        wxString                 text;
+
+        if( code == DRCE_COPPER_SLIVER || code == DRCE_GENERIC_WARNING || code == DRCE_GENERIC_ERROR )
+        {
+            text = wxString::Format( wxT( "%s|%d|%d|%s|%s" ), item->GetSettingsKey(), pos.x, pos.y,
+                                     item->GetMainItemID().AsString(), LayerName( marker->GetLayer() ) );
+        }
+        else if( code == DRCE_UNCONNECTED_ITEMS )
+        {
+            PCB_LAYER_ID layer = marker->GetLayer() == UNDEFINED_LAYER ? F_Cu : marker->GetLayer();
+            text = wxString::Format( wxT( "%s|%d|%d|%s|%d|%s|%s" ), item->GetSettingsKey(), pos.x, pos.y,
+                                     LayerName( layer ), (int) marker->GetMarkerType(),
+                                     item->GetMainItemID().AsString(), item->GetAuxItemID().AsString() );
+        }
+        else if( code == DRCE_STARVED_THERMAL )
+        {
+            text = wxString::Format( wxT( "%s|%d|%d|%s|%s|%s" ), item->GetSettingsKey(), pos.x, pos.y,
+                                     item->GetMainItemID().AsString(), item->GetAuxItemID().AsString(),
+                                     LayerName( marker->GetLayer() ) );
+        }
+        else if( code == DRCE_UNRESOLVED_VARIABLE && marker->GetMarkerType() == MARKER_BASE::MARKER_DRAWING_SHEET )
+        {
+            text = wxString::Format( wxT( "%s|%d|%d||" ), item->GetSettingsKey(), pos.x, pos.y );
+        }
+        else
+        {
+            text = wxString::Format( wxT( "%s|%d|%d|%s|%s" ), item->GetSettingsKey(), pos.x, pos.y,
+                                     item->GetMainItemID().AsString(), item->GetAuxItemID().AsString() );
+        }
+
+        out.push_back( { std::string( text.ToUTF8() ), std::string( exclusion.GetComment().ToUTF8() ) } );
+    }
+
+    return out;
+}
+
+
+static KOPENAPI_RESULT saveVersionCopy( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const wxFileName& aTarget,
+                                       const std::string& aVersion )
+{
+    BOARD*     board = aContext.GetBoard();
+    wxFileName current( aContext.GetCurrentFileName() );
+    current.MakeAbsolute();
+
+    if( !board )
+        return KopenapiNoBoard();
+
+    if( aTarget.GetFullPath() == current.GetFullPath() )
+        return KOPENAPI_RESULT::Error( 409, "a copy for an earlier version cannot replace the open board's file" );
+
+    wxFileName project( aTarget );
+    project.SetExt( FILEEXT::ProjectFileExtension );
+    wxFileName openProject( board->GetProject() ? board->GetProject()->GetProjectFullName() : wxString() );
+
+    if( openProject.IsOk() && project.GetFullPath() == openProject.GetFullPath() )
+        return KOPENAPI_RESULT::Error( 409, "the copy's project file would replace the open project; use another name or folder" );
+
+    if( !aTarget.DirExists() && !wxFileName::Mkdir( aTarget.GetPath(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL ) )
+        return KOPENAPI_RESULT::Error( 500, "cannot create " + std::string( aTarget.GetPath().ToUTF8() ) );
+
+    wxString outPath = aTarget.GetFullPath();
+
+    if( !BOARD_LOADER::SaveBoard( outPath, *board ) )
+        return KOPENAPI_RESULT::Error( 500, "writing the board failed" );
+
+    nlohmann::json files = nlohmann::json::array();
+    nlohmann::json report;
+    wxString       error;
+
+    if( !KopenapiLegacyConvertFile( outPath, aVersion, report, error ) )
+        return KOPENAPI_RESULT::Error( 500, std::string( error.ToUTF8() ) );
+
+    files.push_back( report );
+
+    if( board->GetProject()
+        && ( !Pgm().GetSettingsManager().SaveProjectCopy( project.GetFullPath(), board->GetProject() )
+             || !project.FileExists() ) )
+    {
+        return KOPENAPI_RESULT::Error( 500, "writing the project copy failed" );
+    }
+
+    if( board->GetProject() )
+    {
+        nlohmann::json drc = legacyDrcExclusions( *board );
+        nlohmann::json projectReport;
+
+        if( !KopenapiLegacyConvertProject( project.GetFullPath(), aVersion, &drc, projectReport, error ) )
+            return KOPENAPI_RESULT::Error( 500, std::string( error.ToUTF8() ) );
+
+        files.push_back( projectReport );
+    }
+
+    wxFileName rules( board->GetDesignRulesPath() );
+    wxFileName targetRules( aTarget );
+    targetRules.SetExt( FILEEXT::DesignRulesFileExtension );
+
+    if( rules.FileExists() && rules.GetFullPath() != targetRules.GetFullPath() )
+        wxCopyFile( rules.GetFullPath(), targetRules.GetFullPath(), true );
+
+    nlohmann::json status = documentStatus( aCtx );
+    status["copy"] = { { "path", std::string( outPath.ToUTF8() ) },
+                       { "version", aVersion },
+                       { "project", std::string( project.GetFullPath().ToUTF8() ) },
+                       { "files", files } };
+    return KOPENAPI_RESULT::Ok( status );
+}
+
+
 static KOPENAPI_RESULT h_pcb_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
     if( !context )
         return KopenapiNoBoard();
+
+    std::string version;
+    std::string versionError;
+
+    if( !KopenapiLegacyTarget( aArgs, version, versionError ) )
+        return KOPENAPI_RESULT::Error( 400, versionError );
+
+    if( !version.empty() )
+    {
+        if( !aArgs.contains( "path" ) || !aArgs["path"].is_string() )
+            return KOPENAPI_RESULT::Error( 400, "'version' writes a copy: 'path' (.kicad_pcb) is required" );
+
+        wxFileName target( wxString::FromUTF8( aArgs["path"].get<std::string>() ) );
+        target.MakeAbsolute();
+
+        if( target.GetExt() != FILEEXT::KiCadPcbFileExtension )
+            return KOPENAPI_RESULT::Error( 400, "expected a .kicad_pcb path" );
+
+        return saveVersionCopy( aCtx, *context, target, version );
+    }
 
     bool ok = false;
 
@@ -433,11 +612,13 @@ KOPENAPI_REGISTER_DOCUMENTS( "pcb", documentStatus,
                              } );
 
 KOPENAPI_REGISTER( "pcb_open",
-                   "Open a board (.kicad_pcb or its .kicad_pro): editor window in the GUI, in memory headless",
+                   "Open a board (.kicad_pcb, a KiCad 4 .brd, or its .kicad_pro / .pro; a .brd is saved as .kicad_pcb): editor window in the GUI, in memory headless",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
                                    "description":"Drop unsaved changes of the currently open board"},
+                        "switch_project":{"type":"boolean","default":false,
+                                   "description":"Headless: when the open schematic belongs to another project, close it first (refused with its unsaved changes unless discard: true)"},
                         "override_lock":{"type":"boolean","default":false,
                                    "description":"GUI: open even when another process has the file open (never asked in a dialog; refused with a journal error otherwise)"}}})json"_json,
                    false, h_pcb_open, 120 );
@@ -448,8 +629,18 @@ KOPENAPI_REGISTER( "pcb_close", "Close the open board: refuses with unsaved chan
                    false, h_pcb_close );
 
 KOPENAPI_REGISTER( "pcb_save",
-                   "Save the open board; with 'path' save as (headless switches to it, GUI writes a copy)",
-                   R"json({"type":"object","properties":{"path":{"type":"string"}}})json"_json, false, h_pcb_save );
+                   "Save the open board; with 'path' save as (headless switches to it, GUI writes a copy). "
+                   "With 'version' (e.g. \"10.0\") write a copy at 'path' that an earlier KiCad opens, with its "
+                   "project and rules; the open board stays as it is. The result lists what the earlier format "
+                   "cannot hold (dropped or approximated)",
+                   nlohmann::json( { { "type", "object" },
+                                     { "properties",
+                                       { { "path", { { "type", "string" } } },
+                                         { "version",
+                                           { { "type", "string" },
+                                             { "enum", KopenapiLegacyTargets() },
+                                             { "description", "earlier KiCad release to write for; needs 'path'" } } } } } } ),
+                   false, h_pcb_save );
 
 KOPENAPI_REGISTER( "pcb_revert", "Reload the open board from disk, dropping unsaved changes",
                    R"json({"type":"object","properties":{}})json"_json, false, h_pcb_revert, 120 );

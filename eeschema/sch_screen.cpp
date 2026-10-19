@@ -855,7 +855,9 @@ void SCH_SCREEN::UpdateSymbolLinks( REPORTER* aReporter, LEGACY_SYMBOL_LIBS* aLe
 
             wxString id = symbol->GetLibId().Format();
 
-            id.Replace( ':', '_' );
+            // Cache libraries name their symbols either "lib:name" or "lib_name"
+            if( !legacyCacheLib.FindSymbol( id ) )
+                id.Replace( ':', '_' );
 
             if( aReporter )
             {

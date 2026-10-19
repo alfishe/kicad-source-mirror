@@ -2,6 +2,7 @@
 /// @brief kicadopenapi schematic document methods: sch_open, sch_close, sch_save, sch_revert, and
 /// the "sch" document provider.  Compiled into the eeschema kiface; registered when it loads.
 #include <kicadopenapi_util.h>
+#include <kicadopenapi_legacy_save.h>
 #include <kicadopenapi_lock.h>
 #include <kicadopenapi_service.h>
 #include "kopenapi_sch.h"
@@ -26,6 +27,9 @@
 #include <settings/settings_manager.h>
 #include <wildcards_and_files_ext.h>
 
+#include <set>
+
+#include <wx/ffile.h>
 #include <wx/filename.h>
 
 
@@ -130,15 +134,30 @@ static std::string projectConflict( KOPENAPI_CONTEXT& aCtx, const wxFileName& aP
 }
 
 
-static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& aSchematic )
+static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& aSchematic, const nlohmann::json& aArgs )
 {
     wxFileName projectFile( aSchematic );
     projectFile.SetExt( FILEEXT::ProjectFileExtension );
 
     if( std::string other = projectConflict( aCtx, projectFile ); !other.empty() )
     {
-        return KOPENAPI_RESULT::Error( 409, "this process serves project " + other
-                                                    + "; start another instance for a different project" );
+        if( !aArgs.value( "switch_project", false ) )
+        {
+            return KOPENAPI_RESULT::Error( 409, "this process serves project " + other
+                                                        + "; pcb_close first, pass switch_project: true, or start "
+                                                          "another instance for a different project" );
+        }
+
+        // the other project's board goes first, as pcb_close would close it
+        std::optional<KOPENAPI_METHOD> close = KOPENAPI_REGISTRY::Get().Find( "pcb_close" );
+
+        if( !close )
+            return KOPENAPI_RESULT::Error( 500, "pcb_close is not available in this process" );
+
+        KOPENAPI_RESULT closed = close->handler( aCtx, { { "discard", aArgs.value( "discard", false ) } } );
+
+        if( closed.status >= 400 )
+            return closed;
     }
 
     // Drop the current schematic first: activating another project destroys the old PROJECT,
@@ -163,13 +182,17 @@ static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& a
     {
         schematic = EESCHEMA_HELPERS::LoadSchematic( aSchematic.GetFullPath(), false, false, project );
     }
+    catch( const IO_ERROR& ioe )
+    {
+        return KOPENAPI_RESULT::Error( 422, "schematic could not be loaded: " + ioe.What().ToStdString() );
+    }
     catch( ... )
     {
         schematic = nullptr;
     }
 
     if( !schematic )
-        return KOPENAPI_RESULT::Error( 422, "schematic could not be loaded" );
+        return KOPENAPI_RESULT::Error( 422, "schematic could not be loaded (the cause, if KiCad gave one, is in error.log)" );
 
     s_schematic = schematic;
     s_headless = std::make_shared<HEADLESS_SCH_CONTEXT>( &s_schematic, project, aCtx.kiway );
@@ -220,11 +243,23 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     wxFileName schematic( KopenapiCanonicalPath( wxString::FromUTF8( aArgs["path"].get<std::string>() ) ) );
     schematic.MakeAbsolute();
 
-    if( schematic.GetExt() == FILEEXT::ProjectFileExtension )
+    if( schematic.GetExt() == FILEEXT::ProjectFileExtension || schematic.GetExt() == FILEEXT::LegacyProjectFileExtension )
+    {
         schematic.SetExt( FILEEXT::KiCadSchematicFileExtension );
 
-    if( schematic.GetExt() != FILEEXT::KiCadSchematicFileExtension )
-        return KOPENAPI_RESULT::Error( 400, "expected a .kicad_sch or .kicad_pro file" );
+        // a KiCad 5 project keeps its schematic in the legacy format
+        wxFileName legacy( schematic );
+        legacy.SetExt( FILEEXT::LegacySchematicFileExtension );
+
+        if( !schematic.FileExists() && legacy.FileExists() )
+            schematic = legacy;
+    }
+
+    if( schematic.GetExt() != FILEEXT::KiCadSchematicFileExtension
+        && schematic.GetExt() != FILEEXT::LegacySchematicFileExtension )
+    {
+        return KOPENAPI_RESULT::Error( 400, "expected a .kicad_sch, a KiCad 5 .sch, or a .kicad_pro / .pro file" );
+    }
 
     if( !schematic.FileExists() )
         return KOPENAPI_RESULT::Error( 404, "file not found: " + schematic.GetFullPath().ToStdString() );
@@ -243,7 +278,7 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     }
 
     if( aCtx.headless )
-        return openHeadless( aCtx, schematic );
+        return openHeadless( aCtx, schematic, aArgs );
 
     // a file another process has open: opened only when asked (no modal question)
     KICAD_OPENAPI_SERVICE::SetOverrideLock( aArgs.value( "override_lock", false ) );
@@ -287,6 +322,183 @@ static KOPENAPI_RESULT h_sch_close( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 }
 
 
+/// @brief As the editor does on save: KiCad 5 sheets (.sch, no writer) are written in the current
+/// format under .kicad_sch names next to them; the legacy files stay as they are.
+/// @return the new file names
+static nlohmann::json renameLegacySheets( SCHEMATIC& aSchematic )
+{
+    nlohmann::json renamed = nlohmann::json::array();
+    SCH_SCREENS    screens( aSchematic.Root() );
+
+    for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+    {
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_SHEET_T ) )
+        {
+            SCH_SHEET* sheet = static_cast<SCH_SHEET*>( item );
+            wxFileName name( sheet->GetFileName() );
+
+            if( name.IsOk() && name.GetExt() == FILEEXT::LegacySchematicFileExtension )
+            {
+                name.SetExt( FILEEXT::KiCadSchematicFileExtension );
+                sheet->SetFileName( name.GetFullPath() );
+            }
+        }
+
+        wxFileName file( screen->GetFileName() );
+
+        if( file.IsOk() && file.GetExt() == FILEEXT::LegacySchematicFileExtension )
+        {
+            file.SetExt( FILEEXT::KiCadSchematicFileExtension );
+            screen->SetFileName( file.GetFullPath() );
+            renamed.push_back( std::string( file.GetFullPath().ToUTF8() ) );
+        }
+    }
+
+    return renamed;
+}
+
+
+/// @brief Point the copied project's top-level sheet entries at the copy's root file
+static void retargetProjectRoot( const wxString& aProjectFile, const wxString& aOldRoot, const wxString& aNewRoot )
+{
+    wxFFile in( aProjectFile, wxS( "rb" ) );
+    wxString text;
+
+    if( !in.IsOpened() || !in.ReadAll( &text, wxConvUTF8 ) )
+        return;
+
+    in.Close();
+
+    nlohmann::json pro = nlohmann::json::parse( text.ToStdString( wxConvUTF8 ), nullptr, false );
+
+    if( pro.is_discarded() || !pro.contains( "schematic" ) || !pro["schematic"].contains( "top_level_sheets" ) )
+        return;
+
+    bool changed = false;
+
+    for( nlohmann::json& sheet : pro["schematic"]["top_level_sheets"] )
+    {
+        if( sheet.value( "filename", std::string() ) == std::string( aOldRoot.ToUTF8() ) )
+        {
+            sheet["filename"] = std::string( aNewRoot.ToUTF8() );
+            changed = true;
+        }
+    }
+
+    if( !changed )
+        return;
+
+    std::string out = pro.dump( 2 ) + "\n";
+    wxFFile     file( aProjectFile, wxS( "wb" ) );
+
+    if( file.IsOpened() )
+        file.Write( out.data(), out.size() );
+}
+
+
+/// @brief A copy of every sheet (root at aTarget, the others at their paths relative to it) and of
+/// the project, for an earlier KiCad. The open document keeps its files and modified state.
+static KOPENAPI_RESULT saveVersionCopy( KOPENAPI_CONTEXT& aCtx, SCH_CONTEXT& aContext, const wxFileName& aTarget,
+                                        const std::string& aVersion )
+{
+    SCHEMATIC* schematic = aContext.GetSchematic();
+
+    if( !schematic || !schematic->RootScreen() )
+        return KopenapiNoSchematic();
+
+    renameLegacySheets( *schematic );
+
+    wxFileName root( schematic->RootScreen()->GetFileName() );
+    root.MakeAbsolute();
+    const wxString sourceDir = root.GetPath();
+
+    SCH_SCREENS                                  screens( schematic->Root() );
+    std::vector<std::pair<size_t, wxString>>     plan;
+    std::set<wxString>                           openFiles;
+
+    for( size_t ii = 0; ii < screens.GetCount(); ++ii )
+    {
+        wxFileName file( screens.GetScreen( ii )->GetFileName() );
+
+        if( file.IsOk() && file.HasName() )
+        {
+            file.MakeAbsolute( sourceDir );
+            openFiles.insert( file.GetFullPath() );
+        }
+    }
+
+    for( size_t ii = 0; ii < screens.GetCount(); ++ii )
+    {
+        SCH_SCREEN* screen = screens.GetScreen( ii );
+        wxFileName  file( screen->GetFileName() );
+
+        if( !file.IsOk() || !file.HasName() )
+            continue;
+
+        file.MakeAbsolute( sourceDir );
+        wxFileName dest( aTarget );
+
+        if( file.GetFullPath() != root.GetFullPath() )
+        {
+            file.MakeRelativeTo( sourceDir );
+            dest = wxFileName( file.GetFullPath() );
+            dest.MakeAbsolute( aTarget.GetPath() );
+        }
+
+        if( openFiles.count( dest.GetFullPath() ) )
+        {
+            return KOPENAPI_RESULT::Error( 409, "the copy would replace the open schematic's file "
+                                                        + std::string( dest.GetFullPath().ToUTF8() )
+                                                        + "; use another folder" );
+        }
+
+        plan.emplace_back( ii, dest.GetFullPath() );
+    }
+
+    wxFileName project( aTarget );
+    project.SetExt( FILEEXT::ProjectFileExtension );
+
+    if( project.GetFullPath() == wxFileName( aContext.Prj().GetProjectFullName() ).GetFullPath() )
+        return KOPENAPI_RESULT::Error( 409, "the copy's project file would replace the open project; use another folder" );
+
+    nlohmann::json files = nlohmann::json::array();
+
+    for( const auto& [index, dest] : plan )
+    {
+        if( !SCH_API_SAVE::SaveSheetToFile( screens.GetSheet( index ), *schematic, dest ) )
+            return KOPENAPI_RESULT::Error( 500, "writing " + std::string( dest.ToUTF8() ) + " failed" );
+
+        nlohmann::json report;
+        wxString       error;
+
+        if( !KopenapiLegacyConvertFile( dest, aVersion, report, error ) )
+            return KOPENAPI_RESULT::Error( 500, std::string( error.ToUTF8() ) );
+
+        files.push_back( report );
+    }
+
+    if( !Pgm().GetSettingsManager().SaveProjectCopy( project.GetFullPath(), &aContext.Prj() ) || !project.FileExists() )
+        return KOPENAPI_RESULT::Error( 500, "writing the project copy failed" );
+
+    retargetProjectRoot( project.GetFullPath(), root.GetFullName(), aTarget.GetFullName() );
+
+    nlohmann::json projectReport;
+    wxString       projectError;
+
+    if( !KopenapiLegacyConvertProject( project.GetFullPath(), aVersion, nullptr, projectReport, projectError ) )
+        return KOPENAPI_RESULT::Error( 500, std::string( projectError.ToUTF8() ) );
+
+    files.push_back( projectReport );
+
+    nlohmann::json status = documentStatus( aCtx );
+    status["copy"] = { { "path", std::string( aTarget.GetFullPath().ToUTF8() ) },
+                       { "version", aVersion },
+                       { "project", std::string( project.GetFullPath().ToUTF8() ) },
+                       { "files", files } };
+    return KOPENAPI_RESULT::Ok( status );
+}
+
+
 static KOPENAPI_RESULT h_sch_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
@@ -294,7 +506,32 @@ static KOPENAPI_RESULT h_sch_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     if( !context )
         return KopenapiNoSchematic();
 
-    bool ok = false;
+    std::string version;
+    std::string versionError;
+
+    if( !KopenapiLegacyTarget( aArgs, version, versionError ) )
+        return KOPENAPI_RESULT::Error( 400, versionError );
+
+    if( !version.empty() )
+    {
+        if( !aArgs.contains( "path" ) || !aArgs["path"].is_string() )
+            return KOPENAPI_RESULT::Error( 400, "'version' writes a copy: 'path' (.kicad_sch) is required" );
+
+        wxFileName target( wxString::FromUTF8( aArgs["path"].get<std::string>() ) );
+        target.MakeAbsolute();
+
+        if( target.GetExt() != FILEEXT::KiCadSchematicFileExtension )
+            return KOPENAPI_RESULT::Error( 400, "expected a .kicad_sch path" );
+
+        if( !target.DirExists() && !wxFileName::Mkdir( target.GetPath(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL ) )
+            return KOPENAPI_RESULT::Error( 500, "cannot create " + std::string( target.GetPath().ToUTF8() ) );
+
+        return saveVersionCopy( aCtx, *context, target, version );
+    }
+
+    nlohmann::json converted = aCtx.headless && s_schematic ? renameLegacySheets( *s_schematic )
+                                                             : nlohmann::json::array();
+    bool           ok = false;
 
     if( aArgs.contains( "path" ) && aArgs["path"].is_string() )
     {
@@ -316,7 +553,12 @@ static KOPENAPI_RESULT h_sch_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     if( !ok )
         return KOPENAPI_RESULT::Error( 500, "saving the schematic failed" );
 
-    return KOPENAPI_RESULT::Ok( documentStatus( aCtx ) );
+    nlohmann::json status = documentStatus( aCtx );
+
+    if( !converted.empty() )
+        status["converted_from_legacy"] = converted;
+
+    return KOPENAPI_RESULT::Ok( status );
 }
 
 
@@ -484,11 +726,13 @@ KOPENAPI_REGISTER_DOCUMENTS( "sch", documentStatus, releaseHeadless );
 KOPENAPI_REGISTER_HISTORY( "sch", history() );
 
 KOPENAPI_REGISTER( "sch_open",
-                   "Open a schematic (.kicad_sch or its .kicad_pro): editor window in the GUI, in memory headless",
+                   "Open a schematic (.kicad_sch, a KiCad 5 .sch, or its .kicad_pro / .pro; a KiCad 5 schematic is saved as .kicad_sch): editor window in the GUI, in memory headless",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
                                    "description":"Drop unsaved changes of the currently open schematic"},
+                        "switch_project":{"type":"boolean","default":false,
+                                   "description":"Headless: when the open board belongs to another project, close it first (refused with its unsaved changes unless discard: true)"},
                         "override_lock":{"type":"boolean","default":false,
                                    "description":"GUI: open even when another process has the file open (never asked in a dialog; refused with a journal error otherwise)"}}})json"_json,
                    false, h_sch_open, 120 );
@@ -499,8 +743,18 @@ KOPENAPI_REGISTER( "sch_close", "Close the open schematic: refuses with unsaved 
                    false, h_sch_close );
 
 KOPENAPI_REGISTER( "sch_save",
-                   "Save the open schematic; with 'path' save as (headless switches to it, GUI writes a copy)",
-                   R"json({"type":"object","properties":{"path":{"type":"string"}}})json"_json, false, h_sch_save );
+                   "Save the open schematic; with 'path' save as (headless switches to it, GUI writes a copy). "
+                   "With 'version' (e.g. \"10.0\") write a copy of every sheet and the project that an earlier "
+                   "KiCad opens: root at 'path', sub-sheets at their relative paths; the open schematic stays as "
+                   "it is. The result lists what the earlier format cannot hold (dropped or approximated)",
+                   nlohmann::json( { { "type", "object" },
+                                     { "properties",
+                                       { { "path", { { "type", "string" } } },
+                                         { "version",
+                                           { { "type", "string" },
+                                             { "enum", KopenapiLegacyTargets() },
+                                             { "description", "earlier KiCad release to write for; needs 'path'" } } } } } } ),
+                   false, h_sch_save );
 
 KOPENAPI_REGISTER( "sch_revert", "Reload the open schematic from disk, dropping unsaved changes",
                    R"json({"type":"object","properties":{}})json"_json, false, h_sch_revert, 120 );

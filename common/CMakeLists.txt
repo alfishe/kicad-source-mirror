@@ -420,6 +420,14 @@ list( APPEND KICOMMON_SRCS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_memory.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_model_events.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_remote.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_legacy_save.cpp
+    # earlier-version file formats (one directory per target), see legacy_formats.h
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/legacy_formats/legacy_formats.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/legacy_formats/sexpr_tree.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/legacy_formats/keywords_generated.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/legacy_formats/v10/v10_common.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/legacy_formats/v10/board_v10.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/legacy_formats/v10/schematic_v10.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/kicadopenapi_recorder.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/video_encoder_ffmpeg.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/recording/frame_scaler.cpp

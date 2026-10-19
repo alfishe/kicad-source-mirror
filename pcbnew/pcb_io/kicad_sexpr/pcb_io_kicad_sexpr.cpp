@@ -676,6 +676,20 @@ void PCB_IO_KICAD_SEXPR::formatSetup( const BOARD* aBoard ) const
 }
 
 
+/// True once the zone filler has decided the item's per-layer zone connections
+template <typename ITEM>
+static bool hasZoneLayerOverrides( const ITEM* aItem, const BOARD* aBoard )
+{
+    for( PCB_LAYER_ID layer : aBoard->GetEnabledLayers().CuStack() )
+    {
+        if( aItem->GetZoneLayerOverride( layer ) != ZLO_NONE )
+            return true;
+    }
+
+    return false;
+}
+
+
 /// Layers plus the flags that distinguish a backdrill or non-plated span from the primary
 /// one that shares its layer pair
 static void formatDrillSpan( OUTPUTFORMATTER* aOut, const DRILL_SPAN& aSpan )
@@ -2123,7 +2137,8 @@ void PCB_IO_KICAD_SEXPR::format( const PAD* aPad ) const
         {
             KICAD_FORMAT::FormatBool( m_out, "keep_end_layers", aPad->GetKeepTopBottom() );
 
-            if( board )     // Will be nullptr in footprint library
+            // Will be nullptr in footprint library; without overrides the zone filler decides
+            if( board && hasZoneLayerOverrides( aPad, board ) )
             {
                 m_out->Print( "(zone_layer_connections" );
 
@@ -3338,7 +3353,7 @@ void PCB_IO_KICAD_SEXPR::format( const PCB_TRACK* aTrack ) const
         if( via->GetIsFree() )
             KICAD_FORMAT::FormatBool( m_out, "free", true );
 
-        if( via->GetRemoveUnconnected() )
+        if( via->GetRemoveUnconnected() && hasZoneLayerOverrides( via, board ) )
         {
             m_out->Print( "(zone_layer_connections" );
 

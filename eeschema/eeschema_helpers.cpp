@@ -36,6 +36,8 @@
 #include <sch_io/sch_io_mgr.h>
 #include <settings/settings_manager.h>
 #include <wildcards_and_files_ext.h>
+#include <sch_symbol.h>
+#include <wx/log.h>
 #include <tool/tool_manager.h>
 #include <kiface_base.h>
 
@@ -114,7 +116,11 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
     {
         if( !project )
         {
-            if( wxFileExists( projectPath ) )
+            wxFileName legacyPro = pro;
+            legacyPro.SetExt( FILEEXT::LegacyProjectFileExtension );
+
+            // A KiCad 5 project (.pro only) is migrated in memory by the project loader
+            if( wxFileExists( projectPath ) || legacyPro.FileExists() )
             {
                 mgr.LoadProject( projectPath, aSetActive );
                 project = mgr.GetProject( projectPath );
@@ -264,6 +270,18 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
             }
         }
     }
+    catch( const IO_ERROR& ioe )
+    {
+        wxLogError( "%s", ioe.What() );
+        schematic->SetProject( nullptr );
+        return nullptr;
+    }
+    catch( const std::exception& e )
+    {
+        wxLogError( "%s", e.what() );
+        schematic->SetProject( nullptr );
+        return nullptr;
+    }
     catch( ... )
     {
         schematic->SetProject( nullptr );
@@ -291,6 +309,7 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
 
             if( !library )
             {
+                wxLogError( _( "Symbol cache library '%s' could not be loaded." ), cache );
                 schematic->SetProject( nullptr );
                 return nullptr;
             }
@@ -306,6 +325,9 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
             {
                 if( !static_cast<SCH_SYMBOL*>( item )->GetLibSymbolRef() )
                 {
+                    wxLogError( _( "Symbol %s (%s) has no library symbol in '%s' or the libraries." ),
+                                static_cast<SCH_SYMBOL*>( item )->GetField( FIELD_T::REFERENCE )->GetText(),
+                                static_cast<SCH_SYMBOL*>( item )->GetLibId().Format().wx_str(), cache );
                     schematic->SetProject( nullptr );
                     return nullptr;
                 }

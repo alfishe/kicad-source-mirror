@@ -1377,7 +1377,7 @@ bool SETTINGS_MANAGER::SaveProjectCopy( const wxString& aFullPath, PROJECT* aPro
     project->SetReadOnly( false );
 
     project->SetFilename( fn.GetName() );
-    const bool projectOk = project->SaveToFile( fn.GetPath() );
+    const bool projectOk = project->SaveToFile( fn.GetPath(), true );   // a copy is always written
     project->SetFilename( oldName );
 
     // PROJECT_LOCAL_SETTINGS save is best-effort: SaveToFile returns false for

@@ -2866,10 +2866,22 @@ SCH_FIELD* SCH_IO_KICAD_SEXPR_PARSER::parseSchField( SCH_ITEM* aParent )
 
         switch( token )
         {
-        case T_id:  // legacy token; ignore
-            parseInt( "field ID" );
+        case T_id:  // legacy token; only sheet name / file ids are still meaningful
+        {
+            int legacyId = parseInt( "field ID" );
+
+            // Sheet fields saved with a translated name are identified only by their id
+            if( aParent->Type() == SCH_SHEET_T && fieldId == FIELD_T::SHEET_USER )
+            {
+                if( legacyId == 0 )
+                    field->setId( FIELD_T::SHEET_NAME );
+                else if( legacyId == 1 )
+                    field->setId( FIELD_T::SHEET_FILENAME );
+            }
+
             NeedRIGHT();
             break;
+        }
 
         case T_at:
             field->SetPosition( parseXY() );
