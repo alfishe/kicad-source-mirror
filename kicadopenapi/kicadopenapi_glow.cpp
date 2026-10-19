@@ -18,6 +18,9 @@ public:
 
     static constexpr int TICK_MS = 50;
 
+    /// A staggered batch lights up within this time, however many items it has
+    static constexpr int STAGGER_SPAN_MS = 500;
+
     struct ENTRY
     {
         KEY               key;
@@ -44,11 +47,24 @@ public:
 
         const CLOCK::time_point now = CLOCK::now();
 
-        // Staggered entries queue behind what is still waiting to light up
-        CLOCK::time_point next = now;
+        // A newer edit never waits behind an older one: what still waits lights up now
+        for( auto it = m_entries.rbegin(); it != m_entries.rend() && it->start > now; ++it )
+        {
+            auto newest = m_newest.find( it->key );
 
-        if( aStaggerMs > 0 && !m_entries.empty() && m_entries.back().start > now )
-            next = m_entries.back().start + std::chrono::milliseconds( aStaggerMs );
+            if( newest != m_newest.end() && newest->second == it->start )
+                newest->second = now;
+
+            it->start = now;
+
+            if( !it->lit && it->key.first->Alive() )
+                it->key.first->Brighten( it->key.second, true );
+
+            it->lit = true;
+        }
+
+        const int step = aStaggerMs > 0 && !aItems.empty() ? std::min( aStaggerMs, STAGGER_SPAN_MS / int( aItems.size() ) ) : 0;
+        CLOCK::time_point next = now;
 
         for( const KIID& id : aItems )
         {
@@ -65,8 +81,7 @@ public:
             m_entries.push_back( entry );
             m_newest[{ aTarget, id }] = next;
 
-            if( aStaggerMs > 0 )
-                next += std::chrono::milliseconds( aStaggerMs );
+            next += std::chrono::milliseconds( step );
         }
 
         redraw( now );

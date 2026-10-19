@@ -48,8 +48,9 @@ public:
     static KOPENAPI_GLOW_MANAGER& Get();
 
     /// @brief Items an edit changed in the editor behind aTarget.  aStaggerMs > 0: they light up one
-    /// after another, that far apart, in the given order (and dim in that order), so a batch
-    /// reads as a sequence.
+    /// after another, that far apart (closer for a large batch: all within half a second), in the
+    /// given order (and dim in that order), so a batch reads as a sequence.  A newer call never
+    /// waits behind an older one: what still waits lights up at once.
     void Add( KOPENAPI_GLOW_TARGET* aTarget, const std::vector<KIID>& aItems, int aStaggerMs = 0 );
 
     /// @brief Items glowing now (all editors), for tests
