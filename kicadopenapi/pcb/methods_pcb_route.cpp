@@ -10,6 +10,7 @@
 /// and metrics of what the router would do, for comparing variants.
 #include <advanced_config.h>
 #include "kopenapi_pcb.h"
+#include "route_grid.h"
 #include "route_plan.h"
 
 #include <api/pcb_context.h>
@@ -57,6 +58,8 @@
 #include <cmath>
 #include <optional>
 #include <set>
+
+#include <kicadopenapi_jobs.h>
 
 
 namespace
@@ -221,6 +224,16 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
                        + str( static_cast<PAD*>( aItem )->GetNumber() );
         else
             d["type"] = aItem->Type() == PCB_VIA_T ? "via" : "track";
+
+        if( aItem->Type() == PCB_VIA_T )
+        {
+            d["at_mm"] = { toMm( aItem->GetPosition().x ), toMm( aItem->GetPosition().y ) };
+        }
+        else if( PCB_TRACK* track = dynamic_cast<PCB_TRACK*>( aItem ) )
+        {
+            d["from_mm"] = { toMm( track->GetStart().x ), toMm( track->GetStart().y ) };
+            d["to_mm"] = { toMm( track->GetEnd().x ), toMm( track->GetEnd().y ) };
+        }
 
         return d;
     };
@@ -1575,6 +1588,15 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     if( style != "direct" && style != "rail" )
         return KOPENAPI_RESULT::Error( 400, "style: direct or rail" );
 
+    // grid: every net together on one grid of the board, negotiated (PathFinder); pns: one connection
+    // at a time with the push-and-shove router
+    const std::string engine = aArgs.value( "engine", std::string( "pns" ) );
+
+    if( engine != "pns" && engine != "grid" )
+        return KOPENAPI_RESULT::Error( 400, "engine: pns or grid" );
+
+    const bool grid = engine == "grid" && !dryRun;
+
     // attempts per connection and pass: a count, not a time (the same board routes the same way);
     // on a big board an attempt costs about a second
     const int maxTries = std::clamp( aArgs.value( "max_tries", 120 ), 1, 10000 );
@@ -1625,28 +1647,6 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     if( zoneMode != "refill" && zoneMode != "keep" )
         return KOPENAPI_RESULT::Error( 400, "zones: refill (fills out while routing, refilled after) or keep" );
-
-    std::vector<ZONE*> unfilled;
-
-    if( zoneMode == "refill" && !dryRun )
-    {
-        BOARD_COMMIT unfill( context->GetToolManager() );
-
-        for( ZONE* zone : board->Zones() )
-        {
-            if( zone->IsFilled() && !zone->GetIsRuleArea() && !zone->IsTeardropArea() )
-            {
-                unfill.Modify( zone );
-                zone->UnFill();
-                unfilled.push_back( zone );
-            }
-        }
-
-        if( unfilled.empty() )
-            unfill.Revert();
-        else
-            unfill.Push( _( "Unfill zones for routing (API)" ) );
-    }
 
     // Under the parts (avoid): inside the ring of pads of a quad package (QFP, QFN, LGA) no track and
     // no via of this call - such tracks can wall its other pins in.  Temporary rule areas on the
@@ -1883,6 +1883,29 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             jobs.push_back( { static_cast<PAD*>( pa ), pb, pa->m_Uuid, pb->m_Uuid, posB,
                               (double) ( posB - posA ).EuclideanNorm(), name, power } );
         }
+    }
+
+    // the fills are taken out after the connections are read: what a zone joins needs no track
+    std::vector<ZONE*> unfilled;
+
+    if( zoneMode == "refill" && !dryRun )
+    {
+        BOARD_COMMIT unfill( context->GetToolManager() );
+
+        for( ZONE* zone : board->Zones() )
+        {
+            if( zone->IsFilled() && !zone->GetIsRuleArea() && !zone->IsTeardropArea() )
+            {
+                unfill.Modify( zone );
+                zone->UnFill();
+                unfilled.push_back( zone );
+            }
+        }
+
+        if( unfilled.empty() )
+            unfill.Revert();
+        else
+            unfill.Push( _( "Unfill zones for routing (API)" ) );
     }
 
     // equal keys by where the ends are: the board's item order follows uuids, random for a board
@@ -2604,10 +2627,21 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         doneOf = &done;
     }
 
+    // a job's progress: connections routed so far (rip-up and gaps add to them)
+    auto progressCounts = [&]()
+    {
+        return nlohmann::json{ { "routed", std::count( done.begin(), done.end(), true ) } };
+    };
+
     for( size_t index = 0; index < jobs.size(); ++index )
     {
         JOB& job = jobs[index];
-        KopenapiKeepUiAlive();
+
+        if( grid && partner[index] < 0 )
+            continue;   // on the grid below
+
+        if( !KopenapiJobStep( "route", (int) index, (int) jobs.size(), job.net, progressCounts() ) )
+            break;
 
         job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
         job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
@@ -2807,11 +2841,241 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         results.push_back( row );
     }
 
+    // The grid engine: the connections left, every net at once
+    nlohmann::json gridOut;
+
+    if( grid )
+    {
+        board->BuildConnectivity();
+        std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
+        std::vector<GRID_NET>              gridNets;
+        std::map<int, size_t>              gridOf;      // net code -> index in gridNets
+        std::vector<std::vector<size_t>>   jobsOfNet;
+        std::vector<std::pair<int, int>>   endsOfJob( jobs.size(), { -1, -1 } );
+
+        auto endIndex = [&]( GRID_NET& aNet, BOARD_CONNECTED_ITEM* aItem )
+        {
+            auto it = std::find( aNet.ends.begin(), aNet.ends.end(), aItem );
+
+            if( it != aNet.ends.end() )
+                return (int) ( it - aNet.ends.begin() );
+
+            aNet.ends.push_back( aItem );
+            return (int) aNet.ends.size() - 1;
+        };
+
+        for( size_t index = 0; index < jobs.size(); ++index )
+        {
+            JOB& job = jobs[index];
+
+            if( rowOf[index] >= 0 || job.trunk )
+                continue;
+
+            job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
+            job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+            if( !job.from || !job.to )
+            {
+                rowOf[index] = (int) results.size();
+                results.push_back( { { "net", job.net }, { "routed", false }, { "tries", 0 },
+                                     { "reason", "an end of the connection is gone (removed or replaced by an earlier route)" } } );
+                continue;
+            }
+
+            const auto joined = conn->GetConnectedItems( job.from );
+
+            if( std::find( joined.begin(), joined.end(), job.to ) != joined.end() )
+            {
+                rowOf[index] = (int) results.size();
+                done[index] = true;
+                results.push_back( { { "net", job.net }, { "routed", true }, { "joined_by_earlier_route", true },
+                                     { "length_mm", 0.0 }, { "vias", 0 }, { "tries", 0 } } );
+                continue;
+            }
+
+            const int code = job.from->GetNetCode();
+            auto [it, fresh] = gridOf.try_emplace( code, gridNets.size() );
+
+            if( fresh )
+            {
+                NETCLASS* nc = job.from->GetEffectiveNetClass();
+                GRID_NET  n;
+                n.netCode = code;
+                n.width = nc && nc->HasTrackWidth() ? nc->GetTrackWidth() : ds.GetCurrentTrackWidth();
+                n.clearance = netClearance( job.from, ds.m_MinClearance );
+                n.viaDiameter = nc && nc->HasViaDiameter() ? nc->GetViaDiameter() : ds.GetCurrentViaSize();
+                n.viaDrill = nc && nc->HasViaDrill() ? nc->GetViaDrill() : ds.GetCurrentViaDrill();
+                gridNets.push_back( n );
+                jobsOfNet.emplace_back();
+            }
+
+            GRID_NET& n = gridNets[it->second];
+
+            if( const int neck = neckFor( job.from, job.to ); neck > 0 )
+                n.width = std::min( n.width, neck );
+
+            endsOfJob[index] = { endIndex( n, job.from ), endIndex( n, job.to ) };
+            jobsOfNet[it->second].push_back( index );
+        }
+
+        std::atomic<bool> cancel{ false };
+        GRID_PARAMS       params;
+        params.layers = layers;
+        params.cancel = &cancel;
+        params.maxRounds = std::clamp( aArgs.value( "max_rounds", 40 ), 1, 500 );
+        params.variants = std::clamp( aArgs.value( "variants", 0 ), 0, 6 );
+        params.cell = pcbIUScale.mmToIU( std::clamp( aArgs.value( "cell_mm", 0.0 ), 0.0, 1.0 ) );
+        params.viaKeepOut = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_keepout_mm", 5.0 ), 0.0, 20.0 ) );
+        params.progress = [&]( int aRound, int aCrowded )
+        {
+            return KopenapiJobStep( "grid", aRound, params.maxRounds, std::string(),
+                                    nlohmann::json{ { "nets", gridNets.size() }, { "crowded", aCrowded } } );
+        };
+
+        const GRID_RESULT gr = RouteOnGrid( board, gridNets, params );
+
+        // each net's copper staged and guarded against the rest; a net the guard rejects stays out
+        BOARD_COMMIT                        commit( context->GetToolManager() );
+        std::vector<BOARD_CONNECTED_ITEM*>  staged;
+        nlohmann::json                      rejected = nlohmann::json::array();
+        std::vector<bool>                   netOk( gridNets.size(), false );
+        std::vector<int>                    netVias( gridNets.size(), 0 );
+        const auto                          guardFrom = std::chrono::steady_clock::now();
+
+        for( size_t k = 0; k < gr.nets.size(); ++k )
+        {
+            const GRID_NET&                         n = gridNets[k];
+            const GRID_NET_RESULT&                  r = gr.nets[k];
+            NETINFO_ITEM*                           net = board->FindNet( n.netCode );
+            std::vector<std::unique_ptr<PCB_TRACK>> made;
+            std::vector<BOARD_CONNECTED_ITEM*>      mine;
+
+            for( const GRID_TRACK& t : r.tracks )
+            {
+                for( size_t p = 1; p < t.points.size(); ++p )
+                {
+                    auto track = std::make_unique<PCB_TRACK>( board );
+                    track->SetStart( t.points[p - 1] );
+                    track->SetEnd( t.points[p] );
+                    track->SetWidth( n.width );
+                    track->SetLayer( t.layer );
+                    track->SetNet( net );
+                    mine.push_back( track.get() );
+                    made.push_back( std::move( track ) );
+                }
+            }
+
+            for( const VECTOR2I& at : r.vias )
+            {
+                auto via = std::make_unique<PCB_VIA>( board );
+                via->SetPosition( at );
+                via->SetViaType( VIATYPE::THROUGH );
+                via->SetLayerPair( F_Cu, B_Cu );
+                via->SetWidth( PADSTACK::ALL_LAYERS, n.viaDiameter );
+                via->SetDrill( n.viaDrill );
+                via->SetNet( net );
+                mine.push_back( via.get() );
+                made.push_back( std::move( via ) );
+            }
+
+            if( made.empty() )
+                continue;
+
+            const nlohmann::json violations = guard( board, mine, {}, zoneMode == "refill", &staged );
+
+            if( !violations.empty() )
+            {
+                rejected.push_back( { { "net", str( UnescapeString( net->GetNetname() ) ) }, { "violations", violations } } );
+                continue;
+            }
+
+            netOk[k] = true;
+            netVias[k] = (int) r.vias.size();
+            staged.insert( staged.end(), mine.begin(), mine.end() );
+
+            for( std::unique_ptr<PCB_TRACK>& item : made )
+            {
+                added.push_back( item->m_Uuid );
+                commit.Add( item.release() );
+            }
+        }
+
+        if( staged.empty() )
+            commit.Revert();
+        else
+            commit.Push( _( "Route on the grid (API)" ) );
+
+        for( size_t k = 0; k < gridNets.size(); ++k )
+        {
+            const GRID_NET_RESULT* r = k < gr.nets.size() ? &gr.nets[k] : nullptr;
+            bool                   first = true;
+
+            for( size_t index : jobsOfNet[k] )
+            {
+                const auto [a, b] = endsOfJob[index];
+                const bool ok = r && netOk[k] && r->reached[a] && r->reached[b];
+                nlohmann::json row = { { "net", jobs[index].net }, { "routed", ok }, { "tries", 1 }, { "engine", "grid" } };
+
+                if( ok )
+                {
+                    row["length_mm"] = first ? toMm( r->length ) : 0.0;
+                    row["vias"] = first ? netVias[k] : 0;
+                    row["width_mm"] = toMm( gridNets[k].width );
+                    first = false;
+                }
+                else
+                {
+                    row["reason"] = !r || !r->reached[a] || !r->reached[b]
+                                            ? ( KopenapiJobCancelled() ? "stopped" : "no way on the grid (or dropped to keep the rest legal)" )
+                                            : "rejected by the guard: the route would touch another net";
+                }
+
+                done[index] = ok;
+                rowOf[index] = (int) results.size();
+                results.push_back( row );
+            }
+        }
+
+        nlohmann::json crowdedNets = nlohmann::json::array();
+
+        auto netName = [&]( int aCode ) -> std::string
+        {
+            NETINFO_ITEM* info = board->FindNet( aCode );
+            return info ? str( UnescapeString( info->GetNetname() ) ) : std::to_string( aCode );
+        };
+
+        for( const CROWDING& c : gr.crowdedAtEnd )
+        {
+            nlohmann::json by = nlohmann::json::array();
+
+            for( int code : c.by )
+                by.push_back( netName( code ) );
+
+            crowdedNets.push_back( { { "net", netName( c.net ) },
+                                     { "at_mm", { toMm( c.at.x ), toMm( c.at.y ) } },
+                                     { "layer", c.layer >= 0 ? str( board->GetLayerName( layers[c.layer] ) ) : std::string( "via" ) },
+                                     { "by", by } } );
+        }
+
+        nlohmann::json costliest = nlohmann::json::array();
+
+        for( const auto& [code, states] : gr.costliest )
+            costliest.push_back( { { "net", netName( code ) }, { "expanded", states } } );
+
+        gridOut = { { "variant", gr.variant }, { "variants_tried", gr.variantsTried }, { "rounds", gr.rounds },
+                    { "crowded_by_round", gr.crowdedByRound }, { "crowded_at_end", crowdedNets },
+                    { "dropped", gr.conflictsLeft }, { "cell_mm", toMm( gr.cell ) }, { "expanded", gr.expanded },
+                    { "build_ms", std::round( gr.buildMs ) }, { "route_ms", std::round( gr.routeMs ) },
+                    { "guard_ms", std::round( msSince( guardFrom ) ) }, { "rejected", rejected },
+                    { "costliest", costliest }, { "expanded_by_stage", gr.expandedByStage } };
+        board->BuildConnectivity();
+    }
+
     // Rip-up and retry: for a connection that failed, take out the routes of this call that cross
     // its corridor, route it, route them again; if anything of that fails, everything goes back
     // as it was (walkaround only: no other net is pushed aside; the copper of the nets it touched
     // is put back from copies)
-    const int ripRounds = dryRun ? 0 : std::clamp( aArgs.value( "rip_up", 2 ), 0, 6 );
+    const int ripRounds = dryRun || grid ? 0 : std::clamp( aArgs.value( "rip_up", 2 ), 0, 6 );
     int       rippedOk = 0, rippedTried = 0;
 
     // the rip-ups that failed, by board version and the routes taken out; how often each route has
@@ -2834,7 +3098,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         return copperBetween( board, a, b );
     };
 
-    for( int round = 0; round < ripRounds; ++round )
+    for( int round = 0; round < ripRounds && !KopenapiJobCancelled(); ++round )
     {
         bool progress = false;
 
@@ -2850,7 +3114,11 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             if( !job.from || !job.to )
                 continue;
 
-            KopenapiKeepUiAlive();
+            if( !KopenapiJobStep( "rip_up " + std::to_string( round + 1 ), (int) index, (int) jobs.size(), job.net,
+                                  progressCounts() ) )
+            {
+                break;
+            }
 
             // first from both ends, nothing taken out
             if( round == 0 )
@@ -3286,9 +3554,12 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     // Gaps between two pieces of a net's copper: from the end of one piece to the other
     s_routeProfile.pass = "gaps";
 
-    for( const GAP& gap : gaps )
+    for( size_t gapIndex = 0; gapIndex < gaps.size(); ++gapIndex )
     {
-        KopenapiKeepUiAlive();
+        const GAP& gap = gaps[gapIndex];
+
+        if( !KopenapiJobStep( "gaps", (int) gapIndex, (int) gaps.size(), gap.net, progressCounts() ) )
+            break;
 
         auto* a = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( gap.a, true ) );
         auto* b = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( gap.b, true ) );
@@ -3374,7 +3645,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     int cleanTried = 0, cleanSkipped = 0, cleanKept = 0, viasRemoved = 0;
     double shortenedIU = 0;
 
-    if( !dryRun && !rail && aArgs.value( "clean_up", true ) )
+    if( !dryRun && !rail && !grid && aArgs.value( "clean_up", true ) )
     {
         s_routeProfile.pass = "clean_up";
 
@@ -3434,9 +3705,12 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         std::stable_sort( candidates.begin(), candidates.end(),
                           []( const CLEAN_TRY& x, const CLEAN_TRY& y ) { return x.vias > y.vias; } );
 
-        for( const CLEAN_TRY& c : candidates )
+        for( size_t cleanIndex = 0; cleanIndex < candidates.size(); ++cleanIndex )
         {
-            KopenapiKeepUiAlive();
+            const CLEAN_TRY& c = candidates[cleanIndex];
+
+            if( !KopenapiJobStep( "clean_up", (int) cleanIndex, (int) candidates.size(), jobs[c.index].net ) )
+                break;
 
             JOB& job = jobs[c.index];
             job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
@@ -3746,8 +4020,10 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                                   { "shortened_mm", std::round( pcbIUScale.IUTomm( shortenedIU ) * 1000.0 ) / 1000.0 } } },
                                   { "stubs_removed", stubs },
                                   { "kept_out_under", keptOut },
+                                  { "grid", gridOut },
                                   { "plane_layers_skipped", planeLayers },
                                   { "dry_run", dryRun },
+                                  { "stopped", KopenapiJobCancelled() },
                                   { "unrouted_left", dryRun ? connections - routed : (int) connectivity->GetUnconnectedCount( false ) },
                                   { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
                                   { "profile", { { "attempts", s_routeProfile.attempts },
@@ -3867,9 +4143,12 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
         const int step = pcbIUScale.mmToIU( 0.25 );
 
-        for( const auto& [item, pos] : ends )
+        for( size_t endIndex = 0; endIndex < ends.size(); ++endIndex )
         {
-            KopenapiKeepUiAlive();
+            const auto& [item, pos] = ends[endIndex];
+
+            if( !KopenapiJobStep( "stitch", (int) endIndex, (int) ends.size() ) )
+                break;
 
             if( done.count( item ) && item->Type() != PCB_ZONE_T )
                 continue;
@@ -5479,6 +5758,11 @@ KOPENAPI_REGISTER( "pcb_route",
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again, up to 3 choices of them per connection and round; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
+                        "engine":{"type":"string","enum":["pns","grid"],"default":"pns","description":"grid: every net at once on one grid of the board, negotiated congestion (PathFinder) in parallel variants, the best legal result committed (diff-pair trunks still by pns; no rip_up / clean_up passes); pns: one connection at a time with the push-and-shove router"},
+                        "max_rounds":{"type":"integer","default":40,"description":"grid: negotiation rounds before the nets still crowding each other are routed apart or left out"},
+                        "cell_mm":{"type":"number","default":0,"description":"grid: the cell, 0 a sixth of the finest track pitch (width + clearance) on a 0.025 mm step"},
+                        "via_keepout_mm":{"type":"number","default":5,"description":"grid: only a chip's own nets put vias this far around it (pads on four sides, or an array outside its balls) while the board routes; other nets left short and, once all are joined, the via-saving pass may use it; 0 off"},
+                        "variants":{"type":"integer","default":0,"description":"grid: variants run in parallel (net order, layer directions), 0 one per two cores up to 6"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); parts with pads inside the ring (exposed pad, BGA) stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (0.65 mm or closer) is routed no wider than that pad's narrow side (not below the Default class width or the board minimum) when its class is wider; the rest of its net at its class width; the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},

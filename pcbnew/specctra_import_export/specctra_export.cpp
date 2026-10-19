@@ -946,7 +946,7 @@ IMAGE* SPECCTRA_DB::makeIMAGE( BOARD* aBoard, FOOTPRINT* aFootprint )
         else if( zone->GetDoNotAllowTracks() )
             keepout_type = T_wire_keepout;
         else
-            keepout_type = T_keepout;
+            continue;   // tracks and vias allowed: no keepout for a router
 
         // Now, build keepout polygon on each copper layer where the zone
         // keepout is living (keepout zones can live on many copper layers)
@@ -1406,7 +1406,7 @@ void SPECCTRA_DB::FromBOARD( BOARD* aBoard )
             else if( zone->GetDoNotAllowTracks() )
                 keepout_type = T_wire_keepout;
             else
-                keepout_type = T_keepout;
+                continue;   // tracks and vias allowed: no keepout for a router
 
             // Now, build keepout polygon on each copper layer where the zone
             // keepout is living (keepout zones can live on many copper layers)

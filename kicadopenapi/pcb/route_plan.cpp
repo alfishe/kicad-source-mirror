@@ -1,4 +1,5 @@
 #include "route_plan.h"
+#include "route_raster.h"
 
 #include <base_units.h>
 #include <board.h>
@@ -27,57 +28,6 @@
 
 namespace
 {
-
-/// @brief Cells of a box of the board, row by row
-struct PLAN_GRID
-{
-    VECTOR2I origin;
-    int      cell = 1;
-    int      nx = 0;
-    int      ny = 0;
-
-    int      Index( int aX, int aY ) const { return aY * nx + aX; }
-    VECTOR2I Centre( int aX, int aY ) const { return origin + VECTOR2I( aX * cell, aY * cell ); }
-    VECTOR2I Centre( int aIndex ) const { return Centre( aIndex % nx, aIndex / nx ); }
-
-    bool CellOf( const VECTOR2I& aP, int& aX, int& aY ) const
-    {
-        aX = (int) std::lround( (double) ( aP.x - origin.x ) / cell );
-        aY = (int) std::lround( (double) ( aP.y - origin.y ) / cell );
-        return aX >= 0 && aY >= 0 && aX < nx && aY < ny;
-    }
-
-    /// @brief Visit every cell whose centre is within aInflate of the shape and aSkip does not pass over
-    template <typename SKIP, typename VISIT>
-    void Each( const SHAPE& aShape, int aInflate, size_t aOffset, SKIP aSkip, VISIT aVisit ) const
-    {
-        BOX2I bb = aShape.BBox();   // BBox( clearance ) of a compound shape (a pad) leaves the clearance out
-        bb.Inflate( aInflate );
-        const int   x0 = std::max( 0, (int) std::floor( (double) ( bb.GetLeft() - origin.x ) / cell ) );
-        const int   y0 = std::max( 0, (int) std::floor( (double) ( bb.GetTop() - origin.y ) / cell ) );
-        const int   x1 = std::min( nx - 1, (int) std::ceil( (double) ( bb.GetRight() - origin.x ) / cell ) );
-        const int   y1 = std::min( ny - 1, (int) std::ceil( (double) ( bb.GetBottom() - origin.y ) / cell ) );
-
-        for( int y = y0; y <= y1; ++y )
-        {
-            for( int x = x0; x <= x1; ++x )
-            {
-                const size_t i = aOffset + Index( x, y );
-
-                if( !aSkip( i ) && aShape.Collide( Centre( x, y ), aInflate ) )
-                    aVisit( i );
-            }
-        }
-    }
-
-    /// @brief Every cell whose centre is within aInflate of the shape
-    void Mark( const SHAPE& aShape, int aInflate, std::vector<uint8_t>& aCells, size_t aOffset = 0 ) const
-    {
-        Each( aShape, aInflate, aOffset, [&]( size_t i ) { return aCells[i] != 0; },
-              [&]( size_t i ) { aCells[i] = 1; } );
-    }
-};
-
 
 /// @brief Soft copper over the cells of a grid: the first owner of a cell here, any others in more
 struct OWNERS
@@ -431,21 +381,29 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         }
     }
 
-    for( ZONE* zone : board->Zones() )
+    std::vector<ZONE*> zones( board->Zones().begin(), board->Zones().end() );
+
+    for( FOOTPRINT* fp : board->Footprints() )
+        zones.insert( zones.end(), fp->Zones().begin(), fp->Zones().end() );
+
+    for( ZONE* zone : zones )
     {
         if( !zone->GetBoundingBox().Intersects( region ) )
             continue;
 
         if( zone->GetIsRuleArea() )
         {
+            // a footprint's zone keeps its outline in the footprint's own coordinates
+            const SHAPE_POLY_SET area = zone->GetBoardOutline();
+
             for( int l = 0; l < L; ++l )
             {
                 if( zone->GetDoNotAllowTracks() && zone->IsOnLayer( aReq.layers[l] ) )
-                    grid.Mark( *zone->Outline(), halfWidth + slack, track, (size_t) l * cells );
+                    grid.Mark( area, halfWidth + slack, track, (size_t) l * cells );
             }
 
             if( vias && zone->GetDoNotAllowVias() && ( zone->GetLayerSet() & copper ).any() )
-                grid.Mark( *zone->Outline(), viaRadius + slack, via );
+                grid.Mark( area, viaRadius + slack, via );
 
             continue;
         }
@@ -497,18 +455,18 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
 
     if( board->GetBoardPolygonOutlines( outline, true ) && outline.OutlineCount() > 0 )
     {
-        for( int y = 0; y < grid.ny; ++y )
+        std::vector<uint8_t> inside( cells, 0 );
+        grid.Mark( outline, 0, inside );
+
+        for( size_t i = 0; i < cells; ++i )
         {
-            for( int x = 0; x < grid.nx; ++x )
-            {
-                if( outline.Contains( grid.Centre( x, y ) ) )
-                    continue;
+            if( inside[i] )
+                continue;
 
-                for( int l = 0; l < L; ++l )
-                    track[(size_t) l * cells + grid.Index( x, y )] = 1;
+            for( int l = 0; l < L; ++l )
+                track[(size_t) l * cells + i] = 1;
 
-                via[grid.Index( x, y )] = 1;
-            }
+            via[i] = 1;
         }
     }
 
