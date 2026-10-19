@@ -1153,8 +1153,17 @@ public:
 
             unmark( n );
 
+            // where the net's paths branch off one another: kept on the copper
+            std::unordered_set<uint32_t> branches;
+
+            for( const auto& path : m_nets[n].paths )
+            {
+                if( !path.empty() )
+                    branches.insert( path.front() );
+            }
+
             for( auto& path : m_nets[n].paths )
-                pullTight( n, path );
+                pullTight( n, path, branches );
 
             markNet( n );
         }
@@ -1276,8 +1285,9 @@ private:
     }
 
     /// @brief A path drawn tight: each run on a layer as few straight or two-leg (45 / 90 degree)
-    /// pieces as stay clear of the fixed copper and of the other nets, turns of 90 degrees at most
-    void pullTight( int aNet, std::vector<uint32_t>& aPath ) const
+    /// pieces as stay clear of the fixed copper and of the other nets, turns of 90 degrees at most;
+    /// a piece ends at each of aBranches it passes
+    void pullTight( int aNet, std::vector<uint32_t>& aPath, const std::unordered_set<uint32_t>& aBranches ) const
     {
         const WORLD::NET& wn = m_w.nets[aNet];
         const PLAN_GRID&  g = m_w.grid;
@@ -1400,6 +1410,9 @@ private:
                 {
                     break;
                 }
+
+                if( aBranches.count( aPath[j] ) )
+                    break;
             }
 
             if( bestJ == i )
