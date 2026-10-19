@@ -15,6 +15,10 @@
 /// @brief Lets the UI repaint and timers run (at most every 30 ms); cheap to call often
 KICOMMON_API void KopenapiKeepUiAlive();
 
+/// @brief A job's safe point (kicadopenapi_jobs.h): every waiting event runs, API calls queued for
+/// the main thread too (at most every 30 ms); input goes through the job's filter
+KICOMMON_API void KopenapiYieldAll();
+
 /// @brief Runs aWork on a worker thread and keeps the UI alive until it finishes; for work that
 /// does not touch the KiCad model (file conversions, geometry kernels)
 KICOMMON_API void KopenapiRunOffMain( const std::function<void()>& aWork );

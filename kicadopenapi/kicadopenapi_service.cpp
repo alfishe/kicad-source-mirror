@@ -7,6 +7,7 @@
 #include "kicadopenapi_memory.h"
 #include "kicadopenapi_remote.h"
 #include "kicadopenapi_libraries.h"
+#include "kicadopenapi_jobs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +26,8 @@
 #include <mutex>
 #include <deque>
 #include <map>
+#include <optional>
+#include <set>
 #include <thread>
 
 // A body sent without "Content-Type: application/json" (curl -d, Python urllib) is taken as a form,
@@ -406,7 +409,8 @@ struct KICAD_OPENAPI_SERVICE::IMPL
                  { "pid", kopenapi::platform::CurrentPid() },
                  { "port", port },
                  { "headless", ctx.headless },
-                 { "busy", busyJson() } };
+                 { "busy", busyJson() },
+                 { "job", KOPENAPI_JOBS::Get().Busy().empty() ? nlohmann::json() : nlohmann::json( KOPENAPI_JOBS::Get().Busy() ) } };
     }
 
     /// @brief The call holding the main thread (method, running_ms), or null; any thread
@@ -486,6 +490,22 @@ struct KICAD_OPENAPI_SERVICE::IMPL
     /// @param aCaller the X-Kicad-Session header: the client's identity for remote control sessions
     KOPENAPI_RESULT invokeParsed( const std::string& aName, const nlohmann::json& aArgs,
                                   const std::string& aCaller = {} ) const;
+
+    /// @brief The method exists, may run here, and its arguments match its schema; else the error
+    std::optional<KOPENAPI_RESULT> checkCall( const std::string& aName, const nlohmann::json& aArgs,
+                                              std::optional<KOPENAPI_METHOD>& aMethod ) const;
+
+    /// @brief The call as it runs on the main thread (history marks, journal, busy state);
+    /// aStarted (tracing) gets the time it started
+    std::function<KOPENAPI_RESULT()> mainCall( const std::string& aName, const nlohmann::json& aArgs,
+                                               std::shared_ptr<std::chrono::steady_clock::time_point> aStarted ) const;
+
+    /// @brief job_start: checks the call, queues it as a job, answers its job_id at once
+    KOPENAPI_RESULT startJob( const nlohmann::json& aArgs, const std::string& aCaller ) const;
+
+    void traceCall( const std::string& aName, const nlohmann::json& aArgs, const KOPENAPI_RESULT& aOutcome,
+                    std::chrono::steady_clock::time_point aReceived,
+                    std::chrono::steady_clock::time_point aStarted ) const;
 
     void handleMcp( const httplib::Request& aReq, httplib::Response& aRes ) const;
 
@@ -767,23 +787,15 @@ static void addPoints( nlohmann::json& aJson, int aDepth )
 }
 
 
-KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&    aName,
-                                                           const nlohmann::json& aArgs,
-                                                           const std::string&    aCaller ) const
+std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std::string&              aName,
+                                                                      const nlohmann::json&           aArgs,
+                                                                      std::optional<KOPENAPI_METHOD>& aMethod ) const
 {
-    ensureKifaces();
-
-    std::optional<KOPENAPI_METHOD> method = KOPENAPI_REGISTRY::Get().Find( aName );
+    std::optional<KOPENAPI_METHOD>& method = aMethod;
+    method = KOPENAPI_REGISTRY::Get().Find( aName );
 
     if( !method )
         return KOPENAPI_RESULT::Error( 404, "unknown method '" + aName + "'" );
-
-    // a client the user took control back from is stopped; the holder's calls renew its lease
-    if( std::optional<KOPENAPI_RESULT> refused = KOPENAPI_REMOTE::Gate( aCaller, aName ) )
-        return *refused;
-
-    if( aName == "remote_session" )
-        return KOPENAPI_REMOTE::Handle( aCaller, aArgs );
 
     if( method->guiOnly && ctx.headless )
         return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI" );
@@ -817,6 +829,85 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     if( const std::string bad = KopenapiValidateArgs( aName, method->inputSchema, aArgs ); !bad.empty() )
         return KOPENAPI_RESULT::Error( 400, bad );
 
+    return std::nullopt;
+}
+
+
+/// @brief Methods the service answers itself on the HTTP thread: no main thread, no job
+static bool servedByService( const std::string& aName )
+{
+    static const std::set<std::string> names = { "api_trace",  "memory_summary", "api_call_result", "remote_session",
+                                                 "job_start",  "job_get",        "job_cancel",      "job_list" };
+    return names.count( aName ) > 0;
+}
+
+
+KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::startJob( const nlohmann::json& aArgs, const std::string& aCaller ) const
+{
+    const std::string    name = aArgs.value( "method", std::string() );
+    const nlohmann::json args = aArgs.value( "arguments", nlohmann::json::object() );
+
+    if( servedByService( name ) )
+        return KOPENAPI_RESULT::Error( 400, "'" + name + "' answers at once: call it directly" );
+
+    if( std::optional<KOPENAPI_RESULT> refused = KOPENAPI_REMOTE::Gate( aCaller, name ) )
+        return *refused;
+
+    std::optional<KOPENAPI_METHOD> method;
+
+    if( std::optional<KOPENAPI_RESULT> bad = checkCall( name, args, method ) )
+        return *bad;
+
+    std::string       why;
+    const std::string id = KOPENAPI_JOBS::Get().Add( name, why );
+
+    if( id.empty() )
+        return KOPENAPI_RESULT::Error( 409, why );
+
+    if( !wxTheApp )
+    {
+        KOPENAPI_JOBS::Get().Fail( id, KOPENAPI_RESULT::Error( 503, "no application event loop" ) );
+        return KOPENAPI_RESULT::Error( 503, "no application event loop" );
+    }
+
+    auto job = std::make_shared<std::function<void()>>(
+            [id, call = mainCall( name, args, nullptr ), aliveFlag = alive]()
+            {
+                if( !aliveFlag->load() )
+                    KOPENAPI_JOBS::Get().Fail( id, KOPENAPI_RESULT::Error( 503, "service stopping" ) );
+                else
+                    KOPENAPI_JOBS::Get().Run( id, call );
+            } );
+
+    auto* event = new wxThreadEvent();
+    event->SetPayload( job );
+    MAIN_GATE_HANDLER::Get().QueueEvent( event );
+
+    if( waker )
+        waker();
+
+    return KOPENAPI_RESULT::Ok( { { "job_id", id }, { "method", name }, { "state", "queued" } } );
+}
+
+
+KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&    aName,
+                                                           const nlohmann::json& aArgs,
+                                                           const std::string&    aCaller ) const
+{
+    ensureKifaces();
+
+    // a client the user took control back from is stopped; the holder's calls renew its lease
+    if( std::optional<KOPENAPI_RESULT> refused = KOPENAPI_REMOTE::Gate( aCaller, aName ) )
+        return *refused;
+
+    if( aName == "remote_session" )
+        return KOPENAPI_REMOTE::Handle( aCaller, aArgs );
+
+    std::optional<KOPENAPI_METHOD> method;
+
+    if( std::optional<KOPENAPI_RESULT> bad = checkCall( aName, aArgs, method ) )
+        return *bad;
+
     // answered on the HTTP thread: works while the main thread is busy
     if( aName == "api_trace" )
         return KOPENAPI_RESULT::Ok( traceJson( aArgs ) );
@@ -827,27 +918,72 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     if( aName == "api_call_result" )
         return lateCallResult( aArgs );
 
+    if( aName == "job_start" )
+        return startJob( aArgs, aCaller );
+
+    if( aName == "job_get" )
+        return KOPENAPI_JOBS::Get().Status( aArgs );
+
+    if( aName == "job_cancel" )
+        return KOPENAPI_JOBS::Get().Cancel( aArgs );
+
+    if( aName == "job_list" )
+        return KOPENAPI_JOBS::Get().List();
+
+    if( KOPENAPI_REGISTRY::Get().IsEditing( aName ) )
+    {
+        if( const std::string job = KOPENAPI_JOBS::Get().Busy(); !job.empty() )
+            return KOPENAPI_RESULT::Error( 409, "job " + job + " is queued or running and owns the documents: "
+                                                "job_get waits for it, job_cancel stops it" );
+    }
+
+    const bool tracing = traceOn.load( std::memory_order_relaxed );
+    const auto received = tracing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    auto       started = tracing ? std::make_shared<std::chrono::steady_clock::time_point>( received ) : nullptr;
+
+    KOPENAPI_RESULT outcome = runInMain( alive, waker, mainCall( aName, aArgs, started ),
+                                         callTimeout( method->timeoutSec ), aName );
+
+    if( !tracing )
+        return outcome;
+
+    traceCall( aName, aArgs, outcome, received, *started );
+    return outcome;
+}
+
+
+std::function<KOPENAPI_RESULT()>
+KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann::json& aArgs,
+                                       std::shared_ptr<std::chrono::steady_clock::time_point> aStarted ) const
+{
     KOPENAPI_CONTEXT ctxCopy = ctx;
-    KOPENAPI_HANDLER handler = method->handler;
+    KOPENAPI_HANDLER handler = KOPENAPI_REGISTRY::Get().Find( aName )->handler;
     nlohmann::json   args = aArgs;
 
     const std::string operation = "api:" + aName;
-    const bool        tracing = traceOn.load( std::memory_order_relaxed );
-    const auto        received = tracing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-    auto              started = tracing ? std::make_shared<std::chrono::steady_clock::time_point>( received ) : nullptr;
     const IMPL*       self = this;
 
-    KOPENAPI_RESULT outcome = runInMain( alive, waker,
-                      [ctxCopy, handler, args, operation, started, self]() mutable
+    return [ctxCopy, handler, args, operation, started = std::move( aStarted ), self]() mutable
                       {
                           const auto now = std::chrono::steady_clock::now();
 
                           if( started )
                               *started = now;
 
+                          // Editing calls: the documents are marked before, the call is logged
+                          const std::string name = operation.substr( 4 );
+                          const bool        editing = KOPENAPI_REGISTRY::Get().IsEditing( name );
+
+                          // queued before a job and run at one of its safe points
+                          if( editing && KopenapiJobYielding() )
+                              return KOPENAPI_RESULT::Error( 409, "a job owns the documents: job_list, job_cancel" );
+
+                          std::string busyBefore;
+
                           {
                               std::lock_guard<std::mutex> lock( self->traceMutex );
-                              self->busyMethod = operation.substr( 4 );
+                              busyBefore = self->busyMethod;
+                              self->busyMethod = name;
                               self->busySince = now;
                           }
 
@@ -856,20 +992,17 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
                           struct BUSY_END
                           {
                               const IMPL* impl;
+                              std::string before;
                               ~BUSY_END()
                               {
                                   s_apiCalls--;
                                   std::lock_guard<std::mutex> lock( impl->traceMutex );
-                                  impl->busyMethod.clear();
+                                  impl->busyMethod = before;
                               }
-                          } busyEnd{ self };
+                          } busyEnd{ self, busyBefore };
 
                           // Log records during the call are attributed to this method
                           KOPENAPI_JOURNAL::SCOPED_OPERATION scope( operation );
-
-                          // Editing calls: the documents are marked before, the call is logged
-                          const std::string name = operation.substr( 4 );
-                          const bool        editing = KOPENAPI_REGISTRY::Get().IsEditing( name );
 
                           // A method not marked editing must not change a document: in the GUI that
                           // is checked on the undo stacks, so a method that edits without the mark
@@ -880,7 +1013,24 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
                           if( editing )
                               KOPENAPI_HISTORY::Get().BeforeEdit( ctxCopy, name, args );
 
+                          const uint64_t  logBefore = KOPENAPI_JOURNAL::Summary().value( "last_seq", uint64_t( 0 ) );
                           KOPENAPI_RESULT result = handler( ctxCopy, args );
+
+                          // a failure carries what KiCad logged during the call: the cause it would
+                          // have shown in a dialog
+                          if( result.status >= 400 && result.body.contains( "error" ) && result.body["error"].is_object() )
+                          {
+                              nlohmann::json log = nlohmann::json::array();
+
+                              for( const nlohmann::json& entry : KOPENAPI_JOURNAL::Entries( logBefore, 20, "warning" ) )
+                              {
+                                  if( entry.value( "operation", std::string() ) == operation )
+                                      log.push_back( entry.value( "message", std::string() ) );
+                              }
+
+                              if( !log.empty() )
+                                  result.body["error"]["log"] = log;
+                          }
 
                           if( result.status < 400 )
                               addPoints( result.body, 0 );
@@ -912,12 +1062,14 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
                           }
 
                           return result;
-                      },
-                      callTimeout( method->timeoutSec ), aName );
+                      };
+}
 
-    if( !tracing )
-        return outcome;
 
+void KICAD_OPENAPI_SERVICE::IMPL::traceCall( const std::string& aName, const nlohmann::json& aArgs,
+                                             const KOPENAPI_RESULT& aOutcome, std::chrono::steady_clock::time_point aReceived,
+                                             std::chrono::steady_clock::time_point aStarted ) const
+{
     const auto finished = std::chrono::steady_clock::now();
     auto       ms = []( auto d ) { return std::round( std::chrono::duration<double, std::milli>( d ).count() * 10 ) / 10; };
     TRACE      t;
@@ -928,11 +1080,11 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     if( t.args.size() > 2048 )
         t.args = t.args.substr( 0, 2048 ) + "...";
 
-    if( outcome.status >= 400 && outcome.body.contains( "error" ) )
-        t.error = outcome.body["error"].value( "message", std::string() );
-    t.queuedMs = ms( *started - received );
-    t.runMs = ms( finished - *started );
-    t.status = outcome.status;
+    if( aOutcome.status >= 400 && aOutcome.body.contains( "error" ) )
+        t.error = aOutcome.body["error"].value( "message", std::string() );
+    t.queuedMs = ms( aStarted - aReceived );
+    t.runMs = ms( finished - aStarted );
+    t.status = aOutcome.status;
     t.at = wxDateTime::Now().FormatISOCombined( ' ' ).ToStdString();
 
     {
@@ -958,8 +1110,6 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     if( traceToJournal )
         wxLogMessage( "api #%lld %s %zu B: queued %.1f ms, ran %.1f ms -> %d", t.seq, aName, t.argBytes, t.queuedMs,
                       t.runMs, t.status );
-
-    return outcome;
 }
 
 

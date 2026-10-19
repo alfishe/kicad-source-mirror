@@ -33,13 +33,14 @@ inline constexpr const char* kToolsJson = R"json([
   },
   {
     "name": "invoke",
-    "description": "Call a KiCad method found with search. 'arguments' must match the method's inputSchema. Returns the method's JSON result; failures come back with isError=true and an error message.",
+    "description": "Call a KiCad method found with search: {\"name\": \"pcb_open\", \"arguments\": {\"path\": \"...\"}}. The method's own parameters go inside 'arguments' (alias 'args') and must match its inputSchema. Returns the method's JSON result; failures come back with isError=true and an error message.",
     "inputSchema": {
       "type": "object",
       "required": [ "name" ],
       "properties": {
         "name": { "type": "string", "description": "Method name from search" },
-        "arguments": { "type": "object", "description": "Method arguments", "default": {} }
+        "arguments": { "type": "object", "description": "The method's parameters", "default": {} },
+        "args": { "type": "object", "description": "Same as arguments" }
       }
     }
   }

@@ -902,7 +902,7 @@ void Bridge::HandleLine(const std::string& line)
         if (tool == kopenapi::mcp::kInvokeTool && args.is_object() && args.contains("name")
             && args["name"].is_string() && IsBridgeMethod(args["name"].get<std::string>()))
         {
-            json methodArgs = args.value("arguments", json::object());
+            json methodArgs = args.contains("arguments") ? args["arguments"] : args.value("args", json::object());
             Emit(Result(id, CallBridgeMethod(args["name"].get<std::string>(),
                                              methodArgs.is_object() ? methodArgs : json::object())));
             return;

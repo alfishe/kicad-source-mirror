@@ -53,6 +53,28 @@ void KopenapiKeepUiAlive()
 }
 
 
+void KopenapiYieldAll()
+{
+    if( !wxTheApp || !wxThread::IsMain() || g_pumping )
+        return;
+
+    wxEventLoopBase* loop = wxEventLoopBase::GetActive();
+
+    if( !loop || !loop->IsRunning() )
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+
+    if( now - g_lastPump < std::chrono::milliseconds( 30 ) )
+        return;
+
+    g_pumping = true;
+    loop->YieldFor( wxEVT_CATEGORY_ALL );
+    g_pumping = false;
+    g_lastPump = std::chrono::steady_clock::now();
+}
+
+
 void KopenapiRunOffMain( const std::function<void()>& aWork )
 {
     std::future<void> done = std::async( std::launch::async, aWork );

@@ -129,7 +129,29 @@ static json invokeTool( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aArgs )
     if( !aArgs.contains( "name" ) || !aArgs["name"].is_string() )
         return toolResult( { { "error", "'name' (string) is required; find names with search" } }, true );
 
-    json args = aArgs.value( "arguments", json::object() );
+    const std::string method = aArgs["name"].get<std::string>();
+
+    if( aArgs.contains( "arguments" ) && aArgs.contains( "args" ) && aArgs["arguments"] != aArgs["args"] )
+        return toolResult( { { "error", "give the method's parameters once: 'arguments' or 'args'" } }, true );
+
+    json stray = json::array();
+
+    for( const auto& [key, value] : aArgs.items() )
+    {
+        if( key != "name" && key != "arguments" && key != "args" )
+            stray.push_back( key );
+    }
+
+    if( !stray.empty() )
+    {
+        return toolResult( { { "error", "unknown keys for invoke: " + stray.dump()
+                                                + "; the method's parameters go inside 'arguments': {\"name\": \""
+                                                + method + "\", \"arguments\": {...}}" },
+                             { "unknown", stray } },
+                           true );
+    }
+
+    json args = aArgs.contains( "arguments" ) ? aArgs["arguments"] : aArgs.value( "args", json::object() );
 
     if( args.is_null() )
         args = json::object();
@@ -137,7 +159,7 @@ static json invokeTool( const KOPENAPI_MCP_CONTEXT& aCtx, const json& aArgs )
     if( !args.is_object() )
         return toolResult( { { "error", "'arguments' must be an object" } }, true );
 
-    KOPENAPI_RESULT result = aCtx.invoke( aArgs["name"].get<std::string>(), args );
+    KOPENAPI_RESULT result = aCtx.invoke( method, args );
     return toolResult( result.body, result.status >= 400 );
 }
 

@@ -451,3 +451,41 @@ KOPENAPI_REGISTER( "api_call_result",
                         "call_id":{"type":"string","description":"from the 504 of the call"},
                         "wait_s":{"type":"integer","minimum":0,"maximum":600,"default":0}}})json"_json,
                    false, h_api_call_result );
+
+
+static KOPENAPI_RESULT h_job_served( KOPENAPI_CONTEXT&, const nlohmann::json& )
+{
+    // the service answers job_* itself, on the HTTP thread (see invokeParsed)
+    return KOPENAPI_RESULT::Error( 500, "job methods are served by the service" );
+}
+
+
+KOPENAPI_REGISTER( "job_start",
+                   "Run a long call (pcb_route, pcb_stitch, ...) as a job: answers job_id at once, the call "
+                   "runs in KiCad while the UI stays usable (view navigation; other input is dropped, Esc stops "
+                   "the job) and calls that only read still answer. job_get gives progress and the result. One "
+                   "job at a time; calls that edit get 409 while it is queued or running",
+                   R"json({"type":"object","required":["method"],"properties":{
+                        "method":{"type":"string","description":"the method to run, e.g. pcb_route"},
+                        "arguments":{"type":"object","description":"its arguments, as for a direct call"}}})json"_json,
+                   false, h_job_served );
+
+KOPENAPI_REGISTER( "job_get",
+                   "State of a job (queued, running, done, failed, cancelled), its progress (phase, done / total, "
+                   "item at work, counts so far, phase_eta_s), elapsed_s, stop_reason; once finished, status and "
+                   "result: the body the call itself gives (a cancelled job gives what it did until it stopped). "
+                   "wait_s waits up to that long for it to finish. Answers even while KiCad is busy",
+                   R"json({"type":"object","required":["job_id"],"properties":{
+                        "job_id":{"type":"string"},
+                        "wait_s":{"type":"integer","minimum":0,"maximum":600,"default":0}}})json"_json,
+                   false, h_job_served );
+
+KOPENAPI_REGISTER( "job_cancel",
+                   "Ask a job to stop: a queued one never runs, a running one stops at its next safe point and "
+                   "finishes with what it has done (job_get: state cancelled, its result)",
+                   R"json({"type":"object","required":["job_id"],"properties":{
+                        "job_id":{"type":"string"}}})json"_json,
+                   false, h_job_served );
+
+KOPENAPI_REGISTER( "job_list", "The last 32 jobs, newest first, with state and progress (no results)",
+                   R"json({"type":"object","properties":{}})json"_json, false, h_job_served );
