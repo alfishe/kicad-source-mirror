@@ -104,6 +104,18 @@ static std::string projectConflict( KOPENAPI_CONTEXT& aCtx, const wxFileName& aP
 }
 
 
+static bool schematicOpen( KOPENAPI_CONTEXT& aCtx )
+{
+    for( const nlohmann::json& doc : KOPENAPI_REGISTRY::Get().Documents( aCtx ) )
+    {
+        if( doc.value( "domain", "" ) != "pcb" )
+            return true;
+    }
+
+    return false;
+}
+
+
 static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& aBoard, const nlohmann::json& aArgs )
 {
     wxFileName projectFile( aBoard );
@@ -136,6 +148,13 @@ static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& a
 
     SETTINGS_MANAGER& settings = Pgm().GetSettingsManager();
     PROJECT*          project = settings.GetProject( projectFile.GetFullPath() );
+
+    // discard rereads the project file too, unless a schematic of this process still uses it
+    if( project && aArgs.value( "discard", false ) && !schematicOpen( aCtx ) )
+    {
+        settings.UnloadProject( project, false );
+        project = nullptr;
+    }
 
     if( !project )
     {
@@ -616,7 +635,7 @@ KOPENAPI_REGISTER( "pcb_open",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
-                                   "description":"Drop unsaved changes of the currently open board"},
+                                   "description":"Drop unsaved changes of the currently open board; headless, also reread the .kicad_pro from disk (unless a schematic of this process uses the project)"},
                         "switch_project":{"type":"boolean","default":false,
                                    "description":"Headless: when the open schematic belongs to another project, close it first (refused with its unsaved changes unless discard: true)"},
                         "override_lock":{"type":"boolean","default":false,
