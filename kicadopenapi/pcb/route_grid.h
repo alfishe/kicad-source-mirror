@@ -46,7 +46,9 @@ struct GRID_PARAMS
     int                       viaAway = 0;     ///< a via nearer a chip's pads than this costs more, the nearer the more; 0 none
     int                       viaAwayCost = 0; ///< at the pads: as much as this length of track
     float                     hug = 1.0f;      ///< cost factor of a cell beside the copper of the net's own bundle; 1 none
-    float                     astar = 1.2f;    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
+    float                     astar = 1.2f;
+    float                     pfStart = 0.5f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
+    float                     pfGrowth = 1.3f; ///< and how much it grows each round (VPR's pres_fac_mult)    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
     std::atomic<bool>*        cancel = nullptr;
 
     /// @brief Called on the calling thread while the variants run, about every 50 ms; false stops them

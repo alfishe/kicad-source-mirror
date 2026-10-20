@@ -41,9 +41,7 @@ constexpr int DX[8] = { 1, 1, 0, -1, -1, -1, 0, 1 };
 constexpr int DY[8] = { 0, 1, 1, 1, 0, -1, -1, -1 };
 constexpr int NO_DIR = 8;
 
-// PathFinder's schedule (VPR's defaults): the price of sharing a cell grows by this each round, a
-// cell fought over in a round costs this much more for good
-constexpr float PF_GROWTH = 1.3f;
+// a cell fought over in a round costs this much more for good
 constexpr float HIST_STEP = 1.0f;
 
 // rounds with no fewer nets crowded than before them: negotiation is over
@@ -1070,7 +1068,7 @@ public:
 
     void Run()
     {
-        float pf = 0.5f;
+        float pf = m_params.pfStart;
 
         for( m_round = 1; m_round <= m_params.maxRounds && !stopped(); ++m_round )
         {
@@ -1131,7 +1129,7 @@ public:
 
             m_conflicting = left;
             m_byRound.push_back( left );
-            pf = std::min( pf * PF_GROWTH, 1e4f );
+            pf = std::min( pf * m_params.pfGrowth, 1e4f );
 
             if( left == 0 )
                 break;

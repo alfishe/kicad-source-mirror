@@ -3045,6 +3045,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         params.viaAwayCost = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_cost_mm", 8.0 ), 0.0, 100.0 ) );
         params.hug = (float) std::clamp( aArgs.value( "hug", 1.0 ), 0.05, 1.0 );
         params.astar = (float) std::clamp( aArgs.value( "astar", 1.2 ), 1.0, 3.0 );
+        params.pfStart = (float) std::clamp( aArgs.value( "pf_start", 0.5 ), 0.01, 100.0 );
+        params.pfGrowth = (float) std::clamp( aArgs.value( "pf_growth", 1.3 ), 1.01, 10.0 );
         params.progress = [&]( const std::vector<GRID_VARIANT_PROGRESS>& aVariants )
         {
             nlohmann::json variants = nlohmann::json::array();
@@ -5914,6 +5916,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "via_away_cost_mm":{"type":"number","default":8,"description":"grid: a via at a chip's pads costs as much more as this length of track"},
                         "hug":{"type":"number","default":1,"description":"grid: cost factor of a cell beside the copper of the net's own bundle (1: no pull; below 1 so far lowers cohesion, adds vias and time)"},
                         "astar":{"type":"number","default":1.2,"description":"grid: weight of the distance left in the search (1: cheapest paths; more: fewer states searched, paths a little longer)"},
+                        "pf_start":{"type":"number","default":0.5,"description":"grid: price of sharing a cell in the first negotiation round"},
+                        "pf_growth":{"type":"number","default":1.3,"description":"grid: how much that price grows each round (more: fewer rounds, longer detours)"},
                         "variants":{"type":"integer","default":0,"description":"grid: variants run in parallel (net order, layer directions), 0 one per two cores up to 6"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); parts with pads inside the ring (exposed pad, BGA) stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
