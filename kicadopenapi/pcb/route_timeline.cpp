@@ -117,6 +117,7 @@ void GRID_LANE::ForkFrom( const GRID_LANE& aParent, size_t aStep )
     strategy = aParent.strategy;
     order = aParent.order;
     direction = aParent.direction;
+    world = aParent.world;
     steps.assign( aParent.steps.begin(), aParent.steps.begin() + (long) aStep + 1 );
 
     // ids are given in the order first seen: the prefix uses the first ones only

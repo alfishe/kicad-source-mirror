@@ -37,6 +37,10 @@ public:
     /// @brief The last successful editing call logged (0: none)
     long LastSeq() const;
 
+    /// @brief The successful editing call aSeq is still logged with its mark of aDomain: not rolled
+    /// back, the document not opened / closed / reverted since
+    bool Holds( long aSeq, const std::string& aDomain ) const;
+
     /// @brief From inside an editing call: rolls the last logged call back, and the running call's
     /// "before" becomes the state rolled back to (undoing it later goes there)
     KOPENAPI_RESULT RollbackLastInCall( KOPENAPI_CONTEXT& aCtx );

@@ -1493,6 +1493,8 @@ struct ROUTE_BRANCH
     int                            lane = -1;
     size_t                         step = 0;
     std::string                    board;   ///< how the board was brought back to the run's start
+    bool                           warm = false;      ///< over the board as it is now (edited since)
+    bool                           history = true;    ///< warm: the step's history kept
 };
 
 
@@ -1539,6 +1541,18 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         return KOPENAPI_RESULT::Error( 400, "from.step: 0.." + std::to_string( (long long) steps - 1 ) );
 
     branch.step = (size_t) step;
+    branch.warm = aArgs.value( "warm", false );
+
+    if( aArgs.contains( "history" ) )
+    {
+        if( !aArgs["history"].is_string() || ( aArgs["history"] != "keep" && aArgs["history"] != "clear" ) )
+            return KOPENAPI_RESULT::Error( 400, "history: keep or clear" );
+
+        branch.history = aArgs["history"] == "keep";
+    }
+
+    if( !branch.warm && t->Lane( branch.lane ).world )
+        return KOPENAPI_RESULT::Error( 409, "lane " + t->Lane( branch.lane ).name + " went on over an edited board: branch it with warm: true" );
 
     nlohmann::json args = nlohmann::json::parse( t->args, nullptr, false );
 
@@ -1559,10 +1573,18 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         t->appliedSeq = 0;
         branch.board = "the route's copper rolled back";
     }
+    else if( t->appliedSeq > 0 && branch.warm && history.Holds( t->appliedSeq, "pcb" ) )
+    {
+        return KOPENAPI_RESULT::Error( 409, "the copper of run " + std::to_string( t->run )
+                                                    + " is on the board under later edits: roll those back, then the route "
+                                                      "(edit_rollback), edit again and branch warm; or stop a route before it "
+                                                      "applies (job_cancel {keep: true}) to edit" );
+    }
     else
     {
-        branch.board = t->appliedSeq > 0 ? "the route is not the last edit (edit_log): the board was left as it is"
-                                         : "nothing of the run on the board to roll back";
+        branch.board = t->appliedSeq > 0 && history.Holds( t->appliedSeq, "pcb" )
+                               ? "the route is not the last edit (edit_log): the board was left as it is"
+                               : "nothing of the run on the board to roll back";
     }
 
     return pcbRoute( aCtx, args, &branch );
@@ -3142,6 +3164,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             params.branchOf = aBranch->timeline;
             params.branchLane = aBranch->lane;
             params.branchStep = aBranch->step;
+            params.warm = aBranch->warm;
+            params.warmHistory = aBranch->history;
         }
         params.histDecay = (float) std::clamp( aArgs.value( "hist_decay", 1.0 ), 0.1, 1.0 );
         params.recent = std::clamp( aArgs.value( "reroute_recent", 2 ), 0, 100 );
@@ -3267,7 +3291,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         {
             static int runs = 0;
 
-            if( aBranch )
+            if( aBranch && aTimeline == aBranch->timeline )
             {
                 GridTimelineKeep( aTimeline );
                 return;
@@ -3331,12 +3355,30 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             timelineOut = { { "run", gr.timeline->run }, { "bytes", gr.timeline->Bytes() },
                             { "print_ms", std::round( gr.printMs * 10 ) / 10 } };
 
-        if( aBranch && gr.timeline )
+        if( gr.branchLane >= 0 && gr.timeline )
         {
             const GRID_LANE& lane = gr.timeline->Lane( gr.branchLane );
             timelineOut["branch"] = { { "lane", gr.branchLane }, { "variant", lane.name }, { "parent", lane.parent },
                                       { "parent_step", lane.parentStep }, { "steps", lane.steps.size() },
                                       { "restore_ms", std::round( gr.restoreMs * 10 ) / 10 } };
+
+            if( aBranch && aBranch->warm )
+            {
+                nlohmann::json affected = nlohmann::json::array();
+
+                for( const auto& [code, why] : gr.warmAffected )
+                {
+                    NETINFO_ITEM* info = board->FindNet( code );
+                    affected.push_back( { { "net", info ? str( UnescapeString( info->GetNetname() ) ) : std::to_string( code ) },
+                                          { "why", why } } );
+                }
+
+                timelineOut["branch"]["warm"] = { { "round", gr.warmRound }, { "affected", affected } };
+            }
+        }
+        else if( aBranch && !gr.cold.empty() )
+        {
+            timelineOut["cold"] = gr.cold;
         }
 
         // each net's copper staged and guarded against the rest; a net the guard rejects stays out
@@ -3413,7 +3455,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         if( gr.timeline && !staged.empty() )
         {
             gr.timeline->appliedSeq = KOPENAPI_HISTORY::Get().PendingSeq();
-            gr.timeline->appliedLane = aBranch ? gr.branchLane : gr.timeline->winner;
+            gr.timeline->appliedLane = gr.branchLane >= 0 ? gr.branchLane : gr.timeline->winner;
         }
 
         for( size_t k = 0; k < gridNets.size(); ++k )
@@ -6198,7 +6240,9 @@ KOPENAPI_REGISTER( "pcb_route",
                         "pf_start":{"type":"number","default":1.0,"description":"grid: price of sharing a cell in the first negotiation round"},
                         "pf_growth":{"type":"number","default":1.6,"description":"grid: how much that price grows each round (more: fewer rounds, longer detours)"},
                         "record":{"type":"boolean","default":false,"description":"grid: keep every variant's steps for pcb_route_timeline"},
-                        "from":{"type":"object","description":"grid, a branch: the recorded lane goes on after a step as a new lane of the same run (pcb_route_timeline status: parent, parent_step), with the run's own arguments; the copper the run (or its last branch) put on the board is rolled back first when that is the last edit, else the board must be as the run found it (409). Up to the step the recorded nets are taken without searching, so the branch's steps equal the recorded ones until it searches on. A grid route stopped with job_cancel {keep: true} goes on from a stopped lane's last step","properties":{"run":{"type":"integer"},"lane":{"description":"index or variant name; default the lane on the board"},"step":{"type":"integer"}},"required":["step"]},
+                        "from":{"type":"object","description":"grid, a branch: the recorded lane goes on after a step as a new lane of the same run (pcb_route_timeline status: parent, parent_step), with the run's own arguments; the copper the run (or its last branch) put on the board is rolled back first when that is the last edit, else the board must be as the run found it (409). Up to the step the recorded nets are taken without searching, so the branch's steps equal the recorded ones until it searches on. A grid route stopped with job_cancel {keep: true} goes on from a stopped lane's last step. With warm: true over the board as edited since","properties":{"run":{"type":"integer"},"lane":{"description":"index or variant name; default the lane on the board"},"step":{"type":"integer"}},"required":["step"]},
+                        "warm":{"type":"boolean","description":"with from: go on over the board as edited since (a part moved, a keep-out drawn) instead of the run's: the step's copper, history and rounds are taken as they are, the nets whose copper the edit broke (over new copper or keep-outs, pads moved) or that are not joined lose it and are routed first in a new round, the rest keep theirs (timeline.branch.warm: round, affected nets and why). The grid, layers, sizes and nets must be the run's, else a new run is routed cold (timeline.cold: why). The run's copper must not be on the board under the edits (409)"},
+                        "history":{"type":"string","enum":["keep","clear"],"description":"warm: the history of places fought over kept (default) or started empty"},
                         "schedule":{"type":"string","enum":["fixed","adaptive","adaptive_hist"],"default":"fixed","description":"grid, EXPERIMENTAL: negotiation schedule of the built-in variants (adaptive: growth 1.3 while the crowded nets fall, 2.0 when they stall; adaptive_hist: also twice the history on places fought over 3 rounds running)"},
                         "strategies":{"type":"array","description":"grid, EXPERIMENTAL: the variants to race instead of the built-ins: 'short_first_hv@1.0x1.6/a1.5/d0.9/r2', 'fine_first@adaptive', or {order, directions, pf_start, pf_growth, astar, schedule, hist_decay, reroute_recent}","items":{}},
                         "hist_decay":{"type":"number","default":1.0,"description":"grid, EXPERIMENTAL: the history cost of places not fought over in a round is multiplied by this (1: kept for good)"},

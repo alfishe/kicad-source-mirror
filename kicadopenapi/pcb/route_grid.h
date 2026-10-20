@@ -78,6 +78,10 @@ struct GRID_PARAMS
     std::shared_ptr<GRID_TIMELINE> branchOf;
     int                       branchLane = -1;
     size_t                    branchStep = 0;
+    /// @brief A branch over an edited board: the step's state taken as it is (copper, history,
+    /// rounds), the nets the edit broke routed first in a new round; cold when the grid or nets differ
+    bool                      warm = false;
+    bool                      warmHistory = true;   ///< false: the history starts empty
     int                       schedule = 0;    ///< GRID_STRATEGY::schedule of the built-in variants
     float                     histDecay = 1.0f; ///< GRID_STRATEGY::histDecay of the built-in variants
     int                       recent = 2;      ///< GRID_STRATEGY::recent of the built-in variants
@@ -131,6 +135,11 @@ struct GRID_RESULT
     int                          branchLane = -1;     ///< the lane a branch was recorded as
     double                       restoreMs = 0;       ///< a branch: replaying its parent up to the step
     double                       printMs = 0;         ///< hashing the board as the search sees it (recorded / a branch)
+    std::string                  cold;                ///< a warm branch routed cold instead: why
+    int                          warmRound = 0;       ///< a warm branch: the round it went on in
+    /// @brief A warm branch: the nets whose copper at the step the edit broke (net code, why), routed
+    /// first
+    std::vector<std::pair<int, std::string>> warmAffected;
 
     /// @brief Per variant tried: when it finished, its search states per stage, ends joined, vias
     struct VARIANT_STATS

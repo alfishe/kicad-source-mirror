@@ -60,6 +60,9 @@ public:
     bool                   running = false;   ///< steps are being added
     bool                   stopped = false;   ///< the route was stopped before the lane's stages ended
     bool                   deleted = false;   ///< a branch taken out (branch_delete): its index stays, its data gone
+    /// @brief Routed on from its parent_step over an edited board (pcb_route {warm}): the board it
+    /// went on over (worldPrint); 0 the run's
+    uint64_t               world = 0;
 
     /// @brief Ends found walled in by fixed copper: from the search before step `step`
     struct DEAD
@@ -131,6 +134,9 @@ struct GRID_TIMELINE
     std::deque<GRID_LANE>     lanes;         ///< a branch adds one while readers hold others: Lane() / LaneCount()
     int                       winner = -1;   ///< set when the route ends
     uint64_t                  world = 0;     ///< the board as the router saw it (a branch needs the same)
+    uint64_t                  rules = 0;     ///< the grid, layers and sizes (a warm branch needs the same)
+    uint64_t                  nets = 0;      ///< the nets routed, by name in order (a warm branch needs the same)
+    std::vector<std::string>  netKeys;       ///< the nets' board names in order (a warm branch routes them so)
     std::string               args;          ///< the route call's arguments (JSON), a branch's too
     long                      appliedSeq = 0; ///< the edit history entry that put a lane's copper on the board
     int                       appliedLane = -1;

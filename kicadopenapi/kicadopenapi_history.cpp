@@ -416,6 +416,20 @@ long KOPENAPI_HISTORY::PendingSeq() const
 }
 
 
+bool KOPENAPI_HISTORY::Holds( long aSeq, const std::string& aDomain ) const
+{
+    const IMPL* d = const_cast<KOPENAPI_HISTORY*>( this )->impl();
+
+    for( const ENTRY& e : d->log )
+    {
+        if( e.seq == aSeq )
+            return e.status < 400 && e.before.docs.count( aDomain );
+    }
+
+    return false;
+}
+
+
 long KOPENAPI_HISTORY::LastSeq() const
 {
     const IMPL* d = const_cast<KOPENAPI_HISTORY*>( this )->impl();

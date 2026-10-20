@@ -152,6 +152,9 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
                 lanes.back()["parent"] = l.parent;
                 lanes.back()["parent_step"] = l.parentStep;
                 lanes.back()["running"] = l.running;
+
+                if( l.world )
+                    lanes.back()["warm"] = true;
             }
         }
 
@@ -604,7 +607,7 @@ KOPENAPI_REGISTER( "pcb_route_timeline",
                    "expanded / ms / crowded_tiles per step; markers: stage and "
                    "round starts, dropped nets, the end (or the head while live). lane: index or variant name, default the "
                    "lane switched to, else the winner (lane 0 while live). Branches (pcb_route {from: {run, lane, step}}) "
-                   "are lanes too, with parent and parent_step in status; branch_switch {lane}: the lane shown by "
+                   "are lanes too, with parent and parent_step in status (warm: routed on over an edited board); branch_switch {lane}: the lane shown by "
                    "default here and in the replay; branch_delete {lane}: a branch and its branches go (their "
                    "memory freed; not the run's variants, not the lane whose copper is on the board). The timeline is readable while the route runs (live: true; "
                    "steps grow; poll frame {since} from the client's step, or over REST receive the frames "
