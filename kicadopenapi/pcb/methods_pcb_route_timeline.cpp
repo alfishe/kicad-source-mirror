@@ -10,6 +10,7 @@
 #include <base_units.h>
 #include <lset.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 
@@ -124,7 +125,8 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 
         for( size_t k = 0; k < t->lanes.size(); ++k )
         {
-            const GRID_LANE& l = t->lanes[k];
+            const GRID_LANE&                      l = t->lanes[k];
+            std::lock_guard<std::recursive_mutex> lock( l.Mutex() );
             lanes.push_back( { { "lane", k }, { "variant", l.name }, { "steps", l.steps.size() }, { "paths", l.paths.size() },
                                { "rounds", l.histByRound.size() }, { "abandoned", l.abandoned },
                                { "winner", (int) k == t->winner },
@@ -148,13 +150,14 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
             return names;
         }();
         out["winner"] = t->winner;
+        out["live"] = t->live.load();
         out["bytes"] = t->Bytes();
         out["lanes"] = lanes;
         out["stages"] = GRID_TIMELINE::STAGES;
         return KOPENAPI_RESULT::Ok( out );
     }
 
-    int lane = t->winner;
+    int lane = std::max( t->winner, 0 );
 
     if( aArgs.contains( "lane" ) )
     {
@@ -177,7 +180,9 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     if( lane < 0 || lane >= (int) t->lanes.size() )
         return KOPENAPI_RESULT::Error( 404, "no such lane (see verb status)" );
 
-    const GRID_LANE& L = t->lanes[lane];
+    const GRID_LANE&                      L = t->lanes[lane];
+    std::lock_guard<std::recursive_mutex> lock( L.Mutex() );
+    out["live"] = t->live.load();
     out["lane"] = lane;
     out["variant"] = L.name;
     out["steps"] = L.steps.size();
@@ -224,7 +229,7 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
         }
 
         if( !L.steps.empty() )
-            marks.push_back( { { "step", L.steps.size() - 1 }, { "kind", L.abandoned ? "abandoned" : "end" } } );
+            marks.push_back( { { "step", L.steps.size() - 1 }, { "kind", t->live ? "head" : L.abandoned ? "abandoned" : "end" } } );
 
         out["markers"] = marks;
         return KOPENAPI_RESULT::Ok( out );
@@ -335,7 +340,9 @@ KOPENAPI_REGISTER( "pcb_route_timeline",
                    "since the tile was last fought over, 255 never) when the round changed, and the places crowded right after the step (heat: true; crowded.tiles indexes "
                    "the heat grid, counts the crowded states); series: stage / round / net / crowded / "
                    "expanded / ms / crowded_tiles per step; markers: stage and "
-                   "round starts, dropped nets, the end. lane: index or variant name, default the winner",
+                   "round starts, dropped nets, the end (or the head while live). lane: index or variant name, default the "
+                   "winner (lane 0 while live). The timeline is readable while the route runs (live: true; "
+                   "steps grow; poll frame {since} from the client's step)",
                    R"json({"type":"object","properties":{
                         "verb":{"type":"string","enum":["status","frame","series","markers"],"default":"status"},
                         "run":{"type":"integer","description":"the run id from status (only the last run is kept)"},

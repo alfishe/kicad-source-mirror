@@ -3,8 +3,10 @@
 #include "route_grid.h"
 #include "route_raster.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -68,7 +70,12 @@ public:
 
     size_t Bytes() const;
 
+    /// @brief Held by the lane's variant while it adds a step or a round, and by a reader while the
+    /// route runs (GRID_TIMELINE::live)
+    std::recursive_mutex& Mutex() const { return *m_mutex; }
+
 private:
+    std::unique_ptr<std::recursive_mutex>          m_mutex = std::make_unique<std::recursive_mutex>();
     std::vector<uint32_t>                          m_table;
     std::vector<std::vector<uint32_t>>             m_keys;   ///< table before step k * KEY
     std::unordered_map<uint64_t, std::vector<uint32_t>> m_byHash;
@@ -89,7 +96,9 @@ struct GRID_TIMELINE
     int                       tile = 1;      ///< heat tile, cells
     int                       tnx = 0, tny = 0;
     std::vector<GRID_LANE>    lanes;
-    int                       winner = -1;
+    int                       winner = -1;   ///< set when the route ends
+    std::atomic<bool>         live{ false }; ///< the route is running: steps are added; the caller clears it
+                                             ///< once the route's copper is on the board
 
     GRID_NET_RESULT Geometry( const GRID_PATH& aPath ) const;
     size_t          Bytes() const;
@@ -112,3 +121,7 @@ GRID_NET_RESULT GridPathGeometry( const PLAN_GRID& aGrid, size_t aCells, const s
 /// @brief The last recorded grid route of this process (main thread)
 void                           GridTimelineKeep( std::shared_ptr<GRID_TIMELINE> aTimeline );
 std::shared_ptr<GRID_TIMELINE> GridTimelineLast();
+
+/// @brief The editor's replay of a running route moves on (from the route's progress, main thread):
+/// a plain call holds the main loop, so the replay's own timer does not run meanwhile
+void                           GridReplayAdvance();

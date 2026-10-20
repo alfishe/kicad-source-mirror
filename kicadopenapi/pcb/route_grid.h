@@ -68,6 +68,8 @@ struct GRID_PARAMS
     float                     pfStart = 1.0f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
     float                     pfGrowth = 1.6f; ///< and how much it grows each round (VPR's pres_fac_mult)
     bool                      record = false;  ///< keep each variant's timeline (GRID_RESULT::timeline)
+    /// @brief With record: the timeline before the variants start (calling thread); it grows while they run
+    std::function<void( const std::shared_ptr<GRID_TIMELINE>& )> timelineStarted;
     int                       schedule = 0;    ///< GRID_STRATEGY::schedule of the built-in variants
     float                     histDecay = 1.0f; ///< GRID_STRATEGY::histDecay of the built-in variants
     int                       recent = 2;      ///< GRID_STRATEGY::recent of the built-in variants

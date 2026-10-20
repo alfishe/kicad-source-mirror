@@ -74,6 +74,7 @@ public:
         m_frame = aFrame;
         m_timeline = std::move( aTimeline );
         m_lane = aLane;
+        auto lock = hold();
 
         if( !same )
         {
@@ -81,11 +82,18 @@ public:
             m_at = (double) lane().steps.size() - 1;
             m_rate = std::max( 5.0, lane().steps.size() / 20.0 );
             m_playing = false;
-            buildSeries();
+            m_series.clear();
+            m_top = 1;
+            m_live = m_timeline->live;
+            sync();
         }
 
         hideBoardCopper();
         bindInput();
+
+        if( m_live )
+            m_timer.Start( TICK_MS );
+
         Redraw();
         return {};
     }
@@ -121,19 +129,22 @@ public:
 
     void Seek( double aStep )
     {
+        auto lock = hold();
         m_at = std::clamp( aStep, 0.0, (double) lane().steps.size() - 1 );
         Redraw();
     }
 
     void Play( bool aPlay )
     {
+        auto lock = hold();
+
         if( aPlay && m_at >= lane().steps.size() - 1 )
             m_at = 0;
 
         m_playing = aPlay;
         m_last = CLOCK::now();
 
-        if( aPlay )
+        if( aPlay || m_live )
             m_timer.Start( TICK_MS );
         else
             m_timer.Stop();
@@ -143,14 +154,17 @@ public:
 
     void SetRate( double aRate ) { m_rate = std::clamp( aRate, 0.25, 1e5 ); }
 
-    nlohmann::json Status() const
+    nlohmann::json Status()
     {
         if( !Shown() )
             return { { "shown", false } };
 
+        auto             lock = hold();
+        sync();
         const GRID_LANE& L = lane();
         const GRID_STEP& s = L.steps[step()];
         return { { "shown", true },
+                 { "live", m_live },
                  { "run", m_timeline->run },
                  { "lane", m_lane },
                  { "variant", L.name },
@@ -163,13 +177,24 @@ public:
                  { "playing", m_playing },
                  { "rate", m_rate },
                  { "hidden_board_items", m_hidden.size() },
-                 { "draw_us", m_drawUs } };
+                 { "draw_us", m_drawUs },
+                 { "draws", m_draws } };
     }
 
     void Redraw();
 
+    /// @brief Playing / following the head: the next frame when it is due
+    void Advance()
+    {
+        if( Shown() )
+            tick();
+    }
+
 private:
     const GRID_LANE& lane() const { return m_timeline->lanes[m_lane]; }
+
+    /// @brief The lane held against its variant adding steps while the route runs
+    std::unique_lock<std::recursive_mutex> hold() const { return std::unique_lock<std::recursive_mutex>( lane().Mutex() ); }
     size_t           step() const { return (size_t) std::lround( std::floor( m_at ) ); }
 
     void tick()
@@ -180,32 +205,56 @@ private:
             return;
         }
 
+        auto                    lock = hold();
         const CLOCK::time_point now = CLOCK::now();
         const double            dt = std::chrono::duration<double>( now - m_last ).count();
         m_last = now;
-        const size_t before = step();
-        m_at = std::min( m_at + m_rate * dt, (double) lane().steps.size() - 1 );
+        const size_t before = step(), had = m_series.size();
+        const bool   wasPlaying = m_playing;
 
-        if( m_at >= lane().steps.size() - 1 )
+        sync();
+
+        if( m_playing )
         {
-            m_playing = false;
-            m_timer.Stop();
+            m_at = std::min( m_at + m_rate * dt, (double) lane().steps.size() - 1 );
+
+            // at the head of a running route playing waits for the next steps
+            if( m_at >= lane().steps.size() - 1 && !m_live )
+                m_playing = false;
         }
 
-        if( step() != before || !m_playing )
+        if( !m_playing && !m_live )
+            m_timer.Stop();
+
+        if( step() != before || m_series.size() != had || m_playing != wasPlaying )
             Redraw();
     }
 
-    void buildSeries()
+    /// @brief The steps added since: into the strip, the position kept at the head when it was there;
+    /// once the route ends its new copper on the board is hidden too
+    void sync()
     {
         const GRID_LANE& L = lane();
-        m_series.assign( L.steps.size(), 0 );
-        m_top = 1;
+        const size_t     n = L.steps.size();
 
-        for( size_t k = 0; k < L.steps.size(); ++k )
+        if( n > m_series.size() )
         {
-            m_series[k] = L.conflictSets.empty() ? 0 : (int) L.conflictSets[L.steps[k].conflicts].size();
-            m_top = std::max( m_top, m_series[k] );
+            const bool atHead = m_series.empty() || step() + 1 >= m_series.size();
+
+            for( size_t k = m_series.size(); k < n; ++k )
+            {
+                m_series.push_back( L.conflictSets.empty() ? 0 : (int) L.conflictSets[L.steps[k].conflicts].size() );
+                m_top = std::max( m_top, m_series.back() );
+            }
+
+            if( atHead && !m_playing )
+                m_at = (double) n - 1;
+        }
+
+        if( m_live && !m_timeline->live )
+        {
+            m_live = false;
+            hideBoardCopper();
         }
     }
 
@@ -294,6 +343,7 @@ private:
         if( !Shown() )
             return false;
 
+        auto      lock = hold();
         const int n = (int) lane().steps.size();
         const int by = aShift ? 10 : 1;
 
@@ -320,6 +370,7 @@ private:
             return -1;
 
         const double f = std::clamp( ( aScreen.x - 10.0 ) / std::max( 1.0, size.x - 20.0 ), 0.0, 1.0 );
+        auto         lock = hold();
         return f * ( lane().steps.size() - 1 );
     }
 
@@ -390,6 +441,8 @@ private:
     double                                           m_at = 0;
     double                                           m_rate = 10;
     bool                                             m_playing = false;
+    bool                                             m_live = false;
+    long                                             m_draws = 0;    ///< the route is still adding steps
     CLOCK::time_point                                m_last;
     wxTimer                                          m_timer;
     std::vector<int>                                 m_series;
@@ -484,6 +537,9 @@ void REPLAY::Redraw()
 
     const CLOCK::time_point started = CLOCK::now();
     KIGFX::VIEW*            view = m_frame->GetCanvas()->GetView();
+    auto                    lock = hold();
+
+    sync();
 
     if( !m_overlay || m_overlayView != view )
     {
@@ -588,6 +644,7 @@ void REPLAY::Redraw()
 
     view->Update( m_overlay.get() );
     m_frame->GetCanvas()->Refresh();
+    ++m_draws;
     m_drawUs = (long) std::chrono::duration_cast<std::chrono::microseconds>( CLOCK::now() - started ).count();
 }
 
@@ -684,6 +741,12 @@ KOPENAPI_RESULT h_pcb_route_replay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 } // namespace
 
 
+void GridReplayAdvance()
+{
+    replay().Advance();
+}
+
+
 KOPENAPI_REGISTER( "pcb_route_replay",
                    "EXPERIMENTAL. The last recorded grid route (pcb_route {engine: 'grid', record: true}) replayed "
                    "over the board editor's canvas: every net's copper at the step in its layer's colour, the "
@@ -693,7 +756,7 @@ KOPENAPI_REGISTER( "pcb_route_replay",
                    "view while shown; the board is not changed. verb show (lane, at), seek (at | delta), "
                    "play (rate: steps per second), pause, hide, status. Keys while shown: space play / pause, "
                    "left / right a step (shift: 10), home / end, up / down speed, escape closes; drag on the "
-                   "strip to seek. GUI only",
+                   "strip to seek. Shown while the route runs (live) it follows the head when it is there. GUI only",
                    R"json({"type":"object","properties":{
                         "verb":{"type":"string","enum":["show","seek","play","pause","hide","status"],"default":"show"},
                         "lane":{"description":"lane index or variant name; default the winner"},

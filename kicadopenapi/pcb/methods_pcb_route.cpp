@@ -3137,6 +3137,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             return KOPENAPI_RESULT::Error( 400, "strategies: at most 32" );
         params.progress = [&]( const std::vector<GRID_VARIANT_PROGRESS>& aVariants )
         {
+            if( params.record )
+                GridReplayAdvance();
+
             nlohmann::json variants = nlohmann::json::array();
             int            finished = 0, crowded = INT_MAX;
 
@@ -3155,23 +3158,37 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                                     { "variants", variants } } );
         };
 
+        // the timeline readable (pcb_route_timeline, the replay) while the variants add to it
+        params.timelineStarted = [&]( const std::shared_ptr<GRID_TIMELINE>& aTimeline )
+        {
+            static int runs = 0;
+            aTimeline->run = ++runs;
+
+            for( int code : aTimeline->netCodes )
+            {
+                NETINFO_ITEM* info = board->FindNet( code );
+                aTimeline->netNames.push_back( info ? str( UnescapeString( info->GetNetname() ) ) : std::to_string( code ) );
+            }
+
+            GridTimelineKeep( aTimeline );
+        };
+
         const GRID_RESULT gr = RouteOnGrid( board, gridNets, params );
         nlohmann::json    timelineOut;
 
-        if( gr.timeline )
+        // the replay sees the route end with its copper on the board
+        struct LIVE_END
         {
-            static int runs = 0;
-            gr.timeline->run = ++runs;
-
-            for( int code : gr.timeline->netCodes )
+            std::shared_ptr<GRID_TIMELINE> timeline;
+            ~LIVE_END()
             {
-                NETINFO_ITEM* info = board->FindNet( code );
-                gr.timeline->netNames.push_back( info ? str( UnescapeString( info->GetNetname() ) ) : std::to_string( code ) );
+                if( timeline )
+                    timeline->live = false;
             }
+        } liveEnd{ gr.timeline };
 
-            GridTimelineKeep( gr.timeline );
+        if( gr.timeline )
             timelineOut = { { "run", gr.timeline->run }, { "bytes", gr.timeline->Bytes() } };
-        }
 
         // each net's copper staged and guarded against the rest; a net the guard rejects stays out
         BOARD_COMMIT                        commit( context->GetToolManager() );

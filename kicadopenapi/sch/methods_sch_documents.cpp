@@ -220,8 +220,19 @@ static KOPENAPI_RESULT openGui( KOPENAPI_CONTEXT& aCtx, const wxFileName& aSchem
         }
     }
 
+    // the same file again (a reload): KiCad would find its own lock on it and refuse
+    const bool same = frame->GetCurrentFileName() == aSchematic.GetFullPath();
+
+    if( same )
+        frame->ReleaseFile();
+
     if( !frame->OpenProjectFiles( { aSchematic.GetFullPath() } ) )
+    {
+        if( same )
+            frame->LockFile( aSchematic.GetFullPath() );
+
         return KOPENAPI_RESULT::Error( 422, "the schematic editor could not open the schematic" );
+    }
 
     // OpenProjectFiles does not show the frame; mirror KICAD_MANAGER_CONTROL::ShowPlayer
     frame->Iconize( false );

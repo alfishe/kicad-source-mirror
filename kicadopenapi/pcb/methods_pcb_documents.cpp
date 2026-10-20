@@ -224,8 +224,19 @@ static KOPENAPI_RESULT openGui( KOPENAPI_CONTEXT& aCtx, const wxFileName& aBoard
         }
     }
 
+    // the same file again (a reload): KiCad would find its own lock on it and refuse
+    const bool same = frame->GetCurrentFileName() == aBoard.GetFullPath();
+
+    if( same )
+        frame->ReleaseFile();
+
     if( !frame->OpenProjectFiles( { aBoard.GetFullPath() } ) )
+    {
+        if( same )
+            frame->LockFile( aBoard.GetFullPath() );
+
         return KOPENAPI_RESULT::Error( 422, "the PCB editor could not open the board" );
+    }
 
     // OpenProjectFiles does not show the frame; mirror KICAD_MANAGER_CONTROL::ShowPlayer
     frame->Iconize( false );

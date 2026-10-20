@@ -12,6 +12,7 @@ void GRID_LANE::Start( size_t aNets )
 
 uint32_t GRID_LANE::AddConflicts( const std::vector<uint32_t>& aSet )
 {
+    std::lock_guard<std::recursive_mutex> lock( *m_mutex );
     if( aSet.empty() )
         return 0;
 
@@ -39,6 +40,7 @@ uint32_t GRID_LANE::AddConflicts( const std::vector<uint32_t>& aSet )
 
 void GRID_LANE::Add( GRID_STEP aStep, const GRID_PATH* aPath )
 {
+    std::lock_guard<std::recursive_mutex> lock( *m_mutex );
     if( steps.size() % KEY == 0 )
         m_keys.push_back( m_table );
 
@@ -117,6 +119,7 @@ void GRID_LANE::TableAt( size_t aStep, std::vector<uint32_t>& aTable ) const
 
 size_t GRID_LANE::Bytes() const
 {
+    std::lock_guard<std::recursive_mutex> lock( *m_mutex );
     size_t b = steps.capacity() * sizeof( GRID_STEP ) + m_table.capacity() * 4;
 
     for( const GRID_PATH& p : paths )

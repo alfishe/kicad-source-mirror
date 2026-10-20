@@ -1640,9 +1640,6 @@ private:
         if( !m_lane )
             return;
 
-        m_lane->histByRound.push_back( std::move( m_histTaken ) );
-        m_histTaken.clear();
-
         const GRID_TIMELINE& t = *m_timeline;
         const PLAN_GRID&     g = m_w.grid;
         std::vector<uint16_t> heat( (size_t) t.tnx * t.tny, 0 );
@@ -1668,6 +1665,9 @@ private:
             }
         }
 
+        std::lock_guard<std::recursive_mutex> lock( m_lane->Mutex() );
+        m_lane->histByRound.push_back( std::move( m_histTaken ) );
+        m_histTaken.clear();
         m_lane->heatByRound.push_back( std::move( heat ) );
     }
 
@@ -2796,6 +2796,10 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         }
 
         result.timeline = tl;
+        tl->live = true;
+
+        if( aParams.timelineStarted )
+            aParams.timelineStarted( tl );
     }
 
     std::vector<std::future<void>> done;
