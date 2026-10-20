@@ -129,7 +129,8 @@ public:
         {
             EDA_ITEM* item = strength > 0 ? TRAITS::Resolve( frame, id ) : nullptr;
 
-            if( !item )
+            // hidden from the view (a replay over the canvas): no halo around what is not shown
+            if( !item || ( item->viewPrivData() && !view->IsVisible( item ) ) )
                 continue;
 
             const BOX2I box = TRAITS::Box( item );

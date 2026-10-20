@@ -93,6 +93,16 @@ struct GRID_TIMELINE
 
     GRID_NET_RESULT Geometry( const GRID_PATH& aPath ) const;
     size_t          Bytes() const;
+
+    /// @brief The last round finished at a step of a lane (0: none yet)
+    int HeatRound( const GRID_LANE& aLane, size_t aStep ) const;
+
+    /// @brief Per tile: rounds since it was last fought over by the end of round aRound (0: that
+    /// round), 255 never
+    std::vector<uint8_t> FightAge( const GRID_LANE& aLane, int aRound ) const;
+
+    /// @brief The board point (internal units) of a tile's centre
+    VECTOR2I TileCentre( int aTile ) const;
 };
 
 /// @brief Grid paths as tracks and vias: corners only where the direction changes

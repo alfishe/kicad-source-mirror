@@ -56,4 +56,15 @@ const nlohmann::json& KopenapiEditorInputSchema();
 /// @brief JSON schema shared by the pcb_ / sch_action methods
 const nlohmann::json& KopenapiEditorActionSchema();
 
+/// @brief Takes keys before the editor's hotkeys and tools while set: wx key code and MD_* modifiers,
+/// true when taken. Injected keys (pcb_ / sch_input) are offered here too, so the keyboard and the
+/// API act alike.
+using KOPENAPI_KEY_HANDLER = std::function<bool( int aKeyCode, int aModifiers )>;
+
+/// @brief One handler per frame; an empty one removes it
+void KopenapiSetKeyHandler( EDA_DRAW_FRAME* aFrame, KOPENAPI_KEY_HANDLER aHandler );
+
+/// @brief The frame's handler takes the key (true) or not
+bool KopenapiOfferKey( EDA_DRAW_FRAME* aFrame, int aKeyCode, int aModifiers );
+
 #endif

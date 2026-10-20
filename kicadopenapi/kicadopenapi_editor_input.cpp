@@ -425,7 +425,9 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
         input.keyCode = key;
         input.modifiers = mods;
         input.heldButtons = g_heldButtons;
-        aTarget.dispatcher->DispatchInput( input );
+
+        if( !KopenapiOfferKey( aTarget.frame, key, mods ) )
+            aTarget.dispatcher->DispatchInput( input );
 
         wxString shown = wxString::FromUTF8( aStep["key"].get<std::string>() );
 
@@ -456,7 +458,28 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
 
     return "a step is one of move, click, dclick, down, up, select, drag, key, wait_ms";
 }
+std::map<EDA_DRAW_FRAME*, KOPENAPI_KEY_HANDLER>& keyHandlers()
+{
+    static auto* s_handlers = new std::map<EDA_DRAW_FRAME*, KOPENAPI_KEY_HANDLER>();
+    return *s_handlers;
+}
 } // namespace
+
+
+void KopenapiSetKeyHandler( EDA_DRAW_FRAME* aFrame, KOPENAPI_KEY_HANDLER aHandler )
+{
+    if( aHandler )
+        keyHandlers()[aFrame] = std::move( aHandler );
+    else
+        keyHandlers().erase( aFrame );
+}
+
+
+bool KopenapiOfferKey( EDA_DRAW_FRAME* aFrame, int aKeyCode, int aModifiers )
+{
+    auto it = keyHandlers().find( aFrame );
+    return it != keyHandlers().end() && it->second( aKeyCode, aModifiers );
+}
 
 
 KOPENAPI_RESULT KopenapiEditorInput( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE& aScale,

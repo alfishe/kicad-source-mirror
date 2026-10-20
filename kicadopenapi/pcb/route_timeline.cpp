@@ -149,6 +149,42 @@ GRID_NET_RESULT GRID_TIMELINE::Geometry( const GRID_PATH& aPath ) const
 }
 
 
+int GRID_TIMELINE::HeatRound( const GRID_LANE& aLane, size_t aStep ) const
+{
+    const GRID_STEP& st = aLane.steps[aStep];
+    return st.stage == 0 ? st.round - 1 : (int) aLane.heatByRound.size();
+}
+
+
+std::vector<uint8_t> GRID_TIMELINE::FightAge( const GRID_LANE& aLane, int aRound ) const
+{
+    const size_t         last = std::min<size_t>( std::max( aRound, 0 ), aLane.histByRound.size() );
+    std::vector<uint8_t> age( (size_t) tnx * tny, 255 );
+
+    for( size_t r = 0; r < last; ++r )
+    {
+        const uint8_t a = (uint8_t) std::min<size_t>( last - 1 - r, 254 );
+
+        for( uint32_t v : aLane.histByRound[r] )
+        {
+            const uint32_t cell = v & GRID_LANE::VIA ? v & ~GRID_LANE::VIA : (uint32_t) ( v % cells );
+            const int      x = (int) ( cell % grid.nx ) / tile, y = (int) ( cell / grid.nx ) / tile;
+            age[(size_t) y * tnx + x] = a;
+        }
+    }
+
+    return age;
+}
+
+
+VECTOR2I GRID_TIMELINE::TileCentre( int aTile ) const
+{
+    const int x = aTile % tnx, y = aTile / tnx;
+    const VECTOR2I a = grid.Centre( x * tile, y * tile );
+    return a + VECTOR2I( ( tile - 1 ) * grid.cell / 2, ( tile - 1 ) * grid.cell / 2 );
+}
+
+
 size_t GRID_TIMELINE::Bytes() const
 {
     size_t b = 0;

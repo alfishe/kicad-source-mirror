@@ -275,8 +275,8 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     out["cleared"] = cleared;
 
     // the heat of the last round finished by then, when it differs from the one at 'since'
-    const int round = L.steps[at].stage == 0 ? L.steps[at].round - 1 : (int) L.heatByRound.size();
-    const int roundBefore = !sinceGiven ? 0 : L.steps[since].stage == 0 ? L.steps[since].round - 1 : (int) L.heatByRound.size();
+    const int round = t->HeatRound( L, at );
+    const int roundBefore = !sinceGiven ? 0 : t->HeatRound( L, since );
 
     if( aArgs.value( "heat", false ) && round > 0 && ( round != roundBefore || !sinceGiven ) )
     {
@@ -286,22 +286,7 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
                         { "origin_mm", pointMm( t->grid.Centre( 0, 0 ) ) },
                         { "max", h.empty() ? 0 : *std::max_element( h.begin(), h.end() ) }, { "values", h } };
 
-        // per tile: rounds since it was last fought over (0: this round), 255 never
-        const size_t         last = std::min<size_t>( round, L.histByRound.size() );
-        std::vector<uint8_t> age( (size_t) t->tnx * t->tny, 255 );
-
-        for( size_t r = 0; r < last; ++r )
-        {
-            const uint8_t a = (uint8_t) std::min<size_t>( last - 1 - r, 254 );
-
-            for( uint32_t v : L.histByRound[r] )
-            {
-                const uint32_t cell = v & GRID_LANE::VIA ? v & ~GRID_LANE::VIA : (uint32_t) ( v % t->cells );
-                const int      x = (int) ( cell % t->grid.nx ) / t->tile, y = (int) ( cell / t->grid.nx ) / t->tile;
-                age[(size_t) y * t->tnx + x] = a;
-            }
-        }
-
+        const std::vector<uint8_t> age = t->FightAge( L, round );
         out["heat"]["age"] = age;
     }
 
