@@ -16,6 +16,7 @@
 
 #include <api/pcb_context.h>
 #include <kicadopenapi_keepalive.h>
+#include <kicadopenapi_memory.h>
 #include <base_units.h>
 #include <board.h>
 #include <board_commit.h>
@@ -3051,7 +3052,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         params.pfGrowth = (float) std::clamp( aArgs.value( "pf_growth", 1.6 ), 1.01, 10.0 );
         params.record = aArgs.value( "record", false );
         params.histDecay = (float) std::clamp( aArgs.value( "hist_decay", 1.0 ), 0.1, 1.0 );
-        params.recent = std::clamp( aArgs.value( "reroute_recent", 0 ), 0, 100 );
+        params.recent = std::clamp( aArgs.value( "reroute_recent", 2 ), 0, 100 );
 
         auto scheduleOf = []( const std::string& aName ) { return aName == "adaptive" ? 1 : aName == "adaptive_hist" ? 2 : 0; };
 
@@ -3301,6 +3302,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             costliest.push_back( { { "net", netName( code ) }, { "expanded", states } } );
 
         gridOut = { { "variant", gr.variant }, { "variants_tried", gr.variantsTried },
+                    { "lane_mb", std::round( gr.laneBytes / 1048576.0 ) },
+                    { "lanes_memory_allows", gr.lanesMemoryAllows },
                     { "variants_abandoned", gr.variantsAbandoned },
                     { "variant_stats", [&]
                       {
@@ -6026,8 +6029,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "schedule":{"type":"string","enum":["fixed","adaptive","adaptive_hist"],"default":"fixed","description":"grid, EXPERIMENTAL: negotiation schedule of the built-in variants (adaptive: growth 1.3 while the crowded nets fall, 2.0 when they stall; adaptive_hist: also twice the history on places fought over 3 rounds running)"},
                         "strategies":{"type":"array","description":"grid, EXPERIMENTAL: the variants to race instead of the built-ins: 'short_first_hv@1.0x1.6/a1.5/d0.9/r2', 'fine_first@adaptive', or {order, directions, pf_start, pf_growth, astar, schedule, hist_decay, reroute_recent}","items":{}},
                         "hist_decay":{"type":"number","default":1.0,"description":"grid, EXPERIMENTAL: the history cost of places not fought over in a round is multiplied by this (1: kept for good)"},
-                        "reroute_recent":{"type":"integer","default":0,"description":"grid, EXPERIMENTAL: a net that crowds nobody is routed again only through places fought over in the last this many rounds (0: through any place ever fought over)"},
-                        "variants":{"type":"integer","default":0,"description":"grid: variants run in parallel (net order, layer directions), 0 one per two cores up to 6"},
+                        "reroute_recent":{"type":"integer","default":2,"description":"grid: a net that crowds nobody is routed again only through places fought over in the last this many rounds (0: through any place ever fought over)"},
+                        "variants":{"type":"integer","default":0,"description":"grid: how many of the built-in variants (pcb_route_strategies) run in parallel; 0 one per two cores, as many as half the available memory holds (grid.lane_mb, grid.lanes_memory_allows)"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); parts with pads inside the ring (exposed pad, BGA) stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (0.65 mm or closer) is routed no wider than that pad's narrow side (not below the Default class width or the board minimum) when its class is wider; the rest of its net at its class width; the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
@@ -6142,5 +6145,47 @@ KOPENAPI_REGISTER( "pcb_fanout",
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_fanout, 300 );
+
+static KOPENAPI_RESULT h_pcb_route_strategies( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    GRID_PARAMS params;
+    params.pfStart = (float) std::clamp( aArgs.value( "pf_start", 1.0 ), 0.01, 100.0 );
+    params.pfGrowth = (float) std::clamp( aArgs.value( "pf_growth", 1.6 ), 1.01, 10.0 );
+    params.astar = (float) std::clamp( aArgs.value( "astar", 1.2 ), 1.0, 3.0 );
+    params.recent = std::clamp( aArgs.value( "reroute_recent", 2 ), 0, 100 );
+
+    nlohmann::json rows = nlohmann::json::array();
+    const std::vector<GRID_STRATEGY> builtins = GridBuiltinStrategies( params );
+
+    for( const GRID_STRATEGY& st : builtins )
+    {
+        rows.push_back( { { "name", st.Name() }, { "order", st.order }, { "directions", st.directions },
+                          { "pf_start", st.pfStart }, { "pf_growth", st.pfGrowth }, { "astar", st.astar },
+                          { "schedule", st.schedule == 0 ? "fixed" : st.schedule == 1 ? "adaptive" : "adaptive_hist" },
+                          { "hist_decay", st.histDecay }, { "reroute_recent", st.recent } } );
+    }
+
+    const int     cores = (int) std::thread::hardware_concurrency();
+    const int64_t available = KOPENAPI_MEMORY::SystemAvailable();
+
+    return KOPENAPI_RESULT::Ok( { { "builtin", rows }, { "cores", cores },
+                                  { "lanes_by_cores", std::clamp( cores / 2, 1, (int) builtins.size() ) },
+                                  { "memory_available_mb", available > 0 ? available / 1048576 : -1 } } );
+}
+
+
+KOPENAPI_REGISTER( "pcb_route_strategies",
+                   "The grid engine's built-in variants (lanes) raced by pcb_route {engine: 'grid'} when no "
+                   "strategies are given, in the order lanes are dropped from the end: net order, layer "
+                   "directions, first-round price and growth, A* weight, recent rip-up. pcb_route runs one "
+                   "per two cores, as many as half the available memory holds; its answer gives the lane "
+                   "size of that board (grid.lane_mb) and how many lanes fit (grid.lanes_memory_allows). "
+                   "pf_start / pf_growth / astar / reroute_recent: as for pcb_route",
+                   R"json({"type":"object","properties":{
+                        "pf_start":{"type":"number","default":1.0},
+                        "pf_growth":{"type":"number","default":1.6},
+                        "astar":{"type":"number","default":1.2},
+                        "reroute_recent":{"type":"integer","default":2}}})json"_json,
+                   false, h_pcb_route_strategies );
 
 KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_track_add", "pcb_via_add", "pcb_fanout" );

@@ -37,6 +37,9 @@ public:
     /// @brief Physical RAM of the machine (bytes), -1 when unknown
     static int64_t SystemTotal();
 
+    /// @brief Memory still available to processes (free + reclaimable, bytes), -1 when unknown
+    static int64_t SystemAvailable();
+
     /// @brief The calling thread at background priority (for work nobody waits on)
     static void LowerThreadPriority();
 };

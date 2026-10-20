@@ -281,6 +281,12 @@ int64_t KOPENAPI_MEMORY::SystemTotal()
 }
 
 
+int64_t KOPENAPI_MEMORY::SystemAvailable()
+{
+    return kopenapi::platform::SystemMemory().available;
+}
+
+
 void KOPENAPI_MEMORY::LowerThreadPriority()
 {
     kopenapi::platform::LowerCurrentThreadPriority();

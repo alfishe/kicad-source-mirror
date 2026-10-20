@@ -57,7 +57,8 @@ struct GRID_PARAMS
 {
     std::vector<PCB_LAYER_ID> layers;          ///< routing layers
     int                       cell = 0;        ///< 0: from the finest class
-    int                       variants = 0;    ///< 0: one per core, up to 8
+    int                       variants = 0;    ///< 0: half the cores, up to the built-ins, as many as the memory allows
+    int64_t                   memoryBudget = 0; ///< bytes the lanes may take; 0: half the memory available now
     int                       maxRounds = 40;
     int                       viaKeepOut = 0;  ///< only the chip's own nets' vias this far around it while routing; 0 none
     int                       viaAway = 0;     ///< a via nearer a chip's pads than this costs more, the nearer the more; 0 none
@@ -69,7 +70,7 @@ struct GRID_PARAMS
     bool                      record = false;  ///< keep each variant's timeline (GRID_RESULT::timeline)
     int                       schedule = 0;    ///< GRID_STRATEGY::schedule of the built-in variants
     float                     histDecay = 1.0f; ///< GRID_STRATEGY::histDecay of the built-in variants
-    int                       recent = 0;      ///< GRID_STRATEGY::recent of the built-in variants
+    int                       recent = 2;      ///< GRID_STRATEGY::recent of the built-in variants
     std::vector<GRID_STRATEGY> strategies;     ///< the variants to race; empty: the built-ins
     std::atomic<bool>*        cancel = nullptr;
 
@@ -113,6 +114,8 @@ struct GRID_RESULT
     double                       buildMs = 0;
     double                       routeMs = 0;
     std::vector<std::string>     variantsTried;
+    int64_t                      laneBytes = 0;       ///< one lane's search state (estimate)
+    int                          lanesMemoryAllows = 0; ///< within GRID_PARAMS::memoryBudget
     std::vector<std::string>     variantsAbandoned;   ///< stopped in their rounds once another joined everything
 
     /// @brief Per variant tried: when it finished, its search states per stage, ends joined, vias
@@ -149,3 +152,7 @@ struct GRID_RESULT
  * to the other members (hug): the bundle runs side by side.
  */
 GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_PARAMS& aParams );
+
+/// @brief The variants raced when GRID_PARAMS::strategies is empty, in the order lanes are dropped from
+/// the end: mixed net orders, layer directions and first-round prices (relative to aParams.pfStart)
+std::vector<GRID_STRATEGY> GridBuiltinStrategies( const GRID_PARAMS& aParams );

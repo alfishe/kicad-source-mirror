@@ -2,6 +2,8 @@
 #include "route_raster.h"
 #include "route_timeline.h"
 
+#include <kicadopenapi_memory.h>
+
 #include <base_units.h>
 #include <board.h>
 #include <board_design_settings.h>
@@ -28,6 +30,7 @@
 #include <queue>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 
 namespace
@@ -2705,33 +2708,31 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
     std::vector<GRID_STRATEGY> strategies = aParams.strategies;
 
+    // one lane's search state per state: occupancy per sizes, history, node, direction, end, fights,
+    // bundle band; per cell: via occupancy per sizes, via history, fights
+    const int64_t states = (int64_t) world.L * world.cells;
+    const int64_t K = (int64_t) world.sizes.size();
+    result.laneBytes = states * ( 2 * K + 4 + 16 + 1 + 4 + 3 + 4 ) + (int64_t) world.cells * ( 2 * K + 4 + 3 );
+
+    int64_t budget = aParams.memoryBudget;
+
+    if( budget <= 0 )
+    {
+        const int64_t available = KOPENAPI_MEMORY::SystemAvailable();
+        budget = available > 0 ? available / 2 : std::max<int64_t>( KOPENAPI_MEMORY::SystemTotal() / 4, 1LL << 30 );
+    }
+
+    result.lanesMemoryAllows = (int) std::clamp<int64_t>( budget / std::max<int64_t>( result.laneBytes, 1 ), 1, 64 );
+
     if( strategies.empty() )
     {
-        for( const auto& [o, d] : std::vector<std::pair<const char*, const char*>>{ { "short_first", "" },
-                                                                                   { "short_first", "hv" },
-                                                                                   { "fine_first", "" },
-                                                                                   { "long_first", "" },
-                                                                                   { "short_first", "vh" },
-                                                                                   { "fine_first", "hv" } } )
-        {
-            GRID_STRATEGY st;
-            st.order = o;
-            st.directions = d;
-            st.pfStart = aParams.pfStart;
-            st.pfGrowth = aParams.pfGrowth;
-            st.astar = aParams.astar;
-            st.schedule = aParams.schedule;
-            st.histDecay = aParams.histDecay;
-            st.recent = aParams.recent;
-            strategies.push_back( st );
-        }
-
+        strategies = GridBuiltinStrategies( aParams );
         int count = aParams.variants;
 
         if( count <= 0 )
-            count = std::clamp( (int) std::thread::hardware_concurrency() / 2, 1, (int) strategies.size() );
+            count = std::min( (int) std::thread::hardware_concurrency() / 2, result.lanesMemoryAllows );
 
-        strategies.resize( std::min( (size_t) count, strategies.size() ) );
+        strategies.resize( (size_t) std::clamp( count, 1, (int) strategies.size() ) );
     }
 
     std::vector<VARIANT> variants;
@@ -2742,7 +2743,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         v.order = st.order == "long_first" ? longFirst : st.order == "fine_first" ? fineFirst : shortFirst;
         v.direction = st.directions == "hv" ? hv : st.directions == "vh" ? vh : std::vector<int>();
         v.strategy = st;
-        v.name = aParams.strategies.empty() ? st.order + ( st.directions.empty() ? "" : "_" + st.directions ) : st.Name();
+        v.name = st.Name();
 
         if( !groupSize.empty() )
             v.order = bundlesFirst( v.order );
@@ -2914,6 +2915,33 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
     result.routeMs = msSince( routing );
     return result;
+}
+
+
+std::vector<GRID_STRATEGY> GridBuiltinStrategies( const GRID_PARAMS& aParams )
+{
+    std::vector<GRID_STRATEGY> out;
+
+    for( const auto& [o, d, start] : std::vector<std::tuple<const char*, const char*, float>>{ { "short_first", "hv", 1.0f },
+                                                                                              { "fine_first", "hv", 1.0f },
+                                                                                              { "short_first", "", 1.0f },
+                                                                                              { "short_first", "hv", 2.0f },
+                                                                                              { "fine_first", "hv", 2.0f },
+                                                                                              { "short_first", "hv", 0.75f } } )
+    {
+        GRID_STRATEGY st;
+        st.order = o;
+        st.directions = d;
+        st.pfStart = std::clamp( aParams.pfStart * start, 0.01f, 100.0f );
+        st.pfGrowth = aParams.pfGrowth;
+        st.astar = aParams.astar;
+        st.schedule = aParams.schedule;
+        st.histDecay = aParams.histDecay;
+        st.recent = aParams.recent;
+        out.push_back( st );
+    }
+
+    return out;
 }
 
 
