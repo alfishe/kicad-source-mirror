@@ -1397,8 +1397,52 @@ private:
         m_expandedShown = m_expanded;
     }
 
-    /// @brief The net was taken (routed, kept, pulled tight or dropped): one step
+    /// @brief The net was taken (routed, kept, pulled tight or dropped): one step; a paused job
+    /// waits here
     void record( int aNet, int aStage )
+    {
+        recordStep( aNet, aStage );
+        gate();
+    }
+
+    /// @brief While the job is paused: wait, or go on as far as its last job_step allows (n nets,
+    /// or to the n-th round from here; after the rounds to the next stage)
+    void gate()
+    {
+        if( !m_params.held )
+            return;
+
+        for( ;; )
+        {
+            uint64_t    serial = 0;
+            std::string by;
+            int         n = 0;
+
+            if( stopped() || !m_params.held( serial, by, n ) )
+                return;
+
+            if( serial != m_stepSeen )
+            {
+                m_stepSeen = serial;
+                m_stepLeft = by == "round" ? 0 : std::max( n, 1 );
+                m_stepRound = by == "round" ? m_round + std::max( n, 1 ) : -1;
+                m_stepStage = m_stage;
+            }
+
+            if( m_stepLeft > 0 )
+            {
+                --m_stepLeft;
+                return;
+            }
+
+            if( m_stepRound >= 0 && m_stage == m_stepStage && ( m_stage != STAGE_ROUNDS || m_round < m_stepRound ) )
+                return;
+
+            std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
+        }
+    }
+
+    void recordStep( int aNet, int aStage )
     {
         if( !m_lane )
             return;
@@ -2592,6 +2636,10 @@ private:
     std::atomic<int>       m_round{ 0 };
     std::atomic<int>       m_conflicting{ 0 };
     std::atomic<int>       m_stage{ STAGE_ROUNDS };
+    uint64_t               m_stepSeen = 0;    ///< the job_step this variant went on for
+    int                    m_stepLeft = 0;
+    int                    m_stepRound = -1;
+    int                    m_stepStage = -1;
     std::atomic<bool>      m_abandoned{ false };
     std::atomic<int>       m_taken{ 0 };
     std::atomic<int>       m_takenOf{ 0 };

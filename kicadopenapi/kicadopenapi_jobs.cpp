@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 
 namespace
@@ -45,6 +46,11 @@ struct JOB
     CLOCK::time_point finished;
     std::optional<KOPENAPI_RESULT> result;
     std::atomic<bool> cancel{ false };
+    bool              paused = false;
+    uint64_t          stepSerial = 0;      ///< job_step requests so far
+    std::string       stepBy;
+    int               stepN = 0;
+    uint64_t          stepServed = 0;      ///< the last request the main thread went on for
 
     std::string Id() const { return "job-" + std::to_string( seq ); }
     bool        Finished() const { return state == "done" || state == "failed" || state == "cancelled"; }
@@ -107,6 +113,12 @@ nlohmann::json describe( const JOB& aJob, bool aWithResult )
 
     if( !aJob.stopReason.empty() )
         j["stop_reason"] = aJob.stopReason;
+
+    if( !aJob.Finished() )
+        j["paused"] = aJob.paused;
+
+    if( aJob.stepSerial > 0 )
+        j["step"] = { { "serial", aJob.stepSerial }, { "by", aJob.stepBy }, { "n", aJob.stepN } };
 
     if( aWithResult && aJob.result )
     {
@@ -313,9 +325,56 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
 
     KopenapiYieldAll();
 
+    // paused: the UI and reading calls run until job_resume, a job_step or a stop
+    for( bool shown = false;; )
+    {
+        {
+            std::lock_guard<std::mutex> lock( g_mutex );
+            JOB&                        job = *g_current;
+
+            if( !job.paused || job.cancel )
+                break;
+
+            if( job.stepSerial != job.stepServed )
+            {
+                job.stepServed = job.stepSerial;
+                break;
+            }
+        }
+
+        if( !shown && g_titles )
+        {
+            g_titles->Show( "API job " + g_current->method + " paused (job_resume, job_step; Esc stops)" );
+            shown = true;
+        }
+
+        KopenapiYieldAll();
+        std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+    }
+
     std::lock_guard<std::mutex> lock( g_mutex );
     g_yielding = false;
     return !g_current->cancel;
+}
+
+
+bool KopenapiJobHeld( uint64_t* aSerial, std::string* aBy, int* aN )
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+
+    if( !g_current || !g_current->paused || g_current->cancel )
+        return false;
+
+    if( aSerial )
+        *aSerial = g_current->stepSerial;
+
+    if( aBy )
+        *aBy = g_current->stepBy;
+
+    if( aN )
+        *aN = g_current->stepN;
+
+    return true;
 }
 
 
@@ -522,6 +581,53 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Cancel( const nlohmann::json& aArgs )
 
     // the job stops at its next safe point and still gives its result (what it did so far)
     return KOPENAPI_RESULT::Ok( { { "job_id", id }, { "stopping", true } } );
+}
+
+
+KOPENAPI_RESULT KOPENAPI_JOBS::Pause( const nlohmann::json& aArgs, bool aPause )
+{
+    const std::string           id = aArgs.value( "job_id", std::string() );
+    std::lock_guard<std::mutex> lock( g_mutex );
+    auto                        it = g_jobs.find( idOf( id ) );
+
+    if( it == g_jobs.end() )
+        return KOPENAPI_RESULT::Error( 404, "no job '" + id + "'" );
+
+    JOB& job = *it->second;
+
+    if( !job.Finished() && job.paused != aPause )
+    {
+        job.paused = aPause;
+        wxLogMessage( "api job %s (%s): %s", job.Id(), job.method, aPause ? "paused" : "resumed" );
+    }
+
+    return KOPENAPI_RESULT::Ok( describe( job, false ) );
+}
+
+
+KOPENAPI_RESULT KOPENAPI_JOBS::Step( const nlohmann::json& aArgs )
+{
+    const std::string id = aArgs.value( "job_id", std::string() );
+    const std::string by = aArgs.value( "by", std::string( "net" ) );
+
+    if( by != "net" && by != "round" )
+        return KOPENAPI_RESULT::Error( 400, "by: net or round" );
+
+    std::lock_guard<std::mutex> lock( g_mutex );
+    auto                        it = g_jobs.find( idOf( id ) );
+
+    if( it == g_jobs.end() )
+        return KOPENAPI_RESULT::Error( 404, "no job '" + id + "'" );
+
+    JOB& job = *it->second;
+
+    if( job.Finished() || !job.paused )
+        return KOPENAPI_RESULT::Error( 409, "job '" + id + "' is not paused (job_pause first)" );
+
+    job.stepBy = by;
+    job.stepN = std::clamp( aArgs.value( "n", 1 ), 1, 100000 );
+    ++job.stepSerial;
+    return KOPENAPI_RESULT::Ok( describe( job, false ) );
 }
 
 

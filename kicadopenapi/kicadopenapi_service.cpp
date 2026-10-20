@@ -880,7 +880,8 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std
 static bool servedByService( const std::string& aName )
 {
     static const std::set<std::string> names = { "api_trace",  "memory_summary", "api_call_result", "remote_session",
-                                                 "job_start",  "job_get",        "job_cancel",      "job_list" };
+                                                 "job_start",  "job_get",        "job_cancel",      "job_list",
+                                                 "job_pause",  "job_resume",     "job_step" };
     return names.count( aName ) > 0;
 }
 
@@ -972,6 +973,12 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
 
     if( aName == "job_list" )
         return KOPENAPI_JOBS::Get().List();
+
+    if( aName == "job_pause" || aName == "job_resume" )
+        return KOPENAPI_JOBS::Get().Pause( aArgs, aName == "job_pause" );
+
+    if( aName == "job_step" )
+        return KOPENAPI_JOBS::Get().Step( aArgs );
 
     if( KOPENAPI_REGISTRY::Get().IsEditing( aName ) )
     {

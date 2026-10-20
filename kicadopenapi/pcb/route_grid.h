@@ -68,6 +68,9 @@ struct GRID_PARAMS
     float                     pfStart = 1.0f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
     float                     pfGrowth = 1.6f; ///< and how much it grows each round (VPR's pres_fac_mult)
     bool                      record = false;  ///< keep each variant's timeline (GRID_RESULT::timeline)
+    /// @brief A paused job: true while the variants wait between two nets; aSerial / aBy / aN the last
+    /// job_step (KopenapiJobHeld).  Any thread
+    std::function<bool( uint64_t& aSerial, std::string& aBy, int& aN )> held;
     /// @brief With record: the timeline before the variants start (calling thread); it grows while they run
     std::function<void( const std::shared_ptr<GRID_TIMELINE>& )> timelineStarted;
     int                       schedule = 0;    ///< GRID_STRATEGY::schedule of the built-in variants

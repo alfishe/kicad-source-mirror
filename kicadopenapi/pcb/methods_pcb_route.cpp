@@ -3158,6 +3158,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                                     { "variants", variants } } );
         };
 
+        params.held = []( uint64_t& aSerial, std::string& aBy, int& aN ) { return KopenapiJobHeld( &aSerial, &aBy, &aN ); };
+
         // the timeline readable (pcb_route_timeline, the replay) while the variants add to it
         params.timelineStarted = [&]( const std::shared_ptr<GRID_TIMELINE>& aTimeline )
         {

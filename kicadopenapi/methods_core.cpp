@@ -489,5 +489,29 @@ KOPENAPI_REGISTER( "job_cancel",
                         "job_id":{"type":"string"}}})json"_json,
                    false, h_job_served );
 
+KOPENAPI_REGISTER( "job_pause",
+                   "Pause a job at its next safe point (a queued one starts paused): KiCad stays usable and "
+                   "reading calls answer meanwhile; job_get says paused. A grid route (pcb_route engine grid) "
+                   "pauses every variant between two nets, its timeline readable (pcb_route_timeline). "
+                   "job_resume goes on, job_step goes a bit further, job_cancel stops",
+                   R"json({"type":"object","required":["job_id"],"properties":{
+                        "job_id":{"type":"string"}}})json"_json,
+                   false, h_job_served );
+
+KOPENAPI_REGISTER( "job_resume", "Resume a paused job",
+                   R"json({"type":"object","required":["job_id"],"properties":{
+                        "job_id":{"type":"string"}}})json"_json,
+                   false, h_job_served );
+
+KOPENAPI_REGISTER( "job_step",
+                   "A paused job goes on and pauses again: to its next safe point; a grid route by n nets per "
+                   "variant (by: net) or to the next n rounds (by: round; after the rounds: the next stage). "
+                   "409 when the job is not paused",
+                   R"json({"type":"object","required":["job_id"],"properties":{
+                        "job_id":{"type":"string"},
+                        "by":{"type":"string","enum":["net","round"],"default":"net"},
+                        "n":{"type":"integer","minimum":1,"default":1}}})json"_json,
+                   false, h_job_served );
+
 KOPENAPI_REGISTER( "job_list", "The last 32 jobs, newest first, with state and progress (no results)",
                    R"json({"type":"object","properties":{}})json"_json, false, h_job_served );
