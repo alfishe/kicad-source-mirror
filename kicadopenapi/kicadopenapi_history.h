@@ -53,4 +53,10 @@ private:
     IMPL* m_impl = nullptr;
 };
 
+/// @brief Main thread: an API method run from KiCad's own UI (a key in an overlay) as an API call
+/// is: an editing one marked and logged (edit_log, rollback), its progress shown (api_trace), its log
+/// records attributed to "ui:<name>"
+KICOMMON_API KOPENAPI_RESULT KopenapiInvokeInProcess( KOPENAPI_CONTEXT& aCtx, const std::string& aName,
+                                                      const nlohmann::json& aArgs );
+
 #endif

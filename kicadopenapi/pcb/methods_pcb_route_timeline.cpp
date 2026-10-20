@@ -130,11 +130,22 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
         {
             const GRID_LANE&                      l = t->Lane( k );
             std::lock_guard<std::recursive_mutex> lock( l.Mutex() );
+
+            if( l.deleted )
+            {
+                lanes.push_back( { { "lane", k }, { "variant", l.name }, { "deleted", true }, { "parent", l.parent },
+                                   { "parent_step", l.parentStep } } );
+                continue;
+            }
+
             lanes.push_back( { { "lane", k }, { "variant", l.name }, { "steps", l.steps.size() }, { "paths", l.paths.size() },
                                { "rounds", l.histByRound.size() }, { "abandoned", !live && l.abandoned },
                                { "winner", !live && (int) k == t->winner },
                                { "ms", l.steps.empty() ? 0.0 : std::round( l.steps.back().ms ) },
                                { "bytes", l.Bytes() } } );
+
+            if( l.stopped )
+                lanes.back()["stopped"] = true;
 
             if( l.parent >= 0 )
             {
@@ -161,6 +172,7 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
         }();
         out["winner"] = live ? -1 : t->winner;
         out["applied_lane"] = t->appliedLane;
+        out["shown_lane"] = t->DefaultLane();
         out["world"] = [&]
         {
             char hex[17];
@@ -178,8 +190,7 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
 
     if( !aArgs.contains( "lane" ) )
     {
-        if( !t->live )
-            lane = std::max( t->winner, 0 );
+        lane = t->DefaultLane();
     }
     else
     {
@@ -201,6 +212,9 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
 
     if( lane < 0 || lane >= (int) t->LaneCount() )
         return KOPENAPI_RESULT::Error( 404, "no such lane (see verb status)" );
+
+    if( t->Lane( lane ).deleted )
+        return KOPENAPI_RESULT::Error( 404, "lane " + std::to_string( lane ) + " was deleted (branch_delete)" );
 
     const GRID_LANE&                      L = t->Lane( lane );
     std::lock_guard<std::recursive_mutex> lock( L.Mutex() );
@@ -258,7 +272,7 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
     }
 
     if( verb != "frame" )
-        return KOPENAPI_RESULT::Error( 400, "verb: status, frame, series or markers" );
+        return KOPENAPI_RESULT::Error( 400, "verb: status, frame, series, markers, branch_switch or branch_delete" );
 
     if( L.steps.empty() )
         return KOPENAPI_RESULT::Error( 404, "the lane has no steps" );
@@ -336,9 +350,101 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
 }
 
 
+/// @brief The lane an argument names (index or variant name), -1 none
+int laneOf( const GRID_TIMELINE& aTimeline, const nlohmann::json& aLane )
+{
+    for( size_t k = 0; k < aTimeline.LaneCount(); ++k )
+    {
+        if( ( aLane.is_number_integer() && aLane.get<int>() == (int) k )
+            || ( aLane.is_string() && aLane.get<std::string>() == aTimeline.Lane( k ).name ) )
+        {
+            return (int) k;
+        }
+    }
+
+    return -1;
+}
+
+
+/// @brief branch_switch / branch_delete (main thread: the replay follows)
+KOPENAPI_RESULT timelineBranch( const std::shared_ptr<GRID_TIMELINE>& t, const std::string& aVerb, const nlohmann::json& aArgs )
+{
+    if( !t )
+        return KOPENAPI_RESULT::Error( 404, "no grid route recorded in this process: pcb_route {engine: 'grid', record: true}" );
+
+    if( aArgs.contains( "run" ) && aArgs["run"] != t->run )
+        return KOPENAPI_RESULT::Error( 404, "only the last recorded run is kept: run " + std::to_string( t->run ) );
+
+    const int lane = laneOf( *t, aArgs.value( "lane", nlohmann::json() ) );
+
+    if( lane < 0 )
+        return KOPENAPI_RESULT::Error( aArgs.contains( "lane" ) ? 404 : 400, "lane: index or variant name (see verb status)" );
+
+    if( t->Lane( lane ).deleted )
+        return KOPENAPI_RESULT::Error( 404, "lane " + std::to_string( lane ) + " was deleted (branch_delete)" );
+
+    if( aVerb == "branch_switch" )
+    {
+        t->shownLane = lane;
+        GridReplayFollow( t );
+        return KOPENAPI_RESULT::Ok( { { "run", t->run }, { "shown_lane", lane }, { "variant", t->Lane( lane ).name } } );
+    }
+
+    if( t->Lane( lane ).parent < 0 )
+        return KOPENAPI_RESULT::Error( 400, "lane " + std::to_string( lane ) + " is one of the run's variants: only branches go" );
+
+    if( t->live )
+        return KOPENAPI_RESULT::Error( 409, "run " + std::to_string( t->run ) + " is still routing" );
+
+    // the branch and its descendants: a parent always comes before its branches
+    std::vector<bool> gone( t->LaneCount(), false );
+    nlohmann::json    lanes = nlohmann::json::array();
+    gone[lane] = true;
+
+    for( size_t k = lane + 1; k < t->LaneCount(); ++k )
+        gone[k] = t->Lane( k ).parent >= 0 && gone[t->Lane( k ).parent];
+
+    for( size_t k = lane; k < t->LaneCount(); ++k )
+    {
+        if( !gone[k] )
+            continue;
+
+        if( t->Lane( k ).running )
+            return KOPENAPI_RESULT::Error( 409, "lane " + std::to_string( k ) + " is routing" );
+
+        if( (int) k == t->appliedLane && t->appliedSeq > 0 )
+            return KOPENAPI_RESULT::Error( 409, "lane " + std::to_string( k ) + "'s copper is on the board: branch from "
+                                                "another lane first, or roll it back" );
+    }
+
+    const size_t before = t->Bytes();
+
+    for( size_t k = lane; k < t->LaneCount(); ++k )
+    {
+        if( gone[k] && !t->Lane( k ).deleted )
+        {
+            t->Lane( k ).Release();
+            lanes.push_back( k );
+        }
+    }
+
+    if( t->appliedLane >= 0 && gone[t->appliedLane] )
+        t->appliedLane = -1;
+
+    GridReplayFollow( t );
+    KopenapiEventNotify( "pcb_route_timeline" );
+    return KOPENAPI_RESULT::Ok( { { "run", t->run }, { "deleted", lanes }, { "bytes_freed", before - t->Bytes() } } );
+}
+
+
 KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     (void) aCtx;
+    const std::string verb = aArgs.value( "verb", "status" );
+
+    if( verb == "branch_switch" || verb == "branch_delete" )
+        return timelineBranch( GridTimelineLast(), verb, aArgs );
+
     return timelineQuery( GridTimelineLast(), aArgs );
 }
 
@@ -497,11 +603,14 @@ KOPENAPI_REGISTER( "pcb_route_timeline",
                    "the heat grid, counts the crowded states); series: stage / round / net / crowded / "
                    "expanded / ms / crowded_tiles per step; markers: stage and "
                    "round starts, dropped nets, the end (or the head while live). lane: index or variant name, default the "
-                   "winner (lane 0 while live). The timeline is readable while the route runs (live: true; "
+                   "lane switched to, else the winner (lane 0 while live). Branches (pcb_route {from: {run, lane, step}}) "
+                   "are lanes too, with parent and parent_step in status; branch_switch {lane}: the lane shown by "
+                   "default here and in the replay; branch_delete {lane}: a branch and its branches go (their "
+                   "memory freed; not the run's variants, not the lane whose copper is on the board). The timeline is readable while the route runs (live: true; "
                    "steps grow; poll frame {since} from the client's step, or over REST receive the frames "
                    "pushed: GET /api/v1/events?topic=pcb_route_timeline, Server-Sent Events)",
                    R"json({"type":"object","properties":{
-                        "verb":{"type":"string","enum":["status","frame","series","markers"],"default":"status"},
+                        "verb":{"type":"string","enum":["status","frame","series","markers","branch_switch","branch_delete"],"default":"status"},
                         "run":{"type":"integer","description":"the run id from status (only the last run is kept)"},
                         "lane":{"description":"lane index or variant name; default the winner"},
                         "at":{"type":"integer","description":"step; negative from the end; default the last"},

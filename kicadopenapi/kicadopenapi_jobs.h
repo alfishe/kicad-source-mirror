@@ -37,6 +37,10 @@ KICOMMON_API nlohmann::json KopenapiCallProgress();
 /// @brief The running job was asked to stop (job_cancel, Esc, a window close)
 KICOMMON_API bool KopenapiJobCancelled();
 
+/// @brief Stopped by job_cancel {keep: true}: the job applies nothing and keeps its state for later
+/// (a grid route: its timeline, every lane stopped at its last step).  Any thread
+KICOMMON_API bool KopenapiJobKeep();
+
 /// @brief The running job is paused (job_pause) and not asked to stop.  aSerial / aBy / aN: the last
 /// job_step (the serial grows with each), so a worker thread of the job can go that far and wait
 /// again.  Any thread

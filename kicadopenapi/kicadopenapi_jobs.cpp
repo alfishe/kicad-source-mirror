@@ -46,6 +46,7 @@ struct JOB
     CLOCK::time_point finished;
     std::optional<KOPENAPI_RESULT> result;
     std::atomic<bool> cancel{ false };
+    bool              keep = false;   ///< job_cancel {keep}: stop, apply nothing, keep the state
     bool              paused = false;
     uint64_t          stepSerial = 0;      ///< job_step requests so far
     std::string       stepBy;
@@ -422,6 +423,13 @@ bool KopenapiJobCancelled()
 }
 
 
+bool KopenapiJobKeep()
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    return g_current && g_current->cancel && g_current->keep;
+}
+
+
 bool KopenapiJobYielding()
 {
     std::lock_guard<std::mutex> lock( g_mutex );
@@ -583,7 +591,10 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Cancel( const nlohmann::json& aArgs )
             return KOPENAPI_RESULT::Ok( describe( job, false ) );
 
         if( !job.cancel.exchange( true ) )
-            job.stopReason = "job_cancel";
+        {
+            job.keep = aArgs.value( "keep", false );
+            job.stopReason = job.keep ? "job_cancel {keep}" : "job_cancel";
+        }
     }
 
     // the job stops at its next safe point and still gives its result (what it did so far)

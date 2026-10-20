@@ -10,6 +10,7 @@
 #include "route_timeline.h"
 
 #include <kicadopenapi_editor_input.h>
+#include <kicadopenapi_history.h>
 #include <kicadopenapi_registry.h>
 
 #include <base_units.h>
@@ -67,6 +68,7 @@ public:
             Hide();
 
         const bool same = m_timeline == aTimeline && m_lane == aLane;
+        const bool sameRun = m_timeline == aTimeline;
 
         if( m_timeline != aTimeline )
             restoreBoard();
@@ -78,14 +80,20 @@ public:
 
         if( !same )
         {
+            // another lane of the same run: the same step (a branch shares its parent's steps up to it)
+            const double last = (double) lane().steps.size() - 1;
+            const double at = sameRun ? std::min( m_at, last ) : last;
             m_geometry.clear();
-            m_at = (double) lane().steps.size() - 1;
-            m_rate = std::max( 5.0, lane().steps.size() / 20.0 );
+
+            if( !sameRun )
+                m_rate = std::max( 5.0, lane().steps.size() / 20.0 );
+
             m_playing = false;
             m_series.clear();
             m_top = 1;
             m_live = m_timeline->live;
             sync();
+            m_at = m_live && !sameRun ? m_at : at;
         }
 
         hideBoardCopper();
@@ -154,6 +162,21 @@ public:
 
     void SetRate( double aRate ) { m_rate = std::clamp( aRate, 0.25, 1e5 ); }
 
+    void SetContext( const KOPENAPI_CONTEXT& aCtx ) { m_ctx = aCtx; }
+
+    /// @brief After branch_switch / branch_delete: the timeline's default lane when ours is gone or
+    /// another was switched to
+    void Follow( const std::shared_ptr<GRID_TIMELINE>& aTimeline )
+    {
+        if( !Shown() || m_timeline != aTimeline )
+            return;
+
+        const int want = aTimeline->DefaultLane();
+
+        if( want != m_lane && ( aTimeline->Lane( m_lane ).deleted || aTimeline->shownLane == want ) )
+            Show( m_frame.get(), aTimeline, want );
+    }
+
     nlohmann::json Status()
     {
         if( !Shown() )
@@ -176,6 +199,7 @@ public:
                  { "crowded_places", m_series[step()] },
                  { "playing", m_playing },
                  { "rate", m_rate },
+                 { "note", m_note },
                  { "hidden_board_items", m_hidden.size() },
                  { "draw_us", m_drawUs },
                  { "draws", m_draws } };
@@ -357,7 +381,83 @@ private:
         case WXK_UP: SetRate( m_rate * 2 ); Redraw(); return true;
         case WXK_DOWN: SetRate( m_rate / 2 ); Redraw(); return true;
         case WXK_ESCAPE: CallAfter( [this]() { Hide(); } ); return true;   // not inside the handler being removed
+        case '[': switchLane( -1 ); return true;
+        case ']': switchLane( 1 ); return true;
+        case 'r':
+        case 'R': CallAfter( [this]() { branchHere(); } ); return true;   // a route: not inside the key handler
         default: return false;
+        }
+    }
+
+    /// @brief The previous / next lane of the run that is still there
+    void switchLane( int aBy )
+    {
+        const int n = (int) m_timeline->LaneCount();
+
+        for( int k = 1; k < n; ++k )
+        {
+            const int lane = ( ( m_lane + aBy * k ) % n + n ) % n;
+
+            if( !m_timeline->Lane( lane ).deleted && !m_timeline->Lane( lane ).steps.empty() )
+            {
+                m_timeline->shownLane = lane;
+                Show( m_frame.get(), m_timeline, lane );
+                return;
+            }
+        }
+    }
+
+    /// @brief r: the shown lane goes on from the shown step as a new branch (pcb_route {from}),
+    /// then the replay shows the branch; the outcome in the strip, no dialog
+    void branchHere()
+    {
+        if( !Shown() )
+            return;
+
+        std::shared_ptr<GRID_TIMELINE> t = m_timeline;
+
+        if( t != GridTimelineLast() || t->live )
+        {
+            m_note = t->live ? "the route is still running" : "only the last recorded run branches";
+            Redraw();
+            return;
+        }
+
+        const size_t   at = step();
+        const auto     started = CLOCK::now();
+        nlohmann::json args = { { "from", { { "run", t->run }, { "lane", m_lane }, { "step", at } } } };
+
+        m_note = "branching from step " + std::to_string( at + 1 ) + " ...";
+        Redraw();
+        restoreBoard();
+
+        KOPENAPI_RESULT r = KopenapiInvokeInProcess( m_ctx, "pcb_route", args );
+
+        if( !Shown() || !m_frame->GetCanvas() )
+            return;
+
+        hideBoardCopper();
+
+        if( r.status != 200 )
+        {
+            m_note = "branch failed: " + r.body.value( "error", nlohmann::json::object() ).value( "message", std::string() );
+            Redraw();
+            return;
+        }
+
+        const nlohmann::json& b = r.body["grid"]["timeline"]["branch"];
+        const int             lane = b.value( "lane", -1 );
+        char                  note[200];
+        snprintf( note, sizeof( note ), "%s from step %zu: joined %d of %d, %.1f s", b.value( "variant", std::string() ).c_str(),
+                  at + 1, r.body.value( "routed", 0 ), r.body.value( "connections", 0 ),
+                  std::chrono::duration<double>( CLOCK::now() - started ).count() );
+        m_note = note;
+
+        if( lane >= 0 && lane < (int) t->LaneCount() )
+        {
+            t->shownLane = lane;
+            Show( m_frame.get(), t, lane );
+            Seek( (double) t->Lane( lane ).steps.size() - 1 );
         }
     }
 
@@ -436,6 +536,8 @@ private:
     void drawStrip( KIGFX::VIEW_OVERLAY& aOv, double aPx, const BOX2D& aVp );
 
     wxWeakRef<PCB_EDIT_FRAME>                        m_frame;
+    KOPENAPI_CONTEXT                                 m_ctx;
+    std::string                                      m_note;    ///< the last branch's outcome, in the strip
     std::shared_ptr<GRID_TIMELINE>                   m_timeline;
     int                                              m_lane = 0;
     double                                           m_at = 0;
@@ -472,11 +574,14 @@ void REPLAY::drawStrip( KIGFX::VIEW_OVERLAY& aOv, double aPx, const BOX2D& aVp )
     auto xOf = [&]( double k ) { return x0 + ( x1 - x0 ) * k / std::max<size_t>( 1, n - 1 ); };
 
     const GRID_TIMELINE& t = *m_timeline;
-    wxString text = wxString::Format( wxS( "%s   %s   round %d   step %zu / %zu   %s   crowded places %d   %.1f s   "
-                                           "%s %.0f steps/s" ),
-                                      wxString::FromUTF8( L.name ), GRID_TIMELINE::STAGES[s.stage], (int) s.round,
-                                      step() + 1, n, wxString::FromUTF8( t.netNames[s.net] ), m_series[step()],
+    wxString text = wxString::Format( wxS( "%s (lane %d of %zu)   %s   round %d   step %zu / %zu   %s   crowded places %d   "
+                                           "%.1f s   %s %.0f steps/s" ),
+                                      wxString::FromUTF8( L.name ), m_lane + 1, t.LaneCount(), GRID_TIMELINE::STAGES[s.stage],
+                                      (int) s.round, step() + 1, n, wxString::FromUTF8( t.netNames[s.net] ), m_series[step()],
                                       s.ms / 1000.0, m_playing ? wxS( "playing" ) : wxS( "paused" ), m_rate );
+
+    if( !m_note.empty() )
+        text += wxS( "   |   " ) + wxString::FromUTF8( m_note );
 
     // the GAL keeps the first of equally deep shapes: the top first
     const double glyph = 13 * aPx;
@@ -521,6 +626,26 @@ void REPLAY::drawStrip( KIGFX::VIEW_OVERLAY& aOv, double aPx, const BOX2D& aVp )
     {
         if( L.steps[k].stage != L.steps[k - 1].stage )
             aOv.Line( VECTOR2D( xOf( (double) k ), plotTop ), VECTOR2D( xOf( (double) k ), plotBottom ) );
+    }
+
+    // branch points: where branches of this lane go off (cyan), where this branch left its parent (yellow)
+    aOv.SetLineWidth( 2 * aPx );
+
+    for( size_t k = 0; k < t.LaneCount(); ++k )
+    {
+        const GRID_LANE& b = t.Lane( k );
+
+        if( b.parent == m_lane && !b.deleted && b.parentStep < n )
+        {
+            aOv.SetStrokeColor( COLOR4D( 0.3, 0.9, 1.0, 1 ) );
+            aOv.Line( VECTOR2D( xOf( (double) b.parentStep ), plotTop - 4 * aPx ), VECTOR2D( xOf( (double) b.parentStep ), plotBottom ) );
+        }
+    }
+
+    if( L.parent >= 0 && L.parentStep < n )
+    {
+        aOv.SetStrokeColor( COLOR4D( 1.0, 0.85, 0.2, 1 ) );
+        aOv.Line( VECTOR2D( xOf( (double) L.parentStep ), plotTop - 4 * aPx ), VECTOR2D( xOf( (double) L.parentStep ), plotBottom ) );
     }
 
     aOv.SetIsFill( true );
@@ -682,7 +807,7 @@ KOPENAPI_RESULT h_pcb_route_replay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         if( !t || t->LaneCount() == 0 )
             return KOPENAPI_RESULT::Error( 404, "no recorded grid route in this process (pcb_route {engine: 'grid', record: true})" );
 
-        int lane = t->winner >= 0 ? t->winner : 0;
+        int lane = t->DefaultLane();
 
         if( aArgs.contains( "lane" ) )
         {
@@ -699,9 +824,10 @@ KOPENAPI_RESULT h_pcb_route_replay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 return KOPENAPI_RESULT::Error( 404, "no lane " + l.dump() );
         }
 
-        if( t->Lane( lane ).steps.empty() )
-            return KOPENAPI_RESULT::Error( 404, "the lane has no steps" );
+        if( t->Lane( lane ).deleted || t->Lane( lane ).steps.empty() )
+            return KOPENAPI_RESULT::Error( 404, "the lane has no steps (or was deleted)" );
 
+        r.SetContext( aCtx );
         r.Show( frame, t, lane );
     }
 
@@ -747,6 +873,12 @@ void GridReplayAdvance()
 }
 
 
+void GridReplayFollow( const std::shared_ptr<GRID_TIMELINE>& aTimeline )
+{
+    replay().Follow( aTimeline );
+}
+
+
 KOPENAPI_REGISTER( "pcb_route_replay",
                    "EXPERIMENTAL. The last recorded grid route (pcb_route {engine: 'grid', record: true}) replayed "
                    "over the board editor's canvas: every net's copper at the step in its layer's colour, the "
@@ -755,11 +887,15 @@ KOPENAPI_REGISTER( "pcb_route_replay",
                    "with the crowded places over the run. The board's copper of those nets is hidden from the "
                    "view while shown; the board is not changed. verb show (lane, at), seek (at | delta), "
                    "play (rate: steps per second), pause, hide, status. Keys while shown: space play / pause, "
-                   "left / right a step (shift: 10), home / end, up / down speed, escape closes; drag on the "
-                   "strip to seek. Shown while the route runs (live) it follows the head when it is there. GUI only",
+                   "left / right a step (shift: 10), home / end, up / down speed, [ / ] the previous / next lane, "
+                   "r branches the shown lane from the shown step (pcb_route {from}; the board gets the branch's "
+                   "copper, one undo step) and shows the branch, escape closes; drag on the strip to seek. The "
+                   "strip marks where branches go off this lane (cyan) and where this branch left its parent "
+                   "(yellow), the last branch's outcome in its text. Shown while the route runs (live) it follows "
+                   "the head when it is there. GUI only",
                    R"json({"type":"object","properties":{
                         "verb":{"type":"string","enum":["show","seek","play","pause","hide","status"],"default":"show"},
-                        "lane":{"description":"lane index or variant name; default the winner"},
+                        "lane":{"description":"lane index or variant name; default the lane switched to (pcb_route_timeline branch_switch), else the winner"},
                         "at":{"type":"integer","description":"step; negative from the end"},
                         "delta":{"type":"number","description":"steps to move from the current one"},
                         "rate":{"type":"number","description":"steps per second while playing; default the run in 20 s"}}})json"_json,

@@ -58,6 +58,8 @@ public:
     int                    parent = -1;
     size_t                 parentStep = 0;
     bool                   running = false;   ///< steps are being added
+    bool                   stopped = false;   ///< the route was stopped before the lane's stages ended
+    bool                   deleted = false;   ///< a branch taken out (branch_delete): its index stays, its data gone
 
     /// @brief Ends found walled in by fixed copper: from the search before step `step`
     struct DEAD
@@ -98,6 +100,9 @@ public:
 
     size_t Bytes() const;
 
+    /// @brief Frees everything the lane holds (a branch deleted)
+    void Release();
+
     /// @brief Held by the lane's variant while it adds a step or a round, and by a reader while the
     /// route runs (GRID_TIMELINE::live)
     std::recursive_mutex& Mutex() const { return *m_mutex; }
@@ -129,6 +134,7 @@ struct GRID_TIMELINE
     std::string               args;          ///< the route call's arguments (JSON), a branch's too
     long                      appliedSeq = 0; ///< the edit history entry that put a lane's copper on the board
     int                       appliedLane = -1;
+    std::atomic<int>          shownLane{ -1 }; ///< branch_switch: the lane frame / the replay show by default
     std::atomic<bool>         live{ false }; ///< the route is running: steps are added; the caller clears it
                                              ///< once the route's copper is on the board
 
@@ -136,6 +142,10 @@ struct GRID_TIMELINE
     const GRID_LANE& Lane( size_t aLane ) const;
     GRID_LANE&       Lane( size_t aLane );
     size_t           AddLane();
+
+    /// @brief The lane shown when none is asked for: the switched-to one, else the winner (lane 0
+    /// while live)
+    int              DefaultLane() const;
 
     GRID_NET_RESULT Geometry( const GRID_PATH& aPath ) const;
     size_t          Bytes() const;
@@ -165,3 +175,7 @@ std::shared_ptr<GRID_TIMELINE> GridTimelineLast();
 /// @brief The editor's replay of a running route moves on (from the route's progress, main thread):
 /// a plain call holds the main loop, so the replay's own timer does not run meanwhile
 void                           GridReplayAdvance();
+
+/// @brief The editor's replay after branch_switch / branch_delete: it shows the timeline's default
+/// lane when its own is gone or another was switched to (main thread)
+void                           GridReplayFollow( const std::shared_ptr<GRID_TIMELINE>& aTimeline );

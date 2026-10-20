@@ -1367,6 +1367,9 @@ public:
 
     bool Abandoned() const { return m_abandoned; }
 
+    /// @brief Run ended before its stages did, not by another variant's win (a cancelled job)
+    bool Halted() const { return m_stage != STAGE_DONE && !m_abandoned; }
+
     /// @brief After Run: every end joined, no net dropped
     bool Complete() const
     {
@@ -3232,6 +3235,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     {
         GRID_LANE& lane = branchOf->Lane( result.branchLane );
         lane.running = false;
+        lane.stopped = runs[0]->Halted();
         result.restoreMs = runs[0]->RestoreMs();
 
         if( runs[0]->Diverged() )
@@ -3250,6 +3254,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         {
             result.timeline->lanes[k].abandoned = runs[k]->Abandoned();
             result.timeline->lanes[k].running = false;
+            result.timeline->lanes[k].stopped = runs[k]->Halted();
         }
     }
 

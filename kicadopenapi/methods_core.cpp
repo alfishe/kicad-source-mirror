@@ -484,9 +484,12 @@ KOPENAPI_REGISTER( "job_get",
 
 KOPENAPI_REGISTER( "job_cancel",
                    "Ask a job to stop: a queued one never runs, a running one stops at its next safe point and "
-                   "finishes with what it has done (job_get: state cancelled, its result)",
+                   "finishes with what it has done (job_get: state cancelled, its result). keep: true stops "
+                   "it without applying anything and keeps its state: a grid route's timeline stays with every "
+                   "lane stopped at its last step, to branch from (pcb_route {from})",
                    R"json({"type":"object","required":["job_id"],"properties":{
-                        "job_id":{"type":"string"}}})json"_json,
+                        "job_id":{"type":"string"},
+                        "keep":{"type":"boolean","default":false}}})json"_json,
                    false, h_job_served );
 
 KOPENAPI_REGISTER( "job_pause",

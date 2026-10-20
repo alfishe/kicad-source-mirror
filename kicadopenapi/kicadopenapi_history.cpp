@@ -1,4 +1,6 @@
 #include "kicadopenapi_history.h"
+#include "kicadopenapi_jobs.h"
+#include "kicadopenapi_journal.h"
 
 #include <platform.h>
 
@@ -643,3 +645,31 @@ KOPENAPI_REGISTER( "rollback",
                         "checkpoint":{"type":"string"},
                         "steps":{"type":"integer","default":1}}})json"_json,
                    false, h_rollback, 300 );
+
+
+KOPENAPI_RESULT KopenapiInvokeInProcess( KOPENAPI_CONTEXT& aCtx, const std::string& aName, const nlohmann::json& aArgs )
+{
+    const std::optional<KOPENAPI_METHOD> method = KOPENAPI_REGISTRY::Get().Find( aName );
+
+    if( !method )
+        return KOPENAPI_RESULT::Error( 404, "no method " + aName );
+
+    const bool editing = KOPENAPI_REGISTRY::Get().IsEditing( aName );
+
+    if( editing && ( KopenapiJobYielding() || !KOPENAPI_JOBS::Get().Busy().empty() ) )
+        return KOPENAPI_RESULT::Error( 409, "a call or job is running and owns the documents" );
+
+    KOPENAPI_JOURNAL::SCOPED_OPERATION scope( "ui:" + aName );
+    KopenapiCallBegin( aName );
+
+    if( editing )
+        KOPENAPI_HISTORY::Get().BeforeEdit( aCtx, aName, aArgs );
+
+    KOPENAPI_RESULT result = method->handler( aCtx, aArgs );
+
+    if( editing )
+        KOPENAPI_HISTORY::Get().AfterEdit( aCtx, result );
+
+    KopenapiCallEnd();
+    return result;
+}

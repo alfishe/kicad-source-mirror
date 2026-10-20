@@ -221,6 +221,25 @@ size_t GRID_LANE::Bytes() const
 }
 
 
+void GRID_LANE::Release()
+{
+    std::lock_guard<std::recursive_mutex> lock( *m_mutex );
+    deleted = true;
+    std::vector<GRID_STEP>().swap( steps );
+    std::vector<GRID_PATH>().swap( paths );
+    std::vector<DEAD>().swap( dead );
+    std::vector<std::vector<uint32_t>>().swap( histByRound );
+    std::vector<std::vector<uint16_t>>().swap( heatByRound );
+    std::vector<std::vector<uint32_t>>().swap( conflictSets );
+    std::vector<int>().swap( order );
+    std::vector<int>().swap( direction );
+    std::vector<uint32_t>().swap( m_table );
+    std::vector<std::vector<uint32_t>>().swap( m_keys );
+    std::unordered_map<uint64_t, std::vector<uint32_t>>().swap( m_byHash );
+    std::unordered_map<uint64_t, std::vector<uint32_t>>().swap( m_conflictsByHash );
+}
+
+
 GRID_NET_RESULT GRID_TIMELINE::Geometry( const GRID_PATH& aPath ) const
 {
     return GridPathGeometry( grid, cells, layers, aPath.paths, aPath.reached );
@@ -293,6 +312,17 @@ GRID_LANE& GRID_TIMELINE::Lane( size_t aLane )
 {
     std::lock_guard<std::mutex> lock( m_lanesMutex );
     return lanes[aLane];
+}
+
+
+int GRID_TIMELINE::DefaultLane() const
+{
+    const int shown = shownLane;
+
+    if( shown >= 0 && shown < (int) LaneCount() && !Lane( shown ).deleted )
+        return shown;
+
+    return live ? 0 : std::max( winner, 0 );
 }
 
 

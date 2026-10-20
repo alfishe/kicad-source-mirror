@@ -1529,7 +1529,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             branch.lane = (int) k;
     }
 
-    if( branch.lane < 0 )
+    if( branch.lane < 0 || t->Lane( branch.lane ).deleted )
         return KOPENAPI_RESULT::Error( 404, "from.lane: no such lane in run " + std::to_string( t->run ) );
 
     const long long step = from["step"].get<long long>();
@@ -3250,7 +3250,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                     { "variants", variants } } );
         };
 
-        params.held = []( uint64_t& aSerial, std::string& aBy, int& aN ) { return KopenapiJobHeld( &aSerial, &aBy, &aN ); };
+        // a cancelled job stops every variant at its next net, not only at the next progress report
+        params.held = [&cancel]( uint64_t& aSerial, std::string& aBy, int& aN )
+        {
+            if( KopenapiJobCancelled() )
+            {
+                cancel = true;
+                return false;
+            }
+
+            return KopenapiJobHeld( &aSerial, &aBy, &aN );
+        };
 
         // the timeline readable (pcb_route_timeline, the replay) while the variants add to it
         params.timelineStarted = [&]( const std::shared_ptr<GRID_TIMELINE>& aTimeline )
@@ -3291,6 +3301,28 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
             }
         } liveEnd{ gr.timeline };
+
+        // job_cancel {keep}: nothing on the board, the lanes stay where they stopped to branch from
+        if( KopenapiJobKeep() )
+        {
+            nlohmann::json lanes = nlohmann::json::array();
+
+            if( gr.timeline )
+            {
+                for( size_t k = 0; k < gr.timeline->LaneCount(); ++k )
+                {
+                    const GRID_LANE& lane = gr.timeline->Lane( k );
+
+                    if( lane.stopped )
+                        lanes.push_back( { { "lane", k }, { "variant", lane.name }, { "steps", lane.steps.size() } } );
+                }
+            }
+
+            return KOPENAPI_RESULT::Ok( { { "stopped", true }, { "applied", false },
+                                          { "timeline", gr.timeline ? nlohmann::json{ { "run", gr.timeline->run },
+                                                                                      { "stopped_lanes", lanes } }
+                                                                    : nlohmann::json() } } );
+        }
 
         if( !gr.error.empty() )
             return KOPENAPI_RESULT::Error( 409, gr.error + ( aBranch ? "; " + aBranch->board : std::string() ) );
@@ -6166,7 +6198,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "pf_start":{"type":"number","default":1.0,"description":"grid: price of sharing a cell in the first negotiation round"},
                         "pf_growth":{"type":"number","default":1.6,"description":"grid: how much that price grows each round (more: fewer rounds, longer detours)"},
                         "record":{"type":"boolean","default":false,"description":"grid: keep every variant's steps for pcb_route_timeline"},
-                        "from":{"type":"object","description":"grid, a branch: the recorded lane goes on after a step as a new lane of the same run (pcb_route_timeline status: parent, parent_step), with the run's own arguments; the copper the run (or its last branch) put on the board is rolled back first when that is the last edit, else the board must be as the run found it (409). Up to the step the recorded nets are taken without searching, so the branch's steps equal the recorded ones until it searches on","properties":{"run":{"type":"integer"},"lane":{"description":"index or variant name; default the lane on the board"},"step":{"type":"integer"}},"required":["step"]},
+                        "from":{"type":"object","description":"grid, a branch: the recorded lane goes on after a step as a new lane of the same run (pcb_route_timeline status: parent, parent_step), with the run's own arguments; the copper the run (or its last branch) put on the board is rolled back first when that is the last edit, else the board must be as the run found it (409). Up to the step the recorded nets are taken without searching, so the branch's steps equal the recorded ones until it searches on. A grid route stopped with job_cancel {keep: true} goes on from a stopped lane's last step","properties":{"run":{"type":"integer"},"lane":{"description":"index or variant name; default the lane on the board"},"step":{"type":"integer"}},"required":["step"]},
                         "schedule":{"type":"string","enum":["fixed","adaptive","adaptive_hist"],"default":"fixed","description":"grid, EXPERIMENTAL: negotiation schedule of the built-in variants (adaptive: growth 1.3 while the crowded nets fall, 2.0 when they stall; adaptive_hist: also twice the history on places fought over 3 rounds running)"},
                         "strategies":{"type":"array","description":"grid, EXPERIMENTAL: the variants to race instead of the built-ins: 'short_first_hv@1.0x1.6/a1.5/d0.9/r2', 'fine_first@adaptive', or {order, directions, pf_start, pf_growth, astar, schedule, hist_decay, reroute_recent}","items":{}},
                         "hist_decay":{"type":"number","default":1.0,"description":"grid, EXPERIMENTAL: the history cost of places not fought over in a round is multiplied by this (1: kept for good)"},
