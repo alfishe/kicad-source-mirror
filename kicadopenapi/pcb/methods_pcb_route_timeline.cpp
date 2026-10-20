@@ -13,11 +13,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <mutex>
 
 
 namespace
 {
 
+// set on the main thread, read there and by event streams on HTTP threads
+std::mutex                     g_lastMutex;
 std::shared_ptr<GRID_TIMELINE> g_last;
 
 double mm( double aIU )
@@ -104,11 +107,10 @@ bool stepArg( const nlohmann::json& aArgs, const char* aKey, const GRID_LANE& aL
 }
 
 
-KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+/// @brief Any thread: reads the lanes under their locks; the winner only once the route has ended
+KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nlohmann::json& aArgs )
 {
-    (void) aCtx;
-    const auto                     started = std::chrono::steady_clock::now();
-    std::shared_ptr<GRID_TIMELINE> t = g_last;
+    const auto started = std::chrono::steady_clock::now();
 
     if( !t )
         return KOPENAPI_RESULT::Error( 404, "no grid route recorded in this process: pcb_route {engine: 'grid', record: true}" );
@@ -121,6 +123,7 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 
     if( verb == "status" )
     {
+        const bool     live = t->live;   // the winner and abandoned lanes are known once ended
         nlohmann::json lanes = nlohmann::json::array();
 
         for( size_t k = 0; k < t->lanes.size(); ++k )
@@ -128,8 +131,8 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
             const GRID_LANE&                      l = t->lanes[k];
             std::lock_guard<std::recursive_mutex> lock( l.Mutex() );
             lanes.push_back( { { "lane", k }, { "variant", l.name }, { "steps", l.steps.size() }, { "paths", l.paths.size() },
-                               { "rounds", l.histByRound.size() }, { "abandoned", l.abandoned },
-                               { "winner", (int) k == t->winner },
+                               { "rounds", l.histByRound.size() }, { "abandoned", !live && l.abandoned },
+                               { "winner", !live && (int) k == t->winner },
                                { "ms", l.steps.empty() ? 0.0 : std::round( l.steps.back().ms ) },
                                { "bytes", l.Bytes() } } );
         }
@@ -149,17 +152,22 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 
             return names;
         }();
-        out["winner"] = t->winner;
-        out["live"] = t->live.load();
+        out["winner"] = live ? -1 : t->winner;
+        out["live"] = live;
         out["bytes"] = t->Bytes();
         out["lanes"] = lanes;
         out["stages"] = GRID_TIMELINE::STAGES;
         return KOPENAPI_RESULT::Ok( out );
     }
 
-    int lane = std::max( t->winner, 0 );
+    int lane = 0;
 
-    if( aArgs.contains( "lane" ) )
+    if( !aArgs.contains( "lane" ) )
+    {
+        if( !t->live )
+            lane = std::max( t->winner, 0 );
+    }
+    else
     {
         if( aArgs["lane"].is_number_integer() )
         {
@@ -313,19 +321,149 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     return KOPENAPI_RESULT::Ok( out );
 }
 
+
+KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    (void) aCtx;
+    return timelineQuery( GridTimelineLast(), aArgs );
+}
+
+
+/// @brief Event stream of a route's timeline: 'start' when the run is there, 'frame' (verb frame
+/// from the step sent before) whenever the lane's steps grow, 'end' once the route has ended
+KOPENAPI_RESULT openTimelineEvents( const nlohmann::json& aArgs, KOPENAPI_EVENT_POLL& aPoll )
+{
+    struct STATE
+    {
+        std::shared_ptr<GRID_TIMELINE>        timeline;
+        int                                   afterRun = -1;
+        nlohmann::json                        lane;
+        bool                                  geometry = true;
+        bool                                  heat = false;
+        size_t                                sent = SIZE_MAX;
+        std::chrono::steady_clock::time_point waitUntil;
+    };
+
+    auto st = std::make_shared<STATE>();
+
+    if( aArgs.contains( "after_run" ) && !aArgs["after_run"].is_number_integer() )
+        return KOPENAPI_RESULT::Error( 400, "after_run: a run id" );
+
+    if( aArgs.contains( "lane" ) && !aArgs["lane"].is_number_integer() && !aArgs["lane"].is_string() )
+        return KOPENAPI_RESULT::Error( 400, "lane: index or variant name" );
+
+    if( aArgs.contains( "since" ) && !aArgs["since"].is_number_integer() )
+        return KOPENAPI_RESULT::Error( 400, "since: a step" );
+
+    st->afterRun = aArgs.value( "after_run", -1 );
+    st->lane = aArgs.value( "lane", nlohmann::json( 0 ) );
+    st->geometry = aArgs.value( "geometry", true );
+    st->heat = aArgs.value( "heat", false );
+    st->waitUntil = std::chrono::steady_clock::now() + std::chrono::seconds( std::clamp( aArgs.value( "wait_s", 60 ), 0, 3600 ) );
+
+    if( aArgs.contains( "since" ) && aArgs["since"].get<long long>() >= 0 )
+        st->sent = aArgs["since"].get<size_t>();
+
+    aPoll = [st]( std::vector<KOPENAPI_EVENT>& aOut )
+    {
+        if( !st->timeline )
+        {
+            std::shared_ptr<GRID_TIMELINE> t = GridTimelineLast();
+
+            if( !t || t->run <= st->afterRun )
+            {
+                if( std::chrono::steady_clock::now() < st->waitUntil )
+                    return true;
+
+                aOut.push_back( { "end", { { "reason", "no run recorded after run " + std::to_string( st->afterRun ) } } } );
+                return false;
+            }
+
+            KOPENAPI_RESULT status = timelineQuery( t, { { "verb", "status" } } );
+            nlohmann::json  lanes = status.body["lanes"];
+            int             lane = -1;
+
+            for( const nlohmann::json& l : lanes )
+            {
+                if( l["lane"] == st->lane || l["variant"] == st->lane )
+                    lane = l["lane"].get<int>();
+            }
+
+            if( lane < 0 )
+            {
+                aOut.push_back( { "error", { { "error", "no such lane in run " + std::to_string( t->run ) } } } );
+                return false;
+            }
+
+            st->timeline = t;
+            st->lane = lane;
+            status.body.erase( "lanes" );
+            status.body.erase( "winner" );
+            status.body.erase( "bytes" );
+            status.body["lane"] = lane;
+            status.body["variant"] = lanes[lane]["variant"];
+            aOut.push_back( { "start", status.body } );
+        }
+
+        const GRID_TIMELINE& t = *st->timeline;
+        const GRID_LANE&     L = t.lanes[st->lane.get<int>()];
+        const bool           live = t.live;   // before the steps: once ended, every step is in
+        size_t               steps = 0;
+
+        {
+            std::lock_guard<std::recursive_mutex> lock( L.Mutex() );
+            steps = L.steps.size();
+        }
+
+        if( steps && ( st->sent == SIZE_MAX || st->sent < steps - 1 ) )
+        {
+            nlohmann::json q = { { "verb", "frame" }, { "lane", st->lane }, { "at", steps - 1 },
+                                 { "geometry", st->geometry }, { "heat", st->heat } };
+
+            if( st->sent != SIZE_MAX )
+                q["since"] = st->sent;
+
+            KOPENAPI_RESULT frame = timelineQuery( st->timeline, q );
+            aOut.push_back( { frame.status == 200 ? "frame" : "error", frame.body } );
+            st->sent = steps - 1;
+        }
+
+        if( live )
+            return true;
+
+        aOut.push_back( { "end", { { "run", t.run }, { "lane", st->lane }, { "steps", steps }, { "winner", t.winner },
+                                   { "abandoned", L.abandoned } } } );
+        return false;
+    };
+
+    return KOPENAPI_RESULT::Ok( nlohmann::json::object() );
+}
+
 } // namespace
 
 
 void GridTimelineKeep( std::shared_ptr<GRID_TIMELINE> aTimeline )
 {
+    std::lock_guard<std::mutex> lock( g_lastMutex );
     g_last = std::move( aTimeline );
 }
 
 
 std::shared_ptr<GRID_TIMELINE> GridTimelineLast()
 {
+    std::lock_guard<std::mutex> lock( g_lastMutex );
     return g_last;
 }
+
+
+KOPENAPI_REGISTER_EVENT_TOPIC( "pcb_route_timeline",
+                               "a grid route's timeline (pcb_route record: true) as it grows: 'start' (run, lane, "
+                               "variant, nets, grid) once a run newer than after_run (default: any) is recorded "
+                               "(waits wait_s, default 60), 'frame' (pcb_route_timeline verb frame: the nets changed "
+                               "since the step sent before, or since 'since') whenever the lane's steps grow, 'end' "
+                               "(winner, steps) when the route has ended. lane: index or variant name, default 0; "
+                               "geometry (default true), heat (default false) as in pcb_route_timeline",
+                               openTimelineEvents );
 
 
 KOPENAPI_REGISTER( "pcb_route_timeline",
@@ -342,7 +480,8 @@ KOPENAPI_REGISTER( "pcb_route_timeline",
                    "expanded / ms / crowded_tiles per step; markers: stage and "
                    "round starts, dropped nets, the end (or the head while live). lane: index or variant name, default the "
                    "winner (lane 0 while live). The timeline is readable while the route runs (live: true; "
-                   "steps grow; poll frame {since} from the client's step)",
+                   "steps grow; poll frame {since} from the client's step, or over REST receive the frames "
+                   "pushed: GET /api/v1/events?topic=pcb_route_timeline, Server-Sent Events)",
                    R"json({"type":"object","properties":{
                         "verb":{"type":"string","enum":["status","frame","series","markers"],"default":"status"},
                         "run":{"type":"integer","description":"the run id from status (only the last run is kept)"},

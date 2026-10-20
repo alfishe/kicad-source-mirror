@@ -655,3 +655,62 @@ std::string KOPENAPI_JOBS::Busy() const
 
     return std::string();
 }
+
+
+namespace
+{
+
+KOPENAPI_RESULT openJobEvents( const nlohmann::json& aArgs, KOPENAPI_EVENT_POLL& aPoll )
+{
+    const std::string id = aArgs.value( "job_id", nlohmann::json() ).is_string() ? aArgs["job_id"].get<std::string>() : std::string();
+    std::shared_ptr<JOB> job;
+
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+        auto                        it = g_jobs.find( idOf( id ) );
+
+        if( it == g_jobs.end() )
+            return KOPENAPI_RESULT::Error( 404, "no job '" + id + "' (the last " + std::to_string( KEEP ) + " are kept)" );
+
+        job = it->second;
+    }
+
+    auto last = std::make_shared<nlohmann::json>();
+
+    aPoll = [job, last]( std::vector<KOPENAPI_EVENT>& aOut )
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+
+        if( job->Finished() )
+        {
+            aOut.push_back( { "end", describe( *job, true ) } );
+            return false;
+        }
+
+        nlohmann::json j = describe( *job, false );
+        nlohmann::json key = j;
+        key.erase( "elapsed_s" );
+        key.erase( "queued_s" );
+
+        if( key.contains( "progress" ) )
+            key["progress"].erase( "phase_eta_s" );
+
+        if( key != *last )
+        {
+            *last = std::move( key );
+            aOut.push_back( { "progress", std::move( j ) } );
+        }
+
+        return true;
+    };
+
+    return KOPENAPI_RESULT::Ok( nlohmann::json::object() );
+}
+
+} // namespace
+
+
+KOPENAPI_REGISTER_EVENT_TOPIC( "job",
+                               "a job's progress (job_id): 'progress' events as job_get without the result when "
+                               "the phase, counts, pause or step change, then 'end' with the result",
+                               openJobEvents );

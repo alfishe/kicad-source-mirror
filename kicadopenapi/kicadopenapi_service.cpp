@@ -676,6 +676,32 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::openApiJson() const
                 { "202", { { "description", "Notification accepted" } } } } } } }
     };
 
+    {
+        json topics = json::array();
+        std::string described;
+
+        for( const auto& [name, topic] : KOPENAPI_REGISTRY::Get().EventTopics() )
+        {
+            topics.push_back( name );
+            described += "; " + name + ": " + topic.summary;
+        }
+
+        paths["/api/v1/events"] = {
+            { "get",
+              { { "operationId", "events" },
+                { "summary", "Server-Sent Events (REST only, not MCP): a topic's changes pushed as they "
+                             "happen, coalesced to the latest state at most ~30 per second; the other query "
+                             "parameters are the topic's (JSON values, else strings)" + described },
+                { "parameters",
+                  { { { "name", "topic" }, { "in", "query" }, { "required", true },
+                      { "schema", { { "type", "string" }, { "enum", topics } } } } } },
+                { "responses",
+                  { { "200", { { "description", "text/event-stream" },
+                               { "content", { { "text/event-stream", { { "schema", { { "type", "string" } } } } } } } } },
+                    { "404", errorResponse } } } } }
+        };
+    }
+
     if( shutdownHandler )
     {
         paths["/api/v1/shutdown"] = {
@@ -1321,6 +1347,121 @@ void KICAD_OPENAPI_SERVICE::IMPL::handleMcp( const httplib::Request& aReq,
 }
 
 
+/// @brief GET /api/v1/events?topic=…: Server-Sent Events.  The topic's poll runs on this worker
+/// thread at most ~30 times a second, so a burst of changes reaches the client as its latest
+/// state; a comment every 15 s keeps idle proxies and clients from timing out
+static void serveEvents( const httplib::Request& aReq, httplib::Response& aRes,
+                         const std::shared_ptr<std::atomic<bool>>& aAlive )
+{
+    const std::string                                 name = aReq.get_param_value( "topic" );
+    const std::map<std::string, KOPENAPI_EVENT_TOPIC> topics = KOPENAPI_REGISTRY::Get().EventTopics();
+    auto                                              it = topics.find( name );
+
+    if( it == topics.end() )
+    {
+        std::string known;
+
+        for( const auto& [topic, unused] : topics )
+            known += ( known.empty() ? "" : ", " ) + topic;
+
+        reply( aRes, KOPENAPI_RESULT::Error( 404, "topic: one of " + known ) );
+        return;
+    }
+
+    nlohmann::json args = nlohmann::json::object();
+
+    for( const auto& [key, value] : aReq.params )
+    {
+        if( key == "topic" )
+            continue;
+
+        nlohmann::json v = nlohmann::json::parse( value, nullptr, false );
+        args[key] = v.is_discarded() ? nlohmann::json( value ) : v;
+    }
+
+    KOPENAPI_EVENT_POLL poll;
+    KOPENAPI_RESULT     opened = it->second.open( args, poll );
+
+    if( opened.status != 200 || !poll )
+    {
+        reply( aRes, opened.status != 200 ? opened : KOPENAPI_RESULT::Error( 500, "the topic opened no stream" ) );
+        return;
+    }
+
+    using CLOCK = std::chrono::steady_clock;
+
+    struct STREAM
+    {
+        KOPENAPI_EVENT_POLL         poll;
+        std::vector<KOPENAPI_EVENT> events;
+        CLOCK::time_point           next;
+        CLOCK::time_point           wrote = CLOCK::now();
+        bool                        first = true;
+    };
+
+    auto stream = std::make_shared<STREAM>();
+    stream->poll = std::move( poll );
+
+    aRes.set_header( "Cache-Control", "no-cache" );
+    aRes.set_chunked_content_provider(
+            "text/event-stream",
+            [stream, aAlive]( size_t, httplib::DataSink& aSink ) -> bool
+            {
+                STREAM& st = *stream;
+                auto    send = [&]( const std::string& aText )
+                {
+                    st.wrote = CLOCK::now();
+                    return aSink.write( aText.data(), aText.size() );
+                };
+
+                if( st.first )
+                {
+                    st.first = false;
+
+                    if( !send( ": open\n\n" ) )
+                        return false;
+                }
+                else
+                {
+                    std::this_thread::sleep_until( st.next );
+                }
+
+                if( !aAlive->load() || !aSink.is_writable() )
+                {
+                    aSink.done();
+                    return true;
+                }
+
+                bool more = false;
+                st.events.clear();
+
+                try
+                {
+                    more = st.poll( st.events );
+                }
+                catch( const std::exception& e )
+                {
+                    st.events.push_back( { "error", { { "error", e.what() } } } );
+                }
+
+                for( const KOPENAPI_EVENT& e : st.events )
+                {
+                    if( !send( "event: " + e.name + "\ndata: " + toJson( e.data ) + "\n\n" ) )
+                        return false;
+                }
+
+                st.next = CLOCK::now() + std::chrono::milliseconds( 33 );
+
+                if( !more )
+                    aSink.done();
+                else if( CLOCK::now() - st.wrote > std::chrono::seconds( 15 ) && !send( ": keep-alive\n\n" ) )
+                    return false;
+
+                return true;
+            } );
+}
+
+
 void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
 {
     // Exclusive listener (per OS, see platform layer): httplib's default SO_REUSEPORT would
@@ -1359,6 +1500,12 @@ void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
                  [this]( const httplib::Request&, httplib::Response& res )
                  {
                      reply( res, KOPENAPI_RESULT::Ok( openApiJson() ) );
+                 } );
+
+    server->Get( "/api/v1/events",
+                 [this]( const httplib::Request& req, httplib::Response& res )
+                 {
+                     serveEvents( req, res, alive );
                  } );
 
     server->Post( "/mcp",

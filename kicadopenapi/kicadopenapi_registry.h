@@ -125,6 +125,28 @@ struct KOPENAPI_METHOD
 };
 
 
+/// @brief One event of a stream (GET /api/v1/events): the SSE event name and its JSON data
+struct KOPENAPI_EVENT
+{
+    std::string    name;
+    nlohmann::json data;
+};
+
+/// @brief An open stream, polled on its HTTP thread (~30 times a second): appends the events due
+/// now (the latest state only) and returns false after the last one.  Never touches documents
+using KOPENAPI_EVENT_POLL = std::function<bool( std::vector<KOPENAPI_EVENT>& aOut )>;
+
+/// @brief A topic opens a stream from the query parameters (HTTP thread); an error refuses it
+using KOPENAPI_EVENT_OPEN = std::function<KOPENAPI_RESULT( const nlohmann::json& aArgs, KOPENAPI_EVENT_POLL& aPoll )>;
+
+struct KOPENAPI_EVENT_TOPIC
+{
+    std::string         name;
+    std::string         summary;
+    KOPENAPI_EVENT_OPEN open;
+};
+
+
 class wxWindow;
 class wxImage;
 
@@ -200,6 +222,11 @@ public:
 
     std::map<std::string, KOPENAPI_HANDLER> ViewBenchmarks() const;
 
+    /// @brief Event streams served at GET /api/v1/events?topic=name
+    static bool AddEventTopic( KOPENAPI_EVENT_TOPIC aTopic );
+
+    std::map<std::string, KOPENAPI_EVENT_TOPIC> EventTopics() const;
+
     /// @brief Kifaces register how their documents roll back (see KOPENAPI_DOC_HISTORY)
     static bool AddDocumentHistory( const std::string& aDomain, KOPENAPI_DOC_HISTORY aHistory );
 
@@ -231,6 +258,7 @@ private:
     std::vector<KOPENAPI_CANVAS_STEADY>         m_canvasSteadies;
     std::map<std::string, KOPENAPI_DOC_HISTORY> m_docHistories;
     std::map<std::string, KOPENAPI_HANDLER>     m_viewBenchmarks;
+    std::map<std::string, KOPENAPI_EVENT_TOPIC> m_eventTopics;
     std::set<std::string>                       m_editing;
 };
 
@@ -253,6 +281,10 @@ private:
 
 #define KOPENAPI_REGISTER_VIEW_BENCHMARK( aDomain, aHandler )                              \
     static const bool kopenapi_view_bench_reg = KOPENAPI_REGISTRY::AddViewBenchmark( aDomain, aHandler )
+
+#define KOPENAPI_REGISTER_EVENT_TOPIC( aName, aSummary, aOpen )                           \
+    static const bool kopenapi_event_topic_reg =                                           \
+            KOPENAPI_REGISTRY::AddEventTopic( KOPENAPI_EVENT_TOPIC{ aName, aSummary, aOpen } )
 
 #define KOPENAPI_REGISTER_CANVAS_CAPTURE( aCapture )                                       \
     static const bool kopenapi_canvas_reg = KOPENAPI_REGISTRY::AddCanvasCapture( aCapture )

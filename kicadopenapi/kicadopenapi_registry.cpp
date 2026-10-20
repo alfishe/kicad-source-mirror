@@ -86,6 +86,23 @@ std::map<std::string, KOPENAPI_HANDLER> KOPENAPI_REGISTRY::ViewBenchmarks() cons
 }
 
 
+bool KOPENAPI_REGISTRY::AddEventTopic( KOPENAPI_EVENT_TOPIC aTopic )
+{
+    KOPENAPI_REGISTRY& reg = Get();
+    std::lock_guard<std::mutex> lock( reg.m_mutex );
+
+    reg.m_eventTopics[aTopic.name] = std::move( aTopic );
+    return true;
+}
+
+
+std::map<std::string, KOPENAPI_EVENT_TOPIC> KOPENAPI_REGISTRY::EventTopics() const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return m_eventTopics;
+}
+
+
 bool KOPENAPI_REGISTRY::MarkEditing( std::initializer_list<const char*> aNames )
 {
     KOPENAPI_REGISTRY& reg = Get();
