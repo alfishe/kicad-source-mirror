@@ -1,6 +1,7 @@
 /// @file kicadopenapi_keepalive.cpp
 /// @brief UI keep-alive during API calls (see kicadopenapi_keepalive.h).
 #include <kicadopenapi_keepalive.h>
+#include <kicadopenapi_jobs.h>
 
 #include <libraries/library_manager.h>
 
@@ -61,7 +62,10 @@ void KopenapiYieldAll()
     wxEventLoopBase* loop = wxEventLoopBase::GetActive();
 
     if( !loop || !loop->IsRunning() )
+    {
+        KopenapiServeQueuedCalls();   // headless: no UI, the API calls only
         return;
+    }
 
     const auto now = std::chrono::steady_clock::now();
 

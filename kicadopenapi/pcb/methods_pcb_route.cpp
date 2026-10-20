@@ -2918,6 +2918,121 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             jobsOfNet[it->second].push_back( index );
         }
 
+        // bundles: from pcb_net_roles (auto), given, or none; members by their order, nets of this call only
+        nlohmann::json bundlesUsed = nlohmann::json::array();
+        const nlohmann::json bundlesArg = aArgs.contains( "bundles" ) ? aArgs["bundles"] : nlohmann::json( "auto" );
+        std::vector<std::pair<std::string, std::vector<std::vector<std::string>>>> bundleList;
+
+        if( bundlesArg.is_string() && bundlesArg.get<std::string>() == "auto" )
+        {
+            if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+            {
+                const KOPENAPI_RESULT r = roles->handler( aCtx, nlohmann::json::object() );
+
+                if( r.status < 400 && r.body.contains( "bundles" ) )
+                {
+                    for( const auto& b : r.body["bundles"] )
+                    {
+                        std::vector<std::vector<std::string>> members;
+
+                        for( const auto& m : b.value( "members", nlohmann::json::array() ) )
+                            members.push_back( m.value( "nets", std::vector<std::string>() ) );
+
+                        bundleList.emplace_back( b.value( "name", std::string() ), std::move( members ) );
+                    }
+                }
+            }
+        }
+        else if( bundlesArg.is_array() )
+        {
+            for( const auto& b : bundlesArg )
+            {
+                std::vector<std::vector<std::string>> members;
+
+                for( const auto& n : b.value( "nets", nlohmann::json::array() ) )
+                    members.push_back( { n.get<std::string>() } );
+
+                bundleList.emplace_back( b.value( "name", std::string() ), std::move( members ) );
+            }
+        }
+        else if( !( bundlesArg.is_string() && bundlesArg.get<std::string>() == "off" ) )
+        {
+            return KOPENAPI_RESULT::Error( 400, "bundles: \"auto\", \"off\" or [{name, nets}]" );
+        }
+
+        // the parts a net joins: only nets between the same parts run side by side
+        auto partsOf = [&]( const GRID_NET& aNet )
+        {
+            std::set<std::string> refs;
+
+            for( BOARD_CONNECTED_ITEM* end : aNet.ends )
+            {
+                if( auto* fp = end->Type() == PCB_PAD_T ? static_cast<PAD*>( end )->GetParentFootprint() : nullptr )
+                    refs.insert( str( fp->GetReference() ) );
+            }
+
+            return refs;
+        };
+
+        for( const auto& [name, members] : bundleList )
+        {
+            std::vector<std::tuple<size_t, int, std::set<std::string>>> found;   // grid net, rank, parts
+            std::map<std::string, int>                                    netsAt;   // part -> nets of the bundle
+
+            for( size_t m = 0; m < members.size(); ++m )
+            {
+                for( const std::string& netName : members[m] )
+                {
+                    NETINFO_ITEM* info = board->FindNet( wxString::FromUTF8( netName ) );
+
+                    if( !info )
+                        continue;
+
+                    if( auto it = gridOf.find( info->GetNetCode() ); it != gridOf.end() && gridNets[it->second].group < 0 )
+                    {
+                        found.emplace_back( it->second, (int) m, partsOf( gridNets[it->second] ) );
+
+                        for( const std::string& ref : std::get<2>( found.back() ) )
+                            netsAt[ref]++;
+                    }
+                }
+            }
+
+            // a part only one net of the bundle reaches (a pull-up, a test point) is a branch, not a run's end
+            std::map<std::string, std::vector<std::pair<size_t, int>>> runs;   // parts -> grid net, rank
+
+            for( const auto& [k, rank, parts] : found )
+            {
+                std::string key;
+
+                for( const std::string& ref : parts )
+                {
+                    if( netsAt[ref] > 1 )
+                        key += ( key.empty() ? "" : "-" ) + ref;
+                }
+
+                runs[key].emplace_back( k, rank );
+            }
+
+            for( const auto& [parts, found] : runs )
+            {
+                if( found.size() < 2 )
+                    continue;
+
+                const int      group = (int) bundlesUsed.size();
+                nlohmann::json nets = nlohmann::json::array();
+
+                for( const auto& [k, rank] : found )
+                {
+                    gridNets[k].group = group;
+                    gridNets[k].rank = rank;
+                    nets.push_back( str( UnescapeString( board->FindNet( gridNets[k].netCode )->GetNetname() ) ) );
+                }
+
+                bundlesUsed.push_back( { { "name", name }, { "parts", parts }, { "nets", nets } } );
+            }
+        }
+
         std::atomic<bool> cancel{ false };
         GRID_PARAMS       params;
         params.layers = layers;
@@ -2926,10 +3041,28 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         params.variants = std::clamp( aArgs.value( "variants", 0 ), 0, 6 );
         params.cell = pcbIUScale.mmToIU( std::clamp( aArgs.value( "cell_mm", 0.0 ), 0.0, 1.0 ) );
         params.viaKeepOut = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_keepout_mm", 5.0 ), 0.0, 20.0 ) );
-        params.progress = [&]( int aRound, int aCrowded )
+        params.viaAway = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_mm", 7.0 ), 0.0, 30.0 ) );
+        params.viaAwayCost = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_cost_mm", 8.0 ), 0.0, 100.0 ) );
+        params.hug = (float) std::clamp( aArgs.value( "hug", 1.0 ), 0.05, 1.0 );
+        params.astar = (float) std::clamp( aArgs.value( "astar", 1.2 ), 1.0, 3.0 );
+        params.progress = [&]( const std::vector<GRID_VARIANT_PROGRESS>& aVariants )
         {
-            return KopenapiJobStep( "grid", aRound, params.maxRounds, std::string(),
-                                    nlohmann::json{ { "nets", gridNets.size() }, { "crowded", aCrowded } } );
+            nlohmann::json variants = nlohmann::json::array();
+            int            finished = 0, crowded = INT_MAX;
+
+            for( const GRID_VARIANT_PROGRESS& v : aVariants )
+            {
+                finished += v.stage == "done" || v.stage == "abandoned";
+                crowded = std::min( crowded, v.crowded );
+                variants.push_back( { { "variant", v.name }, { "stage", v.stage }, { "round", v.round },
+                                      { "crowded", v.crowded }, { "net", v.net }, { "of", v.nets },
+                                      { "expanded", v.expanded } } );
+            }
+
+            // done / total: variants finished; each variant's own stage below
+            return KopenapiJobStep( "grid", finished, (int) aVariants.size(), std::string(),
+                                    nlohmann::json{ { "nets", gridNets.size() }, { "crowded", crowded },
+                                                    { "variants", variants } } );
         };
 
         const GRID_RESULT gr = RouteOnGrid( board, gridNets, params );
@@ -3062,12 +3195,26 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         for( const auto& [code, states] : gr.costliest )
             costliest.push_back( { { "net", netName( code ) }, { "expanded", states } } );
 
-        gridOut = { { "variant", gr.variant }, { "variants_tried", gr.variantsTried }, { "rounds", gr.rounds },
+        gridOut = { { "variant", gr.variant }, { "variants_tried", gr.variantsTried },
+                    { "variants_abandoned", gr.variantsAbandoned },
+                    { "variant_stats", [&]
+                      {
+                          nlohmann::json rows = nlohmann::json::array();
+
+                          for( const GRID_RESULT::VARIANT_STATS& v : gr.variantStats )
+                          {
+                              rows.push_back( { { "variant", v.name }, { "ms", std::round( v.ms ) },
+                                                { "expanded_by_stage", v.expandedByStage }, { "reached", v.reached },
+                                                { "vias", v.vias }, { "abandoned", v.abandoned } } );
+                          }
+
+                          return rows;
+                      }() }, { "rounds", gr.rounds },
                     { "crowded_by_round", gr.crowdedByRound }, { "crowded_at_end", crowdedNets },
                     { "dropped", gr.conflictsLeft }, { "cell_mm", toMm( gr.cell ) }, { "expanded", gr.expanded },
                     { "build_ms", std::round( gr.buildMs ) }, { "route_ms", std::round( gr.routeMs ) },
                     { "guard_ms", std::round( msSince( guardFrom ) ) }, { "rejected", rejected },
-                    { "costliest", costliest }, { "expanded_by_stage", gr.expandedByStage } };
+                    { "costliest", costliest }, { "expanded_by_stage", gr.expandedByStage }, { "bundles", bundlesUsed } };
         board->BuildConnectivity();
     }
 
@@ -5762,6 +5909,11 @@ KOPENAPI_REGISTER( "pcb_route",
                         "max_rounds":{"type":"integer","default":40,"description":"grid: negotiation rounds before the nets still crowding each other are routed apart or left out"},
                         "cell_mm":{"type":"number","default":0,"description":"grid: the cell, 0 a sixth of the finest track pitch (width + clearance) on a 0.025 mm step"},
                         "via_keepout_mm":{"type":"number","default":5,"description":"grid: only a chip's own nets put vias this far around it (pads on four sides, or an array outside its balls) while the board routes; other nets left short and, once all are joined, the via-saving pass may use it; 0 off"},
+                        "bundles":{"description":"grid: \"auto\" (pcb_net_roles' bundles), \"off\", or [{name, nets}] in member order: a bundle's nets between the same parts are routed first, side by side (the answer's grid.bundles: name, parts, nets)","default":"auto"},
+                        "via_away_mm":{"type":"number","default":7,"description":"grid: a signal via nearer a chip's pads (not an array's) than this costs more, linearly to the pads; 0 off"},
+                        "via_away_cost_mm":{"type":"number","default":8,"description":"grid: a via at a chip's pads costs as much more as this length of track"},
+                        "hug":{"type":"number","default":1,"description":"grid: cost factor of a cell beside the copper of the net's own bundle (1: no pull; below 1 so far lowers cohesion, adds vias and time)"},
+                        "astar":{"type":"number","default":1.2,"description":"grid: weight of the distance left in the search (1: cheapest paths; more: fewer states searched, paths a little longer)"},
                         "variants":{"type":"integer","default":0,"description":"grid: variants run in parallel (net order, layer directions), 0 one per two cores up to 6"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); parts with pads inside the ring (exposed pad, BGA) stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},

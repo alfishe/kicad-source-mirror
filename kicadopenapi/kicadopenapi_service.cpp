@@ -280,19 +280,52 @@ public:
     MAIN_GATE_HANDLER()
     {
         Bind( wxEVT_THREAD,
-              []( wxThreadEvent& aEvent )
+              [this]( wxThreadEvent& aEvent )
               {
+                  m_queued--;
+
                   if( auto job = aEvent.GetPayload<std::shared_ptr<std::function<void()>>>() )
                       ( *job )();
               } );
     }
 
+    /// @brief Any thread; counted once queued, so the count never exceeds what is in the queue
+    void Queue( wxThreadEvent* aEvent )
+    {
+        QueueEvent( aEvent );
+        m_queued++;
+    }
+
+    /// @brief Calls queued and not started (ProcessPendingEvents asserts on an empty queue)
+    int Queued() const { return m_queued; }
+
+    /// @brief API calls: also run at the safe points of a long call
     static MAIN_GATE_HANDLER& Get()
     {
         static MAIN_GATE_HANDLER handler;
         return handler;
     }
+
+    /// @brief Jobs: never started inside another call
+    static MAIN_GATE_HANDLER& Jobs()
+    {
+        static MAIN_GATE_HANDLER handler;
+        return handler;
+    }
+
+private:
+    std::atomic<int> m_queued{ 0 };
 };
+
+
+void KopenapiServeQueuedCalls()
+{
+    MAIN_GATE_HANDLER& gate = MAIN_GATE_HANDLER::Get();
+
+    // one event per ProcessPendingEvents; what arrives meanwhile waits for the next safe point
+    for( int left = gate.Queued(); left > 0 && gate.Queued() > 0; --left )
+        gate.ProcessPendingEvents();
+}
 
 
 /// @brief Run aFn on the main (GUI/event-loop) thread and wait for its result on the calling HTTP
@@ -347,7 +380,7 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
 
     auto* event = new wxThreadEvent();
     event->SetPayload( job );
-    MAIN_GATE_HANDLER::Get().QueueEvent( event );
+    MAIN_GATE_HANDLER::Get().Queue( event );
 
     if( aWaker )
         aWaker();
@@ -413,17 +446,27 @@ struct KICAD_OPENAPI_SERVICE::IMPL
                  { "job", KOPENAPI_JOBS::Get().Busy().empty() ? nlohmann::json() : nlohmann::json( KOPENAPI_JOBS::Get().Busy() ) } };
     }
 
-    /// @brief The call holding the main thread (method, running_ms), or null; any thread
+    /// @brief The call holding the main thread (method, running_ms, progress), or null; any thread
     nlohmann::json busyJson() const
     {
         std::lock_guard<std::mutex> lock( traceMutex );
+        return busyLocked();
+    }
 
+    /// @brief busyJson() under traceMutex
+    nlohmann::json busyLocked() const
+    {
         if( busyMethod.empty() )
             return nullptr;
 
-        return { { "method", busyMethod },
-                 { "running_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - busySince ).count() } };
+        nlohmann::json busy = { { "method", busyMethod },
+                                { "running_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                        std::chrono::steady_clock::now() - busySince ).count() } };
+
+        if( nlohmann::json progress = KopenapiCallProgress(); !progress.is_null() )
+            busy["progress"] = progress;
+
+        return busy;
     }
 
     nlohmann::json openApiJson() const;
@@ -881,7 +924,7 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::startJob( const nlohmann::json& aAr
 
     auto* event = new wxThreadEvent();
     event->SetPayload( job );
-    MAIN_GATE_HANDLER::Get().QueueEvent( event );
+    MAIN_GATE_HANDLER::Jobs().Queue( event );
 
     if( waker )
         waker();
@@ -974,9 +1017,22 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                           const std::string name = operation.substr( 4 );
                           const bool        editing = KOPENAPI_REGISTRY::Get().IsEditing( name );
 
-                          // queued before a job and run at one of its safe points
+                          // queued during a long call and run at one of its safe points
                           if( editing && KopenapiJobYielding() )
-                              return KOPENAPI_RESULT::Error( 409, "a job owns the documents: job_list, job_cancel" );
+                          {
+                              const std::string job = KOPENAPI_JOBS::Get().Busy();
+                              std::string       owner;
+
+                              {
+                                  std::lock_guard<std::mutex> lock( self->traceMutex );
+                                  owner = self->busyMethod;
+                              }
+
+                              return KOPENAPI_RESULT::Error( 409, !job.empty()
+                                                                          ? "a job owns the documents: job_list, job_cancel"
+                                                                          : owner + " is running and owns the documents (reading calls "
+                                                                                    "answer meanwhile); retry once it ends" );
+                          }
 
                           std::string busyBefore;
 
@@ -987,6 +1043,9 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                               self->busySince = now;
                           }
 
+                          if( busyBefore.empty() )
+                              KopenapiCallBegin( name );
+
                           s_apiCalls++;
 
                           struct BUSY_END
@@ -996,6 +1055,10 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                               ~BUSY_END()
                               {
                                   s_apiCalls--;
+
+                                  if( before.empty() )
+                                      KopenapiCallEnd();
+
                                   std::lock_guard<std::mutex> lock( impl->traceMutex );
                                   impl->busyMethod = before;
                               }
@@ -1165,7 +1228,8 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::traceJson( const nlohmann::json& aAr
     }
 
     if( !traceOn )
-        return { { "enabled", false }, { "hint", "api_trace {enabled: true, buffer_bytes?, file?} starts tracing" } };
+        return { { "enabled", false }, { "busy", busyJson() },
+                 { "hint", "api_trace {enabled: true, buffer_bytes?, file?} starts tracing" } };
 
     const size_t   limit = std::max( aArgs.value( "limit", 50 ), 1 );
     const std::string only = aArgs.value( "method", std::string() );
@@ -1187,16 +1251,7 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::traceJson( const nlohmann::json& aAr
         calls.push_back( row );
     }
 
-    nlohmann::json busy = nullptr;
-
-    if( !busyMethod.empty() )
-    {
-        busy = { { "method", busyMethod },
-                 { "running_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - busySince ).count() } };
-    }
-
-    return { { "enabled", true }, { "calls", calls }, { "total", traceSeq }, { "busy", busy }, { "kept", traces.size() },
+    return { { "enabled", true }, { "calls", calls }, { "total", traceSeq }, { "busy", busyLocked() }, { "kept", traces.size() },
              { "buffer_bytes", traceLimit }, { "used_bytes", traceBytes },
              { "file", traceFile.empty() ? nlohmann::json() : nlohmann::json( traceFile ) } };
 }

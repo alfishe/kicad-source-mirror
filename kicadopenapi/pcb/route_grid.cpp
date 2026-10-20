@@ -23,6 +23,7 @@
 #include <map>
 #include <numeric>
 #include <queue>
+#include <set>
 #include <thread>
 #include <unordered_set>
 
@@ -44,10 +45,6 @@ constexpr int NO_DIR = 8;
 // cell fought over in a round costs this much more for good
 constexpr float PF_GROWTH = 1.3f;
 constexpr float HIST_STEP = 1.0f;
-
-// the distance left counts this much more than it costs at least (VPR's astar_fac): far fewer
-// states taken for paths a little off the cheapest
-constexpr float ASTAR_FACTOR = 1.2f;
 
 // rounds with no fewer nets crowded than before them: negotiation is over
 constexpr size_t STALL_ROUNDS = 12;
@@ -112,6 +109,7 @@ struct WORLD
     std::vector<std::vector<int32_t>> via;     ///< per sizes: cells
     std::vector<uint8_t>              fine;    ///< cells near a fine-pitch package
     std::vector<uint32_t>             keep;    ///< cells around chips (a bit each) where only their own nets' vias go
+    std::vector<uint16_t>             away;    ///< cells: distance in cells to the nearest chip pad, up to viaAway; empty none
     std::vector<int32_t>              endOf;   ///< states a net's track there stays inside its end copper: that net
 
     /// @brief Deep inside its own end's copper a path crowds nobody: the end's copper is there anyway
@@ -128,6 +126,8 @@ struct WORLD
         bool                               finePitch = false;
         std::vector<bool>                  walled;    ///< per end: fixed copper parts it from the other ends
         uint32_t                           chips = 0; ///< the chips (keep bits) it has a pad on
+        int                                group = -1;
+        int                                rank = 0;
     };
 
     std::vector<NET> nets;
@@ -293,6 +293,56 @@ inline void own( int32_t& aCell, int32_t aOwner )
         aCell = aOwner;
     else if( aCell != aOwner )
         aCell = -1;
+}
+
+
+/// @brief A chip by its reference: not a passive, a connector, a module or a test point
+bool isPackage( const FOOTPRINT* aFp )
+{
+    static const std::set<std::string> others = { "R", "RN", "RA", "RP", "C", "CN", "L", "FB", "D", "LED", "Y", "X",
+                                                  "J", "P", "A", "SW", "TP", "F", "BT", "H", "MH", "JP" };
+    std::string prefix;
+
+    for( wxUniChar c : aFp->GetReference() )
+    {
+        if( !wxIsalpha( c ) )
+            break;
+
+        prefix += (char) wxToupper( c );
+    }
+
+    return !prefix.empty() && !others.count( prefix );
+}
+
+
+/// @brief Pads in rows on the outline and four or more inside it (a ball or land array)
+bool isArray( const std::vector<BOX2I>& aPads )
+{
+    BOX2I               box = aPads[0];
+    std::vector<double> areas;
+
+    for( const BOX2I& b : aPads )
+    {
+        box.Merge( b );
+        areas.push_back( (double) b.GetArea() );
+    }
+
+    std::nth_element( areas.begin(), areas.begin() + areas.size() / 2, areas.end() );
+    const double median = areas[areas.size() / 2];
+    int          inner = 0;
+
+    for( const BOX2I& b : aPads )
+    {
+        const int edge = std::min( b.GetWidth(), b.GetHeight() );
+
+        if( (double) b.GetArea() <= 4 * median && b.GetLeft() - box.GetLeft() > edge && box.GetRight() - b.GetRight() > edge
+            && b.GetTop() - box.GetTop() > edge && box.GetBottom() - b.GetBottom() > edge )
+        {
+            inner++;
+        }
+    }
+
+    return inner >= 4;
 }
 
 
@@ -756,6 +806,59 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
         }
     }
 
+    // around packages (not arrays, whose vias sit between the balls): how far each cell is from
+    // the nearest pad, for the price of a via there
+    if( aParams.viaAway > 0 && L > 1 )
+    {
+        aWorld.away.assign( cells, UINT16_MAX );
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            if( fp->Pads().size() < 8 || !isPackage( fp ) )
+                continue;
+
+            std::vector<BOX2I> pads;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( pad->GetAttribute() != PAD_ATTRIB::NPTH )
+                    pads.push_back( pad->GetBoundingBox() );
+            }
+
+            if( pads.empty() || isArray( pads ) )
+                continue;
+
+            BOX2I box = pads[0];
+
+            for( const BOX2I& b : pads )
+                box.Merge( b );
+
+            box.Inflate( aParams.viaAway );
+            int x0, y0, x1, y1;
+            grid.CellOf( box.GetOrigin(), x0, y0 );
+            grid.CellOf( box.GetEnd(), x1, y1 );
+
+            for( int y = std::max( 0, y0 ); y <= std::min( grid.ny - 1, y1 ); ++y )
+            {
+                for( int x = std::max( 0, x0 ); x <= std::min( grid.nx - 1, x1 ); ++x )
+                {
+                    const VECTOR2I c = grid.Centre( grid.Index( x, y ) );
+                    double         d = std::numeric_limits<double>::max();
+
+                    for( const BOX2I& b : pads )
+                    {
+                        const double dx = std::max( { (double) b.GetLeft() - c.x, 0.0, (double) c.x - b.GetRight() } );
+                        const double dy = std::max( { (double) b.GetTop() - c.y, 0.0, (double) c.y - b.GetBottom() } );
+                        d = std::min( d, std::hypot( dx, dy ) );
+                    }
+
+                    uint16_t& at = aWorld.away[grid.Index( x, y )];
+                    at = std::min<uint16_t>( at, (uint16_t) std::min( d / cell, 65534.0 ) );
+                }
+            }
+        }
+    }
+
     // the nets' ends: the cells inside each end's copper on the routing layers
     aWorld.endOf.assign( cells * L, 0 );
 
@@ -765,6 +868,8 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
         net.code = n.netCode;
         net.sizes = sizesOf[SIZES{ n.width / 2, std::max( n.clearance, ds.m_MinClearance ), n.viaDiameter / 2, n.viaDrill }.Key()];
         net.vias = n.viaDiameter > 0 && L > 1;
+        net.group = n.group;
+        net.rank = n.rank;
 
         int                   bx0 = INT_MAX, by0 = INT_MAX, bx1 = INT_MIN, by1 = INT_MIN;
         const int             hw = n.width / 2;
@@ -912,11 +1017,8 @@ public:
         m_occVia.assign( K, std::vector<uint16_t>( m_w.cells, 0 ) );
         m_hist.assign( S, 0.0f );
         m_histVia.assign( m_w.cells, 0.0f );
-        m_g.assign( S, 0.0f );
-        m_parent.assign( S, -1 );
-        m_seen.assign( S, 0 );
+        m_node.assign( S, NODE() );
         m_dir.assign( S, NO_DIR );
-        m_target.assign( S, 0 );
         m_targetEnd.assign( S, -1 );
         m_nets.resize( m_w.nets.size() );
 
@@ -950,6 +1052,20 @@ public:
 
         m_viaCost = 10.0f * (float) ( pcbIUScale.mmToIU( 2.0 ) / c );
         m_fineCost = 10.0f * (float) ( pcbIUScale.mmToIU( 3.0 ) / c );
+        m_awayCells = (float) ( m_params.viaAway / c );
+        m_awayCost = 10.0f * (float) ( m_params.viaAwayCost / c );
+
+        if( m_params.hug < 1.0f && std::any_of( m_w.nets.begin(), m_w.nets.end(), []( const WORLD::NET& n ) { return n.group >= 0; } ) )
+        {
+            m_band.assign( S, 0 );
+            m_bandGroup.assign( S, 0 );
+
+            for( size_t a = 0; a < K; ++a )
+            {
+                const SIZES& x = m_w.sizes[a];
+                m_bandDisk.emplace_back( ( 2.0 * x.halfWidth + x.clearance ) / c + std::max( 2.0, pcbIUScale.mmToIU( 0.1 ) / c ) );
+            }
+        }
     }
 
     void Run()
@@ -968,11 +1084,14 @@ public:
                     todo.push_back( n );
             }
 
+            int taken = 0;
+
             for( int n : todo )
             {
                 if( stopped() )
                     return;
 
+                at( STAGE_ROUNDS, taken++, (int) todo.size() );
                 unmark( n );
                 route( n, pf, false );
                 markNet( n );
@@ -1036,8 +1155,12 @@ public:
         }
 
         // still crowded: the worst net routed again where nobody is, until no two nets crowd each other
+        int legalised = 0;
+
         for( std::vector<bool> redone( m_nets.size(), false ); !stopped(); )
         {
+            at( STAGE_LEGALISE, legalised++, (int) m_nets.size() );
+
             int worst = -1, most = 0;
 
             for( size_t n = 0; n < m_nets.size(); ++n )
@@ -1073,12 +1196,14 @@ public:
         // the nets left short: once more where nobody is, now that the rest has settled, with vias
         // allowed around the chips
         m_keepOut = false;
+        int taken = 0;
 
         for( int n : m_v.order )
         {
             if( stopped() )
                 break;
 
+            at( STAGE_SHORT_AGAIN, taken++, (int) m_v.order.size() );
             NET_STATE& net = m_nets[n];
 
             if( std::find( net.reached.begin(), net.reached.end(), false ) == net.reached.end() )
@@ -1111,10 +1236,14 @@ public:
                                  []( const NET_STATE& aNet )
                                  { return std::find( aNet.reached.begin(), aNet.reached.end(), false ) != aNet.reached.end(); } );
 
+        taken = 0;
+
         for( int n : m_v.order )
         {
             if( stopped() )
                 break;
+
+            at( STAGE_FEWER_VIAS, taken++, (int) m_v.order.size() );
 
             if( m_nets[n].vias.empty() )
                 continue;
@@ -1145,12 +1274,14 @@ public:
         }
 
         m_byStage.push_back( m_expanded );
+        taken = 0;
 
         for( int n : m_v.order )
         {
             if( stopped() )
                 break;
 
+            at( STAGE_PULL_TIGHT, taken++, (int) m_v.order.size() );
             unmark( n );
 
             // where the net's paths branch off one another: kept on the copper
@@ -1170,6 +1301,42 @@ public:
 
         for( size_t k = m_byStage.size() - 1; k > 0; --k )
             m_byStage[k] -= m_byStage[k - 1];
+
+        at( STAGE_DONE, (int) m_v.order.size(), (int) m_v.order.size() );
+    }
+
+    /// @brief Another variant has joined everything while this one still negotiates: it stops
+    void Abandon()
+    {
+        if( m_stage == STAGE_ROUNDS )
+            m_abandoned = true;
+    }
+
+    bool Abandoned() const { return m_abandoned; }
+
+    /// @brief After Run: every end joined, no net dropped
+    bool Complete() const
+    {
+        if( m_abandoned || m_dropped > 0 )
+            return false;
+
+        return std::all_of( m_nets.begin(), m_nets.end(),
+                            []( const NET_STATE& aNet )
+                            { return std::find( aNet.reached.begin(), aNet.reached.end(), false ) == aNet.reached.end(); } );
+    }
+
+    GRID_VARIANT_PROGRESS Progress() const
+    {
+        static const char* const names[] = { "rounds", "legalise", "short_again", "fewer_vias", "pull_tight", "done" };
+        GRID_VARIANT_PROGRESS    p;
+        p.name = m_v.name;
+        p.stage = m_abandoned ? "abandoned" : names[m_stage.load()];
+        p.round = std::min<int>( m_round, m_params.maxRounds );
+        p.crowded = m_conflicting;
+        p.net = m_taken;
+        p.nets = m_takenOf;
+        p.expanded = m_expandedShown;
+        return p;
     }
 
     struct NET_STATE
@@ -1179,6 +1346,7 @@ public:
         std::vector<bool>                  reached;
         std::vector<std::vector<uint32_t>> markedTrack;   ///< per sizes
         std::vector<std::vector<uint32_t>> markedVia;     ///< per sizes
+        std::vector<uint32_t>              markedBand;    ///< beside its copper, for its bundle
     };
 
     const std::vector<NET_STATE>& Nets() const { return m_nets; }
@@ -1192,9 +1360,19 @@ public:
     const std::vector<CROWDING>&  Crowded() const { return m_crowded; }
 
 private:
+    enum STAGE { STAGE_ROUNDS, STAGE_LEGALISE, STAGE_SHORT_AGAIN, STAGE_FEWER_VIAS, STAGE_PULL_TIGHT, STAGE_DONE };
+
+    void at( STAGE aStage, int aTaken, int aOf )
+    {
+        m_stage = aStage;
+        m_taken = aTaken;
+        m_takenOf = aOf;
+        m_expandedShown = m_expanded;
+    }
+
     bool stopped() const
     {
-        return m_stop.load( std::memory_order_relaxed )
+        return m_stop.load( std::memory_order_relaxed ) || m_abandoned.load( std::memory_order_relaxed )
                || ( m_params.cancel && m_params.cancel->load( std::memory_order_relaxed ) );
     }
 
@@ -1538,6 +1716,22 @@ private:
             for( uint32_t i : net.markedVia[b] )
                 m_occVia[b][i]++;
         }
+
+        if( !m_band.empty() && m_w.nets[aNet].group >= 0 )
+        {
+            net.markedBand.clear();
+
+            for( int l = 0; l < m_w.L; ++l )
+                dilate( { { &onLayer[l], &m_bandDisk[a] } }, (size_t) l * cells, net.markedBand );
+
+            const uint16_t g = (uint16_t) ( m_w.nets[aNet].group + 1 );
+
+            for( uint32_t s : net.markedBand )
+            {
+                m_band[s]++;
+                m_bandGroup[s] = g;
+            }
+        }
     }
 
     void unmark( int aNet )
@@ -1553,8 +1747,15 @@ private:
                 m_occVia[b][i]--;
         }
 
+        for( uint32_t s : net.markedBand )
+        {
+            if( --m_band[s] == 0 )
+                m_bandGroup[s] = 0;
+        }
+
         net.markedTrack.clear();
         net.markedVia.clear();
+        net.markedBand.clear();
     }
 
     void route( int aNet, float aPf, bool aHard )
@@ -1647,7 +1848,7 @@ private:
         {
             for( uint32_t s : wn.ends[e] )
             {
-                m_target[s] = m_stamp;
+                m_node[s].target = m_stamp;
                 m_targetEnd[s] = e;
             }
         }
@@ -1724,7 +1925,7 @@ private:
             {
                 for( uint32_t s : wn.ends[e] )
                 {
-                    m_target[s] = m_stamp;
+                    m_node[s].target = m_stamp;
                     m_targetEnd[s] = e;
                 }
             }
@@ -1852,12 +2053,12 @@ private:
             if( m_guide )
                 best = std::max( best, (int) ( *m_guide )[(size_t) l * tiles + ( y / m_w.tile ) * m_w.tnx + x / m_w.tile] * m_w.tile );
 
-            return ASTAR_FACTOR * (float) best;
+            return m_params.astar * (float) best;
         };
 
         for( uint32_t s : aTree )
         {
-            if( m_seen[s] == stamp && m_g[s] == 0 )
+            if( m_node[s].seen == stamp && m_node[s].g == 0 )
                 continue;
 
             const int i = (int) ( s % cells );
@@ -1866,9 +2067,9 @@ private:
             if( x < x0 || x > x1 || y < y0 || y > y1 )
                 continue;
 
-            m_seen[s] = stamp;
-            m_g[s] = 0;
-            m_parent[s] = -1;
+            m_node[s].seen = stamp;
+            m_node[s].g = 0;
+            m_node[s].parent = -1;
             m_dir[s] = NO_DIR;
             open.push( { h( x, y, (int) ( s / cells ) ), 0, s } );
         }
@@ -1883,11 +2084,14 @@ private:
                 return 1.0f;
 
             const uint16_t occ = m_occTrack[k][s];
+            const float    hug = !occ && wn.group >= 0 && !m_band.empty() && m_band[s] && m_bandGroup[s] == wn.group + 1
+                                         ? m_params.hug
+                                         : 1.0f;
 
             if( aHard )
-                return occ ? -1.0f : 1.0f;
+                return occ ? -1.0f : hug;
 
-            return ( 1.0f + m_hist[s] ) * ( 1.0f + aPf * occ );
+            return ( 1.0f + m_hist[s] ) * ( 1.0f + aPf * occ ) * hug;
         };
 
         while( !open.empty() )
@@ -1895,14 +2099,14 @@ private:
             const OPEN top = open.top();
             open.pop();
 
-            if( top.g > m_g[top.s] )
+            if( top.g > m_node[top.s].g )
                 continue;
 
-            if( m_target[top.s] == stamp )
+            if( m_node[top.s].target == stamp )
             {
                 aPath.clear();
 
-                for( int64_t s = top.s; s >= 0; s = m_parent[s] )
+                for( int64_t s = top.s; s >= 0; s = m_node[s].parent )
                     aPath.push_back( (uint32_t) s );
 
                 std::reverse( aPath.begin(), aPath.end() );
@@ -1928,12 +2132,12 @@ private:
             {
                 const float ng = top.g + cost;
 
-                if( m_seen[n] == stamp && ng >= m_g[n] )
+                if( m_node[n].seen == stamp && ng >= m_node[n].g )
                     return;
 
-                m_seen[n] = stamp;
-                m_g[n] = ng;
-                m_parent[n] = (int32_t) s;
+                m_node[n].seen = stamp;
+                m_node[n].g = ng;
+                m_node[n].parent = (int32_t) s;
                 m_dir[n] = (uint8_t) nd;
                 const int ni = (int) ( n % cells );
                 open.push( { ng + h( ni % g.nx, ni / g.nx, (int) ( n / cells ) ), ng, n } );
@@ -1959,7 +2163,7 @@ private:
                 }
 
                 const uint32_t n = (uint32_t) ( (size_t) l * cells + g.Index( nx, ny ) );
-                const bool     target = m_target[n] == stamp;
+                const bool     target = m_node[n].target == stamp;
 
                 if( !target && !m_w.TrackOk( k, n, wn.code ) )
                     continue;
@@ -1997,7 +2201,8 @@ private:
                     continue;
 
                 const float base = m_viaCost * m_viaScale * ( aHard ? 1.0f : ( 1.0f + m_histVia[i] ) * ( 1.0f + aPf * occ ) )
-                                   + ( m_w.fine[i] ? m_fineCost : 0.0f );
+                                   + ( m_w.fine[i] ? m_fineCost : 0.0f )
+                                   + ( !m_w.away.empty() && m_w.away[i] < m_awayCells ? m_awayCost * ( 1.0f - m_w.away[i] / m_awayCells ) : 0.0f );
 
                 for( int to = 0; to < L; ++to )
                 {
@@ -2006,10 +2211,10 @@ private:
 
                     const uint32_t n = (uint32_t) ( (size_t) to * cells + i );
 
-                    if( m_target[n] != stamp && !m_w.TrackOk( k, n, wn.code ) )
+                    if( m_node[n].target != stamp && !m_w.TrackOk( k, n, wn.code ) )
                         continue;
 
-                    const float c = m_target[n] == stamp ? 1.0f : cellCost( n );
+                    const float c = m_node[n].target == stamp ? 1.0f : cellCost( n );
 
                     if( c < 0 )
                         continue;
@@ -2033,11 +2238,17 @@ private:
     std::vector<float>                 m_hist;
     std::vector<float>                 m_histVia;
 
-    std::vector<float>    m_g;
-    std::vector<int32_t>  m_parent;
-    std::vector<uint32_t> m_seen;
+    /// @brief A state's search data, together: one cache line holds four states' worth
+    struct NODE
+    {
+        uint32_t seen = 0;     ///< stamp of the search that reached it
+        uint32_t target = 0;   ///< stamp of the search it is an end of
+        float    g = 0;
+        int32_t  parent = -1;
+    };
+
+    std::vector<NODE>     m_node;
     std::vector<uint8_t>  m_dir;
-    std::vector<uint32_t> m_target;
     std::vector<int>      m_targetEnd;
     uint32_t              m_stamp = 0;
     bool                  m_overBudget = false;
@@ -2055,10 +2266,21 @@ private:
     bool  m_keepOut = true;   ///< no vias around the chips but their own nets'
     bool  m_oneWindow = false;   ///< the first window only: no detour around it
     float m_fineCost = 0;
+    float m_awayCells = 0;
+    float m_awayCost = 0;
+
+    std::vector<uint16_t> m_band;        ///< states beside bundle copper: how many members' copper
+    std::vector<uint16_t> m_bandGroup;   ///< and of which bundle (+1)
+    std::vector<DISK>     m_bandDisk;    ///< per sizes: a member's track and the place beside it
 
     std::vector<NET_STATE> m_nets;
     std::atomic<int>       m_round{ 0 };
     std::atomic<int>       m_conflicting{ 0 };
+    std::atomic<int>       m_stage{ STAGE_ROUNDS };
+    std::atomic<bool>      m_abandoned{ false };
+    std::atomic<int>       m_taken{ 0 };
+    std::atomic<int>       m_takenOf{ 0 };
+    std::atomic<long>      m_expandedShown{ 0 };
     int                    m_dropped = 0;
     std::vector<int>       m_byRound;   ///< nets still crowded after each round
     std::vector<long>      m_expandedBy;   ///< search states per net, all rounds
@@ -2172,6 +2394,40 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
                                       return world.nets[a].span < world.nets[b].span;
                                   } );
 
+    // bundles first, the largest first, each member by member; the rest in the variant's order
+    std::map<int, int> groupSize;
+
+    for( const WORLD::NET& n : world.nets )
+    {
+        if( n.group >= 0 )
+            groupSize[n.group]++;
+    }
+
+    auto bundlesFirst = [&]( std::vector<int> aOrder )
+    {
+        std::stable_sort( aOrder.begin(), aOrder.end(),
+                          [&]( int a, int b )
+                          {
+                              const WORLD::NET& x = world.nets[a];
+                              const WORLD::NET& y = world.nets[b];
+
+                              if( ( x.group >= 0 ) != ( y.group >= 0 ) )
+                                  return x.group >= 0;
+
+                              if( x.group < 0 )
+                                  return false;
+
+                              if( x.group != y.group )
+                              {
+                                  const int sx = groupSize[x.group], sy = groupSize[y.group];
+                                  return sx != sy ? sx > sy : x.group < y.group;
+                              }
+
+                              return x.rank < y.rank;
+                          } );
+        return aOrder;
+    };
+
     std::vector<int> hv( world.L, 0 ), vh( world.L, 0 );
 
     for( int l = 0; l < world.L; ++l )
@@ -2187,12 +2443,31 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
                                       { "short_first_vh", shortFirst, vh },
                                       { "fine_first_hv", fineFirst, hv } };
 
+    if( !groupSize.empty() )
+    {
+        for( VARIANT& v : variants )
+            v.order = bundlesFirst( v.order );
+    }
+
     int count = aParams.variants;
 
     if( count <= 0 )
         count = std::clamp( (int) std::thread::hardware_concurrency() / 2, 1, (int) variants.size() );
 
     variants.resize( std::min( (size_t) count, variants.size() ) );
+
+    // the same order and directions route the same: run once
+    for( size_t k = variants.size(); k-- > 1; )
+    {
+        for( size_t j = 0; j < k; ++j )
+        {
+            if( variants[j].order == variants[k].order && variants[j].direction == variants[k].direction )
+            {
+                variants.erase( variants.begin() + (long) k );
+                break;
+            }
+        }
+    }
 
     std::atomic<bool>                        stop{ false };
     std::vector<std::unique_ptr<NEGOTIATION>> runs;
@@ -2205,26 +2480,46 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     for( auto& run : runs )
         done.push_back( std::async( std::launch::async, [r = run.get()]() { r->Run(); } ) );
 
-    for( size_t k = 0; k < done.size(); )
+    // once one variant has joined everything, the variants still negotiating stop: those past
+    // their rounds finish (they may still need fewer vias or less length)
+    std::vector<bool>   finished( runs.size(), false );
+    std::vector<double> finishedMs( runs.size(), 0 );
+    bool                complete = false;
+
+    for( size_t left = runs.size(); left > 0; )
     {
-        if( done[k].wait_for( std::chrono::milliseconds( 50 ) ) == std::future_status::ready )
+        std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
+
+        for( size_t k = 0; k < runs.size(); ++k )
         {
+            if( finished[k] || done[k].wait_for( std::chrono::seconds( 0 ) ) != std::future_status::ready )
+                continue;
+
             done[k].get();
-            ++k;
-            continue;
+            finished[k] = true;
+            finishedMs[k] = msSince( routing );
+            --left;
+
+            if( !complete && runs[k]->Complete() )
+            {
+                complete = true;
+
+                for( size_t j = 0; j < runs.size(); ++j )
+                {
+                    if( !finished[j] )
+                        runs[j]->Abandon();
+                }
+            }
         }
 
-        if( aParams.progress )
+        if( aParams.progress && left > 0 )
         {
-            int round = 0, crowded = INT_MAX;
+            std::vector<GRID_VARIANT_PROGRESS> states;
 
             for( auto& run : runs )
-            {
-                round = std::max( round, run->Round() );
-                crowded = std::min( crowded, run->Conflicting() );
-            }
+                states.push_back( run->Progress() );
 
-            if( !aParams.progress( round, crowded ) )
+            if( !aParams.progress( states ) )
                 stop = true;
         }
     }
@@ -2250,6 +2545,14 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
         result.variantsTried.push_back( variants[k].name );
         result.expanded += runs[k]->Expanded();
+        result.variantStats.push_back( { variants[k].name, finishedMs[k], runs[k]->ExpandedByStage(), reached, vias,
+                                         runs[k]->Abandoned() } );
+
+        if( runs[k]->Abandoned() )
+        {
+            result.variantsAbandoned.push_back( variants[k].name );
+            continue;
+        }
 
         if( reached > bestReached || ( reached == bestReached && ( vias < bestVias || ( vias == bestVias && length < bestLength ) ) ) )
         {

@@ -420,7 +420,9 @@ KOPENAPI_REGISTER( "api_trace",
                    "Trace of the API gate (every REST / MCP call passes it), off until asked (no cost "
                    "then): enabled: true starts it; the last calls (method, "
                    "when, arguments, time queued for the main thread, time running there, status, error) "
-                   "and the call holding the main thread now; answers even while KiCad is busy. Kept in a "
+                   "and, also while tracing is off, the call holding the main thread now with its progress (phase, "
+                   "done of total, counts; pcb_route engine grid: each variant's stage, round, nets crowded); "
+                   "answers even while KiCad is busy. Kept in a "
                    "buffer (buffer_bytes, default 1 MB) and optionally appended to a file as JSON lines "
                    "(file; null stops). Env KICAD_OPENAPI_TRACE=1 also logs every call to the journal",
                    R"json({"type":"object","properties":{

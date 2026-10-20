@@ -18,15 +18,30 @@
 
 /// @brief At a safe point of a call that runs as a job: records the progress (phase, aDone of
 /// aTotal, the item at work, counts so far) and lets the UI and reading API calls run.  False once
-/// the job is asked to stop: the caller finishes with what it has done.  Outside a job: true.
+/// the job is asked to stop: the caller finishes with what it has done.  Outside a job: true
+/// (a plain call's safe point, KopenapiCallBegin).
 KICOMMON_API bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal,
                                    const std::string& aItem = std::string(),
                                    const nlohmann::json& aCounts = nlohmann::json() );
 
+/// @brief The gate: an outermost API call starts / ends on the main thread.  KopenapiJobStep outside
+/// a job records that call's progress and runs the API calls queued meanwhile (edits get 409); no
+/// user input, no stop
+KICOMMON_API void KopenapiCallBegin( const std::string& aMethod );
+KICOMMON_API void KopenapiCallEnd();
+
+/// @brief The progress of the running job, else of the running call ({phase, done, total, item,
+/// counts, phase_eta_s, elapsed_s}); null when it has reported none.  Any thread
+KICOMMON_API nlohmann::json KopenapiCallProgress();
+
 /// @brief The running job was asked to stop (job_cancel, Esc, a window close)
 KICOMMON_API bool KopenapiJobCancelled();
 
-/// @brief The main thread is at a job's safe point: a call running now is nested in the job
+/// @brief Main thread: runs the API calls queued for it now (none of what arrives meanwhile);
+/// GUI and headless (kicadopenapi_service.cpp)
+KICOMMON_API void KopenapiServeQueuedCalls();
+
+/// @brief The main thread is at a safe point of a job or a plain call: a call running now is nested in the job
 KICOMMON_API bool KopenapiJobYielding();
 
 

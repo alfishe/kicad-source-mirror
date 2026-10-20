@@ -55,6 +55,8 @@ std::condition_variable                   g_changed;
 std::map<uint64_t, std::shared_ptr<JOB>>  g_jobs;
 uint64_t                                  g_seq = 0;
 std::shared_ptr<JOB>                      g_current;    ///< the running job (main thread)
+std::shared_ptr<JOB>                      g_call;       ///< the running outermost call, outside jobs
+CLOCK::time_point                         g_callServed;
 bool                                      g_yielding = false;
 constexpr size_t                          KEEP = 32;
 
@@ -95,7 +97,7 @@ nlohmann::json describe( const JOB& aJob, bool aWithResult )
         progress["counts"] = aJob.counts;
 
     // the phase's own pace; phases after it are not known
-    if( aJob.state == "running" && aJob.total > 0 && aJob.done > 0 )
+    if( aJob.state == "running" && aJob.done > 0 && aJob.done < aJob.total )
     {
         const double spent = std::chrono::duration<double>( now - aJob.phaseStarted ).count();
         progress["phase_eta_s"] = std::round( spent / aJob.done * ( aJob.total - aJob.done ) * 10 ) / 10;
@@ -225,6 +227,28 @@ CLOCK::time_point g_titleShown;
 } // namespace
 
 
+namespace
+{
+
+/// @brief Under g_mutex
+void record( JOB& aJob, const std::string& aPhase, int aDone, int aTotal, const std::string& aItem,
+             const nlohmann::json& aCounts )
+{
+    if( aJob.phase != aPhase )
+        aJob.phaseStarted = CLOCK::now();
+
+    aJob.phase = aPhase;
+    aJob.done = aDone;
+    aJob.total = aTotal;
+    aJob.item = aItem;
+
+    if( !aCounts.is_null() )
+        aJob.counts = aCounts;
+}
+
+} // namespace
+
+
 bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const std::string& aItem,
                       const nlohmann::json& aCounts )
 {
@@ -233,21 +257,40 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
     {
         std::lock_guard<std::mutex> lock( g_mutex );
 
-        if( !g_current || g_yielding )
+        if( g_yielding || !wxThread::IsMain() )
             return true;
 
+        if( !g_current && !g_call )
+            return true;
+
+        if( !g_current )
+        {
+            record( *g_call, aPhase, aDone, aTotal, aItem, aCounts );
+
+            if( CLOCK::now() - g_callServed < std::chrono::milliseconds( 30 ) )
+                return true;
+
+            g_yielding = true;
+        }
+    }
+
+    // a plain call: reading API calls queued meanwhile run here (the documents are consistent),
+    // edits get 409; no user input, no stop
+    if( g_yielding )
+    {
+        KopenapiServeQueuedCalls();
+
+        std::lock_guard<std::mutex> lock( g_mutex );
+        g_yielding = false;
+        g_callServed = CLOCK::now();
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+
         JOB& job = *g_current;
-
-        if( job.phase != aPhase )
-            job.phaseStarted = CLOCK::now();
-
-        job.phase = aPhase;
-        job.done = aDone;
-        job.total = aTotal;
-        job.item = aItem;
-
-        if( !aCounts.is_null() )
-            job.counts = aCounts;
+        record( job, aPhase, aDone, aTotal, aItem, aCounts );
 
         if( job.cancel )
             return false;
@@ -273,6 +316,40 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
     std::lock_guard<std::mutex> lock( g_mutex );
     g_yielding = false;
     return !g_current->cancel;
+}
+
+
+void KopenapiCallBegin( const std::string& aMethod )
+{
+    auto call = std::make_shared<JOB>();
+    call->method = aMethod;
+    call->state = "running";
+    call->started = call->phaseStarted = CLOCK::now();
+
+    std::lock_guard<std::mutex> lock( g_mutex );
+    g_call = std::move( call );
+}
+
+
+void KopenapiCallEnd()
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    g_call.reset();
+}
+
+
+nlohmann::json KopenapiCallProgress()
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    const JOB*                  job = g_current ? g_current.get() : g_call.get();
+
+    if( !job || job->phase.empty() )
+        return nullptr;
+
+    const nlohmann::json j = describe( *job, false );
+    nlohmann::json       progress = j["progress"];
+    progress["elapsed_s"] = j["elapsed_s"];
+    return progress;
 }
 
 

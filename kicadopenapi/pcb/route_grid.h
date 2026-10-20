@@ -20,6 +20,20 @@ struct GRID_NET
     int                                clearance = 0;
     int                                viaDiameter = 0;   ///< 0: no vias for this net
     int                                viaDrill = 0;
+    int                                group = -1;   ///< bundle: routed first, along its other members
+    int                                rank = 0;     ///< member order within the bundle
+};
+
+/// @brief Where each variant is while the variants run
+struct GRID_VARIANT_PROGRESS
+{
+    std::string name;
+    std::string stage;      ///< rounds, legalise, short_again, fewer_vias, pull_tight, done, abandoned
+    int         round = 0;
+    int         crowded = 0;
+    int         net = 0;    ///< nets taken in this stage (of nets)
+    int         nets = 0;
+    long        expanded = 0;
 };
 
 struct GRID_PARAMS
@@ -29,10 +43,14 @@ struct GRID_PARAMS
     int                       variants = 0;    ///< 0: one per core, up to 8
     int                       maxRounds = 40;
     int                       viaKeepOut = 0;  ///< only the chip's own nets' vias this far around it while routing; 0 none
+    int                       viaAway = 0;     ///< a via nearer a chip's pads than this costs more, the nearer the more; 0 none
+    int                       viaAwayCost = 0; ///< at the pads: as much as this length of track
+    float                     hug = 1.0f;      ///< cost factor of a cell beside the copper of the net's own bundle; 1 none
+    float                     astar = 1.2f;    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
     std::atomic<bool>*        cancel = nullptr;
 
     /// @brief Called on the calling thread while the variants run, about every 50 ms; false stops them
-    std::function<bool( int aRound, int aConflicts )> progress;
+    std::function<bool( const std::vector<GRID_VARIANT_PROGRESS>& )> progress;
 };
 
 /// @brief A run of track on one layer: its corners from end to end
@@ -71,6 +89,20 @@ struct GRID_RESULT
     double                       buildMs = 0;
     double                       routeMs = 0;
     std::vector<std::string>     variantsTried;
+    std::vector<std::string>     variantsAbandoned;   ///< stopped in their rounds once another joined everything
+
+    /// @brief Per variant tried: when it finished, its search states per stage, ends joined, vias
+    struct VARIANT_STATS
+    {
+        std::string       name;
+        double            ms = 0;
+        std::vector<long> expandedByStage;
+        long              reached = 0;
+        long              vias = 0;
+        bool              abandoned = false;
+    };
+
+    std::vector<VARIANT_STATS> variantStats;
     std::vector<int>             crowdedByRound;   ///< the winner's nets still crowded after each round
     std::vector<CROWDING>        crowdedAtEnd;     ///< still crowded when its rounds ended
     std::vector<long>            expandedByStage;   ///< the winner's: rounds, legalising, the short again, fewer vias
@@ -87,6 +119,8 @@ struct GRID_RESULT
  * length; ties to the first variant).  Vias cost more near fine-pitch packages; around chips (pads on
  * four sides, or an array outside its balls) only the chip's own nets put vias while the board
  * routes: the other nets only when left short, and once every net is joined in the pass that saves
- * vias.
+ * vias.  Signal vias cost more the nearer they are to a chip's pads (viaAway).  Bundles (GRID_NET::group)
+ * are routed first in each variant, member by member, and a cell beside a member's copper costs less
+ * to the other members (hug): the bundle runs side by side.
  */
 GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_PARAMS& aParams );
