@@ -126,15 +126,22 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
         const bool     live = t->live;   // the winner and abandoned lanes are known once ended
         nlohmann::json lanes = nlohmann::json::array();
 
-        for( size_t k = 0; k < t->lanes.size(); ++k )
+        for( size_t k = 0; k < t->LaneCount(); ++k )
         {
-            const GRID_LANE&                      l = t->lanes[k];
+            const GRID_LANE&                      l = t->Lane( k );
             std::lock_guard<std::recursive_mutex> lock( l.Mutex() );
             lanes.push_back( { { "lane", k }, { "variant", l.name }, { "steps", l.steps.size() }, { "paths", l.paths.size() },
                                { "rounds", l.histByRound.size() }, { "abandoned", !live && l.abandoned },
                                { "winner", !live && (int) k == t->winner },
                                { "ms", l.steps.empty() ? 0.0 : std::round( l.steps.back().ms ) },
                                { "bytes", l.Bytes() } } );
+
+            if( l.parent >= 0 )
+            {
+                lanes.back()["parent"] = l.parent;
+                lanes.back()["parent_step"] = l.parentStep;
+                lanes.back()["running"] = l.running;
+            }
         }
 
         out["nets"] = t->netNames.size();
@@ -153,6 +160,13 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
             return names;
         }();
         out["winner"] = live ? -1 : t->winner;
+        out["applied_lane"] = t->appliedLane;
+        out["world"] = [&]
+        {
+            char hex[17];
+            snprintf( hex, sizeof( hex ), "%016llx", (unsigned long long) t->world );
+            return std::string( hex );
+        }();
         out["live"] = live;
         out["bytes"] = t->Bytes();
         out["lanes"] = lanes;
@@ -177,18 +191,18 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
         {
             lane = -1;
 
-            for( size_t k = 0; k < t->lanes.size(); ++k )
+            for( size_t k = 0; k < t->LaneCount(); ++k )
             {
-                if( t->lanes[k].name == aArgs["lane"].get<std::string>() )
+                if( t->Lane( k ).name == aArgs["lane"].get<std::string>() )
                     lane = (int) k;
             }
         }
     }
 
-    if( lane < 0 || lane >= (int) t->lanes.size() )
+    if( lane < 0 || lane >= (int) t->LaneCount() )
         return KOPENAPI_RESULT::Error( 404, "no such lane (see verb status)" );
 
-    const GRID_LANE&                      L = t->lanes[lane];
+    const GRID_LANE&                      L = t->Lane( lane );
     std::lock_guard<std::recursive_mutex> lock( L.Mutex() );
     out["live"] = t->live.load();
     out["lane"] = lane;
@@ -406,7 +420,7 @@ KOPENAPI_RESULT openTimelineEvents( const nlohmann::json& aArgs, KOPENAPI_EVENT_
         }
 
         const GRID_TIMELINE& t = *st->timeline;
-        const GRID_LANE&     L = t.lanes[st->lane.get<int>()];
+        const GRID_LANE&     L = t.Lane( st->lane.get<int>() );
         const bool           live = t.live;   // before the steps: once ended, every step is in
         size_t               steps = 0;
 

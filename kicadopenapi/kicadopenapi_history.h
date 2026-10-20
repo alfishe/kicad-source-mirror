@@ -31,6 +31,16 @@ public:
     KOPENAPI_RESULT Checkpoints() const;
     KOPENAPI_RESULT Rollback( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs );
 
+    /// @brief The editing call running now: its log entry's number once it ends (0: none)
+    long PendingSeq() const;
+
+    /// @brief The last successful editing call logged (0: none)
+    long LastSeq() const;
+
+    /// @brief From inside an editing call: rolls the last logged call back, and the running call's
+    /// "before" becomes the state rolled back to (undoing it later goes there)
+    KOPENAPI_RESULT RollbackLastInCall( KOPENAPI_CONTEXT& aCtx );
+
     /// @brief The document of aDomain was opened / closed / reverted: its earlier marks no longer
     /// apply (the other domain's marks stay; log entries stay)
     void Reset( const std::string& aDomain, const std::string& aReason );

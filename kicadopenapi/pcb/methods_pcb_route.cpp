@@ -12,6 +12,8 @@
 #include "kopenapi_pcb.h"
 #include "route_grid.h"
 #include "route_timeline.h"
+
+#include <kicadopenapi_history.h>
 #include "route_plan.h"
 
 #include <api/pcb_context.h>
@@ -1484,7 +1486,90 @@ static std::vector<VECTOR2I> segmentPath( const nlohmann::json& aSegments, const
 }
 
 
+/// @brief pcb_route {from}: a recorded lane goes on after one of its steps
+struct ROUTE_BRANCH
+{
+    std::shared_ptr<GRID_TIMELINE> timeline;
+    int                            lane = -1;
+    size_t                         step = 0;
+    std::string                    board;   ///< how the board was brought back to the run's start
+};
+
+
+static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ROUTE_BRANCH* aBranch );
+
+
 static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    if( !aArgs.contains( "from" ) )
+        return pcbRoute( aCtx, aArgs, nullptr );
+
+    const nlohmann::json& from = aArgs["from"];
+
+    if( !from.is_object() || !from.contains( "step" ) || !from["step"].is_number_integer() )
+        return KOPENAPI_RESULT::Error( 400, "from: {run, lane (index or variant), step}" );
+
+    std::shared_ptr<GRID_TIMELINE> t = GridTimelineLast();
+
+    if( !t )
+        return KOPENAPI_RESULT::Error( 404, "no recorded route (pcb_route {engine: 'grid', record: true})" );
+
+    if( from.value( "run", t->run ) != t->run )
+        return KOPENAPI_RESULT::Error( 404, "only the last recorded run is kept: run " + std::to_string( t->run ) );
+
+    if( t->live )
+        return KOPENAPI_RESULT::Error( 409, "run " + std::to_string( t->run ) + " is still routing" );
+
+    ROUTE_BRANCH          branch{ t, -1, 0 };
+    const nlohmann::json& lane = from.value( "lane", nlohmann::json( t->appliedLane >= 0 ? t->appliedLane : t->winner ) );
+
+    for( size_t k = 0; k < t->LaneCount(); ++k )
+    {
+        if( ( lane.is_number_integer() && lane.get<int>() == (int) k ) || ( lane.is_string() && lane.get<std::string>() == t->Lane( k ).name ) )
+            branch.lane = (int) k;
+    }
+
+    if( branch.lane < 0 )
+        return KOPENAPI_RESULT::Error( 404, "from.lane: no such lane in run " + std::to_string( t->run ) );
+
+    const long long step = from["step"].get<long long>();
+    const size_t    steps = t->Lane( branch.lane ).steps.size();
+
+    if( step < 0 || step >= (long long) steps )
+        return KOPENAPI_RESULT::Error( 400, "from.step: 0.." + std::to_string( (long long) steps - 1 ) );
+
+    branch.step = (size_t) step;
+
+    nlohmann::json args = nlohmann::json::parse( t->args, nullptr, false );
+
+    if( !args.is_object() )
+        return KOPENAPI_RESULT::Error( 500, "the run's arguments are not kept" );
+
+    // the board as the run found it: the copper of the run (or of its last branch) taken back when
+    // that is the last edit; else the board must already be so
+    KOPENAPI_HISTORY& history = KOPENAPI_HISTORY::Get();
+
+    if( t->appliedSeq > 0 && history.LastSeq() == t->appliedSeq )
+    {
+        KOPENAPI_RESULT back = history.RollbackLastInCall( aCtx );
+
+        if( back.status != 200 )
+            return back;
+
+        t->appliedSeq = 0;
+        branch.board = "the route's copper rolled back";
+    }
+    else
+    {
+        branch.board = t->appliedSeq > 0 ? "the route is not the last edit (edit_log): the board was left as it is"
+                                         : "nothing of the run on the board to roll back";
+    }
+
+    return pcbRoute( aCtx, args, &branch );
+}
+
+
+static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ROUTE_BRANCH* aBranch )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
@@ -3051,6 +3136,13 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         params.pfStart = (float) std::clamp( aArgs.value( "pf_start", 1.0 ), 0.01, 100.0 );
         params.pfGrowth = (float) std::clamp( aArgs.value( "pf_growth", 1.6 ), 1.01, 10.0 );
         params.record = aArgs.value( "record", false );
+
+        if( aBranch )
+        {
+            params.branchOf = aBranch->timeline;
+            params.branchLane = aBranch->lane;
+            params.branchStep = aBranch->step;
+        }
         params.histDecay = (float) std::clamp( aArgs.value( "hist_decay", 1.0 ), 0.1, 1.0 );
         params.recent = std::clamp( aArgs.value( "reroute_recent", 2 ), 0, 100 );
 
@@ -3164,7 +3256,15 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         params.timelineStarted = [&]( const std::shared_ptr<GRID_TIMELINE>& aTimeline )
         {
             static int runs = 0;
+
+            if( aBranch )
+            {
+                GridTimelineKeep( aTimeline );
+                return;
+            }
+
             aTimeline->run = ++runs;
+            aTimeline->args = aArgs.dump();
 
             for( int code : aTimeline->netCodes )
             {
@@ -3192,8 +3292,20 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             }
         } liveEnd{ gr.timeline };
 
+        if( !gr.error.empty() )
+            return KOPENAPI_RESULT::Error( 409, gr.error + ( aBranch ? "; " + aBranch->board : std::string() ) );
+
         if( gr.timeline )
-            timelineOut = { { "run", gr.timeline->run }, { "bytes", gr.timeline->Bytes() } };
+            timelineOut = { { "run", gr.timeline->run }, { "bytes", gr.timeline->Bytes() },
+                            { "print_ms", std::round( gr.printMs * 10 ) / 10 } };
+
+        if( aBranch && gr.timeline )
+        {
+            const GRID_LANE& lane = gr.timeline->Lane( gr.branchLane );
+            timelineOut["branch"] = { { "lane", gr.branchLane }, { "variant", lane.name }, { "parent", lane.parent },
+                                      { "parent_step", lane.parentStep }, { "steps", lane.steps.size() },
+                                      { "restore_ms", std::round( gr.restoreMs * 10 ) / 10 } };
+        }
 
         // each net's copper staged and guarded against the rest; a net the guard rejects stays out
         BOARD_COMMIT                        commit( context->GetToolManager() );
@@ -3265,6 +3377,12 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             commit.Revert();
         else
             commit.Push( _( "Route on the grid (API)" ) );
+
+        if( gr.timeline && !staged.empty() )
+        {
+            gr.timeline->appliedSeq = KOPENAPI_HISTORY::Get().PendingSeq();
+            gr.timeline->appliedLane = aBranch ? gr.branchLane : gr.timeline->winner;
+        }
 
         for( size_t k = 0; k < gridNets.size(); ++k )
         {
@@ -6048,6 +6166,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "pf_start":{"type":"number","default":1.0,"description":"grid: price of sharing a cell in the first negotiation round"},
                         "pf_growth":{"type":"number","default":1.6,"description":"grid: how much that price grows each round (more: fewer rounds, longer detours)"},
                         "record":{"type":"boolean","default":false,"description":"grid: keep every variant's steps for pcb_route_timeline"},
+                        "from":{"type":"object","description":"grid, a branch: the recorded lane goes on after a step as a new lane of the same run (pcb_route_timeline status: parent, parent_step), with the run's own arguments; the copper the run (or its last branch) put on the board is rolled back first when that is the last edit, else the board must be as the run found it (409). Up to the step the recorded nets are taken without searching, so the branch's steps equal the recorded ones until it searches on","properties":{"run":{"type":"integer"},"lane":{"description":"index or variant name; default the lane on the board"},"step":{"type":"integer"}},"required":["step"]},
                         "schedule":{"type":"string","enum":["fixed","adaptive","adaptive_hist"],"default":"fixed","description":"grid, EXPERIMENTAL: negotiation schedule of the built-in variants (adaptive: growth 1.3 while the crowded nets fall, 2.0 when they stall; adaptive_hist: also twice the history on places fought over 3 rounds running)"},
                         "strategies":{"type":"array","description":"grid, EXPERIMENTAL: the variants to race instead of the built-ins: 'short_first_hv@1.0x1.6/a1.5/d0.9/r2', 'fine_first@adaptive', or {order, directions, pf_start, pf_growth, astar, schedule, hist_decay, reroute_recent}","items":{}},
                         "hist_decay":{"type":"number","default":1.0,"description":"grid, EXPERIMENTAL: the history cost of places not fought over in a round is multiplied by this (1: kept for good)"},

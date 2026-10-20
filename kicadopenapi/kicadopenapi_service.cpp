@@ -1666,7 +1666,9 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
         m_impl->server = std::make_unique<httplib::Server>();
         m_impl->server->new_task_queue = []
         {
-            return new httplib::ThreadPool( CPPHTTPLIB_THREAD_POOL_COUNT,
+            // standing threads for them: the pool adds one only when none is idle as a connection
+            // comes, so a burst of streams could otherwise wait behind each other
+            return new httplib::ThreadPool( CPPHTTPLIB_THREAD_POOL_COUNT + MAX_EVENT_STREAMS,
                                             CPPHTTPLIB_THREAD_POOL_MAX_COUNT + MAX_EVENT_STREAMS );
         };
         m_impl->registerRoutes();

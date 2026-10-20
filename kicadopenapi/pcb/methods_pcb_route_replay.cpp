@@ -191,7 +191,7 @@ public:
     }
 
 private:
-    const GRID_LANE& lane() const { return m_timeline->lanes[m_lane]; }
+    const GRID_LANE& lane() const { return m_timeline->Lane( m_lane ); }
 
     /// @brief The lane held against its variant adding steps while the route runs
     std::unique_lock<std::recursive_mutex> hold() const { return std::unique_lock<std::recursive_mutex>( lane().Mutex() ); }
@@ -679,7 +679,7 @@ KOPENAPI_RESULT h_pcb_route_replay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     {
         std::shared_ptr<GRID_TIMELINE> t = GridTimelineLast();
 
-        if( !t || t->lanes.empty() )
+        if( !t || t->LaneCount() == 0 )
             return KOPENAPI_RESULT::Error( 404, "no recorded grid route in this process (pcb_route {engine: 'grid', record: true})" );
 
         int lane = t->winner >= 0 ? t->winner : 0;
@@ -689,9 +689,9 @@ KOPENAPI_RESULT h_pcb_route_replay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             const nlohmann::json& l = aArgs["lane"];
             lane = -1;
 
-            for( size_t i = 0; i < t->lanes.size(); ++i )
+            for( size_t i = 0; i < t->LaneCount(); ++i )
             {
-                if( ( l.is_number_integer() && l.get<int>() == (int) i ) || ( l.is_string() && l.get<std::string>() == t->lanes[i].name ) )
+                if( ( l.is_number_integer() && l.get<int>() == (int) i ) || ( l.is_string() && l.get<std::string>() == t->Lane( i ).name ) )
                     lane = (int) i;
             }
 
@@ -699,7 +699,7 @@ KOPENAPI_RESULT h_pcb_route_replay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 return KOPENAPI_RESULT::Error( 404, "no lane " + l.dump() );
         }
 
-        if( t->lanes[lane].steps.empty() )
+        if( t->Lane( lane ).steps.empty() )
             return KOPENAPI_RESULT::Error( 404, "the lane has no steps" );
 
         r.Show( frame, t, lane );

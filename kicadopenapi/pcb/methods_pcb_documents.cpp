@@ -17,6 +17,7 @@
 #include <board_loader.h>
 #include <board_design_settings.h>
 #include <api/board/board_rules.pb.h>
+#include <drc/drc_engine.h>
 #include <drc/drc_exclusion.h>
 #include <drc/drc_item.h>
 #include <pcb_marker.h>
@@ -615,8 +616,21 @@ static KOPENAPI_DOC_HISTORY history()
         if( !board )
             return false;
 
-        // Back under the document's own path, unsaved
+        // Back under the document's own path, unsaved, with the custom rules beside it (the loader
+        // looked for them beside the copy)
         board->SetFileName( original );
+
+        if( std::shared_ptr<DRC_ENGINE> engine = board->GetDesignSettings().m_DRCEngine )
+        {
+            try
+            {
+                engine->InitEngine( board->GetDesignRulesPath() );
+            }
+            catch( ... )
+            {
+                // a broken custom rules file: reported by pcb_drc
+            }
+        }
         s_headless.reset();
         s_headless = std::make_shared<HEADLESS_PCB_CONTEXT>( std::move( board ), project,
                                                              GetAppSettings<PCBNEW_SETTINGS>( "pcbnew" ), aCtx.kiway );

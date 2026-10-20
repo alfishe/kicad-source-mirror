@@ -102,6 +102,74 @@ void GRID_LANE::Add( GRID_STEP aStep, const GRID_PATH* aPath )
 }
 
 
+void GRID_LANE::AddDead( int aNet, int aEnd )
+{
+    std::lock_guard<std::recursive_mutex> lock( *m_mutex );
+    dead.push_back( { (uint32_t) steps.size(), aNet, aEnd } );
+}
+
+
+void GRID_LANE::ForkFrom( const GRID_LANE& aParent, size_t aStep )
+{
+    std::lock_guard<std::recursive_mutex> lock( aParent.Mutex() );
+    aStep = std::min( aStep, aParent.steps.size() - 1 );
+
+    strategy = aParent.strategy;
+    order = aParent.order;
+    direction = aParent.direction;
+    steps.assign( aParent.steps.begin(), aParent.steps.begin() + (long) aStep + 1 );
+
+    // ids are given in the order first seen: the prefix uses the first ones only
+    uint32_t pathsUsed = 0, setsUsed = 1;
+
+    for( const GRID_STEP& st : steps )
+    {
+        if( st.path != GRID_STEP::NONE )
+            pathsUsed = std::max( pathsUsed, st.path + 1 );
+
+        setsUsed = std::max( setsUsed, st.conflicts + 1 );
+    }
+
+    paths.assign( aParent.paths.begin(), aParent.paths.begin() + pathsUsed );
+    conflictSets.assign( aParent.conflictSets.begin(), aParent.conflictSets.begin() + setsUsed );
+
+    auto keep = []( const std::unordered_map<uint64_t, std::vector<uint32_t>>& aFrom, uint32_t aBelow,
+                    std::unordered_map<uint64_t, std::vector<uint32_t>>& aTo )
+    {
+        aTo.clear();
+
+        for( const auto& [h, ids] : aFrom )
+        {
+            for( uint32_t id : ids )
+            {
+                if( id < aBelow )
+                    aTo[h].push_back( id );
+            }
+        }
+    };
+
+    keep( aParent.m_byHash, pathsUsed, m_byHash );
+    keep( aParent.m_conflictsByHash, setsUsed, m_conflictsByHash );
+
+    m_keys.assign( aParent.m_keys.begin(), aParent.m_keys.begin() + (long) ( aStep / KEY + 1 ) );
+    aParent.TableAt( aStep, m_table );
+
+    const GRID_STEP& last = steps.back();
+    const size_t     rounds = last.stage == 0 ? (size_t) last.round - 1 : aParent.histByRound.size();
+
+    histByRound.assign( aParent.histByRound.begin(), aParent.histByRound.begin() + (long) rounds );
+    heatByRound.assign( aParent.heatByRound.begin(), aParent.heatByRound.begin() + (long) rounds );
+
+    dead.clear();
+
+    for( const DEAD& d : aParent.dead )
+    {
+        if( d.step <= aStep )
+            dead.push_back( d );
+    }
+}
+
+
 void GRID_LANE::TableAt( size_t aStep, std::vector<uint32_t>& aTable ) const
 {
     if( m_keys.empty() )
@@ -197,12 +265,42 @@ VECTOR2I GRID_TIMELINE::TileCentre( int aTile ) const
 
 size_t GRID_TIMELINE::Bytes() const
 {
-    size_t b = 0;
+    std::lock_guard<std::mutex> lock( m_lanesMutex );
+    size_t                      b = 0;
 
     for( const GRID_LANE& lane : lanes )
         b += lane.Bytes();
 
     return b;
+}
+
+
+size_t GRID_TIMELINE::LaneCount() const
+{
+    std::lock_guard<std::mutex> lock( m_lanesMutex );
+    return lanes.size();
+}
+
+
+const GRID_LANE& GRID_TIMELINE::Lane( size_t aLane ) const
+{
+    std::lock_guard<std::mutex> lock( m_lanesMutex );
+    return lanes[aLane];
+}
+
+
+GRID_LANE& GRID_TIMELINE::Lane( size_t aLane )
+{
+    std::lock_guard<std::mutex> lock( m_lanesMutex );
+    return lanes[aLane];
+}
+
+
+size_t GRID_TIMELINE::AddLane()
+{
+    std::lock_guard<std::mutex> lock( m_lanesMutex );
+    lanes.emplace_back();
+    return lanes.size() - 1;
 }
 
 

@@ -407,6 +407,42 @@ KOPENAPI_RESULT KOPENAPI_HISTORY::Checkpoints() const
 }
 
 
+long KOPENAPI_HISTORY::PendingSeq() const
+{
+    const IMPL* d = const_cast<KOPENAPI_HISTORY*>( this )->impl();
+    return d->pending ? d->pending->seq : 0;
+}
+
+
+long KOPENAPI_HISTORY::LastSeq() const
+{
+    const IMPL* d = const_cast<KOPENAPI_HISTORY*>( this )->impl();
+
+    for( auto it = d->log.rbegin(); it != d->log.rend(); ++it )
+    {
+        if( it->status < 400 )
+            return it->seq;
+    }
+
+    return 0;
+}
+
+
+KOPENAPI_RESULT KOPENAPI_HISTORY::RollbackLastInCall( KOPENAPI_CONTEXT& aCtx )
+{
+    KOPENAPI_RESULT result = Rollback( aCtx, { { "steps", 1 } } );
+    IMPL*           d = impl();
+
+    if( result.status == 200 && d->pending )
+    {
+        IMPL::drop( d->pending->before );
+        d->pending->before = d->mark( aCtx );
+    }
+
+    return result;
+}
+
+
 KOPENAPI_RESULT KOPENAPI_HISTORY::Rollback( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     IMPL*       d = impl();

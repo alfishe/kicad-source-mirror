@@ -73,6 +73,11 @@ struct GRID_PARAMS
     std::function<bool( uint64_t& aSerial, std::string& aBy, int& aN )> held;
     /// @brief With record: the timeline before the variants start (calling thread); it grows while they run
     std::function<void( const std::shared_ptr<GRID_TIMELINE>& )> timelineStarted;
+    /// @brief A branch: the lane branchLane of this timeline goes on after its step branchStep as a new
+    /// lane of the same timeline (the board must be the one the run started from)
+    std::shared_ptr<GRID_TIMELINE> branchOf;
+    int                       branchLane = -1;
+    size_t                    branchStep = 0;
     int                       schedule = 0;    ///< GRID_STRATEGY::schedule of the built-in variants
     float                     histDecay = 1.0f; ///< GRID_STRATEGY::histDecay of the built-in variants
     int                       recent = 2;      ///< GRID_STRATEGY::recent of the built-in variants
@@ -122,6 +127,10 @@ struct GRID_RESULT
     int64_t                      laneBytes = 0;       ///< one lane's search state (estimate)
     int                          lanesMemoryAllows = 0; ///< within GRID_PARAMS::memoryBudget
     std::vector<std::string>     variantsAbandoned;   ///< stopped in their rounds once another joined everything
+    std::string                  error;               ///< nothing routed: why (a branch over another board)
+    int                          branchLane = -1;     ///< the lane a branch was recorded as
+    double                       restoreMs = 0;       ///< a branch: replaying its parent up to the step
+    double                       printMs = 0;         ///< hashing the board as the search sees it (recorded / a branch)
 
     /// @brief Per variant tried: when it finished, its search states per stage, ends joined, vias
     struct VARIANT_STATS

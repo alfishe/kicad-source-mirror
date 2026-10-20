@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -47,6 +48,27 @@ public:
     std::vector<GRID_PATH> paths;
     bool                   abandoned = false;
 
+    /// @brief The variant: its strategy, net order and layer directions
+    GRID_STRATEGY          strategy;
+    std::vector<int>       order;
+    std::vector<int>       direction;
+
+    /// @brief A branch: the lane it goes on from and the step after which its own steps begin (its
+    /// steps before are the parent's); -1 a variant of the run
+    int                    parent = -1;
+    size_t                 parentStep = 0;
+    bool                   running = false;   ///< steps are being added
+
+    /// @brief Ends found walled in by fixed copper: from the search before step `step`
+    struct DEAD
+    {
+        uint32_t step;
+        int32_t  net;
+        int32_t  end;
+    };
+
+    std::vector<DEAD>      dead;
+
     /// @brief Per finished round: the history cost increments of the round (track states, then
     /// cells + VIA for vias), and the heat of the places fought over (max history per tile)
     static constexpr uint32_t VIA = 1u << 31;
@@ -64,6 +86,12 @@ public:
 
     /// @brief After a net was taken: its copper now, deduplicated by content
     void Add( GRID_STEP aStep, const GRID_PATH* aPath );
+
+    void AddDead( int aNet, int aEnd );
+
+    /// @brief A branch's start: the parent's steps up to aStep (inclusive) with their paths, crowded
+    /// places, keys and finished rounds
+    void ForkFrom( const GRID_LANE& aParent, size_t aStep );
 
     /// @brief Every net's path id after step aStep (inclusive); before the first step with SIZE_MAX
     void TableAt( size_t aStep, std::vector<uint32_t>& aTable ) const;
@@ -95,10 +123,19 @@ struct GRID_TIMELINE
     int                       run = 0;       ///< filled by the caller
     int                       tile = 1;      ///< heat tile, cells
     int                       tnx = 0, tny = 0;
-    std::vector<GRID_LANE>    lanes;
+    std::deque<GRID_LANE>     lanes;         ///< a branch adds one while readers hold others: Lane() / LaneCount()
     int                       winner = -1;   ///< set when the route ends
+    uint64_t                  world = 0;     ///< the board as the router saw it (a branch needs the same)
+    std::string               args;          ///< the route call's arguments (JSON), a branch's too
+    long                      appliedSeq = 0; ///< the edit history entry that put a lane's copper on the board
+    int                       appliedLane = -1;
     std::atomic<bool>         live{ false }; ///< the route is running: steps are added; the caller clears it
                                              ///< once the route's copper is on the board
+
+    size_t           LaneCount() const;
+    const GRID_LANE& Lane( size_t aLane ) const;
+    GRID_LANE&       Lane( size_t aLane );
+    size_t           AddLane();
 
     GRID_NET_RESULT Geometry( const GRID_PATH& aPath ) const;
     size_t          Bytes() const;
@@ -112,6 +149,9 @@ struct GRID_TIMELINE
 
     /// @brief The board point (internal units) of a tile's centre
     VECTOR2I TileCentre( int aTile ) const;
+
+private:
+    mutable std::mutex m_lanesMutex;
 };
 
 /// @brief Grid paths as tracks and vias: corners only where the direction changes

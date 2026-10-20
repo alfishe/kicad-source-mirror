@@ -31,6 +31,7 @@
 #include <set>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace
@@ -1302,17 +1303,24 @@ public:
             at( STAGE_PULL_TIGHT, taken++, (int) m_v.order.size() );
             unmark( n );
 
-            // where the net's paths branch off one another: kept on the copper
-            std::unordered_set<uint32_t> branches;
-
-            for( const auto& path : m_nets[n].paths )
+            if( replaying() )
             {
-                if( !path.empty() )
-                    branches.insert( path.front() );
+                takeRecorded( n );
             }
+            else
+            {
+                // where the net's paths branch off one another: kept on the copper
+                std::unordered_set<uint32_t> branches;
 
-            for( auto& path : m_nets[n].paths )
-                pullTight( n, path, branches );
+                for( const auto& path : m_nets[n].paths )
+                {
+                    if( !path.empty() )
+                        branches.insert( path.front() );
+                }
+
+                for( auto& path : m_nets[n].paths )
+                    pullTight( n, path, branches );
+            }
 
             markNet( n );
         }
@@ -1323,14 +1331,32 @@ public:
         at( STAGE_DONE, (int) m_v.order.size(), (int) m_v.order.size() );
     }
 
-    /// @brief Keep the steps in aLane (before Run)
-    void Record( const GRID_TIMELINE& aTimeline, GRID_LANE& aLane, CLOCK::time_point aStarted )
+    /// @brief Keep the steps in aLane (before Run); a branch's lane already holds its parent's
+    void Record( const GRID_TIMELINE& aTimeline, GRID_LANE& aLane, CLOCK::time_point aStarted, bool aFresh = true )
     {
         m_timeline = &aTimeline;
         m_lane = &aLane;
         m_started = aStarted;
-        aLane.Start( m_nets.size() );
+
+        if( aFresh )
+            aLane.Start( m_nets.size() );
     }
+
+    /// @brief A branch (before Run): up to aStep of aFrom the run takes each net's recorded copper
+    /// instead of searching, so it reaches that step's state exactly, then goes on searching
+    void Replay( const GRID_LANE& aFrom, size_t aStep )
+    {
+        m_replay = &aFrom;
+        m_replayEnd = aStep + 1;
+        m_replayAt = 0;
+        m_replayDead = 0;
+        m_replayStarted = CLOCK::now();
+    }
+
+    /// @brief The replay met a net other than the recorded one: the board or the router differ
+    bool   Diverged() const { return m_diverged; }
+    size_t ReplayedSteps() const { return m_replayAt; }
+    double RestoreMs() const { return m_restoreMs; }
 
     /// @brief Another variant has joined everything while this one still negotiates: it stops
     void Abandon()
@@ -1401,6 +1427,23 @@ private:
     /// waits here
     void record( int aNet, int aStage )
     {
+        if( replaying() )
+        {
+            if( m_replay->steps[m_replayAt].net != aNet )
+            {
+                m_diverged = true;
+                return;
+            }
+
+            if( m_lane )
+                recordConflicts( aNet );
+
+            if( ++m_replayAt == m_replayEnd )
+                m_restoreMs = msSince( m_replayStarted );
+
+            return;
+        }
+
         recordStep( aNet, aStage );
         gate();
     }
@@ -1684,6 +1727,13 @@ private:
         if( !m_lane )
             return;
 
+        // in a replay the round is the parent's, already in the lane
+        if( replaying() )
+        {
+            m_histTaken.clear();
+            return;
+        }
+
         const GRID_TIMELINE& t = *m_timeline;
         const PLAN_GRID&     g = m_w.grid;
         std::vector<uint16_t> heat( (size_t) t.tnx * t.tny, 0 );
@@ -1715,9 +1765,72 @@ private:
         m_lane->heatByRound.push_back( std::move( heat ) );
     }
 
+    bool replaying() const { return m_replay && m_replayAt < m_replayEnd; }
+
+    /// @brief In a replay: the recorded copper of the step it is at, for aNet
+    void takeRecorded( int aNet )
+    {
+        const GRID_STEP& st = m_replay->steps[m_replayAt];
+
+        if( st.net != aNet )
+        {
+            m_diverged = true;
+            return;
+        }
+
+        for( ; m_replayDead < m_replay->dead.size() && m_replay->dead[m_replayDead].step <= m_replayAt; ++m_replayDead )
+        {
+            const GRID_LANE::DEAD& d = m_replay->dead[m_replayDead];
+            m_dead[d.net][d.end] = true;
+        }
+
+        const WORLD::NET& wn = m_w.nets[aNet];
+        NET_STATE&        net = m_nets[aNet];
+
+        if( st.path != GRID_STEP::NONE )
+        {
+            net.paths = m_replay->paths[st.path].paths;
+            net.reached = m_replay->paths[st.path].reached;
+        }
+        else
+        {
+            // no copper: the first end alone, as the search leaves it
+            net.paths.clear();
+            net.reached.assign( wn.ends.size(), false );
+
+            for( size_t e = 0; e < wn.ends.size(); ++e )
+            {
+                if( !wn.ends[e].empty() && !wn.walled[e] )
+                {
+                    net.reached[e] = true;
+                    break;
+                }
+            }
+        }
+
+        // pulled tight a net keeps its vias
+        if( st.stage != STAGE_PULL_TIGHT )
+        {
+            net.vias.clear();
+
+            for( const auto& path : net.paths )
+            {
+                for( size_t k = 1; k < path.size(); ++k )
+                {
+                    if( path[k] % m_w.cells == path[k - 1] % m_w.cells )
+                        net.vias.push_back( (uint32_t) ( path[k] % m_w.cells ) );
+                }
+            }
+        }
+
+        m_expanded = st.expanded;
+        std::copy( std::begin( st.box ), std::end( st.box ), m_box.begin() );
+    }
+
     bool stopped() const
     {
         return m_stop.load( std::memory_order_relaxed ) || m_abandoned.load( std::memory_order_relaxed )
+               || m_diverged.load( std::memory_order_relaxed )
                || ( m_params.cancel && m_params.cancel->load( std::memory_order_relaxed ) );
     }
 
@@ -2112,7 +2225,12 @@ private:
     void route( int aNet, float aPf, bool aHard )
     {
         const long before = m_expanded;
-        routeTree( aNet, aPf, aHard );
+
+        if( replaying() )
+            takeRecorded( aNet );
+        else
+            routeTree( aNet, aPf, aHard );
+
         m_expandedBy[aNet] += m_expanded - before;
     }
 
@@ -2155,7 +2273,12 @@ private:
                 if( m_walledIn )
                 {
                     for( int e : left )
+                    {
                         m_dead[aNet][e] = true;
+
+                        if( m_lane )
+                            m_lane->AddDead( aNet, e );
+                    }
                 }
 
                 break;
@@ -2655,6 +2778,13 @@ private:
 
     const GRID_TIMELINE*   m_timeline = nullptr;
     GRID_LANE*             m_lane = nullptr;
+    const GRID_LANE*       m_replay = nullptr;   ///< a branch's parent, taken up to m_replayEnd steps
+    size_t                 m_replayEnd = 0;
+    size_t                 m_replayAt = 0;
+    size_t                 m_replayDead = 0;
+    std::atomic<bool>      m_diverged{ false };
+    CLOCK::time_point      m_replayStarted;
+    double                 m_restoreMs = 0;
     CLOCK::time_point      m_started;
     std::array<int, 4>     m_box{ -1, -1, -1, -1 };   ///< cells searched in since the net was taken
     std::vector<uint32_t>  m_histTaken;   ///< this round's history increments
@@ -2674,13 +2804,108 @@ GRID_NET_RESULT toGeometry( const WORLD& aWorld, const GRID_PARAMS& aParams, con
 } // namespace
 
 
+/// @brief The board as the search sees it, hashed: a branch must route over the same. Nets by name:
+/// a board read again numbers them anew
+uint64_t worldPrint( const WORLD& aWorld, const BOARD* aBoard )
+{
+    uint64_t h = 1469598103934665603ull;
+
+    std::unordered_map<int32_t, uint64_t> byCode;
+
+    auto net = [&]( int32_t aCode ) -> uint64_t
+    {
+        if( aCode <= 0 )
+            return (uint64_t) (int64_t) aCode;
+
+        auto [it, added] = byCode.try_emplace( aCode, 0 );
+
+        if( added )
+        {
+            const NETINFO_ITEM* info = aBoard->FindNet( aCode );
+            it->second = std::hash<std::string>()( info ? info->GetNetname().ToStdString() : std::string() ) | 1ull << 63;
+        }
+
+        return it->second;
+    };
+
+    auto mix = [&]( uint64_t v )
+    {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+
+    auto mixAll = [&]( const auto& aValues )
+    {
+        mix( aValues.size() );
+
+        for( const auto& v : aValues )
+            mix( (uint64_t) v );
+    };
+
+    mix( (uint64_t) aWorld.grid.origin.x );
+    mix( (uint64_t) aWorld.grid.origin.y );
+    mix( (uint64_t) aWorld.grid.cell );
+    mix( (uint64_t) aWorld.grid.nx );
+    mix( (uint64_t) aWorld.grid.ny );
+    mix( (uint64_t) aWorld.L );
+    mix( (uint64_t) aWorld.h2h );
+
+    for( const SIZES& sz : aWorld.sizes )
+    {
+        mix( (uint64_t) sz.halfWidth );
+        mix( (uint64_t) sz.clearance );
+        mix( (uint64_t) sz.viaRadius );
+        mix( (uint64_t) sz.viaDrill );
+    }
+
+    auto mixNets = [&]( const std::vector<int32_t>& aOwners )
+    {
+        mix( aOwners.size() );
+
+        for( int32_t v : aOwners )
+            mix( net( v ) );
+    };
+
+    for( const auto& t : aWorld.track )
+        mixNets( t );
+
+    for( const auto& v : aWorld.via )
+        mixNets( v );
+
+    mixAll( aWorld.fine );
+    mixAll( aWorld.keep );
+    mixAll( aWorld.away );
+    mixNets( aWorld.endOf );
+
+    for( const WORLD::NET& n : aWorld.nets )
+    {
+        mix( net( n.code ) );
+        mix( (uint64_t) n.sizes );
+        mix( (uint64_t) n.group );
+        mix( (uint64_t) n.rank );
+        mixAll( n.walled );
+
+        for( const auto& e : n.ends )
+            mixAll( e );
+    }
+
+    return h;
+}
+
+
 GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_PARAMS& aParams )
 {
     GRID_RESULT result;
     const auto  started = CLOCK::now();
 
     if( aNets.empty() || aParams.layers.empty() )
+    {
+        if( aParams.branchOf )
+            result.error = "the board is not the one run " + std::to_string( aParams.branchOf->run )
+                           + " started from (none of its nets is left to route)";
+
         return result;
+    }
 
     WORLD world;
     buildWorld( aBoard, aNets, aParams, world );
@@ -2688,6 +2913,28 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     buildTiles( world );
     result.buildMs = msSince( started );
     result.cell = world.grid.cell;
+
+    const std::shared_ptr<GRID_TIMELINE>& branchOf = aParams.branchOf;
+    const auto                            printFrom = CLOCK::now();
+    const uint64_t                        print = aParams.record || branchOf ? worldPrint( world, aBoard ) : 0;
+    result.printMs = msSince( printFrom );
+
+    if( branchOf )
+    {
+        if( aParams.branchLane < 0 || aParams.branchLane >= (int) branchOf->LaneCount()
+            || aParams.branchStep >= branchOf->Lane( aParams.branchLane ).steps.size() )
+        {
+            result.error = "no such lane or step";
+            return result;
+        }
+
+        if( print != branchOf->world )
+        {
+            result.error = "the board is not the one run " + std::to_string( branchOf->run )
+                           + " started from (its copper, parts, rules or nets changed)";
+            return result;
+        }
+    }
 
     const auto routing = CLOCK::now();
 
@@ -2785,7 +3032,14 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
     std::vector<VARIANT> variants;
 
-    for( const GRID_STRATEGY& st : strategies )
+    if( branchOf )
+    {
+        const GRID_LANE& from = branchOf->Lane( aParams.branchLane );
+        strategies = { from.strategy };
+        variants.push_back( { from.name, from.order, from.direction, from.strategy } );
+    }
+
+    for( const GRID_STRATEGY& st : branchOf ? std::vector<GRID_STRATEGY>() : strategies )
     {
         VARIANT v;
         v.order = st.order == "long_first" ? longFirst : st.order == "fine_first" ? fineFirst : shortFirst;
@@ -2823,7 +3077,36 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     for( const VARIANT& v : variants )
         runs.push_back( std::make_unique<NEGOTIATION>( world, v, aParams, stop ) );
 
-    if( aParams.record )
+    if( branchOf )
+    {
+        const GRID_LANE& from = branchOf->Lane( aParams.branchLane );
+        const size_t     k = branchOf->AddLane();
+        GRID_LANE&       lane = branchOf->Lane( k );
+
+        lane.ForkFrom( from, aParams.branchStep );
+
+        for( size_t n = 0; n < world.nets.size() && n < branchOf->netCodes.size(); ++n )
+            branchOf->netCodes[n] = world.nets[n].code;
+
+        lane.name = from.name + "/b" + std::to_string( k );
+        lane.parent = aParams.branchLane;
+        lane.parentStep = aParams.branchStep;
+        lane.running = true;
+        variants[0].name = lane.name;
+
+        const auto since = std::chrono::duration_cast<CLOCK::duration>(
+                std::chrono::duration<double, std::milli>( from.steps[aParams.branchStep].ms ) );
+        runs[0]->Record( *branchOf, lane, routing - since, false );
+        runs[0]->Replay( from, aParams.branchStep );
+
+        result.timeline = branchOf;
+        result.branchLane = (int) k;
+        branchOf->live = true;
+
+        if( aParams.timelineStarted )
+            aParams.timelineStarted( branchOf );
+    }
+    else if( aParams.record )
     {
         auto tl = std::make_shared<GRID_TIMELINE>();
         tl->grid = world.grid;
@@ -2837,10 +3120,17 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         for( const WORLD::NET& n : world.nets )
             tl->netCodes.push_back( n.code );
 
+        tl->world = print;
+
         for( size_t k = 0; k < runs.size(); ++k )
         {
-            tl->lanes[k].name = variants[k].name;
-            runs[k]->Record( *tl, tl->lanes[k], routing );
+            GRID_LANE& lane = tl->lanes[k];
+            lane.name = variants[k].name;
+            lane.strategy = variants[k].strategy;
+            lane.order = variants[k].order;
+            lane.direction = variants[k].direction;
+            lane.running = true;
+            runs[k]->Record( *tl, lane, routing );
         }
 
         result.timeline = tl;
@@ -2938,16 +3228,40 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         }
     }
 
-    const NEGOTIATION& win = *runs[best];
-    result.variant = variants[best].name;
+    if( branchOf )
+    {
+        GRID_LANE& lane = branchOf->Lane( result.branchLane );
+        lane.running = false;
+        result.restoreMs = runs[0]->RestoreMs();
 
-    if( result.timeline )
+        if( runs[0]->Diverged() )
+        {
+            result.error = "the replay of " + branchOf->Lane( aParams.branchLane ).name + " went another way at step "
+                           + std::to_string( runs[0]->ReplayedSteps() ) + ": the router differs from the one that recorded it";
+            lane.abandoned = true;
+            return result;
+        }
+    }
+    else if( result.timeline )
     {
         result.timeline->winner = best;
 
         for( size_t k = 0; k < runs.size(); ++k )
+        {
             result.timeline->lanes[k].abandoned = runs[k]->Abandoned();
+            result.timeline->lanes[k].running = false;
+        }
     }
+
+    if( best < 0 )
+    {
+        result.error = "stopped";
+        return result;
+    }
+
+    const NEGOTIATION& win = *runs[best];
+    result.variant = variants[best].name;
+
     result.rounds = win.Round();
     result.conflictsLeft = win.Dropped();
     result.crowdedByRound = win.ByRound();
