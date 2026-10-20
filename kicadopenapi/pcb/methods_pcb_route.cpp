@@ -1494,7 +1494,8 @@ struct ROUTE_BRANCH
     size_t                         step = 0;
     std::string                    board;   ///< how the board was brought back to the run's start
     bool                           warm = false;      ///< over the board as it is now (edited since)
-    bool                           history = true;    ///< warm: the step's history kept
+    GRID_PARAMS::WARM_HISTORY      history = GRID_PARAMS::KEEP;
+    int                            removed = -1;      ///< warm: the run's tracks and vias taken out (-1: none were)
 };
 
 
@@ -1545,10 +1546,12 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     if( aArgs.contains( "history" ) )
     {
-        if( !aArgs["history"].is_string() || ( aArgs["history"] != "keep" && aArgs["history"] != "clear" ) )
-            return KOPENAPI_RESULT::Error( 400, "history: keep or clear" );
+        const std::string h = aArgs["history"].is_string() ? aArgs["history"].get<std::string>() : std::string();
 
-        branch.history = aArgs["history"] == "keep";
+        if( h != "keep" && h != "clear" && h != "clear_edited" )
+            return KOPENAPI_RESULT::Error( 400, "history: keep, clear or clear_edited" );
+
+        branch.history = h == "clear" ? GRID_PARAMS::CLEAR : h == "clear_edited" ? GRID_PARAMS::CLEAR_EDITED : GRID_PARAMS::KEEP;
     }
 
     if( !branch.warm && t->Lane( branch.lane ).world )
@@ -1575,10 +1578,38 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     }
     else if( t->appliedSeq > 0 && branch.warm && history.Holds( t->appliedSeq, "pcb" ) )
     {
-        return KOPENAPI_RESULT::Error( 409, "the copper of run " + std::to_string( t->run )
-                                                    + " is on the board under later edits: roll those back, then the route "
-                                                      "(edit_rollback), edit again and branch warm; or stop a route before it "
-                                                      "applies (job_cancel {keep: true}) to edit" );
+        // under later edits: the run's own tracks and vias taken out, the edits kept
+        std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+        if( !context )
+            return KopenapiNoBoard();
+
+        if( std::optional<KOPENAPI_RESULT> busy = guiRouting() )
+            return *busy;
+
+        BOARD*       board = context->GetBoard();
+        BOARD_COMMIT commit( context->GetToolManager() );
+        branch.removed = 0;
+
+        for( const KIID& id : t->appliedItems )
+        {
+            BOARD_ITEM* item = board->ResolveItem( id, true );
+
+            if( item && ( item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T || item->Type() == PCB_VIA_T ) )
+            {
+                commit.Remove( item );
+                branch.removed++;
+            }
+        }
+
+        if( branch.removed > 0 )
+            commit.Push( _( "Take a route's copper out (API)" ) );
+        else
+            commit.Revert();
+
+        t->appliedSeq = 0;
+        t->appliedItems.clear();
+        branch.board = "the run's copper taken out, the edits after it kept";
     }
     else
     {
@@ -3373,7 +3404,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                           { "why", why } } );
                 }
 
-                timelineOut["branch"]["warm"] = { { "round", gr.warmRound }, { "affected", affected } };
+                timelineOut["branch"]["warm"] = { { "round", gr.warmRound }, { "affected", affected },
+                                                  { "edited_tiles", gr.warmEditedTiles }, { "board", aBranch->board } };
+
+                if( aBranch->removed >= 0 )
+                    timelineOut["branch"]["warm"]["copper_removed"] = aBranch->removed;
             }
         }
         else if( aBranch && !gr.cold.empty() )
@@ -3383,6 +3418,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         // each net's copper staged and guarded against the rest; a net the guard rejects stays out
         BOARD_COMMIT                        commit( context->GetToolManager() );
+        std::vector<KIID>                   gridItems;
         std::vector<BOARD_CONNECTED_ITEM*>  staged;
         nlohmann::json                      rejected = nlohmann::json::array();
         std::vector<bool>                   netOk( gridNets.size(), false );
@@ -3443,6 +3479,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             for( std::unique_ptr<PCB_TRACK>& item : made )
             {
                 added.push_back( item->m_Uuid );
+                gridItems.push_back( item->m_Uuid );
                 commit.Add( item.release() );
             }
         }
@@ -3456,6 +3493,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         {
             gr.timeline->appliedSeq = KOPENAPI_HISTORY::Get().PendingSeq();
             gr.timeline->appliedLane = gr.branchLane >= 0 ? gr.branchLane : gr.timeline->winner;
+            gr.timeline->appliedItems = gridItems;
         }
 
         for( size_t k = 0; k < gridNets.size(); ++k )
@@ -6241,8 +6279,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "pf_growth":{"type":"number","default":1.6,"description":"grid: how much that price grows each round (more: fewer rounds, longer detours)"},
                         "record":{"type":"boolean","default":false,"description":"grid: keep every variant's steps for pcb_route_timeline"},
                         "from":{"type":"object","description":"grid, a branch: the recorded lane goes on after a step as a new lane of the same run (pcb_route_timeline status: parent, parent_step), with the run's own arguments; the copper the run (or its last branch) put on the board is rolled back first when that is the last edit, else the board must be as the run found it (409). Up to the step the recorded nets are taken without searching, so the branch's steps equal the recorded ones until it searches on. A grid route stopped with job_cancel {keep: true} goes on from a stopped lane's last step. With warm: true over the board as edited since","properties":{"run":{"type":"integer"},"lane":{"description":"index or variant name; default the lane on the board"},"step":{"type":"integer"}},"required":["step"]},
-                        "warm":{"type":"boolean","description":"with from: go on over the board as edited since (a part moved, a keep-out drawn) instead of the run's: the step's copper, history and rounds are taken as they are, the nets whose copper the edit broke (over new copper or keep-outs, pads moved) or that are not joined lose it and are routed first in a new round, the rest keep theirs (timeline.branch.warm: round, affected nets and why). The grid, layers, sizes and nets must be the run's, else a new run is routed cold (timeline.cold: why). The run's copper must not be on the board under the edits (409)"},
-                        "history":{"type":"string","enum":["keep","clear"],"description":"warm: the history of places fought over kept (default) or started empty"},
+                        "warm":{"type":"boolean","description":"with from: go on over the board as edited since (a part moved, a keep-out drawn) instead of the run's: the step's copper, history and rounds are taken as they are, the nets whose copper the edit broke (over new copper or keep-outs, pads moved) or that are not joined lose it and are routed first in a new round, the rest keep theirs (timeline.branch.warm: round, affected nets and why). The grid, layers, sizes and nets must be the run's, else a new run is routed cold (timeline.cold: why). The run's copper on the board under later edits is taken out first, the edits kept (warm.copper_removed)"},
+                        "history":{"type":"string","enum":["keep","clear","clear_edited"],"description":"warm: the history of places fought over kept (default), started empty, or cleared where the edit changed the board (and 1 mm around; timeline.branch.warm.edited_tiles)"},
                         "schedule":{"type":"string","enum":["fixed","adaptive","adaptive_hist"],"default":"fixed","description":"grid, EXPERIMENTAL: negotiation schedule of the built-in variants (adaptive: growth 1.3 while the crowded nets fall, 2.0 when they stall; adaptive_hist: also twice the history on places fought over 3 rounds running)"},
                         "strategies":{"type":"array","description":"grid, EXPERIMENTAL: the variants to race instead of the built-ins: 'short_first_hv@1.0x1.6/a1.5/d0.9/r2', 'fine_first@adaptive', or {order, directions, pf_start, pf_growth, astar, schedule, hist_decay, reroute_recent}","items":{}},
                         "hist_decay":{"type":"number","default":1.0,"description":"grid, EXPERIMENTAL: the history cost of places not fought over in a round is multiplied by this (1: kept for good)"},

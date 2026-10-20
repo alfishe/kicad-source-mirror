@@ -81,7 +81,10 @@ struct GRID_PARAMS
     /// @brief A branch over an edited board: the step's state taken as it is (copper, history,
     /// rounds), the nets the edit broke routed first in a new round; cold when the grid or nets differ
     bool                      warm = false;
-    bool                      warmHistory = true;   ///< false: the history starts empty
+    /// @brief The step's history: kept, cleared, or cleared where the world changed (and a tile
+    /// around)
+    enum WARM_HISTORY { KEEP, CLEAR, CLEAR_EDITED };
+    WARM_HISTORY              warmHistory = KEEP;
     int                       schedule = 0;    ///< GRID_STRATEGY::schedule of the built-in variants
     float                     histDecay = 1.0f; ///< GRID_STRATEGY::histDecay of the built-in variants
     int                       recent = 2;      ///< GRID_STRATEGY::recent of the built-in variants
@@ -137,6 +140,7 @@ struct GRID_RESULT
     double                       printMs = 0;         ///< hashing the board as the search sees it (recorded / a branch)
     std::string                  cold;                ///< a warm branch routed cold instead: why
     int                          warmRound = 0;       ///< a warm branch: the round it went on in
+    int                          warmEditedTiles = 0; ///< a warm branch: tiles of the world that changed
     /// @brief A warm branch: the nets whose copper at the step the edit broke (net code, why), routed
     /// first
     std::vector<std::pair<int, std::string>> warmAffected;

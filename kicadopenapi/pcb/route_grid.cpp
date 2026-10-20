@@ -1369,7 +1369,8 @@ public:
     /// world (each net's copper, the history of the finished rounds, the present factor); the nets
     /// whose copper the world no longer allows, or that are not joined, lose it and go first in a new
     /// round
-    void WarmStart( const GRID_LANE& aFrom, size_t aStep, bool aHistory )
+    void WarmStart( const GRID_LANE& aFrom, size_t aStep, GRID_PARAMS::WARM_HISTORY aHistory,
+                    const std::vector<bool>& aEdited )
     {
         const auto                            started = CLOCK::now();
         std::lock_guard<std::recursive_mutex> lock( aFrom.Mutex() );
@@ -1397,7 +1398,7 @@ public:
         {
             m_round = (int) r + 1;
 
-            for( uint32_t v : aHistory ? aFrom.histByRound[r] : std::vector<uint32_t>() )
+            for( uint32_t v : aHistory != GRID_PARAMS::CLEAR ? aFrom.histByRound[r] : std::vector<uint32_t>() )
             {
                 if( v & GRID_LANE::VIA )
                     m_histVia[v & ~GRID_LANE::VIA] += histStep( S + ( v & ~GRID_LANE::VIA ) );
@@ -1405,11 +1406,36 @@ public:
                     m_hist[v] += histStep( v );
             }
 
-            if( aHistory && m_v.strategy.histDecay < 1.0f )
+            if( aHistory != GRID_PARAMS::CLEAR && m_v.strategy.histDecay < 1.0f )
                 decayHistory();
 
             m_byRound.push_back( byRound[r] );
             m_pf = std::min( m_pf * growth(), 1e4f );
+        }
+
+        if( aHistory == GRID_PARAMS::CLEAR_EDITED && m_timeline )
+        {
+            for( size_t c = 0; c < m_w.cells; ++c )
+            {
+                const auto [x, y] = tileOf( (uint32_t) c );
+
+                if( !aEdited[(size_t) y * m_timeline->tnx + x] )
+                    continue;
+
+                for( int l = 0; l < m_w.L; ++l )
+                {
+                    const size_t s = (size_t) l * m_w.cells + c;
+                    m_hist[s] = 0;
+
+                    if( !m_fought.empty() )
+                        m_fought[s] = 0, m_streak[s] = 0;
+                }
+
+                m_histVia[c] = 0;
+
+                if( !m_fought.empty() )
+                    m_fought[S + c] = 0, m_streak[S + c] = 0;
+            }
         }
 
         std::vector<uint32_t> table;
@@ -3098,6 +3124,65 @@ uint64_t worldPrint( const WORLD& aWorld, const BOARD* aBoard )
 }
 
 
+/// @brief Per tile of aTile cells (aTnx across): what the search sees there hashed, nets by name, so
+/// two worlds on the same grid tell where they differ
+std::vector<uint64_t> tilePrints( const WORLD& aWorld, const BOARD* aBoard, int aTile, int aTnx, int aTny )
+{
+    std::vector<uint64_t> h( (size_t) aTnx * aTny, 1469598103934665603ull );
+    std::unordered_map<int32_t, uint64_t> byCode;
+
+    auto net = [&]( int32_t aCode ) -> uint64_t
+    {
+        if( aCode <= 0 )
+            return (uint64_t) (int64_t) aCode;
+
+        auto [it, added] = byCode.try_emplace( aCode, 0 );
+
+        if( added )
+        {
+            const NETINFO_ITEM* info = aBoard->FindNet( aCode );
+            it->second = std::hash<std::string>()( info ? info->GetNetname().ToStdString() : std::string() ) | 1ull << 63;
+        }
+
+        return it->second;
+    };
+
+    const PLAN_GRID& g = aWorld.grid;
+
+    for( int y = 0; y < g.ny; ++y )
+    {
+        for( int x = 0; x < g.nx; ++x )
+        {
+            const size_t c = (size_t) y * g.nx + x;
+            uint64_t&    t = h[(size_t) ( y / aTile ) * aTnx + x / aTile];
+
+            auto mix = [&]( uint64_t v )
+            {
+                t ^= v;
+                t *= 1099511628211ull;
+            };
+
+            for( size_t k = 0; k < aWorld.sizes.size(); ++k )
+            {
+                for( int l = 0; l < aWorld.L; ++l )
+                    mix( net( aWorld.track[k][(size_t) l * aWorld.cells + c] ) );
+
+                mix( net( aWorld.via[k][c] ) );
+            }
+
+            for( int l = 0; l < aWorld.L; ++l )
+                mix( net( aWorld.endOf[(size_t) l * aWorld.cells + c] ) );
+
+            mix( aWorld.keep.empty() ? 0 : aWorld.keep[c] );
+            mix( aWorld.fine.empty() ? 0 : aWorld.fine[c] );
+            mix( aWorld.away.empty() ? 0 : aWorld.away[c] );
+        }
+    }
+
+    return h;
+}
+
+
 /// @brief What a warm branch needs to be the same: the grid, layers and sizes (aNets false), or the
 /// nets routed by name in order (aNets true)
 uint64_t rulesPrint( const WORLD& aWorld, const BOARD* aBoard, bool aNets )
@@ -3203,6 +3288,10 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     const uint64_t                 print = aParams.record || branchOf ? worldPrint( world, aBoard ) : 0;
     const uint64_t                 rules = rulesPrint( world, aBoard, false );
     const uint64_t                 netsPrint = rulesPrint( world, aBoard, true );
+    const int                      tile = std::max( 1, (int) std::lround( pcbIUScale.mmToIU( 1.0 ) / (double) world.grid.cell ) );
+    const int                      tnx = ( world.grid.nx + tile - 1 ) / tile, tny = ( world.grid.ny + tile - 1 ) / tile;
+    const std::vector<uint64_t>    tiles = aParams.record || branchOf ? tilePrints( world, aBoard, tile, tnx, tny )
+                                                                     : std::vector<uint64_t>();
     result.printMs = msSince( printFrom );
 
     if( branchOf )
@@ -3406,7 +3495,36 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         if( aParams.warm )
         {
             lane.world = print;
-            runs[0]->WarmStart( from, aParams.branchStep, aParams.warmHistory );
+
+            // the tiles the edit changed, and one around each
+            const std::vector<uint64_t>& now = tiles;
+            std::vector<bool>           edited( now.size(), false );
+
+            for( int ty = 0; ty < branchOf->tny; ++ty )
+            {
+                for( int tx = 0; tx < branchOf->tnx; ++tx )
+                {
+                    const size_t t = (size_t) ty * branchOf->tnx + tx;
+
+                    if( t >= branchOf->tilePrints.size() || now[t] == branchOf->tilePrints[t] )
+                        continue;
+
+                    result.warmEditedTiles++;
+
+                    for( int dy = -1; dy <= 1; ++dy )
+                    {
+                        for( int dx = -1; dx <= 1; ++dx )
+                        {
+                            const int x = tx + dx, y = ty + dy;
+
+                            if( x >= 0 && y >= 0 && x < branchOf->tnx && y < branchOf->tny )
+                                edited[(size_t) y * branchOf->tnx + x] = true;
+                        }
+                    }
+                }
+            }
+
+            runs[0]->WarmStart( from, aParams.branchStep, aParams.warmHistory, edited );
             result.warmRound = runs[0]->FirstRound();
 
             for( const auto& [n, why] : runs[0]->Affected() )
@@ -3430,9 +3548,9 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         tl->grid = world.grid;
         tl->cells = world.cells;
         tl->layers = aParams.layers;
-        tl->tile = std::max( 1, (int) std::lround( pcbIUScale.mmToIU( 1.0 ) / (double) world.grid.cell ) );
-        tl->tnx = ( world.grid.nx + tl->tile - 1 ) / tl->tile;
-        tl->tny = ( world.grid.ny + tl->tile - 1 ) / tl->tile;
+        tl->tile = tile;
+        tl->tnx = tnx;
+        tl->tny = tny;
         tl->lanes.resize( runs.size() );
 
         for( const WORLD::NET& n : world.nets )
@@ -3441,6 +3559,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         tl->world = print;
         tl->rules = rules;
         tl->nets = netsPrint;
+        tl->tilePrints = tiles;
 
         for( const WORLD::NET& n : world.nets )
         {

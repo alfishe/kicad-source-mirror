@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <kiid.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -137,9 +138,11 @@ struct GRID_TIMELINE
     uint64_t                  rules = 0;     ///< the grid, layers and sizes (a warm branch needs the same)
     uint64_t                  nets = 0;      ///< the nets routed, by name in order (a warm branch needs the same)
     std::vector<std::string>  netKeys;       ///< the nets' board names in order (a warm branch routes them so)
+    std::vector<uint64_t>     tilePrints;    ///< per tile (tile, tnx, tny): the world there hashed (what an edit changed)
     std::string               args;          ///< the route call's arguments (JSON), a branch's too
     long                      appliedSeq = 0; ///< the edit history entry that put a lane's copper on the board
     int                       appliedLane = -1;
+    std::vector<KIID>         appliedItems;  ///< the tracks and vias that put it there
     std::atomic<int>          shownLane{ -1 }; ///< branch_switch: the lane frame / the replay show by default
     std::atomic<bool>         live{ false }; ///< the route is running: steps are added; the caller clears it
                                              ///< once the route's copper is on the board
