@@ -5,11 +5,13 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 class BOARD;
 class BOARD_CONNECTED_ITEM;
+struct GRID_TIMELINE;
 
 /// @brief A net to join on the grid: its ends (pads, tracks, vias of the net) and its sizes
 struct GRID_NET
@@ -36,6 +38,21 @@ struct GRID_VARIANT_PROGRESS
     long        expanded = 0;
 };
 
+/// @brief How one variant searches: net order, layer directions, negotiation schedule, A* weight
+struct GRID_STRATEGY
+{
+    std::string order = "short_first";   ///< short_first, fine_first, long_first
+    std::string directions;              ///< "" any, "hv", "vh" (per layer from the first)
+    float       pfStart = 1.0f;
+    float       pfGrowth = 1.6f;
+    float       astar = 1.2f;
+    int         schedule = 0;            ///< 0 fixed, 1 adaptive growth, 2 adaptive + history on cells fought over again
+    float       histDecay = 1.0f;        ///< history of places not fought over in a round is multiplied by this; 1 kept
+    int         recent = 0;              ///< rounds: a net is routed again through history this recent only; 0 any history
+
+    std::string Name() const;
+};
+
 struct GRID_PARAMS
 {
     std::vector<PCB_LAYER_ID> layers;          ///< routing layers
@@ -46,9 +63,14 @@ struct GRID_PARAMS
     int                       viaAway = 0;     ///< a via nearer a chip's pads than this costs more, the nearer the more; 0 none
     int                       viaAwayCost = 0; ///< at the pads: as much as this length of track
     float                     hug = 1.0f;      ///< cost factor of a cell beside the copper of the net's own bundle; 1 none
-    float                     astar = 1.2f;
-    float                     pfStart = 0.5f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
-    float                     pfGrowth = 1.3f; ///< and how much it grows each round (VPR's pres_fac_mult)    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
+    float                     astar = 1.2f;    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
+    float                     pfStart = 1.0f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
+    float                     pfGrowth = 1.6f; ///< and how much it grows each round (VPR's pres_fac_mult)
+    bool                      record = false;  ///< keep each variant's timeline (GRID_RESULT::timeline)
+    int                       schedule = 0;    ///< GRID_STRATEGY::schedule of the built-in variants
+    float                     histDecay = 1.0f; ///< GRID_STRATEGY::histDecay of the built-in variants
+    int                       recent = 0;      ///< GRID_STRATEGY::recent of the built-in variants
+    std::vector<GRID_STRATEGY> strategies;     ///< the variants to race; empty: the built-ins
     std::atomic<bool>*        cancel = nullptr;
 
     /// @brief Called on the calling thread while the variants run, about every 50 ms; false stops them
@@ -109,6 +131,7 @@ struct GRID_RESULT
     std::vector<CROWDING>        crowdedAtEnd;     ///< still crowded when its rounds ended
     std::vector<long>            expandedByStage;   ///< the winner's: rounds, legalising, the short again, fewer vias
     std::vector<std::pair<int, long>> costliest;   ///< the winner's nets that took the most search states
+    std::shared_ptr<GRID_TIMELINE>    timeline;    ///< with GRID_PARAMS::record: every variant's steps
 };
 
 /**

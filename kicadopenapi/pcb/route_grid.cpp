@@ -1,5 +1,6 @@
 #include "route_grid.h"
 #include "route_raster.h"
+#include "route_timeline.h"
 
 #include <base_units.h>
 #include <board.h>
@@ -18,6 +19,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <climits>
+#include <cstdio>
 #include <future>
 #include <limits>
 #include <map>
@@ -998,6 +1001,7 @@ struct VARIANT
     std::string      name;
     std::vector<int> order;
     std::vector<int> direction;   ///< per layer: 0 any, 1 horizontal, 2 vertical
+    GRID_STRATEGY    strategy;
 };
 
 
@@ -1068,7 +1072,7 @@ public:
 
     void Run()
     {
-        float pf = m_params.pfStart;
+        float pf = m_v.strategy.pfStart;
 
         for( m_round = 1; m_round <= m_params.maxRounds && !stopped(); ++m_round )
         {
@@ -1078,7 +1082,8 @@ public:
 
             for( int n : m_v.order )
             {
-                if( m_round == 1 || conflicts( n ) > 0 || throughHistory( n ) )
+                if( m_round == 1 || conflicts( n ) > 0
+                    || ( m_v.strategy.recent > 0 ? throughRecentHistory( n ) : throughHistory( n ) ) )
                     todo.push_back( n );
             }
 
@@ -1096,7 +1101,8 @@ public:
             }
 
             // places fought over cost more from now on
-            int left = 0;
+            int          left = 0;
+            const size_t S = (size_t) m_w.L * m_w.cells;
 
             for( size_t n = 0; n < m_nets.size(); ++n )
             {
@@ -1109,8 +1115,11 @@ public:
                     {
                         if( m_occTrack[k][s] >= 2 && !m_w.InOwnEnd( s, m_w.nets[n].code ) )
                         {
-                            m_hist[s] += HIST_STEP;
+                            m_hist[s] += histStep( s );
                             any = true;
+
+                            if( m_lane )
+                                m_histTaken.push_back( s );
                         }
                     }
                 }
@@ -1119,17 +1128,24 @@ public:
                 {
                     if( m_occVia[k][i] >= 2 )
                     {
-                        m_histVia[i] += HIST_STEP;
+                        m_histVia[i] += histStep( S + i );
                         any = true;
+
+                        if( m_lane )
+                            m_histTaken.push_back( i | GRID_LANE::VIA );
                     }
                 }
 
                 left += any;
             }
 
+            if( m_v.strategy.histDecay < 1.0f )
+                decayHistory();
+
             m_conflicting = left;
             m_byRound.push_back( left );
-            pf = std::min( pf * m_params.pfGrowth, 1e4f );
+            recordRound();
+            pf = std::min( pf * growth(), 1e4f );
 
             if( left == 0 )
                 break;
@@ -1179,6 +1195,7 @@ public:
                 m_nets[worst] = NET_STATE();
                 m_nets[worst].reached.assign( m_w.nets[worst].ends.size(), false );
                 m_dropped++;
+                record( worst, (int) std::size( GRID_TIMELINE::STAGES ) - 1 );
                 continue;
             }
 
@@ -1303,6 +1320,15 @@ public:
         at( STAGE_DONE, (int) m_v.order.size(), (int) m_v.order.size() );
     }
 
+    /// @brief Keep the steps in aLane (before Run)
+    void Record( const GRID_TIMELINE& aTimeline, GRID_LANE& aLane, CLOCK::time_point aStarted )
+    {
+        m_timeline = &aTimeline;
+        m_lane = &aLane;
+        m_started = aStarted;
+        aLane.Start( m_nets.size() );
+    }
+
     /// @brief Another variant has joined everything while this one still negotiates: it stops
     void Abandon()
     {
@@ -1366,6 +1392,280 @@ private:
         m_taken = aTaken;
         m_takenOf = aOf;
         m_expandedShown = m_expanded;
+    }
+
+    /// @brief The net was taken (routed, kept, pulled tight or dropped): one step
+    void record( int aNet, int aStage )
+    {
+        if( !m_lane )
+            return;
+
+        GRID_STEP st;
+        st.stage = (uint8_t) aStage;
+        st.round = (uint16_t) std::min( m_round.load(), 65535 );
+        st.net = aNet;
+        st.crowded = m_conflicting;
+        st.expanded = m_expanded;
+        std::copy( m_box.begin(), m_box.end(), st.box );
+        st.ms = (float) msSince( m_started );
+        st.conflicts = recordConflicts( aNet );
+
+        const NET_STATE& net = m_nets[aNet];
+        GRID_PATH        path{ net.paths, net.reached };
+        m_lane->Add( st, &path );
+    }
+
+    /// @brief A tile of the timeline (x, y) holding a cell
+    std::pair<int, int> tileOf( uint32_t aCell ) const
+    {
+        return { (int) ( aCell % m_w.grid.nx ) / m_timeline->tile, (int) ( aCell / m_w.grid.nx ) / m_timeline->tile };
+    }
+
+    /// @brief Widens the tiles changed since the last step by a net's copper (and a tile around it)
+    void touchChanged( int aNet )
+    {
+        auto add = [&]( uint32_t aCell )
+        {
+            const auto [x, y] = tileOf( aCell );
+            m_changed = { std::min( m_changed[0], x - 1 ), std::min( m_changed[1], y - 1 ), std::max( m_changed[2], x + 1 ),
+                          std::max( m_changed[3], y + 1 ) };
+        };
+
+        for( const auto& path : m_nets[aNet].paths )
+        {
+            for( uint32_t s : path )
+                add( (uint32_t) ( s % m_w.cells ) );
+        }
+
+        for( uint32_t i : m_nets[aNet].vias )
+            add( i );
+    }
+
+    /// @brief The tiles where a net crowds another now, one entry per crowded state
+    void crowdedTiles( int aNet, std::vector<uint32_t>& aOut ) const
+    {
+        aOut.clear();
+        const int k = m_w.nets[aNet].sizes;
+
+        auto add = [&]( uint32_t aCell )
+        {
+            const auto [x, y] = tileOf( aCell );
+            aOut.push_back( (uint32_t) ( y * m_timeline->tnx + x ) );
+        };
+
+        for( const auto& path : m_nets[aNet].paths )
+        {
+            for( uint32_t s : path )
+            {
+                if( m_occTrack[k][s] >= 2 && !m_w.InOwnEnd( s, m_w.nets[aNet].code ) )
+                    add( (uint32_t) ( s % m_w.cells ) );
+            }
+        }
+
+        for( uint32_t i : m_nets[aNet].vias )
+        {
+            if( m_occVia[k][i] >= 2 )
+                add( i );
+        }
+    }
+
+    /// @brief The places crowded after a net was taken: the net's own, and again those of the nets
+    /// crowded before where the copper changed; returns the set's id in the lane
+    uint32_t recordConflicts( int aNet )
+    {
+        if( m_netConflicts.empty() )
+            m_netConflicts.resize( m_nets.size() );
+
+        touchChanged( aNet );
+        crowdedTiles( aNet, m_netConflicts[aNet] );
+
+        std::vector<int> still;
+
+        for( int n : m_conflictNets )
+        {
+            if( n == aNet )
+                continue;
+
+            for( uint32_t t : m_netConflicts[n] )
+            {
+                const int x = (int) ( t % m_timeline->tnx ), y = (int) ( t / m_timeline->tnx );
+
+                if( x >= m_changed[0] && x <= m_changed[2] && y >= m_changed[1] && y <= m_changed[3] )
+                {
+                    crowdedTiles( n, m_netConflicts[n] );
+                    break;
+                }
+            }
+
+            if( !m_netConflicts[n].empty() )
+                still.push_back( n );
+        }
+
+        if( !m_netConflicts[aNet].empty() )
+            still.push_back( aNet );
+
+        m_conflictNets.swap( still );
+        m_changed = { INT_MAX, INT_MAX, INT_MIN, INT_MIN };
+
+        std::vector<uint32_t> all;
+
+        for( int n : m_conflictNets )
+            all.insert( all.end(), m_netConflicts[n].begin(), m_netConflicts[n].end() );
+
+        std::sort( all.begin(), all.end() );
+        std::vector<uint32_t> set;
+
+        for( size_t i = 0; i < all.size(); )
+        {
+            size_t j = i;
+
+            while( j < all.size() && all[j] == all[i] )
+                ++j;
+
+            set.push_back( all[i] << 8 | (uint32_t) std::min<size_t>( j - i, 255 ) );
+            i = j;
+        }
+
+        return m_lane->AddConflicts( set );
+    }
+
+    /// @brief The present factor's growth after this round: fixed, or slow while the crowded nets
+    /// fall (by a tenth over two rounds) and fast when they stall
+    float growth() const
+    {
+        if( m_v.strategy.schedule == 0 )
+            return m_v.strategy.pfGrowth;
+
+        const size_t r = m_byRound.size();
+
+        if( r < 3 )
+            return 1.3f;
+
+        return m_byRound[r - 1] <= 0.9 * m_byRound[r - 3] ? 1.3f : 2.0f;
+    }
+
+    /// @brief History added to a state (track states, then S + via cell) fought over this round:
+    /// twice the step once it was fought over in three rounds running (schedule 2)
+    float histStep( size_t aState )
+    {
+        if( !stampsFought() )
+            return HIST_STEP;
+
+        if( m_fought.empty() )
+        {
+            const size_t S = (size_t) m_w.L * m_w.cells;
+            m_fought.assign( S + m_w.cells, 0 );
+            m_streak.assign( S + m_w.cells, 0 );
+        }
+
+        const uint16_t round = (uint16_t) m_round.load();
+
+        if( m_fought[aState] != round )
+        {
+            m_streak[aState] = m_fought[aState] + 1 == round ? (uint8_t) std::min( 255, m_streak[aState] + 1 ) : 1;
+            m_fought[aState] = round;
+        }
+
+        return m_v.strategy.schedule >= 2 && m_streak[aState] >= 3 ? 2.0f * HIST_STEP : HIST_STEP;
+    }
+
+    /// @brief Whether the round each state was last fought over is kept
+    bool stampsFought() const
+    {
+        const GRID_STRATEGY& st = m_v.strategy;
+        return st.schedule >= 2 || st.histDecay < 1.0f || st.recent > 0;
+    }
+
+    /// @brief History of the places not fought over this round fades; what is left under a tenth of
+    /// a step is gone
+    void decayHistory()
+    {
+        const float  d = m_v.strategy.histDecay;
+        const size_t S = (size_t) m_w.L * m_w.cells;
+        const uint16_t round = (uint16_t) m_round.load();
+
+        auto fade = [&]( float& aHist, size_t aState )
+        {
+            if( aHist > 0 && ( m_fought.empty() || m_fought[aState] != round ) )
+            {
+                aHist *= d;
+
+                if( aHist < 0.1f * HIST_STEP )
+                    aHist = 0;
+            }
+        };
+
+        for( size_t s = 0; s < S; ++s )
+            fade( m_hist[s], s );
+
+        for( size_t i = 0; i < m_histVia.size(); ++i )
+            fade( m_histVia[i], S + i );
+    }
+
+    /// @brief Whether the net passes where nets were fought over in the last rounds (strategy recent)
+    bool throughRecentHistory( int aNet ) const
+    {
+        if( m_fought.empty() )
+            return false;
+
+        const size_t S = (size_t) m_w.L * m_w.cells;
+        const int    since = m_round - m_v.strategy.recent;
+
+        auto recent = [&]( size_t aState ) { return m_fought[aState] && (int) m_fought[aState] >= since; };
+
+        for( const auto& path : m_nets[aNet].paths )
+        {
+            for( uint32_t s : path )
+            {
+                if( recent( s ) )
+                    return true;
+            }
+        }
+
+        for( uint32_t i : m_nets[aNet].vias )
+        {
+            if( recent( S + i ) )
+                return true;
+        }
+
+        return false;
+    }
+
+    /// @brief After a round: its history increments and the heat per tile
+    void recordRound()
+    {
+        if( !m_lane )
+            return;
+
+        m_lane->histByRound.push_back( std::move( m_histTaken ) );
+        m_histTaken.clear();
+
+        const GRID_TIMELINE& t = *m_timeline;
+        const PLAN_GRID&     g = m_w.grid;
+        std::vector<uint16_t> heat( (size_t) t.tnx * t.tny, 0 );
+
+        for( int l = 0; l < m_w.L; ++l )
+        {
+            const float* hist = m_hist.data() + (size_t) l * m_w.cells;
+
+            for( int y = 0; y < g.ny; ++y )
+            {
+                uint16_t* row = heat.data() + (size_t) ( y / t.tile ) * t.tnx;
+
+                for( int x = 0; x < g.nx; ++x )
+                {
+                    const float v = hist[(size_t) y * g.nx + x];
+
+                    if( v > 0 )
+                    {
+                        uint16_t& h = row[x / t.tile];
+                        h = std::max<uint16_t>( h, (uint16_t) std::min( v, 65535.0f ) );
+                    }
+                }
+            }
+        }
+
+        m_lane->heatByRound.push_back( std::move( heat ) );
     }
 
     bool stopped() const
@@ -1730,6 +2030,8 @@ private:
                 m_bandGroup[s] = g;
             }
         }
+
+        record( aNet, m_stage );
     }
 
     void unmark( int aNet )
@@ -1754,6 +2056,10 @@ private:
         net.markedTrack.clear();
         net.markedVia.clear();
         net.markedBand.clear();
+        m_box = { -1, -1, -1, -1 };
+
+        if( m_lane )
+            touchChanged( aNet );
     }
 
     void route( int aNet, float aPf, bool aHard )
@@ -2036,6 +2342,14 @@ private:
 
         const size_t tiles = (size_t) m_w.tnx * m_w.tny;
 
+        if( m_lane )
+        {
+            if( m_box[0] < 0 )
+                m_box = { x0, y0, x1, y1 };
+            else
+                m_box = { std::min( m_box[0], x0 ), std::min( m_box[1], y0 ), std::max( m_box[2], x1 ), std::max( m_box[3], y1 ) };
+        }
+
         auto h = [&]( int x, int y, int l )
         {
             int best = INT_MAX;
@@ -2051,7 +2365,7 @@ private:
             if( m_guide )
                 best = std::max( best, (int) ( *m_guide )[(size_t) l * tiles + ( y / m_w.tile ) * m_w.tnx + x / m_w.tile] * m_w.tile );
 
-            return m_params.astar * (float) best;
+            return m_v.strategy.astar * (float) best;
         };
 
         for( uint32_t s : aTree )
@@ -2287,68 +2601,23 @@ private:
     std::vector<long>      m_byStage;      ///< search states: rounds, legalising, the short again, fewer vias
     std::vector<CROWDING>  m_crowded;   ///< nets still crowded when the rounds ended
     long                   m_expanded = 0;
+
+    const GRID_TIMELINE*   m_timeline = nullptr;
+    GRID_LANE*             m_lane = nullptr;
+    CLOCK::time_point      m_started;
+    std::array<int, 4>     m_box{ -1, -1, -1, -1 };   ///< cells searched in since the net was taken
+    std::vector<uint32_t>  m_histTaken;   ///< this round's history increments
+    std::array<int, 4>     m_changed{ INT_MAX, INT_MAX, INT_MIN, INT_MIN };   ///< tiles changed since the last step
+    std::vector<std::vector<uint32_t>> m_netConflicts;   ///< per net: the tiles of its crowded states
+    std::vector<int>       m_conflictNets;   ///< the nets crowded at the last step
+    std::vector<uint16_t>  m_fought;      ///< per state: the last round it was fought over
+    std::vector<uint8_t>   m_streak;      ///< and in how many rounds running
 };
 
 
 GRID_NET_RESULT toGeometry( const WORLD& aWorld, const GRID_PARAMS& aParams, const NEGOTIATION::NET_STATE& aNet )
 {
-    GRID_NET_RESULT out;
-    out.reached = aNet.reached;
-    out.complete = std::all_of( aNet.reached.begin(), aNet.reached.end(), []( bool r ) { return r; } );
-
-    const size_t     cells = aWorld.cells;
-    const PLAN_GRID& g = aWorld.grid;
-
-    for( const auto& path : aNet.paths )
-    {
-        GRID_TRACK run;
-
-        auto flush = [&]()
-        {
-            if( run.points.size() >= 2 )
-            {
-                for( size_t k = 1; k < run.points.size(); ++k )
-                    out.length += ( run.points[k] - run.points[k - 1] ).EuclideanNorm();
-
-                out.tracks.push_back( run );
-            }
-
-            run.points.clear();
-        };
-
-        for( size_t k = 0; k < path.size(); ++k )
-        {
-            const int      l = (int) ( path[k] / cells );
-            const VECTOR2I p = g.Centre( (int) ( path[k] % cells ) );
-
-            if( k > 0 && l != (int) ( path[k - 1] / cells ) )
-            {
-                flush();
-                out.vias.push_back( p );
-            }
-
-            run.layer = aParams.layers[l];
-
-            // a corner only where the direction changes
-            if( run.points.size() >= 2 )
-            {
-                const VECTOR2I a = run.points[run.points.size() - 2], b = run.points.back();
-                const VECTOR2I d1 = b - a, d2 = p - b;
-
-                if( (int64_t) d1.x * d2.y == (int64_t) d1.y * d2.x && (int64_t) d1.x * d2.x + (int64_t) d1.y * d2.y > 0 )
-                {
-                    run.points.back() = p;
-                    continue;
-                }
-            }
-
-            run.points.push_back( p );
-        }
-
-        flush();
-    }
-
-    return out;
+    return GridPathGeometry( aWorld.grid, aWorld.cells, aParams.layers, aNet.paths, aNet.reached );
 }
 
 } // namespace
@@ -2434,32 +2703,64 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         vh[l] = l % 2 ? 1 : 2;
     }
 
-    std::vector<VARIANT> variants = { { "short_first", shortFirst, {} },
-                                      { "short_first_hv", shortFirst, hv },
-                                      { "fine_first", fineFirst, {} },
-                                      { "long_first", longFirst, {} },
-                                      { "short_first_vh", shortFirst, vh },
-                                      { "fine_first_hv", fineFirst, hv } };
+    std::vector<GRID_STRATEGY> strategies = aParams.strategies;
 
-    if( !groupSize.empty() )
+    if( strategies.empty() )
     {
-        for( VARIANT& v : variants )
-            v.order = bundlesFirst( v.order );
+        for( const auto& [o, d] : std::vector<std::pair<const char*, const char*>>{ { "short_first", "" },
+                                                                                   { "short_first", "hv" },
+                                                                                   { "fine_first", "" },
+                                                                                   { "long_first", "" },
+                                                                                   { "short_first", "vh" },
+                                                                                   { "fine_first", "hv" } } )
+        {
+            GRID_STRATEGY st;
+            st.order = o;
+            st.directions = d;
+            st.pfStart = aParams.pfStart;
+            st.pfGrowth = aParams.pfGrowth;
+            st.astar = aParams.astar;
+            st.schedule = aParams.schedule;
+            st.histDecay = aParams.histDecay;
+            st.recent = aParams.recent;
+            strategies.push_back( st );
+        }
+
+        int count = aParams.variants;
+
+        if( count <= 0 )
+            count = std::clamp( (int) std::thread::hardware_concurrency() / 2, 1, (int) strategies.size() );
+
+        strategies.resize( std::min( (size_t) count, strategies.size() ) );
     }
 
-    int count = aParams.variants;
+    std::vector<VARIANT> variants;
 
-    if( count <= 0 )
-        count = std::clamp( (int) std::thread::hardware_concurrency() / 2, 1, (int) variants.size() );
+    for( const GRID_STRATEGY& st : strategies )
+    {
+        VARIANT v;
+        v.order = st.order == "long_first" ? longFirst : st.order == "fine_first" ? fineFirst : shortFirst;
+        v.direction = st.directions == "hv" ? hv : st.directions == "vh" ? vh : std::vector<int>();
+        v.strategy = st;
+        v.name = aParams.strategies.empty() ? st.order + ( st.directions.empty() ? "" : "_" + st.directions ) : st.Name();
 
-    variants.resize( std::min( (size_t) count, variants.size() ) );
+        if( !groupSize.empty() )
+            v.order = bundlesFirst( v.order );
+
+        variants.push_back( std::move( v ) );
+    }
 
     // the same order and directions route the same: run once
     for( size_t k = variants.size(); k-- > 1; )
     {
         for( size_t j = 0; j < k; ++j )
         {
-            if( variants[j].order == variants[k].order && variants[j].direction == variants[k].direction )
+            const GRID_STRATEGY& a = variants[j].strategy;
+            const GRID_STRATEGY& b = variants[k].strategy;
+
+            if( variants[j].order == variants[k].order && variants[j].direction == variants[k].direction
+                && a.pfStart == b.pfStart && a.pfGrowth == b.pfGrowth && a.astar == b.astar && a.schedule == b.schedule
+                && a.histDecay == b.histDecay && a.recent == b.recent )
             {
                 variants.erase( variants.begin() + (long) k );
                 break;
@@ -2472,6 +2773,29 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
     for( const VARIANT& v : variants )
         runs.push_back( std::make_unique<NEGOTIATION>( world, v, aParams, stop ) );
+
+    if( aParams.record )
+    {
+        auto tl = std::make_shared<GRID_TIMELINE>();
+        tl->grid = world.grid;
+        tl->cells = world.cells;
+        tl->layers = aParams.layers;
+        tl->tile = std::max( 1, (int) std::lround( pcbIUScale.mmToIU( 1.0 ) / (double) world.grid.cell ) );
+        tl->tnx = ( world.grid.nx + tl->tile - 1 ) / tl->tile;
+        tl->tny = ( world.grid.ny + tl->tile - 1 ) / tl->tile;
+        tl->lanes.resize( runs.size() );
+
+        for( const WORLD::NET& n : world.nets )
+            tl->netCodes.push_back( n.code );
+
+        for( size_t k = 0; k < runs.size(); ++k )
+        {
+            tl->lanes[k].name = variants[k].name;
+            runs[k]->Record( *tl, tl->lanes[k], routing );
+        }
+
+        result.timeline = tl;
+    }
 
     std::vector<std::future<void>> done;
 
@@ -2563,6 +2887,14 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
     const NEGOTIATION& win = *runs[best];
     result.variant = variants[best].name;
+
+    if( result.timeline )
+    {
+        result.timeline->winner = best;
+
+        for( size_t k = 0; k < runs.size(); ++k )
+            result.timeline->lanes[k].abandoned = runs[k]->Abandoned();
+    }
     result.rounds = win.Round();
     result.conflictsLeft = win.Dropped();
     result.crowdedByRound = win.ByRound();
@@ -2582,4 +2914,33 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
     result.routeMs = msSince( routing );
     return result;
+}
+
+
+std::string GRID_STRATEGY::Name() const
+{
+    auto num = []( float v )
+    {
+        char buf[16];
+        snprintf( buf, sizeof( buf ), "%g", v );
+        return std::string( buf );
+    };
+
+    std::string n = order + ( directions.empty() ? "" : "_" + directions );
+
+    if( schedule == 0 )
+        n += "@" + num( pfStart ) + "x" + num( pfGrowth );
+    else
+        n += schedule == 1 ? "@adaptive" : "@adaptive_hist";
+
+    if( astar != 1.2f )
+        n += "/a" + num( astar );
+
+    if( histDecay != 1.0f )
+        n += "/d" + num( histDecay );
+
+    if( recent > 0 )
+        n += "/r" + std::to_string( recent );
+
+    return n;
 }

@@ -11,6 +11,7 @@
 #include <advanced_config.h>
 #include "kopenapi_pcb.h"
 #include "route_grid.h"
+#include "route_timeline.h"
 #include "route_plan.h"
 
 #include <api/pcb_context.h>
@@ -37,6 +38,7 @@
 #include <pcb_shape.h>
 #include <pcb_track.h>
 #include <router/pns_kicad_iface.h>
+#include <regex>
 #include <router/pns_placement_algo.h>
 #include <router/pns_router.h>
 #include <router/pns_routing_settings.h>
@@ -3045,8 +3047,93 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         params.viaAwayCost = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_cost_mm", 8.0 ), 0.0, 100.0 ) );
         params.hug = (float) std::clamp( aArgs.value( "hug", 1.0 ), 0.05, 1.0 );
         params.astar = (float) std::clamp( aArgs.value( "astar", 1.2 ), 1.0, 3.0 );
-        params.pfStart = (float) std::clamp( aArgs.value( "pf_start", 0.5 ), 0.01, 100.0 );
-        params.pfGrowth = (float) std::clamp( aArgs.value( "pf_growth", 1.3 ), 1.01, 10.0 );
+        params.pfStart = (float) std::clamp( aArgs.value( "pf_start", 1.0 ), 0.01, 100.0 );
+        params.pfGrowth = (float) std::clamp( aArgs.value( "pf_growth", 1.6 ), 1.01, 10.0 );
+        params.record = aArgs.value( "record", false );
+        params.histDecay = (float) std::clamp( aArgs.value( "hist_decay", 1.0 ), 0.1, 1.0 );
+        params.recent = std::clamp( aArgs.value( "reroute_recent", 0 ), 0, 100 );
+
+        auto scheduleOf = []( const std::string& aName ) { return aName == "adaptive" ? 1 : aName == "adaptive_hist" ? 2 : 0; };
+
+        if( aArgs.contains( "schedule" ) )
+        {
+            if( !aArgs["schedule"].is_string() || ( aArgs["schedule"] != "fixed" && scheduleOf( aArgs["schedule"] ) == 0 ) )
+                return KOPENAPI_RESULT::Error( 400, "schedule: fixed, adaptive or adaptive_hist" );
+
+            params.schedule = scheduleOf( aArgs["schedule"] );
+        }
+
+        // "short_first_hv@1.0x1.6/a1.5/d0.9/r2", "fine_first@adaptive" or {order, directions, pf_start, pf_growth, astar, schedule, hist_decay, reroute_recent}
+        for( const nlohmann::json& js : aArgs.value( "strategies", nlohmann::json::array() ) )
+        {
+            GRID_STRATEGY st;
+            st.pfStart = params.pfStart;
+            st.pfGrowth = params.pfGrowth;
+            st.astar = params.astar;
+            st.schedule = params.schedule;
+            st.histDecay = params.histDecay;
+            st.recent = params.recent;
+
+            if( js.is_string() )
+            {
+                std::smatch m;
+                const std::string text = js.get<std::string>();
+                static const std::regex re( R"(^(short_first|fine_first|long_first)(?:_(hv|vh))?(?:@(?:([0-9.]+)x([0-9.]+)|(adaptive|adaptive_hist)))?(?:/a([0-9.]+))?(?:/d([0-9.]+))?(?:/r([0-9]+))?$)" );
+
+                if( !std::regex_match( text, m, re ) )
+                    return KOPENAPI_RESULT::Error( 400, "strategies: '" + text + "' is not ORDER[_hv|_vh][@START x GROWTH|@adaptive|@adaptive_hist][/aASTAR][/dDECAY][/rROUNDS]" );
+
+                st.order = m[1];
+                st.directions = m[2];
+
+                if( m[3].matched )
+                {
+                    st.pfStart = std::stof( m[3] );
+                    st.pfGrowth = std::stof( m[4] );
+                    st.schedule = 0;
+                }
+
+                if( m[5].matched )
+                    st.schedule = scheduleOf( m[5] );
+
+                if( m[6].matched )
+                    st.astar = std::stof( m[6] );
+
+                if( m[7].matched )
+                    st.histDecay = std::stof( m[7] );
+
+                if( m[8].matched )
+                    st.recent = std::stoi( m[8] );
+            }
+            else if( js.is_object() )
+            {
+                st.order = js.value( "order", st.order );
+                st.directions = js.value( "directions", st.directions );
+                st.pfStart = js.value( "pf_start", st.pfStart );
+                st.pfGrowth = js.value( "pf_growth", st.pfGrowth );
+                st.astar = js.value( "astar", st.astar );
+                st.schedule = scheduleOf( js.value( "schedule", std::string( "fixed" ) ) );
+                st.histDecay = js.value( "hist_decay", st.histDecay );
+                st.recent = js.value( "reroute_recent", st.recent );
+
+                if( st.order != "short_first" && st.order != "fine_first" && st.order != "long_first" )
+                    return KOPENAPI_RESULT::Error( 400, "strategies[].order: short_first, fine_first or long_first" );
+            }
+            else
+            {
+                return KOPENAPI_RESULT::Error( 400, "strategies: names or objects" );
+            }
+
+            st.pfStart = std::clamp( st.pfStart, 0.01f, 100.0f );
+            st.pfGrowth = std::clamp( st.pfGrowth, 1.01f, 10.0f );
+            st.astar = std::clamp( st.astar, 1.0f, 3.0f );
+            st.histDecay = std::clamp( st.histDecay, 0.1f, 1.0f );
+            st.recent = std::clamp( st.recent, 0, 100 );
+            params.strategies.push_back( st );
+        }
+
+        if( params.strategies.size() > 32 )
+            return KOPENAPI_RESULT::Error( 400, "strategies: at most 32" );
         params.progress = [&]( const std::vector<GRID_VARIANT_PROGRESS>& aVariants )
         {
             nlohmann::json variants = nlohmann::json::array();
@@ -3068,6 +3155,22 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         };
 
         const GRID_RESULT gr = RouteOnGrid( board, gridNets, params );
+        nlohmann::json    timelineOut;
+
+        if( gr.timeline )
+        {
+            static int runs = 0;
+            gr.timeline->run = ++runs;
+
+            for( int code : gr.timeline->netCodes )
+            {
+                NETINFO_ITEM* info = board->FindNet( code );
+                gr.timeline->netNames.push_back( info ? str( UnescapeString( info->GetNetname() ) ) : std::to_string( code ) );
+            }
+
+            GridTimelineKeep( gr.timeline );
+            timelineOut = { { "run", gr.timeline->run }, { "bytes", gr.timeline->Bytes() } };
+        }
 
         // each net's copper staged and guarded against the rest; a net the guard rejects stays out
         BOARD_COMMIT                        commit( context->GetToolManager() );
@@ -3216,7 +3319,8 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                     { "dropped", gr.conflictsLeft }, { "cell_mm", toMm( gr.cell ) }, { "expanded", gr.expanded },
                     { "build_ms", std::round( gr.buildMs ) }, { "route_ms", std::round( gr.routeMs ) },
                     { "guard_ms", std::round( msSince( guardFrom ) ) }, { "rejected", rejected },
-                    { "costliest", costliest }, { "expanded_by_stage", gr.expandedByStage }, { "bundles", bundlesUsed } };
+                    { "costliest", costliest }, { "expanded_by_stage", gr.expandedByStage }, { "bundles", bundlesUsed },
+                    { "timeline", timelineOut } };
         board->BuildConnectivity();
     }
 
@@ -5916,8 +6020,13 @@ KOPENAPI_REGISTER( "pcb_route",
                         "via_away_cost_mm":{"type":"number","default":8,"description":"grid: a via at a chip's pads costs as much more as this length of track"},
                         "hug":{"type":"number","default":1,"description":"grid: cost factor of a cell beside the copper of the net's own bundle (1: no pull; below 1 so far lowers cohesion, adds vias and time)"},
                         "astar":{"type":"number","default":1.2,"description":"grid: weight of the distance left in the search (1: cheapest paths; more: fewer states searched, paths a little longer)"},
-                        "pf_start":{"type":"number","default":0.5,"description":"grid: price of sharing a cell in the first negotiation round"},
-                        "pf_growth":{"type":"number","default":1.3,"description":"grid: how much that price grows each round (more: fewer rounds, longer detours)"},
+                        "pf_start":{"type":"number","default":1.0,"description":"grid: price of sharing a cell in the first negotiation round"},
+                        "pf_growth":{"type":"number","default":1.6,"description":"grid: how much that price grows each round (more: fewer rounds, longer detours)"},
+                        "record":{"type":"boolean","default":false,"description":"grid: keep every variant's steps for pcb_route_timeline"},
+                        "schedule":{"type":"string","enum":["fixed","adaptive","adaptive_hist"],"default":"fixed","description":"grid, EXPERIMENTAL: negotiation schedule of the built-in variants (adaptive: growth 1.3 while the crowded nets fall, 2.0 when they stall; adaptive_hist: also twice the history on places fought over 3 rounds running)"},
+                        "strategies":{"type":"array","description":"grid, EXPERIMENTAL: the variants to race instead of the built-ins: 'short_first_hv@1.0x1.6/a1.5/d0.9/r2', 'fine_first@adaptive', or {order, directions, pf_start, pf_growth, astar, schedule, hist_decay, reroute_recent}","items":{}},
+                        "hist_decay":{"type":"number","default":1.0,"description":"grid, EXPERIMENTAL: the history cost of places not fought over in a round is multiplied by this (1: kept for good)"},
+                        "reroute_recent":{"type":"integer","default":0,"description":"grid, EXPERIMENTAL: a net that crowds nobody is routed again only through places fought over in the last this many rounds (0: through any place ever fought over)"},
                         "variants":{"type":"integer","default":0,"description":"grid: variants run in parallel (net order, layer directions), 0 one per two cores up to 6"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); parts with pads inside the ring (exposed pad, BGA) stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
