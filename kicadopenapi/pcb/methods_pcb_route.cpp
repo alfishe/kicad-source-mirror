@@ -3185,7 +3185,10 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             ~LIVE_END()
             {
                 if( timeline )
+                {
                     timeline->live = false;
+                    KopenapiEventNotify( "pcb_route_timeline" );
+                }
             }
         } liveEnd{ gr.timeline };
 

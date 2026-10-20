@@ -444,8 +444,12 @@ KOPENAPI_RESULT openTimelineEvents( const nlohmann::json& aArgs, KOPENAPI_EVENT_
 
 void GridTimelineKeep( std::shared_ptr<GRID_TIMELINE> aTimeline )
 {
-    std::lock_guard<std::mutex> lock( g_lastMutex );
-    g_last = std::move( aTimeline );
+    {
+        std::lock_guard<std::mutex> lock( g_lastMutex );
+        g_last = std::move( aTimeline );
+    }
+
+    KopenapiEventNotify( "pcb_route_timeline" );
 }
 
 

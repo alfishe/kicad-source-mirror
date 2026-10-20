@@ -1347,9 +1347,16 @@ void KICAD_OPENAPI_SERVICE::IMPL::handleMcp( const httplib::Request& aReq,
 }
 
 
-/// @brief GET /api/v1/events?topic=…: Server-Sent Events.  The topic's poll runs on this worker
-/// thread at most ~30 times a second, so a burst of changes reaches the client as its latest
-/// state; a comment every 15 s keeps idle proxies and clients from timing out
+/// @brief Open event streams, each holding an HTTP worker while open: the worker pool has room for
+/// this many beyond the calls' own, and one more is refused
+static constexpr int    MAX_EVENT_STREAMS = 64;
+static std::atomic<int> s_eventStreams{ 0 };
+
+
+/// @brief GET /api/v1/events?topic=…: Server-Sent Events.  The worker sleeps until the topic changes
+/// (KopenapiEventNotify), then polls at most ~30 times a second, so a burst of changes reaches the
+/// client as its latest state; idle it polls once a second for the topic's deadlines, and a comment
+/// every 15 s keeps idle proxies and clients from timing out
 static void serveEvents( const httplib::Request& aReq, httplib::Response& aRes,
                          const std::shared_ptr<std::atomic<bool>>& aAlive )
 {
@@ -1379,6 +1386,13 @@ static void serveEvents( const httplib::Request& aReq, httplib::Response& aRes,
         args[key] = v.is_discarded() ? nlohmann::json( value ) : v;
     }
 
+    if( s_eventStreams.load() >= MAX_EVENT_STREAMS )
+    {
+        reply( aRes, KOPENAPI_RESULT::Error( 503, std::to_string( MAX_EVENT_STREAMS )
+                                                          + " event streams are open; close one" ) );
+        return;
+    }
+
     KOPENAPI_EVENT_POLL poll;
     KOPENAPI_RESULT     opened = it->second.open( args, poll );
 
@@ -1392,14 +1406,20 @@ static void serveEvents( const httplib::Request& aReq, httplib::Response& aRes,
 
     struct STREAM
     {
+        std::string                 topic;
         KOPENAPI_EVENT_POLL         poll;
         std::vector<KOPENAPI_EVENT> events;
+        uint64_t                    seen = 0;
         CLOCK::time_point           next;
         CLOCK::time_point           wrote = CLOCK::now();
         bool                        first = true;
+
+        STREAM() { s_eventStreams++; }
+        ~STREAM() { s_eventStreams--; }
     };
 
     auto stream = std::make_shared<STREAM>();
+    stream->topic = name;
     stream->poll = std::move( poll );
 
     aRes.set_header( "Cache-Control", "no-cache" );
@@ -1424,6 +1444,9 @@ static void serveEvents( const httplib::Request& aReq, httplib::Response& aRes,
                 else
                 {
                     std::this_thread::sleep_until( st.next );
+                    KopenapiEventWait( st.topic, st.seen,
+                                       std::min( st.wrote + std::chrono::seconds( 15 ),
+                                                 CLOCK::now() + std::chrono::seconds( 1 ) ) );
                 }
 
                 if( !aAlive->load() || !aSink.is_writable() )
@@ -1434,6 +1457,7 @@ static void serveEvents( const httplib::Request& aReq, httplib::Response& aRes,
 
                 bool more = false;
                 st.events.clear();
+                st.seen = KopenapiEventSeq( st.topic );
 
                 try
                 {
@@ -1640,6 +1664,11 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     {
         // A fresh server per attempt: httplib decommissions a server after a failed bind
         m_impl->server = std::make_unique<httplib::Server>();
+        m_impl->server->new_task_queue = []
+        {
+            return new httplib::ThreadPool( CPPHTTPLIB_THREAD_POOL_COUNT,
+                                            CPPHTTPLIB_THREAD_POOL_MAX_COUNT + MAX_EVENT_STREAMS );
+        };
         m_impl->registerRoutes();
 
         if( m_impl->server->bind_to_port( KOPENAPI_HOST_ADDR, basePort + i ) )
@@ -1807,6 +1836,7 @@ void KICAD_OPENAPI_SERVICE::Stop()
     // Unblock workers waiting on main-thread calls first, then stop and join the listener
     // (which joins the worker pool).
     m_impl->alive->store( false );
+    KopenapiEventWakeAll();
     m_impl->server->stop();
 
     if( m_impl->preloadThread.joinable() )

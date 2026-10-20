@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 
 
@@ -100,6 +101,77 @@ std::map<std::string, KOPENAPI_EVENT_TOPIC> KOPENAPI_REGISTRY::EventTopics() con
 {
     std::lock_guard<std::mutex> lock( m_mutex );
     return m_eventTopics;
+}
+
+
+namespace
+{
+
+struct EVENT_HUB
+{
+    std::mutex                      mutex;
+    std::condition_variable         changed;
+    std::map<std::string, uint64_t> seq;
+    uint64_t                        wakes = 0;
+};
+
+EVENT_HUB& eventHub()
+{
+    static EVENT_HUB hub;
+    return hub;
+}
+
+} // namespace
+
+
+void KopenapiEventNotify( const std::string& aTopic )
+{
+    EVENT_HUB& hub = eventHub();
+
+    {
+        std::lock_guard<std::mutex> lock( hub.mutex );
+        ++hub.seq[aTopic];
+    }
+
+    hub.changed.notify_all();
+}
+
+
+uint64_t KopenapiEventSeq( const std::string& aTopic )
+{
+    EVENT_HUB&                  hub = eventHub();
+    std::lock_guard<std::mutex> lock( hub.mutex );
+    auto                        it = hub.seq.find( aTopic );
+
+    return it == hub.seq.end() ? 0 : it->second;
+}
+
+
+void KopenapiEventWait( const std::string& aTopic, uint64_t aSeen, std::chrono::steady_clock::time_point aUntil )
+{
+    EVENT_HUB&                   hub = eventHub();
+    std::unique_lock<std::mutex> lock( hub.mutex );
+    const uint64_t               wakes = hub.wakes;
+
+    hub.changed.wait_until( lock, aUntil,
+                            [&]
+                            {
+                                auto it = hub.seq.find( aTopic );
+                                return hub.wakes != wakes || ( it != hub.seq.end() && it->second != aSeen );
+                            } );
+}
+
+
+void KopenapiEventWakeAll()
+{
+    EVENT_HUB& hub = eventHub();
+
+    {
+        std::lock_guard<std::mutex> lock( hub.mutex );
+        ++hub.wakes;
+    }
+
+    hub.changed.notify_all();
 }
 
 

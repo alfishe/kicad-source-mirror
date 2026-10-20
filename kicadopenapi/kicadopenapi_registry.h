@@ -20,6 +20,7 @@
 #ifndef KICADOPENAPI_REGISTRY_H
 #define KICADOPENAPI_REGISTRY_H
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -132,8 +133,9 @@ struct KOPENAPI_EVENT
     nlohmann::json data;
 };
 
-/// @brief An open stream, polled on its HTTP thread (~30 times a second): appends the events due
-/// now (the latest state only) and returns false after the last one.  Never touches documents
+/// @brief An open stream, polled on its HTTP thread when its topic changed (KopenapiEventNotify),
+/// at most ~30 times a second, and once a second otherwise: appends the events due now (the latest
+/// state only) and returns false after the last one.  Never touches documents
 using KOPENAPI_EVENT_POLL = std::function<bool( std::vector<KOPENAPI_EVENT>& aOut )>;
 
 /// @brief A topic opens a stream from the query parameters (HTTP thread); an error refuses it
@@ -145,6 +147,19 @@ struct KOPENAPI_EVENT_TOPIC
     std::string         summary;
     KOPENAPI_EVENT_OPEN open;
 };
+
+/// @brief What a topic's streams show has changed (any thread, cheap): they are woken to poll
+KICOMMON_API void KopenapiEventNotify( const std::string& aTopic );
+
+/// @brief The topic's changes so far
+KICOMMON_API uint64_t KopenapiEventSeq( const std::string& aTopic );
+
+/// @brief Waits until the topic's changes differ from aSeen, aUntil, or KopenapiEventWakeAll
+KICOMMON_API void KopenapiEventWait( const std::string& aTopic, uint64_t aSeen,
+                                     std::chrono::steady_clock::time_point aUntil );
+
+/// @brief Wakes every waiting stream (the service stops)
+KICOMMON_API void KopenapiEventWakeAll();
 
 
 class wxWindow;

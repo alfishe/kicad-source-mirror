@@ -256,6 +256,8 @@ void record( JOB& aJob, const std::string& aPhase, int aDone, int aTotal, const 
 
     if( !aCounts.is_null() )
         aJob.counts = aCounts;
+
+    KopenapiEventNotify( "job" );
 }
 
 } // namespace
@@ -319,6 +321,7 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
     }
 
     g_changed.notify_all();
+    KopenapiEventNotify( "job" );
 
     if( !title.empty() )
         g_titles->Show( title );
@@ -477,6 +480,7 @@ void KOPENAPI_JOBS::Run( const std::string& aId, const std::function<KOPENAPI_RE
             job->state = "cancelled";
             job->started = job->finished = CLOCK::now();
             g_changed.notify_all();
+            KopenapiEventNotify( "job" );
             return;
         }
 
@@ -486,6 +490,7 @@ void KOPENAPI_JOBS::Run( const std::string& aId, const std::function<KOPENAPI_RE
     }
 
     g_changed.notify_all();
+    KopenapiEventNotify( "job" );
     wxLogMessage( "api job %s (%s): started", aId, job->method );
 
     JOB_FILTER filter;
@@ -520,6 +525,7 @@ void KOPENAPI_JOBS::Run( const std::string& aId, const std::function<KOPENAPI_RE
     }
 
     g_changed.notify_all();
+    KopenapiEventNotify( "job" );
     wxLogMessage( "api job %s (%s): %s", aId, job->method, job->state );
 }
 
@@ -538,6 +544,7 @@ void KOPENAPI_JOBS::Fail( const std::string& aId, const KOPENAPI_RESULT& aResult
     }
 
     g_changed.notify_all();
+    KopenapiEventNotify( "job" );
 }
 
 
@@ -598,6 +605,7 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Pause( const nlohmann::json& aArgs, bool aPause )
     if( !job.Finished() && job.paused != aPause )
     {
         job.paused = aPause;
+        KopenapiEventNotify( "job" );
         wxLogMessage( "api job %s (%s): %s", job.Id(), job.method, aPause ? "paused" : "resumed" );
     }
 
@@ -627,6 +635,7 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Step( const nlohmann::json& aArgs )
     job.stepBy = by;
     job.stepN = std::clamp( aArgs.value( "n", 1 ), 1, 100000 );
     ++job.stepSerial;
+    KopenapiEventNotify( "job" );
     return KOPENAPI_RESULT::Ok( describe( job, false ) );
 }
 

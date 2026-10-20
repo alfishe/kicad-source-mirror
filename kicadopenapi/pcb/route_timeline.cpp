@@ -1,5 +1,7 @@
 #include "route_timeline.h"
 
+#include <kicadopenapi_registry.h>
+
 #include <algorithm>
 
 
@@ -40,6 +42,11 @@ uint32_t GRID_LANE::AddConflicts( const std::vector<uint32_t>& aSet )
 
 void GRID_LANE::Add( GRID_STEP aStep, const GRID_PATH* aPath )
 {
+    struct NOTIFY
+    {
+        ~NOTIFY() { KopenapiEventNotify( "pcb_route_timeline" ); }
+    } notify;
+
     std::lock_guard<std::recursive_mutex> lock( *m_mutex );
     if( steps.size() % KEY == 0 )
         m_keys.push_back( m_table );
