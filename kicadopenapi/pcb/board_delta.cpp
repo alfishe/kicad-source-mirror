@@ -239,6 +239,7 @@ BOARD_STATE_APPLIED BoardStateApply( BOARD* aBoard, BOARD_COMMIT& aCommit, const
         for( BOARD_ITEM* item : items )
         {
             temp->Remove( item, REMOVE_MODE::BULK );
+            item->SetParent( aBoard );
             parsed[item->m_Uuid] = item;
 
             if( FOOTPRINT* fp = dynamic_cast<FOOTPRINT*>( item ) )
@@ -313,6 +314,20 @@ BOARD_STATE_APPLIED BoardStateApply( BOARD* aBoard, BOARD_COMMIT& aCommit, const
     // parsed but not asked for (an item's text with another KIID): not put on the board
     for( auto& [id, item] : parsed )
         delete item;
+
+    return out;
+}
+
+
+std::vector<KIID> BoardCopperNotIn( const BOARD* aBoard, const BOARD_STATE& aState )
+{
+    std::vector<KIID> out;
+
+    for( PCB_TRACK* t : aBoard->Tracks() )
+    {
+        if( !targetOf( aState, t->m_Uuid ) )
+            out.push_back( t->m_Uuid );
+    }
 
     return out;
 }

@@ -7,6 +7,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 class BOARD;
 class BOARD_COMMIT;
@@ -41,6 +42,10 @@ struct BOARD_STATE_APPLIED
 /// @brief The board made aState's: items differing taken out, the state's put in (parsed, their
 /// nets by name), staged on aCommit. Main thread
 BOARD_STATE_APPLIED BoardStateApply( BOARD* aBoard, BOARD_COMMIT& aCommit, const BOARD_STATE& aState );
+
+/// @brief The board's tracks, arcs and vias aState does not have (the copper a run put over the board
+/// it started from: router copper is new items, edits of aState's own keep their KIIDs)
+std::vector<KIID> BoardCopperNotIn( const BOARD* aBoard, const BOARD_STATE& aState );
 
 /// @brief How the board now differs from aState: items to add, to remove and changed, a few KIIDs each
 nlohmann::json BoardStateDiff( const BOARD* aBoard, const BOARD_STATE& aState );

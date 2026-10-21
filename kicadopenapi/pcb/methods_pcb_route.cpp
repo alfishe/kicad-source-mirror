@@ -1564,6 +1564,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
             GridTimelineFind( run )->appliedSeq = 0;
             GridTimelineFind( run )->appliedItems.clear();
+            GridTimelineFind( run )->appliedBySwitch = false;
             nodeBoard = { { "removed", applied.removed }, { "added", applied.added }, { "replaced", applied.replaced } };
         }
     }
@@ -1626,7 +1627,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     // that is the last edit; else the board must already be so
     KOPENAPI_HISTORY& history = KOPENAPI_HISTORY::Get();
 
-    if( t->appliedSeq > 0 && history.LastSeq() == t->appliedSeq )
+    if( t->appliedSeq > 0 && history.LastSeq() == t->appliedSeq && !t->appliedBySwitch )
     {
         KOPENAPI_RESULT back = history.RollbackLastInCall( aCtx );
 
@@ -1636,9 +1637,9 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         t->appliedSeq = 0;
         branch.board = "the route's copper rolled back";
     }
-    else if( t->appliedSeq > 0 && branch.warm && history.Holds( t->appliedSeq, "pcb" ) )
+    else if( t->appliedSeq > 0 && ( branch.warm || t->appliedBySwitch ) && history.Holds( t->appliedSeq, "pcb" ) )
     {
-        // under later edits: the run's own tracks and vias taken out, the edits kept
+        // under later edits, or switched to: the run's own tracks and vias taken out, the edits kept
         std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
         if( !context )
@@ -1667,9 +1668,16 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         else
             commit.Revert();
 
+        // the fills still give way to the copper taken out: pads they joined before the run would
+        // read as connections to route (other nets than the run's)
+        if( branch.removed > 0 && args.value( "zones", std::string( "refill" ) ) == "refill" )
+            refillPours( *context, board );
+
         t->appliedSeq = 0;
         t->appliedItems.clear();
-        branch.board = "the run's copper taken out, the edits after it kept";
+        branch.board = t->appliedBySwitch ? "the copper of the node switched to taken out, the edits after it kept"
+                                          : "the run's copper taken out, the edits after it kept";
+        t->appliedBySwitch = false;
     }
     else
     {
@@ -1854,6 +1862,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     if( zoneMode != "refill" && zoneMode != "keep" )
         return KOPENAPI_RESULT::Error( 400, "zones: refill (fills out while routing, refilled after) or keep" );
+
+    // the board as the route found it, for the variant tree's nodes: before its temporary keep-outs and the fills taken out
+    VARIANT_FOUND foundBoard;
+
+    if( grid && ( aArgs.value( "record", false ) || aBranch ) )
+        foundBoard = VariantTreeRouteFound( board );
 
     // Under the parts (avoid): inside the ring of pads of a quad package (QFP, QFN, LGA) no track and
     // no via of this call - such tracks can wall its other pins in.  Temporary rule areas on the
@@ -3051,6 +3065,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // The grid engine: the connections left, every net at once
     nlohmann::json gridOut;
 
+    // the end node keeps the board as the call leaves it (fills refilled, stubs out)
+    struct
+    {
+        std::shared_ptr<GRID_TIMELINE> timeline;
+        int                            lane = -1;
+        nlohmann::json                 metrics;
+    } endNode;
+
     if( grid )
     {
         board->BuildConnectivity();
@@ -3410,10 +3432,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         nlohmann::json    timelineOut;
 
         if( gr.timeline && ( !aBranch || gr.timeline != aBranch->timeline ) )
-            VariantTreeRunStarted( gr.timeline, board );
+            VariantTreeRunStarted( gr.timeline, foundBoard );
 
         if( gr.timeline && gr.branchLane >= 0 && aBranch && aBranch->warm )
-            VariantTreeWarmLane( gr.timeline, gr.branchLane, board );
+            VariantTreeWarmLane( gr.timeline, gr.branchLane, foundBoard );
 
         // the replay sees the route end with its copper on the board
         struct LIVE_END
@@ -3589,6 +3611,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             gr.timeline->appliedSeq = KOPENAPI_HISTORY::Get().PendingSeq();
             gr.timeline->appliedLane = gr.branchLane >= 0 ? gr.branchLane : gr.timeline->winner;
             gr.timeline->appliedItems = gridItems;
+            gr.timeline->appliedBySwitch = false;
         }
 
         for( size_t k = 0; k < gridNets.size(); ++k )
@@ -3599,7 +3622,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             for( size_t index : jobsOfNet[k] )
             {
                 const auto [a, b] = endsOfJob[index];
-                const bool ok = r && netOk[k] && r->reached[a] && r->reached[b];
+                const bool reached = r && a < r->reached.size() && b < r->reached.size() && r->reached[a] && r->reached[b];
+                const bool ok = netOk[k] && reached;
                 nlohmann::json row = { { "net", jobs[index].net }, { "routed", ok }, { "tries", 1 }, { "engine", "grid" } };
 
                 if( ok )
@@ -3611,7 +3635,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
                 else
                 {
-                    row["reason"] = !r || !r->reached[a] || !r->reached[b]
+                    row["reason"] = !reached
                                             ? ( KopenapiJobCancelled() ? "stopped" : "no way on the grid (or dropped to keep the rest legal)" )
                                             : "rejected by the guard: the route would touch another net";
                 }
@@ -3657,8 +3681,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                                           nlohmann::json::object(), nullptr );
                 }
 
-                timelineOut["nodes"]["end"] = VariantTreeAutoNode( gr.timeline, lane, gr.timeline->Lane( lane ).steps.size() - 1,
-                                                                   "end", metrics, board );
+                endNode = { gr.timeline, lane, metrics };
             }
         }
 
@@ -3718,7 +3741,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // its corridor, route it, route them again; if anything of that fails, everything goes back
     // as it was (walkaround only: no other net is pushed aside; the copper of the nets it touched
     // is put back from copies)
-    const int ripRounds = dryRun || grid ? 0 : std::clamp( aArgs.value( "rip_up", 2 ), 0, 6 );
+    const int ripRounds = dryRun ? 0 : std::clamp( aArgs.value( "rip_up", 2 ), 0, 6 );
     int       rippedOk = 0, rippedTried = 0;
 
     // the rip-ups that failed, by board version and the routes taken out; how often each route has
@@ -4650,6 +4673,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         moved.push_back( { { "net", info ? str( info->GetNetname() ) : std::to_string( net ) },
                            { "pieces", { b.first, a.first } },
                            { "length_mm", { toMm( b.second ), toMm( a.second ) } } } );
+    }
+
+    if( endNode.timeline )
+    {
+        gridOut["timeline"]["nodes"]["end"] = VariantTreeAutoNode( endNode.timeline, endNode.lane,
+                                                                   endNode.timeline->Lane( endNode.lane ).steps.size() - 1,
+                                                                   "end", endNode.metrics, board );
     }
 
     return KOPENAPI_RESULT::Ok( { { "connections", connections },
@@ -6403,7 +6433,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
                         "engine":{"type":"string","enum":["pns","grid"],"default":"pns","description":"grid: every net at once on one grid of the board, negotiated congestion (PathFinder) in parallel variants, the best legal result committed (diff-pair trunks still by pns; no rip_up / clean_up passes); pns: one connection at a time with the push-and-shove router"},
                         "max_rounds":{"type":"integer","default":40,"description":"grid: negotiation rounds before the nets still crowding each other are routed apart or left out"},
-                        "cell_mm":{"type":"number","default":0,"description":"grid: the cell, 0 a sixth of the finest track pitch (width + clearance) on a 0.025 mm step"},
+                        "cell_mm":{"type":"number","default":0,"description":"grid: the cell, 0 a third of the finest track pitch (width + clearance) on a 0.025 mm step"},
                         "via_keepout_mm":{"type":"number","default":5,"description":"grid: only a chip's own nets put vias this far around it (pads on four sides, or an array outside its balls) while the board routes; other nets left short and, once all are joined, the via-saving pass may use it; 0 off"},
                         "bundles":{"description":"grid: \"auto\" (pcb_net_roles' bundles), \"off\", or [{name, nets}] in member order: a bundle's nets between the same parts are routed first, side by side (the answer's grid.bundles: name, parts, nets)","default":"auto"},
                         "via_away_mm":{"type":"number","default":7,"description":"grid: a signal via nearer a chip's pads (not an array's) than this costs more, linearly to the pads; 0 off"},

@@ -198,18 +198,24 @@ int nodeAt( const GRID_TIMELINE& aT, int aLane, size_t aStep, const std::string&
 
 
 /// @brief Under g_mutex: a board state outside any run (start, edit) hung from the node last current
-int boardNode( const std::string& aKind, const std::string& aName, const BOARD* aBoard )
+int boardNode( const std::string& aKind, const std::string& aName, std::shared_ptr<const BOARD_STATE> aBoard, long aSeq )
 {
     VARIANT_NODE n;
-    n.board = takeBoard( aBoard );
+    n.board = std::move( aBoard );
     n.id = g_nextId++;
     n.parent = findNode( g_current ) ? g_current : 0;
     n.kind = aKind;
     n.name = aName;
-    n.boardSeq = KOPENAPI_HISTORY::Get().LastSeq();
+    n.boardSeq = aSeq;
     n.created = nowMs();
     g_nodes.push_back( n );
     return n.id;
+}
+
+
+int boardNode( const std::string& aKind, const std::string& aName, const BOARD* aBoard )
+{
+    return boardNode( aKind, aName, takeBoard( aBoard ), KOPENAPI_HISTORY::Get().LastSeq() );
 }
 
 
@@ -576,7 +582,7 @@ KOPENAPI_RESULT h_pcb_variant_switch( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     const int   id = aArgs["id"].get<int>();
     int         savedAs = 0, run = 0, lane = -1;
     size_t      step = 0;
-    std::shared_ptr<const BOARD_STATE> state;
+    std::shared_ptr<const BOARD_STATE> state, laneStart;
 
     {
         std::lock_guard<std::mutex> lock( g_mutex );
@@ -595,6 +601,11 @@ KOPENAPI_RESULT h_pcb_variant_switch( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
         run = n->run;
         lane = n->lane;
         step = n->step;
+
+        if( auto it = g_laneBoard.find( { run, lane } ); it != g_laneBoard.end() )
+            laneStart = it->second;
+        else if( auto r = g_runBoard.find( run ); r != g_runBoard.end() )
+            laneStart = r->second;
 
         // the board as it is, unless a node holds it already
         if( !currentNode() )
@@ -635,6 +646,16 @@ KOPENAPI_RESULT h_pcb_variant_switch( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     if( applied.netsMissing )
         out["nets_missing"] = applied.netsMissing;
 
+    for( const std::shared_ptr<GRID_TIMELINE>& t : GridTimelinesKept() )
+    {
+        if( t->appliedBySwitch )
+        {
+            t->appliedSeq = 0;
+            t->appliedItems.clear();
+            t->appliedBySwitch = false;
+        }
+    }
+
     if( run )
     {
         if( std::shared_ptr<GRID_TIMELINE> t = GridTimelineFind( run ) )
@@ -646,9 +667,12 @@ KOPENAPI_RESULT h_pcb_variant_switch( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
                 GridReplayShowAt( t, lane, step );
             }
 
-            // the copper on the board is no longer known to be the run's
-            t->appliedSeq = 0;
-            t->appliedItems.clear();
+            // the copper the lane put over the board it started from: a branch takes it out again
+            KOPENAPI_HISTORY& h = KOPENAPI_HISTORY::Get();
+            t->appliedSeq = h.PendingSeq() > 0 ? h.PendingSeq() : h.LastSeq();
+            t->appliedLane = lane;
+            t->appliedItems = laneStart ? BoardCopperNotIn( board, *laneStart ) : std::vector<KIID>();
+            t->appliedBySwitch = true;
             out["timeline"] = { { "run", run }, { "lane", lane }, { "step", step } };
         }
         else
@@ -681,28 +705,43 @@ bool VariantTreeLaneBoard( int aId, std::shared_ptr<const BOARD_STATE>& aState, 
 }
 
 
-void VariantTreeWarmLane( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aLane, const BOARD* aBoard )
+VARIANT_FOUND VariantTreeRouteFound( const BOARD* aBoard )
 {
     std::lock_guard<std::mutex> lock( g_mutex );
-    g_laneBoard[{ aTimeline->run, aLane }] = takeBoard( aBoard );
+    VARIANT_FOUND               found;
+    found.origin = currentNode();
+
+    if( found.origin && !findNode( found.origin )->board )
+        found.origin = 0;
+
+    found.board = takeBoard( aBoard );
+    found.seq = KOPENAPI_HISTORY::Get().LastSeq();
+    return found;
 }
 
 
-int VariantTreeRunStarted( const std::shared_ptr<GRID_TIMELINE>& aTimeline, const BOARD* aBoard )
+void VariantTreeWarmLane( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aLane, const VARIANT_FOUND& aFound )
 {
     std::lock_guard<std::mutex> lock( g_mutex );
-    int                         origin = currentNode();
+    g_laneBoard[{ aTimeline->run, aLane }] = aFound.board;
+}
 
-    if( !origin || !findNode( origin )->board )
+
+int VariantTreeRunStarted( const std::shared_ptr<GRID_TIMELINE>& aTimeline, const VARIANT_FOUND& aFound )
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    int                         origin = findNode( aFound.origin ) ? aFound.origin : 0;
+
+    if( !origin )
     {
-        origin = boardNode( "start", "before run " + std::to_string( aTimeline->run ), aBoard );
+        origin = boardNode( "start", "before run " + std::to_string( aTimeline->run ), aFound.board, aFound.seq );
         g_current = origin;
-        g_currentSeq = KOPENAPI_HISTORY::Get().LastSeq();
+        g_currentSeq = aFound.seq;
     }
 
     g_runOrigin[aTimeline->run] = origin;
     g_runBoard[aTimeline->run] = findNode( origin )->board;
-    g_runStartSeq[aTimeline->run] = KOPENAPI_HISTORY::Get().LastSeq();
+    g_runStartSeq[aTimeline->run] = aFound.seq;
     return origin;
 }
 

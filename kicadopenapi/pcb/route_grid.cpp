@@ -81,10 +81,12 @@ struct DISK
     int              r = 0;
     std::vector<int> half;   ///< per dy + r: the farthest dx inside, -1 none
 
-    explicit DISK( double aRadiusCells )
+    /// aSlack (cells squared) widens the test: a diagonal step between two cells just outside
+    /// passes as close as sqrt( d * d - 0.5 ) to the centre
+    explicit DISK( double aRadiusCells, double aSlack = 0.0 )
     {
-        r = std::max( 0, (int) std::ceil( aRadiusCells ) );
-        const double rr = aRadiusCells * aRadiusCells;
+        r = std::max( 0, (int) std::ceil( std::sqrt( aRadiusCells * aRadiusCells + aSlack ) ) );
+        const double rr = aRadiusCells * aRadiusCells + aSlack;
         half.assign( 2 * r + 1, -1 );
 
         for( int dy = -r; dy <= r; ++dy )
@@ -376,7 +378,7 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
         }
     }
 
-    // a cell of a sixth of the finest pitch of track and clearance, on a 0.025 mm step
+    // a cell of a third of the finest pitch of track and clearance, on a 0.025 mm step
     const int step = pcbIUScale.mmToIU( 0.025 );
     int       cell = aParams.cell;
 
@@ -387,7 +389,7 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
         for( const SIZES& s : aWorld.sizes )
             finest = std::min( finest, 2 * s.halfWidth + s.clearance );
 
-        cell = std::clamp( finest / 6 / step * step, step, 4 * step );
+        cell = std::clamp( finest / 3 / step * step, step, 4 * step );
     }
 
     BOX2I region = aBoard->GetBoardEdgesBoundingBox();
@@ -1050,9 +1052,11 @@ public:
                 const double viaVia = std::max( x.viaRadius + y.viaRadius + clr, ( x.viaDrill + y.viaDrill ) / 2 + m_w.h2h );
 
                 // a's track / via onto b's track map and b's via map
+                // a via against a track: room for the track's diagonal steps past it (track against
+                // track stays exact, parallel runs at the minimum pitch)
                 m_trackDisk[a].push_back( { DISK( ( x.halfWidth + clr + y.halfWidth ) / c ),
-                                            DISK( ( x.viaRadius + clr + y.halfWidth ) / c ) } );
-                m_viaDisk[a].push_back( { DISK( ( x.halfWidth + clr + y.viaRadius ) / c ), DISK( viaVia / c ) } );
+                                            DISK( ( x.viaRadius + clr + y.halfWidth ) / c, 0.5 ) } );
+                m_viaDisk[a].push_back( { DISK( ( x.halfWidth + clr + y.viaRadius ) / c, 0.5 ), DISK( viaVia / c ) } );
             }
         }
 
@@ -1512,10 +1516,11 @@ public:
     size_t ReplayedSteps() const { return m_replayAt; }
     double RestoreMs() const { return m_restoreMs; }
 
-    /// @brief Another variant has joined everything while this one still negotiates: it stops
-    void Abandon()
+    /// @brief Another variant has joined everything while this one still negotiates (or, aAny,
+    /// this one is too far behind the first finished): it stops
+    void Abandon( bool aAny = false )
     {
-        if( m_stage == STAGE_ROUNDS )
+        if( aAny || m_stage == STAGE_ROUNDS )
             m_abandoned = true;
     }
 
@@ -2597,13 +2602,17 @@ private:
                 best = aPath;
             }
 
-            // a path through vias may only be the window's: a detour around it is tried once
+            // a path through vias may only be the window's: a detour around it is tried once (not
+            // when the search never met the window's edge: a wider one finds the same)
             bool through = false;
 
             for( size_t k = 1; end >= 0 && k < aPath.size() && !through; ++k )
                 through = aPath[k] % cells == aPath[k - 1] % cells;
 
-            if( ( end >= 0 && ( !through || widened ) ) || whole || m_oneWindow || stopped() )
+            // a search that never reached the window's edge is the whole board's
+            const bool closed = !m_hitEdge && !m_overBudget;
+
+            if( ( end >= 0 && ( !through || widened || !m_hitEdge ) ) || whole || closed || m_oneWindow || stopped() )
             {
                 if( bestEnd >= 0 )
                 {
@@ -2611,7 +2620,7 @@ private:
                     return bestEnd;
                 }
 
-                m_walledIn = whole && !aHard && !m_overBudget && !stopped();
+                m_walledIn = ( whole || closed ) && !aHard && !m_overBudget && !stopped();
                 return -1;
             }
 
@@ -2784,6 +2793,7 @@ private:
         const long budget = 4L * ( x1 - x0 + 1 ) * ( y1 - y0 + 1 ) * L;
         long       taken = 0;
         m_overBudget = false;
+        m_hitEdge = false;
 
         auto cellCost = [&]( uint32_t s ) -> float
         {
@@ -2835,7 +2845,7 @@ private:
             const int      dir = m_dir[s];
             const int      pref = m_v.direction.empty() ? 0 : m_v.direction[l];
 
-            auto relax = [&]( uint32_t n, float cost, int nd )
+            auto relax = [&]( uint32_t n, float cost, int nd, int nx, int ny, int nl )
             {
                 const float ng = top.g + cost;
 
@@ -2846,8 +2856,7 @@ private:
                 m_node[n].g = ng;
                 m_node[n].parent = (int32_t) s;
                 m_dir[n] = (uint8_t) nd;
-                const int ni = (int) ( n % cells );
-                open.push( { ng + h( ni % g.nx, ni / g.nx, (int) ( n / cells ) ), ng, n } );
+                open.push( { ng + h( nx, ny, nl ), ng, n } );
             };
 
             for( int d = 0; d < 8; ++d )
@@ -2855,7 +2864,10 @@ private:
                 const int nx = x + DX[d], ny = y + DY[d];
 
                 if( nx < x0 || nx > x1 || ny < y0 || ny > y1 )
+                {
+                    m_hitEdge = m_hitEdge || ( nx >= 0 && ny >= 0 && nx < g.nx && ny < g.ny );
                     continue;
+                }
 
                 // no sharp turns
                 int turn = 0;
@@ -2897,7 +2909,7 @@ private:
                 else if( pref == 2 && d != 2 && d != 6 )
                     step *= ( d & 1 ) ? 1.3f : 1.6f;
 
-                relax( n, step * c + ( turn == 1 ? 3.0f : turn == 2 ? 8.0f : 0.0f ), d );
+                relax( n, step * c + ( turn == 1 ? 3.0f : turn == 2 ? 8.0f : 0.0f ), d, nx, ny, l );
             }
 
             if( wn.vias && L > 1 && m_w.ViaOk( k, (uint32_t) i, wn.code ) && !( m_keepOut && ( m_w.keep[i] & ~wn.chips ) ) )
@@ -2926,7 +2938,7 @@ private:
                     if( c < 0 )
                         continue;
 
-                    relax( n, base * c, NO_DIR );
+                    relax( n, base * c, NO_DIR, x, y, to );
                 }
             }
         }
@@ -2959,6 +2971,7 @@ private:
     std::vector<int>      m_targetEnd;
     uint32_t              m_stamp = 0;
     bool                  m_overBudget = false;
+    bool                  m_hitEdge = false;    ///< the last window's search tried to step out of it
     float                 m_lastCost = 0;
     bool                  m_walledIn = false;   ///< the last search failed over the whole board on fixed copper alone
 
@@ -3591,10 +3604,12 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         done.push_back( std::async( std::launch::async, [r = run.get()]() { r->Run(); } ) );
 
     // once one variant has joined everything, the variants still negotiating stop: those past
-    // their rounds finish (they may still need fewer vias or less length)
+    // their rounds finish (they may still need fewer vias or less length).  Once the first has
+    // finished at all, the others get a quarter of its time again (2 s at least)
     std::vector<bool>   finished( runs.size(), false );
     std::vector<double> finishedMs( runs.size(), 0 );
     bool                complete = false;
+    double              firstMs = -1;
 
     for( size_t left = runs.size(); left > 0; )
     {
@@ -3610,6 +3625,9 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
             finishedMs[k] = msSince( routing );
             --left;
 
+            if( firstMs < 0 && !runs[k]->Halted() )
+                firstMs = finishedMs[k];
+
             if( !complete && runs[k]->Complete() )
             {
                 complete = true;
@@ -3619,6 +3637,15 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
                     if( !finished[j] )
                         runs[j]->Abandon();
                 }
+            }
+        }
+
+        if( firstMs >= 0 && left > 0 && msSince( routing ) > firstMs + std::max( 2000.0, firstMs / 4 ) )
+        {
+            for( size_t j = 0; j < runs.size(); ++j )
+            {
+                if( !finished[j] )
+                    runs[j]->Abandon( true );
             }
         }
 

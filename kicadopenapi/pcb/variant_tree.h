@@ -9,12 +9,24 @@ class BOARD;
 struct BOARD_STATE;
 struct GRID_TIMELINE;
 
-/// @brief A recorded run starts from the board as it is (pcb_route, main thread): the node it starts
-/// from, the current one or else a new 'start' node with the board now
-int VariantTreeRunStarted( const std::shared_ptr<GRID_TIMELINE>& aTimeline, const BOARD* aBoard );
+/// @brief The board as a recorded route found it, taken before the route changes it (the pours'
+/// fills taken out for the routing)
+struct VARIANT_FOUND
+{
+    int                                origin = 0; ///< the current node while the board is still its
+    std::shared_ptr<const BOARD_STATE> board;
+    long                               seq = 0;    ///< the board's edit-history entry then
+};
 
-/// @brief A warm branch's lane goes on over the board as it is now: its steps' nodes keep that board
-void VariantTreeWarmLane( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aLane, const BOARD* aBoard );
+/// @brief pcb_route (main thread), before its first change of the board
+VARIANT_FOUND VariantTreeRouteFound( const BOARD* aBoard );
+
+/// @brief A recorded run starts from the board it found: the node it starts from, the current one
+/// or else a new 'start' node with that board
+int VariantTreeRunStarted( const std::shared_ptr<GRID_TIMELINE>& aTimeline, const VARIANT_FOUND& aFound );
+
+/// @brief A warm branch's lane goes on over the board it found: its steps' nodes keep that board
+void VariantTreeWarmLane( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aLane, const VARIANT_FOUND& aFound );
 
 /// @brief An automatic node at a lane's step (kind end, branch or pause); an existing node at the
 /// same place is returned instead. aCurrent: the board after the running call, the node's

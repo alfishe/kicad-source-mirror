@@ -143,6 +143,7 @@ struct GRID_TIMELINE
     long                      appliedSeq = 0; ///< the edit history entry that put a lane's copper on the board
     int                       appliedLane = -1;
     std::vector<KIID>         appliedItems;  ///< the tracks and vias that put it there
+    bool                      appliedBySwitch = false; ///< put there by pcb_variant_switch: taken out, never rolled back
     std::atomic<int>          shownLane{ -1 }; ///< branch_switch: the lane frame / the replay show by default
     std::atomic<bool>         live{ false }; ///< the route is running: steps are added; the caller clears it
                                              ///< once the route's copper is on the board
