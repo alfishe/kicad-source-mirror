@@ -416,9 +416,9 @@ private:
 
         std::shared_ptr<GRID_TIMELINE> t = m_timeline;
 
-        if( t != GridTimelineLast() || t->live )
+        if( t != GridTimelineFind( t->run ) || t->live )
         {
-            m_note = t->live ? "the route is still running" : "only the last recorded run branches";
+            m_note = t->live ? "the route is still running" : "the run is no longer kept";
             Redraw();
             return;
         }

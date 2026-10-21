@@ -12,6 +12,7 @@
 #include "kopenapi_pcb.h"
 #include "route_grid.h"
 #include "route_timeline.h"
+#include "variant_tree.h"
 
 #include <kicadopenapi_history.h>
 #include "route_plan.h"
@@ -1507,18 +1508,41 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     if( !aArgs.contains( "from" ) )
         return pcbRoute( aCtx, aArgs, nullptr );
 
-    const nlohmann::json& from = aArgs["from"];
+    nlohmann::json from = aArgs["from"];
+    bool           warmByNode = false;
+
+    if( from.is_object() && from.contains( "node" ) )
+    {
+        int         run = 0, lane = -1;
+        size_t      step = 0;
+        std::string error;
+
+        if( !from["node"].is_number_integer() )
+            return KOPENAPI_RESULT::Error( 400, "from.node: a node id (pcb_variant_tree list)" );
+
+        if( !VariantTreeNodeAt( from["node"].get<int>(), run, lane, step, error ) )
+            return KOPENAPI_RESULT::Error( 404, error );
+
+        from = { { "run", run }, { "lane", lane }, { "step", step } };
+
+        if( !GridTimelineFind( run ) )
+            return KOPENAPI_RESULT::Error( 409, "node " + aArgs["from"]["node"].dump() + ": run " + std::to_string( run )
+                                                + "'s timeline was evicted (pcb_variant_tree budget)" );
+
+        warmByNode = GridTimelineFind( run )->Lane( lane ).world != 0;
+    }
 
     if( !from.is_object() || !from.contains( "step" ) || !from["step"].is_number_integer() )
-        return KOPENAPI_RESULT::Error( 400, "from: {run, lane (index or variant), step}" );
+        return KOPENAPI_RESULT::Error( 400, "from: {node} or {run, lane (index or variant), step}" );
 
-    std::shared_ptr<GRID_TIMELINE> t = GridTimelineLast();
+    if( from.contains( "run" ) && !from["run"].is_number_integer() )
+        return KOPENAPI_RESULT::Error( 400, "from.run: a run id" );
+
+    std::shared_ptr<GRID_TIMELINE> t = from.contains( "run" ) ? GridTimelineFind( from["run"].get<int>() ) : GridTimelineLast();
 
     if( !t )
-        return KOPENAPI_RESULT::Error( 404, "no recorded route (pcb_route {engine: 'grid', record: true})" );
-
-    if( from.value( "run", t->run ) != t->run )
-        return KOPENAPI_RESULT::Error( 404, "only the last recorded run is kept: run " + std::to_string( t->run ) );
+        return KOPENAPI_RESULT::Error( 404, from.contains( "run" ) ? "run " + from["run"].dump() + " is not kept (pcb_variant_tree list: timelines)"
+                                                                   : "no recorded route (pcb_route {engine: 'grid', record: true})" );
 
     if( t->live )
         return KOPENAPI_RESULT::Error( 409, "run " + std::to_string( t->run ) + " is still routing" );
@@ -1542,7 +1566,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         return KOPENAPI_RESULT::Error( 400, "from.step: 0.." + std::to_string( (long long) steps - 1 ) );
 
     branch.step = (size_t) step;
-    branch.warm = aArgs.value( "warm", false );
+    branch.warm = aArgs.value( "warm", false ) || warmByNode;
 
     if( aArgs.contains( "history" ) )
     {
@@ -3343,6 +3367,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         const GRID_RESULT gr = RouteOnGrid( board, gridNets, params );
         nlohmann::json    timelineOut;
 
+        if( gr.timeline && ( !aBranch || gr.timeline != aBranch->timeline ) )
+            VariantTreeRunStarted( gr.timeline );
+
         // the replay sees the route end with its copper on the board
         struct LIVE_END
         {
@@ -3361,22 +3388,45 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         if( KopenapiJobKeep() )
         {
             nlohmann::json lanes = nlohmann::json::array();
+            int            best = -1;
 
             if( gr.timeline )
             {
+                // the pause node: the stopped lane with the fewest nets crowded, then the furthest
+                auto rank = [&]( int aLane )
+                {
+                    const GRID_LANE& l = gr.timeline->Lane( aLane );
+                    return std::make_pair( l.steps.empty() ? INT_MAX : l.steps.back().crowded, -(long long) l.steps.size() );
+                };
+
                 for( size_t k = 0; k < gr.timeline->LaneCount(); ++k )
                 {
                     const GRID_LANE& lane = gr.timeline->Lane( k );
 
-                    if( lane.stopped )
-                        lanes.push_back( { { "lane", k }, { "variant", lane.name }, { "steps", lane.steps.size() } } );
+                    if( !lane.stopped || lane.deleted )
+                        continue;
+
+                    lanes.push_back( { { "lane", k }, { "variant", lane.name }, { "steps", lane.steps.size() } } );
+
+                    if( !lane.steps.empty() && ( best < 0 || rank( (int) k ) < rank( best ) ) )
+                        best = (int) k;
                 }
             }
 
-            return KOPENAPI_RESULT::Ok( { { "stopped", true }, { "applied", false },
-                                          { "timeline", gr.timeline ? nlohmann::json{ { "run", gr.timeline->run },
-                                                                                      { "stopped_lanes", lanes } }
-                                                                    : nlohmann::json() } } );
+            nlohmann::json out = { { "stopped", true }, { "applied", false } };
+
+            if( gr.timeline )
+            {
+                out["timeline"] = { { "run", gr.timeline->run }, { "stopped_lanes", lanes } };
+
+                if( best >= 0 )
+                {
+                    out["timeline"]["node"] = VariantTreeAutoNode( gr.timeline, best, gr.timeline->Lane( best ).steps.size() - 1,
+                                                                   "pause", nlohmann::json::object(), true );
+                }
+            }
+
+            return KOPENAPI_RESULT::Ok( out );
         }
 
         if( !gr.error.empty() )
@@ -3524,6 +3574,46 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 done[index] = ok;
                 rowOf[index] = (int) results.size();
                 results.push_back( row );
+            }
+        }
+
+        if( gr.timeline )
+        {
+            const int lane = gr.branchLane >= 0 ? gr.branchLane : gr.timeline->winner;
+
+            if( lane >= 0 && !gr.timeline->Lane( lane ).steps.empty() )
+            {
+                int    joined = 0, connections = 0, vias = 0;
+                double length = 0;
+
+                for( size_t k = 0; k < gridNets.size(); ++k )
+                {
+                    for( size_t index : jobsOfNet[k] )
+                    {
+                        connections++;
+                        joined += done[index];
+                    }
+
+                    if( netOk[k] && k < gr.nets.size() )
+                    {
+                        vias += netVias[k];
+                        length += gr.nets[k].length;
+                    }
+                }
+
+                const nlohmann::json metrics = { { "routed", joined }, { "connections", connections }, { "vias", vias },
+                                                 { "length_mm", toMm( length ) }, { "route_ms", std::round( gr.routeMs ) },
+                                                 { "applied", !staged.empty() } };
+
+                if( gr.branchLane >= 0 )
+                {
+                    const GRID_LANE& b = gr.timeline->Lane( gr.branchLane );
+                    timelineOut["nodes"]["branch"] = VariantTreeAutoNode( gr.timeline, b.parent, b.parentStep, "branch",
+                                                                          nlohmann::json::object(), false );
+                }
+
+                timelineOut["nodes"]["end"] = VariantTreeAutoNode( gr.timeline, lane, gr.timeline->Lane( lane ).steps.size() - 1,
+                                                                   "end", metrics, true );
             }
         }
 
@@ -6278,7 +6368,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "pf_start":{"type":"number","default":1.0,"description":"grid: price of sharing a cell in the first negotiation round"},
                         "pf_growth":{"type":"number","default":1.6,"description":"grid: how much that price grows each round (more: fewer rounds, longer detours)"},
                         "record":{"type":"boolean","default":false,"description":"grid: keep every variant's steps for pcb_route_timeline"},
-                        "from":{"type":"object","description":"grid, a branch: the recorded lane goes on after a step as a new lane of the same run (pcb_route_timeline status: parent, parent_step), with the run's own arguments; the copper the run (or its last branch) put on the board is rolled back first when that is the last edit, else the board must be as the run found it (409). Up to the step the recorded nets are taken without searching, so the branch's steps equal the recorded ones until it searches on. A grid route stopped with job_cancel {keep: true} goes on from a stopped lane's last step. With warm: true over the board as edited since","properties":{"run":{"type":"integer"},"lane":{"description":"index or variant name; default the lane on the board"},"step":{"type":"integer"}},"required":["step"]},
+                        "from":{"type":"object","description":"grid, a branch: the recorded lane goes on after a step as a new lane of the same run (pcb_route_timeline status: parent, parent_step), with the run's own arguments; the copper the run (or its last branch) put on the board is rolled back first when that is the last edit, else the board must be as the run found it (409). Up to the step the recorded nets are taken without searching, so the branch's steps equal the recorded ones until it searches on. A grid route stopped with job_cancel {keep: true} goes on from a stopped lane's last step. With warm: true over the board as edited since. {node}: from a pcb_variant_tree node (its run, lane and step; warm when its lane went on over an edited board); the answer's timeline.nodes names the branch and end nodes","properties":{"node":{"type":"integer","description":"a pcb_variant_tree node instead of run / lane / step"},"run":{"type":"integer","description":"a kept run; default the one recorded or branched last"},"lane":{"description":"index or variant name; default the lane on the board"},"step":{"type":"integer"}}},
                         "warm":{"type":"boolean","description":"with from: go on over the board as edited since (a part moved, a keep-out drawn) instead of the run's: the step's copper, history and rounds are taken as they are, the nets whose copper the edit broke (over new copper or keep-outs, pads moved) or that are not joined lose it and are routed first in a new round, the rest keep theirs (timeline.branch.warm: round, affected nets and why). The grid, layers, sizes and nets must be the run's, else a new run is routed cold (timeline.cold: why). The run's copper on the board under later edits is taken out first, the edits kept (warm.copper_removed)"},
                         "history":{"type":"string","enum":["keep","clear","clear_edited"],"description":"warm: the history of places fought over kept (default), started empty, or cleared where the edit changed the board (and 1 mm around; timeline.branch.warm.edited_tiles)"},
                         "schedule":{"type":"string","enum":["fixed","adaptive","adaptive_hist"],"default":"fixed","description":"grid, EXPERIMENTAL: negotiation schedule of the built-in variants (adaptive: growth 1.3 while the crowded nets fall, 2.0 when they stall; adaptive_hist: also twice the history on places fought over 3 rounds running)"},

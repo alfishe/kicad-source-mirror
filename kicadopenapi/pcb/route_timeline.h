@@ -177,9 +177,16 @@ private:
 GRID_NET_RESULT GridPathGeometry( const PLAN_GRID& aGrid, size_t aCells, const std::vector<PCB_LAYER_ID>& aLayers,
                                   const std::vector<std::vector<uint32_t>>& aPaths, const std::vector<bool>& aReached );
 
-/// @brief The last recorded grid route of this process (main thread)
+/// @brief The recorded grid routes of this process: the last runs within a memory budget, least
+/// recently used out first (never the last one or a live one). Keep: a run recorded or branched now
 void                           GridTimelineKeep( std::shared_ptr<GRID_TIMELINE> aTimeline );
 std::shared_ptr<GRID_TIMELINE> GridTimelineLast();
+/// @brief A kept run by id (used: it goes to the end of the eviction order); null when not kept
+std::shared_ptr<GRID_TIMELINE> GridTimelineFind( int aRun );
+std::vector<std::shared_ptr<GRID_TIMELINE>> GridTimelinesKept();
+size_t                         GridTimelineBudget();
+/// @brief The runs evicted to fit the new budget
+std::vector<int>               GridTimelineSetBudget( size_t aBytes );
 
 /// @brief The editor's replay of a running route moves on (from the route's progress, main thread):
 /// a plain call holds the main loop, so the replay's own timer does not run meanwhile

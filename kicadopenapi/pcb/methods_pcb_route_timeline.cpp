@@ -19,9 +19,12 @@
 namespace
 {
 
-// set on the main thread, read there and by event streams on HTTP threads
-std::mutex                     g_lastMutex;
-std::shared_ptr<GRID_TIMELINE> g_last;
+// set on the main thread, read there and by event streams on HTTP threads: the recorded runs kept,
+// least recently used first, and the one recorded or branched last
+std::mutex                                  g_lastMutex;
+std::deque<std::shared_ptr<GRID_TIMELINE>>  g_kept;
+std::shared_ptr<GRID_TIMELINE>              g_last;
+size_t                                      g_budget = (size_t) 256 << 20;
 
 double mm( double aIU )
 {
@@ -114,9 +117,6 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
 
     if( !t )
         return KOPENAPI_RESULT::Error( 404, "no grid route recorded in this process: pcb_route {engine: 'grid', record: true}" );
-
-    if( aArgs.contains( "run" ) && aArgs["run"] != t->run )
-        return KOPENAPI_RESULT::Error( 404, "only the last recorded run is kept: run " + std::to_string( t->run ) );
 
     const std::string verb = aArgs.value( "verb", "status" );
     nlohmann::json    out = { { "run", t->run } };
@@ -375,9 +375,6 @@ KOPENAPI_RESULT timelineBranch( const std::shared_ptr<GRID_TIMELINE>& t, const s
     if( !t )
         return KOPENAPI_RESULT::Error( 404, "no grid route recorded in this process: pcb_route {engine: 'grid', record: true}" );
 
-    if( aArgs.contains( "run" ) && aArgs["run"] != t->run )
-        return KOPENAPI_RESULT::Error( 404, "only the last recorded run is kept: run " + std::to_string( t->run ) );
-
     const int lane = laneOf( *t, aArgs.value( "lane", nlohmann::json() ) );
 
     if( lane < 0 )
@@ -444,11 +441,24 @@ KOPENAPI_RESULT h_pcb_route_timeline( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 {
     (void) aCtx;
     const std::string verb = aArgs.value( "verb", "status" );
+    std::shared_ptr<GRID_TIMELINE> t = GridTimelineLast();
+
+    if( aArgs.contains( "run" ) )
+    {
+        if( !aArgs["run"].is_number_integer() )
+            return KOPENAPI_RESULT::Error( 400, "run: a run id (pcb_variant_tree list: timelines)" );
+
+        t = GridTimelineFind( aArgs["run"].get<int>() );
+
+        if( !t )
+            return KOPENAPI_RESULT::Error( 404, "run " + aArgs["run"].dump() + " is not kept (evicted or never recorded; "
+                                                "pcb_variant_tree list: timelines)" );
+    }
 
     if( verb == "branch_switch" || verb == "branch_delete" )
-        return timelineBranch( GridTimelineLast(), verb, aArgs );
+        return timelineBranch( t, verb, aArgs );
 
-    return timelineQuery( GridTimelineLast(), aArgs );
+    return timelineQuery( t, aArgs );
 }
 
 
@@ -565,11 +575,56 @@ KOPENAPI_RESULT openTimelineEvents( const nlohmann::json& aArgs, KOPENAPI_EVENT_
 } // namespace
 
 
+namespace
+{
+
+/// @brief Under g_lastMutex: the least recently used runs go until the rest fit the budget; the last
+/// one and the live ones stay
+std::vector<int> evictLocked()
+{
+    std::vector<int> evicted;
+    size_t           total = 0;
+
+    for( const std::shared_ptr<GRID_TIMELINE>& t : g_kept )
+        total += t->Bytes();
+
+    for( auto it = g_kept.begin(); it != g_kept.end() && total > g_budget; )
+    {
+        const std::shared_ptr<GRID_TIMELINE>& t = *it;
+        bool                                  busy = t == g_last || t->live;
+
+        for( size_t k = 0; k < t->LaneCount() && !busy; ++k )
+            busy = t->Lane( k ).running;
+
+        if( busy )
+        {
+            ++it;
+            continue;
+        }
+
+        total -= std::min( total, t->Bytes() );
+        evicted.push_back( t->run );
+        it = g_kept.erase( it );
+    }
+
+    return evicted;
+}
+
+} // namespace
+
+
 void GridTimelineKeep( std::shared_ptr<GRID_TIMELINE> aTimeline )
 {
     {
         std::lock_guard<std::mutex> lock( g_lastMutex );
+        auto it = std::find( g_kept.begin(), g_kept.end(), aTimeline );
+
+        if( it != g_kept.end() )
+            g_kept.erase( it );
+
+        g_kept.push_back( aTimeline );
         g_last = std::move( aTimeline );
+        evictLocked();
     }
 
     KopenapiEventNotify( "pcb_route_timeline" );
@@ -580,6 +635,47 @@ std::shared_ptr<GRID_TIMELINE> GridTimelineLast()
 {
     std::lock_guard<std::mutex> lock( g_lastMutex );
     return g_last;
+}
+
+
+std::shared_ptr<GRID_TIMELINE> GridTimelineFind( int aRun )
+{
+    std::lock_guard<std::mutex> lock( g_lastMutex );
+
+    for( auto it = g_kept.begin(); it != g_kept.end(); ++it )
+    {
+        if( ( *it )->run != aRun )
+            continue;
+
+        std::shared_ptr<GRID_TIMELINE> t = *it;
+        g_kept.erase( it );
+        g_kept.push_back( t );
+        return t;
+    }
+
+    return nullptr;
+}
+
+
+std::vector<std::shared_ptr<GRID_TIMELINE>> GridTimelinesKept()
+{
+    std::lock_guard<std::mutex> lock( g_lastMutex );
+    return { g_kept.begin(), g_kept.end() };
+}
+
+
+size_t GridTimelineBudget()
+{
+    std::lock_guard<std::mutex> lock( g_lastMutex );
+    return g_budget;
+}
+
+
+std::vector<int> GridTimelineSetBudget( size_t aBytes )
+{
+    std::lock_guard<std::mutex> lock( g_lastMutex );
+    g_budget = aBytes;
+    return evictLocked();
 }
 
 
@@ -594,7 +690,7 @@ KOPENAPI_REGISTER_EVENT_TOPIC( "pcb_route_timeline",
 
 
 KOPENAPI_REGISTER( "pcb_route_timeline",
-                   "EXPERIMENTAL. Replay of the last grid route recorded in this process (pcb_route {engine: "
+                   "EXPERIMENTAL. Replay of a grid route recorded in this process (pcb_route {engine: "
                    "'grid', record: true}): each variant (lane) took nets one by one - routed in a negotiation "
                    "round, legalised, routed short again, with fewer vias, pulled tight, dropped - and every "
                    "step is kept. verb status: lanes, steps, sizes; frame: the copper at step 'at' (default the "
@@ -606,7 +702,8 @@ KOPENAPI_REGISTER( "pcb_route_timeline",
                    "the heat grid, counts the crowded states); series: stage / round / net / crowded / "
                    "expanded / ms / crowded_tiles per step; markers: stage and "
                    "round starts, dropped nets, the end (or the head while live). lane: index or variant name, default the "
-                   "lane switched to, else the winner (lane 0 while live). Branches (pcb_route {from: {run, lane, step}}) "
+                   "lane switched to, else the winner (lane 0 while live). run: a kept run (default the one recorded or branched last; "
+                   "the last runs are kept within a memory budget, pcb_variant_tree list: timelines). Branches (pcb_route {from: {run, lane, step}}) "
                    "are lanes too, with parent and parent_step in status (warm: routed on over an edited board); branch_switch {lane}: the lane shown by "
                    "default here and in the replay; branch_delete {lane}: a branch and its branches go (their "
                    "memory freed; not the run's variants, not the lane whose copper is on the board). The timeline is readable while the route runs (live: true; "
@@ -614,7 +711,7 @@ KOPENAPI_REGISTER( "pcb_route_timeline",
                    "pushed: GET /api/v1/events?topic=pcb_route_timeline, Server-Sent Events)",
                    R"json({"type":"object","properties":{
                         "verb":{"type":"string","enum":["status","frame","series","markers","branch_switch","branch_delete"],"default":"status"},
-                        "run":{"type":"integer","description":"the run id from status (only the last run is kept)"},
+                        "run":{"type":"integer","description":"a kept run; default the one recorded or branched last"},
                         "lane":{"description":"lane index or variant name; default the winner"},
                         "at":{"type":"integer","description":"step; negative from the end; default the last"},
                         "since":{"type":"integer","description":"the step the client shows; default none (every net)"},
