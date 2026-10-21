@@ -195,3 +195,7 @@ void                           GridReplayAdvance();
 /// @brief The editor's replay after branch_switch / branch_delete: it shows the timeline's default
 /// lane when its own is gone or another was switched to (main thread)
 void                           GridReplayFollow( const std::shared_ptr<GRID_TIMELINE>& aTimeline );
+
+/// @brief The editor's replay, when shown, goes to a run's lane and step (a variant-tree switch;
+/// main thread)
+void                           GridReplayShowAt( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aLane, size_t aStep );

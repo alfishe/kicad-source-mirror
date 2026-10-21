@@ -166,6 +166,16 @@ public:
 
     /// @brief After branch_switch / branch_delete: the timeline's default lane when ours is gone or
     /// another was switched to
+    /// @brief A variant-tree switch: the replay, when shown, goes to the node's run, lane and step
+    void ShowAt( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aLane, size_t aStep )
+    {
+        if( !Shown() || !aTimeline || aTimeline->Lane( aLane ).deleted || aTimeline->Lane( aLane ).steps.empty() )
+            return;
+
+        Show( m_frame.get(), aTimeline, aLane );
+        Seek( (double) aStep );
+    }
+
     void Follow( const std::shared_ptr<GRID_TIMELINE>& aTimeline )
     {
         if( !Shown() || m_timeline != aTimeline )
@@ -876,6 +886,12 @@ void GridReplayAdvance()
 void GridReplayFollow( const std::shared_ptr<GRID_TIMELINE>& aTimeline )
 {
     replay().Follow( aTimeline );
+}
+
+
+void GridReplayShowAt( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aLane, size_t aStep )
+{
+    replay().ShowAt( aTimeline, aLane, aStep );
 }
 
 

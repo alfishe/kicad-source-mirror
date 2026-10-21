@@ -3,9 +3,14 @@
 /// back to (docs/inprogress/2026-10-19-route-replay/design-tree.md). A node is a run, lane and step
 /// plus the board's edit-history entry; nodes on the same run form the tree of its lanes, a run
 /// hangs from the node it started from.
+#include "board_delta.h"
 #include "kopenapi_pcb.h"
 #include "route_timeline.h"
 #include "variant_tree.h"
+
+#include <api/pcb_context.h>
+#include <board.h>
+#include <board_commit.h>
 
 #include <kicadopenapi_history.h>
 #include <kicadopenapi_registry.h>
@@ -36,6 +41,7 @@ struct VARIANT_NODE
     /// node's own lane first
     std::vector<std::pair<int, size_t>> chain;
     long                     boardSeq = 0;  ///< the edit-history entry the board is after (0: as opened)
+    std::shared_ptr<const BOARD_STATE> board;   ///< the board at the node (a run's step: the board its lane ran over)
     nlohmann::json           metrics;
     long long                created = 0;   ///< ms since the epoch
 };
@@ -45,6 +51,9 @@ std::mutex                g_mutex;
 std::vector<VARIANT_NODE> g_nodes;
 std::map<int, int>        g_runOrigin;     ///< run: the node it started from
 std::map<int, long>       g_runStartSeq;   ///< run: the board's edit-history entry it started after
+std::map<int, std::shared_ptr<const BOARD_STATE>> g_runBoard;   ///< run: the board it started from
+std::map<std::pair<int, int>, std::shared_ptr<const BOARD_STATE>> g_laneBoard;   ///< warm lane: the board it went on over
+std::map<std::string, std::shared_ptr<const BOARD_BASE>> g_bases;   ///< board file: the states' base
 int                       g_nextId = 1;
 int                       g_current = 0;   ///< the node the board was last made / found at
 long                      g_currentSeq = -1;
@@ -80,6 +89,13 @@ void setCurrent( int aId )
     KOPENAPI_HISTORY& h = KOPENAPI_HISTORY::Get();
     g_current = aId;
     g_currentSeq = h.PendingSeq() > 0 ? h.PendingSeq() : h.LastSeq();
+}
+
+
+/// @brief Under g_mutex: the board now as a state against its file's base
+std::shared_ptr<const BOARD_STATE> takeBoard( const BOARD* aBoard )
+{
+    return BoardStateTake( aBoard, g_bases[aBoard->GetFileName().ToStdString()] );
 }
 
 
@@ -161,6 +177,18 @@ int nodeAt( const GRID_TIMELINE& aT, int aLane, size_t aStep, const std::string&
     n.warm = warmChain( aT, n.chain );
     n.name = n.variant + " @ step " + std::to_string( aStep );
     n.boardSeq = g_runStartSeq.count( aT.run ) ? g_runStartSeq[aT.run] : 0;
+
+    if( aT.Lane( aLane ).world )
+    {
+        auto it = g_laneBoard.find( { aT.run, aLane } );
+        n.board = it != g_laneBoard.end() ? it->second : nullptr;
+    }
+    else
+    {
+        auto it = g_runBoard.find( aT.run );
+        n.board = it != g_runBoard.end() ? it->second : nullptr;
+    }
+
     n.metrics = stepMetrics( aT, aLane, aStep );
     n.metrics.update( aMetrics );
     n.created = nowMs();
@@ -170,9 +198,10 @@ int nodeAt( const GRID_TIMELINE& aT, int aLane, size_t aStep, const std::string&
 
 
 /// @brief Under g_mutex: a board state outside any run (start, edit) hung from the node last current
-int boardNode( const std::string& aKind, const std::string& aName )
+int boardNode( const std::string& aKind, const std::string& aName, const BOARD* aBoard )
 {
     VARIANT_NODE n;
+    n.board = takeBoard( aBoard );
     n.id = g_nextId++;
     n.parent = findNode( g_current ) ? g_current : 0;
     n.kind = aKind;
@@ -223,9 +252,14 @@ nlohmann::json nodeJson( const VARIANT_NODE& n, const std::set<int>& aKept, int 
     KOPENAPI_HISTORY& h = KOPENAPI_HISTORY::Get();
     nlohmann::json    j = { { "id", n.id }, { "parent", parentOf( n ) }, { "name", n.name }, { "kind", n.kind },
                             { "tags", n.tags }, { "board_seq", n.boardSeq },
-                            { "board", n.boardSeq == 0 || h.Holds( n.boardSeq, "pcb" ) ? "held" : "lost" },
+                            { "history", n.boardSeq == 0 || h.Holds( n.boardSeq, "pcb" ) ? "held" : "lost" },
                             { "pinned", false }, { "current", n.id == aCurrent }, { "created_ms", n.created },
                             { "metrics", n.metrics } };
+
+    if( n.board )
+        j["board"] = { { "changed", n.board->items.size() }, { "removed", n.board->removed.size() }, { "bytes", n.board->Bytes() } };
+    else
+        j["board"] = nullptr;
 
     if( n.run )
     {
@@ -281,19 +315,24 @@ KOPENAPI_RESULT treeList()
 }
 
 
-KOPENAPI_RESULT treeNode( const nlohmann::json& aArgs )
+KOPENAPI_RESULT treeNode( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     const nlohmann::json at = aArgs.value( "at", nlohmann::json( "current" ) );
     int                  id = 0;
 
     if( at.is_string() && at.get<std::string>() == "current" )
     {
+        std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+        if( !context )
+            return KopenapiNoBoard();
+
         std::lock_guard<std::mutex> lock( g_mutex );
         id = currentNode();
 
         if( !id )
         {
-            id = boardNode( "edit", "edited" );
+            id = boardNode( "edit", "edited", context->GetBoard() );
             setCurrent( id );
         }
     }
@@ -459,16 +498,52 @@ KOPENAPI_RESULT treeBudget( const nlohmann::json& aArgs )
 }
 
 
+/// @brief How the board now differs from a node's
+KOPENAPI_RESULT treeDiff( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    if( !aArgs.contains( "id" ) || !aArgs["id"].is_number_integer() )
+        return KOPENAPI_RESULT::Error( 400, "id: a node (verb list)" );
+
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    std::shared_ptr<const BOARD_STATE> state;
+
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+        const VARIANT_NODE*         n = findNode( aArgs["id"].get<int>() );
+
+        if( !n )
+            return KOPENAPI_RESULT::Error( 404, "no node " + aArgs["id"].dump() );
+
+        state = n->board;
+    }
+
+    if( !state )
+        return KOPENAPI_RESULT::Error( 409, "node " + aArgs["id"].dump() + " keeps no board" );
+
+    const auto     started = std::chrono::steady_clock::now();
+    nlohmann::json out = BoardStateDiff( context->GetBoard(), *state );
+    out["id"] = aArgs["id"];
+    out["ms"] = std::round( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count() * 10 ) / 10;
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
 KOPENAPI_RESULT h_pcb_variant_tree( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
-    (void) aCtx;
     const std::string verb = aArgs.value( "verb", "list" );
 
     if( verb == "list" )
         return treeList();
 
     if( verb == "node" )
-        return treeNode( aArgs );
+        return treeNode( aCtx, aArgs );
+
+    if( verb == "diff" )
+        return treeDiff( aCtx, aArgs );
 
     if( verb == "rename" || verb == "tag" || verb == "delete" )
         return treeEdit( verb, aArgs );
@@ -476,32 +551,164 @@ KOPENAPI_RESULT h_pcb_variant_tree( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     if( verb == "budget" )
         return treeBudget( aArgs );
 
-    return KOPENAPI_RESULT::Error( 400, "verb: list, node, rename, tag, delete or budget" );
+    return KOPENAPI_RESULT::Error( 400, "verb: list, node, diff, rename, tag, delete or budget" );
+}
+
+
+KOPENAPI_RESULT h_pcb_variant_switch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    if( !aArgs.contains( "id" ) || !aArgs["id"].is_number_integer() )
+        return KOPENAPI_RESULT::Error( 400, "id: a node (pcb_variant_tree list)" );
+
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    for( const std::shared_ptr<GRID_TIMELINE>& t : GridTimelinesKept() )
+    {
+        if( t->live )
+            return KOPENAPI_RESULT::Error( 409, "run " + std::to_string( t->run ) + " is still routing" );
+    }
+
+    const auto  started = std::chrono::steady_clock::now();
+    BOARD*      board = context->GetBoard();
+    const int   id = aArgs["id"].get<int>();
+    int         savedAs = 0, run = 0, lane = -1;
+    size_t      step = 0;
+    std::shared_ptr<const BOARD_STATE> state;
+
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+        const VARIANT_NODE*         n = findNode( id );
+
+        if( !n )
+            return KOPENAPI_RESULT::Error( 404, "no node " + std::to_string( id ) );
+
+        if( !n->board )
+            return KOPENAPI_RESULT::Error( 409, "node " + std::to_string( id ) + " keeps no board" );
+
+        if( n->board->base->file != board->GetFileName().ToStdString() )
+            return KOPENAPI_RESULT::Error( 409, "node " + std::to_string( id ) + " is of another board: " + n->board->base->file );
+
+        state = n->board;
+        run = n->run;
+        lane = n->lane;
+        step = n->step;
+
+        // the board as it is, unless a node holds it already
+        if( !currentNode() )
+            savedAs = boardNode( "edit", "before switch", board );
+    }
+
+    const double takeMs = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
+    BOARD_COMMIT              commit( context->GetToolManager() );
+    const BOARD_STATE_APPLIED applied = BoardStateApply( board, commit, *state );
+
+    if( !applied.error.empty() )
+    {
+        commit.Revert();
+        return KOPENAPI_RESULT::Error( 500, applied.error );
+    }
+
+    const bool changed = applied.removed + applied.added + applied.replaced > 0;
+
+    if( changed )
+        commit.Push( _( "Switch to a variant (API)" ) );
+    else
+        commit.Revert();
+
+    {
+        // a call that changed nothing is not logged: the board is still after the last entry
+        std::lock_guard<std::mutex> lock( g_mutex );
+        setCurrent( id );
+
+        if( !changed )
+            g_currentSeq = KOPENAPI_HISTORY::Get().LastSeq();
+    }
+
+    nlohmann::json out = { { "id", id }, { "removed", applied.removed }, { "added", applied.added },
+                           { "replaced", applied.replaced },
+                           { "saved_as", savedAs ? nlohmann::json( savedAs ) : nlohmann::json() },
+                           { "take_ms", std::round( takeMs * 10 ) / 10 } };
+
+    if( applied.netsMissing )
+        out["nets_missing"] = applied.netsMissing;
+
+    if( run )
+    {
+        if( std::shared_ptr<GRID_TIMELINE> t = GridTimelineFind( run ) )
+        {
+            if( !t->Lane( lane ).deleted )
+            {
+                t->shownLane = lane;
+                GridReplayFollow( t );
+                GridReplayShowAt( t, lane, step );
+            }
+
+            // the copper on the board is no longer known to be the run's
+            t->appliedSeq = 0;
+            t->appliedItems.clear();
+            out["timeline"] = { { "run", run }, { "lane", lane }, { "step", step } };
+        }
+        else
+        {
+            out["timeline"] = { { "run", run }, { "evicted", true } };
+        }
+    }
+
+    out["switch_ms"] = std::round( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count() * 10 ) / 10;
+    KopenapiEventNotify( "pcb_route_timeline" );
+    return KOPENAPI_RESULT::Ok( out );
 }
 
 } // namespace
 
 
-int VariantTreeRunStarted( const std::shared_ptr<GRID_TIMELINE>& aTimeline )
+bool VariantTreeLaneBoard( int aId, std::shared_ptr<const BOARD_STATE>& aState, std::string& aError )
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    const VARIANT_NODE*         n = findNode( aId );
+
+    if( !n || !n->board )
+    {
+        aError = n ? "node " + std::to_string( aId ) + " keeps no board" : "no node " + std::to_string( aId );
+        return false;
+    }
+
+    aState = n->board;
+    return true;
+}
+
+
+void VariantTreeWarmLane( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aLane, const BOARD* aBoard )
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    g_laneBoard[{ aTimeline->run, aLane }] = takeBoard( aBoard );
+}
+
+
+int VariantTreeRunStarted( const std::shared_ptr<GRID_TIMELINE>& aTimeline, const BOARD* aBoard )
 {
     std::lock_guard<std::mutex> lock( g_mutex );
     int                         origin = currentNode();
 
-    if( !origin )
+    if( !origin || !findNode( origin )->board )
     {
-        origin = boardNode( "start", "before run " + std::to_string( aTimeline->run ) );
+        origin = boardNode( "start", "before run " + std::to_string( aTimeline->run ), aBoard );
         g_current = origin;
         g_currentSeq = KOPENAPI_HISTORY::Get().LastSeq();
     }
 
     g_runOrigin[aTimeline->run] = origin;
+    g_runBoard[aTimeline->run] = findNode( origin )->board;
     g_runStartSeq[aTimeline->run] = KOPENAPI_HISTORY::Get().LastSeq();
     return origin;
 }
 
 
 int VariantTreeAutoNode( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aLane, size_t aStep,
-                         const std::string& aKind, const nlohmann::json& aMetrics, bool aCurrent )
+                         const std::string& aKind, const nlohmann::json& aMetrics, const BOARD* aCurrent )
 {
     std::lock_guard<std::mutex> lock( g_mutex );
     const int                   id = nodeAt( *aTimeline, aLane, aStep, aKind, aMetrics );
@@ -512,6 +719,7 @@ int VariantTreeAutoNode( const std::shared_ptr<GRID_TIMELINE>& aTimeline, int aL
         KOPENAPI_HISTORY& h = KOPENAPI_HISTORY::Get();
         n->boardSeq = h.PendingSeq() > 0 ? h.PendingSeq() : h.LastSeq();
         n->metrics.update( aMetrics );
+        n->board = takeBoard( aCurrent );
         setCurrent( id );
     }
 
@@ -555,14 +763,17 @@ KOPENAPI_REGISTER( "pcb_variant_tree",
                    "from (a 'start' node: the board before the run; an 'edit' node: the board edited since a "
                    "node). verb list: nodes, the current one (the board is still that node's) or "
                    "edited_since, the runs kept in memory (timelines: the last runs within budget_mb, least "
-                   "recently used out first; a node of an evicted run keeps its metrics, timeline: evicted); "
+                   "recently used out first; a node of an evicted run keeps its metrics, timeline: evicted). Each node keeps its board as the items that differ from a "
+                   "base by KIID (board: changed, removed, bytes; a run's step: the board its lane ran over), "
+                   "pcb_variant_switch goes there; "
                    "node {at: \"current\" | {run, lane, step}, name, tags}: a node there (an existing one at the "
-                   "same place is returned); rename {id, name}; tag {id, add, remove}; delete {id}: the node "
+                   "same place is returned); diff {id}: how the board now differs from the node's (same, to_add, "
+                   "to_remove, changed); rename {id, name}; tag {id, add, remove}; delete {id}: the node "
                    "and the nodes under it (not the current node, not a node tagged locked); budget {mb}: the "
                    "timelines' memory budget (default 256), runs evicted to fit. pcb_route {from: {node}} goes "
                    "on from a node",
                    R"json({"type":"object","properties":{
-                        "verb":{"type":"string","enum":["list","node","rename","tag","delete","budget"],"default":"list"},
+                        "verb":{"type":"string","enum":["list","node","diff","rename","tag","delete","budget"],"default":"list"},
                         "at":{"description":"node: \"current\" (default) or {run, lane (index or variant; default the shown lane), step (negative from the end)}"},
                         "id":{"type":"integer"},
                         "name":{"type":"string"},
@@ -571,3 +782,16 @@ KOPENAPI_REGISTER( "pcb_variant_tree",
                         "remove":{"type":"array","items":{"type":"string"}},
                         "mb":{"type":"number","description":"budget: memory for the kept runs' timelines"}}})json"_json,
                    false, h_pcb_variant_tree );
+
+
+KOPENAPI_REGISTER( "pcb_variant_switch",
+                   "EXPERIMENTAL. The board goes to a pcb_variant_tree node's state in one edit (undo: edit_rollback "
+                   "or the editor's undo): the items that differ (footprints, tracks, vias, zones, drawings; by "
+                   "KIID, as their s-expression) taken out, the node's put in, nets by name. Board edits no node "
+                   "holds are kept first as a node 'before switch' (saved_as). A node of a run shows its lane and "
+                   "step (pcb_route_timeline default lane, the replay when shown); the node becomes current. 409 "
+                   "while a route runs or for a node of another board file",
+                   R"json({"type":"object","required":["id"],"properties":{"id":{"type":"integer"}}})json"_json,
+                   false, h_pcb_variant_switch );
+
+KOPENAPI_MARK_EDITING( "pcb_variant_switch" );

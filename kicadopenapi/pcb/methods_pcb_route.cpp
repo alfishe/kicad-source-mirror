@@ -12,6 +12,7 @@
 #include "kopenapi_pcb.h"
 #include "route_grid.h"
 #include "route_timeline.h"
+#include "board_delta.h"
 #include "variant_tree.h"
 
 #include <kicadopenapi_history.h>
@@ -1510,6 +1511,7 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     nlohmann::json from = aArgs["from"];
     bool           warmByNode = false;
+    nlohmann::json nodeBoard;
 
     if( from.is_object() && from.contains( "node" ) )
     {
@@ -1530,6 +1532,40 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                                 + "'s timeline was evicted (pcb_variant_tree budget)" );
 
         warmByNode = GridTimelineFind( run )->Lane( lane ).world != 0;
+
+        // the board the node's lane ran over, unless asked to go on warm over the board as it is
+        if( !aArgs.value( "warm", false ) )
+        {
+            std::shared_ptr<const BOARD_STATE> state;
+            std::shared_ptr<PCB_CONTEXT>       context = KopenapiPcbContext( aCtx );
+
+            if( !context )
+                return KopenapiNoBoard();
+
+            if( std::optional<KOPENAPI_RESULT> busy = guiRouting() )
+                return *busy;
+
+            if( !VariantTreeLaneBoard( aArgs["from"]["node"].get<int>(), state, error ) )
+                return KOPENAPI_RESULT::Error( 409, error );
+
+            BOARD_COMMIT              commit( context->GetToolManager() );
+            const BOARD_STATE_APPLIED applied = BoardStateApply( context->GetBoard(), commit, *state );
+
+            if( !applied.error.empty() )
+            {
+                commit.Revert();
+                return KOPENAPI_RESULT::Error( 500, applied.error );
+            }
+
+            if( applied.removed + applied.added + applied.replaced > 0 )
+                commit.Push( _( "Switch to a variant (API)" ) );
+            else
+                commit.Revert();
+
+            GridTimelineFind( run )->appliedSeq = 0;
+            GridTimelineFind( run )->appliedItems.clear();
+            nodeBoard = { { "removed", applied.removed }, { "added", applied.added }, { "replaced", applied.replaced } };
+        }
     }
 
     if( !from.is_object() || !from.contains( "step" ) || !from["step"].is_number_integer() )
@@ -1640,6 +1676,12 @@ static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         branch.board = t->appliedSeq > 0 && history.Holds( t->appliedSeq, "pcb" )
                                ? "the route is not the last edit (edit_log): the board was left as it is"
                                : "nothing of the run on the board to roll back";
+    }
+
+    if( !nodeBoard.is_null() )
+    {
+        branch.board = "the board of node " + aArgs["from"]["node"].dump() + " (items removed " + nodeBoard["removed"].dump()
+                       + ", added " + nodeBoard["added"].dump() + ", replaced " + nodeBoard["replaced"].dump() + ")";
     }
 
     return pcbRoute( aCtx, args, &branch );
@@ -3368,7 +3410,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         nlohmann::json    timelineOut;
 
         if( gr.timeline && ( !aBranch || gr.timeline != aBranch->timeline ) )
-            VariantTreeRunStarted( gr.timeline );
+            VariantTreeRunStarted( gr.timeline, board );
+
+        if( gr.timeline && gr.branchLane >= 0 && aBranch && aBranch->warm )
+            VariantTreeWarmLane( gr.timeline, gr.branchLane, board );
 
         // the replay sees the route end with its copper on the board
         struct LIVE_END
@@ -3422,7 +3467,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( best >= 0 )
                 {
                     out["timeline"]["node"] = VariantTreeAutoNode( gr.timeline, best, gr.timeline->Lane( best ).steps.size() - 1,
-                                                                   "pause", nlohmann::json::object(), true );
+                                                                   "pause", nlohmann::json::object(), board );
                 }
             }
 
@@ -3609,11 +3654,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 {
                     const GRID_LANE& b = gr.timeline->Lane( gr.branchLane );
                     timelineOut["nodes"]["branch"] = VariantTreeAutoNode( gr.timeline, b.parent, b.parentStep, "branch",
-                                                                          nlohmann::json::object(), false );
+                                                                          nlohmann::json::object(), nullptr );
                 }
 
                 timelineOut["nodes"]["end"] = VariantTreeAutoNode( gr.timeline, lane, gr.timeline->Lane( lane ).steps.size() - 1,
-                                                                   "end", metrics, true );
+                                                                   "end", metrics, board );
             }
         }
 
