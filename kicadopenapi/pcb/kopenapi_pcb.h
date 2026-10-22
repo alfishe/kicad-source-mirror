@@ -8,6 +8,7 @@
 #define KOPENAPI_PCB_H
 
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -64,6 +65,10 @@ bool KopenapiAssemblyBox( BOARD* aBoard, double aLo[3], double aHi[3] );
 /// models changed.
 /// @return what was trimmed, or null when the rule is off
 nlohmann::json KopenapiLeadTrimRefresh( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext );
+
+/// @brief Height of every footprint with a shown 3D model, in mm from the board surface on its own
+/// side (model boxes, cached geometry); footprints without a readable model are absent
+std::map<const FOOTPRINT*, double> KopenapiFootprintHeights( BOARD* aBoard );
 
 nlohmann::json KopenapiPanelEdgeJson( FOOTPRINT* aFootprint, const std::string& aMethod = "auto" );
 

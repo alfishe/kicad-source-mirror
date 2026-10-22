@@ -974,3 +974,74 @@ bool KopenapiAssemblyBox( BOARD* aBoard, double aLo[3], double aHi[3] )
 
     return true;
 }
+
+
+std::map<const FOOTPRINT*, double> KopenapiFootprintHeights( BOARD* aBoard )
+{
+    const double thickness = aBoard->GetDesignSettings().GetBoardThickness() / pcbIUScale.IU_PER_MM;
+    std::vector<std::tuple<FOOTPRINT*, std::filesystem::path, glm::mat4>> jobs;
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( const FP_3DMODEL& m : fp->Models() )
+        {
+            if( !m.m_Show )
+                continue;
+
+            std::filesystem::path file = KopenapiModelFile( fp, m, aBoard->GetProject() );
+
+            if( std::filesystem::exists( file ) )
+                jobs.emplace_back( fp, file, modelMatrix( m ) );
+        }
+    }
+
+    std::vector<KOPENAPI_MODEL_GEOMETRY> boxes( jobs.size() );
+    KopenapiRunOffMain(
+            [&]()
+            {
+                // models in parallel: the STEP reads take the translator lock, the meshing does not
+                std::atomic<size_t>      next{ 0 };
+                std::vector<std::thread> workers;
+                const size_t             n = std::min<size_t>( jobs.size(), std::max( 1u, std::thread::hardware_concurrency() / 2 ) );
+
+                for( size_t w = 0; w < n; ++w )
+                {
+                    workers.emplace_back(
+                            [&]()
+                            {
+                                for( size_t i = next++; i < jobs.size(); i = next++ )
+                                    boxes[i] = KopenapiModelGeometry( std::get<1>( jobs[i] ), std::get<2>( jobs[i] ), false );
+                            } );
+                }
+
+                for( std::thread& t : workers )
+                    t.join();
+            } );
+
+    std::map<const FOOTPRINT*, double> heights;
+
+    for( size_t i = 0; i < jobs.size(); ++i )
+    {
+        const KOPENAPI_MODEL_GEOMETRY& g = boxes[i];
+        const FOOTPRINT*               fp = std::get<0>( jobs[i] );
+
+        if( !g.ok )
+            continue;
+
+        // z of the board frame: up from the top surface; a bottom part grows down from -thickness
+        double top = -1e9, bottom = 1e9;
+
+        for( int c = 0; c < 8; ++c )
+        {
+            const double z = toBoard( fp, g.min[0], g.min[1], ( c & 4 ) ? g.max[2] : g.min[2], thickness )[2];
+            top = std::max( top, z );
+            bottom = std::min( bottom, z );
+        }
+
+        const double h = fp->IsFlipped() ? -thickness - bottom : top;
+        double&      kept = heights[fp];
+        kept = std::max( kept, std::round( h * 100 ) / 100 );
+    }
+
+    return heights;
+}

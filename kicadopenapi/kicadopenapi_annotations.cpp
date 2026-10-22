@@ -92,6 +92,7 @@ struct ANNOTATION
     std::optional<BOX2D> area;              ///< internal units
     COLOR4D           colour{ 1.0, 0.55, 0.0, 1.0 };
     double            widthPx = 3.0;
+    std::optional<double> fill;             ///< fill opacity: highlight / region inside, spotlight's dimming
     double            ttl = 0.0;            ///< seconds, 0 = until removed
     bool              pulse = false;
     int               number = 0;
@@ -372,7 +373,7 @@ void LAYER::drawAnnotation( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const BOX
         aOverlay.SetStrokeColor( colour.WithAlpha( aAlpha ) );
         aOverlay.SetIsFill( true );
         aOverlay.SetIsStroke( true );
-        aOverlay.SetFillColor( colour.WithAlpha( 0.12 * aAlpha ) );
+        aOverlay.SetFillColor( colour.WithAlpha( aNote.fill.value_or( 0.12 ) * aAlpha ) );
         aOverlay.Rectangle( a, b );
     }
     else if( aNote.kind == "arrow" && target && to )
@@ -442,7 +443,7 @@ void LAYER::drawAnnotation( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const BOX
         aOverlay.SetLineWidth( width );
         aOverlay.SetStrokeColor( colour.WithAlpha( aAlpha ) );
         aOverlay.SetIsFill( aNote.kind == "region" );
-        aOverlay.SetFillColor( colour.WithAlpha( 0.08 * aAlpha ) );
+        aOverlay.SetFillColor( colour.WithAlpha( ( aNote.kind == "region" ? aNote.fill.value_or( 0.08 ) : 0.0 ) * aAlpha ) );
         aOverlay.SetIsStroke( true );
         aOverlay.Rectangle( box.GetOrigin(), box.GetEnd() );
 
@@ -452,7 +453,7 @@ void LAYER::drawAnnotation( KIGFX::VIEW_OVERLAY& aOverlay, double aPx, const BOX
             outer.Merge( box );
             aOverlay.SetIsStroke( false );
             aOverlay.SetIsFill( true );
-            aOverlay.SetFillColor( COLOR4D( 0, 0, 0, 0.55 * aAlpha ) );
+            aOverlay.SetFillColor( COLOR4D( 0, 0, 0, aNote.fill.value_or( 0.55 ) * aAlpha ) );
             aOverlay.Rectangle( outer.GetOrigin(), VECTOR2D( outer.GetRight(), box.GetTop() ) );
             aOverlay.Rectangle( VECTOR2D( outer.GetLeft(), box.GetBottom() ), outer.GetEnd() );
             aOverlay.Rectangle( VECTOR2D( outer.GetLeft(), box.GetTop() ), VECTOR2D( box.GetLeft(), box.GetBottom() ) );
@@ -814,6 +815,10 @@ std::string applyFields( const KOPENAPI_ANNOTATION_HOST& aHost, const nlohmann::
     aNote.colour = parseColour( aSpec.value( "color", nlohmann::json() ), aNote.colour );
     aNote.widthPx = std::clamp( aSpec.value( "width_px", aNote.widthPx ), 0.5, 20.0 );
     aNote.pulse = aSpec.value( "pulse", aNote.pulse );
+
+    if( aSpec.contains( "fill_opacity" ) && aSpec["fill_opacity"].is_number() )
+        aNote.fill = std::clamp( aSpec["fill_opacity"].get<double>(), 0.0, 1.0 );
+
     aNote.number = aSpec.value( "number", aNote.number );
 
     if( aSpec.contains( "ttl_s" ) )
@@ -989,6 +994,7 @@ const nlohmann::json& KopenapiAnnotateSchema()
             "color":{"type":"string","description":"#RRGGBB (default orange)"},
             "width_px":{"type":"number","default":3},
             "pulse":{"type":"boolean","default":false},
+            "fill_opacity":{"type":"number","minimum":0,"maximum":1,"description":"highlight / region fill (defaults 0.12 / 0.08); spotlight: how dark the rest is (0.55)"},
             "ttl_s":{"type":"number","description":"fade out after this many seconds; 0 = stays"},
             "group":{"type":"string","description":"for clear"},
             "on_orphan":{"type":"string","enum":["keep","hide","remove"],"default":"keep","description":"when the anchored item is deleted"}}}},
