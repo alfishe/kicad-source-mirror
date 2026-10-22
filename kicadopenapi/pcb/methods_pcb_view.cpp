@@ -38,6 +38,7 @@
 
 #include <chrono>
 #include <map>
+#include <optional>
 #include <set>
 #include <cmath>
 #include <thread>
@@ -399,7 +400,136 @@ struct CAMERA_MOVE
     double rotate[3] = { 0, 0, 0 };
     double zoom = 1.0;
     double seconds = 1.0;
+
+    std::optional<SFVEC3F> lookAt;        ///< where the camera looks at the end (world), if it pans
+    SFVEC3F                shiftLookAt{ 0 };   ///< the pan over the move (resolveLookAt)
+    SFVEC3F                shiftPos{ 0 };      ///< the camera's offset across the view taken out
 };
+
+
+/// @brief Board mm -> the 3D viewer's world, through the board's own 3D box (however the adapter
+/// places and scales it); the board's top surface is z 0 in mm
+static std::optional<SFVEC3F> boardToWorld( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard, double aX, double aY,
+                                            double aZ )
+{
+    const BOX2I outline = aBoard ? aBoard->GetBoardEdgesBoundingBox() : BOX2I();
+
+    if( outline.GetWidth() <= 0 || outline.GetHeight() <= 0 )
+        return std::nullopt;
+
+    const BOARD_ADAPTER& adapter = aFrame->GetAdapter();
+    const SFVEC3F        bmin = adapter.GetBBox().Min();
+    const SFVEC3F        bmax = adapter.GetBBox().Max();
+    const double         ox = outline.GetLeft() / pcbIUScale.IU_PER_MM;
+    const double         oy = outline.GetTop() / pcbIUScale.IU_PER_MM;
+    const double         sx = ( bmax.x - bmin.x ) / ( outline.GetWidth() / pcbIUScale.IU_PER_MM );
+    const double         sy = ( bmax.y - bmin.y ) / ( outline.GetHeight() / pcbIUScale.IU_PER_MM );
+
+    return SFVEC3F( (float) ( bmin.x + ( aX - ox ) * sx ),
+                    (float) ( bmax.y - ( aY - oy ) * sy ),   // board y runs down, the world's up
+                    (float) ( bmax.z + aZ * sx ) );
+}
+
+
+/// @brief A look_at argument in the world: "board" (its middle), references (the middle of their
+/// boxes) or [x_mm, y_mm]; empty with aError set when it does not resolve
+static std::optional<SFVEC3F> lookAtOf( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard, const nlohmann::json& aArg,
+                                        std::string& aError )
+{
+    if( !aBoard )
+    {
+        aError = "look_at: no board open";
+        return std::nullopt;
+    }
+
+    BOX2I area;
+
+    if( aArg.is_string() && aArg.get<std::string>() == "board" )
+    {
+        area = aBoard->GetBoardEdgesBoundingBox();
+    }
+    else if( aArg.is_array() && aArg.size() == 2 && aArg[0].is_number() && aArg[1].is_number() )
+    {
+        const VECTOR2I p( pcbIUScale.mmToIU( aArg[0].get<double>() ), pcbIUScale.mmToIU( aArg[1].get<double>() ) );
+        area = BOX2I( p, VECTOR2I( 0, 0 ) );
+    }
+    else if( aArg.is_array() && !aArg.empty() )
+    {
+        bool any = false;
+
+        for( const nlohmann::json& r : aArg )
+        {
+            if( !r.is_string() )
+            {
+                aError = "look_at: \"board\", [x_mm, y_mm] or references";
+                return std::nullopt;
+            }
+
+            for( FOOTPRINT* fp : aBoard->Footprints() )
+            {
+                if( fp->GetReference().ToStdString( wxConvUTF8 ) != r.get<std::string>() )
+                    continue;
+
+                const BOX2I b = fp->GetBoundingBox( false );
+                area = any ? area.Merge( b ) : b;
+                any = true;
+            }
+        }
+
+        if( !any )
+        {
+            aError = "look_at: none of the references is on the board";
+            return std::nullopt;
+        }
+    }
+    else
+    {
+        aError = "look_at: \"board\", [x_mm, y_mm] or references";
+        return std::nullopt;
+    }
+
+    const VECTOR2I c = area.GetCenter();
+    std::optional<SFVEC3F> w = boardToWorld( aFrame, aBoard, c.x / pcbIUScale.IU_PER_MM, c.y / pcbIUScale.IU_PER_MM, 0 );
+
+    if( !w )
+        aError = "look_at: the board has no outline";
+
+    return w;
+}
+
+
+/// @brief Moves the point the camera turns about and looks at, and its offset across the view, by
+/// these amounts (KiCad's own interpolation, rotation and zoom kept)
+static void shiftCamera( CAMERA& aCamera, const SFVEC3F& aLookAt, const SFVEC3F& aPos )
+{
+    if( aLookAt == SFVEC3F( 0 ) && aPos == SFVEC3F( 0 ) )
+        return;
+
+    aCamera.SetT0_and_T1_current_T();
+    aCamera.SetLookAtPos_T1( aCamera.GetLookAtPos() + aLookAt );
+    aCamera.Pan_T1( aPos );
+    aCamera.Interpolate( 1.0f );
+}
+
+
+/// @brief The pans of the moves from where the camera looks now: each move with a look_at ends
+/// looking there, centred in the view (a manual pan across the view taken out)
+static void resolveLookAt( const CAMERA& aCamera, std::vector<CAMERA_MOVE>& aMoves )
+{
+    SFVEC3F at = aCamera.GetLookAtPos();
+    SFVEC3F pos = aCamera.GetCameraPos();
+
+    for( CAMERA_MOVE& m : aMoves )
+    {
+        if( !m.lookAt )
+            continue;
+
+        m.shiftLookAt = *m.lookAt - at;
+        m.shiftPos = SFVEC3F( -pos.x, -pos.y, 0 );
+        at = *m.lookAt;
+        pos.x = pos.y = 0;
+    }
+}
 
 
 /// @brief Zoom correction along the moves (follow framing): (time into the moves, factor)
@@ -407,6 +537,7 @@ using FRAMING = std::vector<std::pair<double, double>>;
 
 static nlohmann::json fitTrajectory( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard, const std::vector<CAMERA_MOVE>& aMoves,
                                     double aSeconds, FRAMING* aFollow = nullptr );
+static void stepMove( CAMERA& aCamera, const CAMERA_MOVE& aMove, double aFrom, double aTo );
 
 
 /// @brief The correction at time aT (linear between samples)
@@ -683,13 +814,44 @@ static KOPENAPI_RESULT h_view3d_camera( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         camera.RotateZ( glm::radians( r[2].get<float>() ) );
     }
 
+    wxWeakRef<EDA_3D_VIEWER_FRAME> alive( frame );
+
+    if( aArgs.contains( "look_at" ) )
+    {
+        std::string                  error;
+        const std::optional<SFVEC3F> at = lookAtOf( frame, boardOf( aCtx ), aArgs["look_at"], error );
+
+        if( !at )
+            return KOPENAPI_RESULT::Error( error.find( "none" ) != std::string::npos ? 404 : 400, error );
+
+        std::vector<CAMERA_MOVE> pan( 1 );
+        pan[0].lookAt = at;
+        resolveLookAt( camera, pan );
+        double done = 0;
+
+        KopenapiAnimate( aArgs.value( "animate", true ) ? 0.6 : 0.0,
+                         [&]( double e )
+                         {
+                             if( !alive )
+                                 return;
+
+                             stepMove( camera, pan[0], done, e );
+                             done = e;
+                             frame->GetCanvas()->DoRePaint();
+                         } );
+
+        if( !alive )
+            return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
+
+        if( done < 1.0 )
+            stepMove( camera, pan[0], done, 1.0 );
+    }
+
     if( aArgs.contains( "zoom" ) )
         camera.Zoom( aArgs["zoom"].get<float>() );
 
     // frame the whole assembly in this pose (unless a zoom was asked for)
     nlohmann::json fit;
-
-    wxWeakRef<EDA_3D_VIEWER_FRAME> alive( frame );
 
     if( aArgs.value( "fit_assembly", true ) && !aArgs.contains( "zoom" ) )
         fit = fitTrajectory( frame, boardOf( aCtx ), {}, aArgs.value( "animate", true ) ? 0.5 : 0.0 );
@@ -714,6 +876,8 @@ static void stepMove( CAMERA& aCamera, const CAMERA_MOVE& aMove, double aFrom, d
 
     if( aMove.zoom != 1.0 )
         aCamera.Zoom( (float) std::pow( aMove.zoom, de ) );
+
+    shiftCamera( aCamera, aMove.shiftLookAt * (float) de, aMove.shiftPos * (float) de );
 }
 
 
@@ -772,30 +936,17 @@ static std::vector<glm::vec4> assemblyCorners( EDA_3D_VIEWER_FRAME* aFrame, BOAR
     if( !aBoard || !KopenapiAssemblyBox( aBoard, lo, hi ) )
         return {};
 
-    // board mm -> the viewer's world: through the board's own 3D box (however the adapter places
-    // and scales it); the board's top surface is z 0 in mm
-    const BOARD_ADAPTER& adapter = aFrame->GetAdapter();
-    const BOX2I          outline = aBoard->GetBoardEdgesBoundingBox();
-    const SFVEC3F        bmin = adapter.GetBBox().Min();
-    const SFVEC3F        bmax = adapter.GetBBox().Max();
-
-    if( outline.GetWidth() <= 0 || outline.GetHeight() <= 0 )
-        return {};
-
-    const double ox = outline.GetLeft() / pcbIUScale.IU_PER_MM;
-    const double oy = outline.GetTop() / pcbIUScale.IU_PER_MM;
-    const double sx = ( bmax.x - bmin.x ) / ( outline.GetWidth() / pcbIUScale.IU_PER_MM );
-    const double sy = ( bmax.y - bmin.y ) / ( outline.GetHeight() / pcbIUScale.IU_PER_MM );
     std::vector<glm::vec4> corners;
 
     for( int c = 0; c < 8; ++c )
     {
-        const double x = ( c & 1 ) ? hi[0] : lo[0];
-        const double y = ( c & 2 ) ? hi[1] : lo[1];
-        const double z = ( c & 4 ) ? hi[2] : lo[2];
-        corners.emplace_back( (float) ( bmin.x + ( x - ox ) * sx ),
-                              (float) ( bmax.y - ( y - oy ) * sy ),   // board y runs down, the world's up
-                              (float) ( bmax.z + z * sx ), 1.0f );
+        const std::optional<SFVEC3F> w = boardToWorld( aFrame, aBoard, ( c & 1 ) ? hi[0] : lo[0],
+                                                       ( c & 2 ) ? hi[1] : lo[1], ( c & 4 ) ? hi[2] : lo[2] );
+
+        if( !w )
+            return {};
+
+        corners.emplace_back( *w, 1.0f );
     }
 
     return corners;
@@ -873,6 +1024,8 @@ static nlohmann::json fitTrajectory( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard,
     {
         const CAMERA_MOVE& m = it->first;
         const double       de = it->second;
+
+        shiftCamera( camera, m.shiftLookAt * (float) -de, m.shiftPos * (float) -de );
 
         if( m.zoom != 1.0 )
             camera.Zoom( (float) std::pow( m.zoom, -de ) );
@@ -1022,11 +1175,23 @@ static KOPENAPI_RESULT h_view3d_animate( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
         move.zoom = k.value( "zoom", 1.0 );
         move.seconds = std::clamp( k.value( "seconds", 1.0 ), 0.05, 120.0 );
+
+        if( k.contains( "look_at" ) )
+        {
+            std::string error;
+            move.lookAt = lookAtOf( frame, boardOf( aCtx ), k["look_at"], error );
+
+            if( !move.lookAt )
+                return KOPENAPI_RESULT::Error( error.find( "none" ) != std::string::npos ? 404 : 400, "moves[]." + error );
+        }
+
         moves.push_back( move );
     }
 
     if( moves.empty() )
         return KOPENAPI_RESULT::Error( 400, "give effect or moves" );
+
+    resolveLookAt( frame->GetCurrentCamera(), moves );
 
     nlohmann::json fit;
     FRAMING        follow;
@@ -1050,7 +1215,21 @@ static KOPENAPI_RESULT h_view3d_animate( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( frames < 0 )
         return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
 
-    return KOPENAPI_RESULT::Ok( { { "moves", moves.size() }, { "seconds", total }, { "frames", frames }, { "fit", fit } } );
+    nlohmann::json result = { { "moves", moves.size() }, { "seconds", total }, { "frames", frames }, { "fit", fit } };
+
+    for( auto it = moves.rbegin(); it != moves.rend(); ++it )
+    {
+        if( !it->lookAt )
+            continue;
+
+        // where the last look_at target ends up on screen: [0, 0] is the centre, +-1 the edges
+        CAMERA&         camera = frame->GetCurrentCamera();
+        const glm::vec4 clip = camera.GetProjectionMatrix() * camera.GetViewMatrix() * glm::vec4( *it->lookAt, 1.0f );
+        result["look_at_screen"] = { clip.x / clip.w, clip.y / clip.w };
+        break;
+    }
+
+    return KOPENAPI_RESULT::Ok( result );
 }
 
 
@@ -1131,11 +1310,13 @@ KOPENAPI_REGISTER( "view3d_layers",
 
 KOPENAPI_REGISTER( "view3d_camera",
                    "3D viewer camera: preset view (top, bottom, left, right, front, back, fit; animated), "
-                   "then rotate_deg [x, y, z] and zoom factor; opens the viewer if needed; GUI only",
+                   "then rotate_deg [x, y, z], look_at (turn about and look at parts or a point of the "
+                   "board) and zoom factor; opens the viewer if needed; GUI only",
                    R"json({"type":"object","properties":{
                         "preset":{"type":"string","enum":["top","bottom","left","right","front","back","fit"]},
                         "animate":{"type":"boolean","default":true},
                         "rotate_deg":{"type":"array","items":{"type":"number"}},
+                        "look_at":{"description":"the point the camera looks at and turns about, centred in the view: references (the middle of their parts), [x_mm, y_mm] on the board, or \"board\" (its middle, the default view)","oneOf":[{"type":"string","enum":["board"]},{"type":"array","items":{"type":["string","number"]}}]},
                         "zoom":{"type":"number","description":"> 1 closer"},
                         "fit_assembly":{"type":"boolean","default":true,"description":"frame the whole assembly (board + models over its edges) for any rotation"},
                         "open":{"type":"boolean","default":true}}})json"_json,
@@ -1156,7 +1337,8 @@ KOPENAPI_REGISTER( "view3d_orbit",
 KOPENAPI_REGISTER( "view3d_animate",
                    "Smooth 3D camera choreography (fly-around, rotation about all three axes, zoom; eased): "
                    "built-in effects turntable, tumble, flyover, showcase (speed factor), or your own moves "
-                   "[{rotate_deg: [x, y, z], zoom, seconds}] played in order; for demos and recordings; the "
+                   "[{rotate_deg: [x, y, z], zoom, look_at, seconds}] played in order (look_at pans the "
+                   "camera to parts or a point along the move: a tour of the board); for demos and recordings; the "
                    "viewer's manual behaviour is untouched; GUI only",
                    R"json({"type":"object","properties":{
                         "effect":{"type":"string","enum":["turntable","tumble","flyover","showcase"]},
@@ -1164,6 +1346,7 @@ KOPENAPI_REGISTER( "view3d_animate",
                         "moves":{"type":"array","items":{"type":"object","properties":{
                             "rotate_deg":{"type":"array","items":{"type":"number"}},
                             "zoom":{"type":"number","default":1},
+                            "look_at":{"description":"pan along the move to look at (and turn about) references, [x_mm, y_mm] or \"board\"","oneOf":[{"type":"string","enum":["board"]},{"type":"array","items":{"type":["string","number"]}}]},
                             "seconds":{"type":"number","default":1}}}},
                         "fit_assembly":{"type":"boolean","default":true,"description":"first frame the whole assembly (board + models over its edges) so nothing leaves the view while turning"},
                         "framing":{"type":"string","enum":["follow","path"],"default":"follow","description":"follow: the zoom follows the assembly's reach along the way (close where it lies flat, wider while tilted, smooth, never clipped); path: one zoom for the whole way"},
