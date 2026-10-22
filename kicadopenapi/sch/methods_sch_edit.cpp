@@ -862,7 +862,10 @@ public:
             // Shared with other parts: stretch / follow at the point itself
             for( SCH_ITEM* item : plan.here )
             {
-                if( m_anchors.count( item ) || m_done.count( item ) )
+                // a wire between two moved points stretches at both ends
+                const bool otherEnd = m_done.count( item ) && m_stretched.count( item );
+
+                if( m_anchors.count( item ) || ( m_done.count( item ) && !otherEnd ) )
                     continue;
 
                 if( labelKind( item->Type() ) || item->Type() == SCH_NO_CONNECT_T )
@@ -890,14 +893,19 @@ public:
                     if( wire->GetStartPoint() != move.from && wire->GetEndPoint() != move.from )
                         continue;
 
-                    m_commit.Modify( item, m_screen );
+                    if( !otherEnd )
+                        m_commit.Modify( item, m_screen );
 
                     if( wire->GetStartPoint() == move.from )
                         wire->SetStartPoint( move.to );
                     else
                         wire->SetEndPoint( move.to );
 
+                    if( otherEnd )
+                        continue;
+
                     stretched.push_back( wire );
+                    m_stretched.insert( item );
                 }
                 else
                 {
@@ -1086,6 +1094,7 @@ private:
     SCH_SHEET_PATH        m_path;
     std::set<SCH_ITEM*>   m_anchors;
     std::set<SCH_ITEM*>   m_done;
+    std::set<SCH_ITEM*>   m_stretched;   ///< wires stretched at one end so far
     std::vector<MOVE>     m_moves;
 };
 
@@ -1607,6 +1616,630 @@ static KOPENAPI_RESULT h_sch_items_move( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     pushEdit( commit, context->GetSchematic(), _( "Move (API)" ), aCtx.kiway, touched );
 
     nlohmann::json result = { { "moved", anchors.size() }, { "touched", touched.size() } };
+
+    if( !warnings.empty() )
+        result["warnings"] = warnings;
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
+
+namespace
+{
+
+/// @brief Paper sizes sch_page_set / sch_blocks_arrange pick from, smallest first (landscape, mm)
+const std::vector<std::pair<PAGE_SIZE_TYPE, VECTOR2D>> ISO_PAPER = {
+    { PAGE_SIZE_TYPE::A4, { 297, 210 } }, { PAGE_SIZE_TYPE::A3, { 420, 297 } }, { PAGE_SIZE_TYPE::A2, { 594, 420 } },
+    { PAGE_SIZE_TYPE::A1, { 841, 594 } }, { PAGE_SIZE_TYPE::A0, { 1189, 841 } }
+};
+
+/// Drawing area of a page: inside the frame, above the title block strip
+constexpr double PAGE_MARGIN_MM = 15.24;
+constexpr double TITLE_STRIP_MM = 40.64;
+
+
+VECTOR2D usableMm( const VECTOR2D& aPage )
+{
+    return { aPage.x - 2 * PAGE_MARGIN_MM, aPage.y - 2 * PAGE_MARGIN_MM - TITLE_STRIP_MM };
+}
+
+
+/// @brief The smallest ISO landscape paper whose drawing area holds aContent (mm); A0 if none does
+std::pair<PAGE_SIZE_TYPE, VECTOR2D> paperFor( const VECTOR2D& aContent )
+{
+    for( const auto& paper : ISO_PAPER )
+    {
+        const VECTOR2D area = usableMm( paper.second );
+
+        if( area.x >= aContent.x && area.y >= aContent.y )
+            return paper;
+    }
+
+    return ISO_PAPER.back();
+}
+
+
+nlohmann::json pageCard( const PAGE_INFO& aPage )
+{
+    return { { "paper", str( aPage.GetTypeAsString() ) },
+             { "portrait", aPage.IsPortrait() },
+             { "width_mm", std::round( aPage.GetWidthMM() * 100 ) / 100 },
+             { "height_mm", std::round( aPage.GetHeightMM() * 100 ) / 100 } };
+}
+
+
+/// @brief Set the page of aScreen; redraws the editor if one shows it
+void applyPage( SCH_CONTEXT& aContext, SCH_SCREEN* aScreen, const PAGE_INFO& aPage )
+{
+    aScreen->SetPageSettings( aPage );
+    aScreen->SetContentModified( true );
+
+    TOOL_MANAGER* tools = aContext.GetToolManager();
+
+    if( SCH_EDIT_FRAME* frame = tools ? dynamic_cast<SCH_EDIT_FRAME*>( tools->GetToolHolder() ) : nullptr )
+    {
+        if( frame->GetScreen() == aScreen )
+            frame->HardRedraw();
+    }
+}
+
+
+BOX2I sheetContent( SCH_SCREEN* aScreen )
+{
+    BOX2I box;
+    bool  first = true;
+
+    for( SCH_ITEM* item : aScreen->Items() )
+    {
+        if( first )
+            box = item->GetBoundingBox();
+        else
+            box.Merge( item->GetBoundingBox() );
+
+        first = false;
+    }
+
+    return box;
+}
+
+
+/// @brief A block of sch_blocks_arrange: its parts and everything attached to them
+struct BLOCK
+{
+    std::string         name;
+    std::set<SCH_ITEM*> items;
+    BOX2I               box;
+    VECTOR2I            delta;
+};
+
+
+/// @brief Points where aItem connects to wiring
+std::vector<VECTOR2I> connectionPoints( SCH_ITEM* aItem, const SCH_SHEET_PATH& aPath )
+{
+    if( aItem->Type() == SCH_SYMBOL_T )
+    {
+        std::vector<VECTOR2I> points;
+
+        for( SCH_PIN* pin : static_cast<SCH_SYMBOL*>( aItem )->GetPins( &aPath ) )
+            points.push_back( pin->GetPosition() );
+
+        return points;
+    }
+
+    if( aItem->Type() == SCH_LINE_T )
+        return { static_cast<SCH_LINE*>( aItem )->GetStartPoint(), static_cast<SCH_LINE*>( aItem )->GetEndPoint() };
+
+    return { aItem->GetPosition() };
+}
+
+
+/// @brief Wiring, labels, no-connects, junctions and power symbols reachable from aBlock's parts
+/// without passing another non-power part; aOwners gets aBlock for each of them
+void floodBlock( SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, size_t aBlock, const std::set<SCH_ITEM*>& aParts,
+                 std::map<SCH_ITEM*, std::set<size_t>>& aOwners )
+{
+    std::vector<VECTOR2I>         todo;
+    std::set<std::pair<int, int>> seen;
+
+    for( SCH_ITEM* part : aParts )
+    {
+        aOwners[part].insert( aBlock );
+
+        for( const VECTOR2I& p : connectionPoints( part, aPath ) )
+            todo.push_back( p );
+    }
+
+    auto take = [&]( SCH_ITEM* aItem )
+    {
+        if( !aOwners[aItem].insert( aBlock ).second )
+            return;
+
+        for( const VECTOR2I& p : connectionPoints( aItem, aPath ) )
+            todo.push_back( p );
+
+        // wires and pins ending on the middle of a wire join it
+        if( aItem->Type() == SCH_LINE_T )
+        {
+            SCH_LINE* line = static_cast<SCH_LINE*>( aItem );
+
+            for( SCH_ITEM* other : aScreen->Items().Overlapping( line->GetBoundingBox() ) )
+            {
+                for( const VECTOR2I& p : connectionPoints( other, aPath ) )
+                {
+                    if( line->HitTest( p, 0 ) )
+                        todo.push_back( p );
+                }
+            }
+        }
+    };
+
+    while( !todo.empty() )
+    {
+        const VECTOR2I p = todo.back();
+        todo.pop_back();
+
+        if( !seen.insert( { p.x, p.y } ).second )
+            continue;
+
+        for( SCH_ITEM* item : aScreen->Items().Overlapping( p ) )
+        {
+            switch( item->Type() )
+            {
+            case SCH_LINE_T:
+                if( static_cast<SCH_LINE*>( item )->IsWire() && item->HitTest( p, 0 ) )
+                    take( item );
+
+                break;
+
+            case SCH_SYMBOL_T:
+            {
+                SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+                if( !symbol->IsPower() || aParts.count( item ) )
+                    break;
+
+                for( SCH_PIN* pin : symbol->GetPins( &aPath ) )
+                {
+                    if( pin->GetPosition() == p )
+                    {
+                        take( item );
+                        break;
+                    }
+                }
+
+                break;
+            }
+
+            case SCH_JUNCTION_T:
+            case SCH_NO_CONNECT_T:
+                if( item->GetPosition() == p )
+                    take( item );
+
+                break;
+
+            default:
+                if( labelKind( item->Type() ) && item->GetPosition() == p )
+                    aOwners[item].insert( aBlock );   // a label names the net, nothing beyond it is wiring
+
+                break;
+            }
+        }
+    }
+}
+
+} // namespace
+
+
+static KOPENAPI_RESULT h_sch_page_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    std::optional<SCH_SHEET_PATH> sheet = targetSheet( *context, aArgs );
+
+    if( !sheet )
+        return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+
+    SCH_SCREEN*       screen = sheet->LastScreen();
+    PAGE_INFO         page = screen->GetPageSettings();
+    const std::string paper = aArgs.value( "paper", std::string() );
+    const bool        portrait = aArgs.value( "portrait", page.IsPortrait() );
+
+    if( paper == "auto" )
+    {
+        const BOX2I    box = sheetContent( screen );
+        const VECTOR2D content( schIUScale.IUTomm( box.GetWidth() ), schIUScale.IUTomm( box.GetHeight() ) );
+        page.SetType( paperFor( content ).first, false );
+    }
+    else if( paper == "User" )
+    {
+        if( !aArgs.contains( "width_mm" ) || !aArgs.contains( "height_mm" ) )
+            return KOPENAPI_RESULT::Error( 400, "paper User needs width_mm and height_mm" );
+
+        PAGE_INFO::SetCustomWidthMils( aArgs["width_mm"].get<double>() * 1000 / 25.4 );
+        PAGE_INFO::SetCustomHeightMils( aArgs["height_mm"].get<double>() * 1000 / 25.4 );
+        page.SetType( PAGE_SIZE_TYPE::User );
+    }
+    else if( !paper.empty() )
+    {
+        if( !page.SetType( wxString::FromUTF8( paper ), portrait ) )
+            return KOPENAPI_RESULT::Error( 400, "unknown paper '" + paper + "' (A5..A0, A..E, USLetter, USLegal, "
+                                                "USLedger, User, auto)" );
+    }
+
+    if( paper != "auto" && paper != "User" )
+        page.SetPortrait( portrait );
+
+    nlohmann::json result = { { "before", pageCard( screen->GetPageSettings() ) } };
+    applyPage( *context, screen, page );
+    result["page"] = pageCard( page );
+
+    const BOX2I content = sheetContent( screen );
+    const BOX2I sheetBox( VECTOR2I( 0, 0 ), VECTOR2I( schIUScale.mmToIU( page.GetWidthMM() ),
+                                                       schIUScale.mmToIU( page.GetHeightMM() ) ) );
+
+    if( !sheetBox.Contains( content ) )
+        result["warnings"] = { "the drawing reaches beyond the new page (sch_blocks_arrange packs it)" };
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
+
+static KOPENAPI_RESULT h_sch_blocks_arrange( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    if( !aArgs.contains( "blocks" ) || !aArgs["blocks"].is_array() || aArgs["blocks"].empty() )
+        return KOPENAPI_RESULT::Error( 400, "give 'blocks': [{name, refs: [...]}]" );
+
+    std::optional<SCH_SHEET_PATH> sheet = targetSheet( *context, aArgs );
+
+    if( !sheet )
+        return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+
+    SCH_SCREEN* screen = sheet->LastScreen();
+
+    std::map<std::string, SCH_SYMBOL*> byRef;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        if( !symbol->IsPower() )
+            byRef[str( symbol->GetRef( &*sheet ) )] = symbol;
+    }
+
+    // Blocks and their parts
+    std::vector<BLOCK>                    blocks;
+    std::vector<std::set<SCH_ITEM*>>      parts;
+    std::map<std::string, size_t>         blockOf;
+    nlohmann::json                        unknown = nlohmann::json::array();
+
+    for( const nlohmann::json& b : aArgs["blocks"] )
+    {
+        const std::string name = b.value( "name", "block" + std::to_string( blocks.size() + 1 ) );
+
+        if( blockOf.count( name ) )
+            return KOPENAPI_RESULT::Error( 400, "block name '" + name + "' twice" );
+
+        blockOf[name] = blocks.size();
+        blocks.push_back( { name, {}, {}, {} } );
+        parts.emplace_back();
+
+        for( const nlohmann::json& r : b.value( "refs", nlohmann::json::array() ) )
+        {
+            auto it = byRef.find( r.get<std::string>() );
+
+            if( it == byRef.end() )
+                unknown.push_back( r );
+            else if( !parts.back().insert( it->second ).second )
+                unknown.push_back( r );
+        }
+    }
+
+    if( !unknown.empty() )
+        return KOPENAPI_RESULT::Error( 400, "not a part on this sheet (or listed twice): " + unknown.dump() );
+
+    std::map<SCH_ITEM*, std::set<size_t>> owners;
+    nlohmann::json                        unassigned = nlohmann::json::array();
+
+    for( const auto& [ref, symbol] : byRef )
+    {
+        size_t in = 0;
+
+        for( const std::set<SCH_ITEM*>& p : parts )
+            in += p.count( symbol );
+
+        if( in > 1 )
+            return KOPENAPI_RESULT::Error( 400, ref + " is in more than one block" );
+
+        if( !in )
+            unassigned.push_back( ref );
+    }
+
+    if( !unassigned.empty() )
+    {
+        KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 400, "every part of the sheet goes into a block" );
+        refused.body["unassigned"] = unassigned;
+        return refused;
+    }
+
+    for( size_t i = 0; i < blocks.size(); ++i )
+        floodBlock( screen, *sheet, i, parts[i], owners );
+
+    std::set<SCH_ITEM*> shared;
+
+    for( const auto& [item, who] : owners )
+    {
+        if( who.size() == 1 )
+            blocks[*who.begin()].items.insert( item );
+        else
+            shared.insert( item );
+    }
+
+    for( BLOCK& block : blocks )
+    {
+        bool first = true;
+
+        for( SCH_ITEM* item : block.items )
+        {
+            if( first )
+                block.box = item->GetBoundingBox();
+            else
+                block.box.Merge( item->GetBoundingBox() );
+
+            first = false;
+        }
+    }
+
+    // Wiring tied to no part (a PWR_FLAG on a power symbol, a stub with a label) goes with the nearest block
+    for( SCH_ITEM* item : screen->Items() )
+    {
+        const bool wiring = item->Type() == SCH_LINE_T || item->Type() == SCH_JUNCTION_T
+                            || item->Type() == SCH_NO_CONNECT_T || labelKind( item->Type() )
+                            || ( item->Type() == SCH_SYMBOL_T && static_cast<SCH_SYMBOL*>( item )->IsPower() );
+
+        if( !wiring || owners.count( item ) )
+            continue;
+
+        std::map<SCH_ITEM*, std::set<size_t>> cluster;
+        floodBlock( screen, *sheet, 0, { item }, cluster );
+
+        BOX2I box = item->GetBoundingBox();
+
+        for( const auto& [member, who] : cluster )
+            box.Merge( member->GetBoundingBox() );
+
+        BLOCK* home = &blocks.front();
+
+        for( BLOCK& block : blocks )
+        {
+            if( block.box.Distance( box ) < home->box.Distance( box ) )
+                home = &block;
+        }
+
+        for( const auto& [member, who] : cluster )
+        {
+            if( !owners.count( member ) )
+            {
+                owners[member] = { size_t( home - blocks.data() ) };
+                home->items.insert( member );
+            }
+        }
+    }
+
+    // Texts and graphics nobody owns go with the block they lie in
+    nlohmann::json stayed = nlohmann::json::array();
+
+    for( SCH_ITEM* item : screen->Items() )
+    {
+        if( owners.count( item ) )
+            continue;
+
+        const VECTOR2I centre = item->GetBoundingBox().GetCenter();
+        BLOCK*         home = nullptr;
+
+        for( BLOCK& block : blocks )
+        {
+            if( block.box.Contains( centre ) )
+                home = &block;
+        }
+
+        if( home )
+            home->items.insert( item );
+        else
+            stayed.push_back( { { "uuid", str( item->m_Uuid.AsString() ) }, { "type", str( item->GetClass() ) } } );
+    }
+
+    // Rows: given, or shelves about as wide as the drawing is tall
+    const int gap = toIU( aArgs.value( "gap_mm", 12.7 ) );
+    std::vector<std::vector<size_t>> rows;
+
+    if( aArgs.contains( "rows" ) )
+    {
+        std::set<size_t> placed;
+
+        for( const nlohmann::json& row : aArgs["rows"] )
+        {
+            rows.emplace_back();
+
+            for( const nlohmann::json& n : row )
+            {
+                auto it = blockOf.find( n.get<std::string>() );
+
+                if( it == blockOf.end() || !placed.insert( it->second ).second )
+                    return KOPENAPI_RESULT::Error( 400, "rows: unknown block or placed twice: " + n.dump() );
+
+                rows.back().push_back( it->second );
+            }
+        }
+
+        if( placed.size() != blocks.size() )
+            return KOPENAPI_RESULT::Error( 400, "rows must place every block" );
+    }
+    else
+    {
+        double area = 0;
+        int    widest = 0;
+
+        for( const BLOCK& block : blocks )
+        {
+            area += double( block.box.GetWidth() + gap ) * ( block.box.GetHeight() + gap );
+            widest = std::max<int>( widest, block.box.GetWidth() );
+        }
+
+        const int width = std::max<int>( widest, std::sqrt( area * 1.414 ) );
+        int       x = 0;
+
+        for( size_t i = 0; i < blocks.size(); ++i )
+        {
+            if( rows.empty() || ( x > 0 && x + blocks[i].box.GetWidth() > width ) )
+            {
+                rows.emplace_back();
+                x = 0;
+            }
+
+            rows.back().push_back( i );
+            x += blocks[i].box.GetWidth() + gap;
+        }
+    }
+
+    // Shelf layout from (0, 0): blocks top-aligned in a row, the rows centred on the widest one
+    std::vector<VECTOR2I> at( blocks.size() );
+    int                   y = 0, contentW = 0;
+    std::vector<int>      rowW;
+
+    for( const std::vector<size_t>& row : rows )
+    {
+        int w = 0;
+
+        for( size_t i : row )
+            w += blocks[i].box.GetWidth() + ( w ? gap : 0 );
+
+        rowW.push_back( w );
+        contentW = std::max( contentW, w );
+    }
+
+    for( size_t r = 0; r < rows.size(); ++r )
+    {
+        int x = aArgs.value( "align", std::string( "center" ) ) == "left" ? 0 : ( contentW - rowW[r] ) / 2;
+        int h = 0;
+
+        for( size_t i : rows[r] )
+        {
+            at[i] = { x, y };
+            x += blocks[i].box.GetWidth() + gap;
+            h = std::max<int>( h, blocks[i].box.GetHeight() );
+        }
+
+        y += h + gap;
+    }
+
+    const VECTOR2D content( schIUScale.IUTomm( contentW ), schIUScale.IUTomm( std::max( 0, y - gap ) ) );
+    const std::string paper = aArgs.value( "paper", std::string( "auto" ) );
+    PAGE_INFO         page = screen->GetPageSettings();
+    nlohmann::json    warnings = nlohmann::json::array();
+
+    if( paper == "auto" )
+        page.SetType( paperFor( content ).first, false );
+    else if( paper != "keep" && !page.SetType( wxString::FromUTF8( paper ), false ) )
+        return KOPENAPI_RESULT::Error( 400, "unknown paper '" + paper + "' (auto, keep, A4..A0, ...)" );
+
+    const VECTOR2D area = usableMm( { page.GetWidthMM(), page.GetHeightMM() } );
+
+    if( area.x < content.x || area.y < content.y )
+        warnings.push_back( "the blocks do not fit the drawing area of " + str( page.GetTypeAsString() ) );
+
+    // Centre the drawing in the area above the title block
+    const VECTOR2I origin( toIU( PAGE_MARGIN_MM + std::max( 0.0, area.x - content.x ) / 2 ),
+                           toIU( PAGE_MARGIN_MM + std::max( 0.0, area.y - content.y ) / 2 ) );
+
+    for( size_t i = 0; i < blocks.size(); ++i )
+    {
+        const VECTOR2I d = origin + at[i] - blocks[i].box.GetOrigin();
+        blocks[i].delta = { toIU( schIUScale.IUTomm( d.x ) ), toIU( schIUScale.IUTomm( d.y ) ) };
+    }
+
+    SCH_COMMIT          commit( context->GetToolManager() );
+    SHEET_DRAG          drag( commit, screen, *sheet );
+    std::set<SCH_ITEM*> moved;
+    std::vector<KIID>   touched;
+
+    // Wiring between blocks: its ends on a block go with the block, the rest stretches
+    for( SCH_ITEM* item : shared )
+    {
+        for( const VECTOR2I& p : connectionPoints( item, *sheet ) )
+        {
+            for( const BLOCK& block : blocks )
+            {
+                for( SCH_ITEM* other : screen->Items().Overlapping( p ) )
+                {
+                    if( !block.items.count( other ) )
+                        continue;
+
+                    for( const VECTOR2I& q : connectionPoints( other, *sheet ) )
+                    {
+                        if( q == p )
+                            drag.AddPointMove( p, p + block.delta, false );
+                    }
+                }
+            }
+        }
+    }
+
+    for( const BLOCK& block : blocks )
+    {
+        for( SCH_ITEM* item : block.items )
+        {
+            commit.Modify( item, screen );
+            item->Move( block.delta );
+            moved.insert( item );
+            touched.push_back( item->m_Uuid );
+        }
+    }
+
+    drag.SetAnchors( moved );
+
+    for( const nlohmann::json& w : drag.Apply( touched ) )
+        warnings.push_back( w );
+
+    if( std::optional<KOPENAPI_RESULT> refused = lockedDragged( screen, touched, moved, aArgs ) )
+    {
+        commit.Revert();
+        return *refused;
+    }
+
+    pushEdit( commit, context->GetSchematic(), _( "Arrange blocks (API)" ), aCtx.kiway, {} );
+
+    if( paper != "keep" )
+        applyPage( *context, screen, page );
+
+    nlohmann::json out = nlohmann::json::array();
+
+    for( size_t i = 0; i < blocks.size(); ++i )
+    {
+        const BOX2I box( blocks[i].box.GetOrigin() + blocks[i].delta, blocks[i].box.GetSize() );
+        out.push_back( { { "name", blocks[i].name },
+                         { "parts", parts[i].size() },
+                         { "items", blocks[i].items.size() },
+                         { "dx_mm", toMm( blocks[i].delta.x ) },
+                         { "dy_mm", toMm( blocks[i].delta.y ) },
+                         { "box_mm", { toMm( box.GetLeft() ), toMm( box.GetTop() ), toMm( box.GetRight() ),
+                                       toMm( box.GetBottom() ) } } } );
+    }
+
+    nlohmann::json result = { { "blocks", out },
+                              { "shared_wiring", shared.size() },
+                              { "page", pageCard( page ) },
+                              { "content_mm", { content.x, content.y } } };
+
+    if( !stayed.empty() )
+        result["not_moved"] = stayed;
 
     if( !warnings.empty() )
         result["warnings"] = warnings;
@@ -2862,6 +3495,37 @@ KOPENAPI_REGISTER( "sch_items_move",
                         "sheet":{"type":"string"},
                         "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_items_move );
+
+KOPENAPI_REGISTER( "sch_blocks_arrange",
+                   std::string( "Lay a sheet out as compact blocks: every part goes into one of 'blocks' "
+                                "(name + refs); each block moves as a whole with its own wiring, labels, "
+                                "no-connects and power symbols; wires between blocks stretch and are re-routed. "
+                                "Blocks are packed in 'rows' (block names per row; default: shelves about as wide "
+                                "as tall) with gap_mm between them, centred in the page's drawing area; paper "
+                                "auto picks the smallest ISO landscape page that holds them (keep: leave the "
+                                "page). Texts and graphics inside a block's area go with it. The page change is "
+                                "not on the undo stack." ) + EDIT_NOTE,
+                   R"json({"type":"object","required":["blocks"],"properties":{
+                        "blocks":{"type":"array","items":{"type":"object","required":["refs"],"properties":{
+                            "name":{"type":"string"},"refs":{"type":"array","items":{"type":"string"}}}}},
+                        "rows":{"type":"array","items":{"type":"array","items":{"type":"string"}}},
+                        "gap_mm":{"type":"number","default":12.7},
+                        "align":{"type":"string","enum":["center","left"],"default":"center"},
+                        "paper":{"type":"string","default":"auto","description":"auto, keep, or A4..A0, A..E, USLetter..."},
+                        "sheet":{"type":"string"},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
+                   false, h_sch_blocks_arrange );
+
+KOPENAPI_REGISTER( "sch_page_set",
+                   "Set a sheet's paper: A5..A0, A..E, USLetter, USLegal, USLedger, User (width_mm, height_mm) "
+                   "or auto (the smallest ISO landscape page whose drawing area holds what is drawn); "
+                   "portrait. Warns when the drawing reaches beyond the page. Not on the undo stack.",
+                   R"json({"type":"object","properties":{
+                        "paper":{"type":"string"},
+                        "portrait":{"type":"boolean"},
+                        "width_mm":{"type":"number"},"height_mm":{"type":"number"},
+                        "sheet":{"type":"string"}}})json"_json,
+                   false, h_sch_page_set );
 
 KOPENAPI_REGISTER( "sch_item_delete",
                    std::string( "Delete schematic items (symbols, labels, wires, no-connects...) by uuid." ) + EDIT_NOTE,
