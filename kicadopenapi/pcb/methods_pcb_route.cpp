@@ -444,6 +444,9 @@ struct ROUTE_REQUEST
     /// @brief A narrower track than the net's class gives (> 0): the connection meets a fine-pitch pad
     int neckWidth = 0;
 
+    /// @brief The track width of this route instead of the net class's (> 0)
+    int width = 0;
+
     /// @brief Where on `from` the route starts (a track's end); its position when not given
     std::optional<VECTOR2I> fromPos;
 
@@ -623,6 +626,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
 
     if( aReq.viaDrill > 0 )
         sizes.SetViaDrill( aReq.viaDrill );
+
+    if( aReq.width > 0 )
+        sizes.SetTrackWidth( aReq.width );
 
     if( aReq.neckWidth > 0 && aReq.neckWidth < sizes.TrackWidth() )
     {
@@ -1400,8 +1406,14 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
     if( aArgs.contains( "via_drill_mm" ) )
         req.viaDrill = pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", 0.0 ) );
 
+    if( aArgs.contains( "width_mm" ) )
+        req.width = pcbIUScale.mmToIU( aArgs.value( "width_mm", 0.0 ) );
+
     {
         const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+
+        if( aArgs.contains( "width_mm" ) && req.width < std::max( 1, bds.m_TrackMinWidth ) )
+            return KOPENAPI_RESULT::Error( 422, "width_mm below the board's minimum track width" );
 
         if( ( req.viaDiameter && req.viaDiameter < bds.m_ViasMinSize ) || ( req.viaDrill && req.viaDrill < bds.m_MinThroughDrill ) )
             return KOPENAPI_RESULT::Error( 422, "via_diameter_mm / via_drill_mm below the board's minimum via" );
@@ -2692,7 +2704,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( board->MatchDpSuffix( wxString::FromUTF8( netP ), other ) != 1 || !jobNets.count( str( other ) ) )
                 continue;
 
-            NETINFO_ITEM* infoP = board->FindNet( wxString::FromUTF8( netP ) );
+            NETINFO_ITEM* infoP = KopenapiFindNet( board, netP );
             NETINFO_ITEM* infoN = board->FindNet( other );
 
             if( !infoP || !infoN )
@@ -3212,7 +3224,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 for( const std::string& netName : members[m] )
                 {
-                    NETINFO_ITEM* info = board->FindNet( wxString::FromUTF8( netName ) );
+                    NETINFO_ITEM* info = KopenapiFindNet( board, netName );
 
                     if( !info )
                         continue;
@@ -4725,6 +4737,20 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 /// an end on one side only (an SMD pad, an island of a zone) gets a through via at a free spot
 /// next to it (and a short track from a pad); each via passes the net-merge guard and must land
 /// inside the board; zones are refilled at the end.
+// What a stitching via serves, for the answer: REF.PAD, the track end of an island, or a zone island
+static std::string stitchedFor( BOARD_CONNECTED_ITEM* aItem )
+{
+    if( aItem->Type() == PCB_PAD_T )
+        return str( static_cast<PAD*>( aItem )->GetParentFootprint()->GetReference() ) + "."
+               + str( static_cast<PAD*>( aItem )->GetNumber() );
+
+    if( aItem->Type() == PCB_TRACE_T || aItem->Type() == PCB_ARC_T )
+        return "track island";
+
+    return "zone island";
+}
+
+
 static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -4734,7 +4760,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     BOARD*        board = context->GetBoard();
     const wxString netName = wxString::FromUTF8( aArgs.value( "net", std::string( "GND" ) ) );
-    NETINFO_ITEM* net = board->FindNet( netName );
+    NETINFO_ITEM* net = KopenapiFindNet( board, aArgs.value( "net", std::string( "GND" ) ) );
 
     if( !net )
         return KOPENAPI_RESULT::Error( 404, "net not found: " + str( netName ) );
@@ -4828,12 +4854,14 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
             const PCB_LAYER_ID layer = item->Type() == PCB_ZONE_T ? item->GetLayerSet().CuStack().front()
                                                                     : item->GetLayerSet().CuStack().front();
-            const BOX2I box = item->Type() == PCB_ZONE_T ? BOX2I( pos, VECTOR2I( 0, 0 ) ) : item->GetBoundingBox();
+            const bool  onTrack = item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T;
+            const BOX2I box = item->Type() == PCB_ZONE_T || onTrack ? BOX2I( pos, VECTOR2I( 0, 0 ) ) : item->GetBoundingBox();
             bool        ok = false;
 
             // Candidate spots, nearest first: around a pad; inside a zone island (on a grid over the
             // island, the via's copper fully in it)
-            std::vector<VECTOR2I> candidates;
+            std::vector<VECTOR2I>                         candidates;
+            std::map<std::pair<int, int>, VECTOR2I>       stubFrom;   // where the stub to a spot starts
 
             if( item->Type() == PCB_ZONE_T )
             {
@@ -4875,22 +4903,56 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
             }
             else
             {
-                for( int ring = 0; ring < 6; ++ring )
-                {
-                    const int reach = std::max( box.GetWidth(), box.GetHeight() ) / 2 + viaDia / 2 + pcbIUScale.mmToIU( 0.4 )
-                                      + ring * pcbIUScale.mmToIU( 0.5 );
+                // around the pad; for an island of tracks around every pad and track end of it on this layer
+                std::vector<std::pair<VECTOR2I, int>> bases = { { pos, std::max( box.GetWidth(), box.GetHeight() ) / 2 } };
 
-                    for( int k = 0; k < 16; ++k )
+                if( onTrack )
+                {
+                    for( BOARD_CONNECTED_ITEM* other : board->GetConnectivity()->GetConnectedItems( item ) )
                     {
-                        const double a = k * M_PI / 8;
-                        VECTOR2I     at = pos + VECTOR2I( KiROUND( reach * std::cos( a ) ), KiROUND( reach * std::sin( a ) ) );
-                        candidates.emplace_back( KiROUND( (double) at.x / step ) * step, KiROUND( (double) at.y / step ) * step );
+                        if( other->GetNetCode() != net->GetNetCode() || !other->IsOnLayer( layer ) )
+                            continue;
+
+                        if( other->Type() == PCB_PAD_T )
+                        {
+                            const BOX2I pb = other->GetBoundingBox();
+                            bases.emplace_back( other->GetPosition(), std::max( pb.GetWidth(), pb.GetHeight() ) / 2 );
+                        }
+                        else if( other->Type() == PCB_TRACE_T || other->Type() == PCB_ARC_T )
+                        {
+                            bases.emplace_back( static_cast<PCB_TRACK*>( other )->GetStart(), 0 );
+                            bases.emplace_back( static_cast<PCB_TRACK*>( other )->GetEnd(), 0 );
+                        }
+                    }
+                }
+
+                for( const auto& [base, half] : bases )
+                {
+                    for( int ring = 0; ring < 6; ++ring )
+                    {
+                        const int reach = half + viaDia / 2 + pcbIUScale.mmToIU( 0.4 ) + ring * pcbIUScale.mmToIU( 0.5 );
+
+                        for( int k = 0; k < 16; ++k )
+                        {
+                            const double a = k * M_PI / 8;
+                            VECTOR2I     at = base + VECTOR2I( KiROUND( reach * std::cos( a ) ), KiROUND( reach * std::sin( a ) ) );
+                            at = VECTOR2I( KiROUND( (double) at.x / step ) * step, KiROUND( (double) at.y / step ) * step );
+                            candidates.push_back( at );
+                            stubFrom[{ at.x, at.y }] = base;
+                        }
                     }
                 }
             }
 
+            // nearest to the anchor first; for an island the stub length decides (a spot near any of its pads)
+            auto stubLength = [&]( const VECTOR2I& at )
+            {
+                auto it = stubFrom.find( { at.x, at.y } );
+                return ( at - ( it == stubFrom.end() ? pos : it->second ) ).EuclideanNorm();
+            };
+
             std::stable_sort( candidates.begin(), candidates.end(), [&]( const VECTOR2I& x, const VECTOR2I& y )
-                              { return ( x - pos ).EuclideanNorm() < ( y - pos ).EuclideanNorm(); } );
+                              { return stubLength( x ) < stubLength( y ); } );
 
             if( candidates.size() > 400 )
                 candidates.resize( 400 );
@@ -4940,10 +5002,12 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
                     std::unique_ptr<PCB_TRACK> track;
 
-                    if( item->Type() == PCB_PAD_T )
+                    // a pad, or the end of a track that joins pads into an island without the plane
+                    if( item->Type() == PCB_PAD_T || onTrack )
                     {
                         track = std::make_unique<PCB_TRACK>( board );
-                        track->SetStart( pos );
+                        auto from = stubFrom.find( { at.x, at.y } );
+                        track->SetStart( from == stubFrom.end() ? pos : from->second );
                         track->SetEnd( at );
                         track->SetWidth( width );
                         track->SetLayer( layer );
@@ -4973,10 +5037,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                     fresh_vias.push_back( { item, added.end()[hasTrack ? -2 : -1], hasTrack ? added.back() : niluuid, at } );
                     placed.push_back( { { "via", str( fresh_vias.back().via.AsString() ) },
                                         { "at_mm", { toMm( at.x ), toMm( at.y ) } },
-                                        { "for", item->Type() == PCB_PAD_T
-                                                         ? str( static_cast<PAD*>( item )->GetParentFootprint()->GetReference() ) + "."
-                                                                   + str( static_cast<PAD*>( item )->GetNumber() )
-                                                         : std::string( "zone island" ) } } );
+                                        { "for", stitchedFor( item ) } } );
                     done.insert( item );
                     ok = true;
                 }
@@ -4984,10 +5045,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
             if( !ok )
             {
-                misses[item] = { { "for", item->Type() == PCB_PAD_T
-                                              ? str( static_cast<PAD*>( item )->GetParentFootprint()->GetReference() ) + "."
-                                                        + str( static_cast<PAD*>( item )->GetNumber() )
-                                              : std::string( "zone island" ) },
+                misses[item] = { { "for", stitchedFor( item ) },
                                  { "at_mm", { toMm( pos.x ), toMm( pos.y ) } },
                                  { "reason", candidates.empty() ? "no spot to try (the island is too small for a via)"
                                                                 : "no free spot within reach: every spot near it touches "
@@ -5020,10 +5078,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
             bad.insert( { st.at.x, st.at.y } );
             done.erase( st.item );
-            misses[st.item] = { { "for", st.item->Type() == PCB_PAD_T
-                                             ? str( static_cast<PAD*>( st.item )->GetParentFootprint()->GetReference() ) + "."
-                                                       + str( static_cast<PAD*>( st.item )->GetNumber() )
-                                             : std::string( "zone island" ) },
+            misses[st.item] = { { "for", stitchedFor( st.item ) },
                                 { "at_mm", { toMm( st.at.x ), toMm( st.at.y ) } },
                                 { "reason", "the via there was off the plane after the refill (an island too small to keep)" } };
             for( auto it = placed.begin(); it != placed.end(); ++it )
@@ -5376,7 +5431,7 @@ std::vector<PCB_TRACK*> selectTracks( BOARD* aBoard, const nlohmann::json& aArgs
 
     for( const nlohmann::json& n : netNames )
     {
-        NETINFO_ITEM* net = n.is_string() ? aBoard->FindNet( wxString::FromUTF8( n.get<std::string>() ) ) : nullptr;
+        NETINFO_ITEM* net = n.is_string() ? KopenapiFindNet( aBoard, n.get<std::string>() ) : nullptr;
 
         if( !net )
         {
@@ -5749,7 +5804,7 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     if( aArgs.contains( "net" ) )
     {
-        NETINFO_ITEM* named = aArgs["net"].is_string() ? board->FindNet( wxString::FromUTF8( aArgs["net"].get<std::string>() ) )
+        NETINFO_ITEM* named = aArgs["net"].is_string() ? KopenapiFindNet( board, aArgs["net"].get<std::string>() )
                                                        : nullptr;
 
         if( !named )
@@ -6380,8 +6435,8 @@ static KOPENAPI_RESULT h_pcb_fanout( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 KOPENAPI_REGISTER( "pcb_route_connection",
                    "EXPERIMENTAL. Route one connection with KiCad's push-and-shove router, as a person "
                    "does in the editor: from a pad (REF.PAD) to a pad of the same net, or to the nearest "
-                   "unconnected point of its net; layer, mode walkaround / shove; track width and clearance "
-                   "from the board's rules; waypoints steer it (corners, vias with a layer change). A guard "
+                   "unconnected point of its net; layer, mode walkaround / shove; track width (width_mm to set) and "
+                   "clearance from the board's rules; waypoints steer it (corners, vias with a layer change). A guard "
                    "rejects routes whose copper would touch another net. Undo one route: pcb_tracks_delete "
                    "(between its pads). "
                    "dry_run: measure only (geometry, length, detour, vias, shoved items), nothing changes",
@@ -6392,6 +6447,7 @@ KOPENAPI_REGISTER( "pcb_route_connection",
                         "mode":{"type":"string","enum":["walkaround","shove"],"default":"walkaround"},
                         "waypoints":{"type":"array","description":"points to pass in order: [x_mm, y_mm] fixes a corner there; {at: [x_mm, y_mm], layer: 'B.Cu'} drops a through via there and continues on that layer","items":{}},
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills give way while routing and are refilled around the route; keep: the route must clear the fills"},
+                        "width_mm":{"type":"number","description":"track width of this route (default the net class's), e.g. narrower to leave a fine-pitch pad"},
                         "via_diameter_mm":{"type":"number","description":"via size of this route (default the net class's)"},"via_drill_mm":{"type":"number"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_route_connection, 120 );
@@ -6465,8 +6521,8 @@ KOPENAPI_REGISTER( "pcb_route",
 
 KOPENAPI_REGISTER( "pcb_stitch",
                    "Stitch a net (default GND) to its pours and planes: every open end on one side only (SMD "
-                   "pad, zone island) gets a through via at a free spot next to it (with a short track from a "
-                   "pad), guarded against touching other nets (other nets' fills give way: they are refilled), "
+                   "pad, zone island, the track end of pads joined by tracks) gets a through via at a free spot "
+                   "next to it (with a short track from a pad or track end), guarded against touching other nets (other nets' fills give way: they are refilled), "
                    "inside the board; after the refill a via the fill does not reach is taken out and its pad "
                    "tried at another spot (up to 3 passes); unlocked vias of the net left touching one layer "
                    "only are removed. On inner planes stitch before routing the signals (the spots next to the "

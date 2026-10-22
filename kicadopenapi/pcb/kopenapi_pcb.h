@@ -84,4 +84,11 @@ std::vector<PCB_TRACK*> KopenapiSelectTracks( BOARD* aBoard, const nlohmann::jso
 /// @brief The item's extent as a user sees it (a footprint without its texts)
 BOX2I KopenapiBoardItemBox( const BOARD_ITEM* aItem );
 
+class NETINFO_ITEM;
+
+/**
+ * @brief Board net by name, as the answers spell it (unescaped, e.g. "Net-(U1-X1/CLK)") or in KiCad's stored form
+ */
+NETINFO_ITEM* KopenapiFindNet( BOARD* aBoard, const std::string& aName );
+
 #endif

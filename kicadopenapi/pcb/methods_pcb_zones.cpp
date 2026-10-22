@@ -281,8 +281,7 @@ static KOPENAPI_RESULT h_pcb_zone_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
         return KopenapiNoBoard();
 
     BOARD*        board = context->GetBoard();
-    const wxString netName = wxString::FromUTF8( aArgs.value( "net", std::string() ) );
-    NETINFO_ITEM* net = board->FindNet( netName );
+    NETINFO_ITEM* net = KopenapiFindNet( board, aArgs.value( "net", std::string() ) );
 
     if( !net )
         return KOPENAPI_RESULT::Error( 404, "net not found: " + aArgs.value( "net", std::string() ) + " (pcb_net_list)" );

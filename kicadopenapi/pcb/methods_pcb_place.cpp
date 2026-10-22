@@ -1354,7 +1354,7 @@ std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBo
         {
             for( const nlohmann::json& rail : block.body.value( "rails", nlohmann::json::array() ) )
             {
-                if( NETINFO_ITEM* net = aBoard->FindNet( wxString::FromUTF8( rail.value( "net", std::string() ) ) ) )
+                if( NETINFO_ITEM* net = KopenapiFindNet( aBoard, rail.value( "net", std::string() ) ) )
                 {
                     rails.insert( net->GetNetCode() );
 

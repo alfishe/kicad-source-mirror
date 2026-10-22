@@ -47,8 +47,7 @@ static std::string netName( const wxString& aName )
 }
 
 
-/// @brief Board net by name, as typed (unescaped) or in KiCad's stored form
-static NETINFO_ITEM* findNet( BOARD* aBoard, const std::string& aName )
+NETINFO_ITEM* KopenapiFindNet( BOARD* aBoard, const std::string& aName )
 {
     const wxString name = wxString::FromUTF8( aName );
 
@@ -207,7 +206,7 @@ static nlohmann::json inferRole( BOARD* aBoard, const NETINFO_ITEM* aNet, const 
         {
             const std::string candidate = full.substr( 0, full.size() - suffix.size() ) + other;
 
-            if( findNet( aBoard, candidate ) )
+            if( KopenapiFindNet( aBoard, candidate ) )
             {
                 out["role"] = "diff_pair";
                 out["counterpart"] = candidate;
@@ -410,7 +409,7 @@ static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     if( aArgs.contains( "code" ) && aArgs["code"].is_number_integer() )
         net = board->FindNet( aArgs["code"].get<int>() );
     else if( aArgs.contains( "name" ) && aArgs["name"].is_string() )
-        net = findNet( board, aArgs["name"].get<std::string>() );
+        net = KopenapiFindNet( board, aArgs["name"].get<std::string>() );
     else if( aArgs.contains( "pin" ) && aArgs["pin"].is_string() )
     {
         // "REF.PAD"

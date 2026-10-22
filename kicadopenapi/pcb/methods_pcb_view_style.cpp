@@ -132,7 +132,7 @@ static KOPENAPI_RESULT h_pcb_view_style( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         {
             frame->GetToolManager()->RunAction( PCB_ACTIONS::clearHighlight );
         }
-        else if( NETINFO_ITEM* net = board->FindNet( wxString::FromUTF8( name ) ) )
+        else if( NETINFO_ITEM* net = KopenapiFindNet( board, name ) )
         {
             frame->GetToolManager()->RunAction<int>( PCB_ACTIONS::highlightNet, net->GetNetCode() );
         }
