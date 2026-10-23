@@ -9,6 +9,8 @@
 #include <api/pcb_context.h>
 #include <board.h>
 #include <board_design_settings.h>
+#include <connectivity/connectivity_data.h>
+#include <ratsnest/ratsnest_data.h>
 #include <footprint.h>
 #include <pcb_track.h>
 #include <page_info.h>
@@ -221,6 +223,73 @@ KOPENAPI_RESULT readImage( const wxString& aFile, int aStatus, const wxString& a
 } // namespace
 
 
+/// @brief Draws the board's open connections (ratsnest) over a render whose top-left pixel is
+/// aWindow's origin; returns how many were drawn
+static int drawRatsnest( BOARD* aBoard, wxImage& aImage, const BOX2I& aWindow, double aPxPerIU, bool aMirror,
+                  bool aBlackAndWhite, int aDpi )
+{
+    aBoard->BuildConnectivity();
+    std::shared_ptr<CONNECTIVITY_DATA> connectivity = aBoard->GetConnectivity();
+    connectivity->RecalculateRatsnest();
+
+    const int           radius = std::max( 1, aDpi / 150 );
+    const unsigned char r = aBlackAndWhite ? 0 : 245, g = aBlackAndWhite ? 0 : 255, b = aBlackAndWhite ? 0 : 213;
+    const int           w = aImage.GetWidth(), h = aImage.GetHeight();
+    unsigned char*      px = aImage.GetData();
+
+    auto toPx = [&]( const VECTOR2I& aAt )
+    {
+        const double x = aMirror ? aWindow.GetRight() - aAt.x : aAt.x - aWindow.GetLeft();
+        return VECTOR2D( x * aPxPerIU, ( aAt.y - aWindow.GetTop() ) * aPxPerIU );
+    };
+
+    auto dot = [&]( const VECTOR2D& aAt )
+    {
+        const int cx = KiROUND( aAt.x ), cy = KiROUND( aAt.y );
+
+        for( int y = std::max( 0, cy - radius ); y <= std::min( h - 1, cy + radius ); ++y )
+        {
+            for( int x = std::max( 0, cx - radius ); x <= std::min( w - 1, cx + radius ); ++x )
+            {
+                if( ( x - cx ) * ( x - cx ) + ( y - cy ) * ( y - cy ) > radius * radius )
+                    continue;
+
+                unsigned char* p = px + 3 * ( (size_t) y * w + x );
+                p[0] = r;
+                p[1] = g;
+                p[2] = b;
+            }
+        }
+    };
+
+    int drawn = 0;
+
+    for( int net = 1; net < (int) aBoard->GetNetCount(); ++net )
+    {
+        RN_NET* rn = connectivity->GetRatsnestForNet( net );
+
+        if( !rn )
+            continue;
+
+        for( const CN_EDGE& edge : rn->GetEdges() )
+        {
+            if( !edge.GetSourceNode() || !edge.GetTargetNode() )
+                continue;
+
+            const VECTOR2D a = toPx( edge.GetSourcePos() ), c = toPx( edge.GetTargetPos() );
+            const int      steps = std::max( 1, KiROUND( ( c - a ).EuclideanNorm() * 2 ) );
+
+            for( int i = 0; i <= steps; ++i )
+                dot( a + ( c - a ) * ( double( i ) / steps ) );
+
+            drawn++;
+        }
+    }
+
+    return drawn;
+}
+
+
 static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -382,6 +451,11 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     if( !sheet && !want.IsEmpty() && want.GetSize() != image.GetSize() )
         image = image.GetSubImage( want );
 
+    int ratsnest = -1;
+
+    if( aArgs.value( "ratsnest", false ) )
+        ratsnest = drawRatsnest( board, image, window, pxPerIU, job.m_mirror, job.m_blackAndWhite, dpi );
+
     if( !byRegion && aArgs.value( "crop", true ) )
         image = KopenapiCropToContent( image, dpi / 6 );
 
@@ -389,6 +463,9 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     result["layers"] = layers;
     result["dpi"] = dpi;
     result["estimate"] = cost.Json();
+
+    if( ratsnest >= 0 )
+        result["ratsnest_drawn"] = ratsnest;
 
     if( byRegion )
         result["region_mm"] = region;
@@ -712,7 +789,7 @@ KOPENAPI_REGISTER( "pcb_render_layers",
 KOPENAPI_REGISTER( "pcb_render",
                    "Render the open board (unsaved edits included) to a PNG image with KiCad's own plotter, "
                    "like `kicad-cli pcb export png`: layers as a list (F.Cu,F.SilkS,Edge.Cuts...) or a preset "
-                   "(front, back, copper, assembly); the whole board cropped to the drawing, or a region drawn "
+                   "(front, back, copper, assembly), the ratsnest over it on request; the whole board cropped to the drawing, or a region drawn "
                    "alone at a high dpi for detail; an image over 64 megapixels is refused (422) with what it "
                    "would cost (memory, CPU) and the dpi / region that fit; GUI and headless; over MCP an image",
                    R"json({"type":"object","properties":{
@@ -725,7 +802,8 @@ KOPENAPI_REGISTER( "pcb_render",
                         "mirror":{"type":"boolean","default":false},
                         "black_and_white":{"type":"boolean","default":false},
                         "theme":{"type":"string"},
-                        "zones":{"type":"string","enum":["filled","outline","hidden"],"default":"filled","description":"outline: each pour drawn as its edge (the tracks and pads under it show); hidden: no pours"}}})json"_json,
+                        "zones":{"type":"string","enum":["filled","outline","hidden"],"default":"filled","description":"outline: each pour drawn as its edge (the tracks and pads under it show); hidden: no pours"},
+                        "ratsnest":{"type":"boolean","default":false,"description":"draw the open connections (ratsnest) over the image; the answer counts them (ratsnest_drawn)"}}})json"_json,
                    false, h_pcb_render, 300 );
 
 KOPENAPI_REGISTER( "pcb_render_3d",

@@ -16,6 +16,7 @@
 #include <board_design_settings.h>
 #include <connectivity/connectivity_data.h>
 #include <footprint.h>
+#include <geometry/shape_poly_set.h>
 #include <kicadopenapi_util.h>
 #include <netlist_reader/board_netlist_updater.h>
 #include <netlist_reader/netlist_reader.h>
@@ -497,10 +498,74 @@ static KOPENAPI_RESULT h_pcb_outline_set( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( !context )
         return KopenapiNoBoard();
 
-    BOARD* board = context->GetBoard();
-    BOX2I  rect;
+    BOARD*         board = context->GetBoard();
+    BOX2I          rect;
+    SHAPE_POLY_SET shape;   // polygon / trim: the new outline; empty for a rectangle
 
-    if( aArgs.value( "fit", false ) )
+    if( aArgs.contains( "polygon" ) )
+    {
+        const nlohmann::json& pts = aArgs["polygon"];
+
+        if( !pts.is_array() || pts.size() < 3 )
+            return KOPENAPI_RESULT::Error( 400, "polygon: [[x_mm, y_mm], ...], at least 3 points" );
+
+        SHAPE_LINE_CHAIN chain;
+
+        for( const nlohmann::json& pt : pts )
+        {
+            if( !pt.is_array() || pt.size() != 2 || !pt[0].is_number() || !pt[1].is_number() )
+                return KOPENAPI_RESULT::Error( 400, "polygon: [[x_mm, y_mm], ...]" );
+
+            chain.Append( VECTOR2I( toIU( pt[0].get<double>() ), toIU( pt[1].get<double>() ) ) );
+        }
+
+        chain.SetClosed( true );
+        shape.AddOutline( chain );
+        shape.Simplify();
+
+        if( shape.OutlineCount() != 1 )
+            return KOPENAPI_RESULT::Error( 400, "polygon: one simple closed outline (it crosses itself)" );
+    }
+    else if( aArgs.contains( "trim" ) )
+    {
+        const nlohmann::json& t = aArgs["trim"];
+
+        if( !t.is_object() )
+            return KOPENAPI_RESULT::Error( 400, "trim: {top_mm, bottom_mm, left_mm, right_mm}" );
+
+        SHAPE_POLY_SET present;
+
+        if( !board->GetBoardPolygonOutlines( present, false ) || present.OutlineCount() == 0 )
+            return KOPENAPI_RESULT::Error( 409, "trim needs a closed board outline" );
+
+        const BOX2I  box = present.BBox();
+        const double top = t.value( "top_mm", 0.0 ), bottom = t.value( "bottom_mm", 0.0 );
+        const double left = t.value( "left_mm", 0.0 ), right = t.value( "right_mm", 0.0 );
+
+        if( std::min( { top, bottom, left, right } ) < 0 || toIU( top + bottom ) >= box.GetHeight()
+            || toIU( left + right ) >= box.GetWidth() )
+        {
+            return KOPENAPI_RESULT::Error( 400, "trim: non-negative, less than the outline's size" );
+        }
+
+        SHAPE_POLY_SET   keep;
+        SHAPE_LINE_CHAIN k;
+        const VECTOR2I   a( box.GetLeft() + toIU( left ), box.GetTop() + toIU( top ) );
+        const VECTOR2I   b( box.GetRight() - toIU( right ), box.GetBottom() - toIU( bottom ) );
+        k.Append( a );
+        k.Append( VECTOR2I( b.x, a.y ) );
+        k.Append( b );
+        k.Append( VECTOR2I( a.x, b.y ) );
+        k.SetClosed( true );
+        keep.AddOutline( k );
+        shape = present;
+        shape.BooleanIntersection( keep );
+        shape.Simplify();
+
+        if( shape.OutlineCount() == 0 )
+            return KOPENAPI_RESULT::Error( 400, "trim leaves no board" );
+    }
+    else if( aArgs.value( "fit", false ) )
     {
         // Around the parts with a margin, snapped outwards to 0.5 mm
         std::optional<BOX2I> parts;
@@ -540,7 +605,10 @@ static KOPENAPI_RESULT h_pcb_outline_set( KOPENAPI_CONTEXT& aCtx, const nlohmann
                       VECTOR2I( toIU( aArgs["width_mm"] ), toIU( aArgs["height_mm"] ) ) );
     }
 
-    const double radius = aArgs.value( "corner_radius_mm", 0.0 );
+    if( shape.OutlineCount() > 0 )
+        rect = shape.BBox();
+
+    const double radius = shape.OutlineCount() > 0 ? 0.0 : aArgs.value( "corner_radius_mm", 0.0 );
 
     if( radius < 0 || toIU( radius ) * 2 > std::min( rect.GetWidth(), rect.GetHeight() ) )
         return KOPENAPI_RESULT::Error( 400, "corner_radius_mm: 0 .. half the shorter side" );
@@ -567,16 +635,43 @@ static KOPENAPI_RESULT h_pcb_outline_set( KOPENAPI_CONTEXT& aCtx, const nlohmann
         }
     }
 
-    auto* outline = new PCB_SHAPE( board, SHAPE_T::RECTANGLE );
-    outline->SetLayer( Edge_Cuts );
-    outline->SetStroke( STROKE_PARAMS( toIU( aArgs.value( "line_width_mm", 0.1 ) ), LINE_STYLE::SOLID ) );
-    outline->SetStart( rect.GetOrigin() );
-    outline->SetEnd( rect.GetEnd() );
+    const STROKE_PARAMS     stroke( toIU( aArgs.value( "line_width_mm", 0.1 ) ), LINE_STYLE::SOLID );
+    std::vector<PCB_SHAPE*> added;
 
-    if( radius > 0 )
-        outline->SetCornerRadius( toIU( radius ) );
+    if( shape.OutlineCount() > 0 )
+    {
+        // each outline and each hole its own closed polygon on Edge.Cuts
+        for( int i = 0; i < shape.OutlineCount(); ++i )
+        {
+            for( int h = -1; h < shape.HoleCount( i ); ++h )
+            {
+                auto* poly = new PCB_SHAPE( board, SHAPE_T::POLY );
+                poly->SetLayer( Edge_Cuts );
+                poly->SetStroke( stroke );
+                poly->SetFilled( false );
+                poly->SetPolyShape( SHAPE_POLY_SET( h < 0 ? shape.Outline( i ) : shape.Hole( i, h ) ) );
+                added.push_back( poly );
+            }
+        }
+    }
+    else
+    {
+        auto* rectangle = new PCB_SHAPE( board, SHAPE_T::RECTANGLE );
+        rectangle->SetLayer( Edge_Cuts );
+        rectangle->SetStroke( stroke );
+        rectangle->SetStart( rect.GetOrigin() );
+        rectangle->SetEnd( rect.GetEnd() );
 
-    commit.Add( outline );
+        if( radius > 0 )
+            rectangle->SetCornerRadius( toIU( radius ) );
+
+        added.push_back( rectangle );
+    }
+
+    for( PCB_SHAPE* item : added )
+        commit.Add( item );
+
+    PCB_SHAPE* outline = added.front();
     commit.Push( _( "Board outline (API)" ) );
 
     // A frameless board's page follows its outline
@@ -598,7 +693,19 @@ static KOPENAPI_RESULT h_pcb_outline_set( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     for( FOOTPRINT* fp : board->Footprints() )
     {
-        if( !rect.Contains( footprintBox( fp ) ) )
+        const BOX2I fb = footprintBox( fp );
+        bool        in = rect.Contains( fb );
+
+        if( in && shape.OutlineCount() > 0 )
+        {
+            for( const VECTOR2I& c : { fb.GetOrigin(), VECTOR2I( fb.GetRight(), fb.GetTop() ), fb.GetEnd(),
+                                       VECTOR2I( fb.GetLeft(), fb.GetBottom() ) } )
+            {
+                in = in && shape.Contains( c, -1, 0, true );
+            }
+        }
+
+        if( !in )
             outside.push_back( str( fp->GetReference() ) );
     }
 
@@ -609,6 +716,13 @@ static KOPENAPI_RESULT h_pcb_outline_set( KOPENAPI_CONTEXT& aCtx, const nlohmann
                               { "height_mm", toMm( rect.GetHeight() ) },
                               { "corner_radius_mm", radius },
                               { "replaced_edge_items", removed } };
+
+    if( shape.OutlineCount() > 0 )
+    {
+        result["kind"] = aArgs.contains( "trim" ) ? "trim" : "polygon";
+        result["area_mm2"] = shape.Area() / ( pcbIUScale.IU_PER_MM * pcbIUScale.IU_PER_MM );
+        result["points"] = shape.Outline( 0 ).PointCount();
+    }
 
     if( !outside.empty() )
         result["footprints_outside"] = outside;
@@ -660,6 +774,30 @@ const std::vector<CLASS_FIELD>& classFields()
           []( NETCLASS& c, int v ) { c.SetDiffPairGap( v ); } } };
 
     return fields;
+}
+
+
+// the project's custom design rules (.kicad_dru), "" when there are none
+std::string customRules( BOARD* aBoard )
+{
+    const wxString path = aBoard->GetDesignRulesPath();
+    wxString       text;
+    wxFFile        file;
+
+    if( path.IsEmpty() || !wxFileName::FileExists( path ) || !file.Open( path, wxS( "rb" ) ) || !file.ReadAll( &text, wxConvUTF8 ) )
+        return {};
+
+    return str( text );
+}
+
+
+bool writeCustomRules( const wxString& aPath, const std::string& aText )
+{
+    if( aText.empty() )
+        return !wxFileName::FileExists( aPath ) || wxRemoveFile( aPath );
+
+    wxFFile file( aPath, wxS( "wb" ) );
+    return file.IsOpened() && file.Write( wxString::FromUTF8( aText ), wxConvUTF8 ) && file.Close();
 }
 
 
@@ -733,7 +871,8 @@ nlohmann::json rulesJson( BOARD* aBoard )
              { "thickness_mm", toMm( bds.GetBoardThickness() ) },
              { "constraints", constraints },
              { "netclasses", classes },
-             { "netclass_patterns", patterns } };
+             { "netclass_patterns", patterns },
+             { "custom_rules", customRules( aBoard ) } };
 }
 
 } // namespace
@@ -760,6 +899,46 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     BOARD*                         board = context->GetBoard();
     BOARD_DESIGN_SETTINGS&         bds = board->GetDesignSettings();
     std::shared_ptr<NET_SETTINGS>& net = bds.m_NetSettings;
+
+    // Custom rules first: they must compile, or nothing changes
+    if( aArgs.contains( "custom_rules" ) )
+    {
+        if( !aArgs["custom_rules"].is_string() )
+            return KOPENAPI_RESULT::Error( 400, "custom_rules: the text of a .kicad_dru file (\"\" removes it)" );
+
+        const wxString path = board->GetDesignRulesPath();
+
+        if( path.IsEmpty() )
+            return KOPENAPI_RESULT::Error( 409, "custom_rules need a saved board (the rules file sits next to it)" );
+
+        const std::string before = customRules( board );
+        const std::string after = aArgs["custom_rules"].get<std::string>();
+
+        if( !writeCustomRules( path, after ) )
+            return KOPENAPI_RESULT::Error( 500, "cannot write " + str( path ) );
+
+        if( std::shared_ptr<DRC_ENGINE> engine = bds.m_DRCEngine )
+        {
+            try
+            {
+                engine->InitEngine( path );
+            }
+            catch( const PARSE_ERROR& error )
+            {
+                writeCustomRules( path, before );
+
+                try
+                {
+                    engine->InitEngine( path );
+                }
+                catch( const PARSE_ERROR& )
+                {
+                }
+
+                return KOPENAPI_RESULT::Error( 422, "custom_rules do not compile: " + str( error.What() ) );
+            }
+        }
+    }
 
     // Validate everything first: all or nothing
     auto positive = [&]( const nlohmann::json& aValue ) { return aValue.is_number() && aValue.get<double>() >= 0; };
@@ -998,9 +1177,13 @@ KOPENAPI_REGISTER( "pcb_netlist_apply",
 
 KOPENAPI_REGISTER( "pcb_outline_set",
                    "Set the board outline (Edge.Cuts), replacing the old one: a rectangle by top-left "
-                   "corner and size in mm, or fit: true around the footprints with margin_mm; optional "
-                   "rounded corners; reports footprints lying outside",
+                   "corner and size in mm, or fit: true around the footprints with margin_mm (optional "
+                   "rounded corners); a polygon; or trim: the present outline cut by this much off its "
+                   "sides (a lower / shorter card keeping its shape: edge fingers, bevels); reports "
+                   "footprints lying outside",
                    R"json({"type":"object","properties":{
+                        "polygon":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"[[x_mm, y_mm], ...]: a closed outline"},
+                        "trim":{"type":"object","properties":{"top_mm":{"type":"number"},"bottom_mm":{"type":"number"},"left_mm":{"type":"number"},"right_mm":{"type":"number"}},"description":"cut this much off the present outline's sides (its bounding box)"},
                         "x_mm":{"type":"number"},"y_mm":{"type":"number"},
                         "width_mm":{"type":"number"},"height_mm":{"type":"number"},
                         "fit":{"type":"boolean","default":false},
@@ -1013,7 +1196,7 @@ KOPENAPI_REGISTER( "pcb_outline_set",
 KOPENAPI_REGISTER( "pcb_rules_get",
                    "Board design rules: copper layer count, thickness, board-wide minimum constraints "
                    "(clearance, track width, via, drill, edge and hole clearances, mm), net classes with "
-                   "their values and member nets, net class pattern assignments",
+                   "their values and member nets, net class pattern assignments, the custom rules (.kicad_dru text)",
                    R"json({"type":"object","properties":{}})json"_json, false, h_pcb_rules_get );
 
 KOPENAPI_REGISTER( "pcb_rules_set",
@@ -1021,10 +1204,11 @@ KOPENAPI_REGISTER( "pcb_rules_set",
                    "mm} as listed by pcb_rules_get, netclasses [{name ('Default' edits the default), "
                    "clearance_mm, track_width_mm, via_diameter_mm, via_drill_mm, diff_pair_width_mm, "
                    "diff_pair_gap_mm, nets: [names or patterns like '+*V*', 'GND']}] - e.g. a Power class "
-                   "0.5 mm wide for the rails; answers the rules as now in force",
+                   "0.5 mm wide for the rails; custom_rules (KiCad's rule language); answers the rules as now in force",
                    R"json({"type":"object","properties":{
                         "copper_layers":{"type":"integer"},
                         "thickness_mm":{"type":"number"},
+                        "custom_rules":{"type":"string","description":"the project's custom rules (.kicad_dru text, e.g. (version 1) (rule ...)); written at once, refused (422, nothing changed) when it does not compile; \"\" removes them"},
                         "constraints":{"type":"object","description":"min_clearance_mm, min_track_width_mm, min_via_diameter_mm, min_via_annular_mm, min_through_drill_mm, copper_edge_clearance_mm, hole_clearance_mm, hole_to_hole_mm"},
                         "netclasses":{"type":"array","items":{"type":"object","required":["name"],"properties":{
                             "name":{"type":"string"},"clearance_mm":{"type":"number"},"track_width_mm":{"type":"number"},

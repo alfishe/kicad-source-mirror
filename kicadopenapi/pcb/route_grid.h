@@ -63,6 +63,9 @@ struct GRID_PARAMS
     int                       viaKeepOut = 0;  ///< only the chip's own nets' vias this far around it while routing; 0 none
     int                       viaAway = 0;     ///< a via nearer a chip's pads than this costs more, the nearer the more; 0 none
     int                       viaAwayCost = 0; ///< at the pads: as much as this length of track
+    int                       viaNearHole = 0; ///< a via nearer a through hole of its own net than this costs more; 0 none
+    int                       viaNearHoleCost = 0; ///< at the hole: as much as this length of track
+    float                     rowsCost = 1.0f; ///< cost factor of a cell between the two pin rows of a connector; 1 none
     float                     hug = 1.0f;      ///< cost factor of a cell beside the copper of the net's own bundle; 1 none
     float                     astar = 1.2f;    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
     float                     pfStart = 1.0f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)

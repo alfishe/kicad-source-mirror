@@ -741,7 +741,9 @@ KOPENAPI_REGISTER( "pcb_net_get",
 KOPENAPI_REGISTER( "pcb_footprint_get",
                    "Footprint card: fields, library description, position/side/rotation, attributes, "
                    "bounding box, every pad with its net/function/size/drill and side (west / east / north / south of "
-                   "the part as placed, after rotation and flip; centre for a middle pad), nets, 3D models",
+                   "the part as placed, after rotation and flip; centre for a middle pad), nets, 3D models. Answer: "
+                   "the pcb_footprint_list row (pads = the pad count) plus fields, description, attributes, bbox_mm, "
+                   "pad_list (one entry per pad: number, net, at_mm, side, ...), nets, models, panel_edge",
                    R"json({"type":"object","properties":{
                         "ref":{"type":"string","description":"reference designator, e.g. U3 (must be unique)"},
                         "uuid":{"type":"string","description":"footprint uuid from pcb_footprint_list"}}})json"_json,

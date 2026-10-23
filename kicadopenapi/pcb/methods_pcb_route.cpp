@@ -55,6 +55,8 @@
 #include <zone.h>
 #include <wx/utils.h>
 #include <zone_filler.h>
+#include <cleanup_item.h>
+#include <tracks_cleaner.h>
 
 #include <chrono>
 #include <limits>
@@ -485,6 +487,7 @@ struct ROUTE_PROFILE
     int    attempts = 0;
     int    deadLegsSkipped = 0;   ///< tries not made: their first leg had failed to reach that via
     int    viaSpotsBlocked = 0;   ///< via spots left out: a via there would touch another net
+    int    viaSpotsOffBoard = 0;  ///< via spots left out: on or past the board's edge
     int    ripUpsSkipped = 0;     ///< rip-ups not repeated: nothing changed since the same one failed
     int    ripUpsWalled = 0;      ///< rip-ups not made: no plan even through the routes of this call
     int    ripUpsPlanned = 0;     ///< rip-ups whose routes to take out a plan chose (the rest: the nearest in the corridor)
@@ -2287,6 +2290,43 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return !guard( board, { &via }, {}, true ).empty();
     };
 
+    // a via there would stand on or past the board's edge (escape spots of an edge connector's
+    // fingers point out of the board)
+    SHAPE_POLY_SET boardArea;
+    const bool     hasBoardArea = board->GetBoardPolygonOutlines( boardArea, true ) && boardArea.OutlineCount() > 0;
+
+    auto offBoard = [&]( BOARD_CONNECTED_ITEM* aEnd, const VECTOR2I& aAt )
+    {
+        if( !hasBoardArea )
+            return false;
+
+        int       dia = ds.GetCurrentViaSize();
+        NETCLASS* netclass = aEnd->GetEffectiveNetClass();
+
+        if( netclass && netclass->HasViaDiameter() )
+            dia = std::min( dia, netclass->GetViaDiameter() );
+
+        const SEG::ecoord keep = dia / 2 + std::max( ds.m_CopperEdgeClearance, 0 );
+
+        if( !boardArea.Contains( aAt ) )
+            return true;
+
+        // SHAPE_POLY_SET::SquaredDistance is 0 inside a polygon: measure to the edges themselves
+        for( int i = 0; i < boardArea.OutlineCount(); ++i )
+        {
+            if( boardArea.COutline( i ).SquaredDistance( aAt, true ) < keep * keep )
+                return true;
+
+            for( int h = 0; h < boardArea.HoleCount( i ); ++h )
+            {
+                if( boardArea.CHole( i, h ).SquaredDistance( aAt, true ) < keep * keep )
+                    return true;
+            }
+        }
+
+        return false;
+    };
+
     // Via spots to leave an end: out of the package first (away from its body, past the pad's end,
     // a little to either side), then around the end; nearest the other end first within each kind
     auto spots = [&]( BOARD_CONNECTED_ITEM* aEnd, const VECTOR2I& aPos, const VECTOR2I& aToward )
@@ -2341,6 +2381,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         {
             if( holeClash( aAt ) )
                 return true;
+
+            if( offBoard( aEnd, aAt ) )
+            {
+                s_routeProfile.viaSpotsOffBoard++;
+                return true;
+            }
 
             if( viaBlocked( aEnd, aAt ) )
             {
@@ -3284,6 +3330,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         params.viaKeepOut = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_keepout_mm", 5.0 ), 0.0, 20.0 ) );
         params.viaAway = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_mm", 7.0 ), 0.0, 30.0 ) );
         params.viaAwayCost = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_cost_mm", 8.0 ), 0.0, 100.0 ) );
+        params.rowsCost = (float) std::clamp( aArgs.value( "rows_cost", 6.0 ), 1.0, 100.0 );
+        params.viaNearHole = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_near_hole_mm", 2.5 ), 0.0, 30.0 ) );
+        params.viaNearHoleCost = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_near_hole_cost_mm", 6.0 ), 0.0, 100.0 ) );
         params.hug = (float) std::clamp( aArgs.value( "hug", 1.0 ), 0.05, 1.0 );
         params.astar = (float) std::clamp( aArgs.value( "astar", 1.2 ), 1.0, 3.0 );
         params.pfStart = (float) std::clamp( aArgs.value( "pf_start", 1.0 ), 0.01, 100.0 );
@@ -3974,6 +4023,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             for( int pick = 0; pick < RIP_PICKS && !done[index]; ++pick )
             {
+                // a failed pick puts copies back: the ends may be new objects
+                job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
+                job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+                if( !job.from || !job.to )
+                    break;
+
                 std::vector<size_t> victims = pickVictims();
 
                 if( victims.empty() )
@@ -4714,6 +4770,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                   { "profile", { { "attempts", s_routeProfile.attempts },
                                                  { "dead_legs_skipped", s_routeProfile.deadLegsSkipped },
                                                  { "via_spots_blocked", s_routeProfile.viaSpotsBlocked },
+                                                 { "via_spots_off_board", s_routeProfile.viaSpotsOffBoard },
                                                  { "rip_ups_skipped", s_routeProfile.ripUpsSkipped },
                                                  { "rip_ups_planned", s_routeProfile.ripUpsPlanned },
                                                  { "rip_ups_walled", s_routeProfile.ripUpsWalled },
@@ -4951,8 +5008,47 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                 return ( at - ( it == stubFrom.end() ? pos : it->second ) ).EuclideanNorm();
             };
 
+            // spots over one of the net's pours on another layer first: a via inside the outline of a
+            // higher-priority pour of another net there reaches nothing
+            auto onPlane = [&]( const VECTOR2I& at )
+            {
+                for( ZONE* zone : board->Zones() )
+                {
+                    if( zone->GetIsRuleArea() || zone->GetNetCode() != net->GetNetCode() )
+                        continue;
+
+                    for( PCB_LAYER_ID l : zone->GetLayerSet().CuStack() )
+                    {
+                        if( l == layer || !zone->GetBoardOutline().Contains( at ) )
+                            continue;
+
+                        const bool covered = std::any_of( board->Zones().begin(), board->Zones().end(),
+                                                          [&]( ZONE* other )
+                                                          {
+                                                              return !other->GetIsRuleArea() && other->GetNetCode() != net->GetNetCode()
+                                                                     && other->IsOnLayer( l )
+                                                                     && other->GetAssignedPriority() > zone->GetAssignedPriority()
+                                                                     && other->GetBoardOutline().Contains( at );
+                                                          } );
+
+                        if( !covered )
+                            return true;
+                    }
+                }
+
+                return false;
+            };
+
+            std::map<std::pair<int, int>, bool> planeAt;
+
+            for( const VECTOR2I& at : candidates )
+                planeAt.emplace( std::make_pair( at.x, at.y ), onPlane( at ) );
+
             std::stable_sort( candidates.begin(), candidates.end(), [&]( const VECTOR2I& x, const VECTOR2I& y )
-                              { return stubLength( x ) < stubLength( y ); } );
+                              {
+                                  const bool px = planeAt[{ x.x, x.y }], py = planeAt[{ y.x, y.y }];
+                                  return px != py ? px : stubLength( x ) < stubLength( y );
+                              } );
 
             if( candidates.size() > 400 )
                 candidates.resize( 400 );
@@ -5766,6 +5862,116 @@ static KOPENAPI_RESULT h_pcb_tracks_delete( KOPENAPI_CONTEXT& aCtx, const nlohma
 }
 
 
+static KOPENAPI_RESULT h_pcb_tracks_cleanup( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    if( std::optional<KOPENAPI_RESULT> busy = guiRouting() )
+        return *busy;
+
+    BOARD*             board = context->GetBoard();
+    std::set<int>      netCodes;
+    nlohmann::json     unknown = nlohmann::json::array();
+
+    for( const char* key : { "net", "nets" } )
+    {
+        if( !aArgs.contains( key ) )
+            continue;
+
+        std::vector<std::string> names = aArgs[key].is_array() ? aArgs[key].get<std::vector<std::string>>()
+                                                               : std::vector<std::string>{ aArgs[key].get<std::string>() };
+
+        for( const std::string& name : names )
+        {
+            if( NETINFO_ITEM* net = board->FindNet( wxString::FromUTF8( name ) ) )
+                netCodes.insert( net->GetNetCode() );
+            else
+                unknown.push_back( name );
+        }
+    }
+
+    if( !unknown.empty() )
+        return KOPENAPI_RESULT::Error( 404, "no such net: " + unknown.dump() );
+
+    const bool dryRun = aArgs.value( "dry_run", false );
+
+    board->BuildConnectivity();
+
+    BOARD_COMMIT                               commit( context->GetToolManager() );
+    TRACKS_CLEANER                             cleaner( board, commit );
+    std::vector<std::shared_ptr<CLEANUP_ITEM>> found;
+
+    if( !netCodes.empty() )
+    {
+        cleaner.SetFilter( [&]( BOARD_CONNECTED_ITEM* aItem ) { return !netCodes.count( aItem->GetNetCode() ); } );
+    }
+
+    cleaner.CleanupBoard( dryRun, &found, aArgs.value( "shorting", false ), aArgs.value( "redundant_vias", true ),
+                          aArgs.value( "merge_segments", false ), aArgs.value( "dangling_tracks", true ),
+                          aArgs.value( "tracks_in_pads", false ), aArgs.value( "dangling_vias", true ) );
+
+    static const std::map<int, std::string> kinds = {
+        { CLEANUP_SHORTING_TRACK, "shorting_track" }, { CLEANUP_SHORTING_VIA, "shorting_via" },
+        { CLEANUP_REDUNDANT_VIA, "redundant_via" },   { CLEANUP_DUPLICATE_TRACK, "duplicate_track" },
+        { CLEANUP_MERGE_TRACKS, "merged_tracks" },    { CLEANUP_DANGLING_TRACK, "dangling_track" },
+        { CLEANUP_DANGLING_VIA, "dangling_via" },     { CLEANUP_ZERO_LENGTH_TRACK, "zero_length_track" },
+        { CLEANUP_TRACK_IN_PAD, "track_in_pad" } };
+
+    nlohmann::json counts = nlohmann::json::object();
+    nlohmann::json items = nlohmann::json::array();
+
+    for( const std::shared_ptr<CLEANUP_ITEM>& item : found )
+    {
+        auto        it = kinds.find( item->GetErrorCode() );
+        std::string kind = it != kinds.end() ? it->second : str( item->GetErrorText( -1, false ) );
+        counts[kind] = counts.value( kind, 0 ) + 1;
+        nlohmann::json entry = { { "kind", kind }, { "uuid", str( item->GetMainItemID().AsString() ) } };
+
+        if( BOARD_ITEM* b = board->ResolveItem( item->GetMainItemID(), true ) )
+        {
+            entry["net"] = b->IsConnected() ? str( static_cast<BOARD_CONNECTED_ITEM*>( b )->GetNetname() ) : "";
+            entry["at_mm"] = { pcbIUScale.IUTomm( b->GetPosition().x ), pcbIUScale.IUTomm( b->GetPosition().y ) };
+        }
+
+        items.push_back( entry );
+    }
+
+    nlohmann::json out = { { "dry_run", dryRun }, { "counts", counts }, { "items", items } };
+
+    if( dryRun || commit.Empty() )
+        return KOPENAPI_RESULT::Ok( out );
+
+    commit.Push( _( "Board Cleanup (API)" ) );
+
+    if( aArgs.value( "refill_zones", false ) )
+    {
+        BOARD_COMMIT fillCommit( context->GetToolManager() );
+        ZONE_FILLER  filler( board, &fillCommit );
+        KOPENAPI_KEEPALIVE_REPORTER reporter;
+        filler.SetProgressReporter( &reporter );
+        std::vector<ZONE*> zones( board->Zones().begin(), board->Zones().end() );
+
+        if( filler.Fill( zones ) )
+            fillCommit.Push( _( "Fill zones (API)" ) );
+        else
+            fillCommit.Revert();
+
+        out["zones_refilled"] = true;
+    }
+
+    board->BuildConnectivity();
+    board->GetConnectivity()->RecalculateRatsnest();
+    showRoutes( aCtx, {} );
+
+    out["applied"] = true;
+    out["unrouted_left"] = board->GetConnectivity()->GetUnconnectedCount( false );
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
 static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -5923,6 +6129,11 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( !steps.empty() && steps[0].via )
     {
         dropVia( steps[0].at );
+
+        // a via alone keeps its net (connectivity would give it the net of a pour it stands in)
+        if( steps.size() == 1 && !fromPad )
+            static_cast<PCB_VIA*>( made.back().get() )->SetIsFree();
+
         layer = *steps[0].via;
     }
 
@@ -6494,6 +6705,9 @@ KOPENAPI_REGISTER( "pcb_route",
                         "bundles":{"description":"grid: \"auto\" (pcb_net_roles' bundles), \"off\", or [{name, nets}] in member order: a bundle's nets between the same parts are routed first, side by side (the answer's grid.bundles: name, parts, nets)","default":"auto"},
                         "via_away_mm":{"type":"number","default":7,"description":"grid: a signal via nearer a chip's pads (not an array's) than this costs more, linearly to the pads; 0 off"},
                         "via_away_cost_mm":{"type":"number","default":8,"description":"grid: a via at a chip's pads costs as much more as this length of track"},
+                        "rows_cost":{"type":"number","default":6,"description":"grid: a track between the two pin rows of a 2-row connector (a header) costs this many times more: pins leave the rows outward, rails run outside the row; 1 off"},
+                        "via_near_hole_mm":{"type":"number","default":2.5,"description":"grid: a via nearer a through-hole pad or via of its own net than this costs more, linearly to the hole (the hole is on every layer: start on the layer needed there); 0 off"},
+                        "via_near_hole_cost_mm":{"type":"number","default":6,"description":"grid: a via at its own net's through hole costs as much more as this length of track"},
                         "hug":{"type":"number","default":1,"description":"grid: cost factor of a cell beside the copper of the net's own bundle (1: no pull; below 1 so far lowers cohesion, adds vias and time)"},
                         "astar":{"type":"number","default":1.2,"description":"grid: weight of the distance left in the search (1: cheapest paths; more: fewer states searched, paths a little longer)"},
                         "pf_start":{"type":"number","default":1.0,"description":"grid: price of sharing a cell in the first negotiation round"},
@@ -6568,6 +6782,23 @@ KOPENAPI_REGISTER( "pcb_tracks_delete",
                         "override_locks":{"type":"boolean","default":false},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_tracks_delete, 300 );
+
+KOPENAPI_REGISTER( "pcb_tracks_cleanup",
+                   "Board cleanup as KiCad's Cleanup Tracks & Vias, in one undo step: dangling tracks and vias "
+                   "(ends that reach nothing, repeated until none is left), vias inside a pad or another via, "
+                   "and on request shorting copper, collinear segments merged, tracks inside pads; net / nets "
+                   "limit it. Answers counts per kind and the items (uuid, net, where); dry_run lists only",
+                   R"json({"type":"object","properties":{
+                        "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
+                        "dangling_tracks":{"type":"boolean","default":true},
+                        "dangling_vias":{"type":"boolean","default":true},
+                        "redundant_vias":{"type":"boolean","default":true},
+                        "shorting":{"type":"boolean","default":false,"description":"remove tracks and vias joining two nets"},
+                        "merge_segments":{"type":"boolean","default":false},
+                        "tracks_in_pads":{"type":"boolean","default":false},
+                        "refill_zones":{"type":"boolean","default":false},
+                        "dry_run":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_tracks_cleanup, 300 );
 
 KOPENAPI_REGISTER( "pcb_track_add",
                    "Lay a track by hand along given points (no router): from a pad and / or to a pad (their "
@@ -6664,4 +6895,4 @@ KOPENAPI_REGISTER( "pcb_route_strategies",
                         "reroute_recent":{"type":"integer","default":2}}})json"_json,
                    false, h_pcb_route_strategies );
 
-KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_track_add", "pcb_via_add", "pcb_fanout" );
+KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_tracks_cleanup", "pcb_track_add", "pcb_via_add", "pcb_fanout" );

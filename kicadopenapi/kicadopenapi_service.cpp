@@ -864,7 +864,17 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std
     method = KOPENAPI_REGISTRY::Get().Find( aName );
 
     if( !method )
-        return KOPENAPI_RESULT::Error( 404, "unknown method '" + aName + "'" );
+    {
+        const std::vector<std::string> similar = KOPENAPI_REGISTRY::Get().Similar( aName, 6, !ctx.headless );
+        std::string                    hint;
+
+        for( const std::string& name : similar )
+            hint += ( hint.empty() ? " (did you mean " : ", " ) + name;
+
+        KOPENAPI_RESULT result = KOPENAPI_RESULT::Error( 404, "unknown method '" + aName + "'" + ( hint.empty() ? "" : hint + "?)" ) );
+        result.body["error"]["similar"] = similar;
+        return result;
+    }
 
     if( method->guiOnly && ctx.headless )
         return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI" );

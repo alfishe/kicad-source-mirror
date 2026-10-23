@@ -301,6 +301,9 @@ void applyFields( SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath, const nlohma
     if( aArgs.contains( "on_board" ) && aArgs["on_board"].is_boolean() )
         aSymbol->SetExcludedFromBoard( !aArgs["on_board"].get<bool>() );
 
+    if( aArgs.contains( "in_pos" ) && aArgs["in_pos"].is_boolean() )
+        aSymbol->SetExcludedFromPosFiles( !aArgs["in_pos"].get<bool>() );
+
     if( aArgs.contains( "ref" ) && aArgs["ref"].is_string() && !aArgs["ref"].get<std::string>().empty() )
         aSymbol->SetRef( &aPath, wxString::FromUTF8( aArgs["ref"].get<std::string>() ) );
 }
@@ -3461,13 +3464,13 @@ KOPENAPI_REGISTER( "sch_symbol_add",
                         "mirror":{"type":"string","enum":["none","x","y"],"default":"none"},
                         "ref":{"type":"string"},"value":{"type":"string"},"footprint":{"type":"string"},
                         "fields":{"type":"object","additionalProperties":{"type":"string"}},
-                        "dnp":{"type":"boolean"},"in_bom":{"type":"boolean"},"on_board":{"type":"boolean"},
+                        "dnp":{"type":"boolean"},"in_bom":{"type":"boolean"},"on_board":{"type":"boolean"},"in_pos":{"type":"boolean"},
                         "annotate":{"type":"boolean","default":true}}})json"_json,
                    false, h_sch_symbol_add, 120 );
 
 KOPENAPI_REGISTER( "sch_symbol_update",
                    std::string( "Edit a placed symbol by uuid or ref: value, footprint, fields, new_ref, "
-                                "position, rotation, mirror, dnp / in_bom / on_board, field text positions "
+                                "position, rotation, mirror, dnp / in_bom / on_board / in_pos, field text positions "
                                 "(field_positions, autoplace_fields); moving carries the part's own wiring (stubs, power "
                                 "symbols, PWR_FLAGs, labels) and stretches / re-routes wiring shared with other "
                                 "parts." ) + EDIT_NOTE,
@@ -3479,6 +3482,7 @@ KOPENAPI_REGISTER( "sch_symbol_update",
                         "rotation":{"type":"integer","enum":[0,90,180,270]},
                         "mirror":{"type":"string","enum":["none","x","y"]},
                         "dnp":{"type":"boolean"},"in_bom":{"type":"boolean"},"on_board":{"type":"boolean"},
+                        "in_pos":{"type":"boolean","description":"in the position (pick and place) files"},
                         "field_positions":{"type":"object","description":"per field name: {x_mm, y_mm}, \"hide\" or \"show\""},
                         "autoplace_fields":{"type":"boolean","default":false,"description":"re-place reference / value text clear of other parts, texts and wires (done anyway after a move)"},
                         "override_locks":{"type":"boolean","default":false}}})json"_json,

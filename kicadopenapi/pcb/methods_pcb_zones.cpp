@@ -110,6 +110,56 @@ std::string padModeName( ZONE_CONNECTION aMode )
 }
 
 
+const std::map<std::string, ISLAND_REMOVAL_MODE>& islandModes()
+{
+    static const std::map<std::string, ISLAND_REMOVAL_MODE> modes = { { "always", ISLAND_REMOVAL_MODE::ALWAYS },
+                                                                      { "never", ISLAND_REMOVAL_MODE::NEVER },
+                                                                      { "area", ISLAND_REMOVAL_MODE::AREA } };
+    return modes;
+}
+
+
+std::string islandModeName( ISLAND_REMOVAL_MODE aMode )
+{
+    for( const auto& [name, mode] : islandModes() )
+    {
+        if( mode == aMode )
+            return name;
+    }
+
+    return "never";
+}
+
+
+// remove_islands / min_island_mm2 checked; empty when valid
+std::string islandArgsError( const nlohmann::json& aArgs )
+{
+    if( aArgs.contains( "remove_islands" )
+        && ( !aArgs["remove_islands"].is_string() || !islandModes().count( aArgs["remove_islands"].get<std::string>() ) ) )
+    {
+        return "remove_islands: always, never or area (below min_island_mm2)";
+    }
+
+    if( aArgs.contains( "min_island_mm2" ) && ( !aArgs["min_island_mm2"].is_number() || aArgs["min_island_mm2"].get<double>() < 0 ) )
+        return "min_island_mm2: a number >= 0";
+
+    return {};
+}
+
+
+void applyIslandArgs( ZONE* aZone, const nlohmann::json& aArgs )
+{
+    if( aArgs.contains( "remove_islands" ) )
+        aZone->SetIslandRemovalMode( islandModes().at( aArgs["remove_islands"].get<std::string>() ) );
+
+    if( aArgs.contains( "min_island_mm2" ) )
+    {
+        const double iu = pcbIUScale.IU_PER_MM;
+        aZone->SetMinIslandArea( (long long) ( aArgs["min_island_mm2"].get<double>() * iu * iu ) );
+    }
+}
+
+
 nlohmann::json layerNames( BOARD* aBoard, const LSET& aLayers )
 {
     nlohmann::json l = nlohmann::json::array();
@@ -211,9 +261,23 @@ nlohmann::json zoneJson( BOARD* aBoard, ZONE* aZone )
                          { "min_width_mm", toMm( aZone->GetMinThickness() ) },
                          { "thermal_gap_mm", toMm( aZone->GetThermalReliefGap() ) },
                          { "thermal_spoke_mm", toMm( aZone->GetThermalReliefSpokeWidth() ) },
+                         { "remove_islands", islandModeName( aZone->GetIslandRemovalMode() ) },
+                         { "min_island_mm2", mm2( (double) aZone->GetMinIslandArea() ) },
                          { "filled", aZone->IsFilled() },
                          { "filled_mm2", mm2( area ) },
                          { "islands", islands } };
+
+    if( const SHAPE_POLY_SET* poly = aZone->Outline(); poly && poly->OutlineCount() > 0 )
+    {
+        const BOX2I    box = poly->BBox();
+        nlohmann::json pts = nlohmann::json::array();
+
+        for( const VECTOR2I& pt : poly->COutline( 0 ).CPoints() )
+            pts.push_back( { toMm( pt.x ), toMm( pt.y ) } );
+
+        z["bbox_mm"] = { toMm( box.GetLeft() ), toMm( box.GetTop() ), toMm( box.GetRight() ), toMm( box.GetBottom() ) };
+        z["outline_mm"] = pts;
+    }
 
     nlohmann::json pieces = islandsOf( aBoard, aZone );
 
@@ -336,6 +400,14 @@ static KOPENAPI_RESULT h_pcb_zone_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     zone->SetMinThickness( toIU( aArgs.value( "min_width_mm", 0.25 ) ) );
     zone->SetThermalReliefGap( toIU( aArgs.value( "thermal_gap_mm", 0.5 ) ) );
     zone->SetThermalReliefSpokeWidth( toIU( aArgs.value( "thermal_spoke_mm", 0.5 ) ) );
+
+    if( const std::string bad = islandArgsError( aArgs ); !bad.empty() )
+    {
+        delete zone;
+        return KOPENAPI_RESULT::Error( 400, bad );
+    }
+
+    applyIslandArgs( zone, aArgs );
     const std::string padMode = aArgs.value( "pads", std::string( "tht_thermal" ) );
 
     if( !padModes().count( padMode ) )
@@ -444,10 +516,47 @@ static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( aArgs.contains( "pads" ) && !padModes().count( aArgs.value( "pads", std::string() ) ) )
         return KOPENAPI_RESULT::Error( 400, "pads: tht_thermal, thermal, solid or none" );
 
+    if( const std::string bad = islandArgsError( aArgs ); !bad.empty() )
+        return KOPENAPI_RESULT::Error( 400, bad );
+
     for( const char* key : { "clearance_mm", "min_width_mm", "thermal_gap_mm", "thermal_spoke_mm" } )
     {
         if( aArgs.contains( key ) && ( !aArgs[key].is_number() || aArgs[key].get<double>() < 0 ) )
             return KOPENAPI_RESULT::Error( 400, std::string( key ) + ": a number >= 0 (mm)" );
+    }
+
+    if( aArgs.contains( "uuid" ) && aArgs.contains( "net" ) )
+        return KOPENAPI_RESULT::Error( 400, "uuid or net selects the zones, not both (set_net changes the net)" );
+
+    NETINFO_ITEM* setNet = nullptr;
+
+    if( aArgs.contains( "set_net" ) )
+    {
+        setNet = KopenapiFindNet( board, aArgs.value( "set_net", std::string() ) );
+
+        if( !setNet || setNet->GetNetCode() <= 0 )
+            return KOPENAPI_RESULT::Error( 404, "set_net: no such net on the board" );
+    }
+
+    SHAPE_LINE_CHAIN outline;
+
+    if( aArgs.contains( "points" ) )
+    {
+        if( zones.size() != 1 )
+            return KOPENAPI_RESULT::Error( 400, "points: one zone (by uuid)" );
+
+        for( const nlohmann::json& p : aArgs["points"] )
+        {
+            if( !p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number() )
+                return KOPENAPI_RESULT::Error( 400, "points: [[x_mm, y_mm], ...]" );
+
+            outline.Append( toIU( p[0].get<double>() ), toIU( p[1].get<double>() ) );
+        }
+
+        if( outline.PointCount() < 3 )
+            return KOPENAPI_RESULT::Error( 400, "points: at least 3" );
+
+        outline.SetClosed( true );
     }
 
     BOARD_COMMIT commit( context->GetToolManager() );
@@ -455,6 +564,20 @@ static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
     for( ZONE* zone : zones )
     {
         commit.Modify( zone );
+
+        if( outline.PointCount() >= 3 )
+        {
+            SHAPE_POLY_SET poly;
+            poly.AddOutline( outline );
+            zone->SetOutline( new SHAPE_POLY_SET( poly ) );
+            zone->UnFill();
+        }
+
+        if( setNet )
+        {
+            zone->SetNet( setNet );
+            zone->UnFill();
+        }
 
         if( aArgs.contains( "pads" ) )
             zone->SetPadConnection( padModes().at( aArgs["pads"].get<std::string>() ) );
@@ -476,6 +599,8 @@ static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
         if( aArgs.contains( "name" ) )
             zone->SetZoneName( wxString::FromUTF8( aArgs.value( "name", std::string() ) ) );
+
+        applyIslandArgs( zone, aArgs );
     }
 
     commit.Push( _( "Update zone (API)" ) );
@@ -558,6 +683,8 @@ KOPENAPI_REGISTER( "pcb_zone_add",
                         "min_width_mm":{"type":"number","default":0.25},
                         "thermal_gap_mm":{"type":"number","default":0.5},
                         "thermal_spoke_mm":{"type":"number","default":0.5},
+                        "remove_islands":{"type":"string","enum":["always","never","area"],"description":"drop fill pieces with no pad (area: those below min_island_mm2)"},
+                        "min_island_mm2":{"type":"number"},
                         "pads":{"type":"string","enum":["tht_thermal","thermal","solid","none"],"default":"tht_thermal","description":"tht_thermal: thermal reliefs on through-hole pads, SMD pads solid (small SMD pads starve with reliefs)"},
                         "priority":{"type":"integer","default":0},
                         "name":{"type":"string"},
@@ -565,7 +692,7 @@ KOPENAPI_REGISTER( "pcb_zone_add",
                    false, h_pcb_zone_add, 300 );
 
 KOPENAPI_REGISTER( "pcb_zone_list",
-                   "Copper zones (pours) with uuid, net, layers, priority, pad connection, clearance, minimum "
+                   "Copper zones (pours) with uuid, net, layers, outline (outline_mm, bbox_mm), priority, pad connection, clearance, minimum "
                    "width, thermal gap / spoke, filled area and islands; a fill in more than one piece on a "
                    "layer lists each (island_list: box, area, pads / vias / tracks of the net on it - one with "
                    "pads and no via is cut off and needs one)",
@@ -573,13 +700,18 @@ KOPENAPI_REGISTER( "pcb_zone_list",
                    false, h_pcb_zone_list );
 
 KOPENAPI_REGISTER( "pcb_zone_update",
-                   "Change copper zones (by uuid, or every zone of a net): pad connection, clearance, minimum "
-                   "width, thermal gap / spoke, priority, name; refilled (fill: false to skip); one undo step",
+                   "Change copper zones (by uuid, or every zone of a net): net (set_net), outline (points, one zone), pad "
+                   "connection, clearance, minimum width, thermal gap / spoke, island removal, priority, name; refilled (fill: "
+                   "false to skip); one undo step",
                    R"json({"type":"object","properties":{
-                        "uuid":{"type":"string"},"net":{"type":"string"},
+                        "uuid":{"type":"string"},"net":{"type":"string","description":"every zone of this net (instead of uuid)"},
+                        "set_net":{"type":"string","description":"new net of the zones"},
+                        "points":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"new outline [[x_mm, y_mm], ...] (one zone)"},
                         "pads":{"type":"string","enum":["tht_thermal","thermal","solid","none"]},
                         "clearance_mm":{"type":"number"},"min_width_mm":{"type":"number"},
                         "thermal_gap_mm":{"type":"number"},"thermal_spoke_mm":{"type":"number"},
+                        "remove_islands":{"type":"string","enum":["always","never","area"],"description":"drop fill pieces with no pad (area: those below min_island_mm2)"},
+                        "min_island_mm2":{"type":"number"},
                         "priority":{"type":"integer"},"name":{"type":"string"},
                         "fill":{"type":"boolean","default":true}}})json"_json,
                    false, h_pcb_zone_update, 300 );
@@ -588,7 +720,8 @@ KOPENAPI_REGISTER( "pcb_zone_delete",
                    "Delete copper zones (by uuid, or every zone of a net); locked ones refused (409) unless "
                    "override_locks; one undo step; answers the connections still open",
                    R"json({"type":"object","properties":{
-                        "uuid":{"type":"string"},"net":{"type":"string"},
+                        "uuid":{"type":"string"},"net":{"type":"string","description":"every zone of this net (instead of uuid)"},
+                        "set_net":{"type":"string","description":"new net of the zones"},
                         "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_zone_delete );
 

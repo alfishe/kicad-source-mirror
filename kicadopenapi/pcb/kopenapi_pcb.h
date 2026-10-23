@@ -96,4 +96,16 @@ class NETINFO_ITEM;
  */
 NETINFO_ITEM* KopenapiFindNet( BOARD* aBoard, const std::string& aName );
 
+/**
+ * @brief Validate a net's stored driver edge block ({family, tr_ps, tr_def, rout_ohm, swing_v, nm_v, driver})
+ * @return empty when valid, else what is wrong
+ */
+std::string KopenapiEdgeCheck( const nlohmann::json& aEdge );
+
+/**
+ * @brief Validate a net's stored termination block ({kind, dc_balanced})
+ * @return empty when valid, else what is wrong
+ */
+std::string KopenapiTerminationCheck( const nlohmann::json& aTermination );
+
 #endif

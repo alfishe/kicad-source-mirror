@@ -255,10 +255,15 @@ public:
     std::optional<KOPENAPI_METHOD> Find( const std::string& aName ) const;
 
     /// @brief Keyword search for the MCP `search` tool: query tokens are matched against method
-    /// names (weight 3), summaries (2) and input property names (1); best first, then by
-    /// name.  An empty query returns all methods by name.
+    /// names (weight 3), summaries (2, words run together too: "netclass" finds "net classes")
+    /// and input property names (1); best first, then by name.  An empty query returns all methods by name.
     std::vector<KOPENAPI_METHOD> Search( const std::string& aQuery, size_t aLimit,
                                          bool aIncludeGuiOnly ) const;
+
+    /// @brief Names to offer for an unknown method: a slip of one or two letters first, then methods whose
+    /// name or summary carries its topic words (the domain prefix and generic verbs such as
+    /// list / get / set dropped) within the same domain when it is one, then looser spellings
+    std::vector<std::string> Similar( const std::string& aName, size_t aLimit, bool aIncludeGuiOnly ) const;
 
 private:
     KOPENAPI_REGISTRY() = default;

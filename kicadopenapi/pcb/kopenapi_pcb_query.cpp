@@ -22,6 +22,7 @@
 #include <geometry/shape_poly_set.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <functional>
 #include <list>
@@ -519,9 +520,69 @@ std::string withRectUnits( const std::string& aExpression )
 }
 
 
+/// @brief A function called with no item ("inRect(...)") applies to A: KiCad's grammar has no
+/// bare calls (it reports "Unknown parent of function parameters")
+std::string withItem( const std::string& aExpression )
+{
+    std::string out;
+    char        quote = 0;
+
+    for( size_t i = 0; i < aExpression.size(); ++i )
+    {
+        const char ch = aExpression[i];
+
+        if( quote )
+        {
+            quote = ch == quote ? 0 : quote;
+            out += ch;
+            continue;
+        }
+
+        if( ch == '\'' || ch == '"' )
+        {
+            quote = ch;
+            out += ch;
+            continue;
+        }
+
+        const bool starts = ( std::isalpha( (unsigned char) ch ) || ch == '_' )
+                            && ( i == 0 || !( std::isalnum( (unsigned char) aExpression[i - 1] ) || aExpression[i - 1] == '_' ) );
+
+        if( !starts )
+        {
+            out += ch;
+            continue;
+        }
+
+        size_t end = i;
+
+        while( end < aExpression.size() && ( std::isalnum( (unsigned char) aExpression[end] ) || aExpression[end] == '_' ) )
+            ++end;
+
+        size_t next = end;
+
+        while( next < aExpression.size() && std::isspace( (unsigned char) aExpression[next] ) )
+            ++next;
+
+        size_t prev = i;
+
+        while( prev > 0 && std::isspace( (unsigned char) aExpression[prev - 1] ) )
+            --prev;
+
+        if( next < aExpression.size() && aExpression[next] == '(' && ( prev == 0 || aExpression[prev - 1] != '.' ) )
+            out += "A.";
+
+        out.append( aExpression, i, end - i );
+        i = end - 1;
+    }
+
+    return out;
+}
+
+
 PROGRAM compile( const std::string& aRawExpression, COMPILE_ERROR& aError )
 {
-    const std::string aExpression = withRectUnits( aRawExpression );
+    const std::string aExpression = withRectUnits( withItem( aRawExpression ) );
 
     static std::list<std::pair<std::string, PROGRAM>>                                           lru;
     static std::unordered_map<std::string, std::list<std::pair<std::string, PROGRAM>>::iterator> index;

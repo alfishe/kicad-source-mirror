@@ -419,6 +419,7 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
     const std::string libGlob = aArgs.value( "lib_id", std::string() );
     const std::string sheetGlob = aArgs.value( "sheet", std::string() );
     const bool        includePower = aArgs.value( "include_power", false );
+    const bool        withFields = aArgs.value( "fields", false );
 
     std::vector<nlohmann::json> rows;
 
@@ -447,6 +448,7 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
                                    { "dnp", sym->GetDNP( &path ) },
                                    { "in_bom", !sym->GetExcludedFromBOM( &path ) },
                                    { "on_board", !sym->GetExcludedFromBoard( &path ) },
+                                   { "in_pos", !sym->GetExcludedFromPosFiles( &path ) },
                                    { "locked", sym->IsLocked() },
                                    { "x_mm", sym->GetPosition().x / schIUScale.IU_PER_MM },
                                    { "y_mm", sym->GetPosition().y / schIUScale.IU_PER_MM },
@@ -456,6 +458,16 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
                 || !KopenapiGlob( libGlob, row["lib_id"] ) )
             {
                 continue;
+            }
+
+            if( withFields )
+            {
+                nlohmann::json fields = nlohmann::json::object();
+
+                for( const SCH_FIELD& field : sym->GetFields() )
+                    fields[str( field.GetName() )] = str( field.GetShownText( &path, FOR_GUI ) );
+
+                row["fields"] = fields;
             }
 
             rows.push_back( std::move( row ) );
@@ -829,11 +841,13 @@ KOPENAPI_REGISTER( "sch_sheet_list",
 
 KOPENAPI_REGISTER( "sch_symbol_list",
                    "List schematic symbols per sheet instance: ref, value, lib_id, footprint, unit, sheet, "
-                   "DNP/BOM/board flags; filter by ref/value/lib_id/sheet glob, include_power; paginated",
+                   "DNP/BOM/board/position-file flags, with fields: true every field (name -> text as shown, e.g. LCSC, "
+                   "Manufacturer_Part_Number); filter by ref/value/lib_id/sheet glob, include_power; paginated",
                    KopenapiPagedSchema( R"json({
                         "ref":{"type":"string"},"value":{"type":"string"},"lib_id":{"type":"string"},
                         "sheet":{"type":"string","description":"glob on the sheet path"},
-                        "include_power":{"type":"boolean","default":false}})json"_json ),
+                        "include_power":{"type":"boolean","default":false},
+                        "fields":{"type":"boolean","default":false,"description":"every field of each symbol (name -> shown text)"}})json"_json ),
                    false, h_sch_symbol_list );
 
 KOPENAPI_REGISTER( "sch_net_list",

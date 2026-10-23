@@ -4,6 +4,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cstdio>
+#include <set>
 
 
 KOPENAPI_REGISTRY& KOPENAPI_REGISTRY::Get()
@@ -294,6 +295,51 @@ static std::string lower( std::string aText )
 }
 
 
+static std::string squeeze( const std::string& aText )
+{
+    std::string out;
+
+    for( char ch : aText )
+    {
+        if( std::isalnum( (unsigned char) ch ) )
+            out += (char) std::tolower( (unsigned char) ch );
+    }
+
+    return out;
+}
+
+
+static int scoreMethod( const KOPENAPI_METHOD& aMethod, const std::vector<std::string>& aTerms, bool aWithProperties )
+{
+    const std::string name = lower( aMethod.name );
+    const std::string summary = lower( aMethod.summary );
+    const std::string joined = squeeze( aMethod.summary );
+    std::string       properties;
+
+    if( aWithProperties && aMethod.inputSchema.contains( "properties" ) && aMethod.inputSchema["properties"].is_object() )
+    {
+        for( const auto& [key, value] : aMethod.inputSchema["properties"].items() )
+            properties += lower( key ) + " ";
+    }
+
+    int score = 0;
+
+    for( const std::string& term : aTerms )
+    {
+        if( name.find( term ) != std::string::npos )
+            score += 3;
+
+        if( summary.find( term ) != std::string::npos || joined.find( term ) != std::string::npos )
+            score += 2;
+
+        if( properties.find( term ) != std::string::npos )
+            score += 1;
+    }
+
+    return score;
+}
+
+
 std::vector<KOPENAPI_METHOD> KOPENAPI_REGISTRY::Search( const std::string& aQuery, size_t aLimit,
                                                         bool aIncludeGuiOnly ) const
 {
@@ -305,29 +351,7 @@ std::vector<KOPENAPI_METHOD> KOPENAPI_REGISTRY::Search( const std::string& aQuer
         if( method.guiOnly && !aIncludeGuiOnly )
             continue;
 
-        int score = terms.empty() ? 1 : 0;
-
-        const std::string name = lower( method.name );
-        const std::string summary = lower( method.summary );
-        std::string       properties;
-
-        if( method.inputSchema.contains( "properties" ) && method.inputSchema["properties"].is_object() )
-        {
-            for( const auto& [key, value] : method.inputSchema["properties"].items() )
-                properties += lower( key ) + " ";
-        }
-
-        for( const std::string& term : terms )
-        {
-            if( name.find( term ) != std::string::npos )
-                score += 3;
-
-            if( summary.find( term ) != std::string::npos )
-                score += 2;
-
-            if( properties.find( term ) != std::string::npos )
-                score += 1;
-        }
+        const int score = terms.empty() ? 1 : scoreMethod( method, terms, true );
 
         if( score > 0 )
             scored.emplace_back( score, std::move( method ) );
@@ -345,6 +369,102 @@ std::vector<KOPENAPI_METHOD> KOPENAPI_REGISTRY::Search( const std::string& aQuer
 
         out.push_back( std::move( method ) );
     }
+
+    return out;
+}
+
+
+static size_t editDistance( const std::string& a, const std::string& b )
+{
+    std::vector<size_t> prev( b.size() + 1 ), cur( b.size() + 1 );
+
+    for( size_t j = 0; j <= b.size(); ++j )
+        prev[j] = j;
+
+    for( size_t i = 1; i <= a.size(); ++i )
+    {
+        cur[0] = i;
+
+        for( size_t j = 1; j <= b.size(); ++j )
+            cur[j] = std::min( { prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + ( a[i - 1] == b[j - 1] ? 0 : 1 ) } );
+
+        std::swap( prev, cur );
+    }
+
+    return prev[b.size()];
+}
+
+
+std::vector<std::string> KOPENAPI_REGISTRY::Similar( const std::string& aName, size_t aLimit, bool aIncludeGuiOnly ) const
+{
+    static const std::set<std::string> generic = { "list", "get", "set", "add", "new", "remove", "delete", "del",
+                                                   "edit", "info", "show", "all", "query", "find", "make", "create" };
+
+    std::vector<KOPENAPI_METHOD> methods;
+
+    for( KOPENAPI_METHOD& method : Snapshot() )
+    {
+        if( !method.guiOnly || aIncludeGuiOnly )
+            methods.push_back( std::move( method ) );
+    }
+
+    std::vector<std::string> tokens = tokenize( aName );
+    std::string              domain;
+
+    if( !tokens.empty()
+        && std::any_of( methods.begin(), methods.end(),
+                        [&]( const KOPENAPI_METHOD& m ) { return m.name.rfind( tokens[0] + "_", 0 ) == 0; } ) )
+    {
+        domain = tokens[0] + "_";
+    }
+
+    std::vector<std::string> terms;
+
+    for( size_t i = domain.empty() ? 0 : 1; i < tokens.size(); ++i )
+    {
+        if( !generic.count( tokens[i] ) && tokens[i].size() >= 3 )
+            terms.push_back( tokens[i] );
+    }
+
+    const std::string               wanted = lower( aName );
+    const size_t                    close = std::max<size_t>( 3, wanted.size() / 3 ) + 1;
+    std::vector<std::pair<size_t, std::string>> spelt;
+    std::vector<std::pair<int, std::string>>    topical;
+
+    for( const KOPENAPI_METHOD& m : methods )
+    {
+        if( const size_t d = editDistance( wanted, m.name ); d < close )
+            spelt.emplace_back( d, m.name );
+        else if( !terms.empty() && ( domain.empty() || m.name.rfind( domain, 0 ) == 0 ) )
+        {
+            if( const int score = scoreMethod( m, terms, false ); score > 0 )
+                topical.emplace_back( score, m.name );
+        }
+    }
+
+    std::stable_sort( spelt.begin(), spelt.end() );
+    std::stable_sort( topical.begin(), topical.end(), []( const auto& a, const auto& b ) { return a.first > b.first; } );
+
+    // a slip of a letter or two, then the topic, then the looser spellings
+    std::vector<std::string> out;
+
+    for( const auto& [d, name] : spelt )
+    {
+        if( d <= 2 )
+            out.push_back( name );
+    }
+
+    for( const auto& [score, name] : topical )
+        out.push_back( name );
+
+    for( const auto& [d, name] : spelt )
+    {
+        if( d > 2 )
+            out.push_back( name );
+    }
+
+    if( out.size() > aLimit )
+        out.resize( aLimit );
 
     return out;
 }

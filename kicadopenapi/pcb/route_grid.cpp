@@ -110,11 +110,13 @@ struct WORLD
     int       L = 0;
     size_t    cells = 0;
     int       h2h = 0;
+    int       holeClearance = 0;
 
     std::vector<SIZES>                sizes;
     std::vector<std::vector<int32_t>> track;   ///< per sizes: L * cells; 0 free, net: only that net, -1 none
     std::vector<std::vector<int32_t>> via;     ///< per sizes: cells
     std::vector<uint8_t>              fine;    ///< cells near a fine-pitch package
+    std::vector<uint8_t>              rows;    ///< cells between the two pin rows of a connector
     std::vector<uint32_t>             keep;    ///< cells around chips (a bit each) where only their own nets' vias go
     std::vector<uint16_t>             away;    ///< cells: distance in cells to the nearest chip pad, up to viaAway; empty none
     std::vector<int32_t>              endOf;   ///< states a net's track there stays inside its end copper: that net
@@ -133,6 +135,7 @@ struct WORLD
         bool                               finePitch = false;
         std::vector<bool>                  walled;    ///< per end: fixed copper parts it from the other ends
         uint32_t                           chips = 0; ///< the chips (keep bits) it has a pad on
+        std::vector<std::pair<int, int>>   holes;     ///< cells of its through-hole ends (on every layer already)
         int                                group = -1;
         int                                rank = 0;
     };
@@ -362,6 +365,7 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
 
     aWorld.L = L;
     aWorld.h2h = std::max( ds.m_HoleToHoleMin, 0 );
+    aWorld.holeClearance = std::max( ds.m_HoleClearance, 0 );
 
     std::map<std::tuple<int, int, int, int>, int> sizesOf;
     std::vector<int>                              sample;   // a net of each sizes for the board's rules
@@ -526,28 +530,33 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
 
                 if( std::shared_ptr<SHAPE> s = aShape( layer ) )
                 {
-                    mark( s, rule( CLEARANCE_CONSTRAINT, &probeVia, aItem, layer, floor ) + sz.viaRadius + slack, L,
-                          aViaHard ? -1 : aOwner );
+                    // the via's copper keeps the clearance, its hole the hole clearance
+                    const int reach = std::max( rule( CLEARANCE_CONSTRAINT, &probeVia, aItem, layer, floor ) + sz.viaRadius,
+                                                rule( HOLE_CLEARANCE_CONSTRAINT, &probeVia, aItem, layer, ds.m_HoleClearance )
+                                                        + sz.viaDrill / 2 );
+                    mark( s, reach + slack, L, aViaHard ? -1 : aOwner );
                 }
             }
         };
 
-        auto hole = [&]( BOARD_ITEM* aItem, std::shared_ptr<const SHAPE> aHole, bool aNpth )
+        // another net's copper keeps the hole clearance from a hole, plated or not
+        auto hole = [&]( BOARD_ITEM* aItem, std::shared_ptr<const SHAPE> aHole, int32_t aOwner )
         {
-            if( aNpth )
+            for( int l = 0; l < L; ++l )
             {
-                for( int l = 0; l < L; ++l )
-                {
-                    probeTrack.SetLayer( aParams.layers[l] );
-                    mark( aHole, rule( HOLE_CLEARANCE_CONSTRAINT, &probeTrack, aItem, aParams.layers[l], ds.m_HoleClearance )
-                                         + sz.halfWidth + slack,
-                          l, -1 );
-                }
+                probeTrack.SetLayer( aParams.layers[l] );
+                mark( aHole, rule( HOLE_CLEARANCE_CONSTRAINT, &probeTrack, aItem, aParams.layers[l], ds.m_HoleClearance )
+                                     + sz.halfWidth + slack,
+                      l, aOwner );
             }
 
             if( vias )
+            {
                 mark( aHole, rule( HOLE_TO_HOLE_CONSTRAINT, &probeVia, aItem, F_Cu, aWorld.h2h ) + sz.viaDrill / 2 + slack,
                       L, -1 );
+                mark( aHole, rule( HOLE_CLEARANCE_CONSTRAINT, &probeVia, aItem, F_Cu, ds.m_HoleClearance ) + sz.viaRadius + slack,
+                      L, aOwner );
+            }
         };
 
         auto ownerOf = []( BOARD_CONNECTED_ITEM* aItem ) { return aItem->GetNetCode() > 0 ? aItem->GetNetCode() : -1; };
@@ -567,7 +576,7 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
                             } );
 
                 if( pad->HasHole() )
-                    hole( pad, pad->GetEffectiveHoleShape(), pad->GetAttribute() == PAD_ATTRIB::NPTH );
+                    hole( pad, pad->GetEffectiveHoleShape(), pad->GetAttribute() == PAD_ATTRIB::NPTH ? -1 : ownerOf( pad ) );
             }
 
             for( BOARD_ITEM* item : fp->GraphicalItems() )
@@ -591,10 +600,24 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
                             return t->GetEffectiveShape( aLayer );
                         } );
 
-            if( t->Type() == PCB_VIA_T && vias )
+            if( t->Type() == PCB_VIA_T )
             {
                 std::shared_ptr<SHAPE_SEGMENT> h = static_cast<PCB_VIA*>( t )->GetEffectiveHoleShape();
-                mark( h, aWorld.h2h + sz.viaDrill / 2 + slack, L, -1 );
+
+                for( int l = 0; l < L; ++l )
+                {
+                    probeTrack.SetLayer( aParams.layers[l] );
+                    mark( h, rule( HOLE_CLEARANCE_CONSTRAINT, &probeTrack, t, aParams.layers[l], ds.m_HoleClearance )
+                                     + sz.halfWidth + slack,
+                          l, ownerOf( t ) );
+                }
+
+                if( vias )
+                {
+                    mark( h, aWorld.h2h + sz.viaDrill / 2 + slack, L, -1 );
+                    mark( h, rule( HOLE_CLEARANCE_CONSTRAINT, &probeVia, t, F_Cu, ds.m_HoleClearance ) + sz.viaRadius + slack, L,
+                          ownerOf( t ) );
+                }
             }
         }
 
@@ -813,6 +836,69 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
         }
     }
 
+    // between the two pin rows of a connector (a 2-row header): a way out for its pins, not a channel
+    if( aParams.rowsCost > 1.0f )
+    {
+        aWorld.rows.assign( cells, 0 );
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            if( isPackage( fp ) )
+                continue;
+
+            std::vector<VECTOR2I> at;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( pad->HasHole() && pad->GetAttribute() == PAD_ATTRIB::PTH )
+                    at.push_back( pad->GetPosition() );
+            }
+
+            if( at.size() < 6 )
+                continue;
+
+            for( int axis = 0; axis < 2; ++axis )
+            {
+                const int                 tol = pcbIUScale.mmToIU( 0.05 );
+                std::map<int, int>        lines;   // row coordinate across the rows -> pins
+                int                       lo = INT_MAX, hi = INT_MIN;
+
+                for( const VECTOR2I& p : at )
+                {
+                    const int across = axis == 0 ? p.x : p.y;
+                    const int along = axis == 0 ? p.y : p.x;
+                    auto      it = std::find_if( lines.begin(), lines.end(), [&]( const auto& l ) { return std::abs( l.first - across ) <= tol; } );
+
+                    if( it == lines.end() )
+                        lines[across] = 1;
+                    else
+                        it->second++;
+
+                    lo = std::min( lo, along );
+                    hi = std::max( hi, along );
+                }
+
+                if( lines.size() != 2 || lines.begin()->second < 3 || lines.rbegin()->second < 3 )
+                    continue;
+
+                const int a = lines.begin()->first, b = lines.rbegin()->first;
+
+                for( int y = 0; y < grid.ny; ++y )
+                {
+                    for( int x = 0; x < grid.nx; ++x )
+                    {
+                        const VECTOR2I c = grid.Centre( x, y );
+                        const int      across = axis == 0 ? c.x : c.y;
+                        const int      along = axis == 0 ? c.y : c.x;
+
+                        if( across > a && across < b && along >= lo && along <= hi )
+                            aWorld.rows[grid.Index( x, y )] = 1;
+                    }
+                }
+            }
+        }
+    }
+
     // around packages (not arrays, whose vias sit between the balls): how far each cell is from
     // the nearest pad, for the price of a via there
     if( aParams.viaAway > 0 && L > 1 )
@@ -895,6 +981,15 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
 
             if( PAD* pad = dynamic_cast<PAD*>( end ); pad && chipBit.count( pad->GetParentFootprint() ) )
                 net.chips |= chipBit[pad->GetParentFootprint()];
+
+            if( PAD* pad = dynamic_cast<PAD*>( end ); ( pad && pad->HasHole() && pad->GetAttribute() == PAD_ATTRIB::PTH )
+                                                      || end->Type() == PCB_VIA_T )
+            {
+                int hx = 0, hy = 0;
+
+                if( grid.CellOf( end->GetPosition(), hx, hy ) )
+                    net.holes.emplace_back( hx, hy );
+            }
 
             for( int l = 0; l < L; ++l )
             {
@@ -1049,14 +1144,19 @@ public:
                 const SIZES& x = m_w.sizes[a];
                 const SIZES& y = m_w.sizes[b];
                 const int    clr = std::max( x.clearance, y.clearance );
-                const double viaVia = std::max( x.viaRadius + y.viaRadius + clr, ( x.viaDrill + y.viaDrill ) / 2 + m_w.h2h );
+                const double viaVia = std::max( { x.viaRadius + y.viaRadius + clr, ( x.viaDrill + y.viaDrill ) / 2 + m_w.h2h,
+                                                  x.viaRadius + y.viaDrill / 2 + m_w.holeClearance,
+                                                  y.viaRadius + x.viaDrill / 2 + m_w.holeClearance } );
+                // a via's reach to another net's track: its copper's clearance or its hole's
+                const double xVia = std::max( x.viaRadius + clr, x.viaDrill / 2 + m_w.holeClearance );
+                const double yVia = std::max( y.viaRadius + clr, y.viaDrill / 2 + m_w.holeClearance );
 
                 // a's track / via onto b's track map and b's via map
                 // a via against a track: room for the track's diagonal steps past it (track against
                 // track stays exact, parallel runs at the minimum pitch)
                 m_trackDisk[a].push_back( { DISK( ( x.halfWidth + clr + y.halfWidth ) / c ),
-                                            DISK( ( x.viaRadius + clr + y.halfWidth ) / c, 0.5 ) } );
-                m_viaDisk[a].push_back( { DISK( ( x.halfWidth + clr + y.viaRadius ) / c, 0.5 ), DISK( viaVia / c ) } );
+                                            DISK( ( xVia + y.halfWidth ) / c, 0.5 ) } );
+                m_viaDisk[a].push_back( { DISK( ( x.halfWidth + yVia ) / c, 0.5 ), DISK( viaVia / c ) } );
             }
         }
 
@@ -1064,6 +1164,8 @@ public:
         m_fineCost = 10.0f * (float) ( pcbIUScale.mmToIU( 3.0 ) / c );
         m_awayCells = (float) ( m_params.viaAway / c );
         m_awayCost = 10.0f * (float) ( m_params.viaAwayCost / c );
+        m_nearHoleCells = (float) ( m_params.viaNearHole / c );
+        m_nearHoleCost = 10.0f * (float) ( m_params.viaNearHoleCost / c );
 
         if( m_params.hug < 1.0f && std::any_of( m_w.nets.begin(), m_w.nets.end(), []( const WORLD::NET& n ) { return n.group >= 0; } ) )
         {
@@ -2160,9 +2262,27 @@ private:
         const size_t      cells = m_w.cells;
         const int         k = wn.sizes;
 
+        // between a connector's pin rows only where the path went already
+        std::unordered_set<uint32_t> inRows;
+
+        if( !m_w.rows.empty() )
+        {
+            for( uint32_t s : aPath )
+            {
+                if( m_w.rows[s % cells] )
+                    inRows.insert( s );
+            }
+        }
+
         auto free = [&]( uint32_t s )
         {
-            return m_w.InOwnEnd( s, wn.code ) || ( m_w.TrackOk( k, s, wn.code ) && m_occTrack[k][s] == 0 );
+            if( m_w.InOwnEnd( s, wn.code ) )
+                return true;
+
+            if( !m_w.rows.empty() && m_w.rows[s % cells] && !inRows.count( s ) )
+                return false;
+
+            return m_w.TrackOk( k, s, wn.code ) && m_occTrack[k][s] == 0;
         };
 
         auto dirOf = []( int dx, int dy )
@@ -2805,10 +2925,12 @@ private:
                                          ? m_params.hug
                                          : 1.0f;
 
-            if( aHard )
-                return occ ? -1.0f : hug;
+            const float rows = !m_w.rows.empty() && m_w.rows[s % cells] ? m_params.rowsCost : 1.0f;
 
-            return ( 1.0f + m_hist[s] ) * ( 1.0f + aPf * occ ) * hug;
+            if( aHard )
+                return occ ? -1.0f : hug * rows;
+
+            return ( 1.0f + m_hist[s] ) * ( 1.0f + aPf * occ ) * hug * rows;
         };
 
         while( !open.empty() )
@@ -2921,7 +3043,8 @@ private:
 
                 const float base = m_viaCost * m_viaScale * ( aHard ? 1.0f : ( 1.0f + m_histVia[i] ) * ( 1.0f + aPf * occ ) )
                                    + ( m_w.fine[i] ? m_fineCost : 0.0f )
-                                   + ( !m_w.away.empty() && m_w.away[i] < m_awayCells ? m_awayCost * ( 1.0f - m_w.away[i] / m_awayCells ) : 0.0f );
+                                   + ( !m_w.away.empty() && m_w.away[i] < m_awayCells ? m_awayCost * ( 1.0f - m_w.away[i] / m_awayCells ) : 0.0f )
+                                   + nearHole( wn, x, y );
 
                 for( int to = 0; to < L; ++to )
                 {
@@ -2988,6 +3111,24 @@ private:
     float m_fineCost = 0;
     float m_awayCells = 0;
     float m_awayCost = 0;
+    float m_nearHoleCells = 0;
+    float m_nearHoleCost = 0;
+
+    /// @brief A via beside a through hole of its own net: the hole is on every layer already
+    float nearHole( const WORLD::NET& aNet, int aX, int aY ) const
+    {
+        float worst = 0;
+
+        for( const auto& [hx, hy] : aNet.holes )
+        {
+            const float d = std::hypot( (float) ( aX - hx ), (float) ( aY - hy ) );
+
+            if( d < m_nearHoleCells )
+                worst = std::max( worst, m_nearHoleCost * ( 1.0f - d / m_nearHoleCells ) );
+        }
+
+        return worst;
+    }
 
     std::vector<uint16_t> m_band;        ///< states beside bundle copper: how many members' copper
     std::vector<uint16_t> m_bandGroup;   ///< and of which bundle (+1)
@@ -3093,6 +3234,7 @@ uint64_t worldPrint( const WORLD& aWorld, const BOARD* aBoard )
     mix( (uint64_t) aWorld.grid.ny );
     mix( (uint64_t) aWorld.L );
     mix( (uint64_t) aWorld.h2h );
+    mix( (uint64_t) aWorld.holeClearance );
 
     for( const SIZES& sz : aWorld.sizes )
     {
@@ -3226,6 +3368,7 @@ uint64_t rulesPrint( const WORLD& aWorld, const BOARD* aBoard, bool aNets )
     mix( (uint64_t) aWorld.grid.ny );
     mix( (uint64_t) aWorld.L );
     mix( (uint64_t) aWorld.h2h );
+    mix( (uint64_t) aWorld.holeClearance );
 
     for( const SIZES& sz : aWorld.sizes )
     {

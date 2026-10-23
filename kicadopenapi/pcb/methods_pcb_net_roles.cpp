@@ -99,6 +99,8 @@ struct NET_FACTS
     std::string              netClass;
     double                   widthMm = 0;
     double                   currentA = -1;
+    nlohmann::json           edge;                  ///< driver edge data from the project (pcb_net_roles_set)
+    nlohmann::json           termination;
     bool                     fixedRole = false;     ///< set by the project: nothing else changes it
 
     void Set( const std::string& aRole, const std::string& aSource, const std::string& aWhy )
@@ -341,6 +343,12 @@ static KOPENAPI_RESULT h_pcb_net_roles( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
         for( const auto& t : it->value( "tags", nlohmann::json::array() ) )
             f.tags.insert( t.get<std::string>() );
+
+        if( it->contains( "edge" ) )
+            f.edge = ( *it )["edge"];
+
+        if( it->contains( "termination" ) )
+            f.termination = ( *it )["termination"];
     }
 
     // rails: high current by the project's current or the class width
@@ -859,6 +867,12 @@ static KOPENAPI_RESULT h_pcb_net_roles( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( f.currentA >= 0 )
             row["current_a"] = f.currentA;
 
+        if( f.edge.is_object() )
+            row["edge"] = f.edge;
+
+        if( f.termination.is_object() )
+            row["termination"] = f.termination;
+
         rows.push_back( row );
 
         if( isPowerRole( f.role ) )
@@ -958,6 +972,29 @@ static KOPENAPI_RESULT h_pcb_net_roles_set( KOPENAPI_CONTEXT& aCtx, const nlohma
 
         if( row.contains( "tags" ) )
             entry["tags"] = row["tags"];
+
+        for( const char* key : { "edge", "termination" } )
+        {
+            if( !row.contains( key ) )
+                continue;
+
+            if( row[key].is_null() )
+            {
+                entry.erase( key );
+                continue;
+            }
+
+            const std::string error = std::string( key ) == "edge" ? KopenapiEdgeCheck( row[key] )
+                                                                   : KopenapiTerminationCheck( row[key] );
+
+            if( !error.empty() )
+                return KOPENAPI_RESULT::Error( 400, "nets[" + net + "]." + key + ": " + error );
+
+            entry[key] = row[key];
+        }
+
+        if( entry.empty() )
+            stored["nets"].erase( net );
     }
 
     for( const auto& n : aArgs.value( "remove_nets", nlohmann::json::array() ) )
@@ -1048,8 +1085,10 @@ KOPENAPI_REGISTER( "pcb_net_roles",
                    false, h_pcb_net_roles );
 
 KOPENAPI_REGISTER( "pcb_net_roles_set",
-                   "Store net roles, rail currents and bundles in the project (.kicad_pro, kicadopenapi.net_roles); "
-                   "pcb_net_roles puts them above everything it detects: nets [{net, role?, current_a?, tags?}], "
+                   "Store net roles, rail currents, driver edge data and terminations and bundles in the project "
+                   "(.kicad_pro, kicadopenapi.net_roles); pcb_net_roles puts them above everything it detects: nets "
+                   "[{net, role?, current_a?, tags?, edge?, termination?}] (edge: {family, tr_ps, tr_def 10-90 / "
+                   "20-80, rout_ohm, swing_v, nm_v, driver ref.pin}, see pcb_signal_check; null removes), "
                    "remove_nets, bundles [{name, members: nets}], remove_bundles, accept_bundles (names of detected "
                    "bundles, stored with their member nets as they are now), clear. Answers what is stored and the "
                    "nets not on the board",
@@ -1058,7 +1097,9 @@ KOPENAPI_REGISTER( "pcb_net_roles_set",
                             "net":{"type":"string"},
                             "role":{"type":"string","enum":["ground","power","power_hc","pair","clock","matched","bus","analog","analog_hs","switching","signal","nc","fixed"]},
                             "current_a":{"type":"number","minimum":0},
-                            "tags":{"type":"array","items":{"type":"string"}}},"required":["net"]}},
+                            "tags":{"type":"array","items":{"type":"string"}},
+                            "edge":{"type":["object","null"],"description":"driver edge: {family (lvcmos33, lvcmos18, hc, ahc, ac, f, mcu_fast, mcu_slow, fpga_fast, fpga_slow, sstl, lvds, hcsl, cml, usb2_hs), tr_ps, tr_def (10-90 default, 20-80), rout_ohm, swing_v, nm_v, driver (ref.pin)}; given values win over the family defaults"},
+                            "termination":{"type":["object","null"],"description":"{kind: none / series / end / thevenin / rc / on_die / both, dc_balanced?}; overrides what pcb_signal_check detects"}},"required":["net"]}},
                         "remove_nets":{"type":"array","items":{"type":"string"}},
                         "bundles":{"type":"array","items":{"type":"object","properties":{
                             "name":{"type":"string"},

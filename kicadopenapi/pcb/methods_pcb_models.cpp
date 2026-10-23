@@ -516,6 +516,7 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
         const std::vector<std::vector<glm::vec2>> edge = boardEdgeAt( outline, fp );
         std::vector<size_t>          floating;   // issues of models above the board
         bool                         seated = false;
+        std::vector<std::pair<std::string, std::array<double, 6>>> boxes;   // shown models on the board
 
         for( const FP_3DMODEL& m : fp->Models() )
         {
@@ -596,6 +597,7 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                     const double rest = g.hasSeat ? g.seat : ( tht ? g.bodyBottom : g.min[2] );
                     const double gap = rest;
 
+                    boxes.push_back( { str( m.m_Filename ), { lo[0], lo[1], lo[2], hi[0], hi[1], hi[2] } } );
                     row["bbox_board_mm"] = { { "min", { r2( lo[0] ), r2( lo[1] ), r2( lo[2] ) } },
                                              { "max", { r2( hi[0] ), r2( hi[1] ), r2( hi[2] ) } } };
                     row["height_mm"] = r2( shown.max[2] - std::max( 0.0, shown.min[2] ) );
@@ -611,7 +613,19 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
                     }
 
                     if( !edge.empty() )
-                        row["seat"]["over_board_edge"] = true;
+                    {
+                        // near the edge: flagged only when the model's box on the board reaches past it
+                        SHAPE_POLY_SET past;
+                        past.NewOutline();
+                        past.Append( pcbIUScale.mmToIU( lo[0] ), pcbIUScale.mmToIU( lo[1] ) );
+                        past.Append( pcbIUScale.mmToIU( hi[0] ), pcbIUScale.mmToIU( lo[1] ) );
+                        past.Append( pcbIUScale.mmToIU( hi[0] ), pcbIUScale.mmToIU( hi[1] ) );
+                        past.Append( pcbIUScale.mmToIU( lo[0] ), pcbIUScale.mmToIU( hi[1] ) );
+                        past.BooleanSubtract( outline );
+
+                        if( past.Area() > pcbIUScale.mmToIU( 0.1 ) * (double) pcbIUScale.mmToIU( 0.1 ) )
+                            row["seat"]["over_board_edge"] = true;
+                    }
 
                     if( measured != file )
                         row["seat"]["measured_on"] = "generic model (this is a cut copy)";
@@ -715,6 +729,30 @@ static KOPENAPI_RESULT h_pcb_models_inspect( KOPENAPI_CONTEXT& aCtx, const nlohm
 
         if( !shown )
             issues.push_back( "no 3D model shown" );
+
+        // two shown models filling the same space draw coincident surfaces: they flicker (z-fighting)
+        for( size_t a = 0; a < boxes.size(); ++a )
+        {
+            for( size_t b = a + 1; b < boxes.size(); ++b )
+            {
+                const std::array<double, 6>& p = boxes[a].second;
+                const std::array<double, 6>& q = boxes[b].second;
+                double common = 1, vp = 1, vq = 1;
+
+                for( int i = 0; i < 3; ++i )
+                {
+                    common *= std::max( 0.0, std::min( p[i + 3], q[i + 3] ) - std::max( p[i], q[i] ) );
+                    vp *= std::max( 1e-6, p[i + 3] - p[i] );
+                    vq *= std::max( 1e-6, q[i + 3] - q[i] );
+                }
+
+                if( common > 0.5 * std::min( vp, vq ) )
+                {
+                    issues.push_back( "two models shown in the same place (" + boxes[a].first + ", " + boxes[b].first
+                                      + "): their surfaces flicker in 3D; show one" );
+                }
+            }
+        }
 
         // a part standing on another model of its footprint (a chip on its socket) rests on that
         if( seated && !floating.empty() )
@@ -849,7 +887,7 @@ KOPENAPI_REGISTER( "pcb_models_inspect",
                    "exists), shown, trimmed, offset / rotation / scale, bounding box on the board (mm, z "
                    "up from the top surface), height, seating (THT: body bottom; SMD: lowest point) with "
                    "the gap to the board and lead length below it; problems: missing file, no model, "
-                   "floating, sunk. Seating class per model (<model>.meta.json mount: seat, a1_mm [min, max | "
+                   "floating, sunk, two shown models in the same place (they flicker). Seating class per model (<model>.meta.json mount: seat, a1_mm [min, max | "
                    "null], below_board, socket_ref, formed; else by name): "
                    "shoulder (DIP / SIP chips: gap = package A1, JEDEC >= 0.38 mm), free (TO-92, LEDs, "
                    "HC-49, upright TO-220 / TO-247 ...: any height, footprint field mount_height_mm checks it), body (gap 0), "
