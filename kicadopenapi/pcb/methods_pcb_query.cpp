@@ -46,7 +46,7 @@ KOPENAPI_REGISTER( "pcb_query",
                    R"json({"type":"object","properties":{
                         "from":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string","enum":["footprints","pads","tracks","vias","zones","drawings","texts","groups","items"]}}],"default":"footprints"},
                         "where":{"type":"string","description":"KiCad DRC condition, e.g. A.side() == 'bottom' && A.mount() == 'smd'"},
-                        "select":{"type":"array","items":{"type":"string"},"description":"property names (Reference, Value, Layer, Net, Width, Position_X ...) or functions (A.side())"},
+                        "select":{"type":"array","items":{"type":"string"},"description":"property names (Reference, Value, Layer, Net, Width, Position_X ...) or functions (A.side(); a bare parentRef / side / mount / courtyard is the same); a name that is neither for the queried kinds is a 400 with close names (as group_by / order_by / aggregate)"},
                         "group_by":{"type":"array","items":{"type":"string"}},
                         "aggregate":{"type":"object","additionalProperties":{"type":"string"},"description":"name: count | sum(x) | min(x) | max(x) | avg(x) | distinct(x)"},
                         "order_by":{"type":"array","items":{"type":"string"},"description":"fields, '-' prefix for descending; references sort naturally"},

@@ -153,6 +153,20 @@ int connectablePads( const FOOTPRINT* aFp )
 }
 
 
+/// @brief Mounting pads by the library convention: numbered "MP" (JST SH tabs, shields of
+/// some connectors); a symbol has no pin for them
+bool hasMountingPads( const FOOTPRINT* aFp )
+{
+    for( const PAD* pad : aFp->Pads() )
+    {
+        if( pad->GetAttribute() != PAD_ATTRIB::NPTH && pad->GetNumber() == wxS( "MP" ) )
+            return true;
+    }
+
+    return false;
+}
+
+
 /// @brief KiCad footprint filter semantics (as the footprint chooser applies ki_fp_filters): a pattern
 /// with ':' matches LIB:NAME, otherwise the name; '*' and '?' wildcards; case-insensitive.
 bool matchesFilters( const std::vector<std::string>& aFilters, const std::string& aLib, const std::string& aName )
@@ -306,7 +320,8 @@ static KOPENAPI_RESULT h_pcb_lib_footprint_search( KOPENAPI_CONTEXT& aCtx, const
             if( !matchesFilters( filters, lib, name ) )
                 continue;
 
-            if( pads >= 0 && connectablePads( fp ) != pads )
+            if( pads >= 0 && connectablePads( fp ) != pads
+                && !( hasMountingPads( fp ) && connectablePads( fp ) - 1 == pads ) )
                 continue;
 
             if( !type.empty() && type != mountType( fp ) )
@@ -433,7 +448,7 @@ KOPENAPI_REGISTER( "pcb_lib_footprint_search",
                    KopenapiPagedSchema( R"json({
                         "query":{"type":"string","description":"words; items matching all of them, else best partial matches (partial, unmatched_terms)"},
                         "filters":{"type":"array","items":{"type":"string"},"description":"footprint filters, e.g. [\"SOT?23*\"]"},
-                        "pads":{"type":"integer","description":"exact number of connectable pads (= symbol pins)"},
+                        "pads":{"type":"integer","description":"exact number of connectable pads (= symbol pins); mounting pads numbered MP not counted"},
                         "type":{"type":"string","enum":["smd","tht","unspecified"]},
                         "lib":{"type":"string","description":"glob on the library name"}})json"_json, KOPENAPI_RANKED_PAGE ),
                    false, h_pcb_lib_footprint_search, 600 );

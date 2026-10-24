@@ -2,7 +2,7 @@
 /// @brief kicadopenapi schematic wire router: orthogonal routes on the connection grid that do not
 /// change connectivity by accident.  A route must not run along another wire, touch another
 /// wire's end or another connection point (pin end, label, junction, no-connect), put a corner on
-/// a wire, or cross a symbol body.  Straight, L, then Z shapes are tried; the fewest segments and
+/// a wire, cross a symbol body or reach a pin from inside its part.  Straight, L, then Z shapes are tried; the fewest segments and
 /// then the shortest wins.
 #ifndef KOPENAPI_SCH_ROUTER_H
 #define KOPENAPI_SCH_ROUTER_H
@@ -21,6 +21,10 @@ class SCH_SHEET_PATH;
 
 namespace kopenapi_sch
 {
+
+/// @brief An axis-aligned segment enters the open interior of a box
+bool SegmentCrossesBody( const VECTOR2I& aA, const VECTOR2I& aB, const BOX2I& aBox );
+
 
 class WIRE_ROUTER
 {
@@ -46,7 +50,14 @@ private:
     std::vector<VECTOR2I>                          m_points;
     std::vector<BOX2I>                             m_bodies;
     std::vector<std::string>                       m_bodyNames;   ///< reference of each body
-    std::vector<std::pair<VECTOR2I, size_t>>       m_pinOwner;    ///< pin end -> index into m_bodies
+    struct PIN_END
+    {
+        VECTOR2I pos;
+        size_t   body;   ///< index into m_bodies
+        VECTOR2I out;    ///< unit step away from the body; zero for a pin on the body edge
+    };
+
+    std::vector<PIN_END>                           m_pinOwner;
 };
 
 } // namespace kopenapi_sch

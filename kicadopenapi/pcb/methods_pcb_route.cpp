@@ -167,9 +167,9 @@ int netClearance( BOARD_CONNECTED_ITEM* aItem, int aFloor )
 
 
 /// @brief Gross errors in a staged route: new or moved copper (aChanged) within the clearance of copper
-/// of another net - pads, tracks, vias, filled zones; removed items do not count.  The clearance is
-/// the board's rule for the pair (DRC engine: custom rules, net classes, board minimum), as DRC and
-/// the router see it.  aZonesYield: the caller refills the zones afterwards, so other nets' fills give
+/// of another net - pads, tracks, vias, filled zones - or inside a keep-out that bars it; removed
+/// items do not count.  The clearance is the board's rule for the pair (DRC engine: custom rules,
+/// net classes, board minimum), as DRC and the router see it.  aZonesYield: the caller refills the zones afterwards, so other nets' fills give
 /// way and do not count.  aStaged: copper of the same call that is not on the board yet.
 nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& aChanged,
                       const std::set<BOARD_ITEM*>& aRemoved, bool aZonesYield = false,
@@ -251,6 +251,7 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
     {
         BOX2I reach = item->GetBoundingBox();
         reach.Inflate( widest );
+        std::set<ZONE*> barredBy;
 
         for( PCB_LAYER_ID layer : item->GetLayerSet().CuStack() )
         {
@@ -332,6 +333,28 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
                                             { "new", describe( item ) },
                                             { "other", { { "zone", str( zone->GetZoneName() ) },
                                                          { "net", str( UnescapeString( zone->GetNetname() ) ) } } } } );
+                }
+            }
+
+            for( ZONE* zone : aBoard->Zones() )
+            {
+                if( !zone->GetIsRuleArea() || barredBy.count( zone ) || !zone->IsOnLayer( layer )
+                    || !reach.Intersects( zone->GetBoundingBox() ) )
+                {
+                    continue;
+                }
+
+                const bool barred = item->Type() == PCB_VIA_T   ? zone->GetDoNotAllowVias()
+                                    : item->Type() == PCB_PAD_T ? zone->GetDoNotAllowPads()
+                                                                : zone->GetDoNotAllowTracks();
+
+                if( barred && zone->Outline()->Collide( shape.get(), 0 ) )
+                {
+                    barredBy.insert( zone );
+                    violations.push_back( { { "layer", str( aBoard->GetLayerName( layer ) ) },
+                                            { "new", describe( item ) },
+                                            { "other", { { "keepout", str( zone->GetZoneName() ) },
+                                                         { "uuid", str( zone->m_Uuid.AsString() ) } } } } );
                 }
             }
         }
@@ -6182,7 +6205,7 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     if( !violations.empty() )
     {
-        KOPENAPI_RESULT rejected = KOPENAPI_RESULT::Error( 422, "rejected by the guard: this copper would touch another net" );
+        KOPENAPI_RESULT rejected = KOPENAPI_RESULT::Error( 422, "rejected by the guard: this copper would touch another net or enter a keep-out" );
         rejected.body["violations"] = violations;
         rejected.body["segments"] = segments;
         return rejected;
@@ -6804,8 +6827,8 @@ KOPENAPI_REGISTER( "pcb_track_add",
                    "Lay a track by hand along given points (no router): from a pad and / or to a pad (their "
                    "centres) through points in mm; a point with via continues on that layer through a via. "
                    "Width and via size from the net's class unless width_mm is given. The same guard as the "
-                   "router: copper that would touch another net is refused (422 with the violations), nothing "
-                   "is added then. One undo step; dry_run checks only",
+                   "router: copper that would touch another net or enter a keep-out is refused (422 with the "
+                   "violations), nothing is added then. One undo step; dry_run checks only",
                    R"json({"type":"object","properties":{
                         "from":{"type":"string","description":"REF.PAD: start at its centre, on its net"},
                         "to":{"type":"string","description":"REF.PAD of the same net: end at its centre"},

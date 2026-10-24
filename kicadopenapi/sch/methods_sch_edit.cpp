@@ -55,10 +55,15 @@
 #include <wx/ffile.h>
 #include <wx/timer.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <functional>
+#include <limits>
 #include <map>
+#include <numeric>
+#include <set>
 
 using namespace kopenapi_sch;
 
@@ -769,7 +774,7 @@ VECTOR2I powerNaturalDirection( LIB_SYMBOL* aLib, SCHEMATIC* aSchematic, const S
 
 /// @brief A power symbol with its pin on aPoint and its body pointing aBody, numbered #PWR<n>
 SCH_SYMBOL* makePowerSymbol( LIB_SYMBOL* aLib, SCHEMATIC* aSchematic, const SCH_SHEET_PATH& aPath, const VECTOR2I& aPoint,
-                             const VECTOR2I& aBody, std::set<wxString>& aTaken )
+                             const VECTOR2I& aBody, std::set<wxString>& aTaken, const wxString& aNet = wxEmptyString )
 {
     std::unique_ptr<LIB_SYMBOL> flat = aLib->Flatten();
     auto*                       symbol = new SCH_SYMBOL( *flat, aLib->GetLibId(), &aPath, 1, 1, aPoint, aSchematic );
@@ -787,6 +792,11 @@ SCH_SYMBOL* makePowerSymbol( LIB_SYMBOL* aLib, SCHEMATIC* aSchematic, const SCH_
 
     const bool flag = aLib->GetName().CmpNoCase( wxS( "PWR_FLAG" ) ) == 0;
     symbol->SetRef( &aPath, nextFreeRef( aSchematic, flag ? wxS( "#FLG" ) : wxS( "#PWR" ), aTaken ) );
+
+    // a power symbol's value names its net: power:+3V3 drawn for the rail +3V3_PM
+    if( !flag && !aNet.IsEmpty() && symbol->GetField( FIELD_T::VALUE )->GetText() != aNet )
+        symbol->GetField( FIELD_T::VALUE )->SetText( aNet );
+
     symbol->AutoplaceFields( nullptr, AUTOPLACE_AUTO );
     return symbol;
 }
@@ -1368,6 +1378,390 @@ static KOPENAPI_RESULT h_sch_wire( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
 
     return KOPENAPI_RESULT::Ok( result );
 }
+
+
+namespace
+{
+
+/// @brief Pins grouped by the net they are on (net names aside): equal before and after an edit =
+/// the circuit is unchanged
+std::set<std::vector<std::string>> pinPartition( SCHEMATIC* aSchematic )
+{
+    std::map<std::string, std::vector<std::string>> byNet;
+
+    for( const NET_ENTRY& net : collectNets( aSchematic ) )
+    {
+        for( const auto& [pin, path] : netPins( net ) )
+        {
+            if( SCH_SYMBOL* symbol = pinSymbol( pin ); symbol && !symbol->IsPower() )
+                byNet[net.name].push_back( pinId( pin, path ) );
+        }
+    }
+
+    std::set<std::vector<std::string>> groups;
+
+    for( auto& [name, pins] : byNet )
+    {
+        std::sort( pins.begin(), pins.end() );
+        groups.insert( pins );
+    }
+
+    return groups;
+}
+
+} // namespace
+
+
+/// @brief sch_rewire: local labels that join pins of parts near each other become wires.  Per net
+/// name on the sheet, the label-carrying pins are linked by a shortest tree; each link up to max_mm
+/// is routed with the wire router (no other pin, wire end, label or body touched); in every group
+/// of pins the wires now join, one label stays (the net keeps its name, far groups stay linked).
+/// The pin partition before and after must be equal, else everything is put back.
+static KOPENAPI_RESULT h_sch_texts_settle( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    std::optional<SCH_SHEET_PATH> sheet = targetSheet( *context, aArgs );
+
+    if( !sheet )
+        return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+
+    SCH_SCREEN*       screen = sheet->LastScreen();
+    SCH_COMMIT        commit( context->GetToolManager() );
+    std::vector<KIID> touched;
+    std::set<std::string> moved, stuck;
+
+    auto positions = []( SCH_SYMBOL* aSymbol )
+    {
+        std::vector<VECTOR2I> at;
+
+        for( SCH_FIELD& field : aSymbol->GetFields() )
+            at.push_back( field.GetPosition() );
+
+        return at;
+    };
+
+    // twice: texts moved off a spot in the first pass may free another part's spot
+    for( int pass = 0; pass < 2; ++pass )
+    {
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+            if( symbol->IsLocked() )
+                continue;
+
+            const std::vector<VECTOR2I> before = positions( symbol );
+            const bool                  clear = placeFieldsClear( symbol, screen, *sheet, false );
+            const std::vector<VECTOR2I> after = positions( symbol );
+            const std::string           ref = str( symbol->GetRef( &*sheet, false ) );
+
+            if( !clear )
+                stuck.insert( ref );
+            else
+                stuck.erase( ref );
+
+            if( after == before )
+                continue;
+
+            // the commit keeps the state before the change: put it back, record, redo
+            size_t k = 0;
+
+            for( SCH_FIELD& field : symbol->GetFields() )
+                field.SetPosition( before[k++] );
+
+            commit.Modify( symbol, screen );
+            placeFieldsClear( symbol, screen, *sheet, false );
+            moved.insert( ref );
+            touched.push_back( symbol->m_Uuid );
+        }
+    }
+
+    if( !commit.Empty() )
+        pushEdit( commit, context->GetSchematic(), _( "Settle texts (API)" ), aCtx.kiway, touched );
+
+    return KOPENAPI_RESULT::Ok( { { "sheet", sheetPath( *sheet ) },
+                                  { "moved", std::vector<std::string>( moved.begin(), moved.end() ) },
+                                  { "stuck", std::vector<std::string>( stuck.begin(), stuck.end() ) } } );
+}
+
+
+static KOPENAPI_RESULT h_sch_rewire( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    std::optional<SCH_SHEET_PATH> sheet = targetSheet( *context, aArgs );
+
+    if( !sheet )
+        return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+
+    SCHEMATIC*   schematic = context->GetSchematic();
+    SCH_SCREEN*  screen = sheet->LastScreen();
+    const double maxMm = aArgs.value( "max_mm", 50.8 );
+    const bool   dryRun = aArgs.value( "dry_run", false );
+    const std::string only = aArgs.value( "net", std::string() );
+
+    // pin ends of the sheet's parts, with the pin's REF.PIN
+    std::map<std::pair<int, int>, std::string> pinAt;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        if( symbol->IsPower() )
+            continue;
+
+        for( SCH_PIN* pin : symbol->GetPins( &*sheet ) )
+            pinAt[{ pin->GetPosition().x, pin->GetPosition().y }] = pinId( pin, *sheet );
+    }
+
+    struct PIN_LABEL
+    {
+        SCH_LABEL_BASE* label;
+        std::string     pin;
+        VECTOR2I        at;
+        VECTOR2I        out;
+    };
+
+    std::map<wxString, std::vector<PIN_LABEL>> groups;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_LABEL_T ) )
+    {
+        SCH_LABEL_BASE* label = static_cast<SCH_LABEL_BASE*>( item );
+        const VECTOR2I  at = label->GetPosition();
+        auto            pin = pinAt.find( { at.x, at.y } );
+
+        if( pin == pinAt.end() || ( !only.empty() && str( UnescapeString( label->GetText() ) ) != only ) )
+            continue;
+
+        std::optional<END_AT> end = findEnd( schematic, pin->second, sheet );
+        groups[label->GetText()].push_back( { label, pin->second, at, end ? end->out : VECTOR2I( 0, 0 ) } );
+    }
+
+    const std::set<std::vector<std::string>> before = pinPartition( schematic );
+    WIRE_ROUTER router( screen, *sheet, toIU( GRID_MM ) );
+    const double maxIU = schIUScale.mmToIU( maxMm );
+
+    std::vector<std::vector<VECTOR2I>> routes;
+    std::vector<SCH_LABEL_BASE*>       drop;
+    nlohmann::json                     nets = nlohmann::json::array();
+
+    for( auto& [name, members] : groups )
+    {
+        if( members.size() < 2 )
+            continue;
+
+        // shortest tree over the pins (Prim, Manhattan length): the links worth a wire
+        const size_t        n = members.size();
+        std::vector<bool>   in( n, false );
+        std::vector<double> cost( n, std::numeric_limits<double>::max() );
+        std::vector<int>    from( n, -1 );
+        std::vector<std::pair<int, int>> links;
+        cost[0] = 0;
+
+        for( size_t step = 0; step < n; ++step )
+        {
+            int next = -1;
+
+            for( size_t i = 0; i < n; ++i )
+            {
+                if( !in[i] && ( next < 0 || cost[i] < cost[next] ) )
+                    next = int( i );
+            }
+
+            in[next] = true;
+
+            if( from[next] >= 0 )
+                links.emplace_back( from[next], next );
+
+            for( size_t i = 0; i < n; ++i )
+            {
+                const VECTOR2I d = members[i].at - members[next].at;
+                const double   len = std::abs( d.x ) + std::abs( d.y );
+
+                if( !in[i] && len < cost[i] )
+                {
+                    cost[i] = len;
+                    from[i] = next;
+                }
+            }
+        }
+
+        // the links routed; groups of pins they join (union-find)
+        std::vector<int> root( n );
+        std::iota( root.begin(), root.end(), 0 );
+        std::function<int( int )> find = [&]( int i ) { return root[i] == i ? i : root[i] = find( root[i] ); };
+        nlohmann::json failed = nlohmann::json::array();
+        int            wired = 0;
+
+        for( const auto& [a, b] : links )
+        {
+            const VECTOR2I d = members[b].at - members[a].at;
+
+            if( std::abs( d.x ) + std::abs( d.y ) > maxIU )
+                continue;
+
+            const VECTOR2I& out = members[a].out;
+            std::string     why;
+            std::optional<std::vector<VECTOR2I>> path =
+                    router.Route( members[a].at, members[b].at, out.y != 0 ? "vh" : "hv", &why );
+
+            if( !path )
+            {
+                failed.push_back( { { "from", members[a].pin }, { "to", members[b].pin }, { "why", why } } );
+                continue;
+            }
+
+            for( size_t i = 0; i + 1 < path->size(); ++i )
+                router.AddWire( ( *path )[i], ( *path )[i + 1] );
+
+            routes.push_back( *path );
+            root[find( a )] = find( b );
+            wired++;
+        }
+
+        // one label per group of joined pins stays: the leftmost, then topmost
+        std::map<int, int> keep;
+
+        for( size_t i = 0; i < n; ++i )
+        {
+            auto [it, fresh] = keep.emplace( find( int( i ) ), int( i ) );
+            const VECTOR2I& cur = members[it->second].at;
+
+            if( !fresh && ( members[i].at.x < cur.x || ( members[i].at.x == cur.x && members[i].at.y < cur.y ) ) )
+                it->second = int( i );
+        }
+
+        for( size_t i = 0; i < n; ++i )
+        {
+            if( keep[find( int( i ) )] != int( i ) )
+                drop.push_back( members[i].label );
+        }
+
+        nets.push_back( { { "net", str( UnescapeString( name ) ) },
+                          { "pins", n },
+                          { "wires", wired },
+                          { "labels_left", keep.size() },
+                          { "not_routed", failed } } );
+    }
+
+    nlohmann::json result = { { "sheet", sheetPath( *sheet ) }, { "nets", nets }, { "wires", routes.size() },
+                              { "labels_removed", drop.size() }, { "dry_run", dryRun } };
+
+    if( dryRun || routes.empty() )
+        return KOPENAPI_RESULT::Ok( result );
+
+    SCH_COMMIT                   commit( context->GetToolManager() );
+    std::vector<KIID>            added;
+    std::vector<SCH_LABEL_BASE*> saved;
+
+    for( const std::vector<VECTOR2I>& points : routes )
+    {
+        for( size_t i = 0; i + 1 < points.size(); ++i )
+        {
+            auto* wire = new SCH_LINE( points[i], LAYER_WIRE );
+            wire->SetEndPoint( points[i + 1] );
+            commit.Add( wire, screen );
+            added.push_back( wire->m_Uuid );
+        }
+    }
+
+    for( SCH_LABEL_BASE* label : drop )
+    {
+        saved.push_back( static_cast<SCH_LABEL_BASE*>( label->Clone() ) );
+        commit.Remove( label, screen );
+    }
+
+    commit.Push( _( "Labels to wires (API)" ), SKIP_CONNECTIVITY );
+
+    SCH_COMMIT junctions( context->GetToolManager() );
+
+    for( const std::vector<VECTOR2I>& points : routes )
+    {
+        for( const VECTOR2I& point : { points.front(), points.back() } )
+        {
+            if( screen->IsExplicitJunctionNeeded( point ) && !screen->GetItem( point, 0, SCH_JUNCTION_T ) )
+            {
+                auto* junction = new SCH_JUNCTION( point );
+                junctions.Add( junction, screen );
+                added.push_back( junction->m_Uuid );
+            }
+        }
+    }
+
+    pushEdit( junctions, schematic, _( "Labels to wires (API)" ), aCtx.kiway, added );
+
+    if( pinPartition( schematic ) != before )
+    {
+        SCH_COMMIT undo( context->GetToolManager() );
+
+        const std::set<KIID> ours( added.begin(), added.end() );
+
+        for( SCH_ITEM* item : screen->Items() )
+        {
+            if( ours.count( item->m_Uuid ) )
+                undo.Remove( item, screen );
+        }
+
+        for( SCH_LABEL_BASE* label : saved )
+            undo.Add( label, screen );
+
+        pushEdit( undo, schematic, _( "Labels to wires (API) undone" ) );
+        return KOPENAPI_RESULT::Error( 500, "the wires would have changed the circuit; everything was put back "
+                                            "(report this: the router let a wire touch another connection)" );
+    }
+
+    for( SCH_LABEL_BASE* label : saved )
+        delete label;
+
+    // part texts the new wires run through move clear of them
+    SCH_COMMIT texts( context->GetToolManager() );
+    bool       moved = false;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+        bool        hit = false;
+
+        for( SCH_FIELD& field : symbol->GetFields() )
+        {
+            if( !field.IsVisible() || field.GetShownText( &*sheet, FOR_GUI ).IsEmpty() )
+                continue;
+
+            BOX2I box = field.GetBoundingBox();
+            box.Inflate( schIUScale.mmToIU( 0.5 ) );
+
+            for( const std::vector<VECTOR2I>& points : routes )
+            {
+                for( size_t i = 0; !hit && i + 1 < points.size(); ++i )
+                {
+                    SCH_LINE probe( points[i], LAYER_WIRE );
+                    probe.SetEndPoint( points[i + 1] );
+                    hit = box.GetWidth() > 0 && box.GetHeight() > 0 && probe.HitTest( box, false, 0 );
+                }
+            }
+        }
+
+        if( hit )
+        {
+            texts.Modify( symbol, screen );
+            placeFieldsClear( symbol, screen, *sheet, false );
+            moved = true;
+        }
+    }
+
+    if( moved )
+        pushEdit( texts, schematic, _( "Labels to wires (API)" ) );
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
 
 
 namespace
@@ -2575,7 +2969,7 @@ static KOPENAPI_RESULT h_sch_connect( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     // has no direction to go by.)
     auto placePower = [&]( const VECTOR2I& aPoint, const VECTOR2I& aOut, const SCH_SHEET_PATH& aPath ) -> SCH_ITEM*
     {
-        return makePowerSymbol( powerSymbol, schematic, aPath, aPoint, aOut, takenRefs );
+        return makePowerSymbol( powerSymbol, schematic, aPath, aPoint, aOut, takenRefs, wxString::FromUTF8( net ) );
     };
 
     const bool upright = aArgs.value( "orientation", std::string( "upright" ) ) != "away";
@@ -3053,7 +3447,7 @@ static KOPENAPI_RESULT h_sch_power_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                     const VECTOR2I candidate = *point + d * ( steps * grid );
                     std::optional<std::vector<VECTOR2I>> path = router.Route( *point, candidate, "hv", &why );
 
-                    if( path && path->size() == 2 && spotClear( candidate, b, *point ) )
+                    if( path && path->size() == 2 && freePoint( candidate, nullptr ) && spotClear( candidate, b, *point ) )
                     {
                         end = candidate;
                         body = b;
@@ -4463,6 +4857,31 @@ KOPENAPI_REGISTER( "sch_wire",
                         "sheet":{"type":"string","description":"for point-only wires"}}})json"_json,
                    false, h_sch_wire );
 
+KOPENAPI_REGISTER( "sch_texts_settle",
+                   std::string( "Move the reference / value texts of every part on a sheet (power symbols too) that lie "
+                                "on something - another text, a part, a wire, a label - to a clear spot next to their "
+                                "part (where KiCad places them, else right / below / above / left at a growing "
+                                "distance); texts already clear stay. Returns the parts moved and the ones with no "
+                                "clear spot nearby (stuck: move the part). Run before sch_layout_check" ) + EDIT_NOTE,
+                   R"json({"type":"object","properties":{"sheet":{"type":"string"}}})json"_json,
+                   false, h_sch_texts_settle );
+
+
+KOPENAPI_REGISTER( "sch_rewire",
+                   std::string( "Turn label wiring into wires a reader can follow: on a sheet, local labels sitting on "
+                                "part pins are linked per net by a shortest tree, every link up to max_mm is drawn "
+                                "as a wire by the router (no other pin, wire end, label or part body touched; "
+                                "junctions added), and of each group of pins the wires now join one label stays "
+                                "(the net keeps its name; far groups stay linked by it). The circuit is checked "
+                                "before / after and restored if it changed. Per net: pins, wires, labels left, "
+                                "links not routed (why: move a part, then run it again). dry_run: plan only" ) + EDIT_NOTE,
+                   R"json({"type":"object","properties":{
+                        "sheet":{"type":"string"},
+                        "net":{"type":"string","description":"only this net (label text)"},
+                        "max_mm":{"type":"number","default":50.8,"description":"longest link drawn as a wire (Manhattan)"},
+                        "dry_run":{"type":"boolean","default":false}}})json"_json,
+                   false, h_sch_rewire );
+
 KOPENAPI_REGISTER( "sch_item_list",
                    "List the wiring items of a sheet with uuids (to inspect, move or delete them): wires and "
                    "buses (from, to), labels (kind, text, at), junctions, no-connects, power symbols; each with "
@@ -4559,4 +4978,4 @@ KOPENAPI_REGISTER( "sch_sheet_pin_add",
                         "create_labels":{"type":"boolean","default":false,"description":"a hierarchical label per pin inside the sheet's file"}}})json" ),
                    false, h_sch_sheet_pin_add );
 
-KOPENAPI_MARK_EDITING( "sch_symbol_add", "sch_symbol_update", "sch_items_move", "sch_item_delete", "sch_connect", "sch_wire", "sch_power_add", "sch_label_add", "sch_no_connect", "sch_annotate", "sch_lock", "sch_unlock", "sch_sheet_add", "sch_sheet_pin_add" );
+KOPENAPI_MARK_EDITING( "sch_symbol_add", "sch_symbol_update", "sch_items_move", "sch_item_delete", "sch_connect", "sch_wire", "sch_rewire", "sch_texts_settle", "sch_power_add", "sch_label_add", "sch_no_connect", "sch_annotate", "sch_lock", "sch_unlock", "sch_sheet_add", "sch_sheet_pin_add" );

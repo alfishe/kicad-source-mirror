@@ -54,8 +54,23 @@ bool overlapAlong( const VECTOR2I& aA, const VECTOR2I& aB, const VECTOR2I& aC, c
 }
 
 
+
+
+int length( const std::vector<VECTOR2I>& aPolyline )
+{
+    int total = 0;
+
+    for( size_t i = 0; i + 1 < aPolyline.size(); ++i )
+        total += std::abs( aPolyline[i + 1].x - aPolyline[i].x ) + std::abs( aPolyline[i + 1].y - aPolyline[i].y );
+
+    return total;
+}
+
+} // namespace
+
+
 /// @brief An axis-aligned segment enters the open interior of a box
-bool crossesBody( const VECTOR2I& aA, const VECTOR2I& aB, const BOX2I& aBox )
+bool SegmentCrossesBody( const VECTOR2I& aA, const VECTOR2I& aB, const BOX2I& aBox )
 {
     const int left = aBox.GetLeft(), right = aBox.GetRight(), top = aBox.GetTop(), bottom = aBox.GetBottom();
 
@@ -72,19 +87,6 @@ bool crossesBody( const VECTOR2I& aA, const VECTOR2I& aB, const BOX2I& aBox )
 
     return std::max( aA.y, aB.y ) > top && std::min( aA.y, aB.y ) < bottom;
 }
-
-
-int length( const std::vector<VECTOR2I>& aPolyline )
-{
-    int total = 0;
-
-    for( size_t i = 0; i + 1 < aPolyline.size(); ++i )
-        total += std::abs( aPolyline[i + 1].x - aPolyline[i].x ) + std::abs( aPolyline[i + 1].y - aPolyline[i].y );
-
-    return total;
-}
-
-} // namespace
 
 
 WIRE_ROUTER::WIRE_ROUTER( SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, int aGrid,
@@ -111,13 +113,27 @@ WIRE_ROUTER::WIRE_ROUTER( SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, int 
         {
             SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
 
+            const BOX2I body = symbol->GetBodyBoundingBox();
+
             for( SCH_PIN* pin : symbol->GetPins( &aPath ) )
             {
-                m_points.push_back( pin->GetPosition() );
-                m_pinOwner.emplace_back( pin->GetPosition(), m_bodies.size() );
+                const VECTOR2I pos = pin->GetPosition();
+                VECTOR2I       out( 0, 0 );
+
+                if( pos.x < body.GetLeft() )
+                    out = VECTOR2I( -1, 0 );
+                else if( pos.x > body.GetRight() )
+                    out = VECTOR2I( 1, 0 );
+                else if( pos.y < body.GetTop() )
+                    out = VECTOR2I( 0, -1 );
+                else if( pos.y > body.GetBottom() )
+                    out = VECTOR2I( 0, 1 );
+
+                m_points.push_back( pos );
+                m_pinOwner.push_back( { pos, m_bodies.size(), out } );
             }
 
-            m_bodies.push_back( symbol->GetBodyBoundingBox() );
+            m_bodies.push_back( body );
             m_bodyNames.push_back( symbol->GetRef( &aPath, false ).ToStdString( wxConvUTF8 ) );
             break;
         }
@@ -129,7 +145,7 @@ WIRE_ROUTER::WIRE_ROUTER( SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, int 
             for( SCH_SHEET_PIN* pin : sheet->GetPins() )
             {
                 m_points.push_back( pin->GetPosition() );
-                m_pinOwner.emplace_back( pin->GetPosition(), m_bodies.size() );
+                m_pinOwner.push_back( { pin->GetPosition(), m_bodies.size(), VECTOR2I( 0, 0 ) } );
             }
 
             m_bodies.push_back( BOX2I( sheet->GetPosition(), sheet->GetSize() ) );
@@ -175,13 +191,30 @@ std::string WIRE_ROUTER::obstacle( const std::vector<VECTOR2I>& aPolyline, const
                + std::to_string( std::lround( p.y / 100.0 ) / 100.0 ).substr( 0, 7 ) + ") mm";
     };
 
-    // The part an end pin belongs to may be touched by the segment leaving that pin
+    // A pin standing out of its part is reached from outside only: the end segment never runs back
+    // along the pin into the part (out of the tip or sideways is fine, its body is an obstacle like
+    // any other).  A pin on the body edge (sheet pins, power symbols) may graze its own body.
     std::set<size_t> own;
+    const size_t     n = aPolyline.size();
 
-    for( const auto& [pos, body] : m_pinOwner )
+    for( const PIN_END& pin : m_pinOwner )
     {
-        if( pos == aFrom || pos == aTo )
-            own.insert( body );
+        if( pin.pos != aFrom && pin.pos != aTo )
+            continue;
+
+        if( pin.out == VECTOR2I( 0, 0 ) )
+        {
+            own.insert( pin.body );
+            continue;
+        }
+
+        const VECTOR2I next = pin.pos == aFrom ? aPolyline[1] : aPolyline[n - 2];
+        const VECTOR2I step = next - pin.pos;
+        const VECTOR2I dir( ( step.x > 0 ) - ( step.x < 0 ), ( step.y > 0 ) - ( step.y < 0 ) );
+
+        if( dir == VECTOR2I( -pin.out.x, -pin.out.y ) )
+            return "reaches the pin at " + mm( pin.pos ) + " from inside "
+                   + ( pin.body < m_bodyNames.size() ? m_bodyNames[pin.body] : std::string( "its part" ) );
     }
 
     for( size_t i = 0; i + 1 < aPolyline.size(); ++i )
@@ -222,7 +255,7 @@ std::string WIRE_ROUTER::obstacle( const std::vector<VECTOR2I>& aPolyline, const
             if( endSegment && own.count( b ) )
                 continue;
 
-            if( crossesBody( p, q, m_bodies[b] ) )
+            if( SegmentCrossesBody( p, q, m_bodies[b] ) )
                 return "crosses the body of " + ( b < m_bodyNames.size() ? m_bodyNames[b] : std::string( "a symbol" ) );
         }
     }
@@ -236,51 +269,104 @@ std::optional<std::vector<VECTOR2I>> WIRE_ROUTER::Route( const VECTOR2I& aFrom, 
 {
     std::vector<std::vector<VECTOR2I>> candidates;
 
-    if( aFrom.x == aTo.x || aFrom.y == aTo.y )
-        candidates.push_back( { aFrom, aTo } );
-
-    const std::vector<VECTOR2I> hv = { aFrom, VECTOR2I( aTo.x, aFrom.y ), aTo };
-    const std::vector<VECTOR2I> vh = { aFrom, VECTOR2I( aFrom.x, aTo.y ), aTo };
-
-    if( aFrom.x != aTo.x && aFrom.y != aTo.y )
+    // Straight, L, then Z shapes (a middle segment shifted along the grid, nearest the middle
+    // first, up to 40 steps beyond the two ends) between two points
+    auto shapes = [&]( const VECTOR2I& aA, const VECTOR2I& aB, const std::vector<VECTOR2I>& aHead,
+                       const std::vector<VECTOR2I>& aTail )
     {
-        candidates.push_back( aPrefer == "vh" ? vh : hv );
-        candidates.push_back( aPrefer == "vh" ? hv : vh );
-    }
+        auto add = [&]( std::vector<VECTOR2I> aMiddle )
+        {
+            std::vector<VECTOR2I> polyline = aHead;
+            polyline.insert( polyline.end(), aMiddle.begin(), aMiddle.end() );
+            polyline.insert( polyline.end(), aTail.begin(), aTail.end() );
+            candidates.push_back( std::move( polyline ) );
+        };
 
-    // Z shapes: a vertical (or horizontal) middle segment shifted along the grid, nearest the
-    // middle first, up to 40 steps beyond the two ends
-    constexpr int STEPS = 40;
-    std::vector<int> xs, ys;
+        if( aA.x == aB.x || aA.y == aB.y )
+            add( { aA, aB } );
 
-    for( int x = std::min( aFrom.x, aTo.x ) - STEPS * m_grid; x <= std::max( aFrom.x, aTo.x ) + STEPS * m_grid; x += m_grid )
-        xs.push_back( x );
+        const std::vector<VECTOR2I> hv = { aA, VECTOR2I( aB.x, aA.y ), aB };
+        const std::vector<VECTOR2I> vh = { aA, VECTOR2I( aA.x, aB.y ), aB };
 
-    for( int y = std::min( aFrom.y, aTo.y ) - STEPS * m_grid; y <= std::max( aFrom.y, aTo.y ) + STEPS * m_grid; y += m_grid )
-        ys.push_back( y );
+        if( aA.x != aB.x && aA.y != aB.y )
+        {
+            add( aPrefer == "vh" ? vh : hv );
+            add( aPrefer == "vh" ? hv : vh );
+        }
 
-    const int midX = ( aFrom.x + aTo.x ) / 2, midY = ( aFrom.y + aTo.y ) / 2;
-    std::sort( xs.begin(), xs.end(), [&]( int a, int b ) { return std::abs( a - midX ) < std::abs( b - midX ); } );
-    std::sort( ys.begin(), ys.end(), [&]( int a, int b ) { return std::abs( a - midY ) < std::abs( b - midY ); } );
+        constexpr int STEPS = 40;
+        std::vector<int> xs, ys;
 
-    for( int x : xs )
+        for( int x = std::min( aA.x, aB.x ) - STEPS * m_grid; x <= std::max( aA.x, aB.x ) + STEPS * m_grid; x += m_grid )
+            xs.push_back( x );
+
+        for( int y = std::min( aA.y, aB.y ) - STEPS * m_grid; y <= std::max( aA.y, aB.y ) + STEPS * m_grid; y += m_grid )
+            ys.push_back( y );
+
+        const int midX = ( aA.x + aB.x ) / 2, midY = ( aA.y + aB.y ) / 2;
+        std::sort( xs.begin(), xs.end(), [&]( int a, int b ) { return std::abs( a - midX ) < std::abs( b - midX ); } );
+        std::sort( ys.begin(), ys.end(), [&]( int a, int b ) { return std::abs( a - midY ) < std::abs( b - midY ); } );
+
+        for( int x : xs )
+        {
+            if( x != aA.x && x != aB.x )
+                add( { aA, VECTOR2I( x, aA.y ), VECTOR2I( x, aB.y ), aB } );
+        }
+
+        for( int y : ys )
+        {
+            if( y != aA.y && y != aB.y )
+                add( { aA, VECTOR2I( aA.x, y ), VECTOR2I( aB.x, y ), aB } );
+        }
+    };
+
+    shapes( aFrom, aTo, {}, {} );
+
+    // Pins facing away from each other: leave each pin straight out first, then the shapes above
+    auto outOf = [&]( const VECTOR2I& aPin )
     {
-        if( x != aFrom.x && x != aTo.x )
-            candidates.push_back( { aFrom, VECTOR2I( x, aFrom.y ), VECTOR2I( x, aTo.y ), aTo } );
-    }
+        for( const PIN_END& pin : m_pinOwner )
+        {
+            if( pin.pos == aPin )
+                return pin.out;
+        }
 
-    for( int y : ys )
+        return VECTOR2I( 0, 0 );
+    };
+
+    const VECTOR2I outFrom = outOf( aFrom ), outTo = outOf( aTo );
+
+    if( outFrom != VECTOR2I( 0, 0 ) || outTo != VECTOR2I( 0, 0 ) )
     {
-        if( y != aFrom.y && y != aTo.y )
-            candidates.push_back( { aFrom, VECTOR2I( aFrom.x, y ), VECTOR2I( aTo.x, y ), aTo } );
+        for( int steps = 1; steps <= 4; ++steps )
+        {
+            const VECTOR2I a = aFrom + outFrom * ( steps * m_grid );
+            const VECTOR2I b = aTo + outTo * ( steps * m_grid );
+            shapes( a, b, a == aFrom ? std::vector<VECTOR2I>() : std::vector<VECTOR2I>{ aFrom },
+                    b == aTo ? std::vector<VECTOR2I>() : std::vector<VECTOR2I>{ aTo } );
+        }
     }
 
     std::optional<std::vector<VECTOR2I>> best;
 
     for( std::vector<VECTOR2I>& candidate : candidates )
     {
-        // collapse zero-length legs (a Z whose start or end is already aligned)
+        // collapse zero-length legs (a Z whose start or end is already aligned) and straight joints
         candidate.erase( std::unique( candidate.begin(), candidate.end() ), candidate.end() );
+
+        for( size_t k = 1; k + 1 < candidate.size(); )
+        {
+            const VECTOR2I& p = candidate[k - 1];
+            const VECTOR2I& q = candidate[k + 1];
+
+            if( ( p.x == candidate[k].x && q.x == candidate[k].x ) || ( p.y == candidate[k].y && q.y == candidate[k].y ) )
+                candidate.erase( candidate.begin() + k );
+            else
+                ++k;
+        }
+
+        if( candidate.size() < 2 || candidate.front() != aFrom || candidate.back() != aTo )
+            continue;
 
         const std::string blocked = obstacle( candidate, aFrom, aTo );
 

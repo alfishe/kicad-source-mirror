@@ -449,7 +449,8 @@ std::vector<std::string> knownNames()
 
 std::vector<std::string> suggestions( const std::string& aMessage )
 {
-    // "Unrecognized property 'Heigth'" / "Unrecognized function 'sid'"
+    // "Unrecognized property 'Heigth'" / "Unrecognized function 'sid'"; close by spelling, or
+    // containing the word (Number: Pad_Number)
     const size_t open = aMessage.find( '\'' );
     const size_t close = open == std::string::npos ? open : aMessage.find( '\'', open + 1 );
 
@@ -468,7 +469,7 @@ std::vector<std::string> suggestions( const std::string& aMessage )
 
         const size_t d = editDistance( word, bare );
 
-        if( d <= std::max<size_t>( 2, word.size() / 3 ) )
+        if( d <= std::max<size_t>( 2, word.size() / 3 ) || ( word.size() >= 3 && wxString::FromUTF8( bare ).Lower().Contains( wxString::FromUTF8( word ).Lower() ) ) )
             scored.emplace_back( d, name );
     }
 
@@ -881,10 +882,78 @@ struct FIELD
 };
 
 
-bool prepareField( const std::string& aName, FIELD& aField, COMPILE_ERROR& aError )
+/// @brief The item types of the queried kinds
+std::vector<TYPE_ID> kindTypes( const std::set<std::string>& aKinds )
+{
+    static const std::map<std::string, std::vector<TYPE_ID>> types = {
+        { "footprints", { TYPE_HASH( FOOTPRINT ) } },
+        { "pads", { TYPE_HASH( PAD ) } },
+        { "tracks", { TYPE_HASH( PCB_TRACK ), TYPE_HASH( PCB_ARC ) } },
+        { "vias", { TYPE_HASH( PCB_VIA ) } },
+        { "zones", { TYPE_HASH( ZONE ) } },
+        { "drawings", { TYPE_HASH( PCB_SHAPE ) } },
+        { "texts", { TYPE_HASH( PCB_TEXT ), TYPE_HASH( PCB_TEXTBOX ) } },
+        { "groups", { TYPE_HASH( PCB_GROUP ) } }
+    };
+
+    std::vector<TYPE_ID> out;
+
+    for( const std::string& kind : aKinds )
+    {
+        if( auto it = types.find( kind ); it != types.end() )
+            out.insert( out.end(), it->second.begin(), it->second.end() );
+    }
+
+    return out;
+}
+
+
+/// @brief A property of some item of the queried kinds: a class property, or a dynamic one an item
+/// carries (footprint fields)
+bool knownProperty( BOARD* aBoard, const std::set<std::string>& aKinds, const wxString& aProperty )
+{
+    PROPERTY_MANAGER& propMgr = PROPERTY_MANAGER::Instance();
+
+    for( TYPE_ID type : kindTypes( aKinds ) )
+    {
+        if( propMgr.GetProperty( type, aProperty ) )
+            return true;
+    }
+
+    bool found = false;
+
+    forEachItem( aBoard, aKinds,
+                 [&]( BOARD_ITEM* aItem ) -> bool
+                 {
+                     found = propMgr.GetProperty( aItem, aProperty ) != nullptr;
+                     return !found;
+                 } );
+
+    return found;
+}
+
+
+/// @brief A field: a property name (spaces as underscores), A.func(...), or a bare name of a query
+/// function without arguments (parentRef as A.parentRef()).  aKinds given: a name that is none of
+/// these for the queried kinds is an error
+bool prepareField( const std::string& aName, FIELD& aField, COMPILE_ERROR& aError, BOARD* aBoard = nullptr,
+                   const std::set<std::string>* aKinds = nullptr )
 {
     aField.name = aName;
     aField.function = aName.find( '(' ) != std::string::npos;
+    std::string name = aName.rfind( "A.", 0 ) == 0 ? aName.substr( 2 ) : aName;
+
+    if( !aField.function )
+    {
+        auto fn = queryFunctions().find( wxString::FromUTF8( name ).Lower() );
+
+        if( fn != queryFunctions().end() && fn->second.signature.EndsWith( wxS( "()" ) ) )
+        {
+            aField.function = true;
+            aField.program = compile( "A." + fn->second.signature.ToStdString(), aError );
+            return aField.program != nullptr;
+        }
+    }
 
     if( aField.function )
     {
@@ -893,9 +962,21 @@ bool prepareField( const std::string& aName, FIELD& aField, COMPILE_ERROR& aErro
         return aField.program != nullptr;
     }
 
-    std::string name = aName.rfind( "A.", 0 ) == 0 ? aName.substr( 2 ) : aName;
     aField.property = wxString::FromUTF8( name );
     aField.property.Replace( wxS( "_" ), wxS( " " ) );
+
+    if( aKinds && aBoard && !knownProperty( aBoard, *aKinds, aField.property ) )
+    {
+        std::string kinds;
+
+        for( const std::string& kind : *aKinds )
+            kinds += ( kinds.empty() ? "" : ", " ) + kind;
+
+        aError.message = "Unrecognized property '" + name + "' (not a property of " + kinds
+                         + ", nor a function such as A.parentRef())";
+        return false;
+    }
+
     return true;
 }
 
@@ -1173,14 +1254,14 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
 
     std::map<std::string, FIELD> fields;
 
-    auto needField = [&]( const std::string& aName ) -> bool
+    auto needField = [&]( const std::string& aName, bool aCheck = true ) -> bool
     {
         if( aName.empty() || fields.count( aName ) )
             return true;
 
         FIELD f;
 
-        if( !prepareField( aName, f, error ) )
+        if( !prepareField( aName, f, error, aBoard, aCheck ? &kinds : nullptr ) )
             return false;
 
         fields[aName] = f;
@@ -1189,7 +1270,7 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
 
     for( const std::string& n : selectNames )
     {
-        if( !needField( n ) )
+        if( !needField( n, aArgs.contains( "select" ) ) )
             return compileError( "select", n, error );
     }
 

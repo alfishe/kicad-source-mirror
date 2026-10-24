@@ -679,7 +679,16 @@ KOPENAPI_RESULT KopenapiInvokeInProcess( KOPENAPI_CONTEXT& aCtx, const std::stri
     if( editing )
         KOPENAPI_HISTORY::Get().BeforeEdit( aCtx, aName, aArgs );
 
-    KOPENAPI_RESULT result = method->handler( aCtx, aArgs );
+    KOPENAPI_RESULT result;
+
+    try
+    {
+        result = method->handler( aCtx, aArgs );
+    }
+    catch( const KOPENAPI_RETRY_LATER& e )
+    {
+        result = e.Result();
+    }
 
     if( editing )
         KOPENAPI_HISTORY::Get().AfterEdit( aCtx, result );

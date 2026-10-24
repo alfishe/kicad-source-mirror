@@ -6,6 +6,7 @@
 /// flat, filterable, paginated violation list for agents.  In the GUI the markers appear in the
 /// open editor, like running ERC from its dialog.
 #include "kopenapi_sch.h"
+#include "kopenapi_sch_model.h"
 
 #include <api/sch_context.h>
 #include <kicadopenapi_keepalive.h>
@@ -57,8 +58,12 @@ static KOPENAPI_RESULT h_sch_erc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
             frame = nullptr;
     }
 
+    kopenapi_sch::ensureConnectivity( schematic );
+
     if( frame )
         frame->ClearErcMarkers();
+
+    kopenapi_sch::ensureConnectivity( schematic );
 
     KOPENAPI_KEEPALIVE_REPORTER reporter;
     ERC_TESTER tester( schematic );

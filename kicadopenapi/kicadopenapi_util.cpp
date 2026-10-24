@@ -259,6 +259,25 @@ KOPENAPI_TEXT_MATCH KopenapiTextMatch( const std::string& aQuery, const std::str
     const std::string query = lower( aQuery );
     const std::string nameCore = KopenapiLogicCore( name );
 
+    // "usb-a" names USB_A as well
+    std::string dashedName = name;
+    std::replace( dashedName.begin(), dashedName.end(), '_', '-' );
+
+    // A one-letter term ("USB C") is a whole token of the text, never any letter inside a word
+    auto hasToken = []( const std::string& aText, const std::string& aTerm )
+    {
+        for( size_t at = aText.find( aTerm ); at != std::string::npos; at = aText.find( aTerm, at + 1 ) )
+        {
+            const size_t after = at + aTerm.size();
+
+            if( ( at == 0 || !std::isalnum( (unsigned char) aText[at - 1] ) )
+                && ( after == aText.size() || !std::isalnum( (unsigned char) aText[after] ) ) )
+                return true;
+        }
+
+        return false;
+    };
+
     KOPENAPI_TEXT_MATCH result;
     size_t              start = 0;
 
@@ -276,19 +295,24 @@ KOPENAPI_TEXT_MATCH KopenapiTextMatch( const std::string& aQuery, const std::str
 
         // A name hit says most, but a term buried inside a longer name ("usb" in FSUSB42MUX)
         // says less than the part's own keywords and description
-        if( name == term )
+        auto in = [&]( const std::string& aText )
+        {
+            return term.size() == 1 ? hasToken( aText, term ) : aText.find( term ) != std::string::npos;
+        };
+
+        if( name == term || dashedName == term )
             termScore = 100;
-        else if( name.rfind( term, 0 ) == 0 )
+        else if( term.size() > 1 && ( name.rfind( term, 0 ) == 0 || dashedName.rfind( term, 0 ) == 0 ) )
             termScore = 30;
-        else if( name.find( term ) != std::string::npos )
+        else if( in( name ) || in( dashedName ) )
             termScore = 8;
         else if( !nameCore.empty() && KopenapiLogicCore( term ) == nameCore )
             termScore = 20;   // the same logic function in another family: 74LS257 for 74LVC257
 
-        if( keywords.find( term ) != std::string::npos )
+        if( in( keywords ) )
             termScore += 12;
 
-        if( description.find( term ) != std::string::npos )
+        if( in( description ) )
             termScore += 6;
 
         if( termScore == 0 )
@@ -300,6 +324,22 @@ KOPENAPI_TEXT_MATCH KopenapiTextMatch( const std::string& aQuery, const std::str
         result.matched++;
         result.score += termScore;
     }
+
+    // the words together are the name ("USB A" = USB_A, "usb c" leads USB_C_Receptacle): before USB3_A
+    std::string joined;
+
+    for( size_t at = 0; at < query.size(); )
+    {
+        const size_t end = query.find_first_of( " \t", at );
+        const std::string term = query.substr( at, end == std::string::npos ? std::string::npos : end - at );
+        at = end == std::string::npos ? query.size() : end + 1;
+
+        if( !term.empty() )
+            joined += ( joined.empty() ? "" : "_" ) + term;
+    }
+
+    if( result.terms > 1 && ( name == joined || name.rfind( joined + "_", 0 ) == 0 ) )
+        result.score += 40;
 
     return result;
 }

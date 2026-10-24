@@ -7,6 +7,30 @@
 #include <set>
 
 
+KOPENAPI_RETRY_LATER::KOPENAPI_RETRY_LATER( const std::string& aMessage, int aRetryAfterSec,
+                                            nlohmann::json aDetail ) :
+        std::runtime_error( aMessage ),
+        m_retryAfterSec( std::max( 1, aRetryAfterSec ) ),
+        m_detail( std::move( aDetail ) )
+{
+}
+
+
+KOPENAPI_RETRY_LATER::~KOPENAPI_RETRY_LATER() = default;
+
+
+KOPENAPI_RESULT KOPENAPI_RETRY_LATER::Result() const
+{
+    KOPENAPI_RESULT result = KOPENAPI_RESULT::Error( 503, what() );
+    result.body["retry_after_s"] = m_retryAfterSec;
+
+    if( !m_detail.is_null() )
+        result.body["error"]["detail"] = m_detail;
+
+    return result;
+}
+
+
 KOPENAPI_REGISTRY& KOPENAPI_REGISTRY::Get()
 {
     static KOPENAPI_REGISTRY instance;

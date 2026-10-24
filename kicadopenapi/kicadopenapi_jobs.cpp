@@ -512,6 +512,10 @@ void KOPENAPI_JOBS::Run( const std::string& aId, const std::function<KOPENAPI_RE
     {
         result = aCall();
     }
+    catch( const KOPENAPI_RETRY_LATER& e )
+    {
+        result = e.Result();
+    }
     catch( const std::exception& e )
     {
         result = KOPENAPI_RESULT::Error( 500, e.what() );

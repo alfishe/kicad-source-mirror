@@ -26,6 +26,7 @@
 #include <initializer_list>
 #include <set>
 #include <map>
+#include <stdexcept>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -57,6 +58,25 @@ struct KOPENAPI_RESULT
     {
         return { aStatus, { { "error", { { "code", aStatus }, { "message", aMessage } } } } };
     }
+};
+
+
+/// @brief Thrown by a handler that cannot answer from complete data right now.  The service
+/// answers it with 503, the message, "retry_after_s" in the body and a Retry-After header, so
+/// a caller never gets partial data with 200.
+class KICOMMON_API KOPENAPI_RETRY_LATER : public std::runtime_error
+{
+public:
+    KOPENAPI_RETRY_LATER( const std::string& aMessage, int aRetryAfterSec, nlohmann::json aDetail = nullptr );
+    ~KOPENAPI_RETRY_LATER() override;
+
+    int RetryAfterSec() const { return m_retryAfterSec; }
+
+    KOPENAPI_RESULT Result() const;
+
+private:
+    int            m_retryAfterSec;
+    nlohmann::json m_detail;
 };
 
 

@@ -87,7 +87,19 @@ private:
 /// @brief Pin card; with a resolver also its footprint pads and pad_status
 nlohmann::json pinJson( const SCH_PIN* aPin, const SCH_SHEET_PATH& aPath, PAD_RESOLVER* aPads = nullptr );
 
-/// @brief All nets, natural name order, code = 1-based position
+constexpr int CONNECTIVITY_RETRY_AFTER_S = 2;
+
+/// @brief Sheet instances the published connectivity does not cover at their screen's current
+/// revision (the engine leaves them out of every net query); empty when it is complete
+std::vector<std::string> staleConnectivitySheets( SCHEMATIC* aSchematic );
+
+/// @brief Every connectivity read goes through this first: an edit not yet published is
+/// published now (synchronous rebuild on the main thread).  Throws KOPENAPI_RETRY_LATER (503
+/// "connectivity is being rebuilt; retry", retry_after_s, error.detail.stale_sheets) when the
+/// connectivity still cannot be complete, so no reader answers with partial nets.
+void ensureConnectivity( SCHEMATIC* aSchematic );
+
+/// @brief All nets, natural name order, code = 1-based position (ensureConnectivity first)
 std::vector<NET_ENTRY> collectNets( SCHEMATIC* aSchematic );
 
 /// @brief Role of a net: name heuristics (KopenapiNetRoleFromName) plus graph facts — a power symbol on

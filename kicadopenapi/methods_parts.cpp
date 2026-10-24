@@ -12,6 +12,7 @@
 #include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
 #include <kiway.h>
+#include <wx/string.h>
 
 #include <algorithm>
 #include <string_view>
@@ -91,8 +92,8 @@ std::string normalizeToken( std::string aToken )
 
 
 /// @brief How well a footprint name fits package words: per word 3 for a whole name token ("0603" in
-/// R_0603_1608Metric, not in R_0201_0603Metric), 2 for the same dimension ("5mm" = "D5.0mm"),
-/// 1 for a substring; 0 when a word does not occur at all.
+/// R_0603_1608Metric, not in R_0201_0603Metric), 2 for the same dimension ("5mm" = "D5.0mm") or a
+/// dash part ("cr1220" in CR1220-VCN), 1 for a substring; 0 when a word does not occur at all.
 int packageScore( const std::vector<std::string>& aPackage, const std::string& aFootprint )
 {
     std::string name = lower( aFootprint );
@@ -126,7 +127,8 @@ int packageScore( const std::vector<std::string>& aPackage, const std::string& a
         {
             if( t == word )
                 best = std::max( best, 3 );
-            else if( normalizeToken( t ) == normalizeToken( word ) )
+            else if( normalizeToken( t ) == normalizeToken( word )
+                     || ( "-" + t + "-" ).find( "-" + word + "-" ) != std::string::npos )
                 best = std::max( best, 2 );
         }
 
@@ -157,7 +159,8 @@ const std::vector<std::pair<std::vector<std::string>, std::string>>& genericPart
         { { "diode" },                                                "Device:D" },
         { { "ferrite", "bead" },                                      "Device:FerriteBead" },
         { { "crystal", "xtal" },                                      "Device:Crystal" },
-        { { "fuse" },                                                 "Device:Fuse" } };
+        { { "fuse" },                                                 "Device:Fuse" },
+        { { "battery" },                                              "Device:Battery_Cell" } };
 
     return table;
 }
@@ -264,8 +267,14 @@ std::string genericSymbol( const std::vector<std::string>& aQuery, std::vector<s
         return buffer;
     }
 
+    // a battery charger / monitor is a chip, not the cell
+    const bool batteryChip = hasWord( aQuery, { "charger", "charging", "management", "monitor", "protection", "gauge", "fuel" } );
+
     for( const auto& [names, libId] : genericParts() )
     {
+        if( batteryChip && libId == "Device:Battery_Cell" )
+            continue;
+
         for( const std::string& word : aQuery )
         {
             if( std::find( names.begin(), names.end(), word ) != names.end() )
@@ -312,6 +321,7 @@ std::vector<std::string> packageWordsOf( const std::vector<std::string>& aQuery 
         "pin",       "pins",     "way",     "position", "connector", "conn",    "header",  "socket", "terminal", "screw",
         "resistor",  "res",      "capacitor", "cap",    "inductor",  "choke",   "led",     "diode",  "schottky", "zener",
         "ferrite",   "bead",     "crystal", "xtal",     "fuse",      "electrolytic", "polarized", "polarised", "tantalum",
+        "battery",   "holder",   "coin",    "cell",
         "smd",       "tht",      "a",       "an",       "for",       "with",    "of" };
     std::vector<std::string> out;
 
@@ -335,6 +345,42 @@ std::vector<std::string> packageWordsOf( const std::vector<std::string>& aQuery 
 
     return out;
 }
+
+/// @brief aLibId is of the kind a symbol's footprint filters name, any size or pin count: a filter
+/// without ':' by the footprint name ("Crystal*": Crystal_SMD_3225-4Pin, not C_1210_3225Metric), one
+/// with ':' by its library part ("Connector*:*_1x??_*": any Connector_* library, JST SH 1x04-1MP too)
+bool ofFilterKind( const nlohmann::json& aFilters, const std::string& aLibId )
+{
+    const size_t      colon = aLibId.find( ':' );
+    const std::string lib = colon == std::string::npos ? std::string() : aLibId.substr( 0, colon );
+    const std::string name = aLibId.substr( colon == std::string::npos ? 0 : colon + 1 );
+
+    for( const nlohmann::json& f : aFilters )
+    {
+        const std::string filter = f.get<std::string>();
+        const size_t      split = filter.find( ':' );
+
+        if( split == std::string::npos ? wxString( lower( name ) ).Matches( wxString( lower( filter ) ) )
+                                       : wxString( lower( lib ) ).Matches( wxString( lower( filter.substr( 0, split ) ) ) ) )
+            return true;
+    }
+
+    return false;
+}
+
+
+/// @brief A package name: letters, '-', a digit ("tssop-16", "sot-23-5", "dip-8")
+bool isPackageWord( const std::string& aWord )
+{
+    size_t letters = 0;
+
+    while( letters < aWord.size() && std::isalpha( (unsigned char) aWord[letters] ) )
+        ++letters;
+
+    return letters >= 2 && letters + 1 < aWord.size() && aWord[letters] == '-'
+           && std::isdigit( (unsigned char) aWord[letters + 1] );
+}
+
 
 /// @brief Packages a symbol's description names, in its order: "Dual opamp, DIP-8/DMP-8/SSOP-8" ->
 /// dip-8, soic-8, ssop-8 (vendor names of the same body mapped: JRC DMP = SOIC)
@@ -360,9 +406,7 @@ std::vector<std::string> describedPackages( const std::string& aDescription )
         while( letters < word.size() && std::isalpha( (unsigned char) word[letters] ) )
             ++letters;
 
-        // letters, '-', a digit: "dip-8", "sot-23-5", "to-220-5"
-        if( letters >= 2 && letters + 1 < word.size() && word[letters] == '-'
-            && std::isdigit( (unsigned char) word[letters + 1] ) )
+        if( isPackageWord( word ) )
         {
             const auto        a = alias.find( word.substr( 0, letters ) );
             const std::string package = a == alias.end() ? word : a->second + word.substr( letters );
@@ -409,15 +453,24 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     if( query.empty() )
         return KOPENAPI_RESULT::Error( 400, "give 'query': what the part is (e.g. 'resistor', 'LED', 'ATtiny85', 'LDO 3.3V')" );
 
-    const std::vector<std::string> queryWords = words( query );
-    std::string                    value = aArgs.value( "value", std::string() );
-    const std::vector<std::string> askedPackage = words( aArgs.value( "package", std::string() ) );
-    const std::string              mount = aArgs.value( "mount", std::string() );
+    std::vector<std::string> queryWords = words( query );
+    std::string              value = aArgs.value( "value", std::string() );
+    std::vector<std::string> askedPackage = words( aArgs.value( "package", std::string() ) );
+    std::string                    mount = aArgs.value( "mount", std::string() );
     const int                      limit = std::clamp( aArgs.value( "limit", 3 ), 1, 10 );
     const int                      footprints = std::clamp( aArgs.value( "footprints", 3 ), 1, 10 );
 
     if( !mount.empty() && mount != "smd" && mount != "tht" )
         return KOPENAPI_RESULT::Error( 400, "mount: smd or tht" );
+
+    if( mount.empty() )
+    {
+        for( const std::string& w : queryWords )
+        {
+            if( w == "smd" || w == "tht" )
+                mount = w;
+        }
+    }
 
     if( aCtx.kiway )
     {
@@ -430,6 +483,41 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     std::vector<std::string> defaultPackage, layout;
     const std::string        generic = genericSymbol( queryWords, defaultPackage, layout );
     std::vector<std::string> symbols;
+
+    // A part named with its package ("74LVC257 TSSOP-16"): the package words are the package
+    std::string partQuery = query;
+
+    if( generic.empty() && askedPackage.empty() )
+    {
+        std::istringstream in( query );
+        std::string        w;
+        std::vector<std::string> rest;
+
+        partQuery.clear();
+
+        while( in >> w )
+        {
+            if( isPackageWord( lower( w ) ) )
+            {
+                askedPackage.push_back( lower( w ) );
+            }
+            else
+            {
+                partQuery += ( partQuery.empty() ? "" : " " ) + w;
+                rest.push_back( lower( w ) );
+            }
+        }
+
+        if( rest.empty() )
+        {
+            partQuery = query;
+            askedPackage.clear();
+        }
+        else
+        {
+            queryWords = rest;
+        }
+    }
     bool                     partial = false;
 
     // Package attempts, best first: asked words + words of the query (series: "jst xh"), then
@@ -439,6 +527,10 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     if( !generic.empty() )
     {
         symbols.push_back( generic );
+
+        // most SMD crystals have four pads (two to ground)
+        if( generic == "Device:Crystal" )
+            symbols.push_back( "Device:Crystal_GND24" );
 
         // A value written into the query ("resistor 10k 0603"), as written (case kept); not for
         // connectors, whose numbers are pin counts
@@ -500,7 +592,7 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             }
         }
 
-        KOPENAPI_RESULT found = callMethod( aCtx, "sch_lib_symbol_search", { { "query", query }, { "limit", limit * 4 } } );
+        KOPENAPI_RESULT found = callMethod( aCtx, "sch_lib_symbol_search", { { "query", partQuery }, { "limit", limit * 4 } } );
 
         if( found.status != 200 )
             return found;
@@ -563,10 +655,13 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 found.push_back( { aRow, aWhy, aSource } );
         };
 
-        auto search = [&]( nlohmann::json aSearch, const std::string& aWhy, int aSource )
+        auto search = [&]( nlohmann::json aSearch, const std::string& aWhy, int aSource, int aExtraPads = 0 )
         {
             if( !mount.empty() )
                 aSearch["type"] = mount;
+
+            if( aExtraPads > 0 )
+                aSearch.erase( "pads" );
 
             aSearch["limit"] = 2000;
             KOPENAPI_RESULT result = callMethod( aCtx, "pcb_lib_footprint_search", aSearch );
@@ -575,7 +670,12 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 return;
 
             for( const nlohmann::json& row : result.body["items"] )
-                add( row, aWhy, aSource );
+            {
+                const int pads = row.value( "pads", 0 );
+
+                if( aExtraPads == 0 || ( pads >= pins && pads <= pins + aExtraPads ) )
+                    add( row, aWhy, aSource );
+            }
         };
 
         if( !ownFootprint.empty() )
@@ -591,9 +691,11 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             search( { { "filters", filters }, { "pads", pins } }, "matches the symbol's footprint filters and pin count", 1 );
 
         nlohmann::json fits = nlohmann::json::array();
+        size_t         attempt = 0;
 
-        for( const std::vector<std::string>& package : attempts )
+        for( ; attempt < attempts.size(); ++attempt )
         {
+            const std::vector<std::string>& package = attempts[attempt];
             std::vector<FIT> pool = found;
 
             // by package words and pin count alone (symbols without filters, or filters too narrow)
@@ -607,7 +709,7 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 {
                     // one word at a time: the footprint search needs every word, packageScore
                     // knows "5mm" = "D5.0mm"
-                    search( { { "query", w }, { "pads", pins } }, "matches the package and pin count", 2 );
+                    search( { { "query", w }, { "pads", pins } }, "matches the package and pin count", 2, 1 );
                 }
 
                 pool.insert( pool.end(), found.begin(), found.end() );
@@ -624,7 +726,21 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
             for( FIT& fit : pool )
             {
-                int score = package.empty() ? 1 : packageScore( package, fit.row["lib_id"] );
+                int score = package.empty() ? 1 : 2 * packageScore( package, fit.row["lib_id"] );
+
+                // the package named only in the footprint's text (Keystone 3000 1x12mm: "CR1220"), after
+                // the footprints whose name has it
+                if( score == 0 && !package.empty() )
+                {
+                    score = packageScore( package, fit.row["lib_id"].get<std::string>() + "_"
+                                                           + fit.row.value( "description", std::string() ) + " "
+                                                           + fit.row.value( "keywords", std::string() ) ) > 0 ? 1 : 0;
+                }
+
+                // a generic part takes only footprints of its kind (no C_1210 for a crystal); a specific
+                // part's filters name its usual package, a package asked for overrides them
+                if( fit.source == 2 && !generic.empty() && !filters.empty() && !ofFilterKind( filters, fit.row["lib_id"] ) )
+                    score = 0;
 
                 if( byDescription )
                     score = fit.source == 0 ? 1000 : describedScore( described, fit.row["lib_id"] );
@@ -633,8 +749,8 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                     scored.emplace_back( score, fit );
             }
 
-            // footprints the symbol itself names or allows beat the package-only finds (C_0603 for a resistor)
-            if( std::any_of( scored.begin(), scored.end(), []( const auto& f ) { return f.second.source < 2; } ) )
+            // footprints the symbol itself names or allows beat the package-only finds of a specific part
+            if( generic.empty() && std::any_of( scored.begin(), scored.end(), []( const auto& f ) { return f.second.source < 2; } ) )
                 std::erase_if( scored, []( const auto& f ) { return f.second.source == 2; } );
 
             std::stable_sort( scored.begin(), scored.end(),
@@ -671,7 +787,7 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         std::string note;
 
         // The same logic function drawn for another family (74LS257 for 74LVC257): the asked part is the value
-        const std::string asked = value.empty() && queryWords.size() == 1 ? query : value;
+        const std::string asked = value.empty() && queryWords.size() == 1 ? partQuery : value;
         const std::string name = libId.substr( libId.find( ':' ) + 1 );
 
         if( generic.empty() && !asked.empty() && lower( name ) != lower( asked ) && !KopenapiLogicCore( asked ).empty()
@@ -686,7 +802,8 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         if( !fits.empty() )
             use["footprint"] = fits[0]["lib_id"];
 
-        candidates.push_back( { { "symbol", libId },
+        candidates.push_back( { { "attempt", attempt },
+                                { "symbol", libId },
                                 { "description", c.value( "description", std::string() ) },
                                 { "pins", pins },
                                 { "symbol_footprint", ownFootprint },
@@ -697,20 +814,33 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
             candidates.back()["note"] = note;
     }
 
-    // With a package asked for, parts that have no footprint of it go (if any other part has one)
-    if( !askedPackage.empty()
-        && std::any_of( candidates.begin(), candidates.end(), []( const nlohmann::json& c ) { return !c["footprints"].empty(); } ) )
+    // With a package asked for, parts that have no footprint of it go (if any other part has one); a
+    // generic part offered in two forms keeps the form that fits the package words best (Crystal_GND24
+    // in 3225 before a two-pin crystal that fell back to its default footprints)
+    const bool byPackage = !askedPackage.empty() || ( !generic.empty() && symbols.size() > 1 );
+    size_t     bestAttempt = attempts.size();
+
+    for( const nlohmann::json& c : candidates )
+    {
+        if( !c["footprints"].empty() )
+            bestAttempt = std::min( bestAttempt, c["attempt"].get<size_t>() );
+    }
+
+    if( byPackage && bestAttempt < attempts.size() )
     {
         nlohmann::json kept = nlohmann::json::array();
 
         for( const nlohmann::json& c : candidates )
         {
-            if( !c["footprints"].empty() )
+            if( !c["footprints"].empty() && ( askedPackage.empty() ? c["attempt"].get<size_t>() == bestAttempt : true ) )
                 kept.push_back( c );
         }
 
         candidates = kept;
     }
+
+    for( nlohmann::json& c : candidates )
+        c.erase( "attempt" );
 
     nlohmann::json result = { { "query", query }, { "candidates", candidates } };
 

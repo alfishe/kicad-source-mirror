@@ -45,6 +45,7 @@ static KOPENAPI_RESULT h_sch_netlist_kicad( KOPENAPI_CONTEXT& aCtx, const nlohma
         return KOPENAPI_RESULT::Error( 409, "parts without a reference (sch_annotate first): " + unannotated.dump() );
 
     schematic->RebuildConnectivity();
+    ensureConnectivity( schematic );
 
     NETLIST_EXPORTER_KICAD exporter( schematic, aCtx.kiway );
     STRING_FORMATTER       formatter;

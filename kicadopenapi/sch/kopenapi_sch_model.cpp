@@ -4,6 +4,7 @@
 #include <connection_graph.h>
 #include <connectivity/conn_facade.h>
 #include <kicadopenapi_libraries.h>
+#include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
 #include <kiface_base.h>
 #include <kiface_ids.h>
@@ -166,8 +167,71 @@ const std::set<wxString>& PAD_RESOLVER::FootprintPads( const wxString& aFootprin
 }
 
 
+std::vector<std::string> staleConnectivitySheets( SCHEMATIC* aSchematic )
+{
+    std::vector<std::string> stale;
+
+    if( !ADVANCED_CFG::GetCfg().m_ConnectivityEngine )
+        return stale;
+
+    const SCH_CONNECTIVITY::FACADE& connectivity = aSchematic->Connectivity();
+    const auto&                     revisions = connectivity.Published().Auxiliary().ScreenRevisions();
+
+    // The facade hides every instance whose screen revision differs from the published one
+    for( const SCH_SHEET_PATH& path : aSchematic->Hierarchy() )
+    {
+        const SCH_SCREEN* screen = path.LastScreen();
+
+        if( !screen )
+            continue;
+
+        const auto revision = revisions.find( screen->ConnectivityId() );
+
+        if( revision == revisions.end() || revision->second != screen->ConnectivityRevision()
+            || !connectivity.Keys().FindInstance( path.Path() ) )
+        {
+            stale.push_back( sheetPath( path ) );
+        }
+    }
+
+    return stale;
+}
+
+
+void ensureConnectivity( SCHEMATIC* aSchematic )
+{
+    if( staleConnectivitySheets( aSchematic ).empty() )
+        return;
+
+    std::string cause;
+
+    try
+    {
+        aSchematic->RebuildConnectivity();
+    }
+    catch( const std::exception& e )
+    {
+        cause = e.what();
+    }
+
+    const std::vector<std::string> stale = staleConnectivitySheets( aSchematic );
+
+    if( stale.empty() )
+        return;
+
+    nlohmann::json detail = { { "stale_sheets", stale } };
+
+    if( !cause.empty() )
+        detail["cause"] = cause;
+
+    throw KOPENAPI_RETRY_LATER( "connectivity is being rebuilt; retry", CONNECTIVITY_RETRY_AFTER_S, detail );
+}
+
+
 std::vector<NET_ENTRY> collectNets( SCHEMATIC* aSchematic )
 {
+    ensureConnectivity( aSchematic );
+
     std::vector<NET_ENTRY> nets;
 
     if( ADVANCED_CFG::GetCfg().m_ConnectivityEngine )

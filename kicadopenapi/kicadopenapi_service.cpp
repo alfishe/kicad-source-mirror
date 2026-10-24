@@ -267,6 +267,10 @@ static std::string toJson( const nlohmann::json& aJson )
 static void reply( httplib::Response& aRes, const KOPENAPI_RESULT& aResult )
 {
     aRes.status = aResult.status;
+
+    if( aResult.status == 503 && aResult.body.contains( "retry_after_s" ) && aResult.body["retry_after_s"].is_number() )
+        aRes.set_header( "Retry-After", std::to_string( aResult.body["retry_after_s"].get<int>() ) );
+
     aRes.set_content( toJson( aResult.body ), "application/json" );
 }
 
@@ -367,6 +371,10 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
                 try
                 {
                     promise->set_value( fn() );
+                }
+                catch( const KOPENAPI_RETRY_LATER& e )
+                {
+                    promise->set_value( e.Result() );
                 }
                 catch( const std::exception& e )
                 {
@@ -1120,7 +1128,16 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                               KOPENAPI_HISTORY::Get().BeforeEdit( ctxCopy, name, args );
 
                           const uint64_t  logBefore = KOPENAPI_JOURNAL::Summary().value( "last_seq", uint64_t( 0 ) );
-                          KOPENAPI_RESULT result = handler( ctxCopy, args );
+                          KOPENAPI_RESULT result;
+
+                          try
+                          {
+                              result = handler( ctxCopy, args );
+                          }
+                          catch( const KOPENAPI_RETRY_LATER& e )
+                          {
+                              result = e.Result();
+                          }
 
                           // a failure carries what KiCad logged during the call: the cause it would
                           // have shown in a dialog
