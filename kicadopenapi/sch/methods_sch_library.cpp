@@ -336,14 +336,15 @@ KOPENAPI_REGISTER( "sch_lib_list",
 
 KOPENAPI_REGISTER( "sch_lib_symbol_search",
                    "Search library symbols (parts) by words in name, keywords and description, ranked "
-                   "(e.g. 'ldo 3.3', 'usb uart', 'opamp dual'); filter by library glob, power symbols, "
+                   "(e.g. 'ldo 3.3', 'usb uart', 'opamp dual'; a 74-series number finds every logic family of it: "
+                   "74LVC257 -> 74LS257); filter by library glob, power symbols, "
                    "pin count; returns lib_id, description, pins, units, default footprint, footprint "
                    "filters, used_in_design; paginated",
                    KopenapiPagedSchema( R"json({
                         "query":{"type":"string","description":"words; items matching all of them, else best partial matches (partial, unmatched_terms)"},
                         "lib":{"type":"string","description":"glob on the library name"},
                         "power":{"type":"boolean","default":false,"description":"power symbols only"},
-                        "min_pins":{"type":"integer"},"max_pins":{"type":"integer"}})json"_json ),
+                        "min_pins":{"type":"integer"},"max_pins":{"type":"integer"}})json"_json, KOPENAPI_RANKED_PAGE ),
                    false, h_sch_lib_symbol_search, 600 );
 
 KOPENAPI_REGISTER( "sch_lib_symbol_get",

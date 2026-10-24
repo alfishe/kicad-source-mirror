@@ -51,7 +51,7 @@ const char* portDirection( const SCH_SHEET_PIN* aPin )
     case LABEL_FLAG_SHAPE::L_INPUT:    return "input";
     case LABEL_FLAG_SHAPE::L_OUTPUT:   return "output";
     case LABEL_FLAG_SHAPE::L_BIDI:     return "bidirectional";
-    case LABEL_FLAG_SHAPE::L_TRISTATE: return "tristate";
+    case LABEL_FLAG_SHAPE::L_TRISTATE: return "tri_state";
     default:                           return "passive";
     }
 }

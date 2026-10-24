@@ -39,6 +39,11 @@ KICOMMON_API bool KopenapiIsConnectorRef( const std::string& aRef );
 KICOMMON_API int KopenapiTextScore( const std::string& aQuery, const std::string& aName,
                                     const std::string& aKeywords, const std::string& aDescription );
 
+/// @brief The function of a 74 / 54 series logic part number without vendor prefix, logic family
+/// and suffix: "SN74LVC257APW", "74HC257", "74LS257" -> "74257", "74LVC1G04" -> "741g04" (lower
+/// case); empty when aText is not such a number.  Equal cores share the function and pinout.
+KICOMMON_API std::string KopenapiLogicCore( const std::string& aText );
+
 /// @brief Per-term outcome of a free-text query against a library item
 struct KOPENAPI_TEXT_MATCH
 {
@@ -53,14 +58,17 @@ KICOMMON_API KOPENAPI_TEXT_MATCH KopenapiTextMatch( const std::string& aQuery, c
 
 /// @brief Page of ranked search rows: rows matching every query term if there are any; otherwise the
 /// best partial matches (most terms first), flagged "partial" with the terms nothing matched, so
-/// a query with one unlucky word still returns something useful.
+/// a query with one unlucky word still returns something useful.  Default page: 20 rows.
 KICOMMON_API nlohmann::json KopenapiRankedPage( std::vector<std::pair<KOPENAPI_TEXT_MATCH, nlohmann::json>> aRows,
                                                 const nlohmann::json& aArgs );
 
 /// @brief JSON schema properties shared by all paginated methods (limit, cursor)
-KICOMMON_API nlohmann::json KopenapiPageSchema();
+KICOMMON_API nlohmann::json KopenapiPageSchema( int aDefaultLimit = 100 );
 
 /// @brief Object schema with aProperties plus limit/cursor
-KICOMMON_API nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties );
+KICOMMON_API nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit = 100 );
+
+/// @brief Default page size of ranked searches (KopenapiRankedPage)
+constexpr int KOPENAPI_RANKED_PAGE = 20;
 
 #endif

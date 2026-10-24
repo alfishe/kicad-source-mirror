@@ -1,6 +1,6 @@
 /// @file methods_sch_edit.cpp
 /// @brief kicadopenapi schematic edits (step d4): sch_new, sch_symbol_add, sch_symbol_update,
-/// sch_item_delete, sch_connect, sch_no_connect, sch_annotate.
+/// sch_item_delete, sch_connect, sch_no_connect, sch_annotate, sch_sheet_add, sch_sheet_pin_add.
 ///
 /// Every method is one SCH_COMMIT through the context's tool manager: in the GUI it is one undo
 /// step, repaints and marks the document modified, like an edit made by hand; headless the
@@ -11,6 +11,7 @@
 #include "kopenapi_sch_model.h"
 #include "kopenapi_sch_router.h"
 
+#include <api/sch_api_save.h>
 #include <api/sch_context.h>
 #include <kicadopenapi_keepalive.h>
 #include <base_units.h>
@@ -26,21 +27,29 @@
 #include <sch_junction.h>
 #include <sch_line.h>
 #include <sch_field.h>
+#include <sch_io/sch_io.h>
+#include <sch_io/sch_io_mgr.h>
 #include <sch_file_versions.h>
 #include <sch_label.h>
 #include <sch_no_connect.h>
 #include <sch_pin.h>
 #include <sch_reference_list.h>
 #include <sch_screen.h>
+#include <sch_sheet.h>
 #include <sch_sheet_path.h>
+#include <sch_sheet_pin.h>
 #include <sch_symbol.h>
 #include <schematic.h>
 #include <string_utils.h>
 #include <tool/tool_manager.h>
+#include <tools/sch_tool_utils.h>
 #include <view/view.h>
 #include <view/view_overlay.h>
 #include <gal/painter.h>
 #include <layer_ids.h>
+#include <project.h>
+#include <wildcards_and_files_ext.h>
+#include <wx_filename.h>
 
 #include <wx/filename.h>
 #include <wx/ffile.h>
@@ -1102,7 +1111,88 @@ private:
 };
 
 
-/// @brief A wire end: REF.PIN, or a point {x_mm, y_mm} on the target sheet
+VECTOR2I sheetPinOutward( const SCH_SHEET_PIN* aPin )
+{
+    switch( aPin->GetSide() )
+    {
+    case SHEET_SIDE::LEFT:  return VECTOR2I( -1, 0 );
+    case SHEET_SIDE::RIGHT: return VECTOR2I( 1, 0 );
+    case SHEET_SIDE::TOP:   return VECTOR2I( 0, -1 );
+    default:                return VECTOR2I( 0, 1 );
+    }
+}
+
+
+std::string sheetPinName( const SCH_SHEET_PIN* aPin )
+{
+    return str( UnescapeString( aPin->GetText() ) );
+}
+
+
+/// @brief A named connection point: a symbol pin or a sheet pin
+struct END_AT
+{
+    SCH_ITEM*      item = nullptr;
+    SCH_SHEET_PATH path;
+    VECTOR2I       position;
+    VECTOR2I       out;   ///< unit vector pointing away from the part / sheet
+};
+
+
+/// @brief REF.PIN of a symbol, else SHEET.PIN of a sheet pin (sheet name or its path as sch_sheet_list
+/// prints it, then the pin name); a sheet drawn on several instances is taken on aPrefer when given
+std::optional<END_AT> findEnd( SCHEMATIC* aSchematic, const std::string& aName,
+                               const std::optional<SCH_SHEET_PATH>& aPrefer = std::nullopt )
+{
+    if( std::optional<PIN_AT> at = findPin( aSchematic, aName ) )
+        return END_AT{ at->pin, at->path, at->pin->GetPosition(), outward( at->pin ) };
+
+    std::optional<END_AT> found;
+
+    for( const SCH_SHEET_PATH& path : aSchematic->Hierarchy() )
+    {
+        for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SHEET_T ) )
+        {
+            SCH_SHEET*     sheet = static_cast<SCH_SHEET*>( item );
+            SCH_SHEET_PATH child = path;
+            child.push_back( sheet );
+
+            const std::string name = str( sheet->GetName() ), human = sheetPath( child );
+
+            for( SCH_SHEET_PIN* pin : sheet->GetPins() )
+            {
+                const std::string pinName = sheetPinName( pin );
+
+                if( aName != name + "." + pinName && aName != human + "." + pinName )
+                    continue;
+
+                if( !found || ( aPrefer && path == *aPrefer && found->path != *aPrefer ) )
+                    found = END_AT{ pin, path, pin->GetPosition(), sheetPinOutward( pin ) };
+            }
+        }
+    }
+
+    return found;
+}
+
+
+/// @brief The net an item is on now on one sheet instance (after a commit)
+std::string netOfItem( SCHEMATIC* aSchematic, const SCH_ITEM* aItem, const SCH_SHEET_PATH& aPath )
+{
+    for( const NET_ENTRY& net : collectNets( aSchematic ) )
+    {
+        for( const NET_INSTANCE& inst : net.instances )
+        {
+            if( inst.path == aPath && std::find( inst.items.begin(), inst.items.end(), aItem ) != inst.items.end() )
+                return net.name;
+        }
+    }
+
+    return std::string();
+}
+
+
+/// @brief A wire end: REF.PIN, SHEET.PIN, or a point {x_mm, y_mm} on the target sheet
 std::optional<VECTOR2I> wireEnd( SCHEMATIC* aSchematic, const nlohmann::json& aEnd, std::optional<SCH_SHEET_PATH>& aSheet,
                                  VECTOR2I& aOutward, std::string& aError )
 {
@@ -1110,7 +1200,7 @@ std::optional<VECTOR2I> wireEnd( SCHEMATIC* aSchematic, const nlohmann::json& aE
 
     if( aEnd.is_string() )
     {
-        std::optional<PIN_AT> at = findPin( aSchematic, aEnd.get<std::string>() );
+        std::optional<END_AT> at = findEnd( aSchematic, aEnd.get<std::string>(), aSheet );
 
         if( !at )
         {
@@ -1125,14 +1215,14 @@ std::optional<VECTOR2I> wireEnd( SCHEMATIC* aSchematic, const nlohmann::json& aE
         }
 
         aSheet = at->path;
-        aOutward = outward( at->pin );
-        return at->pin->GetPosition();
+        aOutward = at->out;
+        return at->position;
     }
 
     if( aEnd.is_object() && aEnd.contains( "x_mm" ) && aEnd.contains( "y_mm" ) )
         return VECTOR2I( toIU( aEnd["x_mm"].get<double>() ), toIU( aEnd["y_mm"].get<double>() ) );
 
-    aError = "a wire end is REF.PIN or {x_mm, y_mm}";
+    aError = "a wire end is REF.PIN, SHEET.PIN (a sheet pin) or {x_mm, y_mm}";
     return std::nullopt;
 }
 
@@ -1267,7 +1357,14 @@ static KOPENAPI_RESULT h_sch_wire( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     nlohmann::json result = { { "segments", segments }, { "junctions", dots } };
 
     if( aArgs["from"].is_string() )
-        result["net"] = netOfPin( schematic, aArgs["from"] );
+    {
+        std::string net = netOfPin( schematic, aArgs["from"] );
+
+        if( std::optional<END_AT> end = net.empty() ? findEnd( schematic, aArgs["from"], sheet ) : std::nullopt )
+            net = netOfItem( schematic, end->item, end->path );
+
+        result["net"] = net;
+    }
 
     return KOPENAPI_RESULT::Ok( result );
 }
@@ -3192,7 +3289,7 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const std::string kind = aArgs.value( "kind", std::string( "local" ) );
 
     if( text.empty() || ( !aArgs.contains( "pin" ) && ( !aArgs.contains( "x_mm" ) || !aArgs.contains( "y_mm" ) ) ) )
-        return KOPENAPI_RESULT::Error( 400, "give 'text' and either 'pin' (REF.PIN: names the net there) or 'x_mm' / 'y_mm' "
+        return KOPENAPI_RESULT::Error( 400, "give 'text' and either 'pin' (REF.PIN or SHEETNAME.PIN: names the net there) or 'x_mm' / 'y_mm' "
                                             "(a point on a wire or a pin end)" );
 
     if( kind != "local" && kind != "global" && kind != "hierarchical" )
@@ -3206,13 +3303,13 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     {
         // Name the net at a pin: on a free grid point of the wire leaving the pin (text along
         // the wire, away from the pin, clear of parts and texts), else on the pin end itself
-        std::optional<PIN_AT> at = aArgs["pin"].is_string() ? findPin( context->GetSchematic(), aArgs["pin"] ) : std::nullopt;
+        std::optional<END_AT> at = aArgs["pin"].is_string() ? findEnd( context->GetSchematic(), aArgs["pin"] ) : std::nullopt;
 
         if( !at )
             return KOPENAPI_RESULT::Error( 404, "pin not found: " + aArgs["pin"].dump() );
 
         sheet = at->path;
-        point = at->pin->GetPosition();
+        point = at->position;
 
         SCH_SCREEN* screen = sheet->LastScreen();
         const int   grid = toIU( GRID_MM );
@@ -3293,7 +3390,7 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
         if( !found && side == "auto" )
         {
-            const VECTOR2I out = outward( at->pin );
+            const VECTOR2I out = at->out;
             side = out.x > 0 ? "right" : out.x < 0 ? "left" : out.y < 0 ? "up" : "down";
         }
     }
@@ -3438,6 +3535,792 @@ static KOPENAPI_RESULT h_sch_annotate( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 }
 
 
+namespace
+{
+
+constexpr double SHEET_PIN_PITCH_MM = 2.54;
+
+
+std::optional<LABEL_FLAG_SHAPE> portShape( const std::string& aDirection )
+{
+    static const std::map<std::string, LABEL_FLAG_SHAPE> shapes = { { "input", LABEL_FLAG_SHAPE::L_INPUT },
+                                                                    { "output", LABEL_FLAG_SHAPE::L_OUTPUT },
+                                                                    { "bidirectional", LABEL_FLAG_SHAPE::L_BIDI },
+                                                                    { "tri_state", LABEL_FLAG_SHAPE::L_TRISTATE },
+                                                                    { "tristate", LABEL_FLAG_SHAPE::L_TRISTATE },
+                                                                    { "passive", LABEL_FLAG_SHAPE::L_UNSPECIFIED } };
+    auto it = shapes.find( aDirection );
+    return it == shapes.end() ? std::nullopt : std::optional<LABEL_FLAG_SHAPE>( it->second );
+}
+
+
+std::optional<SHEET_SIDE> sheetSide( const std::string& aSide )
+{
+    static const std::map<std::string, SHEET_SIDE> sides = { { "left", SHEET_SIDE::LEFT },
+                                                             { "right", SHEET_SIDE::RIGHT },
+                                                             { "top", SHEET_SIDE::TOP },
+                                                             { "bottom", SHEET_SIDE::BOTTOM } };
+    auto it = sides.find( aSide );
+    return it == sides.end() ? std::nullopt : std::optional<SHEET_SIDE>( it->second );
+}
+
+
+const char* sideName( SHEET_SIDE aSide )
+{
+    switch( aSide )
+    {
+    case SHEET_SIDE::LEFT:  return "left";
+    case SHEET_SIDE::RIGHT: return "right";
+    case SHEET_SIDE::TOP:   return "top";
+    default:                return "bottom";
+    }
+}
+
+
+bool vertical( SHEET_SIDE aSide )
+{
+    return aSide == SHEET_SIDE::LEFT || aSide == SHEET_SIDE::RIGHT;
+}
+
+
+/// @brief Distance of a pin from the top / left corner along its side
+int sideOffset( const SCH_SHEET_PIN* aPin )
+{
+    const VECTOR2I d = aPin->GetPosition() - aPin->GetParent()->GetPosition();
+    return vertical( aPin->GetSide() ) ? d.y : d.x;
+}
+
+
+VECTOR2I sideAt( const SCH_SHEET* aSheet, SHEET_SIDE aSide, int aOffset )
+{
+    const VECTOR2I pos = aSheet->GetPosition(), size = aSheet->GetSize();
+
+    switch( aSide )
+    {
+    case SHEET_SIDE::LEFT:  return VECTOR2I( pos.x, pos.y + aOffset );
+    case SHEET_SIDE::RIGHT: return VECTOR2I( pos.x + size.x, pos.y + aOffset );
+    case SHEET_SIDE::TOP:   return VECTOR2I( pos.x + aOffset, pos.y );
+    default:                return VECTOR2I( pos.x + aOffset, pos.y + size.y );
+    }
+}
+
+
+nlohmann::json sheetPinCard( const SCH_SHEET_PIN* aPin )
+{
+    return { { "name", sheetPinName( aPin ) },
+             { "direction", portDirection( aPin ) },
+             { "side", sideName( aPin->GetSide() ) },
+             { "offset_mm", toMm( sideOffset( aPin ) ) },
+             { "x_mm", toMm( aPin->GetPosition().x ) },
+             { "y_mm", toMm( aPin->GetPosition().y ) },
+             { "uuid", str( aPin->m_Uuid.AsString() ) } };
+}
+
+
+struct PIN_SPEC
+{
+    std::string             name;
+    LABEL_FLAG_SHAPE        shape = LABEL_FLAG_SHAPE::L_INPUT;
+    SHEET_SIDE              side = SHEET_SIDE::LEFT;
+    std::optional<double>   offset;
+};
+
+
+/// @brief Pin requests: name, direction (default: the shape of the sheet file's hierarchical label of
+/// that name, else input), side, offset_mm.  409 on a name the sheet has or the request repeats.
+std::optional<KOPENAPI_RESULT> pinSpecs( const nlohmann::json& aPins, const SCH_SHEET* aSheet, const SCH_SCREEN* aScreen,
+                                         std::vector<PIN_SPEC>& aSpecs )
+{
+    std::set<std::string> names;
+
+    for( const SCH_SHEET_PIN* pin : aSheet->GetPins() )
+        names.insert( sheetPinName( pin ) );
+
+    for( const nlohmann::json& p : aPins )
+    {
+        PIN_SPEC spec;
+        spec.name = p.is_object() ? p.value( "name", std::string() ) : std::string();
+
+        if( spec.name.empty() )
+            return KOPENAPI_RESULT::Error( 400, "every pin needs a 'name'" );
+
+        if( !names.insert( spec.name ).second )
+            return KOPENAPI_RESULT::Error( 409, "the sheet already has a pin '" + spec.name + "'" );
+
+        if( p.contains( "direction" ) )
+        {
+            std::optional<LABEL_FLAG_SHAPE> shape = portShape( p.value( "direction", std::string() ) );
+
+            if( !shape )
+                return KOPENAPI_RESULT::Error( 400, "direction must be input, output, bidirectional, tri_state or passive" );
+
+            spec.shape = *shape;
+        }
+        else if( aScreen )
+        {
+            for( SCH_ITEM* item : aScreen->Items().OfType( SCH_HIER_LABEL_T ) )
+            {
+                if( str( UnescapeString( static_cast<SCH_HIERLABEL*>( item )->GetText() ) ) == spec.name )
+                {
+                    spec.shape = static_cast<SCH_HIERLABEL*>( item )->GetShape();
+                    break;
+                }
+            }
+        }
+
+        std::optional<SHEET_SIDE> side = sheetSide( p.value( "side", std::string( "left" ) ) );
+
+        if( !side )
+            return KOPENAPI_RESULT::Error( 400, "side must be left, right, top or bottom" );
+
+        spec.side = *side;
+
+        if( p.contains( "offset_mm" ) && p["offset_mm"].is_number() )
+            spec.offset = p["offset_mm"].get<double>();
+
+        aSpecs.push_back( spec );
+    }
+
+    return std::nullopt;
+}
+
+
+/// @brief Put a pin on a side: at the given offset (snapped to the grid, inside the side), else on the
+/// next free slot of the 2.54 mm pitch; the sheet grows when the side is full.  The caller has the
+/// sheet in its commit.
+SCH_SHEET_PIN* addSheetPin( SCH_SHEET* aSheet, SCH_SCREEN* aScreen, const PIN_SPEC& aSpec, std::string& aError )
+{
+    const int pitch = toIU( SHEET_PIN_PITCH_MM );
+    int       length = vertical( aSpec.side ) ? aSheet->GetSize().y : aSheet->GetSize().x;
+    int       offset = 0;
+
+    auto taken = [&]( int aOffset )
+    {
+        for( const SCH_SHEET_PIN* pin : aSheet->GetPins() )
+        {
+            if( pin->GetSide() == aSpec.side && std::abs( sideOffset( pin ) - aOffset ) < pitch / 2 )
+                return true;
+        }
+
+        return false;
+    };
+
+    if( aSpec.offset )
+    {
+        offset = toIU( *aSpec.offset );
+
+        if( offset <= 0 || offset >= length )
+        {
+            aError = fmt::format( "offset_mm {} is not inside the {} side (0 < offset < {} mm)", *aSpec.offset,
+                                  sideName( aSpec.side ), toMm( length ) );
+            return nullptr;
+        }
+
+        if( taken( offset ) )
+        {
+            aError = fmt::format( "a pin already sits at offset {} mm of the {} side", toMm( offset ), sideName( aSpec.side ) );
+            return nullptr;
+        }
+    }
+    else
+    {
+        offset = pitch;
+
+        while( taken( offset ) )
+            offset += pitch;
+
+        if( offset + pitch > length )
+        {
+            const VECTOR2I size = aSheet->GetSize();
+            aSheet->Resize( vertical( aSpec.side ) ? VECTOR2I( size.x, offset + pitch ) : VECTOR2I( offset + pitch, size.y ) );
+        }
+    }
+
+    const int textSize = aSheet->Schematic()->Settings().m_DefaultTextSize;
+    auto*     pin = new SCH_SHEET_PIN( aSheet, sideAt( aSheet, aSpec.side, offset ), wxString::FromUTF8( aSpec.name ) );
+
+    pin->SetTextSize( VECTOR2I( textSize, textSize ) );
+    pin->SetShape( aSpec.shape );
+    pin->SetSide( aSpec.side );
+    pin->ConstrainOnEdge( sideAt( aSheet, aSpec.side, offset ), false );
+    aSheet->AddPin( pin );
+    pin->AutoplaceFields( aScreen, AUTOPLACE_AUTO );
+    return pin;
+}
+
+
+/// @brief A free spot for a hierarchical label in a sheet's own file: a column near the left page edge
+/// (text left, connection point to the right) or, for pins on the right / bottom side, near the
+/// right edge; clear of everything drawn and of the labels placed before (aTaken)
+SCH_HIERLABEL* freeHierLabel( SCH_SCREEN* aScreen, const SCH_SHEET_PIN* aPin, std::vector<BOX2I>& aTaken )
+{
+    const VECTOR2D page = aScreen->GetPageSettings().GetSizeIU( schIUScale.IU_PER_MILS );
+    const bool     right = aPin->GetSide() == SHEET_SIDE::RIGHT || aPin->GetSide() == SHEET_SIDE::BOTTOM;
+    const int      x = right ? toIU( schIUScale.IUTomm( int( page.x ) ) - 50.8 ) : toIU( 50.8 );
+    const int      textSize = aScreen->Schematic() ? aScreen->Schematic()->Settings().m_DefaultTextSize : toIU( 1.27 );
+
+    auto make = [&]( int aY )
+    {
+        auto* label = new SCH_HIERLABEL( VECTOR2I( x, aY ), aPin->GetText() );
+        label->SetTextSize( VECTOR2I( textSize, textSize ) );
+        label->SetShape( aPin->GetShape() );
+        label->SetSpinStyle( right ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT );
+        return label;
+    };
+
+    const int air = toIU( 1.27 );
+
+    for( int y = toIU( 25.4 ); y < int( page.y ) - toIU( 50.8 ); y += toIU( SHEET_PIN_PITCH_MM ) )
+    {
+        SCH_HIERLABEL* label = make( y );
+        const BOX2I    box = label->GetBoundingBox().GetInflated( air );
+        bool           clear = true;
+
+        for( SCH_ITEM* item : aScreen->Items().Overlapping( box ) )
+        {
+            if( item->GetBoundingBox().Intersects( box ) )
+                clear = false;
+        }
+
+        for( const BOX2I& other : aTaken )
+            clear &= !other.Intersects( box );
+
+        if( clear )
+        {
+            aTaken.push_back( box );
+            return label;
+        }
+
+        delete label;
+    }
+
+    return make( toIU( 25.4 ) );
+}
+
+
+/// @brief Sheet instance of a sheet symbol by its path (as sch_sheet_list prints it), its uuid, or its
+/// name when that is unique; the root is no sheet symbol
+std::optional<SCH_SHEET_PATH> sheetInstance( SCHEMATIC* aSchematic, const std::string& aWanted, int& aStatus, std::string& aError )
+{
+    std::vector<SCH_SHEET_PATH> byName;
+
+    for( const SCH_SHEET_PATH& path : aSchematic->Hierarchy() )
+    {
+        if( path.size() < 2 || path.at( path.size() - 2 )->IsVirtualRootSheet() )
+            continue;
+
+        if( sheetPath( path ) == aWanted || str( path.Last()->m_Uuid.AsString() ) == aWanted )
+            return path;
+
+        if( str( path.Last()->GetName() ) == aWanted )
+            byName.push_back( path );
+    }
+
+    if( byName.size() == 1 )
+        return byName.front();
+
+    aStatus = byName.empty() ? 404 : 409;
+    aError = byName.empty() ? "sheet not found: " + aWanted + " (sch_sheet_list paths, or the sheet uuid)"
+                            : "sheet name '" + aWanted + "' is used by several sheets: give the path";
+    return std::nullopt;
+}
+
+
+bool sameFile( const wxString& aA, const wxString& aB )
+{
+    return !aA.IsEmpty() && !aB.IsEmpty() && wxFileName( aA ) == wxFileName( aB );
+}
+
+
+/// @brief A screen's file and the files of every sheet below it
+void collectFiles( const SCH_SCREEN* aScreen, std::vector<wxString>& aFiles, int aDepth = 0 )
+{
+    if( !aScreen || aDepth > 64 )
+        return;
+
+    aFiles.push_back( aScreen->GetFileName() );
+
+    for( SCH_ITEM* item : aScreen->Items().OfType( SCH_SHEET_T ) )
+        collectFiles( static_cast<SCH_SHEET*>( item )->GetScreen(), aFiles, aDepth + 1 );
+}
+
+
+bool startsWith( const SCH_SHEET_PATH& aPath, const SCH_SHEET_PATH& aPrefix )
+{
+    if( aPath.size() < aPrefix.size() )
+        return false;
+
+    for( size_t i = 0; i < aPrefix.size(); ++i )
+    {
+        if( aPath.at( i ) != aPrefix.at( i ) )
+            return false;
+    }
+
+    return true;
+}
+
+} // namespace
+
+
+static KOPENAPI_RESULT h_sch_sheet_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    const std::string name = aArgs.value( "name", std::string() );
+    const std::string file = aArgs.value( "file", std::string() );
+
+    if( name.empty() || file.empty() || !aArgs.contains( "x_mm" ) || !aArgs.contains( "y_mm" ) )
+        return KOPENAPI_RESULT::Error( 400, "give 'name', 'file' (.kicad_sch), 'x_mm' and 'y_mm'" );
+
+    const double widthMm = aArgs.value( "width_mm", 50.8 ), heightMm = aArgs.value( "height_mm", 25.4 );
+
+    if( toIU( widthMm ) < toIU( 2 * SHEET_PIN_PITCH_MM ) || toIU( heightMm ) < toIU( 2 * SHEET_PIN_PITCH_MM ) )
+        return KOPENAPI_RESULT::Error( 400, "width_mm and height_mm must be at least 5.08" );
+
+    if( aArgs.contains( "pins" ) && !aArgs["pins"].is_array() )
+        return KOPENAPI_RESULT::Error( 400, "'pins' is an array of {name, direction, side, offset_mm}" );
+
+    std::optional<SCH_SHEET_PATH> parent = targetSheet( *context, aArgs );
+
+    if( !parent )
+        return KOPENAPI_RESULT::Error( 404, "sheet not found (see sch_sheet_list)" );
+
+    SCHEMATIC*     schematic = context->GetSchematic();
+    SCH_SCREEN*    parentScreen = parent->LastScreen();
+    const wxString parentFile = parentScreen->GetFileName();
+
+    if( parentFile.IsEmpty() )
+        return KOPENAPI_RESULT::Error( 409, "the parent sheet has no file yet: save the schematic first (sch_save)" );
+
+    // The file: relative names are taken from the project directory; the sheet stores it relative to
+    // its parent's directory, as the editor does
+    wxFileName fn( wxString::FromUTF8( file ) );
+
+    if( fn.GetExt() != wxString::FromUTF8( FILEEXT::KiCadSchematicFileExtension ) )
+        return KOPENAPI_RESULT::Error( 422, "file must be a KiCad schematic (.kicad_sch): " + file );
+
+    const wxString projectDir = context->Prj().GetProjectPath();
+    fn.Normalize( FN_NORMALIZE_FLAGS, projectDir.IsEmpty() ? wxFileName( parentFile ).GetPath() : projectDir );
+
+    wxString absolute = fn.GetFullPath();
+    absolute.Replace( wxT( "\\" ), wxT( "/" ) );
+
+    wxFileName relative( absolute );
+    wxString   stored = relative.MakeRelativeTo( wxFileName( parentFile ).GetPath() ) ? relative.GetFullPath() : absolute;
+    stored.Replace( wxT( "\\" ), wxT( "/" ) );
+
+    const wxString wxName = wxString::FromUTF8( name );
+
+    for( SCH_ITEM* item : parentScreen->Items().OfType( SCH_SHEET_T ) )
+    {
+        if( static_cast<SCH_SHEET*>( item )->GetName().CmpNoCase( wxName ) == 0 )
+            return KOPENAPI_RESULT::Error( 409, "the parent sheet already has a sheet named '" + name + "' (names are unique "
+                                                "per sheet, case-insensitive)" );
+    }
+
+    // Recursion: the file must not be the parent or one of its ancestors, nor contain one of them
+    std::vector<wxString> ancestors;
+
+    for( size_t i = 0; i < parent->size(); ++i )
+    {
+        if( !parent->at( i )->IsVirtualRootSheet() && parent->at( i )->GetScreen() )
+            ancestors.push_back( parent->at( i )->GetScreen()->GetFileName() );
+    }
+
+    auto recursion = [&]( const std::vector<wxString>& aFiles ) -> std::optional<KOPENAPI_RESULT>
+    {
+        for( const wxString& f : aFiles )
+        {
+            for( const wxString& a : ancestors )
+            {
+                if( sameFile( f, a ) )
+                    return KOPENAPI_RESULT::Error( 422, "recursion: " + str( f ) + " is the parent sheet or one of its "
+                                                        "ancestors, so the sheet would contain itself" );
+            }
+        }
+
+        return std::nullopt;
+    };
+
+    if( std::optional<KOPENAPI_RESULT> refused = recursion( { absolute } ) )
+        return *refused;
+
+    SCH_SCREEN* reuse = nullptr;
+
+    for( const SCH_SHEET_PATH& path : schematic->Hierarchy() )
+    {
+        const wxFileName other( path.LastScreen()->GetFileName() );
+
+        if( sameFile( other.GetFullPath(), absolute ) )
+        {
+            reuse = path.LastScreen();
+            break;
+        }
+
+        if( other.GetPath() == fn.GetPath() && other.GetFullName().CmpNoCase( fn.GetFullName() ) == 0 )
+            return KOPENAPI_RESULT::Error( 409, "the file name differs only in case from " + str( other.GetFullPath() )
+                                                + ": that breaks on case-insensitive file systems" );
+    }
+
+    auto sheet = std::make_unique<SCH_SHEET>( parent->Last(), VECTOR2I( toIU( aArgs["x_mm"].get<double>() ), toIU( aArgs["y_mm"].get<double>() ) ),
+                                              VECTOR2I( toIU( widthMm ), toIU( heightMm ) ) );
+    sheet->SetName( wxName );
+    sheet->SetFileName( stored );
+
+    nlohmann::json             warnings = nlohmann::json::array();
+    const SCH_SHEET_LIST       before = schematic->Hierarchy();
+    const wxString             projectName = context->Prj().GetProjectName();
+    std::string                source = reuse ? "shared" : fn.FileExists() ? "loaded" : "created";
+    std::unique_ptr<SCH_SHEET> loaded;
+    SCH_SCREEN*                screen = reuse;
+
+    if( source == "loaded" )
+    {
+        // Read like SCH_EDIT_FRAME::LoadSheetFromFile, without its dialogs
+        IO_RELEASER<SCH_IO> pi( SCH_IO_MGR::FindPlugin( SCH_IO_MGR::SCH_KICAD ) );
+        loaded = std::make_unique<SCH_SHEET>( schematic );
+        const_cast<KIID&>( loaded->m_Uuid ) = sheet->m_Uuid;
+        loaded->SetFileName( absolute );
+
+        std::map<std::string, UTF8> props;
+        props["hierarchical_sheet_load"] = "1";
+
+        try
+        {
+            pi->LoadSchematicFile( absolute, schematic, loaded.get(), &props );
+        }
+        catch( const IO_ERROR& error )
+        {
+            return KOPENAPI_RESULT::Error( 422, "not a readable KiCad schematic: " + file + ": " + str( error.What() ) );
+        }
+
+        // The editor offers a partial schematic here; the API refuses instead
+        if( !pi->GetError().IsEmpty() )
+            return KOPENAPI_RESULT::Error( 422, "not a readable KiCad schematic (or a sheet in it is not): " + file + ": "
+                                                + str( pi->GetError() ) );
+
+        screen = loaded->GetScreen();
+
+        if( !screen )
+            return KOPENAPI_RESULT::Error( 422, "not a readable KiCad schematic: " + file );
+
+        if( SCH_SCREENS( loaded.get() ).HasNoFullyDefinedLibIds() )
+            return KOPENAPI_RESULT::Error( 422, "the file's symbols are not linked to library ids (a pre-6 schematic "
+                                                "not remapped): remap it in its own project first" );
+    }
+
+    if( screen )
+    {
+        std::vector<wxString> files;
+        collectFiles( screen, files );
+
+        if( std::optional<KOPENAPI_RESULT> refused = recursion( files ) )
+            return *refused;
+    }
+
+    // Pins asked for: checked on a copy before anything changes
+    std::vector<PIN_SPEC> specs;
+    std::string           error;
+
+    if( aArgs.contains( "pins" ) )
+    {
+        if( std::optional<KOPENAPI_RESULT> refused = pinSpecs( aArgs["pins"], sheet.get(), screen, specs ) )
+            return *refused;
+
+        SCH_SHEET probe( *sheet );
+
+        for( const PIN_SPEC& spec : specs )
+        {
+            if( !addSheetPin( &probe, nullptr, spec, error ) )
+                return KOPENAPI_RESULT::Error( error.find( "already sits" ) != std::string::npos ? 409 : 400, error );
+        }
+    }
+
+    if( source == "shared" )
+    {
+        // Another instance of a file already in the hierarchy shares its screen
+        sheet->SetScreen( reuse );
+
+        SCH_SHEET_LIST below( sheet.get() );
+
+        if( !projectName.IsEmpty() )
+            below.AddNewSymbolInstances( *parent, projectName );
+
+        below.AddNewSheetInstances( *parent, before.GetLastVirtualPageNumber() );
+    }
+    else if( source == "loaded" )
+    {
+        // Sheets inside a file from another folder keep pointing at their files
+        if( fn.GetPathWithSep() != projectDir )
+        {
+            for( const SCH_SHEET_PATH& path : SCH_SHEET_LIST( loaded.get() ) )
+            {
+                wxString lastPath = projectDir;
+
+                for( unsigned i = 1; i < path.size(); i++ )
+                {
+                    SCH_SHEET*  sub = path.at( i );
+                    SCH_SCREEN* subScreen = sub ? sub->GetScreen() : nullptr;
+
+                    if( !subScreen || !wxFileName( subScreen->GetFileName() ).IsAbsolute() )
+                        continue;
+
+                    wxFileName subFile( subScreen->GetFileName() );
+                    wxFileName tmp = subFile;
+                    wxString   subName = tmp.MakeRelativeTo( lastPath ) ? tmp.GetFullPath() : subFile.GetFullPath();
+
+                    subName.Replace( wxT( "\\" ), wxT( "/" ) );
+                    sub->SetFileName( subName );
+                    lastPath = subFile.GetPath();
+                }
+            }
+        }
+
+        SCH_SHEET_LIST below( loaded.get() );
+
+        if( screen->GetFileFormatVersionAtLoad() < 20221002 && !screen->GetSymbolInstances().empty() )
+            below.UpdateSymbolInstanceData( screen->GetSymbolInstances() );
+
+        screen->MigrateSimModels();
+
+        if( !projectName.IsEmpty() )
+            below.AddNewSymbolInstances( *parent, projectName );
+
+        below.AddNewSheetInstances( *parent, before.GetLastVirtualPageNumber() );
+        sheet->SetScreen( screen );
+        loaded.reset();
+    }
+    else
+    {
+        if( !fn.DirExists() && !wxFileName::Mkdir( fn.GetPath(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL ) )
+            return KOPENAPI_RESULT::Error( 500, "cannot create the directory of " + file );
+
+        screen = new SCH_SCREEN( schematic );
+        screen->SetFileName( absolute );
+        screen->SetPageSettings( parentScreen->GetPageSettings() );
+        sheet->SetScreen( screen );
+
+        SCH_SHEET_PATH instance = *parent;
+        instance.push_back( sheet.get() );
+        instance.SetPageNumber( before.GetNextPageNumber() );
+    }
+
+    // Pins: those asked for, then one per hierarchical label of the file without a pin (outputs on the
+    // right, the rest on the left, by name: like the editor's automatic sheet pins)
+    for( const PIN_SPEC& spec : specs )
+        addSheetPin( sheet.get(), parentScreen, spec, error );
+
+    if( aArgs.value( "sync_pins", true ) )
+    {
+        std::vector<SCH_HIERLABEL*> labels = GetUnplacedSheetPinLabels( *sheet );
+
+        std::sort( labels.begin(), labels.end(),
+                   []( const SCH_HIERLABEL* a, const SCH_HIERLABEL* b ) { return a->GetText() < b->GetText(); } );
+
+        for( SCH_HIERLABEL* label : labels )
+        {
+            PIN_SPEC spec;
+            spec.name = str( UnescapeString( label->GetText() ) );
+            spec.shape = label->GetShape();
+            spec.side = label->GetShape() == LABEL_FLAG_SHAPE::L_OUTPUT ? SHEET_SIDE::RIGHT : SHEET_SIDE::LEFT;
+            addSheetPin( sheet.get(), parentScreen, spec, error );
+        }
+    }
+
+    sheet->AutoplaceFields( parentScreen, AUTOPLACE_AUTO );
+
+    // On the screen before the commit so the hierarchy and the annotation see the new instance; the
+    // commit then only records it (and adds it to the view)
+    SCH_SHEET* placed = sheet.release();
+    parentScreen->Append( placed );
+
+    SCH_COMMIT commit( context->GetToolManager() );
+    commit.Add( placed, parentScreen );
+    schematic->RefreshHierarchy();
+
+    if( source == "loaded" )
+        SCH_SCREENS( schematic->Root() ).ReplaceDuplicateTimeStamps();
+
+    SCH_SHEET_PATH full = *parent;
+    full.push_back( placed );
+
+    // The sheet's own page number comes from the properties dialog in the editor
+    if( full.GetPageNumber().IsEmpty() )
+    {
+        full.SetPageNumber( schematic->Hierarchy().GetNextPageNumber() );
+        schematic->RefreshHierarchy();
+    }
+
+    if( aArgs.value( "annotate", true ) )
+    {
+        // Like the editor's automatic annotation of a new sheet: its symbols renumbered for this instance
+        for( const SCH_SHEET_PATH& path : schematic->Hierarchy() )
+        {
+            if( !startsWith( path, full ) )
+                continue;
+
+            for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+            {
+                SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+                if( !symbol->IsPower() )
+                    symbol->ClearAnnotation( &path, false );
+            }
+        }
+
+        annotate( schematic, commit, false );
+    }
+
+    pushEdit( commit, schematic, _( "Add sheet (API)" ), aCtx.kiway, { placed->m_Uuid } );
+
+    if( source == "created" && !SCH_API_SAVE::SaveSheetToFile( placed, *schematic, absolute ) )
+        warnings.push_back( "could not write " + str( absolute ) + " yet: sch_save writes it" );
+
+    for( const SCH_SHEET_PATH& path : schematic->Hierarchy() )
+    {
+        if( path.Path() == full.Path() )
+            full = path;
+    }
+
+    nlohmann::json pins = nlohmann::json::array(), symbols = nlohmann::json::array();
+
+    for( const SCH_SHEET_PIN* pin : placed->GetPins() )
+        pins.push_back( sheetPinCard( pin ) );
+
+    for( SCH_ITEM* item : placed->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        if( !symbol->IsPower() )
+            symbols.push_back( { { "ref", str( symbol->GetRef( &full, false ) ) },
+                                 { "value", str( symbol->GetValue( &full, FOR_GUI ) ) },
+                                 { "lib_id", str( symbol->GetLibId().Format() ) },
+                                 { "uuid", str( symbol->m_Uuid.AsString() ) } } );
+    }
+
+    nlohmann::json result = { { "uuid", str( placed->m_Uuid.AsString() ) },
+                              { "path", sheetPath( full ) },
+                              { "name", name },
+                              { "file", str( stored ) },
+                              { "file_absolute", str( absolute ) },
+                              { "source", source },
+                              { "page", str( full.GetPageNumber() ) },
+                              { "x_mm", toMm( placed->GetPosition().x ) },
+                              { "y_mm", toMm( placed->GetPosition().y ) },
+                              { "width_mm", toMm( placed->GetSize().x ) },
+                              { "height_mm", toMm( placed->GetSize().y ) },
+                              { "pins", pins },
+                              { "symbols", symbols } };
+
+    if( !warnings.empty() )
+        result["warnings"] = warnings;
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
+
+static KOPENAPI_RESULT h_sch_sheet_pin_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    const std::string wanted = aArgs.value( "sheet_path", aArgs.value( "uuid", std::string() ) );
+
+    if( wanted.empty() || !aArgs.contains( "pins" ) || !aArgs["pins"].is_array() || aArgs["pins"].empty() )
+        return KOPENAPI_RESULT::Error( 400, "give 'sheet_path' (or the sheet's uuid) and 'pins' [{name, direction, side, offset_mm}]" );
+
+    SCHEMATIC*                    schematic = context->GetSchematic();
+    int                           status = 404;
+    std::string                   error;
+    std::optional<SCH_SHEET_PATH> instance = sheetInstance( schematic, wanted, status, error );
+
+    if( !instance )
+        return KOPENAPI_RESULT::Error( status, error );
+
+    SCH_SHEET*     sheet = instance->Last();
+    SCH_SHEET_PATH parent = *instance;
+    parent.pop_back();
+
+    SCH_SCREEN*           parentScreen = parent.LastScreen();
+    SCH_SCREEN*           own = sheet->GetScreen();
+    std::vector<PIN_SPEC> specs;
+
+    if( std::optional<KOPENAPI_RESULT> refused = pinSpecs( aArgs["pins"], sheet, own, specs ) )
+        return *refused;
+
+    // Offsets checked on a copy first, so a bad one changes nothing
+    {
+        SCH_SHEET probe( *sheet );
+
+        for( const PIN_SPEC& spec : specs )
+        {
+            if( !addSheetPin( &probe, nullptr, spec, error ) )
+                return KOPENAPI_RESULT::Error( error.find( "already sits" ) != std::string::npos ? 409 : 400, error );
+        }
+    }
+
+    const bool        createLabels = aArgs.value( "create_labels", false );
+    SCH_COMMIT        commit( context->GetToolManager() );
+    std::vector<KIID> glowing = { sheet->m_Uuid };
+    std::vector<BOX2I> taken;
+    nlohmann::json    pins = nlohmann::json::array();
+
+    commit.Modify( sheet, parentScreen );
+
+    for( const PIN_SPEC& spec : specs )
+    {
+        SCH_SHEET_PIN* pin = addSheetPin( sheet, parentScreen, spec, error );
+        nlohmann::json card = sheetPinCard( pin );
+
+        if( createLabels && own )
+        {
+            SCH_HIERLABEL* existing = nullptr;
+
+            for( SCH_ITEM* item : own->Items().OfType( SCH_HIER_LABEL_T ) )
+            {
+                if( static_cast<SCH_HIERLABEL*>( item )->GetText() == pin->GetText() )
+                    existing = static_cast<SCH_HIERLABEL*>( item );
+            }
+
+            SCH_HIERLABEL* label = existing ? existing : freeHierLabel( own, pin, taken );
+
+            if( !existing )
+                commit.Add( label, own );
+
+            card["label"] = { { "uuid", str( label->m_Uuid.AsString() ) },
+                              { "x_mm", toMm( label->GetPosition().x ) },
+                              { "y_mm", toMm( label->GetPosition().y ) },
+                              { "created", !existing } };
+        }
+
+        pins.push_back( card );
+    }
+
+    pushEdit( commit, schematic, _( "Add sheet pin (API)" ), aCtx.kiway, glowing );
+
+    for( nlohmann::json& card : pins )
+    {
+        for( const SCH_SHEET_PIN* pin : sheet->GetPins() )
+        {
+            if( str( pin->m_Uuid.AsString() ) == card["uuid"].get<std::string>() )
+                card["net"] = netOfItem( schematic, pin, parent );
+        }
+    }
+
+    return KOPENAPI_RESULT::Ok( { { "sheet", sheetPath( *instance ) },
+                                  { "uuid", str( sheet->m_Uuid.AsString() ) },
+                                  { "parent", sheetPath( parent ) },
+                                  { "width_mm", toMm( sheet->GetSize().x ) },
+                                  { "height_mm", toMm( sheet->GetSize().y ) },
+                                  { "pins", pins } } );
+}
+
+
 static const char* EDIT_NOTE = " One commit = one undo step in the GUI.";
 
 KOPENAPI_REGISTER( "sch_new",
@@ -3569,13 +4452,13 @@ KOPENAPI_REGISTER( "sch_power_add",
                    false, h_sch_power_add );
 
 KOPENAPI_REGISTER( "sch_wire",
-                   std::string( "Draw a wire between two pins (REF.PIN) or points {x_mm, y_mm} on one sheet: "
+                   std::string( "Draw a wire between two pins (REF.PIN, sheet pins SHEETNAME.PIN) or points {x_mm, y_mm} on one sheet: "
                                 "straight when aligned, else one corner (route auto/hv/vh); junction dots "
                                 "where it meets other wires; returns the segments and the resulting net. "
                                 "Use for short local connections, sch_connect labels for long ones." ) + EDIT_NOTE,
                    R"json({"type":"object","required":["from","to"],"properties":{
-                        "from":{"description":"REF.PIN or {x_mm, y_mm}"},
-                        "to":{"description":"REF.PIN or {x_mm, y_mm}"},
+                        "from":{"description":"REF.PIN, SHEETNAME.PIN (a sheet pin) or {x_mm, y_mm}"},
+                        "to":{"description":"REF.PIN, SHEETNAME.PIN (a sheet pin) or {x_mm, y_mm}"},
                         "route":{"type":"string","enum":["auto","hv","vh"],"default":"auto"},
                         "sheet":{"type":"string","description":"for point-only wires"}}})json"_json,
                    false, h_sch_wire );
@@ -3600,7 +4483,7 @@ KOPENAPI_REGISTER( "sch_label_add",
                                 "joined and where, warns when it touches nothing. Labels on many pins at once: "
                                 "sch_connect." ) + EDIT_NOTE,
                    R"json({"type":"object","required":["text"],"properties":{
-                        "text":{"type":"string"},"pin":{"type":"string","description":"REF.PIN, instead of x_mm / y_mm"},
+                        "text":{"type":"string"},"pin":{"type":"string","description":"REF.PIN or SHEETNAME.PIN (a sheet pin), instead of x_mm / y_mm"},
                         "x_mm":{"type":"number"},"y_mm":{"type":"number"},
                         "kind":{"type":"string","enum":["local","global","hierarchical"],"default":"local"},
                         "side":{"type":"string","enum":["auto","left","right","up","down"],"default":"auto"},
@@ -3635,4 +4518,45 @@ KOPENAPI_REGISTER( "sch_lock",
 
 KOPENAPI_REGISTER( "sch_unlock", "Unlock schematic items (refs, uuids); one undo step", SCH_LOCK_SCHEMA, false, h_sch_unlock );
 
-KOPENAPI_MARK_EDITING( "sch_symbol_add", "sch_symbol_update", "sch_items_move", "sch_item_delete", "sch_connect", "sch_wire", "sch_power_add", "sch_label_add", "sch_no_connect", "sch_annotate", "sch_lock", "sch_unlock" );
+#define SCH_SHEET_PIN_SCHEMA R"json({"type":"object","required":["name"],"properties":{
+                        "name":{"type":"string"},
+                        "direction":{"type":"string","enum":["input","output","bidirectional","tri_state","passive"],
+                                     "description":"default: the shape of the sheet file's hierarchical label of that name, else input"},
+                        "side":{"type":"string","enum":["left","right","top","bottom"],"default":"left"},
+                        "offset_mm":{"type":"number","description":"along the side from its top / left corner; default: next free slot on the 2.54 mm pitch (the sheet grows when full)"}}})json"
+
+KOPENAPI_REGISTER( "sch_sheet_add",
+                   std::string( "Add a hierarchical sheet (sub-sheet) to a sheet, like Draw Sheet: name, file (.kicad_sch, "
+                                "relative to the project directory or absolute), top-left corner and size in mm. An existing "
+                                "file is loaded (a file already in the hierarchy is shared: another instance of it, e.g. two "
+                                "channels); a new file is created empty with the parent's paper and written at once. Sheet "
+                                "pins: 'pins', plus with sync_pins one per hierarchical label of the file that has none "
+                                "(direction from the label; outputs right, others left). Hierarchy, page number and "
+                                "annotation of the new instance's symbols are updated. 409 name taken on that sheet, 422 "
+                                "recursion or not a schematic. Answers uuid, path, page, pins with positions (wire to them "
+                                "or address them as SHEETNAME.PIN in sch_wire / sch_label_add), symbols of the file." ) + EDIT_NOTE,
+                   nlohmann::json::parse( std::string( R"json({"type":"object","required":["name","file","x_mm","y_mm"],"properties":{
+                        "name":{"type":"string","description":"sheet name, unique among the sheets of the parent (case-insensitive)"},
+                        "file":{"type":"string","description":".kicad_sch, relative to the project directory or absolute"},
+                        "x_mm":{"type":"number","description":"top-left corner"},"y_mm":{"type":"number"},
+                        "width_mm":{"type":"number","default":50.8},"height_mm":{"type":"number","default":25.4},
+                        "sheet":{"type":"string","description":"parent sheet path from sch_sheet_list; default current/root"},
+                        "pins":{"type":"array","items":)json" ) + SCH_SHEET_PIN_SCHEMA + R"json(},
+                        "sync_pins":{"type":"boolean","default":true,"description":"a pin for every hierarchical label of the file without one"},
+                        "annotate":{"type":"boolean","default":true,"description":"renumber the new instance's symbols (first free numbers), as the editor's automatic annotation does; false keeps the file's references"}}})json" ),
+                   false, h_sch_sheet_add, 120 );
+
+KOPENAPI_REGISTER( "sch_sheet_pin_add",
+                   std::string( "Add pins to a sheet symbol (sheet_path as sch_sheet_list prints it, the sheet's uuid, or "
+                                "its name when unique), like Add Sheet Pin: name, direction, side, offset_mm (default the "
+                                "next free 2.54 mm slot; the sheet grows when a side is full). create_labels also puts a "
+                                "matching hierarchical label in the sheet's own file on a free spot (an existing one is "
+                                "reused). 409 on a pin name the sheet already has. Answers every pin's position in mm "
+                                "(on the grid: sch_wire to {x_mm, y_mm} or to SHEETNAME.PIN) and the label positions inside." ) + EDIT_NOTE,
+                   nlohmann::json::parse( std::string( R"json({"type":"object","required":["sheet_path","pins"],"properties":{
+                        "sheet_path":{"type":"string","description":"e.g. \"project/Mixer\" (sch_sheet_list path), or the sheet uuid"},
+                        "pins":{"type":"array","items":)json" ) + SCH_SHEET_PIN_SCHEMA + R"json(},
+                        "create_labels":{"type":"boolean","default":false,"description":"a hierarchical label per pin inside the sheet's file"}}})json" ),
+                   false, h_sch_sheet_pin_add );
+
+KOPENAPI_MARK_EDITING( "sch_symbol_add", "sch_symbol_update", "sch_items_move", "sch_item_delete", "sch_connect", "sch_wire", "sch_power_add", "sch_label_add", "sch_no_connect", "sch_annotate", "sch_lock", "sch_unlock", "sch_sheet_add", "sch_sheet_pin_add" );

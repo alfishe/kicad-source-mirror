@@ -122,12 +122,20 @@ WIRE_ROUTER::WIRE_ROUTER( SCH_SCREEN* aScreen, const SCH_SHEET_PATH& aPath, int 
             break;
         }
         case SCH_SHEET_T:
-            for( SCH_SHEET_PIN* pin : static_cast<SCH_SHEET*>( item )->GetPins() )
-                m_points.push_back( pin->GetPosition() );
+        {
+            SCH_SHEET* sheet = static_cast<SCH_SHEET*>( item );
 
-            m_bodies.push_back( item->GetBoundingBox() );
-            m_bodyNames.push_back( "sheet " + static_cast<SCH_SHEET*>( item )->GetName().ToStdString( wxConvUTF8 ) );
+            // sheet pins sit on the border: a wire leaving one may touch its own sheet
+            for( SCH_SHEET_PIN* pin : sheet->GetPins() )
+            {
+                m_points.push_back( pin->GetPosition() );
+                m_pinOwner.emplace_back( pin->GetPosition(), m_bodies.size() );
+            }
+
+            m_bodies.push_back( BOX2I( sheet->GetPosition(), sheet->GetSize() ) );
+            m_bodyNames.push_back( "sheet " + sheet->GetName().ToStdString( wxConvUTF8 ) );
             break;
+        }
 
         case SCH_JUNCTION_T:
         case SCH_NO_CONNECT_T:

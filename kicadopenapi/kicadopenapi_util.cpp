@@ -125,9 +125,9 @@ nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json&
 }
 
 
-nlohmann::json KopenapiPageSchema()
+nlohmann::json KopenapiPageSchema( int aDefaultLimit )
 {
-    return { { "limit", { { "type", "integer" }, { "minimum", 1 }, { "maximum", 1000 }, { "default", 100 } } },
+    return { { "limit", { { "type", "integer" }, { "minimum", 1 }, { "maximum", 1000 }, { "default", aDefaultLimit } } },
              { "cursor", { { "type", "string" }, { "description", "next_cursor of the previous page" } } } };
 }
 
@@ -172,10 +172,10 @@ nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName )
 }
 
 
-nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties )
+nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit )
 {
     // a named object: a range-for over items() of a temporary iterates a destroyed object
-    const nlohmann::json page = KopenapiPageSchema();
+    const nlohmann::json page = KopenapiPageSchema( aDefaultLimit );
 
     for( const auto& [key, value] : page.items() )
         aProperties[key] = value;
@@ -201,6 +201,49 @@ bool KopenapiIsConnectorRef( const std::string& aRef )
 }
 
 
+std::string KopenapiLogicCore( const std::string& aText )
+{
+    auto alpha = []( char c ) { return std::isalpha( static_cast<unsigned char>( c ) ) != 0; };
+    size_t k = 0;
+
+    while( k < aText.size() && alpha( aText[k] ) )
+        ++k;
+
+    // vendor prefixes only: AD7400 is no 7400
+    static const std::set<std::string> vendors = { "", "sn", "mc", "cd", "m", "mm", "dm", "hd" };
+    std::string prefix = aText.substr( 0, k );
+
+    for( char& ch : prefix )
+        ch = static_cast<char>( std::tolower( static_cast<unsigned char>( ch ) ) );
+
+    if( !vendors.count( prefix ) || ( aText.compare( k, 2, "74" ) != 0 && aText.compare( k, 2, "54" ) != 0 ) )
+        return std::string();
+
+    k += 2;
+
+    while( k < aText.size() && alpha( aText[k] ) )   // family: LS, HC, LVC, AHCT, CBTLV
+        ++k;
+
+    size_t end = k;
+
+    while( end < aText.size() && std::isalnum( static_cast<unsigned char>( aText[end] ) ) )
+        ++end;
+
+    std::string number = aText.substr( k, end - k );
+
+    while( !number.empty() && alpha( number.back() ) )   // suffix: A, D, PW
+        number.pop_back();
+
+    if( number.size() < 2 || !std::isdigit( static_cast<unsigned char>( number[0] ) ) )
+        return std::string();
+
+    for( char& ch : number )
+        ch = static_cast<char>( std::tolower( static_cast<unsigned char>( ch ) ) );
+
+    return "74" + number;
+}
+
+
 KOPENAPI_TEXT_MATCH KopenapiTextMatch( const std::string& aQuery, const std::string& aName, const std::string& aKeywords,
                                        const std::string& aDescription )
 {
@@ -214,6 +257,7 @@ KOPENAPI_TEXT_MATCH KopenapiTextMatch( const std::string& aQuery, const std::str
 
     const std::string name = lower( aName ), keywords = lower( aKeywords ), description = lower( aDescription );
     const std::string query = lower( aQuery );
+    const std::string nameCore = KopenapiLogicCore( name );
 
     KOPENAPI_TEXT_MATCH result;
     size_t              start = 0;
@@ -238,6 +282,8 @@ KOPENAPI_TEXT_MATCH KopenapiTextMatch( const std::string& aQuery, const std::str
             termScore = 30;
         else if( name.find( term ) != std::string::npos )
             termScore = 8;
+        else if( !nameCore.empty() && KopenapiLogicCore( term ) == nameCore )
+            termScore = 20;   // the same logic function in another family: 74LS257 for 74LVC257
 
         if( keywords.find( term ) != std::string::npos )
             termScore += 12;
@@ -313,7 +359,7 @@ nlohmann::json KopenapiRankedPage( std::vector<std::pair<KOPENAPI_TEXT_MATCH, nl
     for( auto& [match, row] : kept )
         rows.push_back( std::move( row ) );
 
-    nlohmann::json page = KopenapiPage( rows, aArgs );
+    nlohmann::json page = KopenapiPage( rows, aArgs, KOPENAPI_RANKED_PAGE );
 
     if( !anyFull && !rows.empty() )
     {

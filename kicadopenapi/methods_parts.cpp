@@ -336,6 +336,69 @@ std::vector<std::string> packageWordsOf( const std::vector<std::string>& aQuery 
     return out;
 }
 
+/// @brief Packages a symbol's description names, in its order: "Dual opamp, DIP-8/DMP-8/SSOP-8" ->
+/// dip-8, soic-8, ssop-8 (vendor names of the same body mapped: JRC DMP = SOIC)
+std::vector<std::string> describedPackages( const std::string& aDescription )
+{
+    static const std::map<std::string, std::string> alias = { { "dmp", "soic" }, { "so", "soic" } };
+    std::vector<std::string> out;
+    std::string              word;
+
+    for( char ch : lower( aDescription ) + " " )
+    {
+        if( std::isalnum( (unsigned char) ch ) || ch == '-' || ch == '.' )
+        {
+            word += ch;
+            continue;
+        }
+
+        while( !word.empty() && ( word.back() == '.' || word.back() == '-' ) )
+            word.pop_back();
+
+        size_t letters = 0;
+
+        while( letters < word.size() && std::isalpha( (unsigned char) word[letters] ) )
+            ++letters;
+
+        // letters, '-', a digit: "dip-8", "sot-23-5", "to-220-5"
+        if( letters >= 2 && letters + 1 < word.size() && word[letters] == '-'
+            && std::isdigit( (unsigned char) word[letters + 1] ) )
+        {
+            const auto        a = alias.find( word.substr( 0, letters ) );
+            const std::string package = a == alias.end() ? word : a->second + word.substr( letters );
+
+            if( std::find( out.begin(), out.end(), package ) == out.end() )
+                out.push_back( package );
+        }
+
+        word.clear();
+    }
+
+    return out;
+}
+
+
+/// @brief How well aFootprint is one of aPackages: the fit of its name to the package (whole token
+/// "DIP-8_W7.62mm" before "DIP-8-16_W7.62mm"), then the package's place in the description; a socket
+/// is no package of the part and comes after the bodies; 0 when it is none of them
+int describedScore( const std::vector<std::string>& aPackages, const std::string& aFootprint )
+{
+    int best = 0;
+
+    for( size_t k = 0; k < aPackages.size(); ++k )
+    {
+        const int fit = packageScore( { aPackages[k] }, aFootprint );
+
+        if( fit > 0 )
+            best = std::max( best, fit * 100 + int( aPackages.size() - k ) * 10 );
+    }
+
+    if( best > 0 && lower( aFootprint ).find( "socket" ) != std::string::npos )
+        best = std::max( 1, best - 250 );
+
+    return best;
+}
+
 } // namespace
 
 
@@ -477,6 +540,7 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         const std::string     ownFootprint = c.value( "footprint", std::string() );
         const int             pins = c.value( "pins", 0 );
         const nlohmann::json  filters = c.value( "footprint_filters", nlohmann::json::array() );
+        const std::vector<std::string> described = describedPackages( c.value( "description", std::string() ) );
 
         // Every fitting footprint found, then ranked: package fit, source (own footprint,
         // the symbol's filters, package words only), then the libraries' own order (plain
@@ -551,11 +615,19 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 seen = std::move( savedSeen );
             }
 
+            // Without package words, the packages the description names rank the footprints, in its
+            // order; footprints that fit only the filters and pin count go (no LFCSP-8 for a part
+            // made in DIP-8 / SOIC-8 / SSOP-8), unless none is of a named package
+            const bool byDescription = package.empty() && std::any_of( pool.begin(), pool.end(),
+                    [&]( const FIT& f ) { return f.source > 0 && describedScore( described, f.row["lib_id"] ) > 0; } );
             std::vector<std::pair<int, FIT>> scored;
 
             for( FIT& fit : pool )
             {
-                const int score = package.empty() ? 1 : packageScore( package, fit.row["lib_id"] );
+                int score = package.empty() ? 1 : packageScore( package, fit.row["lib_id"] );
+
+                if( byDescription )
+                    score = fit.source == 0 ? 1000 : describedScore( described, fit.row["lib_id"] );
 
                 if( score > 0 )
                     scored.emplace_back( score, fit );
@@ -594,8 +666,21 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
         // A value is the generic part's value; a specific part keeps its own unless it is that part
         const std::string own = c.value( "value", std::string() );
-        const std::string useValue = !generic.empty() ? ( value.empty() ? own : value )
-                                     : ( !value.empty() && lower( libId ).find( lower( value ) ) != std::string::npos ? value : own );
+        std::string useValue = !generic.empty() ? ( value.empty() ? own : value )
+                               : ( !value.empty() && lower( libId ).find( lower( value ) ) != std::string::npos ? value : own );
+        std::string note;
+
+        // The same logic function drawn for another family (74LS257 for 74LVC257): the asked part is the value
+        const std::string asked = value.empty() && queryWords.size() == 1 ? query : value;
+        const std::string name = libId.substr( libId.find( ':' ) + 1 );
+
+        if( generic.empty() && !asked.empty() && lower( name ) != lower( asked ) && !KopenapiLogicCore( asked ).empty()
+            && KopenapiLogicCore( asked ) == KopenapiLogicCore( name ) )
+        {
+            useValue = asked;
+            note = "symbol " + name + " of another logic family, same function and pinout; value set to " + asked;
+        }
+
         nlohmann::json use = { { "lib_id", libId }, { "value", useValue } };
 
         if( !fits.empty() )
@@ -607,6 +692,9 @@ static KOPENAPI_RESULT h_part_find( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                                 { "symbol_footprint", ownFootprint },
                                 { "footprints", fits },
                                 { "use", use } } );
+
+        if( !note.empty() )
+            candidates.back()["note"] = note;
     }
 
     // With a package asked for, parts that have no footprint of it go (if any other part has one)

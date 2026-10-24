@@ -435,7 +435,7 @@ KOPENAPI_REGISTER( "pcb_lib_footprint_search",
                         "filters":{"type":"array","items":{"type":"string"},"description":"footprint filters, e.g. [\"SOT?23*\"]"},
                         "pads":{"type":"integer","description":"exact number of connectable pads (= symbol pins)"},
                         "type":{"type":"string","enum":["smd","tht","unspecified"]},
-                        "lib":{"type":"string","description":"glob on the library name"}})json"_json ),
+                        "lib":{"type":"string","description":"glob on the library name"}})json"_json, KOPENAPI_RANKED_PAGE ),
                    false, h_pcb_lib_footprint_search, 600 );
 
 KOPENAPI_REGISTER( "pcb_lib_footprint_get",
