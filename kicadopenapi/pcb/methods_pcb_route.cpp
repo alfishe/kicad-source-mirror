@@ -217,6 +217,25 @@ static std::string copperKey( const BOARD_ITEM* aItem )
 }
 
 
+/// @brief The other net of a differential pair: one of aPairs (P net code -> N), else the board's name rule
+static NETINFO_ITEM* coupledNet( BOARD* aBoard, const NETINFO_ITEM* aNet, const std::map<int, int>* aPairs )
+{
+    if( !aNet )
+        return nullptr;
+
+    if( aPairs )
+    {
+        for( const auto& [p, n] : *aPairs )
+        {
+            if( aNet->GetNetCode() == p || aNet->GetNetCode() == n )
+                return aBoard->FindNet( aNet->GetNetCode() == p ? n : p );
+        }
+    }
+
+    return aBoard->DpCoupledNet( aNet );
+}
+
+
 /// @brief Gross errors in a staged route: new or moved copper (aChanged) within the clearance of copper
 /// of another net - pads, tracks, vias, filled zones - or inside a keep-out that bars it; removed
 /// items do not count.  The clearance is the board's rule for the pair (DRC engine: custom rules,
@@ -663,8 +682,12 @@ struct ROUTE_REQUEST
     std::vector<std::pair<VECTOR2I, std::optional<PCB_LAYER_ID>>> vias;
 
     /// @brief Route the pair: from and to are pads of the P (or N) net, the coupled pads of the other
-    /// net are found next to them by KiCad's diff-pair router (net names ending in +/- or P/N)
+    /// net are found next to them by KiCad's diff-pair router (net names ending in +/- or P/N, or a
+    /// pair of `pairs`)
     bool diffPair = false;
+
+    /// @brief Pairs the router takes as differential pairs besides its name rule (P net code -> N)
+    const std::map<int, int>* pairs = nullptr;
 
     /// @brief A narrower track than the net's class gives (> 0): the connection meets a fine-pitch pad
     int neckWidth = 0;
@@ -732,6 +755,8 @@ struct ROUTE_PROFILE
     double moveMs = 0;    ///< the router's path search (every Move of the head)
     double totalMs = 0;   ///< whole attempts (world, routing, guard, commit)
     int    triesStopped = 0;   ///< router tries ended inside the router (job_cancel, the connection's budget)
+    std::map<std::string, int> budgetSpent;   ///< connections whose time budget ran out, by pass
+    std::vector<std::string>   overFirstBudget;   ///< the connections the first pass left on its budget (net REF.PAD)
     int64_t clearanceLookups = 0;   ///< the router's clearances looked up past its caches
     int64_t ruleEvaluations = 0;    ///< ... and the design rule evaluations they took
 
@@ -1084,6 +1109,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
 
     auto iface = std::make_unique<KOPENAPI_PNS_IFACE>();
     iface->SetBoard( board );
+
+    if( aReq.pairs )
+        iface->SetExplicitDiffPairs( *aReq.pairs );
     // no SetView: without a view the interface draws no previews (SetView( nullptr ) would
     // create a preview group that EraseView then updates on a null view)
     iface->SetHostTool( routeHost( aContext.GetToolManager() ) );
@@ -1455,7 +1483,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         if( stopped )
             profile.triesStopped++;
 
-        aOut["reason"] = stopped       ? "stopped inside the router try (job_cancel or the connection's rip_up_budget_s)"
+        aOut["reason"] = stopped       ? "stopped inside the router try (job_cancel or the connection's time budget: first_pass_budget_s / rip_up_budget_s)"
                          : aReq.diffPair ? "the pair did not reach the target pads"
                          : reached     ? "the router could not fix the route"
                          : wrongLayer  ? "at the target but on another layer than its pad: a via is needed in front of it"
@@ -1602,7 +1630,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         return true;
     }
 
-    const NETINFO_ITEM* coupled = aReq.diffPair ? board->DpCoupledNet( aReq.from->GetNet() ) : nullptr;
+    const NETINFO_ITEM* coupled = aReq.diffPair ? coupledNet( board, aReq.from->GetNet(), aReq.pairs ) : nullptr;
 
     auto otherNet = [&]( const BOARD_ITEM* aItem ) -> int
     {
@@ -2346,17 +2374,24 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
         const nlohmann::json at = w.is_object() ? w.value( "at", nlohmann::json() ) : w;
 
         if( !at.is_array() || at.size() != 2 || !at[0].is_number() || !at[1].is_number() )
-            return KOPENAPI_RESULT::Error( 400, "waypoints: [x_mm, y_mm] (a corner) or {at: [x_mm, y_mm], layer: \"B.Cu\"} "
-                                                "(a via there, the route continues on that layer)" );
+            return KOPENAPI_RESULT::Error( 400, "waypoints: [x_mm, y_mm] (a corner) or {at: [x_mm, y_mm], via: \"B.Cu\"} "
+                                                "(a via there, the route continues on that layer; layer is the same key)" );
 
         std::optional<PCB_LAYER_ID> viaLayer;
 
-        if( w.is_object() && w.contains( "layer" ) )
+        // via and layer name the same thing (as pcb_track_add's points): the layer after the via
+        if( w.is_object() && ( w.contains( "via" ) || w.contains( "layer" ) ) )
         {
-            viaLayer = w["layer"].is_string() ? parseLayer( board, w["layer"].get<std::string>() ) : std::nullopt;
+            if( w.contains( "via" ) && w.contains( "layer" ) && w["via"] != w["layer"] )
+                return KOPENAPI_RESULT::Error( 400, "waypoints: via and layer differ (" + w["via"].dump() + " vs " + w["layer"].dump()
+                                                    + "): both name the layer the route continues on after the via; give one" );
+
+            const nlohmann::json& name = w.contains( "via" ) ? w["via"] : w["layer"];
+            viaLayer = name.is_string() ? parseLayer( board, name.get<std::string>() ) : std::nullopt;
 
             if( !viaLayer )
-                return KOPENAPI_RESULT::Error( 400, "waypoints: layer is an enabled copper layer" );
+                return KOPENAPI_RESULT::Error( 400, "waypoints: via (or layer) is an enabled copper layer, the one the route "
+                                                    "continues on after the via there" );
         }
 
         const VECTOR2I point( pcbIUScale.mmToIU( at[0].get<double>() ), pcbIUScale.mmToIU( at[1].get<double>() ) );
@@ -2550,10 +2585,30 @@ struct ROUTE_BRANCH
 };
 
 
-static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ROUTE_BRANCH* aBranch );
+static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ROUTE_BRANCH* aBranch,
+                                 bool aQuiet = false );
 
 // rows of pcb_route listed by default (failed ones first when cut)
 constexpr size_t ROUTE_LIST_CAP = 100;
+
+
+/// @brief The way out of a pad of a part's outer row: the axis of its side, pointing away from the part
+/// (none for a pad inside the rows: an exposed pad, a ball inside an array)
+static std::optional<VECTOR2I> outwardOf( const PAD* aPad, const BOX2I& aCentres )
+{
+    const VECTOR2I c = aPad->GetPosition();
+    const BOX2I    pb = aPad->GetBoundingBox();
+    const bool     onX = c.x == aCentres.GetLeft() || c.x == aCentres.GetRight();
+    const bool     onY = c.y == aCentres.GetTop() || c.y == aCentres.GetBottom();
+
+    if( onX && ( !onY || pb.GetWidth() >= pb.GetHeight() ) )
+        return VECTOR2I( c.x == aCentres.GetLeft() ? -1 : 1, 0 );
+
+    if( onY )
+        return VECTOR2I( 0, c.y == aCentres.GetTop() ? -1 : 1 );
+
+    return std::nullopt;
+}
 
 
 /// @brief Under a quad package's body (QFP / QFN / LGA, pads on four sides): the area inside its
@@ -2691,8 +2746,46 @@ static std::vector<UNDER_PART> underPartAreas( BOARD* aBoard )
 static KOPENAPI_RESULT routeOrBranch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs );
 
 
+/// @brief pns dry run: the call routed for real, every pass (rip-up, clean-up, stub sweep, refill),
+/// then the board taken back to where the call found it; the answer is what applying would give
+static KOPENAPI_RESULT pnsDryRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    KOPENAPI_HISTORY& history = KOPENAPI_HISTORY::Get();
+
+    if( !history.TrialBegin( aCtx, "pcb" ) )
+        return KOPENAPI_RESULT::Error( 409, "dry_run: no copy of the board before the call could be made to take the routes "
+                                            "back; route for real and roll back (rollback)" );
+
+    nlohmann::json args = aArgs;
+    args["dry_run"] = false;
+
+    KOPENAPI_RESULT result = pcbRoute( aCtx, args, nullptr, true );
+    KOPENAPI_RESULT back = history.TrialRestore( aCtx );
+
+    if( back.status != 200 )
+    {
+        return KOPENAPI_RESULT::Error( 500, "dry_run: the routes could not be taken back (" + back.body.dump()
+                                                    + "): the board holds them; rollback 1 step takes them out" );
+    }
+
+    if( result.status == 200 )
+    {
+        result.body["dry_run"] = true;
+        result.body["applied"] = false;
+        result.body["simulated"] = "the whole call (first pass, retries, rip-up, clean-up, stubs, refill) was routed on the board "
+                                   "and taken back: applying the same call on the same board gives these rows; uuids in them "
+                                   "are gone";
+    }
+
+    return result;
+}
+
+
 static KOPENAPI_RESULT h_pcb_route( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
+    if( aArgs.value( "dry_run", false ) && aArgs.value( "engine", std::string( "pns" ) ) == "pns" && !aArgs.contains( "from" ) )
+        return pnsDryRun( aCtx, aArgs );
+
     KOPENAPI_RESULT result = routeOrBranch( aCtx, aArgs );
 
     // job_cancel {apply: false} / {keep: true}: what was laid so far goes, whichever pass laid it (pair
@@ -2924,7 +3017,8 @@ static KOPENAPI_RESULT routeOrBranch( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 }
 
 
-static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ROUTE_BRANCH* aBranch )
+static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ROUTE_BRANCH* aBranch,
+                                 bool aQuiet )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
@@ -3054,9 +3148,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // on a big board an attempt costs about a second
     const int maxTries = std::clamp( aArgs.value( "max_tries", 120 ), 1, 10000 );
 
-    // the retry / rip-up pass gives each connection this long; a cancelled job stops between tries
+    // the retry / rip-up pass gives each connection this long, the first pass firstBudgetS (a connection
+    // over it waits for the retry pass); a cancelled job stops between tries
     const double ripBudgetS = std::clamp( aArgs.value( "rip_up_budget_s", 30.0 ), 0.0, 3600.0 );
+    const double firstBudgetS = std::clamp( aArgs.value( "first_pass_budget_s", 30.0 ), 0.0, 3600.0 );
     std::optional<std::chrono::steady_clock::time_point> tryDeadline;
+    std::string budgetName = "first_pass_budget_s";
 
     auto overTime = [&]()
     {
@@ -3187,6 +3284,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         std::string           net;
         bool                  power;
         bool                  trunk = false;   ///< a differential pair's trunk, not an airwire
+        bool                  foreign = false; ///< copper of an earlier call (rip_up_scope unlocked), no row
+        int                   bus = -1;        ///< its bus (index in busOut), its place in the bus's order
+        int                   busIndex = -1;
+        std::optional<VECTOR2I> busVia = std::nullopt;   ///< its spot in the bus's via fan (bus_layer)
         double                ms = 0;          ///< time of every try for it, rip-up re-routes too
     };
 
@@ -4168,8 +4269,16 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
 
         if( !ok && overTime() )
-            aAttempt["reason"] = std::string( KopenapiJobCancelled() ? "stopped (job_cancel)" : "the connection's rip_up_budget_s ran out" )
+        {
+            if( !KopenapiJobCancelled() )
+            {
+                profile.budgetSpent[profile.pass]++;
+                aAttempt["budget"] = budgetName;
+            }
+
+            aAttempt["reason"] = std::string( KopenapiJobCancelled() ? "stopped (job_cancel)" : "the connection's " + budgetName + " ran out" )
                                  + " after " + std::to_string( aTries ) + " tries; last: " + aAttempt.value( "reason", std::string( "-" ) );
+        }
         else if( !ok && aTries >= maxTries )
             aAttempt["reason"] = "gave up after " + std::to_string( aTries ) + " tries (max_tries); last: "
                                  + aAttempt.value( "reason", std::string( "-" ) );
@@ -4181,8 +4290,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // routed too, a trunk between each two footprints next in a chain over the footprints with pads of
     // both nets (connector - ESD - MCU), from the P and N pads nearest each other there.  The trunks
     // go first and coupled; airwires their copper joins afterwards are not routed again.
-    std::vector<JOB> trunks;
-    nlohmann::json   pairsSkipped = nlohmann::json::array();
+    std::vector<JOB>   trunks;
+    nlohmann::json     pairsSkipped = nlohmann::json::array();
+    std::map<int, int> explicitPairs;   // the pairs handed to the router (P net code -> N)
 
     if( diffPairs == "auto" && !rail )
     {
@@ -4191,27 +4301,62 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         for( const JOB& job : jobs )
             jobNets.insert( job.net );
 
+        // the pairs: KiCad's name rule (+/-, P/N), USB's DP / DM naming (USB_DP, USB_DP_MCU), and the
+        // pairs pcb_net_roles finds; each net in one pair, both nets routed by this call
+        std::vector<std::pair<std::string, std::string>> pairNames;
+        std::set<std::string>                            inPair;
+
+        auto addPair = [&]( const std::string& aP, const std::string& aN )
+        {
+            if( aP == aN || inPair.count( aP ) || inPair.count( aN ) || !jobNets.count( aP ) || !jobNets.count( aN ) )
+                return;
+
+            pairNames.emplace_back( aP, aN );
+            inPair.insert( aP );
+            inPair.insert( aN );
+        };
+
         for( const std::string& netP : jobNets )
         {
             wxString other;
 
-            if( board->MatchDpSuffix( wxString::FromUTF8( netP ), other ) != 1 || !jobNets.count( str( other ) ) )
+            if( board->MatchDpSuffix( wxString::FromUTF8( netP ), other ) == 1 && jobNets.count( str( other ) ) )
             {
-                // USB's DP / DM naming (USB_DP, USB_DP_MCU): KiCad's pairing knows +/- and P/N only
-                static const std::regex dp( R"(^(.*D)P((?:_[^/]*)?)$)" );
-                std::smatch             m;
-
-                if( !std::regex_match( netP, m, dp ) || !jobNets.count( m[1].str() + "M" + m[2].str() ) )
-                    continue;
-
-                other = wxString::FromUTF8( m[1].str() + "M" + m[2].str() );
+                addPair( netP, str( other ) );
+                continue;
             }
 
+            static const std::regex dp( R"(^(.*D)P((?:_[^/]*)?)$)" );
+            std::smatch             m;
+
+            if( std::regex_match( netP, m, dp ) )
+                addPair( netP, m[1].str() + "M" + m[2].str() );
+        }
+
+        if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+        {
+            const KOPENAPI_RESULT r = roles->handler( aCtx, nlohmann::json::object() );
+
+            if( r.status < 400 && r.body.contains( "pairs" ) && r.body["pairs"].is_array() )
+            {
+                for( const nlohmann::json& pr : r.body["pairs"] )
+                {
+                    if( pr.is_object() && pr.value( "p", nlohmann::json() ).is_string() && pr.value( "n", nlohmann::json() ).is_string() )
+                        addPair( pr["p"].get<std::string>(), pr["n"].get<std::string>() );
+                }
+            }
+        }
+
+        for( const auto& [netP, otherName] : pairNames )
+        {
+            const wxString other = wxString::FromUTF8( otherName );
             NETINFO_ITEM* infoP = KopenapiFindNet( board, netP );
             NETINFO_ITEM* infoN = KopenapiFindNet( board, str( other ) );
 
             if( !infoP || !infoN )
                 continue;
+
+            explicitPairs[infoP->GetNetCode()] = infoN->GetNetCode();
 
             // per footprint with pads of both nets: the P and N pads nearest each other
             std::vector<std::pair<PAD*, PAD*>> ends;
@@ -4340,6 +4485,313 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     }
 
+    // bus: the members of a bundle leaving the same side of a package one after another in pin order
+    // (the pin on the inside of the turn to their far ends first: each next one runs beside the last,
+    // uncrossed); bus_layer: each member drops a through via on a diagonal fan in front of the row
+    // (via pitch apart, the vias of the later members kept free while they wait) and goes on on that
+    // layer; a member the fan does not route is routed as any connection
+    nlohmann::json            busOut = nlohmann::json::array();
+    std::optional<PCB_LAYER_ID> busLayer;
+
+    if( aArgs.contains( "bus_layer" ) )
+    {
+        busLayer = aArgs["bus_layer"].is_string() ? parseLayer( board, aArgs["bus_layer"].get<std::string>() ) : std::nullopt;
+
+        if( !busLayer || std::find( layers.begin(), layers.end(), *busLayer ) == layers.end() )
+            return KOPENAPI_RESULT::Error( 400, "bus_layer: one of the call's layers" );
+    }
+
+    {
+        const nlohmann::json busArg = aArgs.contains( "bus" ) ? aArgs["bus"] : nlohmann::json( "off" );
+        std::vector<std::pair<std::string, std::vector<std::string>>> busList;
+
+        if( busArg.is_string() && busArg.get<std::string>() == "auto" )
+        {
+            if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+            {
+                const KOPENAPI_RESULT r = roles->handler( aCtx, nlohmann::json::object() );
+
+                if( r.status < 400 && r.body.contains( "bundles" ) && r.body["bundles"].is_array() )
+                {
+                    for( const auto& b : r.body["bundles"] )
+                    {
+                        std::vector<std::string> members;
+
+                        for( const auto& m : b.value( "members", nlohmann::json::array() ) )
+                        {
+                            for( const std::string& n : m.value( "nets", std::vector<std::string>() ) )
+                                members.push_back( n );
+                        }
+
+                        busList.emplace_back( b.value( "name", std::string() ), std::move( members ) );
+                    }
+                }
+            }
+        }
+        else if( busArg.is_array() )
+        {
+            for( const auto& b : busArg )
+            {
+                std::vector<std::string> members;
+
+                for( const auto& n : b.value( "nets", nlohmann::json::array() ) )
+                {
+                    if( !n.is_string() )
+                        return KOPENAPI_RESULT::Error( 400, "bus: [{name, nets: [net names]}]" );
+
+                    if( !KopenapiFindNet( board, n.get<std::string>() ) )
+                        return KopenapiNoSuchNet( board, n.get<std::string>(), "bus: " );
+
+                    members.push_back( n.get<std::string>() );
+                }
+
+                busList.emplace_back( b.value( "name", std::string( "bus" ) + std::to_string( busList.size() + 1 ) ), std::move( members ) );
+            }
+        }
+        else if( !( busArg.is_string() && busArg.get<std::string>() == "off" ) )
+        {
+            return KOPENAPI_RESULT::Error( 400, "bus: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]" );
+        }
+
+        if( grid && !busList.empty() )
+        {
+            busOut.push_back( { { "skipped", "engine grid: its bundles (the bundles argument) route the members side by side" } } );
+            busList.clear();
+        }
+
+        std::set<size_t> taken;   // jobs already in a bus
+
+        for( const auto& [name, members] : busList )
+        {
+            std::set<int> codes;
+
+            for( const std::string& n : members )
+            {
+                if( NETINFO_ITEM* info = KopenapiFindNet( board, n ) )
+                    codes.insert( info->GetNetCode() );
+            }
+
+            // the part the members leave: the package with the most of their ends (the finer pitch on a tie)
+            std::map<FOOTPRINT*, int> endsAt;
+
+            for( size_t k = 0; k < jobs.size(); ++k )
+            {
+                if( taken.count( k ) || !codes.count( jobs[k].from->GetNetCode() ) )
+                    continue;
+
+                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[k].from ), jobs[k].to } )
+                {
+                    if( FOOTPRINT* fp = end->Type() == PCB_PAD_T ? static_cast<PAD*>( end )->GetParentFootprint() : nullptr;
+                        fp && fp->Pads().size() >= 4 )
+                    {
+                        endsAt[fp]++;
+                    }
+                }
+            }
+
+            FOOTPRINT* source = nullptr;
+
+            for( const auto& [fp, n] : endsAt )
+            {
+                if( !source || n > endsAt[source]
+                    || ( n == endsAt[source] && pitchOf( fp->Pads().front() ) < pitchOf( source->Pads().front() ) )
+                    || ( n == endsAt[source] && pitchOf( fp->Pads().front() ) == pitchOf( source->Pads().front() )
+                         && fp->GetReference() < source->GetReference() ) )
+                {
+                    source = fp;
+                }
+            }
+
+            nlohmann::json out = { { "name", name } };
+
+            if( !source || endsAt[source] < 2 )
+            {
+                out["skipped"] = "fewer than two of its connections leave one package";
+                busOut.push_back( out );
+                continue;
+            }
+
+            // one connection per member net, leaving the source part (its end there made the start)
+            std::map<int, size_t> memberJob;
+
+            for( size_t k = 0; k < jobs.size(); ++k )
+            {
+                JOB& j = jobs[k];
+
+                if( taken.count( k ) || !codes.count( j.from->GetNetCode() ) || memberJob.count( j.from->GetNetCode() ) )
+                    continue;
+
+                if( j.from->GetParentFootprint() != source )
+                {
+                    PAD* farPad = dynamic_cast<PAD*>( j.to );
+
+                    if( !farPad || farPad->GetParentFootprint() != source )
+                        continue;
+
+                    PAD* nearPad = j.from;
+                    j.from = farPad;
+                    j.to = nearPad;
+                    std::swap( j.fromId, j.toId );
+                    j.toPos = nearPad->GetPosition();
+                }
+
+                memberJob[j.from->GetNetCode()] = k;
+            }
+
+            BOX2I centres( source->Pads().front()->GetPosition(), VECTOR2I( 0, 0 ) );
+
+            for( PAD* pad : source->Pads() )
+                centres.Merge( pad->GetPosition() );
+
+            // per side of the package: the rows the members leave
+            std::map<std::pair<int, int>, std::vector<size_t>> bySide;
+
+            for( const auto& [code, k] : memberJob )
+            {
+                if( std::optional<VECTOR2I> dir = outwardOf( jobs[k].from, centres ) )
+                    bySide[{ dir->x, dir->y }].push_back( k );
+            }
+
+            for( auto& [dirKey, list] : bySide )
+            {
+                if( list.size() < 2 )
+                    continue;
+
+                const VECTOR2I dir( dirKey.first, dirKey.second );
+                const VECTOR2I tangent( dir.y != 0 ? 1 : 0, dir.x != 0 ? 1 : 0 );
+                auto along = [&]( const VECTOR2I& aAt ) { return (int64_t) aAt.x * tangent.x + (int64_t) aAt.y * tangent.y; };
+                auto across = [&]( const VECTOR2I& aAt ) { return (int64_t) aAt.x * dir.x + (int64_t) aAt.y * dir.y; };
+
+                int64_t mid = 0, farSide = 0;
+
+                for( size_t k : list )
+                {
+                    mid += along( jobs[k].from->GetPosition() ) / (int64_t) list.size();
+                    farSide += ( along( jobs[k].toPos ) - along( jobs[k].from->GetPosition() ) ) / (int64_t) list.size();
+                }
+
+                // the inside of the turn first; ties by the pin's place
+                std::sort( list.begin(), list.end(), [&]( size_t x, size_t y )
+                           {
+                               const int64_t ax = along( jobs[x].from->GetPosition() ), ay = along( jobs[y].from->GetPosition() );
+                               return farSide >= 0 ? ax > ay : ax < ay;
+                           } );
+
+                const int busIndexOut = (int) busOut.size();
+                nlohmann::json sideOut = { { "name", name },
+                                           { "part", str( source->GetReference() ) },
+                                           { "side", dir.x < 0 ? "left" : dir.x > 0 ? "right" : dir.y < 0 ? "top" : "bottom" },
+                                           { "nets", nlohmann::json::array() } };
+
+                for( size_t m = 0; m < list.size(); ++m )
+                {
+                    JOB& j = jobs[list[m]];
+                    j.bus = busIndexOut;
+                    j.busIndex = (int) m;
+                    taken.insert( list[m] );
+                    sideOut["nets"].push_back( j.net );
+                }
+
+                PAD* first = jobs[list.front()].from;
+                const PCB_LAYER_ID padLayer = first->IsOnLayer( F_Cu ) ? F_Cu : first->IsOnLayer( B_Cu ) ? B_Cu
+                                                                                                        : first->GetLayerSet().CuStack().front();
+
+                if( busLayer && *busLayer != padLayer && viasAllowed )
+                {
+                    NETCLASS* netclass = first->GetEffectiveNetClass();
+                    const int width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : ds.GetCurrentTrackWidth();
+                    const int dia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
+                    const int drill = netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : ds.GetCurrentViaDrill();
+                    const int clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
+                    const double viaPitch = std::max( double( dia + clearance ), double( drill + std::max( ds.m_HoleToHoleMin, 0 ) ) );
+                    const double need = dia / 2.0 + clearance + width / 2.0;   // a track beside a via
+
+                    int64_t tipLine = std::numeric_limits<int64_t>::min();
+                    double  minGap = std::numeric_limits<double>::max();
+                    int64_t maxOffset = 0;
+
+                    for( size_t m = 0; m < list.size(); ++m )
+                    {
+                        PAD*        pad = jobs[list[m]].from;
+                        const BOX2I pb = pad->GetBoundingBox();
+                        tipLine = std::max( tipLine, across( pad->GetPosition() ) + ( dir.x != 0 ? pb.GetWidth() : pb.GetHeight() ) / 2 );
+                        maxOffset = std::max( maxOffset, std::abs( along( pad->GetPosition() ) - mid ) );
+
+                        if( m > 0 )
+                            minGap = std::min( minGap, (double) std::abs( along( pad->GetPosition() ) - along( jobs[list[m - 1]].from->GetPosition() ) ) );
+                    }
+
+                    // the lines spread (45 degrees at most) until a line passes the via before it
+                    const double  spread = std::max( 1.0, need / std::max( 1.0, minGap ) );
+                    const int64_t rayLength = KiROUND( maxOffset * ( spread - 1.0 ) );
+                    double        fanAcross = (double) tipLine + rayLength + dia / 2.0 + clearance;
+                    nlohmann::json fanSpots = nlohmann::json::array();
+
+                    for( size_t m = 0; m < list.size(); ++m )
+                    {
+                        JOB&          j = jobs[list[m]];
+                        const int64_t fanned = mid + KiROUND( ( along( j.from->GetPosition() ) - mid ) * spread );
+
+                        if( m > 0 )
+                        {
+                            const double df = std::abs( (double) fanned
+                                                        - ( mid + KiROUND( ( along( jobs[list[m - 1]].from->GetPosition() ) - mid ) * spread ) ) );
+                            fanAcross += std::max( need, std::sqrt( std::max( 0.0, viaPitch * viaPitch - df * df ) ) );
+                        }
+
+                        const int64_t c = KiROUND( fanAcross );
+                        j.busVia = VECTOR2I( (int) ( fanned * tangent.x + c * dir.x ), (int) ( fanned * tangent.y + c * dir.y ) );
+                        fanSpots.push_back( { toMm( j.busVia->x ), toMm( j.busVia->y ) } );
+                    }
+
+                    sideOut["via_layer"] = str( board->GetLayerName( *busLayer ) );
+                    sideOut["vias_mm"] = fanSpots;
+                    sideOut["via_pitch_mm"] = toMm( KiROUND( viaPitch ) );
+                }
+                else if( busLayer && *busLayer != padLayer )
+                {
+                    sideOut["no_via_fan"] = "vias: false or one layer";
+                }
+
+                busOut.push_back( sideOut );
+            }
+        }
+
+        // the members one after another where the first of them was in the order
+        if( !taken.empty() )
+        {
+            std::vector<JOB> ordered;
+            std::set<int>    emitted;
+
+            for( size_t k = 0; k < jobs.size(); ++k )
+            {
+                if( jobs[k].bus < 0 )
+                {
+                    ordered.push_back( jobs[k] );
+                    continue;
+                }
+
+                if( !emitted.insert( jobs[k].bus ).second )
+                    continue;
+
+                std::vector<const JOB*> members;
+
+                for( const JOB& j : jobs )
+                {
+                    if( j.bus == jobs[k].bus )
+                        members.push_back( &j );
+                }
+
+                std::sort( members.begin(), members.end(), []( const JOB* x, const JOB* y ) { return x->busIndex < y->busIndex; } );
+
+                for( const JOB* j : members )
+                    ordered.push_back( *j );
+            }
+
+            jobs = std::move( ordered );
+        }
+    }
+
     jobs.insert( jobs.begin(), trunks.begin(), trunks.end() );
 
     std::vector<int> partner( jobs.size(), -1 );
@@ -4353,6 +4805,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     nlohmann::json    results = nlohmann::json::array();
     std::vector<int>  rowOf( jobs.size(), -1 );
     std::vector<bool> done( jobs.size(), false );
+    std::vector<bool> overFirstBudget( jobs.size(), false );   // the first pass ran out of time for it
 
     // Ways out of the fine-pitch pads on the edges of their packages (pads inside the ring of an area
     // array are left to the fan-out): from the pad's end outward, room for a track or a via
@@ -4427,6 +4880,28 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         doneOf = &done;
     }
 
+    // a bus member's via spot is kept free while it waits
+    for( size_t k = 0; k < jobs.size(); ++k )
+    {
+        if( !jobs[k].busVia || !busLayer )
+            continue;
+
+        NETCLASS* netclass = jobs[k].from->GetEffectiveNetClass();
+        const int dia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
+
+        for( PCB_LAYER_ID l : layers )
+        {
+            ESCAPE_FRONT front;
+            front.pad = jobs[k].from;
+            front.layer = l;
+            front.shape = SHAPE_SEGMENT( *jobs[k].busVia, *jobs[k].busVia, dia );
+            front.jobs.push_back( k );
+            fronts.push_back( std::move( front ) );
+        }
+
+        doneOf = &done;
+    }
+
     // live progress: this call's connections (airwires, then gaps) summed from the rows as the
     // totals are, and the board's open connections now; at most every 200 ms within a pass
     std::string                           progressPass;
@@ -4460,7 +4935,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 ( ok ? routed : failed )++;
         }
 
-        const int connections = (int) ( jobs.size() - trunks.size() + gaps.size() );
+        const int connections = (int) ( jobs.size() - trunks.size() + gaps.size()
+                                        - std::count_if( jobs.begin(), jobs.end(), []( const JOB& j ) { return j.foreign; } ) );
 
         nlohmann::json counts = { { "pass", aPass },
                                   { "connections", connections },
@@ -4577,6 +5053,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                         ROUTE_REQUEST req{ a, b, b->GetPosition(), layer, mode, dryRun, {} };
                         req.diffPair = true;
+                        req.pairs = &explicitPairs;
 
                         const auto key = std::make_tuple( a, b, (int) layer );
                         auto       guide = guides.find( key );
@@ -4674,7 +5151,57 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         nlohmann::json attempt;
         int            tries = 0;
-        const bool     ok = tryRoute( job, attempt, tries, true, false );
+
+        if( firstBudgetS > 0 )
+            tryDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( (long) ( firstBudgetS * 1000 ) );
+
+        // a bus member with its via spot: from its pad to the via, on to its far end on bus_layer
+        nlohmann::json busRow;
+
+        if( job.bus >= 0 )
+            busRow = { { "name", busOut[job.bus].value( "name", std::string() ) }, { "index", job.busIndex } };
+
+        bool ok = false;
+
+        if( job.busVia && busLayer )
+        {
+            const PCB_LAYER_ID padLayer = job.from->IsOnLayer( F_Cu ) ? F_Cu : job.from->IsOnLayer( B_Cu ) ? B_Cu
+                                                                                                         : job.from->GetLayerSet().CuStack().front();
+            const auto fanStarted = std::chrono::steady_clock::now();
+            const long outer = profile.job;
+            profile.job = (long) index;
+
+            if( doneOf )
+                refreshFronts();
+
+            ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
+            req.fronts = &fronts;
+            req.neckWidth = neckFor( job.from, job.to );
+            req.vias = { { *job.busVia, *busLayer } };
+            attempt = nlohmann::json::object();
+            tries++;
+            ok = routeOne( *context, req, attempt, added );
+            job.ms += msSince( fanStarted );
+            profile.job = outer;
+            busRow["via_mm"] = { toMm( job.busVia->x ), toMm( job.busVia->y ) };
+            busRow["fan"] = ok;
+
+            if( !ok )
+                busRow["fan_failed"] = attempt.value( "reason", std::string() );
+        }
+
+        if( !ok )
+            ok = tryRoute( job, attempt, tries, true, false );
+
+        tryDeadline.reset();
+
+        // the budget ran out: the retry pass tries it again, the forward way included
+        if( !ok && attempt.contains( "budget" ) )
+        {
+            overFirstBudget[index] = true;
+            profile.overFirstBudget.push_back( job.net + " " + str( job.from->GetParentFootprint()->GetReference() ) + "."
+                                               + str( job.from->GetNumber() ) );
+        }
 
         nlohmann::json row = { { "net", job.net },
                                { "from", str( job.from->GetParentFootprint()->GetReference() ) + "." + str( job.from->GetNumber() ) },
@@ -4684,8 +5211,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             row["to"] = str( static_cast<PAD*>( job.to )->GetParentFootprint()->GetReference() ) + "."
                         + str( static_cast<PAD*>( job.to )->GetNumber() );
 
+        if( busRow.is_object() )
+            row["bus"] = busRow;
+
         // GUI, for watching: each accepted route is drawn before the next one starts
-        if( ok && stepMs > 0 && !aCtx.headless && aCtx.kiway )
+        if( ok && stepMs > 0 && !aQuiet && !aCtx.headless && aCtx.kiway )
         {
             if( auto* frame = ROUTE_GLOW_TRAITS::Frame( aCtx.kiway ) )
             {
@@ -4725,7 +5255,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         {
             row["reason"] = attempt.value( "reason", std::string() );
 
-            for( const char* key : { "violations", "stopped_at_mm", "blocked_by", "plan", "boxed_in", "pad_exits_tried_mm" } )
+            for( const char* key : { "violations", "stopped_at_mm", "blocked_by", "plan", "boxed_in", "pad_exits_tried_mm", "budget" } )
             {
                 if( attempt.contains( key ) )
                     row[key] = attempt[key];
@@ -5879,6 +6409,151 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     const int ripRounds = dryRun ? 0 : std::clamp( aArgs.value( "rip_up", 2 ), 0, 6 );
     int       rippedOk = 0, rippedTried = 0;
 
+    budgetName = "rip_up_budget_s";
+
+    // rip_up_scope unlocked: the unlocked copper of other nets (earlier calls, laid by hand) near the
+    // connections left may be taken out too; each piece between two pads of its net (a spanning tree
+    // over the pads it joins) is a route that goes back when the rip-up is over, or all goes back
+    const std::string ripScope = aArgs.value( "rip_up_scope", std::string( "call" ) );
+
+    if( ripScope != "call" && ripScope != "unlocked" )
+        return KOPENAPI_RESULT::Error( 400, "rip_up_scope: call (only this call's routes) or unlocked (any unlocked copper)" );
+
+    size_t         foreignJobs = 0;
+    nlohmann::json foreignMoved = nlohmann::json::array();
+
+    if( ripScope == "unlocked" && ripRounds > 0 && !grid )
+    {
+        BOX2I           leftArea;
+        bool            anyLeft = false;
+        std::set<int>   own;
+
+        for( size_t k = 0; k < jobs.size(); ++k )
+        {
+            if( PAD* from = dynamic_cast<PAD*>( board->ResolveItem( jobs[k].fromId, true ) ) )
+                own.insert( from->GetNetCode() );
+
+            if( done[k] || rowOf[k] < 0 || jobs[k].trunk )
+                continue;
+
+            BOX2I box( jobs[k].from->GetPosition(), VECTOR2I( 0, 0 ) );
+            box.Merge( jobs[k].toPos );
+            leftArea = anyLeft ? leftArea.Merge( box ) : box;
+            anyLeft = true;
+        }
+
+        for( const auto& [p, n] : explicitPairs )
+            own.insert( p ), own.insert( n );
+
+        leftArea.Inflate( pcbIUScale.mmToIU( 5.0 ) );
+        std::map<int, std::vector<PAD*>> padsOfNet;
+
+        if( anyLeft )
+        {
+            std::set<int> closeNets;
+
+            for( PCB_TRACK* t : board->Tracks() )
+            {
+                if( t->GetNetCode() > 0 && !own.count( t->GetNetCode() ) && t->GetBoundingBox().Intersects( leftArea ) )
+                    closeNets.insert( t->GetNetCode() );
+            }
+
+            for( int code : closeNets )
+            {
+                // a pair's net is not taken apart from its partner
+                if( coupledNet( board, board->FindNet( code ), &explicitPairs ) )
+                    continue;
+
+                padsOfNet[code];
+            }
+
+            for( FOOTPRINT* fp : board->Footprints() )
+            {
+                for( PAD* pad : fp->Pads() )
+                {
+                    if( auto it = padsOfNet.find( pad->GetNetCode() ); it != padsOfNet.end() )
+                        it->second.push_back( pad );
+                }
+            }
+        }
+
+        std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
+
+        for( auto& [code, pads] : padsOfNet )
+        {
+            // the pads its copper joins, a spanning tree (shortest first) over each joined group
+            std::vector<int> group( pads.size(), -1 );
+
+            for( size_t i = 0; i < pads.size(); ++i )
+            {
+                if( group[i] >= 0 )
+                    continue;
+
+                group[i] = (int) i;
+                const auto joined = conn->GetConnectedItems( pads[i] );
+
+                for( size_t j = i + 1; j < pads.size(); ++j )
+                {
+                    if( group[j] < 0 && std::find( joined.begin(), joined.end(), pads[j] ) != joined.end() )
+                        group[j] = (int) i;
+                }
+            }
+
+            std::vector<bool> inTree( pads.size(), false );
+
+            for( size_t root = 0; root < pads.size(); ++root )
+            {
+                if( group[root] != (int) root )
+                    continue;
+
+                inTree[root] = true;
+
+                for( ;; )
+                {
+                    double best = std::numeric_limits<double>::max();
+                    size_t a = 0, b = 0;
+
+                    for( size_t i = 0; i < pads.size(); ++i )
+                    {
+                        if( !inTree[i] || group[i] != (int) root )
+                            continue;
+
+                        for( size_t j = 0; j < pads.size(); ++j )
+                        {
+                            if( inTree[j] || group[j] != (int) root )
+                                continue;
+
+                            const double d = ( pads[i]->GetPosition() - pads[j]->GetPosition() ).EuclideanNorm();
+
+                            if( d < best )
+                                best = d, a = i, b = j;
+                        }
+                    }
+
+                    if( best == std::numeric_limits<double>::max() )
+                        break;
+
+                    inTree[b] = true;
+                    const std::vector<PCB_TRACK*> chain = copperBetween( board, pads[a], pads[b] );
+
+                    if( chain.empty() || std::any_of( chain.begin(), chain.end(), []( PCB_TRACK* t ) { return t->IsLocked(); } ) )
+                        continue;
+
+                    JOB j{ pads[a], pads[b], pads[a]->m_Uuid, pads[b]->m_Uuid, pads[b]->GetPosition(), best,
+                           str( UnescapeString( pads[a]->GetNetname() ) ), false };
+                    j.foreign = true;
+                    jobs.push_back( j );
+                    foreignJobs++;
+                }
+            }
+        }
+
+        done.resize( jobs.size(), true );
+        rowOf.resize( jobs.size(), -1 );
+        partner.resize( jobs.size(), -1 );
+        overFirstBudget.resize( jobs.size(), false );
+    }
+
     // the rip-ups that failed, by board version and the routes taken out; how often each route has
     // been taken out (its copper costs a plan more each time)
     int                                                        boardVersion = 0;
@@ -5934,7 +6609,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 // until a rip-up has moved routes, the board has only gained copper since the first
                 // pass: the forward way failed there already
-                if( tryRoute( job, attempt, tries, false, true, rippedOk > 0 ) )
+                if( tryRoute( job, attempt, tries, false, true, rippedOk > 0 || overFirstBudget[index] ) )
                 {
                     progress = true;
                     boardVersion++;
@@ -5947,6 +6622,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     row.erase( "stopped_at_mm" );
                     row.erase( "blocked_by" );
                     row.erase( "blocked_end" );
+                    row.erase( "budget" );
                     row["retried"] = true;
                     row["layer"] = attempt["layer"];
                     row["mode"] = attempt["mode"];
@@ -5985,7 +6661,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 for( size_t other = 0; other < jobs.size(); ++other )
                 {
                     if( !done[other] || aKeep.count( other ) || partner[other] >= 0 || jobs[other].to->Type() != PCB_PAD_T
-                        || results[rowOf[other]].value( "joined_by_earlier_route", false )
+                        || ( rowOf[other] >= 0 && results[rowOf[other]].value( "joined_by_earlier_route", false ) )
                         || jobs[other].from->GetNetCode() == aTarget.from->GetNetCode() )
                     {
                         continue;   // pairs stay; a joined airwire has no copper of its own; the own net is no obstacle
@@ -6257,9 +6933,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 for( size_t k = 0; ok && k < jobs.size(); ++k )
                 {
-                    if( !done[k] || k == index || jobs[k].trunk || partner[k] >= 0 || rowOf[k] < 0
+                    if( !done[k] || k == index || jobs[k].trunk || partner[k] >= 0 || ( rowOf[k] < 0 && !jobs[k].foreign )
                         || std::find( allTaken.begin(), allTaken.end(), k ) != allTaken.end()
-                        || !results[rowOf[k]].value( "routed", false ) )
+                        || ( rowOf[k] >= 0 && !results[rowOf[k]].value( "routed", false ) ) )
                     {
                         continue;
                     }
@@ -6309,6 +6985,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     row.erase( "blocked_by" );
                     row.erase( "blocked_end" );
                     row.erase( "rip_ups_failed" );
+                    row.erase( "budget" );
+                    row.erase( "boxed_in" );
+                    row.erase( "pad_exits_tried_mm" );
                     row["after_rip_up"] = true;
                     row["layer"] = attempt["layer"];
                     row["mode"] = attempt["mode"];
@@ -6316,8 +6995,40 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     row["vias"] = attempt["metrics"].value( "vias", 0 );
                     row["detour"] = attempt["metrics"]["detour"];
 
+                    // copper of an earlier call laid again: listed, and its net is one this call moved
+                    auto earlier = [&]( size_t aJob, const nlohmann::json* aAttempt )
+                    {
+                        const JOB& j = jobs[aJob];
+                        profile.shovedNets.insert( j.from->GetNetCode() );
+
+                        auto name = []( const BOARD_CONNECTED_ITEM* aItem ) -> std::string
+                        {
+                            const PAD* pad = dynamic_cast<const PAD*>( aItem );
+
+                            return pad && pad->GetParentFootprint()
+                                           ? str( pad->GetParentFootprint()->GetReference() ) + "." + str( pad->GetNumber() )
+                                           : std::string();
+                        };
+
+                        nlohmann::json e = { { "net", j.net }, { "from", name( j.from ) }, { "to", name( j.to ) }, { "for", job.net } };
+
+                        if( aAttempt && aAttempt->contains( "metrics" ) )
+                        {
+                            e["length_mm"] = ( *aAttempt )["metrics"]["length_mm"];
+                            e["vias"] = ( *aAttempt )["metrics"].value( "vias", 0 );
+                        }
+
+                        foreignMoved.push_back( std::move( e ) );
+                    };
+
                     for( size_t k = 0; k < victims.size(); ++k )
                     {
+                        if( rowOf[victims[k]] < 0 )
+                        {
+                            earlier( victims[k], &victimAttempts[k] );
+                            continue;
+                        }
+
                         nlohmann::json& vrow = results[rowOf[victims[k]]];
                         vrow["rerouted"] = true;
                         vrow["length_mm"] = victimAttempts[k]["metrics"]["length_mm"];
@@ -6326,10 +7037,20 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     }
 
                     for( size_t k : cut )
-                        results[rowOf[k]]["rerouted"] = true;
+                    {
+                        if( rowOf[k] < 0 )
+                            earlier( k, nullptr );
+                        else
+                            results[rowOf[k]]["rerouted"] = true;
+                    }
 
                     for( size_t k : secondTaken )
-                        results[rowOf[k]]["rerouted"] = true;
+                    {
+                        if( rowOf[k] < 0 )
+                            earlier( k, nullptr );
+                        else
+                            results[rowOf[k]]["rerouted"] = true;
+                    }
 
                     break;
                 }
@@ -6496,7 +7217,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( size_t k = 0; k < jobs.size(); ++k )
         {
-            if( !done[k] || jobs[k].trunk || partner[k] >= 0 || rowOf[k] < 0 || jobs[k].to->Type() != PCB_PAD_T
+            if( !done[k] || jobs[k].trunk || jobs[k].busVia || partner[k] >= 0 || rowOf[k] < 0 || jobs[k].to->Type() != PCB_PAD_T
                 || !results[rowOf[k]].value( "routed", false ) || results[rowOf[k]].value( "joined_by_earlier_route", false ) )
             {
                 continue;
@@ -6714,9 +7435,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     for( const JOB& job : jobs )
     {
+        if( job.foreign )
+            continue;
+
         callNets.insert( job.from->GetNetCode() );
 
-        if( NETINFO_ITEM* coupled = job.trunk ? board->DpCoupledNet( job.from->GetNet() ) : nullptr )
+        if( NETINFO_ITEM* coupled = job.trunk ? coupledNet( board, job.from->GetNet(), &explicitPairs ) : nullptr )
             callNets.insert( coupled->GetNetCode() );
     }
 
@@ -6867,9 +7591,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     }
 
-    const int connections = (int) ( jobs.size() - trunks.size() + gaps.size() );
+    const int connections = (int) ( jobs.size() - trunks.size() + gaps.size() - foreignJobs );
 
-    if( stepMs == 0 )
+    if( stepMs == 0 && !aQuiet )
         showRoutes( aCtx, added );
 
     connectivity = board->GetConnectivity();
@@ -6991,7 +7715,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "failed", connections - routed },
                               { "length_mm", std::round( length * 1000.0 ) / 1000.0 },
                               { "vias", vias },
-                              { "rip_up", { { "tried", rippedTried }, { "won", rippedOk } } },
+                              { "bus", busOut },
+                              { "rip_up", { { "tried", rippedTried }, { "won", rippedOk }, { "scope", ripScope },
+                                            { "earlier_routes_movable", foreignJobs },
+                                            { "earlier_routes_rerouted", foreignMoved } } },
                               { "clean_up", { { "tried", cleanTried }, { "skipped", cleanSkipped }, { "kept", cleanKept }, { "vias_removed", viasRemoved },
                                               { "shortened_mm", std::round( pcbIUScale.IUTomm( shortenedIU ) * 1000.0 ) / 1000.0 } } },
                               { "stubs_removed", stubs },
@@ -7010,6 +7737,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "profile", { { "attempts", profile.attempts },
                                              { "dead_legs_skipped", profile.deadLegsSkipped },
                                              { "tries_stopped", profile.triesStopped },
+                                             { "budget", { { "first_pass_s", firstBudgetS }, { "rip_up_s", ripBudgetS },
+                                                           { "spent", profile.budgetSpent },
+                                                           { "first_pass_left", profile.overFirstBudget } } },
                                              { "clearance_lookups", profile.clearanceLookups },
                                              { "rule_evaluations", profile.ruleEvaluations },
                                              { "via_spots_blocked", profile.viaSpotsBlocked },
@@ -7063,7 +7793,7 @@ static std::string stitchedFor( BOARD_CONNECTED_ITEM* aItem )
 }
 
 
-static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, bool aQuiet )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
@@ -7094,11 +7824,20 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     const std::vector<UNDER_PART> underAreas = underParts == "avoid" ? underPartAreas( board ) : std::vector<UNDER_PART>();
 
-    // the part whose body a via at aAt (with its stub from aFrom on aLayer) would sit under, or none
-    auto underWhich = [&]( const VECTOR2I& aAt, const std::optional<VECTOR2I>& aFrom, PCB_LAYER_ID aLayer ) -> FOOTPRINT*
+    // the ring under a quad package between its pad rows and its exposed pad: where its own pads'
+    // vias go first (under_parts avoid keeps other parts' vias out of it)
+    const std::vector<UNDER_PART> ringAreas = underParts == "avoid" ? underAreas : underPartAreas( board );
+
+    // the part whose body a via at aAt (with its stub from aFrom on aLayer) would sit under, or none;
+    // the ring of aOwn (the part of the pad the stub leaves) is open to it
+    auto underWhich = [&]( const VECTOR2I& aAt, const std::optional<VECTOR2I>& aFrom, PCB_LAYER_ID aLayer,
+                           const FOOTPRINT* aOwn ) -> FOOTPRINT*
     {
         for( const UNDER_PART& under : underAreas )
         {
+            if( under.fp == aOwn )
+                continue;
+
             if( under.area.Collide( aAt, viaDia / 2 ) )
                 return under.fp;
 
@@ -7108,6 +7847,171 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
         return nullptr;
     };
+
+    // pads: only these ends (REF.PAD of the net), and the islands of tracks they are on
+    std::set<const PAD*> only;
+
+    if( aArgs.contains( "pads" ) )
+    {
+        if( !aArgs["pads"].is_array() )
+            return KOPENAPI_RESULT::Error( 400, "pads: a list of REF.PAD of the net, e.g. [\"U18.68\"]" );
+
+        for( const nlohmann::json& name : aArgs["pads"] )
+        {
+            const std::string text = name.is_string() ? name.get<std::string>() : std::string();
+            const size_t      dot = text.rfind( '.' );
+            FOOTPRINT*        fp = dot == std::string::npos ? nullptr
+                                                            : board->FindFootprintByReference( wxString::FromUTF8( text.substr( 0, dot ) ) );
+            PAD*              pad = nullptr;
+
+            if( fp )
+            {
+                for( PAD* p : fp->Pads() )
+                {
+                    if( str( p->GetNumber() ) == text.substr( dot + 1 ) )
+                        pad = p;
+                }
+            }
+
+            if( !pad )
+                return KOPENAPI_RESULT::Error( 400, "pads: no pad " + ( text.empty() ? name.dump() : text ) + " (REF.PAD)" );
+
+            if( pad->GetNetCode() != net->GetNetCode() )
+            {
+                return KOPENAPI_RESULT::Error( 400, "pads: " + text + " is on " + str( pad->GetNetname() ) + ", not on "
+                                                            + str( net->GetNetname() ) );
+            }
+
+            only.insert( pad );
+        }
+    }
+
+    // escape_keep_mm: the straight way out of a fine-pitch pin (pitch up to 0.65 mm) and of a
+    // pair's or clock's pin stays clear of stitching vias and stubs for that length
+    const double escapeKeepMm = std::clamp( aArgs.value( "escape_keep_mm", 2.0 ), 0.0, 20.0 );
+    const int    minClearance = board->GetDesignSettings().m_MinClearance;
+
+    struct ESCAPE
+    {
+        const PAD*    pad;
+        PCB_LAYER_ID  layer;
+        SHAPE_SEGMENT shape;
+    };
+
+    std::vector<ESCAPE>              escapes;
+    std::set<const PAD*>             finePads;
+    std::map<const PAD*, VECTOR2I>   outward;
+
+    {
+        std::set<int> special;
+
+        if( escapeKeepMm > 0 )
+        {
+            if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+            {
+                const KOPENAPI_RESULT r = roles->handler( aCtx, nlohmann::json::object() );
+
+                if( r.status < 400 && r.body.contains( "nets" ) && r.body["nets"].is_array() )
+                {
+                    for( const nlohmann::json& row : r.body["nets"] )
+                    {
+                        const std::string role = row.value( "role", std::string() );
+
+                        if( role != "pair" && role != "clock" )
+                            continue;
+
+                        if( NETINFO_ITEM* info = KopenapiFindNet( board, row.value( "net", std::string() ) ) )
+                            special.insert( info->GetNetCode() );
+                    }
+                }
+            }
+        }
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            if( fp->Pads().size() < 4 )
+                continue;
+
+            BOX2I centres( fp->Pads().front()->GetPosition(), VECTOR2I( 0, 0 ) );
+
+            for( PAD* pad : fp->Pads() )
+                centres.Merge( pad->GetPosition() );
+
+            for( PAD* pad : fp->Pads() )
+            {
+                double nearest = std::numeric_limits<double>::max();
+
+                for( PAD* other : fp->Pads() )
+                {
+                    if( other != pad && other->GetPosition() != pad->GetPosition() )
+                        nearest = std::min( nearest, (double) ( other->GetPosition() - pad->GetPosition() ).EuclideanNorm() );
+                }
+
+                const bool fine = nearest <= pcbIUScale.mmToIU( 0.65 );
+
+                if( fine )
+                    finePads.insert( pad );
+
+                const std::optional<VECTOR2I> dir = outwardOf( pad, centres );
+
+                if( !dir )
+                    continue;
+
+                outward[pad] = *dir;
+
+                if( escapeKeepMm <= 0 || pad->GetNetCode() == net->GetNetCode() || pad->GetNetCode() <= 0
+                    || ( !fine && !special.count( pad->GetNetCode() ) ) )
+                {
+                    continue;
+                }
+
+                const BOX2I    pb = pad->GetBoundingBox();
+                const int      half = dir->x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
+                const int      across = dir->x ? pb.GetHeight() : pb.GetWidth();
+                const VECTOR2I tip = pad->GetPosition() + *dir * half;
+                const VECTOR2I end = tip + *dir * pcbIUScale.mmToIU( escapeKeepMm );
+
+                for( PCB_LAYER_ID l : pad->GetLayerSet().CuStack() )
+                    escapes.push_back( { pad, l, SHAPE_SEGMENT( tip, end, across + 2 * minClearance ) } );
+            }
+        }
+    }
+
+    // the pin whose escape a via at aAt (with its stub from aFrom on aLayer) would sit in, or none;
+    // the stub counts from where it leaves aFromPad
+    auto inEscape = [&]( const VECTOR2I& aAt, const std::optional<VECTOR2I>& aFrom, PCB_LAYER_ID aLayer,
+                         const PAD* aFromPad ) -> const PAD*
+    {
+        std::optional<VECTOR2I> from = aFrom;
+
+        if( aFrom && aFromPad )
+        {
+            const BOX2I    pb = aFromPad->GetBoundingBox();
+            const VECTOR2I d = aAt - *aFrom;
+            double         t = 1.0;
+
+            if( d.x != 0 )
+                t = std::min( t, pb.GetWidth() / 2.0 / std::abs( (double) d.x ) );
+
+            if( d.y != 0 )
+                t = std::min( t, pb.GetHeight() / 2.0 / std::abs( (double) d.y ) );
+
+            from = *aFrom + VECTOR2I( KiROUND( d.x * t ), KiROUND( d.y * t ) );
+        }
+
+        for( const ESCAPE& e : escapes )
+        {
+            if( e.shape.Collide( aAt, viaDia / 2 ) )
+                return e.pad;
+
+            if( from && aLayer == e.layer && e.shape.Collide( SEG( *from, aAt ), width / 2 ) )
+                return e.pad;
+        }
+
+        return nullptr;
+    };
+
+    int escapeSkipped = 0;
 
     SHAPE_POLY_SET boardShape;
     board->GetBoardPolygonOutlines( boardShape, true );
@@ -7285,6 +8189,20 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
             if( done.count( item ) && item->Type() != PCB_ZONE_T )
                 continue;
 
+            if( !only.empty() )
+            {
+                bool chosen = item->Type() == PCB_PAD_T && only.count( static_cast<PAD*>( item ) );
+
+                if( item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T )
+                {
+                    for( BOARD_CONNECTED_ITEM* other : board->GetConnectivity()->GetConnectedItems( item ) )
+                        chosen |= other->Type() == PCB_PAD_T && only.count( static_cast<PAD*>( other ) );
+                }
+
+                if( !chosen )
+                    continue;
+            }
+
             const PCB_LAYER_ID layer = item->Type() == PCB_ZONE_T ? item->GetLayerSet().CuStack().front()
                                                                     : item->GetLayerSet().CuStack().front();
             const bool  onTrack = item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T;
@@ -7361,6 +8279,24 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
                 for( const auto& [base, half] : bases )
                 {
+                    // inward from a pad of a quad package's row: spots in the ring before its exposed pad
+                    PAD* basePad = item->Type() == PCB_PAD_T && base == pos ? static_cast<PAD*>( item ) : padAt( base );
+
+                    if( auto dir = basePad ? outward.find( basePad ) : outward.end(); dir != outward.end() )
+                    {
+                        const bool quad = std::any_of( ringAreas.begin(), ringAreas.end(),
+                                                       [&]( const UNDER_PART& u ) { return u.fp == basePad->GetParentFootprint(); } );
+                        const BOX2I pb = basePad->GetBoundingBox();
+                        const int   padHalf = dir->second.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
+
+                        for( int k = 0; quad && k < 16; ++k )
+                        {
+                            const VECTOR2I at = base - dir->second * ( padHalf + viaDia / 2 + minClearance + k * pcbIUScale.mmToIU( 0.1 ) );
+                            candidates.push_back( at );
+                            stubFrom[{ at.x, at.y }] = base;
+                        }
+                    }
+
                     for( int ring = 0; ring < 6; ++ring )
                     {
                         const int reach = half + viaDia / 2 + pcbIUScale.mmToIU( 0.4 ) + ring * pcbIUScale.mmToIU( 0.5 );
@@ -7404,8 +8340,42 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
             struct SPOT_KEY
             {
                 bool   plane;
+                int    rank;
                 double stub;
                 size_t index;
+            };
+
+            // the pad a spot's stub leaves (none for a zone island's spot)
+            auto stubPadOf = [&]( const VECTOR2I& at ) -> PAD*
+            {
+                if( item->Type() == PCB_ZONE_T )
+                    return nullptr;
+
+                auto       it = stubFrom.find( { at.x, at.y } );
+                const bool fromPos = it == stubFrom.end() || it->second == pos;
+
+                if( fromPos && item->Type() == PCB_PAD_T )
+                    return static_cast<PAD*>( item );
+
+                return padAt( fromPos ? pos : it->second );
+            };
+
+            // inward under the pad's own package first, then beside a pad of coarse pitch (a cap), a
+            // fine-pitch pin's surroundings last
+            auto rankOf = [&]( const VECTOR2I& at )
+            {
+                PAD* from = stubPadOf( at );
+
+                if( !from )
+                    return 1;
+
+                for( const UNDER_PART& u : ringAreas )
+                {
+                    if( u.fp == from->GetParentFootprint() && u.area.Contains( at ) )
+                        return 0;
+                }
+
+                return finePads.count( from ) ? 2 : 1;
             };
 
             std::vector<SPOT_KEY> keys;
@@ -7415,7 +8385,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
             {
                 const VECTOR2I& at = candidates[i];
                 const bool      plane = planeAt.emplace( std::make_pair( at.x, at.y ), onPlane( at ) ).first->second;
-                keys.push_back( { plane, static_cast<double>( stubLength( at ) ), i } );
+                keys.push_back( { plane, item->Type() == PCB_ZONE_T ? 1 : rankOf( at ), static_cast<double>( stubLength( at ) ), i } );
             }
 
             const size_t keep = std::min<size_t>( keys.size(), 400 );
@@ -7424,6 +8394,9 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                                {
                                    if( x.plane != y.plane )
                                        return x.plane;
+
+                                   if( x.rank != y.rank )
+                                       return x.rank < y.rank;
 
                                    if( x.stub != y.stub )
                                        return x.stub < y.stub;
@@ -7441,6 +8414,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
             const int offPlaneBefore = offPlaneSkipped;
             std::map<std::string, int> underSkipped;   // spots under a part's body, per part
+            std::map<std::string, int> escapeOf;       // spots in a pin's escape, per pin
 
             {
                 for( const VECTOR2I& at : candidates )
@@ -7460,12 +8434,21 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                     {
                         const auto        from = stubFrom.find( { at.x, at.y } );
                         const bool        stub = item->Type() == PCB_PAD_T || onTrack;
-                        const FOOTPRINT*  body = underWhich( at, stub ? std::optional<VECTOR2I>( from == stubFrom.end() ? pos : from->second )
-                                                                      : std::nullopt, layer );
+                        const std::optional<VECTOR2I> start = stub ? std::optional<VECTOR2I>( from == stubFrom.end() ? pos : from->second )
+                                                                   : std::nullopt;
+                        const PAD*        own = stubPadOf( at );
+                        const FOOTPRINT*  body = underWhich( at, start, layer, own ? own->GetParentFootprint() : nullptr );
 
                         if( body )
                         {
                             underSkipped[str( body->GetReference() )]++;
+                            continue;
+                        }
+
+                        if( const PAD* pin = inEscape( at, start, layer, own ) )
+                        {
+                            escapeOf[str( pin->GetParentFootprint()->GetReference() ) + "." + str( pin->GetNumber() )]++;
+                            escapeSkipped++;
                             continue;
                         }
                     }
@@ -7585,8 +8568,8 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
             if( !ok )
             {
-                int underCount = 0;
-                std::string underNames;
+                int underCount = 0, escapeCount = 0;
+                std::string underNames, escapeNames;
 
                 for( const auto& [ref, n] : underSkipped )
                 {
@@ -7594,9 +8577,22 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                     underNames += ( underNames.empty() ? "" : ", " ) + ref;
                 }
 
+                for( const auto& [pin, n] : escapeOf )
+                {
+                    escapeCount += n;
+
+                    if( escapeNames.size() < 120 )
+                        escapeNames += ( escapeNames.empty() ? "" : ", " ) + pin;
+                }
+
+                const int offPlaneHere = offPlaneSkipped - offPlaneBefore;
+
                 misses[item] = { { "for", stitchedFor( item ) },
                                  { "at_mm", { toMm( pos.x ), toMm( pos.y ) } },
-                                 { "reason", !candidates.empty() && underCount > 0 && underCount + offPlaneSkipped - offPlaneBefore >= (int) candidates.size()
+                                 { "reason", !candidates.empty() && escapeCount > 0 && escapeCount + underCount + offPlaneHere >= (int) candidates.size()
+                                                     ? "every spot near it lies in the straight escape of a fine-pitch, pair or clock pin ("
+                                                               + escapeNames + "; escape_keep_mm to shorten) or under a part's body"
+                                             : !candidates.empty() && underCount > 0 && underCount + offPlaneSkipped - offPlaneBefore >= (int) candidates.size()
                                                      ? "every spot near it lies under the body of " + underNames
                                                                + " (inside its ring of pads; under_parts: allow to place there)"
                                              : candidates.empty() ? "no spot to try (the island is too small for a via)"
@@ -7705,8 +8701,12 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         }
     }
 
-    KopenapiKeepUiAlive();
-    showRoutes( aCtx, added );
+    if( !aQuiet )
+    {
+        KopenapiKeepUiAlive();
+        showRoutes( aCtx, added );
+    }
+
     KopenapiKeepUiAlive();
 
     nlohmann::json answer = { { "net", str( netName ) },
@@ -7773,7 +8773,12 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                                     { "dangling_vias_removed", danglingRemoved },
                                     { "not_reached_count", answer["not_reached"].size() },
                                     { "islands_left_count", answer["islands_left"].size() },
-                                    { "spots_off_plane", offPlaneSkipped } };
+                                    { "spots_off_plane", offPlaneSkipped },
+                                    { "escape_keep_mm", escapeKeepMm },
+                                    { "spots_in_escapes", escapeSkipped } };
+
+    if( !only.empty() )
+        out["pads"] = aArgs["pads"];
 
     for( const char* key : { "vias", "not_reached", "islands_left" } )
         cap.Put( out, key, answer[key] );
@@ -7781,6 +8786,40 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     KopenapiKeepUiAlive();
     out.update( KopenapiUnroutedJson( board ) );
     return KOPENAPI_RESULT::Ok( out );
+}
+
+
+/// @brief pcb_stitch; dry_run stitches on the board and takes it all back (the vias and stubs it
+/// reports are what the same call places)
+static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    if( !aArgs.value( "dry_run", false ) )
+        return pcbStitch( aCtx, aArgs, false );
+
+    KOPENAPI_HISTORY& history = KOPENAPI_HISTORY::Get();
+
+    if( !history.TrialBegin( aCtx, "pcb" ) )
+        return KOPENAPI_RESULT::Error( 409, "dry_run: no copy of the board before the call could be made to take the vias "
+                                            "back; stitch for real and roll back (rollback)" );
+
+    KOPENAPI_RESULT result = pcbStitch( aCtx, aArgs, true );
+    KOPENAPI_RESULT back = history.TrialRestore( aCtx );
+
+    if( back.status != 200 )
+    {
+        return KOPENAPI_RESULT::Error( 500, "dry_run: the vias could not be taken back (" + back.body.dump()
+                                                    + "): the board holds them; rollback 1 step takes them out" );
+    }
+
+    if( result.status == 200 )
+    {
+        result.body["dry_run"] = true;
+        result.body["applied"] = false;
+        result.body["simulated"] = "the whole call (vias, stubs, refills, the vias the fill left off the plane taken out) ran "
+                                   "on the board and was taken back: the same call places these vias; uuids in them are gone";
+    }
+
+    return result;
 }
 
 
@@ -10254,7 +11293,11 @@ KOPENAPI_REGISTER( "pcb_route_connection",
                         "to":{"description":"REF.PAD on the same net, or a spot [x_mm, y_mm] / {at, layer}: the net's copper there (track end, via, pad) or a free spot the route ends at (with layer: a via there when the route arrives on another); default: nearest unconnected"},
                         "layer":{"type":"string","description":"start layer; default the 'from' pad's (F.Cu, B.Cu for a pad on the back only). A 'to' on another layer than the route arrives on gets a via in front of it (via_near_target_mm)"},
                         "mode":{"type":"string","enum":["walkaround","shove"],"default":"walkaround"},
-                        "waypoints":{"type":"array","description":"points to pass in order: [x_mm, y_mm] fixes a corner there; {at: [x_mm, y_mm], layer: 'B.Cu'} drops a through via there and continues on that layer","items":{}},
+                        "waypoints":{"type":"array","description":"points to pass in order: [x_mm, y_mm] fixes a corner there; {at: [x_mm, y_mm], via: 'B.Cu'} drops a through via there and continues on that layer (layer: the same key, as in pcb_track_add points; both given must agree)","items":{"oneOf":[
+                            {"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2,"description":"[x_mm, y_mm]: a corner"},
+                            {"type":"object","required":["at"],"properties":{"at":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},
+                                "via":{"type":"string","description":"layer after a through via at this point"},
+                                "layer":{"type":"string","description":"the same as via"}}}]}},
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills give way while routing and are refilled around the route; keep: the route must clear the fills"},
                         "width_mm":{"type":"number","description":"track width of this route (default the net class's), e.g. narrower to leave a fine-pitch pad"},
                         "via_diameter_mm":{"type":"number","description":"via size of this route (default the net class's)"},"via_drill_mm":{"type":"number"},
@@ -10294,7 +11337,12 @@ KOPENAPI_REGISTER( "pcb_route",
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
                    "rip_up, gaps); "
-                   "dry_run routes nothing; rows (results, failed ones first when cut), other_nets_moved and the grid lists capped at list_limit (counts whole), full: true for all",
+                   "nets a pcb_net_roles pair names (USB_DP_MCU / USB_DM_MCU too) are routed coupled as well (diff_pairs); "
+                   "bus routes a bundle's members one after another in pin order, bus_layer through a diagonal via fan (answer bus, row bus); "
+                   "rip_up_scope unlocked lets the rip-up take out unlocked copper of earlier calls too (rip_up.earlier_routes_rerouted, "
+                   "other_nets_moved); the first pass gives each connection first_pass_budget_s (row budget, profile budget); "
+                   "dry_run (pns) routes the whole call on the board and takes it back: its rows are what applying gives (simulated says so); "
+                   "rows (results, failed ones first when cut), other_nets_moved and the grid lists capped at list_limit (counts whole), full: true for all",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
                         "nets":{"type":"array","items":{"type":"string"}},
                         "layers":{"type":"array","items":{"type":"string"},"default":["F.Cu","B.Cu"]},
@@ -10302,6 +11350,10 @@ KOPENAPI_REGISTER( "pcb_route",
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
                         "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it; clean_up: tried / skipped / kept / vias_removed / shortened_mm; rows cleaned)"},
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back); spent: the rip-up fails and what it took out goes back; 0 no limit"},
+                        "first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
+                        "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
+                        "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
+                        "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again, up to 3 choices of them per connection and round; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
@@ -10336,7 +11388,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
                         "style":{"type":"string","enum":["direct","rail"],"default":"direct","description":"rail (power nets): every connection leaves its pads through a via next to them and runs on the second layer"},
                         "step_ms":{"type":"integer","default":0,"description":"GUI: draw each route and wait this long before the next (for watching / recording)"},
-                        "dry_run":{"type":"boolean","default":false}}})json"_json, ROUTE_LIST_CAP ),
+                        "dry_run":{"type":"boolean","default":false,"description":"pns: the whole call (first pass, retries, rip-up, clean-up, stubs, refill) is routed on the board and taken back - rows and totals are what applying gives (409 when no copy of the board could be made); grid: the search and guard, nothing put on the board"}}})json"_json, ROUTE_LIST_CAP ),
                    false, h_pcb_route, 600 );
 
 
@@ -10354,8 +11406,14 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "net's pours beside the main one per zone and layer, as island_list shows them: kind cut_off (no via) or sliver; "
                    "vias go only where the net's plane is on another layer with zone priorities resolved, and a via left on a "
                    "piece under 2 mm2 after the refill is taken out; footprint and board keep-outs are honoured; spots_off_plane) and the "
-                   "connections still open (unrouted); lists capped at list_limit (counts whole), full: true for all",
+                   "connections still open (unrouted); a pad's via goes inward first (under its own package, between the pad row "
+                   "and the exposed pad), an island's beside a coarse-pitch pad (a cap) before a fine-pitch pin; no via or stub in the "
+                   "straight escape of another net's fine-pitch, pair or clock pin (escape_keep_mm; spots_in_escapes); pads picks the ends; "
+                   "dry_run stitches and takes it back; lists capped at list_limit (counts whole), full: true for all",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{"net":{"type":"string","default":"GND"},
+                        "pads":{"type":"array","items":{"type":"string"},"description":"only these ends: REF.PAD of the net (and the islands of tracks they are on); 400 for a pad not found or on another net"},
+                        "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"no via or stub this far out in front of a fine-pitch (0.65 mm or closer), pair or clock pin of another net on a package's row; 0 off"},
+                        "dry_run":{"type":"boolean","default":false,"description":"the whole call (vias, stubs, refills) runs on the board and is taken back: the answer is what it places (409 when no copy of the board could be made)"},
                         "under_parts":{"type":"string","enum":["avoid","allow"],"default":"avoid","description":"avoid: no via or stub inside the ring of pads of a quad package (QFP / QFN / LGA) on its side - the exposed pad and its clearance stay open for its own vias; BGAs are not affected; not_reached says when only such spots were near"}}})json"_json ),
                    false, h_pcb_stitch, 300 );
 
