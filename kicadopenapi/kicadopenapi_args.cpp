@@ -53,13 +53,16 @@ public:
             const std::string where = aPointer.to_string();
             m_message = ( where.empty() ? std::string( "arguments" ) : "'" + where.substr( 1 ) + "'" ) + ": "
                         + aMessage;
+            m_pointer = aPointer;
         }
     }
 
-    const std::string& Message() const { return m_message; }
+    const std::string&                Message() const { return m_message; }
+    const nlohmann::json::json_pointer& Pointer() const { return m_pointer; }
 
 private:
-    std::string m_message;
+    std::string                  m_message;
+    nlohmann::json::json_pointer m_pointer;
 };
 
 
@@ -131,6 +134,137 @@ nlohmann::json integralAsIntegers( const nlohmann::json& aValue )
     return aValue;
 }
 
+/// @brief "unknown argument 'key' (did you mean ...); <where> takes: a, b"; empty when aKey is known
+std::string unknownName( const std::string& aKey, const std::vector<std::string>& aKnown, const std::string& aWhere )
+{
+    if( std::find( aKnown.begin(), aKnown.end(), aKey ) != aKnown.end() )
+        return {};
+
+    std::string nearest;
+    size_t      best = std::max<size_t>( 3, aKey.size() / 3 ) + 1;   // only close names are suggested
+
+    for( const std::string& k : aKnown )
+    {
+        if( const size_t d = distance( aKey, k ); d < best )
+        {
+            best = d;
+            nearest = k;
+        }
+    }
+
+    std::string list;
+
+    for( const std::string& k : aKnown )
+        list += ( list.empty() ? "" : ", " ) + k;
+
+    return "unknown argument '" + aKey + "'" + ( nearest.empty() ? "" : " (did you mean '" + nearest + "'?)" ) + "; "
+           + aWhere + " takes: " + list;
+}
+
+
+/// @brief The object schema that applies to an object value: aSchema itself when it lists
+/// properties, else its only object alternative of oneOf / anyOf; null when none or ambiguous
+const nlohmann::json* objectSchema( const nlohmann::json& aSchema )
+{
+    if( aSchema.contains( "properties" ) )
+        return &aSchema;
+
+    const nlohmann::json* found = nullptr;
+
+    for( const char* key : { "oneOf", "anyOf" } )
+    {
+        if( !aSchema.contains( key ) || !aSchema[key].is_array() )
+            continue;
+
+        for( const nlohmann::json& alt : aSchema[key] )
+        {
+            if( !alt.is_object() || !alt.contains( "properties" ) )
+                continue;
+
+            if( found )
+                return nullptr;
+
+            found = &alt;
+        }
+    }
+
+    return found;
+}
+
+
+/// @brief Unknown names inside nested objects (array items and object properties), as at the top
+/// level: the first one found, or empty.  aPath is the JSON pointer of aValue ("moves/0")
+std::string unknownNested( const nlohmann::json& aSchema, const nlohmann::json& aValue, const std::string& aPath )
+{
+    if( !aSchema.is_object() )
+        return {};
+
+    if( aValue.is_array() )
+    {
+        if( !aSchema.contains( "items" ) || !aSchema["items"].is_object() )
+            return {};
+
+        for( size_t i = 0; i < aValue.size(); ++i )
+        {
+            if( std::string e = unknownNested( aSchema["items"], aValue[i], aPath + "/" + std::to_string( i ) ); !e.empty() )
+                return e;
+        }
+
+        return {};
+    }
+
+    if( !aValue.is_object() )
+        return {};
+
+    const nlohmann::json* schema = objectSchema( aSchema );
+
+    if( !schema || !( *schema )["properties"].is_object() )
+        return {};
+
+    const nlohmann::json& props = ( *schema )["properties"];
+    const bool closed = !schema->contains( "additionalProperties" ) || ( *schema )["additionalProperties"] == false;
+
+    if( closed && !aPath.empty() )
+    {
+        std::vector<std::string> known;
+
+        for( const auto& [key, prop] : props.items() )
+            known.push_back( key );
+
+        for( const auto& [key, value] : aValue.items() )
+        {
+            if( std::string e = unknownName( key, known, "'" + aPath + "'" ); !e.empty() )
+                return e;
+        }
+    }
+
+    for( const auto& [key, value] : aValue.items() )
+    {
+        if( !props.contains( key ) )
+            continue;
+
+        if( std::string e = unknownNested( props[key], value, aPath.empty() ? key : aPath + "/" + key ); !e.empty() )
+            return e;
+    }
+
+    return {};
+}
+
+/// @brief The reference tokens of a JSON pointer ("/points/1" -> points, 1)
+std::vector<std::string> tokens( const nlohmann::json::json_pointer& aPointer )
+{
+    std::vector<std::string>        out;
+    nlohmann::json::json_pointer    p = aPointer;
+
+    while( !p.empty() )
+    {
+        out.insert( out.begin(), p.back() );
+        p.pop_back();
+    }
+
+    return out;
+}
+
 } // namespace
 
 
@@ -164,30 +298,13 @@ std::string KopenapiValidateArgs( const std::string& aMethod, const nlohmann::js
     {
         for( const auto& [key, value] : aArgs.items() )
         {
-            if( std::find( known.begin(), known.end(), key ) != known.end() )
-                continue;
-
-            std::string nearest;
-            size_t      best = std::max<size_t>( 3, key.size() / 3 ) + 1;   // only close names are suggested
-
-            for( const std::string& k : known )
-            {
-                if( const size_t d = distance( key, k ); d < best )
-                {
-                    best = d;
-                    nearest = k;
-                }
-            }
-
-            std::string list;
-
-            for( const std::string& k : known )
-                list += ( list.empty() ? "" : ", " ) + k;
-
-            return "unknown argument '" + key + "'" + ( nearest.empty() ? "" : " (did you mean '" + nearest + "'?)" )
-                   + "; " + aMethod + " takes: " + list;
+            if( std::string e = unknownName( key, known, aMethod ); !e.empty() )
+                return e;
         }
     }
+
+    if( std::string e = unknownNested( aSchema, aArgs, "" ); !e.empty() )
+        return e;
 
     const nlohmann::json_schema::json_validator* validator = validatorFor( aMethod, aSchema );
 
@@ -205,5 +322,54 @@ std::string KopenapiValidateArgs( const std::string& aMethod, const nlohmann::js
         return std::string( "arguments: " ) + e.what();
     }
 
-    return errors ? errors.Message() : std::string();
+    if( !errors )
+        return {};
+
+    // "no subschema has succeeded" says little: an object checked against the one object form of
+    // its oneOf / anyOf gives the reason that form has
+    const nlohmann::json value = integralAsIntegers( aArgs );
+
+    if( errors.Message().find( "subschema" ) != std::string::npos && value.contains( errors.Pointer() ) )
+    {
+        const nlohmann::json& at = value.at( errors.Pointer() );
+        const nlohmann::json* schema = &aSchema;
+
+        for( const std::string& token : tokens( errors.Pointer() ) )
+        {
+            const nlohmann::json* object = schema->is_object() ? objectSchema( *schema ) : nullptr;
+
+            if( object && ( *object )["properties"].contains( token ) )
+                schema = &( *object )["properties"][token];
+            else if( schema->is_object() && schema->contains( "items" ) && ( *schema )["items"].is_object() )
+                schema = &( *schema )["items"];
+            else
+                return errors.Message();
+        }
+
+        const nlohmann::json* form = at.is_object() && schema->is_object() && !schema->contains( "properties" )
+                                             ? objectSchema( *schema )
+                                             : nullptr;
+
+        if( form )
+        {
+            try
+            {
+                nlohmann::json_schema::json_validator one( nullptr, []( const std::string&, const std::string& ) {} );
+                one.set_root_schema( *form );
+                FIRST_ERROR inner;
+                one.validate( at, inner );
+
+                if( inner )
+                {
+                    const std::string where = errors.Pointer().to_string() + inner.Pointer().to_string();
+                    return "'" + where.substr( 1 ) + "': " + inner.Message().substr( inner.Message().find( ": " ) + 2 );
+                }
+            }
+            catch( const std::exception& )
+            {
+            }
+        }
+    }
+
+    return errors.Message();
 }
