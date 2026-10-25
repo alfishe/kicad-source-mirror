@@ -31,6 +31,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
@@ -766,6 +767,34 @@ static int ReceiveTimeoutSeconds()
     return seconds;
 }
 
+/// @brief The receive timeout of one call: a call that asks the server to wait (job_get wait_s) gets
+/// that long plus a margin when it is longer than the default
+static int ReceiveTimeoutFor(const std::string& line)
+{
+    const int base = ReceiveTimeoutSeconds();
+    const json msg = json::parse(line, nullptr, false);
+
+    if (!msg.is_object() || !msg.contains("params") || !msg["params"].is_object())
+        return base;
+
+    const json& params = msg["params"];
+    const json* args = params.contains("arguments") && params["arguments"].is_object() ? &params["arguments"] : nullptr;
+
+    for (const char* key : {"arguments", "args"})
+    {
+        if (args && args->contains(key) && (*args)[key].is_object())
+        {
+            args = &(*args)[key];
+            break;
+        }
+    }
+
+    if (!args || !args->contains("wait_s") || !(*args)["wait_s"].is_number())
+        return base;
+
+    return std::max(base, (*args)["wait_s"].get<int>() + 30);
+}
+
 std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const json& id, const json& aProgressToken)
 {
     std::string host;
@@ -788,7 +817,7 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
         } relock{m_mutex};
         m_mutex.unlock();
         ProgressWatch watch(host, port, aProgressToken);
-        return bridge::Post(host, port, path, line, ReceiveTimeoutSeconds());
+        return bridge::Post(host, port, path, line, ReceiveTimeoutFor(line));
     };
 
     long pid = m_pid;
@@ -821,7 +850,7 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
         std::string message = "cannot reach " + m_url + " (" + result.error + ")";
         if (result.error == "receive timeout" && platform::ProcessAlive(pid))
         {
-            message = "no answer within " + std::to_string(ReceiveTimeoutSeconds())
+            message = "no answer within " + std::to_string(ReceiveTimeoutFor(line))
                       + " s; the call may still run on the server and its changes will stand. " + RunningWork(host, port);
         }
         else if (m_cfg.pinnedUrl.empty() && !platform::ProcessAlive(pid))
