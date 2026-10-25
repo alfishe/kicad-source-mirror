@@ -811,6 +811,10 @@ static KOPENAPI_DOC_HISTORY history()
         PROJECT*         project = s_headless->GetBoard()->GetProject();
         std::unique_ptr<BOARD> board;
 
+        // the copy holds no design settings: the board loaded from it reads them from the project,
+        // so the ones in force (pcb_rules_set constraints, unsaved) go there first
+        s_headless->GetBoard()->GetDesignSettings().SaveToFile();
+
         try
         {
             board = BOARD_LOADER::Load( copy.GetFullPath(), PCB_IO_MGR::KICAD_SEXP, project );

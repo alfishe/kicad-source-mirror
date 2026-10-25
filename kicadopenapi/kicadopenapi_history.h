@@ -49,6 +49,12 @@ public:
     /// nothing: job_cancel {apply: false}); the call is still logged when it ends
     KOPENAPI_RESULT RestoreBeforePending( KOPENAPI_CONTEXT& aCtx );
 
+    /// @brief A trial inside a call that is to change nothing (a dry run done for real): every open
+    /// document is marked now; false (no trial) when aDomain's document could not be marked or a
+    /// trial is running.  TrialRestore brings the documents back and drops the mark; no step is logged
+    bool TrialBegin( KOPENAPI_CONTEXT& aCtx, const std::string& aDomain );
+    KOPENAPI_RESULT TrialRestore( KOPENAPI_CONTEXT& aCtx );
+
     /// @brief The document of aDomain was opened / closed / reverted: its earlier marks no longer
     /// apply (the other domain's marks stay; log entries stay)
     void Reset( const std::string& aDomain, const std::string& aReason );
