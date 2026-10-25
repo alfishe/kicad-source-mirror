@@ -44,6 +44,22 @@ public:
     /// @brief Stop serving; idempotent.  Must be called before the KIWAY/frames go away.
     void Stop();
 
+    /// @brief The host is asked to stop (a signal, /shutdown): queued and running jobs and the
+    /// running call stop at their next safe point, so Stop() does not wait for a long call to
+    /// finish its work.  Any thread
+    void RequestStop( const std::string& aWhy );
+
+    /// @brief The call or job running now ({method, running_ms, progress}), null when none.  Any thread
+    nlohmann::json Busy() const;
+
+    /// @brief A host that exits without Stop() (it did not stop in time) calls this first: the
+    /// discovery file goes, so clients do not find a process that is gone.  Any thread
+    void Abandon();
+
+    /// @brief aHandler (async-signal-safe) on SIGINT / SIGTERM / SIGHUP, on Windows on Ctrl-C,
+    /// Ctrl-Break, console close, logoff and shutdown; the process goes on to stop cleanly
+    static void InstallStopRequestHandler( void ( *aHandler )() );
+
     /// @brief Custom main loops (headless host): called from any thread right after work was queued
     /// for the main thread, so an idle loop can wake at once instead of polling.
     /// Set before Start().

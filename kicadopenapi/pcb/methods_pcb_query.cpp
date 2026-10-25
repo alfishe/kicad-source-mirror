@@ -36,7 +36,7 @@ KOPENAPI_REGISTER( "pcb_query",
                    "(A.Net is the net code), KiCad's functions such as "
                    "A.intersectsCourtyard('U1'), A.enclosedByArea('name')) plus query functions: A.side() "
                    "('top' / 'bottom' / 'both' / 'inner'), A.mount() ('smd' / 'tht' / 'other'), A.parentRef(), "
-                   "A.courtyard() ('x0 y0 x1 y1' mm), A.inRect(x0, y0, x1, y1) / A.touchesRect(...) (mm, or "
+                   "A.courtyard() ('x0 y0 x1 y1' mm), A.Uuid (the item's uuid; '1f2e*' matches a prefix), A.inRect(x0, y0, x1, y1) / A.touchesRect(...) (mm, or "
                    "numbers with units), A.inPolygon('x0 y0, x1 y1, ...'), A.inArea('name'); a call with no item "
                    "(inRect(...)) applies to A. Read-only. "
                    "from picks the kinds: tracks are segments and arcs (A.Type 'Track'), vias are from 'vias' "

@@ -444,6 +444,134 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
 }
 
 
+/// @brief A stub's neck at a pad: the width it may have there and why it is narrower than asked
+struct STUB_NECK
+{
+    int         width = 0;
+    std::string why;   ///< empty when the stub keeps the width it was asked for
+};
+
+
+/// @brief A custom track_width rule where aPad is (a fine-pitch escape rule in a courtyard), for a
+/// track of aNetCode on aLayer: {opt or min, min}; {0, 0} when only the class says
+std::pair<int, int> ruleTrackWidthAt( BOARD* aBoard, PAD* aPad, int aNetCode, PCB_LAYER_ID aLayer )
+{
+    std::shared_ptr<DRC_ENGINE> drc = aBoard->GetDesignSettings().m_DRCEngine;
+
+    if( !drc || !aPad )
+        return { 0, 0 };
+
+    PCB_TRACK probe( aBoard );
+    probe.SetFlags( ROUTER_TRANSIENT );
+    probe.SetNetCode( aNetCode );
+    probe.SetStart( aPad->GetPosition() );
+    probe.SetEnd( aPad->GetPosition() );
+    probe.SetLayer( aLayer );
+
+    const DRC_CONSTRAINT c = drc->EvalRules( TRACK_WIDTH_CONSTRAINT, &probe, nullptr, aLayer );
+
+    if( !c.GetParentRule() || c.GetParentRule()->IsImplicit() )
+        return { 0, 0 };
+
+    const int min = c.GetValue().HasMin() ? c.GetValue().Min() : 0;
+    return { c.GetValue().HasOpt() ? c.GetValue().Opt() : min, min };
+}
+
+
+/// @brief The narrowest a stub at aPad may be: the board minimum, or a custom track_width rule's
+/// min there
+int stubMinWidth( BOARD* aBoard, PAD* aPad, int aNetCode, PCB_LAYER_ID aLayer )
+{
+    return std::max( { aBoard->GetDesignSettings().m_TrackMinWidth, ruleTrackWidthAt( aBoard, aPad, aNetCode, aLayer ).second,
+                       1 } );
+}
+
+
+/// @brief The router's neck-down for a stub leaving aPad: a pad 0.65 mm or closer to the next one of
+/// its part takes a track no wider than its narrow side, not below the Default class width or the
+/// board minimum; a custom track_width rule at the pad sets it lower (its opt, else min) (neck_down
+/// auto of pcb_route)
+STUB_NECK padNeck( BOARD* aBoard, PAD* aPad, int aWidth, PCB_LAYER_ID aLayer )
+{
+    STUB_NECK out{ aWidth, std::string() };
+
+    if( !aPad || !aPad->GetParentFootprint() )
+        return out;
+
+    double pitch = std::numeric_limits<double>::max();
+
+    for( PAD* other : aPad->GetParentFootprint()->Pads() )
+    {
+        if( KopenapiPadNeighbours( other, aPad ) )
+            pitch = std::min( pitch, double( ( other->GetPosition() - aPad->GetPosition() ).EuclideanNorm() ) );
+    }
+
+    if( pitch > pcbIUScale.mmToIU( 0.65 ) )
+        return out;
+
+    const BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
+    std::shared_ptr<NETCLASS>    def = bds.m_NetSettings ? bds.m_NetSettings->GetDefaultNetclass() : nullptr;
+    const int floor = std::max( bds.m_TrackMinWidth, def && def->HasTrackWidth() ? def->GetTrackWidth() : 0 );
+    const VECTOR2I size = aPad->GetSize( PADSTACK::ALL_LAYERS );
+    int            cap = std::max( floor, std::min( size.x, size.y ) );
+
+    if( const int rule = ruleTrackWidthAt( aBoard, aPad, aPad->GetNetCode(), aLayer ).first; rule > 0 )
+        cap = std::max( bds.m_TrackMinWidth, std::min( cap, rule ) );
+
+    if( cap < aWidth )
+    {
+        char text[160];
+        std::snprintf( text, sizeof( text ), "fine-pitch pad %s.%s (pitch %.3g mm, pad %.3g mm wide)",
+                       str( aPad->GetParentFootprint()->GetReference() ).c_str(), str( aPad->GetNumber() ).c_str(),
+                       toMm( pitch ), toMm( std::min( size.x, size.y ) ) );
+        out = { cap, text };
+    }
+
+    return out;
+}
+
+
+/// @brief Narrows aTrack (a stub not on the board yet) until the guard passes it: the widest width
+/// from its own down to aMin (5 µm steps) clear of other nets' copper and keep-outs.  aWith: copper
+/// of the same call (its via).  False, aTrack unchanged, when even aMin does not pass
+bool neckToFit( BOARD* aBoard, PCB_TRACK* aTrack, const std::vector<BOARD_CONNECTED_ITEM*>& aWith, bool aZonesYield,
+                int aMin )
+{
+    const int step = pcbIUScale.mmToIU( 0.005 );
+    const int was = aTrack->GetWidth();
+
+    auto passes = [&]( int aWidth )
+    {
+        aTrack->SetWidth( aWidth );
+        return guard( aBoard, { aTrack }, {}, aZonesYield, &aWith ).empty();
+    };
+
+    if( aMin <= 0 || aMin > was || !passes( aMin ) )
+    {
+        aTrack->SetWidth( was );
+        return false;
+    }
+
+    int lo = aMin, hi = was;   // lo passes; hi is the width asked for
+
+    if( passes( hi ) )
+        return true;
+
+    while( hi - lo > step )
+    {
+        const int mid = lo + ( hi - lo ) / 2;
+
+        if( passes( mid ) )
+            lo = mid;
+        else
+            hi = mid;
+    }
+
+    aTrack->SetWidth( lo / step * step >= aMin ? lo / step * step : lo );
+    return true;
+}
+
+
 /// @brief A pad by REF.PAD.  Several pads can share a number (SOT-223: pin 2 and the tab): aNot excludes
 /// one (the route's start), and the nearest to aNear wins.
 std::optional<PAD*> findPad( BOARD* aBoard, const std::string& aRefPad, PAD* aNot = nullptr, PAD* aNear = nullptr )
@@ -2028,6 +2156,9 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
 
     BOARD* board = context->GetBoard();
 
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     // a spot: [x_mm, y_mm] or {at: [x_mm, y_mm], layer}
     auto spotOf = [&]( const nlohmann::json& aSpot, VECTOR2I& aAt, std::optional<PCB_LAYER_ID>& aLayer ) -> std::string
     {
@@ -2774,6 +2905,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return *busy;
 
     BOARD* board = context->GetBoard();
+
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     const auto started = std::chrono::steady_clock::now();
     ROUTE_PROFILE              profile;
     ROUTE_PROFILES::BIND       bindProfile( board, profile );
@@ -6901,6 +7036,10 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         return KopenapiNoBoard();
 
     BOARD*        board = context->GetBoard();
+
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     const wxString netName = wxString::FromUTF8( aArgs.value( "net", std::string( "GND" ) ) );
     NETINFO_ITEM* net = KopenapiFindNet( board, aArgs.value( "net", std::string( "GND" ) ) );
 
@@ -6991,6 +7130,25 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     nlohmann::json    placed = nlohmann::json::array();
     std::set<BOARD_CONNECTED_ITEM*> done;
     int               offPlaneSkipped = 0;
+    int               neckedStubs = 0;
+
+    // a pad of the net centred at aAt (where an island's stub starts)
+    auto padAt = [&]( const VECTOR2I& aAt ) -> PAD*
+    {
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            if( !fp->GetBoundingBox().Contains( aAt ) )
+                continue;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( pad->GetNetCode() == net->GetNetCode() && pad->GetPosition() == aAt )
+                    return pad;
+            }
+        }
+
+        return nullptr;
+    };
 
     // Passes: place, refill, then take out the vias the fill does not reach (a plane island too small
     // to keep, a knockout); their pads are tried again at other spots
@@ -7312,6 +7470,8 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                     via->SetNet( net );
 
                     std::unique_ptr<PCB_TRACK> track;
+                    PAD*                       stubPad = nullptr;
+                    STUB_NECK                  neck{ width, std::string() };
 
                     // a pad, or the end of a track that joins pads into an island without the plane
                     if( item->Type() == PCB_PAD_T || onTrack )
@@ -7320,9 +7480,13 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                         auto from = stubFrom.find( { at.x, at.y } );
                         track->SetStart( from == stubFrom.end() ? pos : from->second );
                         track->SetEnd( at );
-                        track->SetWidth( width );
                         track->SetLayer( layer );
                         track->SetNet( net );
+
+                        // the pad the stub leaves: necked as the router does at fine-pitch pads
+                        stubPad = item->Type() == PCB_PAD_T ? static_cast<PAD*>( item ) : padAt( track->GetStart() );
+                        neck = padNeck( board, stubPad, width, layer );
+                        track->SetWidth( neck.width );
                     }
 
                     std::vector<BOARD_CONNECTED_ITEM*> fresh = { via.get() };
@@ -7331,7 +7495,28 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                         fresh.push_back( track.get() );
 
                     if( !guard( board, fresh, {}, true ).empty() )
-                        continue;
+                    {
+                        // the stub may still fit narrower: the via alone has to pass first
+                        std::vector<BOARD_CONNECTED_ITEM*> viaOnly = { via.get() };
+                        const int                          before = track ? track->GetWidth() : 0;
+
+                        if( !track || !stubPad || !guard( board, viaOnly, {}, true, nullptr ).empty()
+                            || !neckToFit( board, track.get(), viaOnly, true,
+                                           stubMinWidth( board, stubPad, net->GetNetCode(), layer ) )
+                            || !guard( board, fresh, {}, true ).empty() )
+                        {
+                            continue;
+                        }
+
+                        if( track->GetWidth() < before )
+                        {
+                            neck.why += std::string( neck.why.empty() ? "" : "; " ) + "clearance to the copper next to "
+                                        + str( stubPad->GetParentFootprint()->GetReference() ) + "."
+                                        + str( stubPad->GetNumber() );
+                        }
+                    }
+
+                    const int stubWidth = track ? track->GetWidth() : 0;
 
                     BOARD_COMMIT commit( context->GetToolManager() );
                     const bool   hasTrack = !!track;
@@ -7350,6 +7535,14 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                     placed.push_back( { { "via", str( fresh_vias.back().via.AsString() ) },
                                         { "at_mm", { toMm( at.x ), toMm( at.y ) } },
                                         { "for", stitchedFor( item ) } } );
+
+                    if( hasTrack && stubWidth < width )
+                    {
+                        placed.back()["stub_width_mm"] = toMm( stubWidth );
+                        placed.back()["necked_from_mm"] = toMm( width );
+                        placed.back()["necked_why"] = neck.why;
+                        neckedStubs++;
+                    }
                     done.insert( item );
                     ok = true;
                 }
@@ -7483,6 +7676,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     nlohmann::json answer = { { "net", str( netName ) },
                                   { "vias", placed },
+                                  { "necked_stubs", neckedStubs },
                                   { "dangling_vias_removed", danglingRemoved },
                                   { "not_reached", [&]()
                                     {
@@ -7540,6 +7734,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     const KOPENAPI_LIST_CAP cap( aArgs );
     nlohmann::json          out = { { "net", answer["net"] },
                                     { "vias_added", answer["vias"].size() },
+                                    { "necked_stubs", neckedStubs },
                                     { "dangling_vias_removed", danglingRemoved },
                                     { "not_reached_count", answer["not_reached"].size() },
                                     { "islands_left_count", answer["islands_left"].size() },
@@ -8377,6 +8572,9 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     BOARD* board = context->GetBoard();
 
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     // the path: a pad, points, a pad; a point may carry "via": the layer the track continues on
     struct STEP
     {
@@ -8504,6 +8702,18 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     double                                  length = 0;
     int                                     vias = 0;
     nlohmann::json                          segments = nlohmann::json::array();
+    const bool                              widthGiven = aArgs.contains( "width_mm" );
+
+    // stubs at the end pads: necked as the router does (fine-pitch pads), then to what the
+    // clearances leave (unless width_mm says)
+    struct PAD_STUB
+    {
+        PCB_TRACK*  track;
+        PAD*        pad;
+        std::string why;
+    };
+
+    std::vector<PAD_STUB> padStubs;
 
     auto dropVia = [&]( const VECTOR2I& aAt )
     {
@@ -8542,9 +8752,18 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             track->SetLayer( layer );
             track->SetNet( net );
             length += track->GetLength();
-            segments.push_back( { { "from", { toMm( track->GetStart().x ), toMm( track->GetStart().y ) } },
-                                  { "to", { toMm( track->GetEnd().x ), toMm( track->GetEnd().y ) } },
-                                  { "layer", str( board->GetLayerName( layer ) ) }, { "width_mm", toMm( width ) } } );
+
+            PAD* endPad = i == 1 && fromPad && !steps[0].via ? fromPad
+                          : i + 1 == steps.size() && toPad   ? toPad
+                                                             : nullptr;
+
+            if( endPad && !widthGiven )
+            {
+                const STUB_NECK neck = padNeck( board, endPad, width, layer );
+                track->SetWidth( neck.width );
+                padStubs.push_back( { track.get(), endPad, neck.why } );
+            }
+
             changed.push_back( track.get() );
             made.push_back( std::move( track ) );
         }
@@ -8563,16 +8782,77 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return KOPENAPI_RESULT::Error( 422, "the track arrives on " + str( board->GetLayerName( layer ) ) + ", 'to' pad is not on it "
                                                     "(add a point with via before it)" );
 
-    nlohmann::json out = { { "net", str( UnescapeString( net->GetNetname() ) ) }, { "segments", segments },
-                           { "length_mm", toMm( length ) }, { "vias", vias }, { "width_mm", toMm( width ) },
-                           { "applied", false } };
-
     const std::string zoneMode = aArgs.value( "zones", std::string( "refill" ) );
 
     if( zoneMode != "refill" && zoneMode != "keep" )
         return KOPENAPI_RESULT::Error( 400, "zones: refill (pour fills give way, refilled after) or keep" );
 
-    const nlohmann::json violations = guard( board, changed, {}, zoneMode == "refill" );
+    nlohmann::json violations = guard( board, changed, {}, zoneMode == "refill" );
+
+    // a pad stub too wide for the clearances there narrows to the widest that keeps them
+    if( !violations.empty() && !padStubs.empty() )
+    {
+        for( PAD_STUB& stub : padStubs )
+        {
+            std::vector<BOARD_CONNECTED_ITEM*> rest;
+
+            for( BOARD_CONNECTED_ITEM* item : changed )
+            {
+                if( item != stub.track )
+                    rest.push_back( item );
+            }
+
+            const int before = stub.track->GetWidth();
+
+            if( !guard( board, { stub.track }, {}, zoneMode == "refill", &rest ).empty()
+                && neckToFit( board, stub.track, rest, zoneMode == "refill",
+                              stubMinWidth( board, stub.pad, net->GetNetCode(), stub.track->GetLayer() ) )
+                && stub.track->GetWidth() < before )
+            {
+                stub.why += std::string( stub.why.empty() ? "" : "; " ) + "clearance to the copper next to "
+                            + str( stub.pad->GetParentFootprint()->GetReference() ) + "." + str( stub.pad->GetNumber() );
+            }
+        }
+
+        violations = guard( board, changed, {}, zoneMode == "refill" );
+    }
+
+    nlohmann::json necked = nlohmann::json::array();
+
+    for( const std::unique_ptr<PCB_TRACK>& item : made )
+    {
+        if( item->Type() != PCB_TRACE_T )
+            continue;
+
+        segments.push_back( { { "from", { toMm( item->GetStart().x ), toMm( item->GetStart().y ) } },
+                              { "to", { toMm( item->GetEnd().x ), toMm( item->GetEnd().y ) } },
+                              { "layer", str( board->GetLayerName( item->GetLayer() ) ) },
+                              { "width_mm", toMm( item->GetWidth() ) } } );
+
+        for( const PAD_STUB& stub : padStubs )
+        {
+            if( stub.track == item.get() && item->GetWidth() < width )
+            {
+                segments.back()["necked_from_mm"] = toMm( width );
+                necked.push_back( { { "pad", str( stub.pad->GetParentFootprint()->GetReference() ) + "."
+                                                     + str( stub.pad->GetNumber() ) },
+                                    { "width_mm", toMm( item->GetWidth() ) },
+                                    { "necked_from_mm", toMm( width ) },
+                                    { "why", stub.why } } );
+            }
+        }
+    }
+
+    nlohmann::json out = { { "net", str( UnescapeString( net->GetNetname() ) ) }, { "segments", segments },
+                           { "length_mm", toMm( length ) }, { "vias", vias }, { "width_mm", toMm( width ) },
+                           { "applied", false } };
+
+    if( !necked.empty() )
+    {
+        out["necked"] = necked;
+        out["note"] = "the stub at the pad is narrower than the net class width (" + std::to_string( toMm( width ) ).substr( 0, 5 )
+                      + " mm): see necked";
+    }
 
     if( !violations.empty() )
     {
@@ -9445,6 +9725,10 @@ static KOPENAPI_RESULT h_pcb_fanout( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         return KopenapiNoBoard();
 
     BOARD*         board = context->GetBoard();
+
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     const wxString ref = wxString::FromUTF8( aArgs.value( "ref", std::string() ) );
     FOOTPRINT*     fp = nullptr;
 
@@ -9963,6 +10247,8 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "Stitch a net (default GND) to its pours and planes: every open end on one side only (SMD "
                    "pad, zone island, the track end of pads joined by tracks) gets a through via at a free spot "
                    "next to it (with a short track from a pad or track end), guarded against touching other nets (other nets' fills give way: they are refilled), "
+                   "the stub necked as the router does at a fine-pitch pad (no wider than the pad's narrow side) and further "
+                   "to what the clearances there leave (a via row's stub_width_mm / necked_from_mm / necked_why; necked_stubs counts them), "
                    "inside the board; after the refill a via the fill does not reach is taken out and its pad "
                    "tried at another spot (up to 3 passes); unlocked vias of the net left touching one layer "
                    "only are removed. On inner planes stitch before routing the signals (the spots next to the "
@@ -10035,7 +10321,8 @@ KOPENAPI_REGISTER( "pcb_tracks_cleanup",
 KOPENAPI_REGISTER( "pcb_track_add",
                    "Lay a track by hand along given points (no router): from a pad and / or to a pad (their "
                    "centres) through points in mm; a point with via continues on that layer through a via. "
-                   "Width and via size from the net's class unless width_mm is given. The same guard as the "
+                   "Width and via size from the net's class unless width_mm is given; without width_mm the "
+                   "segments at the from / to pads are necked as in pcb_via_add (answer necked). The same guard as the "
                    "router: copper that would touch another net or enter a keep-out is refused (422 with the "
                    "violations), nothing is added then. One undo step; dry_run checks only",
                    R"json({"type":"object","properties":{
@@ -10052,7 +10339,11 @@ KOPENAPI_REGISTER( "pcb_track_add",
 
 KOPENAPI_REGISTER( "pcb_via_add",
                    "Add a via: alone on a net at a point, or with a short track from a pad (from: REF.PAD); "
-                   "size from the net class unless diameter_mm / drill_mm; the router's guard applies (422 with "
+                   "size from the net class unless diameter_mm / drill_mm; the track at the class width unless "
+                   "width_mm, necked at a fine-pitch pad as the router does (no wider than the pad's narrow side, "
+                   "a custom track_width rule there sets it lower) and further to what the clearances to the "
+                   "neighbouring copper leave (not below the board / rule minimum): the answer's necked [{pad, "
+                   "width_mm, necked_from_mm, why}] and note say so; the router's guard applies (422 with "
                    "the violations); pour fills of other nets give way and are refilled (zones: keep to clear "
                    "them); one undo step; dry_run checks only",
                    R"json({"type":"object","required":["at_mm"],"properties":{

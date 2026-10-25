@@ -56,6 +56,24 @@ class EDA_ITEM;
 /// a recolour only, the cached geometry stays
 void KopenapiPcbBrighten( PCB_BASE_FRAME* aFrame, EDA_ITEM* aItem, bool aOn );
 
+/// @brief The board's custom design rules as the file on disk is now: the DRC engine is set up
+/// again when the .kicad_dru changed (written, added, removed) since this board's rules were last
+/// read here, as KiCad's DRC dialog re-reads it on every run.  Returns false with aError when the
+/// changed file does not compile (the engine keeps the rules it had).
+bool KopenapiDesignRulesFromDisk( BOARD* aBoard, std::string* aError = nullptr );
+
+/// @brief Headless: the board's unsaved flag as it was before this scope (for work that is not an
+/// edit but makes KiCad report net settings changed, as setting the DRC engine up does)
+class KOPENAPI_KEEP_UNSAVED
+{
+public:
+    KOPENAPI_KEEP_UNSAVED();
+    ~KOPENAPI_KEEP_UNSAVED();
+
+private:
+    bool m_unsaved;
+};
+
 class FOOTPRINT_LIBRARY_ADAPTER;
 
 /// @brief The project's footprint libraries, loaded (waits for a load in progress).  Footprints

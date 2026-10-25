@@ -141,6 +141,15 @@ void InstallTerminationHandler(void (*handler)())
 #endif
 }
 
+void InstallStopRequestHandler(void (*handler)())
+{
+#if defined(_WIN32)
+    InstallStopRequestHandlerWindows(handler);
+#else
+    InstallStopRequestHandlerPosix(handler);
+#endif
+}
+
 PipeProcess SpawnWithStdinPipe(const std::vector<std::string>& argv, const fs::path& logFile, std::string& error)
 {
     if (argv.empty())

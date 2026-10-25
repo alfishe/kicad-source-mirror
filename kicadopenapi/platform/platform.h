@@ -54,6 +54,12 @@ void ConfigureListenSocket(std::uintptr_t socket);
 /// Ctrl-C; the process then exits. Also makes writes to a closed pipe non-fatal.
 void InstallTerminationHandler(void (*handler)());
 
+/// @brief Calls handler (must be async-signal-safe) on SIGINT/SIGTERM/SIGHUP, or on Ctrl-C /
+/// Ctrl-Break / console close / logoff / shutdown on Windows, and lets the process go on so its
+/// host stops cleanly. Windows: on close / logoff / shutdown the handler's thread then waits, since
+/// the OS ends the process as soon as it returns (or after its own timeout)
+void InstallStopRequestHandler(void (*handler)());
+
 /// @brief A child process fed through its stdin (e.g. a video encoder)
 struct PipeProcess
 {

@@ -441,12 +441,44 @@ private:
 };
 
 
+/// "Uuid" on A/B (no KiCad property): the item's uuid as text, so == / != take wildcards ('1f2e*')
+class UUID_REF : public LIBEVAL::VAR_REF
+{
+public:
+    explicit UUID_REF( std::unique_ptr<LIBEVAL::VAR_REF> aItem ) :
+            m_item( std::move( aItem ) )
+    {}
+
+    LIBEVAL::VAR_TYPE_T GetType() const override { return LIBEVAL::VT_STRING; }
+
+    LIBEVAL::VALUE* GetValue( LIBEVAL::CONTEXT* aCtx ) override
+    {
+        if( PCBEXPR_VAR_REF* ref = dynamic_cast<PCBEXPR_VAR_REF*>( m_item.get() ) )
+        {
+            if( BOARD_ITEM* item = ref->GetObject( aCtx ) )
+                return new LIBEVAL::VALUE( item->m_Uuid.AsString() );
+        }
+
+        return new LIBEVAL::VALUE();
+    }
+
+private:
+    std::unique_ptr<LIBEVAL::VAR_REF> m_item;
+};
+
+
 /// KiCad's DRC bindings plus the query functions; KiCad's own UCODE is final, so it is composed
 class KOPENAPI_QUERY_UCODE : public LIBEVAL::UCODE
 {
 public:
     std::unique_ptr<LIBEVAL::VAR_REF> CreateVarRef( const wxString& aVar, const wxString& aField ) override
     {
+        if( ( aVar == wxS( "A" ) || aVar == wxS( "B" ) ) && aField.CmpNoCase( wxS( "Uuid" ) ) == 0 )
+        {
+            if( std::unique_ptr<LIBEVAL::VAR_REF> item = m_pcb.CreateVarRef( aVar, wxEmptyString ) )
+                return std::make_unique<UUID_REF>( std::move( item ) );
+        }
+
         std::unique_ptr<LIBEVAL::VAR_REF> ref = m_pcb.CreateVarRef( aVar, aField );
 
         if( ref && ( aVar == wxS( "A" ) || aVar == wxS( "B" ) ) && aField.CmpNoCase( wxS( "Layer" ) ) == 0 )
@@ -514,7 +546,7 @@ size_t editDistance( const std::string& a, const std::string& b )
 std::vector<std::string> knownNames()
 {
     static std::vector<std::string> names = [] {
-        std::set<std::string> set;
+        std::set<std::string> set = { "Uuid" };
         PROPERTY_MANAGER&     propMgr = PROPERTY_MANAGER::Instance();
 
         for( TYPE_ID type : { TYPE_HASH( FOOTPRINT ), TYPE_HASH( PAD ), TYPE_HASH( PCB_TRACK ), TYPE_HASH( PCB_ARC ),

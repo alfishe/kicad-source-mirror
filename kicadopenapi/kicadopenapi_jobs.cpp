@@ -336,6 +336,9 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
         {
             record( *g_call, aPhase, aDone, aTotal, aItem, aCounts );
 
+            if( g_call->cancel )
+                return false;
+
             if( CLOCK::now() - g_callServed < std::chrono::milliseconds( 30 ) )
                 return true;
 
@@ -452,11 +455,10 @@ bool KopenapiJobProgress( const std::string& aPhase, int aDone, int aTotal, cons
 
         record( *job, aPhase, aDone, aTotal, aItem, aCounts );
 
+        cancelled = job->cancel;
+
         if( g_current )
-        {
-            cancelled = g_current->cancel;
             title = jobTitle( *g_current, aPhase, aDone, aTotal );
-        }
     }
 
     g_changed.notify_all();
@@ -551,7 +553,31 @@ nlohmann::json KopenapiRunningProgress()
 bool KopenapiJobCancelled()
 {
     std::lock_guard<std::mutex> lock( g_mutex );
-    return g_current && g_current->cancel;
+    return ( g_current && g_current->cancel ) || ( g_call && g_call->cancel );
+}
+
+
+void KopenapiStopAll( const std::string& aWhy )
+{
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+
+        for( auto& [seq, job] : g_jobs )
+        {
+            if( !job->Finished() && !job->cancel.exchange( true ) )
+            {
+                job->stopReason = aWhy;
+                job->rev++;
+                wxLogMessage( "api job %s (%s): stopping: %s", job->Id(), job->method, aWhy );
+            }
+        }
+
+        if( g_call )
+            g_call->cancel = true;
+    }
+
+    g_changed.notify_all();
+    KopenapiEventNotify( "job" );
 }
 
 

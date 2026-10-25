@@ -21,6 +21,7 @@ long SpawnDetachedPosix(const std::vector<std::string>& argv, const std::filesys
 void KillProcessPosix(long pid);
 void ConfigureListenSocketPosix(std::uintptr_t socket);
 void InstallTerminationHandlerPosix(void (*handler)());
+void InstallStopRequestHandlerPosix(void (*handler)());
 struct PipeProcess;
 PipeProcess SpawnWithStdinPipePosix(const std::vector<std::string>& argv, const std::filesystem::path& logFile,
                                     std::string& error);

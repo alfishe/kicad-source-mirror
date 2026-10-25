@@ -22,6 +22,7 @@ long SpawnDetachedWindows(const std::vector<std::string>& argv, const std::files
 void KillProcessWindows(long pid);
 void ConfigureListenSocketWindows(std::uintptr_t socket);
 void InstallTerminationHandlerWindows(void (*handler)());
+void InstallStopRequestHandlerWindows(void (*handler)());
 struct PipeProcess;
 PipeProcess SpawnWithStdinPipeWindows(const std::vector<std::string>& argv, const std::filesystem::path& logFile,
                                       std::string& error);

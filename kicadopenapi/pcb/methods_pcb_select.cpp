@@ -29,37 +29,55 @@ static KOPENAPI_RESULT h_pcb_select( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     if( aArgs.value( "clear", true ) )
         tool->ClearSelection();
 
-    int selected = 0;
+    int            selected = 0;
+    nlohmann::json unmatched = nlohmann::json::array();
 
     for( const nlohmann::json& r : aArgs.value( "refs", nlohmann::json::array() ) )
     {
-        if( FOOTPRINT* fp = board->FindFootprintByReference( wxString::FromUTF8( r.get<std::string>() ) ) )
+        FOOTPRINT* fp = r.is_string() ? board->FindFootprintByReference( wxString::FromUTF8( r.get<std::string>() ) )
+                                      : nullptr;
+
+        if( fp )
         {
             tool->AddItemToSel( fp );
             ++selected;
+        }
+        else
+        {
+            unmatched.push_back( { { "ref", r }, { "error", "no footprint with this reference" } } );
         }
     }
 
     for( const nlohmann::json& u : aArgs.value( "uuids", nlohmann::json::array() ) )
     {
-        std::string error;
+        std::string error = "not a string";
 
         if( BOARD_ITEM* item = u.is_string() ? KopenapiResolveUuid( board, u.get<std::string>(), error ) : nullptr )
         {
             tool->AddItemToSel( item );
             ++selected;
         }
+        else
+        {
+            unmatched.push_back( { { "uuid", u }, { "error", error } } );
+        }
     }
 
     frame->GetCanvas()->Refresh();
-    return KOPENAPI_RESULT::Ok( { { "selected", selected } } );
+    nlohmann::json out = { { "selected", selected } };
+
+    if( !unmatched.empty() )
+        out["unmatched"] = unmatched;
+
+    return KOPENAPI_RESULT::Ok( out );
 }
 
 
 KOPENAPI_REGISTER( "pcb_select",
                    "Select items in the board editor as a user would (footprints by reference, any item by "
-                   "uuid) - for screenshots, recordings and checks; clear (default) replaces the selection, "
-                   "no arguments clears it; GUI only",
+                   "uuid or uuid prefix, as pcb_query's uuid) - for screenshots, recordings and checks; clear "
+                   "(default) replaces the selection, no arguments clears it; refs / uuids not found are listed in "
+                   "unmatched with the reason; GUI only",
                    R"json({"type":"object","properties":{
                         "refs":{"type":"array","items":{"type":"string"}},
                         "uuids":{"type":"array","items":{"type":"string"}},

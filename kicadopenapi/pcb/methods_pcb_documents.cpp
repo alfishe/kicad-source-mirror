@@ -44,6 +44,19 @@
 static std::shared_ptr<HEADLESS_PCB_CONTEXT> s_headless;
 
 
+KOPENAPI_KEEP_UNSAVED::KOPENAPI_KEEP_UNSAVED() :
+        m_unsaved( s_headless && s_headless->IsContentModified() )
+{
+}
+
+
+KOPENAPI_KEEP_UNSAVED::~KOPENAPI_KEEP_UNSAVED()
+{
+    if( s_headless )
+        s_headless->SetContentModified( m_unsaved );
+}
+
+
 static PCB_EDIT_FRAME* guiFrame( KOPENAPI_CONTEXT& aCtx, bool aCreate )
 {
     if( aCtx.headless || !aCtx.kiway )
