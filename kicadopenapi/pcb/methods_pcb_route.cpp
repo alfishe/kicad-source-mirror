@@ -3592,14 +3592,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         struct TIMED
         {
             JOB&                                  job;
-            long                                  outer = profile.job;
+            ROUTE_PROFILE&                        prof;
+            long                                  outer = prof.job;
             std::chrono::steady_clock::time_point from = std::chrono::steady_clock::now();
             ~TIMED()
             {
                 job.ms += msSince( from );
-                profile.job = outer;
+                prof.job = outer;
             }
-        } timed{ aJob };
+        } timed{ aJob, profile };
 
         profile.job = &aJob - jobs.data();
 
