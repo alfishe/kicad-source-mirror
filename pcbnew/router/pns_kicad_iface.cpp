@@ -299,6 +299,10 @@ public:
     const SHAPE_LINE_CHAIN& HullCache( const PNS::ITEM* aItem, int aClearance,
                                        int aWalkaroundThickness, int aLayer ) override;
 
+    /// @brief Clearances looked up past the caches, and the rule evaluations they took
+    int64_t ClearanceLookups() const { return m_clearanceLookups; }
+    int64_t RuleEvaluations() const { return m_ruleEvaluations; }
+
 private:
     BOARD_ITEM* getBoardItem( const PNS::ITEM* aItem, PCB_LAYER_ID aBoardLayer, int aIdx = 0 );
 
@@ -316,6 +320,9 @@ private:
 
     // Cached for the routing session: the board's biggest clearance, how far a rule can reach
     std::optional<int> m_biggestClearance;
+
+    int64_t m_clearanceLookups = 0;
+    int64_t m_ruleEvaluations = 0;
 
     std::unordered_map<CLEARANCE_CACHE_KEY, int> m_clearanceCache;
     std::unordered_map<TEMP_CLEARANCE_CACHE_KEY, int>    m_tempClearanceCache;
@@ -655,37 +662,46 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
             useReach = true;
         }
 
-        for( int pass = 0; pass < 2; pass++ )
+        auto evaluate = [&]( const VECTOR2I& aStart, const VECTOR2I& aEnd ) -> bool
         {
-            bool evaluated = false;
+            dummyTrack.SetStart( aStart );
+            dummyTrack.SetEnd( aEnd );
 
-            for( int i = 0; i < chain.SegmentCount(); i++ )
+            m_ruleEvaluations++;
+
+            DRC_CONSTRAINT segConstraint = aLineIsFirst
+                ? drcEngine->EvalRules( hostType, &dummyTrack, aOpposingItem, board_layer )
+                : drcEngine->EvalRules( hostType, aOpposingItem, &dummyTrack, board_layer );
+
+            return pickSmallerConstraint( bestConstraint, segConstraint );
+        };
+
+        bool evaluated = false;
+
+        for( int i = 0; i < chain.SegmentCount(); i++ )
+        {
+            if( useReach )
             {
-                if( useReach )
-                {
-                    BOX2I segBox( chain.CPoint( i ), VECTOR2I( 0, 0 ) );
-                    segBox.Merge( chain.CPoint( i + 1 ) );
+                BOX2I segBox( chain.CPoint( i ), VECTOR2I( 0, 0 ) );
+                segBox.Merge( chain.CPoint( i + 1 ) );
 
-                    if( !segBox.Intersects( reach ) )
-                        continue;
-                }
-
-                dummyTrack.SetStart( chain.CPoint( i ) );
-                dummyTrack.SetEnd( chain.CPoint( i + 1 ) );
-                evaluated = true;
-
-                DRC_CONSTRAINT segConstraint = aLineIsFirst
-                    ? drcEngine->EvalRules( hostType, &dummyTrack, aOpposingItem, board_layer )
-                    : drcEngine->EvalRules( hostType, aOpposingItem, &dummyTrack, board_layer );
-
-                if( pickSmallerConstraint( bestConstraint, segConstraint ) )
-                    break;
+                if( !segBox.Intersects( reach ) )
+                    continue;
             }
 
-            if( evaluated || !useReach )
-                break;
+            evaluated = true;
 
-            useReach = false;   // nothing within reach: the line as a whole
+            if( evaluate( chain.CPoint( i ), chain.CPoint( i + 1 ) ) )
+                break;
+        }
+
+        // Nothing of the line within reach yet: a walkaround builds the item's hull from this value
+        // and brings the line to it, so the line is probed where it will pass, at the item (one
+        // evaluation instead of one per segment of a line that may have hundreds)
+        if( !evaluated && useReach )
+        {
+            const VECTOR2I at = aOpposingItem->GetBoundingBox().Centre();
+            evaluate( at, at );
         }
 
         return bestConstraint;
@@ -769,6 +785,8 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
                     dummyB.SetStart( ptB1 );
                     dummyB.SetEnd( ptB2 );
 
+                    m_ruleEvaluations++;
+
                     DRC_CONSTRAINT segConstraint =
                             drcEngine->EvalRules( hostType, &dummyA, &dummyB, board_layer );
 
@@ -799,7 +817,10 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
             parentB = getBoardItem( aItemB, board_layer, 1 );
 
         if( parentA )
+        {
+            m_ruleEvaluations++;
             hostConstraint = drcEngine->EvalRules( hostType, parentA, parentB, board_layer );
+        }
     }
 
     if( hostConstraint.IsNull() )
@@ -933,6 +954,8 @@ int PNS_PCBNEW_RULE_RESOLVER::Clearance( const PNS::ITEM* aA, const PNS::ITEM* a
         if( it != m_tempClearanceCache.end() )
             return it->second;
     }
+
+    m_clearanceLookups++;
 
     PNS::CONSTRAINT constraint;
     int             rv = 0;
@@ -3122,6 +3145,18 @@ PNS::NET_HANDLE PNS_KICAD_IFACE_BASE::GetOrphanedNetHandle()
 PNS::RULE_RESOLVER* PNS_KICAD_IFACE_BASE::GetRuleResolver()
 {
     return m_ruleResolver;
+}
+
+
+int64_t PNS_KICAD_IFACE_BASE::ClearanceLookups() const
+{
+    return m_ruleResolver ? m_ruleResolver->ClearanceLookups() : 0;
+}
+
+
+int64_t PNS_KICAD_IFACE_BASE::RuleEvaluations() const
+{
+    return m_ruleResolver ? m_ruleResolver->RuleEvaluations() : 0;
 }
 
 

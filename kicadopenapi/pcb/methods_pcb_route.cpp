@@ -731,6 +731,13 @@ struct ROUTE_PROFILE
     double syncMs = 0;    ///< the router's world built from the board
     double moveMs = 0;    ///< the router's path search (every Move of the head)
     double totalMs = 0;   ///< whole attempts (world, routing, guard, commit)
+    int    triesStopped = 0;   ///< router tries ended inside the router (job_cancel, the connection's budget)
+    int64_t clearanceLookups = 0;   ///< the router's clearances looked up past its caches
+    int64_t ruleEvaluations = 0;    ///< ... and the design rule evaluations they took
+
+    /// @brief Asked inside a router try, between its walkaround / shove steps: true ends the try as
+    /// failed (job_cancel, the connection's rip_up_budget_s); unset: job_cancel
+    std::function<bool()> stop;
 
     struct TALLY
     {
@@ -1094,17 +1101,30 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     PNS_LAYER_RANGE                         targetLayers;
     bool                                    reached = false;
     bool                                    fixed = false;
+    bool                                    stopped = false;
 
     auto search = [&]() -> std::optional<bool>
     {
         settings.SetMode( aReq.mode );
 
         // The same result on every run: the router's wall-clock limits (made for a hand on the mouse) are
-        // lifted for the call, its iteration limits bound the work (a shove through a dense row can take
-        // 50 ms an iteration: the editor's 250 would run past any clock)
+        // lifted for the call, its iteration and work limits bound the work (a shove through a dense row
+        // can take 50 ms an iteration: the editor's 250 would run past any clock; the largest walkaround
+        // cluster seen, 5800 items around a 600-point line, is 22M work)
         settings.SetShoveTimeLimit( 60000 );
         settings.SetShoveIterationLimit( 100 );
-        settings.SetClusterTimeout( 10000 );
+        settings.SetClusterTimeout( 60000 );
+        settings.SetClusterWorkLimit( 100'000'000 );
+
+        // a cancel or the connection's budget ends the try inside the router, not after it
+        settings.SetStopCheck(
+                [&]()
+                {
+                    if( !stopped && ( profile.stop ? profile.stop() : KopenapiJobCancelled() ) )
+                        stopped = true;
+
+                    return stopped;
+                } );
 
         // our router is current on this thread only: the editor's router stays current for the editor
         PNS::ROUTER::THREAD_SCOPE routerScope;
@@ -1211,6 +1231,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
 
         auto move = [&]( const VECTOR2I& aAt, PNS::ITEM* aItem )
         {
+            if( settings.StopRequested() )
+                return;
+
             const auto from = std::chrono::steady_clock::now();
             router->Move( aAt, aItem );
             profile.moveMs += msSince( from );
@@ -1377,7 +1400,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         // editor's Finish requires too
         // (the pair's placer answers the cursor as its end: it finishes only when it snapped onto the
         // target pads, which FixRoute tells)
-        reached = aReq.diffPair || ( placer->CurrentEnd() == target && targetLayers.Overlaps( router->GetCurrentLayer() ) );
+        reached = !stopped && ( aReq.diffPair || ( placer->CurrentEnd() == target && targetLayers.Overlaps( router->GetCurrentLayer() ) ) );
 
         if( reached && aReq.endViaLayer )
         {
@@ -1392,7 +1415,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
 
             move( target, nullptr );
             move( target, nullptr );
-            reached = placer->CurrentEnd() == target;
+            reached = !stopped && placer->CurrentEnd() == target;
         }
 
         // Fix the line in the router, then commit it to the board (as the router tool does); our
@@ -1405,6 +1428,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
 
     std::optional<bool> early;
     KopenapiCompute( [&]() { early = search(); } );
+
+    profile.clearanceLookups += iface->ClearanceLookups();
+    profile.ruleEvaluations += iface->RuleEvaluations();
 
     if( early )
         return *early;
@@ -1426,7 +1452,11 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
 
         iface->Staged().Revert();
         aOut["routed"] = false;
-        aOut["reason"] = aReq.diffPair ? "the pair did not reach the target pads"
+        if( stopped )
+            profile.triesStopped++;
+
+        aOut["reason"] = stopped       ? "stopped inside the router try (job_cancel or the connection's rip_up_budget_s)"
+                         : aReq.diffPair ? "the pair did not reach the target pads"
                          : reached     ? "the router could not fix the route"
                          : wrongLayer  ? "at the target but on another layer than its pad: a via is needed in front of it"
                                        : "blocked: the track stops before the target";
@@ -3033,6 +3063,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return KopenapiJobCancelled() || ( tryDeadline && std::chrono::steady_clock::now() > *tryDeadline );
     };
 
+    profile.stop = overTime;
+
     const std::string diffPairs = aArgs.value( "diff_pairs", std::string( "auto" ) );
 
     // neck_down: "auto" | "off", or per net {"VBUS": "off", "*": "auto"}
@@ -4135,12 +4167,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 break;
         }
 
-        if( !ok && aTries >= maxTries )
-            aAttempt["reason"] = "gave up after " + std::to_string( aTries ) + " tries (max_tries); last: "
-                                 + aAttempt.value( "reason", std::string( "-" ) );
-        else if( !ok && overTime() )
+        if( !ok && overTime() )
             aAttempt["reason"] = std::string( KopenapiJobCancelled() ? "stopped (job_cancel)" : "the connection's rip_up_budget_s ran out" )
                                  + " after " + std::to_string( aTries ) + " tries; last: " + aAttempt.value( "reason", std::string( "-" ) );
+        else if( !ok && aTries >= maxTries )
+            aAttempt["reason"] = "gave up after " + std::to_string( aTries ) + " tries (max_tries); last: "
+                                 + aAttempt.value( "reason", std::string( "-" ) );
 
         return ok;
     };
@@ -6977,6 +7009,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
                               { "profile", { { "attempts", profile.attempts },
                                              { "dead_legs_skipped", profile.deadLegsSkipped },
+                                             { "tries_stopped", profile.triesStopped },
+                                             { "clearance_lookups", profile.clearanceLookups },
+                                             { "rule_evaluations", profile.ruleEvaluations },
                                              { "via_spots_blocked", profile.viaSpotsBlocked },
                                              { "via_spots_off_board", profile.viaSpotsOffBoard },
                                              { "rip_ups_skipped", profile.ripUpsSkipped },
@@ -10243,13 +10278,15 @@ KOPENAPI_REGISTER( "pcb_route",
                    "job_cancel {apply: false} (or keep: true) leaves the board as the call found it, in whatever pass "
                    "it stops (applied: false; taken_back when copper already written, the grid's included, was "
                    "taken out again; the grid timeline stays to branch from); the retry / rip-up pass gives each "
-                   "connection rip_up_budget_s and a cancel stops it between router tries; "
+                   "connection rip_up_budget_s; a cancel or a spent budget stops a router try within its walkaround / shove "
+                   "steps (the row's reason says so; profile tries_stopped); "
                    "every route passes the net-merge guard; copper of this call that ends nowhere is removed "
                    "(stubs_removed); copper of nets outside the call that shove pushed aside is listed "
                    "(other_nets_moved: pieces and length before / after); a row still routed at the end is "
                    "joined by copper; per connection "
                    "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
-                   "profile (attempts; dead_legs_skipped / via_spots_blocked / rip_ups_skipped / rip_ups_walled: tries not made; "
+                   "profile (attempts; clearance_lookups / rule_evaluations: the router's clearances past its caches and the design "
+                   "rule evaluations they took; dead_legs_skipped / via_spots_blocked / rip_ups_skipped / rip_ups_walled: tries not made; "
                    "rip_ups_planned: rip-ups whose routes a plan chose; rip_ups_second: routes taken out that had no way back "
                    "and moved others in turn; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at); "

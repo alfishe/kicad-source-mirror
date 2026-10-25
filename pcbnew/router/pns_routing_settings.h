@@ -23,7 +23,9 @@
 #ifndef __PNS_ROUTING_SETTINGS
 #define __PNS_ROUTING_SETTINGS
 
+#include <cstdint>
 #include <cstdio>
+#include <functional>
 
 #include <settings/nested_settings.h>
 #include <geometry/direction45.h>
@@ -137,6 +139,16 @@ public:
     int ClusterTimeout() const;
     void SetClusterTimeout( int aMilliseconds ) { m_clusterTimeout = aMilliseconds; }
 
+    /// @brief Work limit of one walkaround cluster (path points times hull points walked, summed over
+    /// its items); 0 none.  Unlike ClusterTimeout() it gives the same result on every machine
+    int64_t ClusterWorkLimit() const { return m_clusterWorkLimit; }
+    void SetClusterWorkLimit( int64_t aWork ) { m_clusterWorkLimit = aWork; }
+
+    /// @brief Asked between the steps of the walkaround and shove loops: true ends the routing step
+    /// as failed (a caller's cancel or deadline); unset never stops
+    void SetStopCheck( std::function<bool()> aCheck ) { m_stopCheck = std::move( aCheck ); }
+    bool StopRequested() const { return m_stopCheck && m_stopCheck(); }
+
     int WalkaroundIterationLimit() const { return m_walkaroundIterationLimit; };
     TIME_LIMIT WalkaroundTimeLimit() const;
 
@@ -208,6 +220,9 @@ private:
     TIME_LIMIT m_shoveTimeLimit;
     TIME_LIMIT m_walkaroundTimeLimit;
     int        m_clusterTimeout = 0;
+    int64_t    m_clusterWorkLimit = 0;
+
+    std::function<bool()> m_stopCheck;
 };
 
 }

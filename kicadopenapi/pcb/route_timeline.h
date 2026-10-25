@@ -64,13 +64,17 @@ public:
     /// @brief Routed on from its parent_step over an edited board (pcb_route {warm}): the board it
     /// went on over (worldPrint); 0 the run's
     uint64_t               world = 0;
+    /// @brief Per net: the exits over that board (world set); empty the run's
+    std::vector<std::vector<GRID_EXIT>> exits;
 
-    /// @brief Ends found walled in by fixed copper: from the search before step `step`
+    /// @brief Ends found walled in by fixed copper (keepOut: and the chips' via keep-out): from the
+    /// search before step `step`
     struct DEAD
     {
         uint32_t step;
         int32_t  net;
         int32_t  end;
+        bool     keepOut = false;
     };
 
     std::vector<DEAD>      dead;
@@ -93,7 +97,7 @@ public:
     /// @brief After a net was taken: its copper now, deduplicated by content
     void Add( GRID_STEP aStep, const GRID_PATH* aPath );
 
-    void AddDead( int aNet, int aEnd );
+    void AddDead( int aNet, int aEnd, bool aKeepOut = false );
 
     /// @brief A branch's start: the parent's steps up to aStep (inclusive) with their paths, crowded
     /// places, keys and finished rounds
@@ -157,7 +161,11 @@ struct GRID_TIMELINE
     /// while live)
     int              DefaultLane() const;
 
-    GRID_NET_RESULT Geometry( const GRID_PATH& aPath ) const;
+    /// @brief Per net: its ends let out half a cell off (the run's board)
+    std::vector<std::vector<GRID_EXIT>> exits;
+
+    /// @brief A net's path as tracks and vias, its exits' copper included
+    GRID_NET_RESULT Geometry( const GRID_LANE& aLane, int aNet, const GRID_PATH& aPath ) const;
     size_t          Bytes() const;
 
     /// @brief The last round finished at a step of a lane (0: none yet)
@@ -173,6 +181,10 @@ struct GRID_TIMELINE
 private:
     mutable std::mutex m_lanesMutex;
 };
+
+/// @brief An exit's copper where the net's copper starts on its cell
+void GridAddExits( GRID_NET_RESULT& aOut, const std::vector<GRID_EXIT>& aExits,
+                   const std::vector<std::vector<uint32_t>>& aPaths );
 
 /// @brief Grid paths as tracks and vias: corners only where the direction changes
 GRID_NET_RESULT GridPathGeometry( const PLAN_GRID& aGrid, size_t aCells, const std::vector<PCB_LAYER_ID>& aLayers,

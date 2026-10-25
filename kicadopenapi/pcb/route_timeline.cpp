@@ -102,10 +102,10 @@ void GRID_LANE::Add( GRID_STEP aStep, const GRID_PATH* aPath )
 }
 
 
-void GRID_LANE::AddDead( int aNet, int aEnd )
+void GRID_LANE::AddDead( int aNet, int aEnd, bool aKeepOut )
 {
     std::lock_guard<std::recursive_mutex> lock( *m_mutex );
-    dead.push_back( { (uint32_t) steps.size(), aNet, aEnd } );
+    dead.push_back( { (uint32_t) steps.size(), aNet, aEnd, aKeepOut } );
 }
 
 
@@ -122,6 +122,7 @@ void GRID_LANE::ForkFrom( const GRID_LANE& aParent, size_t aStep )
     order = aParent.order;
     direction = aParent.direction;
     world = aParent.world;
+    exits = aParent.exits;
     steps.assign( aParent.steps.begin(), aParent.steps.begin() + (long) aStep + 1 );
 
     // ids are given in the order first seen: the prefix uses the first ones only
@@ -226,6 +227,9 @@ size_t GRID_LANE::Bytes() const
     for( const auto& c : conflictSets )
         b += c.capacity() * 4 + sizeof( c );
 
+    for( const auto& e : exits )
+        b += e.size() * ( sizeof( GRID_EXIT ) + 2 * sizeof( VECTOR2I ) ) + sizeof( e );
+
     return b + m_byHash.size() * 48;
 }
 
@@ -242,6 +246,7 @@ void GRID_LANE::Release()
     std::vector<std::vector<uint32_t>>().swap( conflictSets );
     std::vector<int>().swap( order );
     std::vector<int>().swap( direction );
+    std::vector<std::vector<GRID_EXIT>>().swap( exits );
     std::vector<uint32_t>().swap( m_table );
     std::vector<std::vector<uint32_t>>().swap( m_keys );
     std::unordered_map<uint64_t, std::vector<uint32_t>>().swap( m_byHash );
@@ -249,9 +254,38 @@ void GRID_LANE::Release()
 }
 
 
-GRID_NET_RESULT GRID_TIMELINE::Geometry( const GRID_PATH& aPath ) const
+GRID_NET_RESULT GRID_TIMELINE::Geometry( const GRID_LANE& aLane, int aNet, const GRID_PATH& aPath ) const
 {
-    return GridPathGeometry( grid, cells, layers, aPath.paths, aPath.reached );
+    GRID_NET_RESULT out = GridPathGeometry( grid, cells, layers, aPath.paths, aPath.reached );
+    const std::vector<std::vector<GRID_EXIT>>& byNet = aLane.world ? aLane.exits : exits;
+
+    if( aNet >= 0 && (size_t) aNet < byNet.size() )
+        GridAddExits( out, byNet[aNet], aPath.paths );
+
+    return out;
+}
+
+
+void GridAddExits( GRID_NET_RESULT& aOut, const std::vector<GRID_EXIT>& aExits,
+                   const std::vector<std::vector<uint32_t>>& aPaths )
+{
+    for( const GRID_EXIT& exit : aExits )
+    {
+        const bool used = std::any_of( aPaths.begin(), aPaths.end(),
+                                       [&]( const std::vector<uint32_t>& p )
+                                       {
+                                           return std::find( p.begin(), p.end(), exit.state ) != p.end();
+                                       } );
+
+        if( !used )
+            continue;
+
+        for( size_t k = 1; k < exit.track.points.size(); ++k )
+            aOut.length += ( exit.track.points[k] - exit.track.points[k - 1] ).EuclideanNorm();
+
+        aOut.tracks.push_back( exit.track );
+        aOut.halfCellExits.push_back( exit.end );
+    }
 }
 
 

@@ -158,12 +158,20 @@ bool WALKAROUND::singleStep()
         using namespace std::chrono;
         auto start_time = steady_clock::now();
 
-        int timeout_ms = Settings().ClusterTimeout();
+        const int     timeout_ms = Settings().ClusterTimeout();
+        const int64_t workLimit = Settings().ClusterWorkLimit();
+        int64_t       work = 0;
 
         PNS_DBG( Dbg(), BeginGroup, wxString::Format( "cluster-details [cw %d]", aCw?1:0 ), 1 );
 
         for( auto& clItem : aCluster.m_items )
         {
+            if( Settings().StopRequested() )
+            {
+                PNS_DBGN( Dbg(), EndGroup );
+                return false;
+            }
+
             // Check for wallclock timeout
             // Emprically, 100ms seems to be about where you're not going to find a valid path
             // if you haven't found it by then.  This allows the user to adjust their mouse position
@@ -200,6 +208,15 @@ bool WALKAROUND::singleStep()
             LINE tmp( aLine );
 
             aLine.Line().Simplify2();
+
+            work += (int64_t) aLine.PointCount() * hull.PointCount();
+
+            if( workLimit > 0 && work > workLimit )
+            {
+                PNS_DBG( Dbg(), Message, wxString::Format( "processCluster work limit %lld", (long long) workLimit ) );
+                PNS_DBGN( Dbg(), EndGroup );
+                return false;
+            }
 
             bool stat = aLine.Walkaround( hull, tmp.Line(), aCw );
 
@@ -358,6 +375,17 @@ const WALKAROUND::RESULT WALKAROUND::Route( const LINE& aInitialPath )
 
     while( m_iteration < m_iterationLimit )
     {
+        if( Settings().StopRequested() )
+        {
+            for( int pol = 0; pol < MaxWalkPolicies; pol++ )
+            {
+                if( m_currentResult.status[pol] == ST_IN_PROGRESS )
+                    m_currentResult.status[pol] = ST_STUCK;
+            }
+
+            break;
+        }
+
         singleStep();
 
         bool stillInProgress = false;
