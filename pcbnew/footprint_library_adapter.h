@@ -106,8 +106,11 @@ public:
      * @return the footprint if found or NULL if not found.
      * @throw IO_ERROR if the library cannot be found or read.  No exception
      *                 is thrown in the case where \a aNickname cannot be found.
+     *
+     * Virtual so a call from another kiface runs in the one that created the adapter and
+     * reads the footprint cache that kiface filled (see the statics below).
      */
-    FOOTPRINT* LoadFootprint( const wxString& aNickname, const wxString& aName, bool aKeepUUID );
+    virtual FOOTPRINT* LoadFootprint( const wxString& aNickname, const wxString& aName, bool aKeepUUID );
 
     FOOTPRINT* LoadFootprint( const LIB_ID& aLibId, bool aKeepUUID )
     {
@@ -194,6 +197,19 @@ protected:
 private:
     static PCB_IO* pcbplugin( const LIB_DATA* aRow );
 
+    /**
+     * Re-read the library when the footprint @a aName changed on disk since the library was
+     * enumerated: one file query for formats with one file per footprint, the library
+     * timestamp otherwise.  Called on every LoadFootprint().
+     */
+    void refreshIfStale( const LIB_DATA* aLib, const wxString& aNickname, const wxString& aName );
+
+    /// Re-enumerate library @a aNickname when its timestamp changed, or always with @a aForce
+    void refreshLibrary( const wxString& aNickname, bool aForce );
+
+    /// Clone of the preloaded footprint @a aName of library @a aNickname, or nullptr
+    static FOOTPRINT* clonePreloaded( const wxString& aNickname, const wxString& aName, bool aKeepUUID );
+
     static LEAK_AT_EXIT<std::map<wxString, LIB_DATA>> GlobalLibraries;
     // Leaked like GlobalLibraries so adapter destructors can still lock it to evict their entries
     // even when they run during static teardown.
@@ -207,6 +223,11 @@ private:
     /// Filesystem timestamps from when PreloadedFootprints was last populated, guarded by
     /// PreloadedFootprintsMutex.  Static so it shares the lifetime of the cache it describes.
     static LEAK_AT_EXIT<std::map<wxString, long long>> PreloadedTimestamps;
+
+    /// Per-footprint file timestamps (GetFootprintTimestamp) from when PreloadedFootprints was
+    /// populated, by library nickname and footprint name; guarded by PreloadedFootprintsMutex.
+    /// Empty for formats without a file per footprint.
+    static LEAK_AT_EXIT<std::map<wxString, std::map<wxString, long long>>> PreloadedFileTimestamps;
 };
 
 #endif //FOOTPRINT_LIBRARY_ADAPTER_H

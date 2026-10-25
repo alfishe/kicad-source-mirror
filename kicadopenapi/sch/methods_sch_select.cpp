@@ -34,6 +34,17 @@ static KOPENAPI_RESULT h_sch_select( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     for( const nlohmann::json& u : aArgs.value( "uuids", nlohmann::json::array() ) )
         uuids.insert( u.get<std::string>() );
 
+    if( !uuids.empty() )
+    {
+        std::vector<SCH_ITEM*> items;
+
+        for( SCH_ITEM* item : frame->GetScreen()->Items() )
+            items.push_back( item );
+
+        if( std::string error; !KopenapiSchExpandUuids( items, uuids, error ) )
+            return KOPENAPI_RESULT::Error( 400, error );
+    }
+
     if( aArgs.value( "clear", true ) )
         tool->ClearSelection();
 
@@ -67,6 +78,6 @@ KOPENAPI_REGISTER( "sch_select",
                    "replaces the selection, no arguments clears it; GUI only",
                    R"json({"type":"object","properties":{
                         "refs":{"type":"array","items":{"type":"string"}},
-                        "uuids":{"type":"array","items":{"type":"string"}},
+                        "uuids":{"type":"array","items":{"type":"string"},"description":"whole uuids or unique prefixes (4+ characters)"},
                         "clear":{"type":"boolean","default":true}}})json"_json,
                    true, h_sch_select );

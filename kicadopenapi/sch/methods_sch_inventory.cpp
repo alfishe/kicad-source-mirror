@@ -414,7 +414,11 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( !context )
         return KopenapiNoSchematic();
 
-    const std::string refGlob = aArgs.value( "ref", std::string() );
+    KOPENAPI_REF_FILTER refs( aArgs );
+
+    if( !refs.Error().empty() )
+        return KOPENAPI_RESULT::Error( 400, refs.Error() );
+
     const std::string valueGlob = aArgs.value( "value", std::string() );
     const std::string libGlob = aArgs.value( "lib_id", std::string() );
     const std::string sheetGlob = aArgs.value( "sheet", std::string() );
@@ -454,8 +458,8 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
                                    { "y_mm", sym->GetPosition().y / schIUScale.IU_PER_MM },
                                    { "uuid", str( sym->m_Uuid.AsString() ) } };
 
-            if( !KopenapiGlob( refGlob, row["ref"] ) || !KopenapiGlob( valueGlob, row["value"] )
-                || !KopenapiGlob( libGlob, row["lib_id"] ) )
+            if( !KopenapiGlob( valueGlob, row["value"] ) || !KopenapiGlob( libGlob, row["lib_id"] )
+                || !refs.Match( row["ref"] ) )
             {
                 continue;
             }
@@ -483,7 +487,12 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
                    return a["unit"].get<int>() < b["unit"].get<int>();
                } );
 
-    return KOPENAPI_RESULT::Ok( KopenapiPage( rows, aArgs ) );
+    nlohmann::json page = KopenapiPage( rows, aArgs );
+
+    if( !refs.Empty() )
+        page["unmatched"] = refs.Unmatched();
+
+    return KOPENAPI_RESULT::Ok( page );
 }
 
 
@@ -842,9 +851,12 @@ KOPENAPI_REGISTER( "sch_sheet_list",
 KOPENAPI_REGISTER( "sch_symbol_list",
                    "List schematic symbols per sheet instance: ref, value, lib_id, footprint, unit, sheet, "
                    "DNP/BOM/board/position-file flags, with fields: true every field (name -> text as shown, e.g. LCSC, "
-                   "Manufacturer_Part_Number); filter by ref/value/lib_id/sheet glob, include_power; paginated",
+                   "Manufacturer_Part_Number); filter by ref/value/lib_id/sheet glob, include_power; several "
+                   "parts: ref '{U1,R1?}' or refs [...], patterns that matched nothing in unmatched; paginated",
                    KopenapiPagedSchema( R"json({
-                        "ref":{"type":"string"},"value":{"type":"string"},"lib_id":{"type":"string"},
+                        "ref":{"type":"string","description":"glob; alternatives in braces: {U1,R1?}"},
+                        "refs":{"type":"array","items":{"type":"string"},"description":"references or globs (any matches)"},
+                        "value":{"type":"string"},"lib_id":{"type":"string"},
                         "sheet":{"type":"string","description":"glob on the sheet path"},
                         "include_power":{"type":"boolean","default":false},
                         "fields":{"type":"boolean","default":false,"description":"every field of each symbol (name -> shown text)"}})json"_json ),

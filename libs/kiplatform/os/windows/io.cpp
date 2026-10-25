@@ -456,6 +456,37 @@ long long KIPLATFORM::IO::TimestampDir( const wxString& aDirPath, const wxString
 }
 
 
+long long KIPLATFORM::IO::TimestampFile( const wxString& aFilePath )
+{
+    std::wstring path( aFilePath.t_str() );
+
+    if( path.empty() )
+        return 0;
+
+    if( path.size() >= MAX_PATH && path.rfind( L"\\\\", 0 ) != 0 )
+        path = L"\\\\?\\" + path;
+
+    WIN32_FILE_ATTRIBUTE_DATA data;
+
+    if( !GetFileAttributesExW( path.c_str(), GetFileExInfoStandard, &data )
+        || ( data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ) )
+    {
+        return 0;
+    }
+
+    ULARGE_INTEGER written;
+    written.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    written.HighPart = data.ftLastWriteTime.dwHighDateTime;
+
+    ULARGE_INTEGER size;
+    size.LowPart = data.nFileSizeLow;
+    size.HighPart = data.nFileSizeHigh;
+
+    // 100 ns ticks -> microseconds, as on the other platforms
+    const long long micros = (long long) ( written.QuadPart / 10 );
+    return micros * 31 + (long long) size.QuadPart;
+}
+
 bool KIPLATFORM::IO::FlushToDisk( FILE* aFp )
 {
     if( !aFp )

@@ -6,6 +6,7 @@
 #include <kicadopenapi_annotations.h>
 #include <kicadopenapi_model_events.h>
 #include <kicadopenapi_registry.h>
+#include <kicadopenapi_util.h>
 
 #include <base_units.h>
 #include <frame_type.h>
@@ -154,7 +155,62 @@ SCH_ITEM* KopenapiFindSchematicItem( SCH_EDIT_FRAME* aFrame, const std::string& 
         return symbol;
     }
 
-    return nullptr;
+    // no such reference: a uuid prefix of an item of the sheet
+    if( ref.Contains( wxS( "." ) ) )
+        return nullptr;
+
+    std::vector<SCH_ITEM*> items;
+    std::string            error;
+
+    for( SCH_ITEM* item : screen->Items() )
+        items.push_back( item );
+
+    return KopenapiSchMatchUuid( items, aRef, error );
+}
+
+
+SCH_ITEM* KopenapiSchMatchUuid( const std::vector<SCH_ITEM*>& aScope, const std::string& aId, std::string& aError )
+{
+    std::vector<std::string> uuids;
+    uuids.reserve( aScope.size() );
+
+    for( SCH_ITEM* item : aScope )
+        uuids.push_back( item->m_Uuid.AsStdString() );
+
+    const long hit = KopenapiUuidMatch( uuids, aId, aError,
+                                        [&]( size_t aIndex )
+                                        {
+                                            return aScope[aIndex]->GetFriendlyName().ToStdString( wxConvUTF8 );
+                                        } );
+    return hit < 0 ? nullptr : aScope[hit];
+}
+
+
+bool KopenapiSchExpandUuids( const std::vector<SCH_ITEM*>& aScope, std::set<std::string>& aWanted, std::string& aError )
+{
+    std::set<std::string> expanded;
+
+    for( const std::string& id : aWanted )
+    {
+        std::string error;
+
+        if( SCH_ITEM* item = KopenapiSchMatchUuid( aScope, id, error ) )
+        {
+            expanded.insert( item->m_Uuid.AsStdString() );
+        }
+        else if( error.find( "ambiguous" ) != std::string::npos )
+        {
+            aError = error;
+            return false;
+        }
+        else
+        {
+            expanded.insert( id );
+        }
+    }
+
+    aWanted = std::move( expanded );
+    return true;
 }
 
 

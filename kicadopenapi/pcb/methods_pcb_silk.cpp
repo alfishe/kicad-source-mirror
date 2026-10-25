@@ -13,6 +13,7 @@
 #include <footprint.h>
 #include <frame_type.h>
 #include <kicadopenapi_glow_view.h>
+#include <kicadopenapi_util.h>
 #include <kiway.h>
 #include <pad.h>
 #include <pcb_edit_frame.h>
@@ -20,11 +21,16 @@
 #include <pcb_shape.h>
 #include <pcb_text.h>
 #include <pcb_track.h>
+#include <netinfo.h>
+#include <zone.h>
+#include <pcbexpr_evaluator.h>
 #include <geometry/shape_compound.h>
 #include <geometry/shape_poly_set.h>
 #include <tool/tool_manager.h>
 
 #include <algorithm>
+#include <array>
+#include <map>
 #include <functional>
 #include <optional>
 #include <cmath>
@@ -54,15 +60,7 @@ struct SILK_GLOW_TRAITS
         return aFrame->GetBoard() ? aFrame->GetBoard()->ResolveItem( aId, true ) : nullptr;
     }
 
-    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn )
-    {
-        if( aOn )
-            aItem->SetBrightened();
-        else
-            aItem->ClearBrightened();
-
-        aFrame->GetCanvas()->GetView()->Update( aItem, KIGFX::REPAINT );
-    }
+    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn ) { KopenapiPcbBrighten( aFrame, aItem, aOn ); }
 
     static BOX2I Box( EDA_ITEM* aItem ) { return aItem->GetBoundingBox(); }
     static int   Mm() { return pcbIUScale.mmToIU( 1.0 ); }
@@ -88,7 +86,8 @@ BOX2I inkBox( const PCB_FIELD* aText )
 }
 
 
-OBSTACLES collect( BOARD* aBoard, bool aBottom, int aGap, const std::set<const PCB_FIELD*>& aMoving )
+OBSTACLES collect( BOARD* aBoard, bool aBottom, int aGap, const std::set<const PCB_FIELD*>& aMoving,
+                   const FOOTPRINT* aSkip = nullptr )
 {
     OBSTACLES       o;
     const PCB_LAYER_ID silk = aBottom ? B_SilkS : F_SilkS;
@@ -97,6 +96,9 @@ OBSTACLES collect( BOARD* aBoard, bool aBottom, int aGap, const std::set<const P
 
     for( FOOTPRINT* fp : aBoard->Footprints() )
     {
+        if( fp == aSkip )
+            continue;
+
         const SHAPE_POLY_SET& c = fp->GetCourtyard( crtyd );
 
         if( c.OutlineCount() )
@@ -420,8 +422,12 @@ static KOPENAPI_RESULT h_pcb_silk_tidy( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
-    return KOPENAPI_RESULT::Ok( { { "moved", moved }, { "unresolved", unresolved }, { "kept", kept }, { "locked_kept", lockedKept },
-                                  { "dry_run", dryRun } } );
+    nlohmann::json answer = { { "moved_count", moved.size() }, { "unresolved_count", unresolved.size() }, { "kept", kept },
+                              { "locked_kept", lockedKept }, { "dry_run", dryRun } };
+    const KOPENAPI_LIST_CAP cap( aArgs, 20 );
+    cap.Put( answer, "moved", moved );
+    cap.Put( answer, "unresolved", unresolved );
+    return KOPENAPI_RESULT::Ok( answer );
 }
 
 
@@ -439,13 +445,103 @@ struct FREE_SPOT
 };
 
 
+/// @brief Extra conditions on a candidate box (power domains, rule areas): nullptr when it passes,
+/// else the name of the condition that rejects it
+using FREE_TEST = std::function<const char*( const BOX2I& )>;
+
+
+/// @brief Fast box tests against one polygon set (outlines with holes): corner and edge checks, no
+/// boolean operations per candidate
+class POLY_PROBE
+{
+public:
+    explicit POLY_PROBE( const SHAPE_POLY_SET& aPoly ) :
+            m_poly( aPoly ),
+            m_bbox( aPoly.OutlineCount() ? aPoly.BBox() : BOX2I() )
+    {
+        for( auto it = m_poly.CIterateSegmentsWithHoles(); it; ++it )
+        {
+            const SEG seg = *it;
+            m_edges.push_back( { seg, BOX2I::ByCorners( seg.A, seg.B ).Normalize() } );
+        }
+    }
+
+    bool Empty() const { return m_poly.OutlineCount() == 0; }
+
+    /// the box lies fully inside
+    bool Contains( const BOX2I& aBox ) const
+    {
+        if( Empty() || !m_bbox.Contains( aBox ) )
+            return false;
+
+        for( const VECTOR2I& p : corners( aBox ) )
+        {
+            if( !m_poly.Contains( p ) )
+                return false;
+        }
+
+        return !edgeMeets( BOX2I( aBox ).Inflate( -1 ) );
+    }
+
+    /// the box and the polygon share area
+    bool Overlaps( const BOX2I& aBox ) const
+    {
+        if( Empty() || !m_bbox.Intersects( aBox ) )
+            return false;
+
+        for( const VECTOR2I& p : corners( aBox ) )
+        {
+            if( m_poly.Contains( p ) )
+                return true;
+        }
+
+        return edgeMeets( BOX2I( aBox ).Inflate( -1 ) );
+    }
+
+private:
+    static std::array<VECTOR2I, 4> corners( const BOX2I& aBox )
+    {
+        return { aBox.GetOrigin(), VECTOR2I( aBox.GetRight(), aBox.GetTop() ), aBox.GetEnd(),
+                 VECTOR2I( aBox.GetLeft(), aBox.GetBottom() ) };
+    }
+
+    bool edgeMeets( const BOX2I& aBox ) const
+    {
+        const std::array<VECTOR2I, 4> c = corners( aBox );
+        const SEG                     sides[4] = { SEG( c[0], c[1] ), SEG( c[1], c[2] ), SEG( c[2], c[3] ), SEG( c[3], c[0] ) };
+
+        for( const auto& [seg, box] : m_edges )
+        {
+            if( !box.Intersects( aBox ) )
+                continue;
+
+            if( aBox.Contains( seg.A ) || aBox.Contains( seg.B ) )
+                return true;
+
+            for( const SEG& side : sides )
+            {
+                if( seg.Intersects( side ) )
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    SHAPE_POLY_SET                    m_poly;
+    BOX2I                             m_bbox;
+    std::vector<std::pair<SEG, BOX2I>> m_edges;
+};
+
+
 /// @brief Distinct free places of aW x aH on one side: clear of bodies, exposed copper, silk and
 /// the board edge (each kept aGap away); best first (most room, or nearest to aNear)
 std::vector<FREE_SPOT> findFree( BOARD* aBoard, bool aBottom, int aGap, int aW, int aH, const std::optional<VECTOR2I>& aNear,
                                  int aCount, int aStep, const SHAPE_POLY_SET* aRegion = nullptr, bool aIgnoreObstacles = false,
-                                 bool aAvoidTracks = true )
+                                 bool aAvoidTracks = true, const FREE_TEST& aTest = {}, const FOOTPRINT* aSkip = nullptr,
+                                 std::map<std::string, long>* aRejected = nullptr )
 {
-    const OBSTACLES    obs = collect( aBoard, aBottom, aGap, {} );
+    const OBSTACLES    obs = collect( aBoard, aBottom, aGap, {}, aSkip );
     std::vector<BOX2I> blocked = obs.copper;
     blocked.insert( blocked.end(), obs.silk.begin(), obs.silk.end() );
 
@@ -515,13 +611,21 @@ std::vector<FREE_SPOT> findFree( BOARD* aBoard, bool aBottom, int aGap, int aW, 
         for( int64_t x = area.GetLeft(); x + aW <= area.GetRight(); x += aStep )
         {
             const BOX2I box( VECTOR2I( int( x ), int( y ) ), VECTOR2I( aW, aH ) );
+            const char* rejectedBy = nullptr;
 
-            if( ( !aRegion && !insideBoard( obs, box ) )
-                || std::any_of( blocked.begin(), blocked.end(), [&]( const BOX2I& b ) { return b.Intersects( box ); } )
-                || ( aRegion && !regionIsRect && !boxInside( *aRegion, box ) ) )
-            {
+            if( ( !aRegion && !insideBoard( obs, box ) ) || ( aRegion && !regionIsRect && !boxInside( *aRegion, box ) ) )
+                rejectedBy = aRegion ? "region" : "board_edge";
+            else if( aTest )
+                rejectedBy = aTest( box );
+
+            if( !rejectedBy && std::any_of( blocked.begin(), blocked.end(), [&]( const BOX2I& b ) { return b.Intersects( box ); } ) )
+                rejectedBy = "obstacles";
+
+            if( aRejected )
+                ( *aRejected )[rejectedBy ? rejectedBy : "passed"]++;
+
+            if( rejectedBy )
                 continue;
-            }
 
             const double r = room( box );
             spots.push_back( { box, aNear ? -( box.Centre() - *aNear ).EuclideanNorm() : r, r } );
@@ -577,6 +681,128 @@ bool boxInside( const SHAPE_POLY_SET& aPoly, const BOX2I& aBox )
 } // namespace
 
 
+namespace
+{
+
+/// @brief Does a placement rule area claim the footprint (the area's sheet, component class or
+/// group, matched as KiCad's multichannel tool does); design-block areas claim nothing here
+bool placementAreaClaims( const ZONE* aArea, FOOTPRINT* aFootprint )
+{
+    wxString source = aArea->GetPlacementAreaSource();
+    source.Replace( wxT( "'" ), wxT( "\\'" ) );
+    wxString rule;
+
+    switch( aArea->GetPlacementAreaSourceType() )
+    {
+    case PLACEMENT_SOURCE_T::SHEETNAME:       rule = wxT( "A.memberOfSheetOrChildren('" ) + source + wxT( "')" ); break;
+    case PLACEMENT_SOURCE_T::COMPONENT_CLASS: rule = wxT( "A.hasComponentClass('" ) + source + wxT( "')" ); break;
+    case PLACEMENT_SOURCE_T::GROUP_PLACEMENT: rule = wxT( "A.memberOfGroup('" ) + source + wxT( "')" ); break;
+    default:                                  return false;
+    }
+
+    PCBEXPR_COMPILER compiler( new PCBEXPR_UNIT_RESOLVER );
+    PCBEXPR_UCODE    ucode;
+    PCBEXPR_CONTEXT  ctx;
+    PCBEXPR_CONTEXT  preflight;
+
+    if( !compiler.Compile( rule, &ucode, &preflight ) )
+        return false;
+
+    ctx.SetItems( aFootprint, aFootprint );
+    return ucode.Run( &ctx )->AsDouble() != 0.0;
+}
+
+
+/// @brief Copper zones (outlines, priority resolved) of the nets in an avoid_nets entry list:
+/// "NET" (every copper layer) or {"net": "NET", "layer": "In1.Cu"}
+std::optional<KOPENAPI_RESULT> avoidNetsArg( BOARD* aBoard, const nlohmann::json& aArg, SHAPE_POLY_SET& aOut )
+{
+    if( !aArg.is_array() )
+        return KOPENAPI_RESULT::Error( 400, "avoid_nets: net names, or {net, layer} objects" );
+
+    for( const nlohmann::json& entry : aArg )
+    {
+        std::string   name;
+        LSET          layers = LSET::AllCuMask( aBoard->GetCopperLayerCount() );
+
+        if( entry.is_string() )
+        {
+            name = entry.get<std::string>();
+        }
+        else if( entry.is_object() && entry.contains( "net" ) && entry["net"].is_string() )
+        {
+            name = entry["net"].get<std::string>();
+
+            if( entry.contains( "layer" ) )
+            {
+                const PCB_LAYER_ID layer = aBoard->GetLayerID( wxString::FromUTF8( entry.value( "layer", std::string() ) ) );
+
+                if( !IsCopperLayer( layer ) )
+                    return KOPENAPI_RESULT::Error( 400, "avoid_nets: '" + entry.value( "layer", std::string() ) + "' is not a copper layer" );
+
+                layers = LSET( { layer } );
+            }
+        }
+        else
+        {
+            return KOPENAPI_RESULT::Error( 400, "avoid_nets: net names, or {net, layer} objects" );
+        }
+
+        NETINFO_ITEM* net = KopenapiFindNet( aBoard, name );
+
+        if( !net || net->GetNetCode() <= 0 )
+            return KOPENAPI_RESULT::Error( 404, "avoid_nets: no net '" + name + "' on the board" );
+
+        for( PCB_LAYER_ID layer : layers.Seq() )
+        {
+            SHAPE_POLY_SET domain;
+            KopenapiNetDomain( aBoard, net->GetNetCode(), layer, domain );
+            aOut.Append( domain );
+        }
+    }
+
+    if( aOut.OutlineCount() )
+        aOut.Simplify();
+
+    return std::nullopt;
+}
+
+
+/// @brief One sentence on why no place passed, from the per-condition rejection counts
+std::string whyNone( const std::map<std::string, long>& aRejected, const std::vector<std::string>& aOrder,
+                     const std::map<std::string, std::string>& aMeaning )
+{
+    long total = 0;
+
+    for( const auto& [stage, n] : aRejected )
+        total += n;
+
+    if( total == 0 )
+        return "the search area holds no candidate of that size";
+
+    // conditions are tried in aOrder; the first one after which nothing was left decided it
+    long left = total;
+
+    for( const std::string& stage : aOrder )
+    {
+        auto it = aRejected.find( stage );
+        const long n = it == aRejected.end() ? 0 : it->second;
+        left -= n;
+
+        if( left <= 0 && n > 0 )
+        {
+            auto meaning = aMeaning.find( stage );
+            return stage + ": " + ( meaning != aMeaning.end() ? meaning->second : std::string( "rejects" ) ) + " - the last "
+                   + std::to_string( n ) + " of " + std::to_string( total ) + " candidate places";
+        }
+    }
+
+    return "candidates overlap each other only";
+}
+
+} // namespace
+
+
 static KOPENAPI_RESULT h_pcb_free_area( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -584,34 +810,268 @@ static KOPENAPI_RESULT h_pcb_free_area( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( !context )
         return KopenapiNoBoard();
 
-    BOARD*       board = context->GetBoard();
-    const double wMm = aArgs.value( "w_mm", 0.0 );
-    const double hMm = aArgs.value( "h_mm", 0.0 );
-
-    if( wMm <= 0 || hMm <= 0 )
-        return KOPENAPI_RESULT::Error( 400, "w_mm and h_mm: the size wanted" );
+    BOARD*     board = context->GetBoard();
+    const auto iu = []( double aMm ) { return pcbIUScale.mmToIU( aMm ); };
 
     if( board->GetBoardEdgesBoundingBox().GetWidth() <= 0 )
         return KOPENAPI_RESULT::Error( 409, "the board has no outline" );
 
-    const auto iu = []( double aMm ) { return pcbIUScale.mmToIU( aMm ); };
-    const bool bottom = aArgs.value( "side", std::string( "front" ) ) == "back";
+    // the part to place: its courtyard sets the size, its own copper and body are not obstacles
+    FOOTPRINT* part = nullptr;
 
-    std::vector<FREE_SPOT> spots = findFree( board, bottom, iu( std::max( 0.0, aArgs.value( "gap_mm", 0.5 ) ) ), iu( wMm ),
-                                             iu( hMm ), pointArg( aArgs, "near_mm" ), std::clamp( aArgs.value( "count", 5 ), 1, 50 ),
-                                             iu( std::clamp( aArgs.value( "step_mm", 0.5 ), 0.1, 5.0 ) ), nullptr, false,
-                                             aArgs.value( "avoid_tracks", true ) );
+    if( aArgs.contains( "for_ref" ) )
+    {
+        part = board->FindFootprintByReference( wxString::FromUTF8( aArgs.value( "for_ref", std::string() ) ) );
+
+        if( !part )
+            return KOPENAPI_RESULT::Error( 404, "for_ref: no footprint " + aArgs.value( "for_ref", std::string() ) );
+    }
+
+    const bool bottom = aArgs.contains( "side" ) ? aArgs.value( "side", std::string( "front" ) ) == "back"
+                                                 : part && part->GetLayer() == B_Cu;
+    BOX2I      body;
+
+    if( part )
+    {
+        const SHAPE_POLY_SET& court = part->GetCourtyard( part->GetLayer() == B_Cu ? B_CrtYd : F_CrtYd );
+        body = court.OutlineCount() ? court.BBox() : part->GetBoundingBox( false );
+    }
+
+    const double wMm = aArgs.value( "w_mm", part ? body.GetWidth() / pcbIUScale.IU_PER_MM : 0.0 );
+    const double hMm = aArgs.value( "h_mm", part ? body.GetHeight() / pcbIUScale.IU_PER_MM : 0.0 );
+
+    if( wMm <= 0 || hMm <= 0 )
+        return KOPENAPI_RESULT::Error( 400, "w_mm and h_mm: the size wanted (or for_ref: a part's courtyard)" );
+
+    std::vector<std::string>           order = { "board_edge" };
+    std::map<std::string, std::string> meaning = { { "board_edge", "not inside the board outline (less the edge clearance)" },
+                                                   { "obstacles", "on bodies, exposed copper, silk or tracks" } };
+    std::vector<FREE_TEST>             tests;
+    nlohmann::json                     constraints = nlohmann::json::object();
+
+    // inside_net: fully on the net's own copper pour, priorities resolved
+    std::vector<std::pair<PCB_LAYER_ID, std::shared_ptr<POLY_PROBE>>> domains;
+
+    if( aArgs.contains( "inside_net" ) )
+    {
+        const std::string name = aArgs.value( "inside_net", std::string() );
+        NETINFO_ITEM*     net = KopenapiFindNet( board, name );
+
+        if( !net || net->GetNetCode() <= 0 )
+            return KOPENAPI_RESULT::Error( 404, "inside_net: no net '" + name + "' on the board" );
+
+        LSET layers = LSET::AllCuMask( board->GetCopperLayerCount() );
+
+        if( aArgs.contains( "layer" ) )
+        {
+            const PCB_LAYER_ID layer = board->GetLayerID( wxString::FromUTF8( aArgs.value( "layer", std::string() ) ) );
+
+            if( !IsCopperLayer( layer ) )
+                return KOPENAPI_RESULT::Error( 400, "layer: a copper layer (inside_net's plane)" );
+
+            layers = LSET( { layer } );
+        }
+
+        nlohmann::json domainJson = nlohmann::json::array();
+
+        for( PCB_LAYER_ID layer : layers.Seq() )
+        {
+            SHAPE_POLY_SET domain;
+            KopenapiNetDomain( board, net->GetNetCode(), layer, domain );
+
+            if( !domain.OutlineCount() )
+                continue;
+
+            domainJson.push_back( { { "layer", board->GetLayerName( layer ).ToStdString( wxConvUTF8 ) },
+                                    { "area_mm2", std::round( domain.Area() / ( pcbIUScale.IU_PER_MM * pcbIUScale.IU_PER_MM ) * 10 ) / 10 },
+                                    { "bbox_mm", boxMm( domain.BBox() ) } } );
+            domains.emplace_back( layer, std::make_shared<POLY_PROBE>( domain ) );
+        }
+
+        if( domains.empty() )
+        {
+            return KOPENAPI_RESULT::Error( 404, "inside_net: net '" + name + "' has no copper zone"
+                                                + ( aArgs.contains( "layer" ) ? " on " + aArgs.value( "layer", std::string() ) : std::string() )
+                                                + " that wins there (pcb_zone_list)" );
+        }
+
+        constraints["inside_net"] = { { "net", name }, { "domains", domainJson } };
+        order.push_back( "inside_net" );
+        meaning["inside_net"] = "not fully on the " + name + " pour" + ( aArgs.contains( "layer" ) ? " on " + aArgs.value( "layer", std::string() ) : std::string() )
+                                + " (outlines less higher-priority zones and keep-outs)";
+        tests.push_back(
+                [domains]( const BOX2I& aBox ) -> const char*
+                {
+                    for( const auto& [layer, probe] : domains )
+                    {
+                        if( probe->Contains( aBox ) )
+                            return nullptr;
+                    }
+
+                    return "inside_net";
+                } );
+    }
+
+    if( aArgs.contains( "avoid_nets" ) )
+    {
+        SHAPE_POLY_SET avoid;
+
+        if( std::optional<KOPENAPI_RESULT> bad = avoidNetsArg( board, aArgs["avoid_nets"], avoid ) )
+            return *bad;
+
+        auto probe = std::make_shared<POLY_PROBE>( avoid );
+        constraints["avoid_nets"] = aArgs["avoid_nets"];
+        order.push_back( "avoid_nets" );
+        meaning["avoid_nets"] = "overlaps a zone of an avoided net";
+        tests.push_back( [probe]( const BOX2I& aBox ) -> const char* { return probe->Overlaps( aBox ) ? "avoid_nets" : nullptr; } );
+    }
+
+    if( part )
+    {
+        const PCB_LAYER_ID side = bottom ? B_Cu : F_Cu;
+        SHAPE_POLY_SET     keepout;
+        SHAPE_POLY_SET     home;
+        SHAPE_POLY_SET     foreign;
+        nlohmann::json     homeNames = nlohmann::json::array();
+
+        auto consider = [&]( const ZONE* aZone, const FOOTPRINT* aOwner )
+        {
+            if( !aZone->GetIsRuleArea() )
+                return;
+
+            if( aZone->GetDoNotAllowFootprints() && aZone->IsOnLayer( side ) && aOwner != part )
+                keepout.Append( aZone->GetBoardOutline() );
+
+            if( aOwner || !aZone->GetPlacementAreaEnabled()
+                || aZone->GetPlacementAreaSourceType() == PLACEMENT_SOURCE_T::DESIGN_BLOCK )
+            {
+                return;
+            }
+
+            if( placementAreaClaims( aZone, part ) )
+            {
+                home.Append( aZone->GetBoardOutline() );
+                homeNames.push_back( aZone->GetZoneName().ToStdString( wxConvUTF8 ) );
+            }
+            else
+            {
+                foreign.Append( aZone->GetBoardOutline() );
+            }
+        };
+
+        for( ZONE* zone : board->Zones() )
+            consider( zone, nullptr );
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            for( ZONE* zone : fp->Zones() )
+                consider( zone, fp );
+        }
+
+        if( home.OutlineCount() )
+        {
+            home.Simplify();
+
+            // nested areas (a sheet inside its parent's area) are home, not foreign
+            if( foreign.OutlineCount() )
+            {
+                foreign.Simplify();
+                foreign.BooleanSubtract( home );
+            }
+
+            auto homeProbe = std::make_shared<POLY_PROBE>( home );
+            constraints["placement_area"] = homeNames;
+            order.push_back( "placement_area" );
+            meaning["placement_area"] = "not inside the part's placement rule area";
+            tests.push_back( [homeProbe]( const BOX2I& aBox ) -> const char*
+                             { return homeProbe->Contains( aBox ) ? nullptr : "placement_area"; } );
+        }
+
+        if( foreign.OutlineCount() )
+        {
+            foreign.Simplify();
+            auto foreignProbe = std::make_shared<POLY_PROBE>( foreign );
+            order.push_back( "other_placement_area" );
+            meaning["other_placement_area"] = "inside a placement rule area of other parts";
+            tests.push_back( [foreignProbe]( const BOX2I& aBox ) -> const char*
+                             { return foreignProbe->Overlaps( aBox ) ? "other_placement_area" : nullptr; } );
+        }
+
+        if( keepout.OutlineCount() )
+        {
+            keepout.Simplify();
+            auto keepoutProbe = std::make_shared<POLY_PROBE>( keepout );
+            order.push_back( "keepout" );
+            meaning["keepout"] = "in a keep-out that bars footprints on that side";
+            tests.push_back( [keepoutProbe]( const BOX2I& aBox ) -> const char*
+                             { return keepoutProbe->Overlaps( aBox ) ? "keepout" : nullptr; } );
+        }
+    }
+
+    order.push_back( "obstacles" );
+
+    FREE_TEST test;
+
+    if( !tests.empty() )
+    {
+        test = [tests]( const BOX2I& aBox ) -> const char*
+        {
+            for( const FREE_TEST& t : tests )
+            {
+                if( const char* why = t( aBox ) )
+                    return why;
+            }
+
+            return nullptr;
+        };
+    }
+
+    std::map<std::string, long> rejected;
+    std::vector<FREE_SPOT>      spots = findFree( board, bottom, iu( std::max( 0.0, aArgs.value( "gap_mm", 0.5 ) ) ), iu( wMm ),
+                                                  iu( hMm ), pointArg( aArgs, "near_mm" ), std::clamp( aArgs.value( "count", 5 ), 1, 50 ),
+                                                  iu( std::clamp( aArgs.value( "step_mm", 0.5 ), 0.1, 5.0 ) ), nullptr, false,
+                                                  aArgs.value( "avoid_tracks", true ), test, part, &rejected );
     nlohmann::json out = nlohmann::json::array();
 
     for( const FREE_SPOT& s : spots )
     {
-        out.push_back( { { "box_mm", boxMm( s.box ) },
-                         { "center_mm", { mmOf( s.box.Centre().x ), mmOf( s.box.Centre().y ) } },
-                         { "room_mm", mmOf( int( s.room ) ) } } );
+        nlohmann::json spot = { { "box_mm", boxMm( s.box ) },
+                                { "center_mm", { mmOf( s.box.Centre().x ), mmOf( s.box.Centre().y ) } },
+                                { "room_mm", mmOf( int( s.room ) ) } };
+
+        // where the footprint's anchor goes so that its courtyard fills this box
+        if( part )
+        {
+            const VECTOR2I at = s.box.Centre() + ( part->GetPosition() - body.Centre() );
+            spot["position_mm"] = { mmOf( at.x ), mmOf( at.y ) };
+        }
+
+        out.push_back( spot );
     }
 
-    return KOPENAPI_RESULT::Ok( { { "areas", out }, { "side", bottom ? "back" : "front" },
-                                  { "searched_mm", boxMm( board->GetBoardEdgesBoundingBox() ) } } );
+    nlohmann::json counts = nlohmann::json::object();
+
+    for( const auto& [stage, n] : rejected )
+    {
+        if( stage != "passed" )
+            counts[stage] = n;
+    }
+
+    nlohmann::json answer = { { "areas", out }, { "side", bottom ? "back" : "front" },
+                              { "searched_mm", boxMm( board->GetBoardEdgesBoundingBox() ) },
+                              { "size_mm", { std::round( wMm * 100 ) / 100, std::round( hMm * 100 ) / 100 } },
+                              { "rejected", counts }, { "checked_in_order", order } };
+
+    if( !constraints.empty() )
+        answer["constraints"] = constraints;
+
+    if( part )
+        answer["for_ref"] = str( part->GetReference() );
+
+    if( out.empty() )
+        answer["why"] = whyNone( rejected, order, meaning );
+
+    return KOPENAPI_RESULT::Ok( answer );
 }
 
 
@@ -838,14 +1298,23 @@ static KOPENAPI_RESULT h_pcb_silk_fit( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 
 
 KOPENAPI_REGISTER( "pcb_free_area",
-                   "Find free places of a given size on the board for silkscreen art, logos, labels: "
-                   "clear of bodies (courtyards), exposed copper (pads, vias), existing silk and the board "
-                   "edge on one side; best first: the most room around, or nearest to near_mm; distinct "
-                   "places (no overlaps between answers)",
-                   R"json({"type":"object","required":["w_mm","h_mm"],"properties":{
-                        "w_mm":{"type":"number"},
-                        "h_mm":{"type":"number"},
-                        "side":{"type":"string","enum":["front","back"],"default":"front"},
+                   "Find free places of a given size on the board - for silkscreen art, logos, labels, or a "
+                   "part (for_ref: its courtyard size, position_mm for its anchor): clear of bodies "
+                   "(courtyards), exposed copper (pads, vias), existing silk and the board edge on one side; "
+                   "power domains: inside_net (+ layer) keeps the box fully on that net's pour as the zone "
+                   "filler resolves priorities, avoid_nets keeps it off other nets' pours; for_ref also keeps "
+                   "to the part's placement rule area (sheet / component class / group) and out of other "
+                   "parts' areas and footprint keep-outs; best first: the most room around, or nearest to "
+                   "near_mm; distinct places (no overlaps). rejected counts candidates per condition "
+                   "(checked_in_order); with no place found, why names the condition that ruled out the rest",
+                   R"json({"type":"object","properties":{
+                        "w_mm":{"type":"number","description":"width; default: for_ref's courtyard"},
+                        "h_mm":{"type":"number","description":"height; default: for_ref's courtyard"},
+                        "for_ref":{"type":"string","description":"the part to place: size from its courtyard, its own body and pads are no obstacle, placement rule areas and keep-outs honoured, answers give position_mm"},
+                        "inside_net":{"type":"string","description":"the box must lie fully on this net's copper pour (zone outlines less higher-priority zones of other nets and fill keep-outs, clipped to the board)"},
+                        "layer":{"type":"string","description":"inside_net's layer (e.g. In2.Cu); default: any copper layer where the net has a pour"},
+                        "avoid_nets":{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object","properties":{"net":{"type":"string"},"layer":{"type":"string"}},"required":["net"]}]},"description":"the box must not overlap these nets' pours: a name (every copper layer) or {net, layer}"},
+                        "side":{"type":"string","enum":["front","back"],"description":"default: front, or for_ref's side"},
                         "gap_mm":{"type":"number","default":0.5,"description":"clearance kept to every obstacle"},
                         "near_mm":{"type":"array","items":{"type":"number"},"description":"[x, y]: prefer places closest to this point"},
                         "count":{"type":"integer","default":5,"maximum":50},
@@ -885,15 +1354,16 @@ KOPENAPI_REGISTER( "pcb_silk_tidy",
                    "Tidy the silkscreen: move reference designators that sit on bodies (courtyards), "
                    "exposed copper (pads, vias), other silk or off the board to the nearest free spot "
                    "around their part, upright (0 / 90 degrees); answers what moved and what found no "
-                   "place; dry_run to preview",
-                   R"json({"type":"object","properties":{
+                   "place (moved_count / unresolved_count; the lists cut to list_limit, default 20; full: true "
+                   "for all); dry_run to preview",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
                         "refs":{"type":"array","items":{"type":"string"},"description":"only these parts; default all"},
                         "only_problems":{"type":"boolean","default":true,"description":"false: re-place every reference"},
                         "gap_mm":{"type":"number","default":0.15},
                         "max_distance_mm":{"type":"number","default":4.0},
                         "dry_run":{"type":"boolean","default":false},
                         "override_locks":{"type":"boolean","default":false,"description":"also move the reference texts of locked footprints (kept otherwise: locked_kept)"},
-                        "explain":{"type":"boolean","default":false,"description":"answer the text box and what it hits (mm)"}}})json"_json,
+                        "explain":{"type":"boolean","default":false,"description":"answer the text box and what it hits (mm)"}}})json"_json, 20 ),
                    false, h_pcb_silk_tidy, 120 );
 
 KOPENAPI_MARK_EDITING( "pcb_silk_tidy" );

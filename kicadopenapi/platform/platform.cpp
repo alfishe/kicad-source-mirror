@@ -298,4 +298,13 @@ void LowerCurrentThreadPriority()
 #endif
 }
 
+void KeepProcessResponsive()
+{
+#if defined(_WIN32)
+    KeepProcessResponsiveWindows();
+#elif defined(__APPLE__)
+    KeepProcessResponsiveMacOS();
+#endif
+}
+
 } // namespace kopenapi::platform

@@ -6,6 +6,7 @@
 #include <kicadopenapi_annotations.h>
 #include <kicadopenapi_model_events.h>
 #include <kicadopenapi_registry.h>
+#include <kicadopenapi_util.h>
 
 #include <base_units.h>
 #include <board.h>
@@ -13,6 +14,11 @@
 #include <frame_type.h>
 #include <kiway.h>
 #include <pad.h>
+#include <pcb_generator.h>
+#include <pcb_group.h>
+#include <pcb_track.h>
+#include <zone.h>
+#include <cctype>
 #include <trigo.h>
 #include <pcb_edit_frame.h>
 
@@ -144,6 +150,68 @@ KOPENAPI_RESULT h_pcb_overlay( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aAr
 } // namespace
 
 
+BOARD_ITEM* KopenapiMatchUuid( const std::vector<BOARD_ITEM*>& aItems, const std::string& aId, std::string& aError )
+{
+    std::vector<std::string> uuids;
+    uuids.reserve( aItems.size() );
+
+    for( BOARD_ITEM* item : aItems )
+        uuids.push_back( item->m_Uuid.AsStdString() );
+
+    const long hit = KopenapiUuidMatch( uuids, aId, aError,
+                                        [&]( size_t aIndex )
+                                        {
+                                            return aItems[aIndex]->GetFriendlyName().ToStdString( wxConvUTF8 );
+                                        } );
+    return hit < 0 ? nullptr : aItems[hit];
+}
+
+
+BOARD_ITEM* KopenapiResolveUuid( BOARD* aBoard, const std::string& aId, std::string& aError )
+{
+    if( !aBoard )
+    {
+        aError = "no board";
+        return nullptr;
+    }
+
+    const wxString wxId = wxString::FromUTF8( aId );
+
+    if( KIID::SniffTest( wxId ) )
+    {
+        BOARD_ITEM* item = aBoard->ResolveItem( KIID( wxId ), true );
+
+        if( item && item != DELETED_BOARD_ITEM::GetInstance() )
+            return item;
+    }
+
+    std::vector<BOARD_ITEM*> items;
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        items.push_back( fp );
+        fp->RunOnChildren( [&]( BOARD_ITEM* child ) { items.push_back( child ); }, RECURSE_MODE::RECURSE );
+    }
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+        items.push_back( track );
+
+    for( ZONE* zone : aBoard->Zones() )
+        items.push_back( zone );
+
+    for( BOARD_ITEM* drawing : aBoard->Drawings() )
+        items.push_back( drawing );
+
+    for( PCB_GROUP* group : aBoard->Groups() )
+        items.push_back( group );
+
+    for( PCB_GENERATOR* generator : aBoard->Generators() )
+        items.push_back( generator );
+
+    return KopenapiMatchUuid( items, aId, aError );
+}
+
+
 BOARD_ITEM* KopenapiFindBoardItem( BOARD* aBoard, const std::string& aRef )
 {
     if( !aBoard )
@@ -162,7 +230,11 @@ BOARD_ITEM* KopenapiFindBoardItem( BOARD* aBoard, const std::string& aRef )
     if( footprint && ref.Contains( wxS( "." ) ) )
         return footprint->FindPadByNumber( ref.AfterFirst( '.' ) );
 
-    return footprint;
+    if( footprint )
+        return footprint;
+
+    std::string error;
+    return KopenapiResolveUuid( aBoard, aRef, error );
 }
 
 

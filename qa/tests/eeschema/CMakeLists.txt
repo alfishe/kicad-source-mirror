@@ -280,6 +280,7 @@ set( QA_EESCHEMA_SRCS
     test_update_items_connectivity.cpp
     test_design_block_duplicate.cpp
     test_symbol_library.cpp
+    test_symbol_library_fresh.cpp
     test_symbol_library_parse_error.cpp
     test_symbol_embedded_files.cpp
     test_symbol_svg_export.cpp

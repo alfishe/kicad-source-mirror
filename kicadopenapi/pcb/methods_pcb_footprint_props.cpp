@@ -1,6 +1,7 @@
 /// @file methods_pcb_footprint_props.cpp
 /// @brief kicadopenapi footprint properties and library parity: pcb_footprint_update,
-/// pcb_footprint_lib_diff, pcb_footprint_lib_update.
+/// pcb_footprint_lib_diff, pcb_footprint_lib_update, pcb_parts_check (placed footprint <->
+/// library <-> 3D model files and their metadata).
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -14,9 +15,21 @@
 #include <project_pcb.h>
 #include <reporter.h>
 #include <tool/tool_manager.h>
+#include <3d_cache/3d_cache.h>
+#include <filename_resolver.h>
+#include <kiplatform/io.h>
+#include <kicadopenapi_util.h>
+#include <libraries/library_manager.h>
+#include <pad.h>
+#include <wildcards_and_files_ext.h>
 
+#include <picosha2.h>
+
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 
 
@@ -91,15 +104,6 @@ std::vector<FOOTPRINT*> named( BOARD* aBoard, const nlohmann::json& aArgs, bool 
 }
 
 
-FOOTPRINT_LIBRARY_ADAPTER* loadedLibraries( BOARD* aBoard )
-{
-    FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( aBoard->GetProject() );
-    adapter->AsyncLoad();
-    KopenapiWaitLibraries( adapter );
-    return adapter;
-}
-
-
 // the library copy of aFootprint's lib id; aStatus says why there is none
 std::shared_ptr<FOOTPRINT> libraryCopy( FOOTPRINT_LIBRARY_ADAPTER* aAdapter, const LIB_ID& aId, std::string& aStatus,
                                         std::map<LIB_ID, std::shared_ptr<FOOTPRINT>>& aCache )
@@ -139,22 +143,30 @@ std::shared_ptr<FOOTPRINT> libraryCopy( FOOTPRINT_LIBRARY_ADAPTER* aAdapter, con
 }
 
 
-nlohmann::json differences( FOOTPRINT* aFootprint, FOOTPRINT* aLib )
+nlohmann::json reportLines( wxString aText )
 {
-    WX_STRING_REPORTER reporter;
-    nlohmann::json     out = nlohmann::json::array();
+    nlohmann::json out = nlohmann::json::array();
+    aText.Replace( wxS( "\r" ), wxEmptyString );
 
-    if( !aFootprint->FootprintNeedsUpdate( aLib, BOARD_ITEM::COMPARE_FLAGS::DRC, &reporter ) )
-        return out;
-
-    wxString text = reporter.GetMessages();
-    text.Replace( wxS( "\r" ), wxEmptyString );
-
-    for( wxString line : wxSplit( text, '\n', '\0' ) )
+    for( wxString line : wxSplit( aText, '\n', '\0' ) )
     {
         if( !line.Trim().IsEmpty() )
             out.push_back( str( line ) );
     }
+
+    return out;
+}
+
+
+// KiCad's comparison (pads, graphics, attributes, rule areas, 3D models)
+nlohmann::json differences( FOOTPRINT* aFootprint, FOOTPRINT* aLib )
+{
+    WX_STRING_REPORTER reporter;
+
+    if( !aFootprint->FootprintNeedsUpdate( aLib, BOARD_ITEM::COMPARE_FLAGS::DRC, &reporter ) )
+        return nlohmann::json::array();
+
+    nlohmann::json out = reportLines( reporter.GetMessages() );
 
     if( out.empty() )
         out.push_back( "differs" );
@@ -162,7 +174,229 @@ nlohmann::json differences( FOOTPRINT* aFootprint, FOOTPRINT* aLib )
     return out;
 }
 
+
+// the 3D model lines of differences()
+nlohmann::json modelDifferences( const FOOTPRINT* aFootprint, const FOOTPRINT* aLib )
+{
+    WX_STRING_REPORTER reporter;
+
+    if( !aFootprint->ModelsNeedUpdate( aLib, &reporter ) )
+        return nlohmann::json::array();
+
+    return reportLines( reporter.GetMessages() );
+}
+
+
+const wxString EMBED_URI = wxString( FILEEXT::KiCadUriPrefix ) + wxS( "://" );
+
+
+/// sha256 of a file, cached per path and file timestamp
+std::string fileSha256( const std::filesystem::path& aFile )
+{
+    static std::mutex                                             mutex;
+    static std::map<std::string, std::pair<long long, std::string>> cache;
+
+    const long long stamp = KIPLATFORM::IO::TimestampFile( wxString::FromUTF8( aFile.string() ) );
+
+    {
+        std::lock_guard<std::mutex> lock( mutex );
+
+        if( auto it = cache.find( aFile.string() ); it != cache.end() && it->second.first == stamp )
+            return it->second.second;
+    }
+
+    std::ifstream in( aFile, std::ios::binary );
+
+    if( !in )
+        return {};
+
+    std::vector<unsigned char> hash( picosha2::k_digest_size );
+    picosha2::hash256( std::istreambuf_iterator<char>( in ), std::istreambuf_iterator<char>(), hash.begin(),
+                       hash.end() );
+    const std::string hex = picosha2::bytes_to_hex_string( hash.begin(), hash.end() );
+
+    std::lock_guard<std::mutex> lock( mutex );
+    cache[aFile.string()] = { stamp, hex };
+    return hex;
+}
+
+
+struct MODEL_META
+{
+    bool        present = false;
+    std::string sha256;
+    int         leads = -1;     ///< solids of the part named "lead"
+};
+
+
+/// <model>.meta.json beside the model file, cached per path and file timestamp
+MODEL_META modelMeta( const std::filesystem::path& aModel )
+{
+    static std::mutex                                            mutex;
+    static std::map<std::string, std::pair<long long, MODEL_META>> cache;
+
+    std::filesystem::path metaFile = aModel;
+    metaFile.replace_extension( ".meta.json" );
+
+    const long long stamp = KIPLATFORM::IO::TimestampFile( wxString::FromUTF8( metaFile.string() ) );
+
+    if( stamp == 0 )
+        return {};
+
+    {
+        std::lock_guard<std::mutex> lock( mutex );
+
+        if( auto it = cache.find( metaFile.string() ); it != cache.end() && it->second.first == stamp )
+            return it->second.second;
+    }
+
+    MODEL_META     meta;
+    std::ifstream  in( metaFile );
+    nlohmann::json json = nlohmann::json::parse( in, nullptr, false );
+
+    if( json.is_object() )
+    {
+        meta.present = true;
+        meta.sha256 = json.value( "model_sha256", std::string() );
+
+        const nlohmann::json lead = json.value( "/geometry/parts/lead"_json_pointer, nlohmann::json() );
+
+        if( lead.is_object() && lead.value( "solids", -1 ) > 0 )
+            meta.leads = lead.value( "solids", -1 );
+    }
+
+    std::lock_guard<std::mutex> lock( mutex );
+    cache[metaFile.string()] = { stamp, meta };
+    return meta;
+}
+
 } // namespace
+
+
+nlohmann::json KopenapiModelFindings( BOARD* aBoard, const FOOTPRINT* aFootprint )
+{
+    namespace fs = std::filesystem;
+
+    nlohmann::json out = nlohmann::json::array();
+    PROJECT*       project = aBoard->GetProject();
+    S3D_CACHE*     cache = project ? PROJECT_PCB::Get3DCacheManager( project ) : nullptr;
+    wxString       basePath;
+    bool           shown = false;
+
+    if( project )
+    {
+        try
+        {
+            if( std::optional<LIBRARY_TABLE_ROW*> row =
+                        PROJECT_PCB::FootprintLibAdapter( project )->GetRow( aFootprint->GetFPID().GetLibNickname() ) )
+            {
+                basePath = LIBRARY_MANAGER::GetFullURI( *row, true );
+            }
+        }
+        catch( ... )
+        {
+        }
+    }
+
+    auto finding = [&]( const std::string& aKind, const std::string& aSeverity, int aModel, const wxString& aFile,
+                        const std::string& aMessage )
+    {
+        out.push_back( { { "kind", aKind }, { "severity", aSeverity }, { "model", aModel }, { "file", str( aFile ) },
+                         { "message", aMessage } } );
+    };
+
+    std::set<wxString> numberedPads;
+
+    for( const PAD* pad : aFootprint->Pads() )
+    {
+        if( !pad->GetNumber().IsEmpty() )
+            numberedPads.insert( pad->GetNumber() );
+    }
+
+    int index = 0;
+
+    for( const FP_3DMODEL& m : aFootprint->Models() )
+    {
+        index++;
+
+        if( m.m_Filename.IsEmpty() )
+            continue;
+
+        shown |= m.m_Show;
+
+        if( m.m_Filename.StartsWith( EMBED_URI ) )
+        {
+            const wxString name = m.m_Filename.Mid( EMBED_URI.length() );
+            const bool     carried = ( aFootprint->GetEmbeddedFiles() && aFootprint->GetEmbeddedFiles()->GetEmbeddedFile( name ) )
+                                 || ( aBoard->GetEmbeddedFiles() && aBoard->GetEmbeddedFiles()->GetEmbeddedFile( name ) );
+
+            if( !carried )
+                finding( "model_missing", "error", index, m.m_Filename, "embedded model file is not in the footprint or the board" );
+
+            continue;
+        }
+
+        const wxString resolved = cache ? cache->GetResolver()->ResolvePath( m.m_Filename, basePath, {} ) : wxString();
+
+        if( resolved.IsEmpty() || !wxFileName::FileExists( resolved ) )
+        {
+            std::string message = "model file not found (KiCad's 3D search paths)";
+
+            if( m.m_Filename.Lower().EndsWith( wxS( ".wrl" ) ) && cache )
+            {
+                wxString step = m.m_Filename.BeforeLast( '.' ) + wxS( ".step" );
+
+                if( !cache->GetResolver()->ResolvePath( step, basePath, {} ).IsEmpty() )
+                    message += "; a .step of the same name exists (the GUI offers to migrate, kicad-cli substitutes it)";
+            }
+
+            finding( "model_missing", m.m_Show ? "error" : "warning", index, m.m_Filename, message );
+            continue;
+        }
+
+        const fs::path   file( str( resolved ) );
+        const MODEL_META meta = modelMeta( file );
+
+        if( !meta.present )
+            continue;
+
+        // the hash is read only when the model is newer than its metadata
+        std::error_code ec;
+        fs::path        metaFile = file;
+        metaFile.replace_extension( ".meta.json" );
+
+        const auto modelTime = fs::last_write_time( file, ec );
+        const auto metaTime = ec ? modelTime : fs::last_write_time( metaFile, ec );
+
+        if( !meta.sha256.empty() && !ec && modelTime > metaTime && fileSha256( file ) != meta.sha256 )
+        {
+            finding( "model_meta_stale", "warning", index, m.m_Filename,
+                     "the model changed after its metadata (" + metaFile.filename().string()
+                             + " model_sha256 differs): seating, heights and colours may be wrong" );
+        }
+
+        if( meta.leads > 0 && !numberedPads.empty() && meta.leads > (int) numberedPads.size() )
+        {
+            finding( "model_lead_count", "warning", index, m.m_Filename,
+                     "the model has " + std::to_string( meta.leads ) + " leads, the footprint "
+                             + std::to_string( numberedPads.size() ) + " numbered pads: model of another package?" );
+        }
+    }
+
+    if( !shown && !aFootprint->IsBoardOnly() && !numberedPads.empty() )
+        finding( "no_model", "info", 0, wxEmptyString, "no shown 3D model" );
+
+    return out;
+}
+
+
+FOOTPRINT_LIBRARY_ADAPTER* KopenapiFootprintLibraries( PROJECT* aProject )
+{
+    FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( aProject );
+    adapter->AsyncLoad();
+    KopenapiWaitLibraries( adapter );
+    return adapter;
+}
 
 
 static KOPENAPI_RESULT h_pcb_footprint_update( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
@@ -254,7 +488,7 @@ static KOPENAPI_RESULT h_pcb_footprint_lib_diff( KOPENAPI_CONTEXT& aCtx, const n
     BOARD*                     board = context->GetBoard();
     std::vector<std::string>   missing;
     std::vector<FOOTPRINT*>    fps = named( board, aArgs, true, missing );
-    FOOTPRINT_LIBRARY_ADAPTER* adapter = loadedLibraries( board );
+    FOOTPRINT_LIBRARY_ADAPTER* adapter = KopenapiFootprintLibraries( board->GetProject() );
     const bool                 all = aArgs.value( "include_same", false );
 
     std::map<LIB_ID, std::shared_ptr<FOOTPRINT>> cache;
@@ -310,7 +544,7 @@ static KOPENAPI_RESULT h_pcb_footprint_lib_update( KOPENAPI_CONTEXT& aCtx, const
     if( fps.empty() )
         return KOPENAPI_RESULT::Error( 404, missing.empty() ? "give ref or refs (the footprints to update)" : "no footprint " + missing.front() );
 
-    loadedLibraries( board );
+    KopenapiFootprintLibraries( board->GetProject() );
 
     const bool dryRun = aArgs.value( "dry_run", false );
     const bool keepTexts = aArgs.value( "keep_texts", true );
@@ -333,6 +567,25 @@ static KOPENAPI_RESULT h_pcb_footprint_lib_update( KOPENAPI_CONTEXT& aCtx, const
         }
 
         nlohmann::json diff = differences( fp, lib );
+
+        if( keepModels )
+        {
+            nlohmann::json models = modelDifferences( fp, lib );
+
+            if( !models.empty() )
+            {
+                row["models_kept"] = models;
+                nlohmann::json rest = nlohmann::json::array();
+
+                for( const nlohmann::json& line : diff )
+                {
+                    if( std::find( models.begin(), models.end(), line ) == models.end() )
+                        rest.push_back( line );
+                }
+
+                diff = rest;
+            }
+        }
 
         if( diff.empty() || dryRun )
         {
@@ -376,6 +629,87 @@ static KOPENAPI_RESULT h_pcb_footprint_lib_update( KOPENAPI_CONTEXT& aCtx, const
 }
 
 
+static KOPENAPI_RESULT h_pcb_parts_check( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*                     board = context->GetBoard();
+    std::vector<std::string>   missing;
+    std::vector<FOOTPRINT*>    fps = named( board, aArgs, true, missing );
+    const bool                 checkLibrary = aArgs.value( "library", true );
+    const bool                 problemsOnly = aArgs.value( "problems_only", true );
+    FOOTPRINT_LIBRARY_ADAPTER* adapter = checkLibrary ? KopenapiFootprintLibraries( board->GetProject() ) : nullptr;
+
+    std::map<LIB_ID, std::shared_ptr<FOOTPRINT>> cache;
+    std::map<std::string, int>                   counts;
+    std::vector<nlohmann::json>                  rows;
+    int                                          problems = 0;
+
+    for( FOOTPRINT* fp : fps )
+    {
+        nlohmann::json row = { { "ref", str( fp->GetReference() ) }, { "lib_id", str( fp->GetFPID().Format() ) } };
+        nlohmann::json findings = nlohmann::json::array();
+
+        if( adapter )
+        {
+            std::string                status;
+            std::shared_ptr<FOOTPRINT> lib = libraryCopy( adapter, fp->GetFPID(), status, cache );
+
+            if( lib )
+            {
+                nlohmann::json diff = differences( fp, lib.get() );
+
+                if( !diff.empty() )
+                {
+                    findings.push_back( { { "kind", "library_differs" }, { "severity", "warning" },
+                                          { "message", "placed footprint differs from its library copy" },
+                                          { "differences", diff } } );
+                }
+            }
+            else if( status != "no_library_name" || !fp->IsBoardOnly() )
+            {
+                findings.push_back( { { "kind", "library_" + status }, { "severity", "error" },
+                                      { "message", status == "not_in_library" ? "footprint not in its library"
+                                                   : status == "library_missing" ? "library not in the library tables"
+                                                                                 : "footprint has no library name" } } );
+            }
+        }
+
+        for( const nlohmann::json& f : KopenapiModelFindings( board, fp ) )
+            findings.push_back( f );
+
+        bool problem = false;
+
+        for( const nlohmann::json& f : findings )
+        {
+            counts[f["kind"].get<std::string>()]++;
+            problem |= f["severity"] != "info";
+        }
+
+        problems += problem ? 1 : 0;
+
+        if( problemsOnly && !problem )
+            continue;
+
+        row["findings"] = findings;
+        rows.push_back( std::move( row ) );
+    }
+
+    nlohmann::json result = KopenapiPage( rows, aArgs );
+    result["checked"] = fps.size();
+    result["with_problems"] = problems;
+    result["counts"] = counts;
+
+    if( !missing.empty() )
+        result["missing"] = missing;
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
+
 KOPENAPI_REGISTER( "pcb_footprint_update",
                    "Change a placed footprint's properties (ref or refs): type (smd / through_hole / "
                    "unspecified), lib_id (relink to another library footprint; the copper stays), board_only, "
@@ -391,8 +725,10 @@ KOPENAPI_REGISTER( "pcb_footprint_update",
 KOPENAPI_REGISTER( "pcb_footprint_lib_diff",
                    "How placed footprints differ from their library copies (DRC's lib_footprint_mismatch / "
                    "lib_footprint_issues, explained): per footprint status (same, differs, not_in_library, "
-                   "library_missing, no_library_name) and the differences KiCad finds (pads, graphics, "
-                   "attributes, 3D models); default every footprint, only those not the same",
+                   "library_missing, no_library_name) and KiCad's differences (pads, graphics, attributes, "
+                   "rule areas, 3D models: file, offset, rotation, scale, opacity, shown, embedded content), as "
+                   "DRC lib_footprint_mismatch sees them; always against the library files as they are on disk now; "
+                   "default every footprint, only those not the same",
                    R"json({"type":"object","properties":{
                         "ref":{"type":"string"},"refs":{"type":"array","items":{"type":"string"}},
                         "include_same":{"type":"boolean","default":false}}})json"_json,
@@ -402,12 +738,30 @@ KOPENAPI_REGISTER( "pcb_footprint_lib_update",
                    "Replace placed footprints (ref or refs) by their library copies, as \"Update Footprints "
                    "from Library\": position, side, nets and fields stay, pads matched by position; texts keep "
                    "the board's place and look (keep_texts false: the library's); 3D models from the "
-                   "library unless keep_3d_models; dry_run lists what would change; one undo step",
+                   "library unless keep_3d_models (then model differences alone update nothing and are listed "
+                   "as models_kept); always the library files as they are on disk now; dry_run lists what would "
+                   "change; one undo step",
                    R"json({"type":"object","properties":{
                         "ref":{"type":"string"},"refs":{"type":"array","items":{"type":"string"}},
                         "keep_texts":{"type":"boolean","default":true},
                         "keep_3d_models":{"type":"boolean","default":false},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_footprint_lib_update, 300 );
+
+KOPENAPI_REGISTER( "pcb_parts_check",
+                   "Placed footprint <-> library <-> 3D model, one fast pass (default every footprint, "
+                   "only those with problems): library_differs (KiCad's comparison incl. 3D models: file, "
+                   "offset, rotation, scale, opacity, shown, embedded content; the library file as it is on "
+                   "disk now), library_not_in_library / library_library_missing / library_no_library_name, "
+                   "model_missing (not resolved through KiCad's 3D search paths, embedded file absent), "
+                   "model_meta_stale (<model>.meta.json model_sha256 differs from the model), "
+                   "model_lead_count (metadata leads > numbered pads), no_model (info). Symbol <-> footprint: "
+                   "sch_footprint_check (library) and design_parity (placed); pcb_drc and design_parity include "
+                   "this check",
+                   KopenapiPagedSchema( R"json({
+                        "ref":{"type":"string"},"refs":{"type":"array","items":{"type":"string"}},
+                        "library":{"type":"boolean","default":true,"description":"compare with the library copies"},
+                        "problems_only":{"type":"boolean","default":true}})json"_json ),
+                   false, h_pcb_parts_check, 300 );
 
 KOPENAPI_MARK_EDITING( "pcb_footprint_update", "pcb_footprint_lib_update" );

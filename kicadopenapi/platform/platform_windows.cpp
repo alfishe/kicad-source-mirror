@@ -422,6 +422,16 @@ void LowerCurrentThreadPriorityWindows()
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 }
 
+void KeepProcessResponsiveWindows()
+{
+    // EcoQoS for background processes (Windows 11): execution speed throttling off
+    PROCESS_POWER_THROTTLING_STATE state = {};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    state.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+}
+
 } // namespace kopenapi::platform
 
 #endif // _WIN32

@@ -42,7 +42,9 @@ static KOPENAPI_RESULT h_pcb_select( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     for( const nlohmann::json& u : aArgs.value( "uuids", nlohmann::json::array() ) )
     {
-        if( BOARD_ITEM* item = board->ResolveItem( KIID( u.get<std::string>() ), true ) )
+        std::string error;
+
+        if( BOARD_ITEM* item = u.is_string() ? KopenapiResolveUuid( board, u.get<std::string>(), error ) : nullptr )
         {
             tool->AddItemToSel( item );
             ++selected;

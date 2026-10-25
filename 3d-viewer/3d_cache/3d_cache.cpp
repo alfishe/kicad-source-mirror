@@ -21,6 +21,7 @@
 
 #define GLM_FORCE_RADIANS
 
+#include <kiplatform/io.h>
 #include <condition_variable>
 #include <mutex>
 #include <utility>
@@ -80,7 +81,7 @@ public:
     void SetHash( const HASH_128& aHash );
     const wxString GetCacheBaseName();
 
-    wxDateTime    modTime;      // file modification time
+    long long     modTime = 0;  // KIPLATFORM::IO::TimestampFile of the file when read
     HASH_128      m_hash;
     std::string   pluginInfo;   // PluginName:Version string
     SCENEGRAPH*   sceneData;
@@ -244,12 +245,10 @@ SCENEGRAPH* S3D_CACHE::load( const wxString& aModelFile, const wxString& aBasePa
         S3D_CACHE_ENTRY* entry = mi->second;
         cv3D_cache.wait( lock, [entry]() { return !entry->loading; } );
 
-        wxFileName fname( full3Dpath );
-
-        if( fname.FileExists() )    // Only check if file exists. If not, it will
-        {                           // use the same model in cache.
-            bool       reload = ADVANCED_CFG::GetCfg().m_Skip3DModelMemoryCache;
-            wxDateTime fmdate = fname.GetModificationTime();
+        // a missing file keeps the model in the cache
+        if( const long long fmdate = KIPLATFORM::IO::TimestampFile( full3Dpath ); fmdate != 0 )
+        {
+            bool reload = ADVANCED_CFG::GetCfg().m_Skip3DModelMemoryCache;
 
             if( fmdate != mi->second->modTime )
             {
@@ -325,7 +324,7 @@ SCENEGRAPH* S3D_CACHE::checkCache( const wxString& aFileName, S3D_CACHE_ENTRY** 
 
     HASH_128   hashSum;
     wxFileName fname( aFileName );
-    ep->modTime = fname.GetModificationTime();
+    ep->modTime = KIPLATFORM::IO::TimestampFile( aFileName );
 
     if( getHash( aFileName, hashSum ) && !m_CacheDir.empty() )
     {

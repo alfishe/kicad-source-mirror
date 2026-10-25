@@ -352,11 +352,12 @@ static KOPENAPI_RESULT h_pcb_lib_footprint_get( KOPENAPI_CONTEXT& aCtx, const nl
     if( id.empty() || libId.Parse( wxString::FromUTF8( id ) ) >= 0 || libId.GetLibNickname().empty() )
         return KOPENAPI_RESULT::Error( 400, "give 'lib_id' as LIBRARY:FOOTPRINT" );
 
-    FOOTPRINT_LIBRARY_ADAPTER* adapter = loadedAdapter( aCtx );
+    PROJECT* project = libraryProject( aCtx );
 
-    if( !adapter )
+    if( !project )
         return KOPENAPI_RESULT::Error( 503, "no project to read library tables from" );
 
+    FOOTPRINT_LIBRARY_ADAPTER* adapter = KopenapiFootprintLibraries( project );
     std::unique_ptr<FOOTPRINT> fp;
 
     try
@@ -456,7 +457,8 @@ KOPENAPI_REGISTER( "pcb_lib_footprint_search",
 KOPENAPI_REGISTER( "pcb_lib_footprint_get",
                    "Library footprint card by lib_id (LIBRARY:FOOTPRINT): description, keywords, every pad "
                    "(number, attribute, shape, position, size, drill in mm), courtyard size, 3D models, "
-                   "used_in_design, panel_edge of edge connectors (where it faces, depth, overhang)",
+                   "used_in_design, panel_edge of edge connectors (where it faces, depth, overhang); the library "
+                   "read again when its files changed on disk",
                    R"json({"type":"object","required":["lib_id"],"properties":{
                         "lib_id":{"type":"string","description":"e.g. Package_TO_SOT_SMD:SOT-223-3_TabPin2"},
                         "edge_method":{"type":"string","enum":["auto","marker","infer"],"default":"auto","description":"panel_edge from the footprint's marker, inferred from its body, or marker else inferred"}}})json"_json,

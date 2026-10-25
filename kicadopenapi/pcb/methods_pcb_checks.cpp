@@ -8,7 +8,9 @@
 /// zones are refilled only when asked (that does change the board).
 #include "kopenapi_pcb.h"
 
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <set>
 
 #include <api/pcb_context.h>
@@ -24,11 +26,50 @@
 #include <footprint.h>
 #include <footprint_library_adapter.h>
 #include <kicadopenapi_checks.h>
+#include <kicadopenapi_jobs.h>
 #include <pcb_marker.h>
 #include <project_pcb.h>
 #include <tool/tool_manager.h>
 #include <tools/zone_filler_tool.h>
 #include <zone.h>
+
+
+namespace
+{
+
+/// @brief The DRC engine's log: which test provider runs now (any thread)
+class DRC_PROVIDER_WATCH : public REPORTER
+{
+public:
+    using REPORTER::Report;
+
+    REPORTER& Report( const wxString& aText, SEVERITY ) override
+    {
+        static const wxString run = wxS( "Run DRC provider: '" );
+
+        if( aText.StartsWith( run ) )
+        {
+            std::lock_guard<std::mutex> lock( m_mutex );
+            m_provider = aText.Mid( run.length() ).BeforeLast( '\'' ).ToStdString( wxConvUTF8 );
+            m_index++;
+        }
+
+        return *this;
+    }
+
+    std::pair<std::string, int> Current() const
+    {
+        std::lock_guard<std::mutex> lock( m_mutex );
+        return { m_provider, m_index };
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::string        m_provider;
+    int                m_index = 0;
+};
+
+} // namespace
 
 
 static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
@@ -59,11 +100,7 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     toolManager->RunAction( ACTIONS::selectionClear );
 
     // DRC needs the footprint libraries (library footprint mismatch checks)
-    FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( board->GetProject() );
-    adapter->AsyncLoad();
-    KopenapiWaitLibraries( adapter );
-
-    KOPENAPI_KEEPALIVE_REPORTER reporter;
+    KopenapiFootprintLibraries( board->GetProject() );
 
     std::shared_ptr<DRC_ENGINE> engine = board->GetDesignSettings().m_DRCEngine;
 
@@ -84,8 +121,44 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         if( !toolManager->FindTool( ZONE_FILLER_TOOL_NAME ) )
             toolManager->RegisterTool( new ZONE_FILLER_TOOL );
 
-        toolManager->GetTool<ZONE_FILLER_TOOL>()->FillAllZones( nullptr, &reporter, true );
+        KOPENAPI_PROGRESS_REPORTER fillReporter(
+                []( const std::string& aMessage, int aPhase, double aFraction )
+                {
+                    return KopenapiJobProgress( "zones_fill " + std::to_string( aPhase ), (int) std::lround( aFraction * 1000 ),
+                                                1000, aMessage, { { "step", aPhase } } );
+                } );
+
+        toolManager->GetTool<ZONE_FILLER_TOOL>()->FillAllZones( nullptr, &fillReporter, true );
     }
+
+    // progress: the test provider at work, its share done, violations so far by severity (before
+    // exclusions)
+    std::vector<SEVERITY> severityOf( DRCE_LAST + 1, RPT_SEVERITY_ERROR );
+
+    for( int code = DRCE_FIRST; code <= DRCE_LAST; ++code )
+        severityOf[code] = board->GetDesignSettings().GetSeverity( code );
+
+    const int                    providers = (int) engine->GetTestProviders().size();
+    std::atomic<int>             errors{ 0 }, warnings{ 0 };
+    DRC_PROVIDER_WATCH           watch;
+
+    KOPENAPI_PROGRESS_REPORTER reporter(
+            [&]( const std::string& aMessage, int, double aFraction )
+            {
+                const auto [provider, index] = watch.Current();
+                const double fraction = providers > 0 ? std::clamp( ( std::max( index - 1, 0 ) + ( index > 0 ? aFraction : 0.0 ) )
+                                                                    / providers, 0.0, 1.0 ) : 0.0;
+                const nlohmann::json counts = { { "provider", provider },
+                                                { "provider_index", index },
+                                                { "providers", providers },
+                                                { "fraction", std::round( fraction * 1000 ) / 1000 },
+                                                { "violations", { { "error", errors.load() },
+                                                                  { "warning", warnings.load() },
+                                                                  { "total", errors.load() + warnings.load() } } } };
+
+                return KopenapiJobProgress( index > 0 ? "drc " + provider : std::string( "drc setup" ),
+                                            (int) std::lround( aFraction * 1000 ), 1000, aMessage, counts );
+            } );
 
     BOARD_COMMIT commit( toolManager );
 
@@ -96,6 +169,10 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                 PCB_MARKER* marker = new PCB_MARKER( aItem, aPos, aLayer );
                 aPathGenerator( marker );
                 commit.Add( marker );
+
+                const int      code = aItem->GetErrorCode();
+                const SEVERITY severity = code >= 0 && code <= DRCE_LAST ? severityOf[code] : RPT_SEVERITY_ERROR;
+                ( severity == RPT_SEVERITY_ERROR ? errors : warnings ) += severity == RPT_SEVERITY_IGNORE ? 0 : 1;
             } );
 
     board->RecordDRCExclusions();
@@ -103,8 +180,12 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     // Every track error by default: with one error per track KiCad keeps whichever segment its
     // threads report first, so repeated runs differ (seen on Sprinter DX: 2..4 clearance errors)
     engine->SetProgressReporter( &reporter );
+    engine->SetLogReporter( &watch );
     engine->RunTests( EDA_UNITS::MM, aArgs.value( "all_track_errors", true ), false );
+    engine->SetLogReporter( nullptr );
     engine->SetProgressReporter( nullptr );
+
+    const bool stopped = reporter.IsCancelled();
     engine->ClearViolationHandler();
 
     commit.Push( _( "DRC" ), SKIP_UNDO | SKIP_SET_DIRTY );
@@ -209,6 +290,40 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     if( !excluded.empty() )
         result["excluded_within_footprint"] = excluded;
+
+    // the ratsnest's count beside DRC's unconnected_items (which leaves out excluded ones)
+    const KOPENAPI_UNROUTED open = KopenapiUnrouted( board );
+    result["summary"]["unrouted_connections"] = open.connections;
+    result["summary"]["unrouted_nets"] = open.nets;
+    result["summary"]["zone_fills"] = open.zoneFills;
+
+    // a job stopped (job_cancel): the providers run so far, the rest not
+    result["stopped"] = stopped;
+
+    // 3D model files and their metadata (KiCad's DRC has no such test; the library side,
+    // models included, is its lib_footprint_mismatch)
+    if( aArgs.value( "model_checks", true ) )
+    {
+        nlohmann::json             items = nlohmann::json::array();
+        std::map<std::string, int> counts;
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            for( nlohmann::json& f : KopenapiModelFindings( board, fp ) )
+            {
+                if( f["severity"] == "info" )
+                    continue;
+
+                counts[f["kind"].get<std::string>()]++;
+                f["ref"] = fp->GetReference().ToStdString( wxConvUTF8 );
+
+                if( items.size() < 100 )
+                    items.push_back( std::move( f ) );
+            }
+        }
+
+        result["model_findings"] = { { "counts", counts }, { "items", items } };
+    }
 
     return KOPENAPI_RESULT::Ok( result );
 }
@@ -316,9 +431,12 @@ KOPENAPI_REGISTER( "pcb_drc",
                    "`kicad-cli pcb drc`: summary by severity and type, violations (type, severity, "
                    "description, items with uuid and position in mm), unconnected items, ignored checks; "
                    "filter by severity and type glob; paginated; refill_zones refills copper first "
-                   "(changes the board). For schematic parity use design_parity",
+                   "(changes the board); the footprint libraries the board uses read again when their files changed "
+                   "on disk (lib_footprint_mismatch against the current files, 3D models included); model_findings: 3D model "
+                   "files not found and stale / mismatching <model>.meta.json (pcb_parts_check). For schematic parity use design_parity",
                    KopenapiCheckSchema( R"json({
                         "refill_zones":{"type":"boolean","default":false,"description":"refill all zones first (modifies the board)"},
+                        "model_checks":{"type":"boolean","default":true,"description":"model_findings: 3D model files and metadata"},
                         "all_track_errors":{"type":"boolean","default":true,"description":"report every track error (deterministic); false = one per track like the CLI default, which varies between runs"},
                         "exclude_within_footprint":{"oneOf":[{"type":"boolean"},{"type":"array","items":{"type":"string"}}],"default":false,"description":"leave out violations whose items all belong to one footprint (a library part against itself, e.g. pads near its own pegs): true for every footprint or a list of references; they are listed in excluded_within_footprint"}})json"_json ),
                    false, h_pcb_drc, 600 );

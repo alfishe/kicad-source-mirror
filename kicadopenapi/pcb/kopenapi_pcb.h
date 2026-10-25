@@ -15,9 +15,11 @@
 #include <string>
 
 #include <math/box2.h>
+#include <wx/string.h>
 
 #include <kicadopenapi_registry.h>
 
+class BOARD;
 class FOOTPRINT;
 class FP_3DMODEL;
 class PCB_CONTEXT;
@@ -45,6 +47,26 @@ class PCB_BASE_FRAME;
 /// @brief Refresh the board's open 3D viewer after an edit: the current picture stays until the
 /// new scene is complete (no flashing); nothing when no viewer is open
 void KopenapiRefresh3D( PCB_BASE_FRAME* aFrame );
+
+class EDA_ITEM;
+
+/// @brief Set / clear an item's brightening in the board view (a footprint with its children);
+/// a recolour only, the cached geometry stays
+void KopenapiPcbBrighten( PCB_BASE_FRAME* aFrame, EDA_ITEM* aItem, bool aOn );
+
+class FOOTPRINT_LIBRARY_ADAPTER;
+
+/// @brief The project's footprint libraries, loaded (waits for a load in progress).  Footprints
+/// read through the adapter are the files on disk now: LoadFootprint() re-reads a footprint
+/// whose file changed (one file query per load).
+FOOTPRINT_LIBRARY_ADAPTER* KopenapiFootprintLibraries( PROJECT* aProject );
+
+/// @brief Findings on a placed footprint's 3D models, each {kind, severity, model (1-based),
+/// file, message}: model_missing (not resolved through KiCad's 3D search paths, or an embedded
+/// file neither the footprint nor the board carries), model_meta_stale (<model>.meta.json
+/// model_sha256 differs; hashed only when the model is newer than its metadata),
+/// model_lead_count (the metadata's lead solids exceed the numbered pads), no_model (info)
+nlohmann::json KopenapiModelFindings( BOARD* aBoard, const FOOTPRINT* aFootprint );
 
 /// @brief An edge connector's panel line for footprint cards.
 /// @param aMethod auto (marker, else inferred from the body), marker, infer
@@ -75,8 +97,49 @@ nlohmann::json KopenapiPanelEdgeJson( FOOTPRINT* aFootprint, const std::string& 
 class BOARD;
 class BOARD_ITEM;
 
-/// @brief A board item by uuid, a footprint by reference, a pad as REF.NUMBER; nullptr if none
+/// @brief A board item by uuid (or a unique uuid prefix), a footprint by reference, a pad as
+/// REF.NUMBER; nullptr if none
 BOARD_ITEM* KopenapiFindBoardItem( BOARD* aBoard, const std::string& aRef );
+
+/// @brief The board item (footprint children and zones inside footprints included) whose uuid is
+/// aId or starts with it (at least 4 characters, case-insensitive).  nullptr with aError set when
+/// none matches, or when a prefix fits several ("ambiguous: ...", the candidates listed).
+BOARD_ITEM* KopenapiResolveUuid( BOARD* aBoard, const std::string& aId, std::string& aError );
+
+/// @brief KopenapiResolveUuid over the given items only (the zones of a zone method, the tracks of
+/// a track method)
+BOARD_ITEM* KopenapiMatchUuid( const std::vector<BOARD_ITEM*>& aItems, const std::string& aId, std::string& aError );
+
+class SHAPE_POLY_SET;
+
+/// @brief Where a net's pours put its copper on one copper layer, priorities resolved as the zone
+/// filler does: the outlines of the net's zones (board and footprint ones), each less the outlines
+/// of other nets' zones on that layer that win over it (ZONE::HigherPriority: priority, then uuid)
+/// and of keep-outs barring pours there, clipped to the board.  Outlines, not fills: no
+/// clearances around other copper.  Empty when the net has no zone there.
+void KopenapiNetDomain( BOARD* aBoard, int aNetCode, int aLayer, SHAPE_POLY_SET& aOut );
+
+/// @brief Open connections as KiCad's ratsnest counts them, the one figure every method reports:
+/// connections = ratsnest edges (airwires) over every net after a connectivity rebuild, with the
+/// zones as they are filled now; nets = nets with one or more; zone_fills: "none" (no copper zone),
+/// "filled", "stale" (a zone changed since its fill) or "unfilled" (a copper zone without fill:
+/// what it would join counts as open)
+struct KOPENAPI_UNROUTED
+{
+    int         connections = 0;
+    int         nets = 0;
+    std::string zoneFills;
+};
+
+KOPENAPI_UNROUTED KopenapiUnrouted( BOARD* aBoard, bool aRebuild = true );
+
+/// @brief KopenapiUnrouted as answer fields: unrouted_connections, unrouted_nets, zone_fills and
+/// unrouted_left (the same number as unrouted_connections, kept for older callers)
+nlohmann::json KopenapiUnroutedJson( BOARD* aBoard, bool aRebuild = true );
+
+/// @brief Fill state of the board's copper zones as in KOPENAPI_UNROUTED::zoneFills; aStale gets
+/// the zones (name or net, uuid) that are not filled or need a refill
+std::string KopenapiZoneFillState( BOARD* aBoard, nlohmann::json* aStale = nullptr );
 
 class PCB_TRACK;
 

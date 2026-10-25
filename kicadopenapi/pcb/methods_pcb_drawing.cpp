@@ -54,15 +54,7 @@ struct DRAW_GLOW_TRAITS
         return aFrame->GetBoard() ? aFrame->GetBoard()->ResolveItem( aId, true ) : nullptr;
     }
 
-    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn )
-    {
-        if( aOn )
-            aItem->SetBrightened();
-        else
-            aItem->ClearBrightened();
-
-        aFrame->GetCanvas()->GetView()->Update( aItem, KIGFX::REPAINT );
-    }
+    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn ) { KopenapiPcbBrighten( aFrame, aItem, aOn ); }
 
     static BOX2I Box( EDA_ITEM* aItem ) { return aItem->GetBoundingBox(); }
     static int   Mm() { return pcbIUScale.mmToIU( 1.0 ); }
@@ -300,16 +292,12 @@ std::vector<BOARD_ITEM*> drawingsByUuid( BOARD* aBoard, const nlohmann::json& aU
 {
     std::vector<BOARD_ITEM*> out;
 
+    const std::vector<BOARD_ITEM*> drawings( aBoard->Drawings().begin(), aBoard->Drawings().end() );
+
     for( const nlohmann::json& u : aUuids )
     {
-        const KIID id( wxString::FromUTF8( u.get<std::string>() ) );
-        BOARD_ITEM* found = nullptr;
-
-        for( BOARD_ITEM* item : aBoard->Drawings() )
-        {
-            if( item->m_Uuid == id )
-                found = item;
-        }
+        std::string error;
+        BOARD_ITEM* found = u.is_string() ? KopenapiMatchUuid( drawings, u.get<std::string>(), error ) : nullptr;
 
         if( found )
             out.push_back( found );

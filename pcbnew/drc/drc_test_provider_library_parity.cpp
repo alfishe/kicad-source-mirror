@@ -34,6 +34,8 @@
 #include <drc/drc_test_provider.h>
 #include <project_pcb.h>
 #include <string_utils.h>
+#include <wildcards_and_files_ext.h>
+#include <embedded_files.h>
 
 
 /*
@@ -808,11 +810,147 @@ bool footprintVsBoardStackup( const FOOTPRINT& aFp, const BOARD& aBoard, REPORTE
 }
 
 
+bool FOOTPRINT::ModelsNeedUpdate( const FOOTPRINT* aLibFP, REPORTER* aReporter ) const
+{
+    wxCHECK( aLibFP, false );
+
+    // A THT lead-trim cut (<project>/3dmodels/.trimmed/, placed right after the generic model it
+    // hides) is a per-board assembly variant, not a library difference: compare the generic one.
+    const wxString trimmedPrefix = wxS( "${KIPRJMOD}/3dmodels/.trimmed/" );
+    const std::vector<FP_3DMODEL>& board = Models();
+    std::vector<FP_3DMODEL>        mine;
+
+    for( size_t ii = 0; ii < board.size(); ++ii )
+    {
+        if( board[ii].m_Filename.StartsWith( trimmedPrefix ) )
+            continue;
+
+        mine.push_back( board[ii] );
+
+        if( ii + 1 < board.size() && board[ii + 1].m_Filename.StartsWith( trimmedPrefix ) )
+            mine.back().m_Show = true;
+    }
+
+    const std::vector<FP_3DMODEL>& lib = aLibFP->Models();
+    bool                           diff = false;
+
+    auto report =
+            [&]( const wxString& aMsg )
+            {
+                diff = true;
+
+                if( aReporter )
+                    aReporter->Report( aMsg );
+            };
+
+    if( mine.size() != lib.size() )
+    {
+        report( wxString::Format( _( "3D model count differs (%zu here, %zu in library)." ),
+                                  mine.size(), lib.size() ) );
+        return diff;
+    }
+
+    auto differs =
+            []( const VECTOR3D& a, const VECTOR3D& b )
+            {
+                const double eps = 1e-6;
+                return std::abs( a.x - b.x ) > eps || std::abs( a.y - b.y ) > eps
+                       || std::abs( a.z - b.z ) > eps;
+            };
+
+    auto triple =
+            []( const VECTOR3D& v )
+            {
+                return wxString::Format( wxS( "%g, %g, %g" ), v.x, v.y, v.z );
+            };
+
+    const wxString embedPrefix = wxString( FILEEXT::KiCadUriPrefix ) + wxS( "://" );
+
+    for( size_t ii = 0; ii < mine.size(); ++ii )
+    {
+        const FP_3DMODEL& a = mine[ii];
+        const FP_3DMODEL& b = lib[ii];
+        const int         n = (int) ii + 1;
+
+        if( a.m_Filename != b.m_Filename )
+        {
+            report( wxString::Format( _( "3D model %d file differs: '%s' here, '%s' in library." ),
+                                      n, a.m_Filename, b.m_Filename ) );
+        }
+        else if( a.m_Filename.StartsWith( embedPrefix ) )
+        {
+            const wxString name = a.m_Filename.Mid( embedPrefix.length() );
+            const EMBEDDED_FILES::EMBEDDED_FILE* fa = GetEmbeddedFiles()
+                                                              ? GetEmbeddedFiles()->GetEmbeddedFile( name )
+                                                              : nullptr;
+            const EMBEDDED_FILES::EMBEDDED_FILE* fb = aLibFP->GetEmbeddedFiles()
+                                                              ? aLibFP->GetEmbeddedFiles()->GetEmbeddedFile( name )
+                                                              : nullptr;
+            bool same = fa && fb;
+
+            if( same && !fa->data_hash.empty() && !fb->data_hash.empty() )
+                same = fa->data_hash == fb->data_hash;
+            else if( same )
+                same = fa->compressedEncodedData == fb->compressedEncodedData;
+
+            if( !same && ( fa || fb ) )
+            {
+                report( wxString::Format( _( "3D model %d embedded file '%s' differs from library." ),
+                                          n, name ) );
+            }
+        }
+
+        if( differs( a.m_Offset, b.m_Offset ) )
+        {
+            report( wxString::Format( _( "3D model %d offset differs: (%s) here, (%s) in library." ),
+                                      n, triple( a.m_Offset ), triple( b.m_Offset ) ) );
+        }
+
+        if( differs( a.m_Rotation, b.m_Rotation ) )
+        {
+            report( wxString::Format( _( "3D model %d rotation differs: (%s) here, (%s) in library." ),
+                                      n, triple( a.m_Rotation ), triple( b.m_Rotation ) ) );
+        }
+
+        if( differs( a.m_Scale, b.m_Scale ) )
+        {
+            report( wxString::Format( _( "3D model %d scale differs: (%s) here, (%s) in library." ),
+                                      n, triple( a.m_Scale ), triple( b.m_Scale ) ) );
+        }
+
+        if( std::abs( a.m_Opacity - b.m_Opacity ) > 1e-6 )
+        {
+            report( wxString::Format( _( "3D model %d opacity differs: %g here, %g in library." ),
+                                      n, a.m_Opacity, b.m_Opacity ) );
+        }
+
+        if( a.m_Show != b.m_Show )
+        {
+            report( a.m_Show ? wxString::Format( _( "3D model %d is shown here, hidden in library." ), n )
+                             : wxString::Format( _( "3D model %d is hidden here, shown in library." ), n ) );
+        }
+
+        if( diff && !aReporter )
+            return diff;
+    }
+
+    return diff;
+}
+
+
 bool FOOTPRINT::FootprintNeedsUpdate( const FOOTPRINT* aLibFP, int aCompareFlags,
                                       REPORTER* aReporter )
 {
     wxASSERT( aLibFP );
     bool diff = false;
+
+    if( ModelsNeedUpdate( aLibFP, aReporter ) )
+    {
+        diff = true;
+
+        if( !aReporter )
+            return diff;
+    }
 
     std::unique_ptr<FOOTPRINT> temp( static_cast<FOOTPRINT*>( aLibFP->Clone() ) );
 

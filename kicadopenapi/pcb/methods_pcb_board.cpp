@@ -125,26 +125,7 @@ struct PCB_GLOW_TRAITS
         return aFrame->GetBoard() ? aFrame->GetBoard()->ResolveItem( aId, true ) : nullptr;
     }
 
-    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn )
-    {
-        KIGFX::VIEW* view = aFrame->GetCanvas()->GetView();
-
-        auto one = [&]( EDA_ITEM* aOne )
-        {
-            if( aOn )
-                aOne->SetBrightened();
-            else
-                aOne->ClearBrightened();
-
-            view->Update( aOne, KIGFX::REPAINT );
-        };
-
-        one( aItem );
-
-        // a footprint's pads, texts and graphics are drawn on their own
-        if( aItem->Type() == PCB_FOOTPRINT_T )
-            static_cast<FOOTPRINT*>( aItem )->RunOnChildren( [&]( BOARD_ITEM* aChild ) { one( aChild ); }, RECURSE_MODE::RECURSE );
-    }
+    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn ) { KopenapiPcbBrighten( aFrame, aItem, aOn ); }
 
     static BOX2I Box( EDA_ITEM* aItem ) { return aItem->GetBoundingBox(); }
 
@@ -475,11 +456,12 @@ static KOPENAPI_RESULT h_pcb_netlist_apply( KOPENAPI_CONTEXT& aCtx, const nlohma
                               { "warnings", updater->GetWarningCount() },
                               { "new_footprints", updater->GetNewFootprintCount() },
                               { "footprints", board->Footprints().size() },
-                              { "nets", std::max( 0, (int) board->GetNetCount() - 1 ) },
-                              { "report", lines } };
+                              { "nets", std::max( 0, (int) board->GetNetCount() - 1 ) } };
+    const KOPENAPI_LIST_CAP cap( aArgs, 50 );
+    cap.Put( result, "report", lines );
 
     if( !added.empty() )
-        result["added"] = added;
+        cap.Put( result, "added", added );
 
     if( !success )
         result["hint"] = "see report: missing footprints (sch_footprint_check), unannotated parts";
@@ -1162,9 +1144,9 @@ KOPENAPI_REGISTER( "pcb_netlist_apply",
                    "Update the open board from a KiCad netlist (text from sch_netlist_kicad) - KiCad's "
                    "Update PCB from Schematic: adds / replaces / removes footprints, sets nets, values, "
                    "fields; new footprints are laid out in rows beside the board; dry_run reports only; "
-                   "match symbols to footprints by uuid (default) or reference. Usually called through "
-                   "design_update_board",
-                   R"json({"type":"object","required":["netlist"],"properties":{
+                   "match symbols to footprints by uuid (default) or reference; report / added cut to "
+                   "list_limit (default 50; full: true for all). Usually called through design_update_board",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","required":["netlist"],"properties":{
                         "netlist":{"type":"string"},
                         "dry_run":{"type":"boolean","default":false},
                         "match":{"type":"string","enum":["uuid","reference"],"default":"uuid"},
@@ -1172,7 +1154,7 @@ KOPENAPI_REGISTER( "pcb_netlist_apply",
                         "replace_footprints":{"type":"boolean","default":true,"description":"swap footprints whose library id changed"},
                         "override_locks":{"type":"boolean","default":false,"description":"locked footprints are not replaced or removed otherwise (their nets and fields are still updated)"},
                         "spread":{"type":"boolean","default":true},
-                        "spread_width_mm":{"type":"number","default":80}}})json"_json,
+                        "spread_width_mm":{"type":"number","default":80}}})json"_json, 50 ),
                    false, h_pcb_netlist_apply, 600 );
 
 KOPENAPI_REGISTER( "pcb_outline_set",

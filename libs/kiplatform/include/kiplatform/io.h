@@ -215,6 +215,16 @@ namespace IO
     long long TimestampDir( const wxString& aDirPath, const wxString& aFilespec );
 
     /**
+     * A value that changes when a file is rewritten: its modification time (at the file
+     * system's resolution, finer than a second where it keeps one) combined with its size.
+     * Symbolic links are followed.  One metadata query, no directory walk.
+     *
+     * @param aFilePath file to query
+     * @return 0 when the file does not exist or is not a regular file
+     */
+    long long TimestampFile( const wxString& aFilePath );
+
+    /**
      * Flushes user-space buffers for @p aFp and forces the kernel/filesystem to commit
      * the file's data blocks to stable storage.
      *

@@ -24,6 +24,13 @@ KICOMMON_API bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTo
                                    const std::string& aItem = std::string(),
                                    const nlohmann::json& aCounts = nlohmann::json() );
 
+/// @brief Progress inside work whose worker threads may be running (DRC tests, zone fills): records
+/// it like KopenapiJobStep and keeps the windows painted, but runs no API calls and never pauses.
+/// False once the job is asked to stop.  Any thread records; the UI only on the main thread
+KICOMMON_API bool KopenapiJobProgress( const std::string& aPhase, int aDone, int aTotal,
+                                       const std::string& aItem = std::string(),
+                                       const nlohmann::json& aCounts = nlohmann::json() );
+
 /// @brief The gate: an outermost API call starts / ends on the main thread.  KopenapiJobStep outside
 /// a job records that call's progress and runs the API calls queued meanwhile (edits get 409); no
 /// user input, no stop
@@ -31,8 +38,13 @@ KICOMMON_API void KopenapiCallBegin( const std::string& aMethod );
 KICOMMON_API void KopenapiCallEnd();
 
 /// @brief The progress of the running job, else of the running call ({phase, done, total, item,
-/// counts, phase_eta_s, elapsed_s}); null when it has reported none.  Any thread
+/// counts, phase_eta_s, eta_s, elapsed_s}); null when it has reported none.  eta_s: from
+/// counts.fraction (the share of the whole call done) when given, else the phase's pace.  Any thread
 KICOMMON_API nlohmann::json KopenapiCallProgress();
+
+/// @brief {method, rev, progress, job_id + paused for a job} of the call reporting progress now (the
+/// running job, else the plain call); null when none does.  Any thread
+KICOMMON_API nlohmann::json KopenapiRunningProgress();
 
 /// @brief The running job was asked to stop (job_cancel, Esc, a window close)
 KICOMMON_API bool KopenapiJobCancelled();

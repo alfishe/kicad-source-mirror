@@ -8,6 +8,7 @@
 #include <3d_viewer/eda_3d_viewer_frame.h>
 #include <3d_viewer/eda_3d_viewer_settings.h>
 #include <class_draw_panel_gal.h>
+#include <view/view.h>
 #include <kicadopenapi_image.h>
 #include <kicadopenapi_registry.h>
 #include <kiway.h>
@@ -372,6 +373,34 @@ void KopenapiRefresh3D( PCB_BASE_FRAME* aFrame )
         canvas->HoldFrameUntilLoaded();
 
     aFrame->Update3DView( true, true );
+}
+
+
+void KopenapiPcbBrighten( PCB_BASE_FRAME* aFrame, EDA_ITEM* aItem, bool aOn )
+{
+    KIGFX::VIEW* view = aFrame->GetCanvas()->GetView();
+
+    auto one = [&]( EDA_ITEM* aOne )
+    {
+        if( aOn )
+            aOne->SetBrightened();
+        else
+            aOne->ClearBrightened();
+
+        // the painter frames brightened markers, images and drill maps; everything else only
+        // changes colour, and a recolour keeps the cached geometry (text shadows, pad shapes)
+        const KICAD_T type = aOne->Type();
+        const bool    reshaped = type == PCB_MARKER_T || type == PCB_REFERENCE_IMAGE_T || type == PCB_DRILL_MAP_T;
+
+        view->Update( aOne, reshaped ? KIGFX::REPAINT : KIGFX::COLOR );
+    };
+
+    one( aItem );
+
+    // a footprint's pads, texts and graphics are drawn on their own
+    if( aItem->Type() == PCB_FOOTPRINT_T )
+        static_cast<FOOTPRINT*>( aItem )->RunOnChildren( [&]( BOARD_ITEM* aChild ) { one( aChild ); },
+                                                         RECURSE_MODE::RECURSE );
 }
 
 

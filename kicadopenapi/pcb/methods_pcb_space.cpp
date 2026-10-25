@@ -1268,31 +1268,43 @@ static KOPENAPI_RESULT h_pcb_space( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 room.BooleanSubtract( k.area );
         }
 
-        // occupied: the staying parts on this side, and THT pads of the other side's parts
-        SHAPE_POLY_SET occupied;
-
-        for( int i : stay )
+        // occupied: parts on this side, and THT pads of the other side's parts. Every part standing
+        // there now counts, also one that crosses a tried outline (it occupies its cells until moved);
+        // staying parts alone give the room left once the misfits are re-placed.
+        auto occupiedBy = [&]( const std::vector<int>& aParts, SHAPE_POLY_SET& aOut )
         {
-            const PART& p = b.parts[i];
+            for( int i : aParts )
+            {
+                const PART& p = b.parts[i];
 
-            if( p.back == back )
-            {
-                occupied.Append( p.courtyard );
-            }
-            else
-            {
-                for( PAD* pad : p.fp->Pads() )
+                if( p.back == back )
                 {
-                    if( pad->HasHole() )
-                        pad->TransformShapeToPolygon( occupied, back ? B_Cu : F_Cu, 0, ds.m_MaxError, ERROR_OUTSIDE );
+                    aOut.Append( p.courtyard );
+                }
+                else
+                {
+                    for( PAD* pad : p.fp->Pads() )
+                    {
+                        if( pad->HasHole() )
+                            pad->TransformShapeToPolygon( aOut, back ? B_Cu : F_Cu, 0, ds.m_MaxError, ERROR_OUTSIDE );
+                    }
                 }
             }
-        }
+        };
+
+        SHAPE_POLY_SET occupied, occupiedStaying;
+        occupiedBy( stay, occupiedStaying );
+        occupied = occupiedStaying;
+        occupiedBy( misfit, occupied );
+        occupiedBy( needsEdge, occupied );
 
         occupied.Simplify();
         occupied.BooleanIntersection( room );
+        occupiedStaying.Simplify();
+        occupiedStaying.BooleanIntersection( room );
         const double roomArea = room.Area();
         const double occupiedArea = occupied.Area();
+        const double stayingArea = occupiedStaying.Area();
 
         FREE_GRID                   g = rasterise( room, occupied, iu( step ) );
         std::vector<FREE_RECT> rects = freeRects( g, freeCount, int( std::ceil( freeMin / step - 1e-9 ) ) );
@@ -1321,6 +1333,12 @@ static KOPENAPI_RESULT h_pcb_space( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                         { "free_mm2", mm2( roomArea - occupiedArea ) },
                         { "fill", roomArea > 0 ? std::round( occupiedArea / roomArea * 100 ) / 100 : 0.0 },
                         { "free_rects", rectList } };
+
+        if( source != "board" )
+        {
+            sides[side]["occupied_staying_mm2"] = mm2( stayingArea );
+            sides[side]["free_when_moved_mm2"] = mm2( roomArea - stayingArea );
+        }
     }
 
     nlohmann::json answer = { { "outline", { { "source", source },
@@ -1416,12 +1434,12 @@ static KOPENAPI_RESULT h_pcb_space( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         for( int s = 0; s < 2; ++s )
         {
             const std::string side = s ? "back" : "front";
-            const double      freeArea = sides[side]["free_mm2"].get<double>();
+            const double      freeArea = sides[side]["free_when_moved_mm2"].get<double>();
             fit[side] = { { "to_place_mm2", mm2( need[s] ) },
                           { "free_mm2", freeArea },
                           { "free_after_mm2", std::round( ( freeArea - mm2( need[s] ) ) * 10 ) / 10 },
                           { "fill_after", sides[side]["usable_mm2"].get<double>() > 0
-                                                  ? std::round( ( sides[side]["occupied_mm2"].get<double>() + mm2( need[s] ) )
+                                                  ? std::round( ( sides[side]["occupied_staying_mm2"].get<double>() + mm2( need[s] ) )
                                                                 / sides[side]["usable_mm2"].get<double>() * 100 ) / 100
                                                   : 0.0 } };
         }

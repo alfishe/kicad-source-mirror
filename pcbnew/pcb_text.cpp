@@ -854,11 +854,74 @@ double PCB_TEXT::GetCoverageArea( int aTextMargin ) const
 void PCB_TEXT::TransformShapeToPolygon( SHAPE_POLY_SET& aBuffer, PCB_LAYER_ID aLayer, int aClearance, int aMaxError,
                                         ERROR_LOC aErrorLoc, bool aIgnoreLineWidth ) const
 {
-    SHAPE_POLY_SET poly;
+    // The hull is the rendered text's extent in its own frame.  That extent is read off the
+    // stroke ends and glyph triangles directly: building, simplifying and inflating their union
+    // (TransformTextToPolySet) only to take its bounding box costs milliseconds per text.
+    KIGFX::GAL_DISPLAY_OPTIONS empty_opts;
+    KIFONT::FONT*              font = GetDrawFont( nullptr );
+    TEXT_ATTRIBUTES            attrs = GetAttributes();
+    const wxString             shownText = GetShownText( FOR_CANVAS );
+    const VECTOR2I             drawPos = GetDrawPos();
+    const EDA_ANGLE            drawAngle = GetDrawRotation();
+    const int                  penWidth = GetEffectiveTextPenWidth();
 
-    TransformTextToPolySet( poly, 0, aMaxError, aErrorLoc );
+    attrs.m_Angle = drawAngle;
+    attrs.m_Size = GetTextSize();
 
-    buildBoundingHull( &aBuffer, poly, aClearance );
+    BOX2I strokes;
+    BOX2I fills;
+
+    auto inTextFrame =
+            [&]( VECTOR2I aPt )
+            {
+                RotatePoint( aPt, drawPos, -drawAngle );
+                return aPt;
+            };
+
+    CALLBACK_GAL callback_gal(
+            empty_opts,
+            [&]( const VECTOR2I& aPt1, const VECTOR2I& aPt2 )
+            {
+                strokes.Merge( inTextFrame( aPt1 ) );
+                strokes.Merge( inTextFrame( aPt2 ) );
+            },
+            [&]( const VECTOR2I& aPt1, const VECTOR2I& aPt2, const VECTOR2I& aPt3 )
+            {
+                for( const VECTOR2I& point : { aPt1, aPt2, aPt3 } )
+                    fills.Merge( inTextFrame( point ) );
+            } );
+
+    if( auto* cache = GetRenderCache( font, shownText ) )
+        callback_gal.DrawGlyphs( *cache );
+    else
+        font->Draw( &callback_gal, shownText, GetTextPos(), attrs, GetFontMetrics() );
+
+    if( strokes.IsValid() )
+    {
+        strokes.Inflate( penWidth / 2 );
+        fills.Merge( strokes );
+    }
+
+    if( !fills.IsValid() )
+        return;
+
+    if( IsKnockout() )
+        fills.Inflate( GetKnockoutTextMargin( attrs.m_Size, penWidth ) );
+    else if( aErrorLoc == ERROR_OUTSIDE )
+        fills.Inflate( aMaxError );
+
+    fills.Inflate( aClearance );
+
+    const VECTOR2I corners[4] = { fills.GetOrigin(), VECTOR2I( fills.GetRight(), fills.GetTop() ), fills.GetEnd(),
+                                  VECTOR2I( fills.GetLeft(), fills.GetBottom() ) };
+
+    aBuffer.NewOutline();
+
+    for( VECTOR2I corner : corners )
+    {
+        RotatePoint( corner, drawPos, drawAngle );
+        aBuffer.Append( corner.x, corner.y );
+    }
 }
 
 

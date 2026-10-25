@@ -11,7 +11,9 @@
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
+#include <kicadopenapi_jobs.h>
 #include <kicadopenapi_keepalive.h>
+#include <kicadopenapi_util.h>
 #include <base_units.h>
 #include <board.h>
 #include <board_commit.h>
@@ -70,15 +72,7 @@ struct ZONE_GLOW_TRAITS
         return aFrame->GetBoard() ? aFrame->GetBoard()->ResolveItem( aId, true ) : nullptr;
     }
 
-    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn )
-    {
-        if( aOn )
-            aItem->SetBrightened();
-        else
-            aItem->ClearBrightened();
-
-        aFrame->GetCanvas()->GetView()->Update( aItem, KIGFX::REPAINT );
-    }
+    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn ) { KopenapiPcbBrighten( aFrame, aItem, aOn ); }
 
     static BOX2I Box( EDA_ITEM* aItem ) { return aItem->GetBoundingBox(); }
     static int   Mm() { return pcbIUScale.mmToIU( 1.0 ); }
@@ -89,6 +83,68 @@ struct ZONE_GLOW_TRAITS
 double toMm( int aIU )
 {
     return std::round( aIU / pcbIUScale.IU_PER_MM * 1000.0 ) / 1000.0;
+}
+
+
+/// @brief The outline of points [[x, y], ...] or rect [x0, y0, x1, y1] in mm; empty with aError set
+SHAPE_LINE_CHAIN outlineArg( const nlohmann::json& aArgs, std::string& aError )
+{
+    SHAPE_LINE_CHAIN outline;
+
+    if( aArgs.contains( "points" ) && aArgs.contains( "rect" ) )
+    {
+        aError = "points or rect, not both";
+        return outline;
+    }
+
+    if( aArgs.contains( "rect" ) )
+    {
+        const nlohmann::json& r = aArgs["rect"];
+
+        if( !r.is_array() || r.size() != 4 || !std::all_of( r.begin(), r.end(), []( const nlohmann::json& v ) { return v.is_number(); } ) )
+        {
+            aError = "rect: [x0_mm, y0_mm, x1_mm, y1_mm]";
+            return outline;
+        }
+
+        const int x0 = toIU( std::min( r[0].get<double>(), r[2].get<double>() ) );
+        const int x1 = toIU( std::max( r[0].get<double>(), r[2].get<double>() ) );
+        const int y0 = toIU( std::min( r[1].get<double>(), r[3].get<double>() ) );
+        const int y1 = toIU( std::max( r[1].get<double>(), r[3].get<double>() ) );
+
+        if( x0 == x1 || y0 == y1 )
+        {
+            aError = "rect: an area, not a line";
+            return outline;
+        }
+
+        outline.Append( x0, y0 );
+        outline.Append( x1, y0 );
+        outline.Append( x1, y1 );
+        outline.Append( x0, y1 );
+    }
+    else
+    {
+        for( const nlohmann::json& p : aArgs.value( "points", nlohmann::json::array() ) )
+        {
+            if( !p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number() )
+            {
+                aError = "points: [[x_mm, y_mm], ...]";
+                return SHAPE_LINE_CHAIN();
+            }
+
+            outline.Append( toIU( p[0].get<double>() ), toIU( p[1].get<double>() ) );
+        }
+
+        if( outline.PointCount() < 3 )
+        {
+            aError = "points: at least 3 (or rect)";
+            return SHAPE_LINE_CHAIN();
+        }
+    }
+
+    outline.SetClosed( true );
+    return outline;
 }
 
 
@@ -293,12 +349,21 @@ nlohmann::json zoneJson( BOARD* aBoard, ZONE* aZone )
 
 
 /// @brief Fill the zones, push, report per zone and what stays unconnected
-nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::vector<ZONE*>& aZones )
+nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::vector<ZONE*>& aZones,
+                    const KOPENAPI_LIST_CAP* aCap = nullptr )
 {
     BOARD*       board = aContext.GetBoard();
     BOARD_COMMIT commit( aContext.GetToolManager() );
     ZONE_FILLER  filler( board, &commit );
-    KOPENAPI_KEEPALIVE_REPORTER reporter;
+    const int    count = (int) aZones.size();
+
+    KOPENAPI_PROGRESS_REPORTER reporter(
+            [count]( const std::string& aMessage, int aPhase, double aFraction )
+            {
+                return KopenapiJobProgress( "zones_fill " + std::to_string( aPhase ), (int) std::lround( aFraction * 1000 ),
+                                            1000, aMessage, { { "step", aPhase }, { "zones", count } } );
+            } );
+
     filler.SetProgressReporter( &reporter );
     const bool   ok = filler.Fill( aZones );
 
@@ -313,7 +378,22 @@ nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::v
     nlohmann::json zones = nlohmann::json::array();
 
     for( ZONE* zone : aZones )
-        zones.push_back( zoneJson( board, zone ) );
+    {
+        nlohmann::json z = zoneJson( board, zone );
+
+        // a polygon cut short would mislead: one over the limit is left out, its point count kept
+        if( aCap && z.contains( "outline_mm" ) && z["outline_mm"].size() > aCap->Limit() )
+        {
+            z["outline_mm_total"] = z["outline_mm"].size();
+            z.erase( "outline_mm" );
+            z["truncated"] = nlohmann::json::array( { "outline_mm" } );
+        }
+
+        if( aCap && z.contains( "island_list" ) )
+            aCap->Put( z, "island_list", z["island_list"] );
+
+        zones.push_back( std::move( z ) );
+    }
 
     if( !aCtx.headless && aCtx.kiway )
     {
@@ -328,11 +408,86 @@ nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::v
         KopenapiGlow<ZONE_GLOW_TRAITS>( aCtx.kiway, ids, ids.size() > 1 ? 300 : 0 );
     }
 
-    return { { "filled", ok }, { "zones", zones },
-             { "unrouted_left", (int) board->GetConnectivity()->GetUnconnectedCount( false ) } };
+    nlohmann::json out = { { "filled", ok } };
+
+    if( aCap )
+        aCap->Put( out, "zones", std::move( zones ) );
+    else
+        out["zones"] = std::move( zones );
+
+    out.update( KopenapiUnroutedJson( board ) );
+
+    // a job stopped while filling: nothing of the fill applied
+    if( reporter.IsCancelled() )
+        out["stopped"] = true;
+
+    return out;
 }
 
 } // namespace
+
+
+void KopenapiNetDomain( BOARD* aBoard, int aNetCode, int aLayer, SHAPE_POLY_SET& aOut )
+{
+    aOut.RemoveAllContours();
+    const PCB_LAYER_ID layer = (PCB_LAYER_ID) aLayer;
+    std::vector<ZONE*> zones;
+
+    for( ZONE* zone : aBoard->Zones() )
+        zones.push_back( zone );
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( ZONE* zone : fp->Zones() )
+            zones.push_back( zone );
+    }
+
+    SHAPE_POLY_SET barred;
+
+    for( ZONE* zone : zones )
+    {
+        if( zone->GetIsRuleArea() && zone->GetDoNotAllowZoneFills() && zone->IsOnLayer( layer ) )
+            barred.Append( zone->GetBoardOutline() );
+    }
+
+    for( ZONE* zone : zones )
+    {
+        if( zone->GetIsRuleArea() || zone->IsTeardropArea() || zone->GetNetCode() != aNetCode || !zone->IsOnLayer( layer ) )
+            continue;
+
+        SHAPE_POLY_SET mine = zone->GetBoardOutline();
+        SHAPE_POLY_SET above = barred;
+
+        for( ZONE* other : zones )
+        {
+            if( other == zone || other->GetIsRuleArea() || other->IsTeardropArea() || other->GetNetCode() == aNetCode
+                || !other->IsOnLayer( layer ) || !other->HigherPriority( zone )
+                || !other->GetBoundingBox().Intersects( zone->GetBoundingBox() ) )
+            {
+                continue;
+            }
+
+            above.Append( other->GetBoardOutline() );
+        }
+
+        if( above.OutlineCount() )
+        {
+            above.Simplify();
+            mine.BooleanSubtract( above );
+        }
+
+        aOut.Append( mine );
+    }
+
+    if( !aOut.OutlineCount() )
+        return;
+
+    aOut.Simplify();
+    SHAPE_POLY_SET board;
+
+    if( aBoard->GetBoardPolygonOutlines( board, true ) && board.OutlineCount() )
+        aOut.BooleanIntersection( board );
+}
 
 
 nlohmann::json KopenapiZoneIslands( BOARD* aBoard, ZONE* aZone )
@@ -366,21 +521,16 @@ static KOPENAPI_RESULT h_pcb_zone_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
         layers.set( id );
     }
 
-    // The outline: the board's, or a polygon in mm
+    // The outline: a polygon or rect in mm, else the board's
     SHAPE_LINE_CHAIN outline;
 
-    if( aArgs.contains( "points" ) )
+    if( aArgs.contains( "points" ) || aArgs.contains( "rect" ) )
     {
-        for( const nlohmann::json& p : aArgs["points"] )
-        {
-            if( !p.is_array() || p.size() != 2 )
-                return KOPENAPI_RESULT::Error( 400, "points: [[x_mm, y_mm], ...]" );
+        std::string error;
+        outline = outlineArg( aArgs, error );
 
-            outline.Append( toIU( p[0].get<double>() ), toIU( p[1].get<double>() ) );
-        }
-
-        if( outline.PointCount() < 3 )
-            return KOPENAPI_RESULT::Error( 400, "points: at least 3" );
+        if( !error.empty() )
+            return KOPENAPI_RESULT::Error( 400, error );
     }
     else
     {
@@ -438,23 +588,37 @@ static KOPENAPI_RESULT h_pcb_zone_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 namespace
 {
 
-/// @brief The zones a call names: by uuid, or every copper zone of a net; none named: an error
+/// @brief Board zones and the zones inside footprints: what a zone uuid (or prefix) is matched against
+std::vector<BOARD_ITEM*> allZones( BOARD* aBoard )
+{
+    std::vector<BOARD_ITEM*> zones( aBoard->Zones().begin(), aBoard->Zones().end() );
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+        zones.insert( zones.end(), fp->Zones().begin(), fp->Zones().end() );
+
+    return zones;
+}
+
+
+/// @brief The zones a call names: by uuid (or a unique prefix), or every copper zone of a net; none named: an error
 std::vector<ZONE*> namedZones( BOARD* aBoard, const nlohmann::json& aArgs, std::string& aError )
 {
     std::vector<ZONE*> zones;
 
     if( aArgs.contains( "uuid" ) )
     {
-        const KIID id( wxString::FromUTF8( aArgs.value( "uuid", std::string() ) ) );
+        std::string error;
 
-        for( ZONE* zone : aBoard->Zones() )
+        if( ZONE* zone = dynamic_cast<ZONE*>( KopenapiMatchUuid( allZones( aBoard ), aArgs.value( "uuid", std::string() ), error ) );
+            zone && !zone->GetParentFootprint() )
         {
-            if( zone->m_Uuid == id )
-                zones.push_back( zone );
+            zones.push_back( zone );
         }
-
-        if( zones.empty() )
-            aError = "no zone with that uuid (pcb_zone_list, pcb_keepout_list)";
+        else
+        {
+            aError = ( error.empty() ? std::string( "that zone belongs to a footprint" ) : error )
+                     + " (pcb_zone_list, pcb_keepout_list)";
+        }
     }
     else if( aArgs.contains( "net" ) )
     {
@@ -475,6 +639,39 @@ std::vector<ZONE*> namedZones( BOARD* aBoard, const nlohmann::json& aArgs, std::
     }
 
     return zones;
+}
+
+
+/// @brief 409 when the uuid names a rule area inside a footprint: it is the footprint's, changed in
+/// its library and brought over by pcb_footprint_lib_update
+std::optional<KOPENAPI_RESULT> footprintZoneRefusal( BOARD* aBoard, const nlohmann::json& aArgs )
+{
+    if( !aArgs.contains( "uuid" ) )
+        return std::nullopt;
+
+    std::string error;
+    BOARD_ITEM* named = KopenapiMatchUuid( allZones( aBoard ), aArgs.value( "uuid", std::string() ), error );
+
+    if( !named && error.find( "ambiguous" ) != std::string::npos )
+        return KOPENAPI_RESULT::Error( 400, error );
+
+    const KIID id = named ? named->m_Uuid : niluuid;
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( ZONE* zone : fp->Zones() )
+        {
+            if( zone != named )
+                continue;
+
+            return KOPENAPI_RESULT::Error( 409, "zone " + str( id.AsString() ) + " ('" + str( zone->GetZoneName() ) + "') belongs to footprint "
+                                                + str( fp->GetReference() ) + " (" + str( fp->GetFPID().Format() )
+                                                + "): change it in that library footprint and bring it over with "
+                                                  "pcb_footprint_lib_update, or add a board keep-out (pcb_keepout_add)" );
+        }
+    }
+
+    return std::nullopt;
 }
 
 
@@ -535,68 +732,6 @@ LSET copperLayers( BOARD* aBoard, const nlohmann::json& aNames, std::string& aEr
 }
 
 
-/// @brief The outline of points [[x, y], ...] or rect [x0, y0, x1, y1] in mm; empty with aError set
-SHAPE_LINE_CHAIN keepoutOutline( const nlohmann::json& aArgs, std::string& aError )
-{
-    SHAPE_LINE_CHAIN outline;
-
-    if( aArgs.contains( "points" ) && aArgs.contains( "rect" ) )
-    {
-        aError = "points or rect, not both";
-        return outline;
-    }
-
-    if( aArgs.contains( "rect" ) )
-    {
-        const nlohmann::json& r = aArgs["rect"];
-
-        if( !r.is_array() || r.size() != 4 || !std::all_of( r.begin(), r.end(), []( const nlohmann::json& v ) { return v.is_number(); } ) )
-        {
-            aError = "rect: [x0_mm, y0_mm, x1_mm, y1_mm]";
-            return outline;
-        }
-
-        const int x0 = toIU( std::min( r[0].get<double>(), r[2].get<double>() ) );
-        const int x1 = toIU( std::max( r[0].get<double>(), r[2].get<double>() ) );
-        const int y0 = toIU( std::min( r[1].get<double>(), r[3].get<double>() ) );
-        const int y1 = toIU( std::max( r[1].get<double>(), r[3].get<double>() ) );
-
-        if( x0 == x1 || y0 == y1 )
-        {
-            aError = "rect: an area, not a line";
-            return outline;
-        }
-
-        outline.Append( x0, y0 );
-        outline.Append( x1, y0 );
-        outline.Append( x1, y1 );
-        outline.Append( x0, y1 );
-    }
-    else
-    {
-        for( const nlohmann::json& p : aArgs.value( "points", nlohmann::json::array() ) )
-        {
-            if( !p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number() )
-            {
-                aError = "points: [[x_mm, y_mm], ...]";
-                return SHAPE_LINE_CHAIN();
-            }
-
-            outline.Append( toIU( p[0].get<double>() ), toIU( p[1].get<double>() ) );
-        }
-
-        if( outline.PointCount() < 3 )
-        {
-            aError = "points: at least 3 (or rect)";
-            return SHAPE_LINE_CHAIN();
-        }
-    }
-
-    outline.SetClosed( true );
-    return outline;
-}
-
-
 /// @brief The keep-out flags of aArgs checked; empty when valid
 std::string keepoutFlagsError( const nlohmann::json& aArgs )
 {
@@ -611,13 +746,16 @@ std::string keepoutFlagsError( const nlohmann::json& aArgs )
 
 
 /// @brief What a keep-out bars that is inside it now: tracks, vias, pads, footprints (by courtyard,
-/// the footprint's box without one), as KiCad's DRC reports them
+/// the footprint's box without one), as KiCad's DRC reports them: a footprint's keep-out does not
+/// bar the footprint itself, its pads are barred like any other
 nlohmann::json keepoutViolations( BOARD* aBoard, ZONE* aZone )
 {
     nlohmann::json        out = nlohmann::json::array();
-    const SHAPE_POLY_SET* area = aZone->Outline();
+    const SHAPE_POLY_SET  outline = aZone->GetBoardOutline();
+    const SHAPE_POLY_SET* area = &outline;
+    const FOOTPRINT*      owner = aZone->GetParentFootprint();
 
-    if( !area || area->OutlineCount() == 0 )
+    if( area->OutlineCount() == 0 )
         return out;
 
     const BOX2I box = area->BBox();
@@ -683,7 +821,7 @@ nlohmann::json keepoutViolations( BOARD* aBoard, ZONE* aZone )
             }
         }
 
-        if( !aZone->GetDoNotAllowFootprints() || !box.Intersects( fp->GetBoundingBox( false ) ) )
+        if( !aZone->GetDoNotAllowFootprints() || fp == owner || !box.Intersects( fp->GetBoundingBox( false ) ) )
             continue;
 
         bool inside = false;
@@ -733,17 +871,25 @@ nlohmann::json keepoutJson( BOARD* aBoard, ZONE* aZone )
                          { "name", str( aZone->GetZoneName() ) },
                          { "layers", layerNames( aBoard, aZone->GetLayerSet() ) },
                          { "flags", flags },
-                         { "locked", aZone->IsLocked() } };
+                         { "locked", aZone->IsLocked() },
+                         { "footprint_owned", aZone->GetParentFootprint() != nullptr } };
 
-    if( const SHAPE_POLY_SET* poly = aZone->Outline(); poly && poly->OutlineCount() > 0 )
+    if( const FOOTPRINT* owner = aZone->GetParentFootprint() )
     {
-        const BOX2I    box = poly->BBox();
+        k["footprint"] = str( owner->GetReference() );
+        k["footprint_lib_id"] = str( owner->GetFPID().Format() );
+    }
+
+    // on the board: a footprint's zone keeps its outline in the footprint's own coordinates
+    if( SHAPE_POLY_SET poly = aZone->GetBoardOutline(); poly.OutlineCount() > 0 )
+    {
+        const BOX2I    box = poly.BBox();
         nlohmann::json pts = nlohmann::json::array();
 
-        for( const VECTOR2I& pt : poly->COutline( 0 ).CPoints() )
+        for( const VECTOR2I& pt : poly.COutline( 0 ).CPoints() )
             pts.push_back( { toMm( pt.x ), toMm( pt.y ) } );
 
-        k["area_mm2"] = mm2( SHAPE_POLY_SET( *poly ).Area() );
+        k["area_mm2"] = mm2( poly.Area() );
         k["bbox_mm"] = { toMm( box.GetLeft() ), toMm( box.GetTop() ), toMm( box.GetRight() ), toMm( box.GetBottom() ) };
         k["outline_mm"] = pts;
     }
@@ -777,8 +923,17 @@ nlohmann::json pushKeepout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, BOARD
                             const BOX2I& aArea, bool aRefill, const wxString& aMessage )
 {
     BOARD*             board = aContext.GetBoard();
-    std::vector<ZONE*> pours = aRefill ? poursUnder( board, aZone, aArea ) : std::vector<ZONE*>();
+    std::vector<ZONE*> pours = poursUnder( board, aZone, aArea );
     bool               filled = true;
+
+    // not refilled now: the pours are marked stale, so methods judging copper by the fill refill first
+    if( !aRefill )
+    {
+        for( ZONE* pour : pours )
+            pour->SetNeedRefill( true );
+
+        pours.clear();
+    }
 
     if( !pours.empty() )
     {
@@ -803,7 +958,7 @@ nlohmann::json pushKeepout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, BOARD
     if( !filled )
         answer["refill_failed"] = true;
 
-    answer["unrouted_left"] = (int) board->GetConnectivity()->GetUnconnectedCount( false );
+    answer.update( KopenapiUnroutedJson( board ) );
 
     if( !aCtx.headless && aCtx.kiway )
     {
@@ -866,7 +1021,7 @@ static KOPENAPI_RESULT updateKeepout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aCont
 
     if( aArgs.contains( "points" ) || aArgs.contains( "rect" ) )
     {
-        outline = keepoutOutline( aArgs, error );
+        outline = outlineArg( aArgs, error );
 
         if( !error.empty() )
             return KOPENAPI_RESULT::Error( 400, error );
@@ -926,6 +1081,9 @@ static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     BOARD*             board = context->GetBoard();
     std::string        error;
+    if( std::optional<KOPENAPI_RESULT> refused = footprintZoneRefusal( board, aArgs ) )
+        return *refused;
+
     std::vector<ZONE*> zones = namedZones( board, aArgs, error );
 
     if( zones.empty() )
@@ -967,23 +1125,15 @@ static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     SHAPE_LINE_CHAIN outline;
 
-    if( aArgs.contains( "points" ) )
+    if( aArgs.contains( "points" ) || aArgs.contains( "rect" ) )
     {
         if( zones.size() != 1 )
-            return KOPENAPI_RESULT::Error( 400, "points: one zone (by uuid)" );
+            return KOPENAPI_RESULT::Error( 400, std::string( aArgs.contains( "rect" ) ? "rect" : "points" ) + ": one zone (by uuid)" );
 
-        for( const nlohmann::json& p : aArgs["points"] )
-        {
-            if( !p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number() )
-                return KOPENAPI_RESULT::Error( 400, "points: [[x_mm, y_mm], ...]" );
+        outline = outlineArg( aArgs, error );
 
-            outline.Append( toIU( p[0].get<double>() ), toIU( p[1].get<double>() ) );
-        }
-
-        if( outline.PointCount() < 3 )
-            return KOPENAPI_RESULT::Error( 400, "points: at least 3" );
-
-        outline.SetClosed( true );
+        if( !error.empty() )
+            return KOPENAPI_RESULT::Error( 400, error );
     }
 
     BOARD_COMMIT commit( context->GetToolManager() );
@@ -1028,6 +1178,13 @@ static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
             zone->SetZoneName( wxString::FromUTF8( aArgs.value( "name", std::string() ) ) );
 
         applyIslandArgs( zone, aArgs );
+
+        // the fill no longer matches the settings until the zone is refilled (fill: false)
+        for( const auto& [key, value] : aArgs.items() )
+        {
+            if( key != "uuid" && key != "net" && key != "name" && key != "fill" )
+                zone->SetNeedRefill( true );
+        }
     }
 
     commit.Push( _( "Update zone (API)" ) );
@@ -1050,6 +1207,9 @@ static KOPENAPI_RESULT h_pcb_zone_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     BOARD*             board = context->GetBoard();
     std::string        error;
+    if( std::optional<KOPENAPI_RESULT> refused = footprintZoneRefusal( board, aArgs ) )
+        return *refused;
+
     std::vector<ZONE*> zones = namedZones( board, aArgs, error );
 
     if( zones.empty() )
@@ -1070,12 +1230,17 @@ static KOPENAPI_RESULT h_pcb_zone_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann
     board->BuildConnectivity();
     board->GetConnectivity()->RecalculateRatsnest();
 
-    return KOPENAPI_RESULT::Ok( { { "deleted", zones.size() },
-                                  { "unrouted_left", (int) board->GetConnectivity()->GetUnconnectedCount( false ) } } );
+    nlohmann::json answer = { { "deleted", zones.size() } };
+    answer.update( KopenapiUnroutedJson( board ) );
+    return KOPENAPI_RESULT::Ok( answer );
 }
 
 
-static KOPENAPI_RESULT h_pcb_zones_fill( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
+// entries per list of pcb_zones_fill's answer by default
+constexpr size_t ZONES_FILL_LIST_CAP = 20;
+
+
+static KOPENAPI_RESULT h_pcb_zones_fill( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
@@ -1093,7 +1258,8 @@ static KOPENAPI_RESULT h_pcb_zones_fill( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( zones.empty() )
         return KOPENAPI_RESULT::Error( 409, "no copper zones (pcb_zone_add)" );
 
-    return KOPENAPI_RESULT::Ok( fill( aCtx, *context, zones ) );
+    const KOPENAPI_LIST_CAP cap( aArgs, ZONES_FILL_LIST_CAP );
+    return KOPENAPI_RESULT::Ok( fill( aCtx, *context, zones, &cap ) );
 }
 
 
@@ -1110,7 +1276,7 @@ static KOPENAPI_RESULT h_pcb_keepout_add( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( !aArgs.contains( "points" ) && !aArgs.contains( "rect" ) )
         return KOPENAPI_RESULT::Error( 400, "the area: points [[x_mm, y_mm], ...] or rect [x0_mm, y0_mm, x1_mm, y1_mm]" );
 
-    const SHAPE_LINE_CHAIN outline = keepoutOutline( aArgs, error );
+    const SHAPE_LINE_CHAIN outline = outlineArg( aArgs, error );
 
     if( !error.empty() )
         return KOPENAPI_RESULT::Error( 400, error );
@@ -1154,7 +1320,12 @@ static KOPENAPI_RESULT h_pcb_keepout_list( KOPENAPI_CONTEXT& aCtx, const nlohman
     nlohmann::json items = nlohmann::json::array();
     const bool     withViolations = aArgs.value( "violations", true );
 
-    for( ZONE* zone : board->Zones() )
+    std::vector<ZONE*> zones( board->Zones().begin(), board->Zones().end() );
+
+    for( FOOTPRINT* fp : board->Footprints() )
+        zones.insert( zones.end(), fp->Zones().begin(), fp->Zones().end() );
+
+    for( ZONE* zone : zones )
     {
         if( !zone->GetIsRuleArea() )
             continue;
@@ -1176,14 +1347,15 @@ static KOPENAPI_RESULT h_pcb_keepout_list( KOPENAPI_CONTEXT& aCtx, const nlohman
 
 
 KOPENAPI_REGISTER( "pcb_zone_add",
-                   "Add a copper pour (e.g. GND) on one or more copper layers over the board outline or "
-                   "a polygon (points in mm): clearance, minimum width, thermal reliefs or solid pads, "
+                   "Add a copper pour (e.g. GND) on one or more copper layers over the board outline, "
+                   "a polygon (points in mm) or a rect: clearance, minimum width, thermal reliefs or solid pads, "
                    "priority; filled at once by KiCad's zone filler (fill: false to skip); answers area, "
                    "islands and the connections still open",
                    R"json({"type":"object","required":["net"],"properties":{
                         "net":{"type":"string"},
                         "layers":{"type":"array","items":{"type":"string"},"default":["F.Cu","B.Cu"]},
-                        "points":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"polygon [[x_mm, y_mm], ...]; default the board outline"},
+                        "points":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"polygon [[x_mm, y_mm], ...] (or rect, not both); neither: the board outline"},
+                        "rect":{"type":"array","items":{"type":"number"},"description":"[x0_mm, y0_mm, x1_mm, y1_mm] (or points, not both)"},
                         "clearance_mm":{"type":"number","default":0.3},
                         "min_width_mm":{"type":"number","default":0.25},
                         "thermal_gap_mm":{"type":"number","default":0.5},
@@ -1205,21 +1377,23 @@ KOPENAPI_REGISTER( "pcb_zone_list",
                    false, h_pcb_zone_list );
 
 KOPENAPI_REGISTER( "pcb_zone_update",
-                   "Change copper zones (by uuid, or every zone of a net): net (set_net), outline (points, one zone), pad "
+                   "Change copper zones (by uuid, or every zone of a net): net (set_net), outline (points or rect, one zone), pad "
                    "connection, clearance, minimum width, thermal gap / spoke, island removal, priority, name; refilled (fill: "
                    "false to skip); one undo step.  A keep-out (by uuid): points / rect, layers, name and its no_* flags, the "
-                   "pours under it refilled; answers what it now bars (violations)",
+                   "pours under it refilled; answers what it now bars (violations).  A rule area inside a footprint "
+                   "(pcb_keepout_list footprint_owned): 409 naming the footprint; change it in the library footprint and "
+                   "pcb_footprint_lib_update",
                    R"json({"type":"object","properties":{
                         "uuid":{"type":"string"},"net":{"type":"string","description":"every zone of this net (instead of uuid)"},
                         "set_net":{"type":"string","description":"new net of the zones"},
-                        "points":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"new outline [[x_mm, y_mm], ...] (one zone)"},
+                        "points":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"new outline [[x_mm, y_mm], ...] (one zone; or rect)"},
                         "pads":{"type":"string","enum":["tht_thermal","thermal","solid","none"]},
                         "clearance_mm":{"type":"number"},"min_width_mm":{"type":"number"},
                         "thermal_gap_mm":{"type":"number"},"thermal_spoke_mm":{"type":"number"},
                         "remove_islands":{"type":"string","enum":["always","never","area"],"description":"drop fill pieces with no pad (area: those below min_island_mm2)"},
                         "min_island_mm2":{"type":"number"},
                         "priority":{"type":"integer"},"name":{"type":"string"},
-                        "rect":{"type":"array","items":{"type":"number"},"description":"keep-out: new outline [x0_mm, y0_mm, x1_mm, y1_mm]"},
+                        "rect":{"type":"array","items":{"type":"number"},"description":"new outline [x0_mm, y0_mm, x1_mm, y1_mm] (one zone or keep-out; or points)"},
                         "layers":{"type":"array","items":{"type":"string"},"description":"keep-out: copper layers, \"*.Cu\" for all"},
                         "no_tracks":{"type":"boolean"},"no_vias":{"type":"boolean"},"no_pads":{"type":"boolean"},
                         "no_copper_pour":{"type":"boolean"},"no_footprints":{"type":"boolean"},
@@ -1229,7 +1403,8 @@ KOPENAPI_REGISTER( "pcb_zone_update",
 
 KOPENAPI_REGISTER( "pcb_zone_delete",
                    "Delete copper zones (by uuid, or every zone of a net) or a keep-out (by uuid); locked ones refused (409) "
-                   "unless override_locks; one undo step; answers the connections still open",
+                   "unless override_locks; a rule area inside a footprint refused (409, naming the footprint: it goes "
+                   "with its library footprint); one undo step; answers the connections still open",
                    R"json({"type":"object","properties":{
                         "uuid":{"type":"string"},"net":{"type":"string","description":"every zone of this net (instead of uuid)"},
                         "set_net":{"type":"string","description":"new net of the zones"},
@@ -1238,8 +1413,11 @@ KOPENAPI_REGISTER( "pcb_zone_delete",
 
 KOPENAPI_REGISTER( "pcb_zones_fill",
                    "Refill every copper zone with KiCad's zone filler (after tracks or parts moved); "
-                   "answers area and islands per zone and the connections still open",
-                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_zones_fill, 300 );
+                   "answers area and islands per zone and the connections still open; zones, each zone's island_list "
+                   "and outline points capped at list_limit (an outline over it is left out, outline_mm_total gives its points; "
+                   "counts whole), full: true for all",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{}})json"_json, ZONES_FILL_LIST_CAP ),
+                   false, h_pcb_zones_fill, 300 );
 
 KOPENAPI_REGISTER( "pcb_keepout_add",
                    "Add a keep-out (KiCad rule area) over a polygon (points in mm) or a rect on copper layers (default all, "
@@ -1262,9 +1440,12 @@ KOPENAPI_REGISTER( "pcb_keepout_add",
                    false, h_pcb_keepout_add, 300 );
 
 KOPENAPI_REGISTER( "pcb_keepout_list",
-                   "Keep-outs (KiCad rule areas) with uuid, name, layers, flags (no_tracks, no_vias, no_pads, no_copper_pour, "
-                   "no_footprints), area, outline (outline_mm, bbox_mm), locked, and the items inside each that it bars "
-                   "(violations, first 50; violations: false to skip)",
+                   "Keep-outs (KiCad rule areas) of the board and inside footprints (footprint_owned, footprint: its ref, "
+                   "footprint_lib_id) with uuid, name, layers, flags (no_tracks, no_vias, no_pads, no_copper_pour, "
+                   "no_footprints), area, outline on the board (outline_mm, bbox_mm), locked, and the items inside each "
+                   "that it bars (violations, first 50; as DRC: a footprint's keep-out does not bar the footprint itself, "
+                   "its own pads are barred like any other; violations: false to skip).  A footprint's keep-out is changed in its library footprint "
+                   "(pcb_footprint_lib_update), pcb_zone_update / pcb_zone_delete refuse it (409)",
                    R"json({"type":"object","properties":{"violations":{"type":"boolean","default":true}}})json"_json,
                    false, h_pcb_keepout_list );
 

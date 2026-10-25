@@ -463,7 +463,7 @@ static KOPENAPI_RESULT h_job_served( KOPENAPI_CONTEXT&, const nlohmann::json& )
 
 
 KOPENAPI_REGISTER( "job_start",
-                   "Run a long call (pcb_route, pcb_stitch, ...) as a job: answers job_id at once, the call "
+                   "Run a long call (pcb_route, pcb_stitch, pcb_drc, pcb_zones_fill, ...) as a job: answers job_id at once, the call "
                    "runs in KiCad while the UI stays usable (view navigation; other input is dropped, Esc stops "
                    "the job) and calls that only read still answer. job_get gives progress and the result. One "
                    "job at a time; calls that edit get 409 while it is queued or running",
@@ -474,12 +474,16 @@ KOPENAPI_REGISTER( "job_start",
 
 KOPENAPI_REGISTER( "job_get",
                    "State of a job (queued, running, done, failed, cancelled), its progress (phase, done / total, "
-                   "item at work, counts so far, phase_eta_s), elapsed_s, stop_reason; once finished, status and "
-                   "result: the body the call itself gives (a cancelled job gives what it did until it stopped). "
-                   "wait_s waits up to that long for it to finish. Answers even while KiCad is busy",
+                   "item at work, counts so far: pcb_route connections / done / routed / failed / unrouted_left / "
+                   "vias / length_mm / pass, pcb_drc provider / violations, ...; elapsed_s, eta_s, phase_eta_s), "
+                   "rev, stop_reason; once finished, status and result: the body the call itself gives (a "
+                   "cancelled job gives what it did until it stopped). wait_s waits up to that long for it to "
+                   "finish; with since (a rev from an earlier answer) it answers as soon as anything changed "
+                   "after that rev (long poll). Answers even while KiCad is busy",
                    R"json({"type":"object","required":["job_id"],"properties":{
                         "job_id":{"type":"string"},
-                        "wait_s":{"type":"integer","minimum":0,"maximum":600,"default":0}}})json"_json,
+                        "wait_s":{"type":"integer","minimum":0,"maximum":600,"default":0},
+                        "since":{"type":"integer","minimum":0,"description":"answer once the job's rev is past this (with wait_s)"}}})json"_json,
                    false, h_job_served );
 
 KOPENAPI_REGISTER( "job_cancel",

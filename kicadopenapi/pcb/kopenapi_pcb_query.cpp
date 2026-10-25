@@ -351,13 +351,98 @@ const std::map<wxString, QUERY_FUNCTION>& queryFunctions()
 }
 
 
+bool layerNameMatches( const BOARD* aBoard, PCB_LAYER_ID aLayer, const LIBEVAL::VALUE* aPattern )
+{
+    const wxString& pattern = aPattern->AsString();
+
+    for( const wxString& name : { LSET::Name( aLayer ), aBoard ? aBoard->GetLayerName( aLayer ) : wxString() } )
+    {
+        if( name.IsEmpty() )
+            continue;
+
+        if( aPattern->StringIsWildcard() ? WildCompareString( pattern, name, false ) : name.IsSameAs( pattern, false ) )
+            return true;
+    }
+
+    return false;
+}
+
+
+/// A zone's copper layers as one value: equal to a layer name when the zone is on that layer
+class ZONE_LAYERS_VALUE : public LIBEVAL::VALUE
+{
+public:
+    explicit ZONE_LAYERS_VALUE( const ZONE* aZone ) :
+            LIBEVAL::VALUE( aZone->GetBoard() ? aZone->GetBoard()->GetLayerName( aZone->GetFirstLayer() )
+                                              : LSET::Name( aZone->GetFirstLayer() ) ),
+            m_zone( aZone )
+    {}
+
+    bool EqualTo( LIBEVAL::CONTEXT* aCtx, const VALUE* b ) const override
+    {
+        if( !b || b->GetType() != LIBEVAL::VT_STRING )
+            return LIBEVAL::VALUE::EqualTo( aCtx, b );
+
+        for( PCB_LAYER_ID layer : m_zone->GetLayerSet().Seq() )
+        {
+            if( layerNameMatches( m_zone->GetBoard(), layer, b ) )
+                return true;
+        }
+
+        return false;
+    }
+
+    bool NotEqualTo( LIBEVAL::CONTEXT* aCtx, const VALUE* b ) const override
+    {
+        if( !b || b->GetType() == LIBEVAL::VT_UNDEFINED )
+            return false;
+
+        return !EqualTo( aCtx, b );
+    }
+
+private:
+    const ZONE* m_zone;
+};
+
+
+/// "Layer" on A/B: KiCad exposes it only for thieving zones; zones answer with their layer set
+class ZONE_LAYER_REF : public LIBEVAL::VAR_REF
+{
+public:
+    explicit ZONE_LAYER_REF( std::unique_ptr<LIBEVAL::VAR_REF> aInner ) :
+            m_inner( std::move( aInner ) )
+    {}
+
+    LIBEVAL::VAR_TYPE_T GetType() const override { return LIBEVAL::VT_STRING; }
+
+    LIBEVAL::VALUE* GetValue( LIBEVAL::CONTEXT* aCtx ) override
+    {
+        if( PCBEXPR_VAR_REF* ref = dynamic_cast<PCBEXPR_VAR_REF*>( m_inner.get() ) )
+        {
+            if( const ZONE* zone = dynamic_cast<const ZONE*>( ref->GetObject( aCtx ) ) )
+                return new ZONE_LAYERS_VALUE( zone );
+        }
+
+        return m_inner->GetValue( aCtx );
+    }
+
+private:
+    std::unique_ptr<LIBEVAL::VAR_REF> m_inner;
+};
+
+
 /// KiCad's DRC bindings plus the query functions; KiCad's own UCODE is final, so it is composed
 class KOPENAPI_QUERY_UCODE : public LIBEVAL::UCODE
 {
 public:
     std::unique_ptr<LIBEVAL::VAR_REF> CreateVarRef( const wxString& aVar, const wxString& aField ) override
     {
-        return m_pcb.CreateVarRef( aVar, aField );
+        std::unique_ptr<LIBEVAL::VAR_REF> ref = m_pcb.CreateVarRef( aVar, aField );
+
+        if( ref && ( aVar == wxS( "A" ) || aVar == wxS( "B" ) ) && aField.CmpNoCase( wxS( "Layer" ) ) == 0 )
+            return std::make_unique<ZONE_LAYER_REF>( std::move( ref ) );
+
+        return ref;
     }
 
     LIBEVAL::FUNC_CALL_REF CreateFuncCall( const wxString& aName ) override
@@ -760,6 +845,15 @@ void forEachItem( BOARD* aBoard, const std::set<std::string>& aKinds, const std:
             if( !aVisit( zone ) )
                 return;
         }
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            for( ZONE* zone : fp->Zones() )
+            {
+                if( !aVisit( zone ) )
+                    return;
+            }
+        }
     }
 
     if( has( "drawings" ) || has( "texts" ) )
@@ -997,6 +1091,20 @@ nlohmann::json fieldValue( const FIELD& aField, BOARD_ITEM* aItem, PCBEXPR_CONTE
             return nullptr;
 
         return v->AsDouble();
+    }
+
+    if( const ZONE* zone = dynamic_cast<const ZONE*>( aItem ); zone && aField.property.CmpNoCase( wxS( "Layer" ) ) == 0 )
+    {
+        nlohmann::json layers = nlohmann::json::array();
+
+        for( PCB_LAYER_ID layer : zone->GetLayerSet().Seq() )
+            layers.push_back( ( zone->GetBoard() ? zone->GetBoard()->GetLayerName( layer ) : LSET::Name( layer ) )
+                                      .ToStdString( wxConvUTF8 ) );
+
+        if( layers.size() == 1 )
+            return layers[0];
+
+        return layers;
     }
 
     PROPERTY_MANAGER& propMgr = PROPERTY_MANAGER::Instance();
@@ -1367,6 +1475,12 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
     auto itemRow = [&]( BOARD_ITEM* aItem, const std::vector<std::string>& aNames ) -> nlohmann::json
     {
         nlohmann::json row = { { "kind", kindOf( aItem ) }, { "uuid", aItem->m_Uuid.AsStdString() } };
+
+        if( aItem->Type() == PCB_ZONE_T )
+        {
+            const FOOTPRINT* owner = aItem->GetParentFootprint();
+            row["owner"] = owner ? owner->GetReference().ToStdString( wxConvUTF8 ) : std::string( "board" );
+        }
 
         for( const std::string& n : aNames )
             row[n] = fieldValue( fields[n], aItem, ctx );

@@ -44,6 +44,8 @@ std::shared_mutex FOOTPRINT_LIBRARY_ADAPTER::PreloadedFootprintsMutex;
 
 LEAK_AT_EXIT<std::map<wxString, long long>> FOOTPRINT_LIBRARY_ADAPTER::PreloadedTimestamps;
 
+LEAK_AT_EXIT<std::map<wxString, std::map<wxString, long long>>> FOOTPRINT_LIBRARY_ADAPTER::PreloadedFileTimestamps;
+
 
 FOOTPRINT_LIBRARY_ADAPTER::FOOTPRINT_LIBRARY_ADAPTER( LIBRARY_MANAGER& aManager ) :
         LIBRARY_MANAGER_ADAPTER( aManager )
@@ -117,10 +119,31 @@ void FOOTPRINT_LIBRARY_ADAPTER::enumerateLibrary( LIB_DATA* aLib, const wxString
         }
     }
 
+    // Per-file timestamps let LoadFootprint() notice a rewritten footprint with one file query.
+    // A library that changed while it was read keeps none: its next load re-reads it.
+    std::map<wxString, long long> fileTimestamps;
+
+    for( const wxString& footprintName : namesAS )
+    {
+        std::optional<long long> fileTimestamp = plugin->GetFootprintTimestamp( aUri, footprintName );
+
+        if( !fileTimestamp )
+        {
+            fileTimestamps.clear();
+            break;
+        }
+
+        fileTimestamps[footprintName] = *fileTimestamp;
+    }
+
+    if( !fileTimestamps.empty() && plugin->GetLibraryTimestamp( aUri ) != timestamp )
+        fileTimestamps.clear();
+
     {
         std::unique_lock lock( PreloadedFootprintsMutex );
         PreloadedFootprints.Get()[nickname] = std::move( footprints );
         PreloadedTimestamps.Get()[nickname] = timestamp;
+        PreloadedFileTimestamps.Get()[nickname] = std::move( fileTimestamps );
     }
 
     // Clear the plugin's FP_CACHE now that we've copied footprints to PreloadedFootprints.
@@ -250,6 +273,12 @@ long long FOOTPRINT_LIBRARY_ADAPTER::GenerateTimestamp( const wxString* aNicknam
 
 void FOOTPRINT_LIBRARY_ADAPTER::RefreshLibraryIfChanged( const wxString& aNickname )
 {
+    refreshLibrary( aNickname, false );
+}
+
+
+void FOOTPRINT_LIBRARY_ADAPTER::refreshLibrary( const wxString& aNickname, bool aForce )
+{
     std::optional<LIB_DATA*> maybeLib = fetchIfLoaded( aNickname );
 
     if( !maybeLib )
@@ -268,7 +297,7 @@ void FOOTPRINT_LIBRARY_ADAPTER::RefreshLibraryIfChanged( const wxString& aNickna
         std::shared_lock lock( PreloadedFootprintsMutex );
         auto             tsIt = PreloadedTimestamps.Get().find( aNickname );
 
-        if( tsIt != PreloadedTimestamps.Get().end() && tsIt->second == currentTimestamp )
+        if( !aForce && tsIt != PreloadedTimestamps.Get().end() && tsIt->second == currentTimestamp )
             return;
 
         wxLogTrace( traceLibraries, "FP: %s changed on disk, re-enumerating", aNickname );
@@ -283,8 +312,77 @@ void FOOTPRINT_LIBRARY_ADAPTER::RefreshLibraryIfChanged( const wxString& aNickna
         std::unique_lock lock( PreloadedFootprintsMutex );
         PreloadedFootprints.Get().erase( aNickname );
         PreloadedTimestamps.Get().erase( aNickname );
+        PreloadedFileTimestamps.Get().erase( aNickname );
         throw;
     }
+}
+
+
+void FOOTPRINT_LIBRARY_ADAPTER::refreshIfStale( const LIB_DATA* aLib, const wxString& aNickname,
+                                                const wxString& aName )
+{
+    PCB_IO* plugin = pcbplugin( aLib );
+
+    if( !plugin )
+        return;
+
+    // A rewrite in place may leave the library timestamp as it was, so a changed file forces
+    // the re-read.  Additions and removals change the library timestamp.
+    bool force = false;
+
+    if( std::optional<long long> current = plugin->GetFootprintTimestamp( getUri( aLib->row ), aName ) )
+    {
+        std::shared_lock lock( PreloadedFootprintsMutex );
+        auto             libIt = PreloadedFileTimestamps.Get().find( aNickname );
+
+        if( libIt != PreloadedFileTimestamps.Get().end() && !libIt->second.empty() )
+        {
+            auto it = libIt->second.find( aName );
+
+            if( it != libIt->second.end() ? it->second == *current : *current == 0 )
+                return;
+
+            force = it != libIt->second.end() && *current != 0;
+        }
+    }
+
+    try
+    {
+        refreshLibrary( aNickname, force );
+    }
+    catch( const IO_ERROR& e )
+    {
+        wxLogTrace( traceLibraries, "FP: %s: refresh failed: %s", aNickname, e.What() );
+    }
+}
+
+
+FOOTPRINT* FOOTPRINT_LIBRARY_ADAPTER::clonePreloaded( const wxString& aNickname, const wxString& aName,
+                                                      bool aKeepUUID )
+{
+    std::shared_lock lock( PreloadedFootprintsMutex );
+    auto             libIt = PreloadedFootprints.Get().find( aNickname );
+
+    if( libIt == PreloadedFootprints.Get().end() )
+        return nullptr;
+
+    for( const auto& fp : libIt->second )
+    {
+        if( fp->GetFPID().GetLibItemName() == UTF8( aName ) )
+        {
+            FOOTPRINT* copy;
+
+            if( aKeepUUID )
+                copy = static_cast<FOOTPRINT*>( fp->Clone() );
+            else
+                copy = static_cast<FOOTPRINT*>( fp->Duplicate( IGNORE_PARENT_GROUP ) );
+
+            copy->SetParent( nullptr );
+            return copy;
+        }
+    }
+
+    return nullptr;
 }
 
 
@@ -323,31 +421,14 @@ bool FOOTPRINT_LIBRARY_ADAPTER::FootprintExists( const wxString& aNickname, cons
 
 FOOTPRINT* FOOTPRINT_LIBRARY_ADAPTER::LoadFootprint( const wxString& aNickname, const wxString& aName, bool aKeepUUID )
 {
-    // First check if the footprint is in PreloadedFootprints and clone from there.
-    // This avoids re-parsing the file and keeps FP_CACHE from being repopulated.
-    if( fetchIfLoaded( aNickname ) )
+    // Clone from PreloadedFootprints once it matches the files on disk.  This avoids
+    // re-parsing the file and keeps FP_CACHE from being repopulated.
+    if( std::optional<const LIB_DATA*> lib = fetchIfLoaded( aNickname ) )
     {
-        std::shared_lock lock( PreloadedFootprintsMutex );
-        auto libIt = PreloadedFootprints.Get().find( aNickname );
+        refreshIfStale( *lib, aNickname, aName );
 
-        if( libIt != PreloadedFootprints.Get().end() )
-        {
-            for( const auto& fp : libIt->second )
-            {
-                if( fp->GetFPID().GetLibItemName() == UTF8( aName ) )
-                {
-                    FOOTPRINT* copy;
-
-                    if( aKeepUUID )
-                        copy = static_cast<FOOTPRINT*>( fp->Clone() );
-                    else
-                        copy = static_cast<FOOTPRINT*>( fp->Duplicate( IGNORE_PARENT_GROUP ) );
-
-                    copy->SetParent( nullptr );
-                    return copy;
-                }
-            }
-        }
+        if( FOOTPRINT* copy = clonePreloaded( aNickname, aName, aKeepUUID ) )
+            return copy;
     }
 
     // Footprint not found in PreloadedFootprints, fall back to plugin.
@@ -474,6 +555,17 @@ FOOTPRINT_LIBRARY_ADAPTER::SAVE_T FOOTPRINT_LIBRARY_ADAPTER::SaveFootprint( cons
                 clone->SetFPID( id );
 
                 it->second.emplace_back( clone );
+
+                auto stamps = PreloadedFileTimestamps.Get().find( aNickname );
+
+                if( stamps != PreloadedFileTimestamps.Get().end() && !stamps->second.empty() )
+                {
+                    if( std::optional<long long> ts = pcbplugin( *lib )->GetFootprintTimestamp( getUri( ( *lib )->row ),
+                                                                                                 fpName ) )
+                    {
+                        stamps->second[fpName] = *ts;
+                    }
+                }
             }
         }
 
@@ -516,6 +608,12 @@ void FOOTPRINT_LIBRARY_ADAPTER::DeleteFootprint( const wxString& aNickname, cons
                                {
                                    return fp->GetFPID().GetLibItemName().wx_str() == aFootprintName;
                                } );
+            }
+
+            if( auto stamps = PreloadedFileTimestamps.Get().find( aNickname );
+                stamps != PreloadedFileTimestamps.Get().end() )
+            {
+                stamps->second.erase( aFootprintName );
             }
         }
     }

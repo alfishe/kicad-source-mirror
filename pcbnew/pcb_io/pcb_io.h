@@ -24,6 +24,7 @@
 #include <pcb_io/pcb_io_mgr.h>
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -221,6 +222,20 @@ public:
      * Timestamps should not be considered ordered, they either match or they don't.
      */
     virtual long long GetLibraryTimestamp( const wxString& aLibraryPath ) const = 0;
+
+    /**
+     * Generate a timestamp of the file holding one footprint of a library, for formats that
+     * keep one footprint per file.  Must be cheap (one file query): library adapters call it
+     * on every footprint load to notice a rewritten file.
+     *
+     * @return the timestamp (0 when the file is missing), or std::nullopt when the format has
+     *         no per-footprint file (the library timestamp is then used instead)
+     */
+    virtual std::optional<long long> GetFootprintTimestamp( const wxString& aLibraryPath,
+                                                            const wxString& aFootprintName ) const
+    {
+        return std::nullopt;
+    }
 
     /**
      * Load a single footprint from @a aFootprintPath and put its name in @a aFootprintNameOut.

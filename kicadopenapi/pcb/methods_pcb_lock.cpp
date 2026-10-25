@@ -90,28 +90,23 @@ KOPENAPI_RESULT setLocked( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, 
 
         selector = true;
 
-        std::map<std::string, BOARD_ITEM*> byId;
-
-        for( FOOTPRINT* fp : board->Footprints() )
-            byId[str( fp->m_Uuid.AsString() )] = fp;
-
-        for( PCB_TRACK* track : board->Tracks() )
-            byId[str( track->m_Uuid.AsString() )] = track;
-
-        for( ZONE* zone : board->Zones() )
-            byId[str( zone->m_Uuid.AsString() )] = zone;
-
-        for( BOARD_ITEM* drawing : board->Drawings() )
-            byId[str( drawing->m_Uuid.AsString() )] = drawing;
+        std::vector<BOARD_ITEM*> topLevel( board->Footprints().begin(), board->Footprints().end() );
+        topLevel.insert( topLevel.end(), board->Tracks().begin(), board->Tracks().end() );
+        topLevel.insert( topLevel.end(), board->Zones().begin(), board->Zones().end() );
+        topLevel.insert( topLevel.end(), board->Drawings().begin(), board->Drawings().end() );
 
         for( const nlohmann::json& u : aArgs["uuids"] )
         {
-            auto it = u.is_string() ? byId.find( u.get<std::string>() ) : byId.end();
+            std::string error;
+            BOARD_ITEM* hit = u.is_string() ? KopenapiMatchUuid( topLevel, u.get<std::string>(), error ) : nullptr;
 
-            if( it == byId.end() )
+            if( !hit && error.find( "ambiguous" ) != std::string::npos )
+                return KOPENAPI_RESULT::Error( 400, "uuids: " + error );
+
+            if( !hit )
                 missing.push_back( u );
             else
-                items.insert( it->second );
+                items.insert( hit );
         }
     }
 

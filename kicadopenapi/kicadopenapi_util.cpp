@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <set>
 
 
@@ -14,7 +15,173 @@ static char lowerChar( char aChar )
 }
 
 
+/// @brief The first brace group with a comma at its top level: positions of '{' and '}', or npos
+static std::pair<size_t, size_t> braceGroup( const std::string& aPattern )
+{
+    for( size_t open = aPattern.find( '{' ); open != std::string::npos; open = aPattern.find( '{', open + 1 ) )
+    {
+        int  depth = 0;
+        bool comma = false;
+
+        for( size_t i = open; i < aPattern.size(); ++i )
+        {
+            if( aPattern[i] == '{' )
+                ++depth;
+            else if( aPattern[i] == '}' && --depth == 0 )
+            {
+                if( comma )
+                    return { open, i };
+
+                break;
+            }
+            else if( aPattern[i] == ',' && depth == 1 )
+                comma = true;
+        }
+    }
+
+    return { std::string::npos, std::string::npos };
+}
+
+
+static bool globPlain( const std::string& aPattern, const std::string& aText );
+
+
 bool KopenapiGlob( const std::string& aPattern, const std::string& aText )
+{
+    if( aPattern.empty() )
+        return true;
+
+    const auto [open, close] = braceGroup( aPattern );
+
+    if( open == std::string::npos )
+        return globPlain( aPattern, aText );
+
+    const std::string head = aPattern.substr( 0, open ), tail = aPattern.substr( close + 1 );
+    int               depth = 0;
+    size_t            start = open + 1;
+
+    for( size_t i = open + 1; i <= close; ++i )
+    {
+        if( aPattern[i] == '{' )
+            ++depth;
+        else if( aPattern[i] == '}' && depth > 0 )
+            --depth;
+        else if( ( aPattern[i] == ',' && depth == 0 ) || i == close )
+        {
+            const std::string alt = head + aPattern.substr( start, i - start ) + tail;
+
+            if( alt.empty() ? aText.empty() : KopenapiGlob( alt, aText ) )
+                return true;
+
+            start = i + 1;
+        }
+    }
+
+    return false;
+}
+
+
+std::vector<std::string> KopenapiGlobAlternatives( const std::string& aPattern )
+{
+    const auto [open, close] = braceGroup( aPattern );
+
+    if( open == std::string::npos )
+        return { aPattern };
+
+    std::vector<std::string> out;
+    const std::string        head = aPattern.substr( 0, open ), tail = aPattern.substr( close + 1 );
+    int                      depth = 0;
+    size_t                   start = open + 1;
+
+    for( size_t i = open + 1; i <= close; ++i )
+    {
+        if( aPattern[i] == '{' )
+            ++depth;
+        else if( aPattern[i] == '}' && depth > 0 )
+            --depth;
+        else if( ( aPattern[i] == ',' && depth == 0 ) || i == close )
+        {
+            for( std::string& alt : KopenapiGlobAlternatives( head + aPattern.substr( start, i - start ) + tail ) )
+                out.push_back( std::move( alt ) );
+
+            start = i + 1;
+        }
+    }
+
+    return out;
+}
+
+
+KOPENAPI_REF_FILTER::KOPENAPI_REF_FILTER( const nlohmann::json& aArgs, const char* aGlobKey, const char* aListKey )
+{
+    auto add = [&]( const nlohmann::json& aValue, const char* aKey )
+    {
+        if( !aValue.is_string() )
+        {
+            m_error = std::string( aKey ) + ": glob strings (e.g. \"U*\", \"{J8,U37,R86}\")";
+            return;
+        }
+
+        for( std::string& alt : KopenapiGlobAlternatives( aValue.get<std::string>() ) )
+        {
+            if( !alt.empty() )
+                m_patterns.push_back( std::move( alt ) );
+        }
+    };
+
+    if( aGlobKey && aArgs.contains( aGlobKey ) && !( aArgs[aGlobKey].is_string() && aArgs[aGlobKey].get<std::string>().empty() ) )
+        add( aArgs[aGlobKey], aGlobKey );
+
+    if( aListKey && aArgs.contains( aListKey ) )
+    {
+        if( !aArgs[aListKey].is_array() )
+            m_error = std::string( aListKey ) + ": an array of references or globs";
+        else
+        {
+            for( const nlohmann::json& v : aArgs[aListKey] )
+                add( v, aListKey );
+        }
+    }
+
+    m_hit.assign( m_patterns.size(), 0 );
+}
+
+
+bool KOPENAPI_REF_FILTER::Match( const std::string& aRef )
+{
+    if( m_patterns.empty() )
+        return true;
+
+    bool any = false;
+
+    for( size_t i = 0; i < m_patterns.size(); ++i )
+    {
+        if( globPlain( m_patterns[i], aRef ) )
+        {
+            m_hit[i] = 1;
+            any = true;
+        }
+    }
+
+    return any;
+}
+
+
+nlohmann::json KOPENAPI_REF_FILTER::Unmatched() const
+{
+    nlohmann::json out = nlohmann::json::array();
+
+    for( size_t i = 0; i < m_patterns.size(); ++i )
+    {
+        if( !m_hit[i] )
+            out.push_back( m_patterns[i] );
+    }
+
+    return out;
+}
+
+
+static bool globPlain( const std::string& aPattern, const std::string& aText )
 {
     if( aPattern.empty() )
         return true;
@@ -421,4 +588,180 @@ wxString KopenapiCanonicalPath( const wxString& aPath )
         return aPath;
 
     return wxString::FromUTF8( out.string() );
+}
+
+
+KOPENAPI_LIST_CAP::KOPENAPI_LIST_CAP( const nlohmann::json& aArgs, size_t aDefault ) :
+        m_limit( aDefault ),
+        m_full( aArgs.is_object() && aArgs.value( "full", false ) )
+{
+    if( aArgs.is_object() && aArgs.contains( "list_limit" ) && aArgs["list_limit"].is_number() )
+        m_limit = (size_t) std::max( 0.0, aArgs["list_limit"].get<double>() );
+
+    if( m_full )
+        m_limit = std::numeric_limits<size_t>::max();
+}
+
+
+void KOPENAPI_LIST_CAP::mark( nlohmann::json& aOut, const std::string& aKey, size_t aTotal ) const
+{
+    aOut[aKey + "_total"] = aTotal;
+
+    if( !aOut.contains( "truncated" ) || !aOut["truncated"].is_array() )
+        aOut["truncated"] = nlohmann::json::array();
+
+    aOut["truncated"].push_back( aKey );
+}
+
+
+void KOPENAPI_LIST_CAP::Put( nlohmann::json& aOut, const std::string& aKey, nlohmann::json aList ) const
+{
+    if( !aList.is_array() || aList.size() <= m_limit )
+    {
+        aOut[aKey] = std::move( aList );
+        return;
+    }
+
+    const size_t total = aList.size();
+    aList.erase( aList.begin() + (std::ptrdiff_t) m_limit, aList.end() );
+    aOut[aKey] = std::move( aList );
+    mark( aOut, aKey, total );
+}
+
+
+void KOPENAPI_LIST_CAP::PutPreferring( nlohmann::json& aOut, const std::string& aKey, nlohmann::json aList,
+                                       const std::function<bool( const nlohmann::json& )>& aFirst ) const
+{
+    if( !aList.is_array() || aList.size() <= m_limit )
+    {
+        aOut[aKey] = std::move( aList );
+        return;
+    }
+
+    std::vector<bool> keep( aList.size(), false );
+    size_t            kept = 0;
+
+    for( size_t i = 0; i < aList.size() && kept < m_limit; ++i )
+    {
+        if( aFirst( aList[i] ) )
+        {
+            keep[i] = true;
+            kept++;
+        }
+    }
+
+    for( size_t i = 0; i < aList.size() && kept < m_limit; ++i )
+    {
+        if( !keep[i] )
+        {
+            keep[i] = true;
+            kept++;
+        }
+    }
+
+    nlohmann::json cut = nlohmann::json::array();
+
+    for( size_t i = 0; i < aList.size(); ++i )
+    {
+        if( keep[i] )
+            cut.push_back( std::move( aList[i] ) );
+    }
+
+    aOut[aKey] = std::move( cut );
+    mark( aOut, aKey, aList.size() );
+}
+
+
+void KOPENAPI_LIST_CAP::PutObject( nlohmann::json& aOut, const std::string& aKey,
+                                   const std::vector<std::pair<std::string, nlohmann::json>>& aEntries ) const
+{
+    nlohmann::json obj = nlohmann::json::object();
+
+    for( size_t i = 0; i < aEntries.size() && i < m_limit; ++i )
+        obj[aEntries[i].first] = aEntries[i].second;
+
+    aOut[aKey] = std::move( obj );
+
+    if( aEntries.size() > m_limit )
+        mark( aOut, aKey, aEntries.size() );
+}
+
+
+nlohmann::json KOPENAPI_LIST_CAP::Schema( nlohmann::json aSchema, size_t aDefault )
+{
+    if( !aSchema.contains( "type" ) )
+        aSchema["type"] = "object";
+
+    aSchema["properties"]["list_limit"] = { { "type", "integer" },
+                                            { "default", aDefault },
+                                            { "minimum", 0 },
+                                            { "description", "entries listed per list of the answer (uuids, items, rows); "
+                                                             "counts stay whole; a cut list has <key>_total and is named in truncated; 0 = counts only" } };
+    aSchema["properties"]["full"] = { { "type", "boolean" },
+                                      { "default", false },
+                                      { "description", "every entry of every list (large on a big board)" } };
+    return aSchema;
+}
+
+
+long KopenapiUuidMatch( const std::vector<std::string>& aUuids, const std::string& aId, std::string& aError,
+                        const std::function<std::string( size_t )>& aLabel )
+{
+    constexpr size_t kMinPrefix = 4;
+    constexpr size_t kListed = 8;
+
+    std::string id;
+
+    for( char c : aId )
+    {
+        if( !std::isspace( static_cast<unsigned char>( c ) ) )
+            id.push_back( static_cast<char>( std::tolower( static_cast<unsigned char>( c ) ) ) );
+    }
+
+    if( id.empty() )
+    {
+        aError = "uuid: empty";
+        return -1;
+    }
+
+    std::vector<size_t>   hits;
+    std::set<std::string> hitUuids;
+
+    for( size_t i = 0; i < aUuids.size(); ++i )
+    {
+        const std::string& uuid = aUuids[i];
+
+        if( uuid == id )
+            return (long) i;
+
+        if( id.size() >= kMinPrefix && uuid.compare( 0, id.size(), id ) == 0 && hitUuids.insert( uuid ).second )
+            hits.push_back( i );
+    }
+
+    if( hits.size() == 1 )
+        return (long) hits.front();
+
+    if( hits.empty() )
+    {
+        aError = "no item with uuid '" + aId + "'"
+                 + ( id.size() < kMinPrefix ? std::string( " (a uuid prefix needs at least 4 characters)" ) : std::string() );
+        return -1;
+    }
+
+    std::string listed;
+
+    for( size_t i = 0; i < hits.size() && i < kListed; ++i )
+    {
+        listed += ( i ? ", " : "" ) + aUuids[hits[i]];
+
+        if( aLabel )
+            listed += " (" + aLabel( hits[i] ) + ")";
+    }
+
+    if( hits.size() > kListed )
+        listed += ", ...";
+
+    aError = "uuid prefix '" + aId + "' is ambiguous: " + std::to_string( hits.size() )
+             + " items start with it (" + listed + "); use the full uuid";
+    return -1;
 }

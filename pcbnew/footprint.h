@@ -1335,6 +1335,13 @@ public:
                                REPORTER* aReporter = nullptr );
 
     /**
+     * Return true if the 3D models differ from those of @a aLibFP: count, file, offset,
+     * rotation, scale, opacity, visibility, and the content of embedded model files.
+     * Part of FootprintNeedsUpdate(); one report line per difference.
+     */
+    bool ModelsNeedUpdate( const FOOTPRINT* aLibFP, REPORTER* aReporter = nullptr ) const;
+
+    /**
      * Take ownership of caller's heap allocated aInitialComments block.
      *
      * The comments are single line strings already containing the s-expression comments with

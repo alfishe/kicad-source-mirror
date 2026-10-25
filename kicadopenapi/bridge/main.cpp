@@ -33,6 +33,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <ctime>
 #include <cstdlib>
 #include <iostream>
@@ -229,15 +230,162 @@ void OnTermination()
 
 /// @brief region <JSON-RPC helpers>
 
+std::mutex g_emitMutex;  // progress notifications come from a watcher thread
+
 void Emit(const json& message)
 {
+    std::lock_guard<std::mutex> lock(g_emitMutex);
     std::cout << message.dump(-1, ' ', false, json::error_handler_t::replace) << std::endl;
 }
 
 void EmitRaw(const std::string& line)
 {
+    std::lock_guard<std::mutex> lock(g_emitMutex);
     std::cout << line << std::endl;
 }
+
+/// @brief One line for a progress notification: method, phase, done / total, item, the scalar counts
+/// (one level of nesting flattened: violations.error=3), elapsed and eta
+std::string ProgressMessage(const json& running)
+{
+    const json progress = running.value("progress", json::object());
+    std::string text = running.value("method", std::string()) + " " + progress.value("phase", std::string());
+
+    if (progress.value("total", 0) > 0)
+    {
+        text += " " + std::to_string(progress.value("done", 0)) + "/" + std::to_string(progress.value("total", 0));
+    }
+    if (!progress.value("item", std::string()).empty())
+    {
+        text += " " + progress["item"].get<std::string>();
+    }
+
+    std::string counts;
+    auto add = [&](const std::string& key, const json& value)
+    {
+        if (value.is_primitive() && !value.is_null())
+        {
+            counts += (counts.empty() ? "" : " ") + key + "=" + (value.is_string() ? value.get<std::string>() : value.dump());
+        }
+    };
+    if (progress.contains("counts") && progress["counts"].is_object())
+    {
+        for (const auto& [key, value] : progress["counts"].items())
+        {
+            if (value.is_object())
+            {
+                for (const auto& [sub, subValue] : value.items())
+                {
+                    add(key + "." + sub, subValue);
+                }
+            }
+            else
+            {
+                add(key, value);
+            }
+        }
+    }
+    if (!counts.empty())
+    {
+        text += " | " + counts;
+    }
+
+    if (progress.contains("elapsed_s"))
+    {
+        text += " | " + progress["elapsed_s"].dump() + " s";
+    }
+    if (progress.contains("eta_s"))
+    {
+        text += ", eta " + progress["eta_s"].dump() + " s";
+    }
+    if (running.value("paused", false))
+    {
+        text += " (paused)";
+    }
+    return text;
+}
+
+/// @brief While a forwarded tools/call runs: the instance's progress (GET /api/v1/progress, answered
+/// on its HTTP thread) as MCP notifications/progress for the request's progressToken, on each change,
+/// polled every 500 ms; stops (joined) before the call's answer is written
+class ProgressWatch
+{
+public:
+    ProgressWatch(const std::string& host, int port, const json& token)
+    {
+        if (!token.is_string() && !token.is_number())
+        {
+            return;
+        }
+        m_thread = std::thread([this, host, port, token]() { Run(host, port, token); });
+    }
+
+    ~ProgressWatch()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_wake.notify_all();
+        if (m_thread.joinable())
+        {
+            m_thread.join();
+        }
+    }
+
+    ProgressWatch(const ProgressWatch&) = delete;
+    ProgressWatch& operator=(const ProgressWatch&) = delete;
+
+private:
+    void Run(const std::string& host, int port, const json& token)
+    {
+        json last;
+        long sent = 0;
+        std::unique_lock<std::mutex> lock(m_mutex);
+
+        while (!m_wake.wait_for(lock, std::chrono::milliseconds(500), [this] { return m_stop; }))
+        {
+            lock.unlock();
+            const bridge::HttpResult result = bridge::Get(host, port, "/api/v1/progress", 2);
+            lock.lock();
+
+            if (m_stop)
+            {
+                break;
+            }
+            const json parsed = result.ok ? json::parse(result.body, nullptr, false) : json();
+            const json running = parsed.is_object() ? parsed.value("running", json()) : json();
+            if (!running.is_object())
+            {
+                continue;
+            }
+
+            json key = running;
+            key.erase("rev");
+            if (key.contains("progress") && key["progress"].is_object())
+            {
+                for (const char* volatileKey : {"elapsed_s", "eta_s", "phase_eta_s"})
+                {
+                    key["progress"].erase(volatileKey);
+                }
+            }
+            if (key == last)
+            {
+                continue;
+            }
+            last = key;
+
+            Emit({{"jsonrpc", "2.0"},
+                  {"method", "notifications/progress"},
+                  {"params", {{"progressToken", token}, {"progress", ++sent}, {"message", ProgressMessage(running)}}}});
+        }
+    }
+
+    std::mutex m_mutex;
+    std::condition_variable m_wake;
+    bool m_stop = false;
+    std::thread m_thread;
+};
 
 json Result(const json& id, const json& result)
 {
@@ -397,7 +545,8 @@ private:
     std::optional<bridge::Instance> Start(const std::string& mode, const std::string& path, std::string& error);
 
     /// @brief Forward one request line; std::nullopt on transport failure (error already emitted)
-    std::optional<bridge::HttpResult> Forward(const std::string& line, const json& id);
+    /// aProgressToken (string or number): the instance's progress meanwhile as notifications/progress
+    std::optional<bridge::HttpResult> Forward(const std::string& line, const json& id, const json& aProgressToken = json());
 
     json CallBridgeMethod(const std::string& name, const json& args);
 
@@ -592,7 +741,7 @@ bool Bridge::EnsureBound(std::string& error)
     return false;
 }
 
-std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const json& id)
+std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const json& id, const json& aProgressToken)
 {
     std::string host;
     int port = 0;
@@ -613,6 +762,7 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
             ~RELOCK() { m.lock(); }
         } relock{m_mutex};
         m_mutex.unlock();
+        ProgressWatch watch(host, port, aProgressToken);
         return bridge::Post(host, port, path, line);
     };
 
@@ -921,7 +1071,12 @@ void Bridge::HandleLine(const std::string& line)
         return;
     }
 
-    std::optional<bridge::HttpResult> result = Forward(line, id);
+    const json meta = msg.is_object() && msg.contains("params") && msg["params"].is_object()
+                              ? msg["params"].value("_meta", json::object())
+                              : json::object();
+    const json progressToken = method == "tools/call" && meta.is_object() ? meta.value("progressToken", json()) : json();
+
+    std::optional<bridge::HttpResult> result = Forward(line, id, progressToken);
     if (!result)
     {
         return;

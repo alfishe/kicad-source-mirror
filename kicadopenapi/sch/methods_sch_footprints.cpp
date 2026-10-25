@@ -32,7 +32,11 @@ static KOPENAPI_RESULT h_sch_footprint_check( KOPENAPI_CONTEXT& aCtx, const nloh
         return KopenapiNoSchematic();
 
     SCHEMATIC*        schematic = context->GetSchematic();
-    const std::string refGlob = aArgs.value( "ref", std::string() );
+    KOPENAPI_REF_FILTER refs( aArgs );
+
+    if( !refs.Error().empty() )
+        return KOPENAPI_RESULT::Error( 400, refs.Error() );
+
     const bool        onlyProblems = aArgs.value( "problems_only", true );
     PAD_RESOLVER      resolver( aCtx.kiway, &schematic->Project() );
 
@@ -57,7 +61,7 @@ static KOPENAPI_RESULT h_sch_footprint_check( KOPENAPI_CONTEXT& aCtx, const nloh
 
             const std::string ref = str( symbol->GetRef( &path, false ) );
 
-            if( !KopenapiGlob( refGlob, ref ) )
+            if( !refs.Match( ref ) )
                 continue;
 
             PART& part = parts[ref];
@@ -147,6 +151,9 @@ static KOPENAPI_RESULT h_sch_footprint_check( KOPENAPI_CONTEXT& aCtx, const nloh
     nlohmann::json result = KopenapiPage( rows, aArgs );
     result["parts"] = parts.size();
     result["problems"] = problems;
+
+    if( !refs.Empty() )
+        result["unmatched"] = refs.Unmatched();
     result["note"] = "pins match pads by number only: polarity (diode / LED K and A) is the footprint's convention";
     return KOPENAPI_RESULT::Ok( result );
 }
@@ -155,8 +162,9 @@ static KOPENAPI_RESULT h_sch_footprint_check( KOPENAPI_CONTEXT& aCtx, const nloh
 KOPENAPI_REGISTER( "sch_footprint_check",
                    "Symbol <-> footprint check before making the board: per part, footprint missing / not "
                    "found in the libraries, symbol pins without a pad of that number, numbered pads no pin "
-                   "uses; problems_only (default) lists only parts with a problem; filter by ref glob; "
-                   "paginated",
-                   KopenapiPagedSchema( R"json({"ref":{"type":"string"},
+                   "uses; problems_only (default) lists only parts with a problem; filter by ref glob ({U1,J*}) "
+                   "or refs [...], patterns that matched nothing in unmatched; paginated",
+                   KopenapiPagedSchema( R"json({"ref":{"type":"string","description":"glob; alternatives in braces"},
+                        "refs":{"type":"array","items":{"type":"string"}},
                         "problems_only":{"type":"boolean","default":true}})json"_json ),
                    false, h_sch_footprint_check, 600 );

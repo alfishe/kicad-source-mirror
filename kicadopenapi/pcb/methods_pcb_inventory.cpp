@@ -152,6 +152,84 @@ static std::map<int, NET_INFO_AGG> aggregate( BOARD* aBoard )
 }
 
 
+std::string KopenapiZoneFillState( BOARD* aBoard, nlohmann::json* aStale )
+{
+    bool any = false, unfilled = false, stale = false;
+
+    auto visit = [&]( ZONE* aZone )
+    {
+        if( aZone->GetIsRuleArea() || aZone->IsTeardropArea() || !aZone->IsOnCopperLayer() )
+            return;
+
+        any = true;
+        const bool none = !aZone->IsFilled();
+        const bool old = aZone->NeedRefill();
+        unfilled |= none;
+        stale |= old;
+
+        if( aStale && ( none || old ) )
+        {
+            aStale->push_back( { { "uuid", aZone->m_Uuid.AsStdString() },
+                                 { "name", aZone->GetZoneName().ToStdString( wxConvUTF8 ) },
+                                 { "net", UnescapeString( aZone->GetNetname() ).ToStdString( wxConvUTF8 ) },
+                                 { "state", none ? "unfilled" : "stale" } } );
+        }
+    };
+
+    for( ZONE* zone : aBoard->Zones() )
+        visit( zone );
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( ZONE* zone : fp->Zones() )
+            visit( zone );
+    }
+
+    return !any ? "none" : unfilled ? "unfilled" : stale ? "stale" : "filled";
+}
+
+
+KOPENAPI_UNROUTED KopenapiUnrouted( BOARD* aBoard, bool aRebuild )
+{
+    KOPENAPI_UNROUTED out;
+    out.zoneFills = KopenapiZoneFillState( aBoard );
+
+    if( aRebuild )
+    {
+        aBoard->BuildConnectivity();
+        aBoard->GetConnectivity()->RecalculateRatsnest();
+    }
+
+    std::shared_ptr<CONNECTIVITY_DATA> conn = aBoard->GetConnectivity();
+
+    if( !conn )
+        return out;
+
+    // as CONNECTIVITY_DATA::GetUnconnectedCount: every net's ratsnest edges
+    for( int net = 0; net < conn->GetNetCount(); ++net )
+    {
+        if( RN_NET* rn = conn->GetRatsnestForNet( net ) )
+        {
+            const int edges = (int) rn->GetEdges().size();
+            out.connections += edges;
+            out.nets += edges > 0;
+        }
+    }
+
+    return out;
+}
+
+
+nlohmann::json KopenapiUnroutedJson( BOARD* aBoard, bool aRebuild )
+{
+    const KOPENAPI_UNROUTED u = KopenapiUnrouted( aBoard, aRebuild );
+    return { { "unrouted_connections", u.connections },
+             { "unrouted_nets", u.nets },
+             { "zone_fills", u.zoneFills },
+             { "unrouted_left", u.connections } };
+}
+
+
 static int unrouted( BOARD* aBoard, int aNetCode )
 {
     std::shared_ptr<CONNECTIVITY_DATA> conn = aBoard->GetConnectivity();
@@ -314,8 +392,12 @@ static KOPENAPI_RESULT h_pcb_footprint_list( KOPENAPI_CONTEXT& aCtx, const nlohm
     if( !context )
         return KopenapiNoBoard();
 
-    BOARD*            board = context->GetBoard();
-    const std::string refGlob = aArgs.value( "ref", std::string() );
+    BOARD*              board = context->GetBoard();
+    KOPENAPI_REF_FILTER refs( aArgs );
+
+    if( !refs.Error().empty() )
+        return KOPENAPI_RESULT::Error( 400, refs.Error() );
+
     const std::string valueGlob = aArgs.value( "value", std::string() );
     const std::string fpGlob = aArgs.value( "footprint", std::string() );
     const std::string side = aArgs.value( "side", std::string() );
@@ -327,9 +409,9 @@ static KOPENAPI_RESULT h_pcb_footprint_list( KOPENAPI_CONTEXT& aCtx, const nlohm
     {
         nlohmann::json row = footprintRow( fp );
 
-        if( !KopenapiGlob( refGlob, row["ref"] ) || !KopenapiGlob( valueGlob, row["value"] )
-            || !KopenapiGlob( fpGlob, row["footprint"] ) || ( !side.empty() && row["side"] != side )
-            || ( !type.empty() && row["type"] != type ) )
+        if( !KopenapiGlob( valueGlob, row["value"] ) || !KopenapiGlob( fpGlob, row["footprint"] )
+            || ( !side.empty() && row["side"] != side ) || ( !type.empty() && row["type"] != type )
+            || !refs.Match( row["ref"] ) )
         {
             continue;
         }
@@ -341,7 +423,12 @@ static KOPENAPI_RESULT h_pcb_footprint_list( KOPENAPI_CONTEXT& aCtx, const nlohm
                []( const nlohmann::json& a, const nlohmann::json& b )
                { return KopenapiNaturalLess( a["ref"], b["ref"] ); } );
 
-    return KOPENAPI_RESULT::Ok( KopenapiPage( rows, aArgs ) );
+    nlohmann::json page = KopenapiPage( rows, aArgs );
+
+    if( !refs.Empty() )
+        page["unmatched"] = refs.Unmatched();
+
+    return KOPENAPI_RESULT::Ok( page );
 }
 
 
@@ -353,6 +440,7 @@ static KOPENAPI_RESULT h_pcb_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
         return KopenapiNoBoard();
 
     BOARD*                      board = context->GetBoard();
+    const KOPENAPI_UNROUTED     boardOpen = KopenapiUnrouted( board );
     std::map<int, NET_INFO_AGG> agg = aggregate( board );
     const std::string           nameGlob = aArgs.value( "name", std::string() );
     const std::string           classGlob = aArgs.value( "class", std::string() );
@@ -392,7 +480,11 @@ static KOPENAPI_RESULT h_pcb_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
                []( const nlohmann::json& a, const nlohmann::json& b )
                { return KopenapiNaturalLess( a["name"], b["name"] ); } );
 
-    return KOPENAPI_RESULT::Ok( KopenapiPage( rows, aArgs ) );
+    nlohmann::json page = KopenapiPage( rows, aArgs );
+    page["unrouted_connections"] = boardOpen.connections;
+    page["unrouted_nets"] = boardOpen.nets;
+    page["zone_fills"] = boardOpen.zoneFills;
+    return KOPENAPI_RESULT::Ok( page );
 }
 
 
@@ -405,6 +497,7 @@ static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 
     BOARD*        board = context->GetBoard();
     NETINFO_ITEM* net = nullptr;
+    KopenapiUnrouted( board );
 
     if( aArgs.contains( "code" ) && aArgs["code"].is_number_integer() )
         net = board->FindNet( aArgs["code"].get<int>() );
@@ -529,13 +622,13 @@ static KOPENAPI_RESULT h_pcb_footprint_get( KOPENAPI_CONTEXT& aCtx, const nlohma
 
     if( aArgs.contains( "uuid" ) && aArgs["uuid"].is_string() )
     {
-        const std::string uuid = aArgs["uuid"].get<std::string>();
+        const std::vector<BOARD_ITEM*> footprints( board->Footprints().begin(), board->Footprints().end() );
+        std::string                    error;
 
-        for( FOOTPRINT* candidate : board->Footprints() )
-        {
-            if( str( candidate->m_Uuid.AsString() ) == uuid )
-                fp = candidate;
-        }
+        fp = static_cast<FOOTPRINT*>( KopenapiMatchUuid( footprints, aArgs["uuid"].get<std::string>(), error ) );
+
+        if( !fp && error.find( "ambiguous" ) != std::string::npos )
+            return KOPENAPI_RESULT::Error( 400, error );
     }
     else if( aArgs.contains( "ref" ) && aArgs["ref"].is_string() && !aArgs["ref"].get<std::string>().empty() )
     {
@@ -708,9 +801,11 @@ KOPENAPI_REGISTER( "pcb_footprint_list",
                    "List board footprints/components (ref, value, footprint, side, position, occupied box "
                    "courtyard_mm [x0, y0, x1, y1], THT/SMD, DNP, uuid); "
                    "filter by ref/value/footprint glob, side, type; ref '?*' skips unnamed board-only "
-                   "items; paginated, natural ref order",
+                   "items; several parts: ref '{J8,U37,R86}' or refs [...]; patterns that matched nothing "
+                   "in unmatched; paginated, natural ref order",
                    KopenapiPagedSchema( R"json({
-                        "ref":{"type":"string","description":"glob, e.g. U* or R1?"},
+                        "ref":{"type":"string","description":"glob, e.g. U* or R1?; alternatives in braces: {J8,U37,R8?}"},
+                        "refs":{"type":"array","items":{"type":"string"},"description":"references or globs (any matches); with ref: either"},
                         "value":{"type":"string","description":"glob"},
                         "footprint":{"type":"string","description":"library id glob"},
                         "side":{"type":"string","enum":["front","back"]},

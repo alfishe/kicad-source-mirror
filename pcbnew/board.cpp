@@ -2420,6 +2420,8 @@ BOARD_ITEM* BOARD::CacheAndReturnItemById( const KIID& aId, BOARD_ITEM* aItem ) 
 
 void BOARD::UncacheItemByPtr( const BOARD_ITEM* aItem )
 {
+    const bool owned = aItem->m_boardCacheOwner == this;
+
     // Clear owner first, the item no longer points to this board
     aItem->m_boardCacheOwner = nullptr;
 
@@ -2433,6 +2435,11 @@ void BOARD::UncacheItemByPtr( const BOARD_ITEM* aItem )
         m_cachedIdByItem.erase( cached );
         return;
     }
+
+    // Every cached item is owned by this board: a detached copy is in no map, and scanning the
+    // whole cache for each of its children made the library parity check O(board items)
+    if( !owned )
+        return;
 
     std::erase_if( m_itemByIdCache, [aItem]( const auto& entry ) { return entry.second == aItem; } );
 }

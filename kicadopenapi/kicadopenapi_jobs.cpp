@@ -52,6 +52,7 @@ struct JOB
     std::string       stepBy;
     int               stepN = 0;
     uint64_t          stepServed = 0;      ///< the last request the main thread went on for
+    uint64_t          rev = 0;             ///< grows with every change of state or progress (job_get since)
 
     std::string Id() const { return "job-" + std::to_string( seq ); }
     bool        Finished() const { return state == "done" || state == "failed" || state == "cancelled"; }
@@ -84,7 +85,8 @@ uint64_t idOf( const std::string& aId )
 nlohmann::json describe( const JOB& aJob, bool aWithResult )
 {
     const CLOCK::time_point now = CLOCK::now();
-    nlohmann::json          j = { { "job_id", aJob.Id() }, { "method", aJob.method }, { "state", aJob.state } };
+    nlohmann::json          j = { { "job_id", aJob.Id() }, { "method", aJob.method }, { "state", aJob.state },
+                                  { "rev", aJob.rev } };
 
     if( aJob.state == "queued" )
     {
@@ -108,6 +110,26 @@ nlohmann::json describe( const JOB& aJob, bool aWithResult )
     {
         const double spent = std::chrono::duration<double>( now - aJob.phaseStarted ).count();
         progress["phase_eta_s"] = std::round( spent / aJob.done * ( aJob.total - aJob.done ) * 10 ) / 10;
+    }
+
+    progress["elapsed_s"] = j["elapsed_s"];
+
+    // the whole call's pace when it tells the share of its work done (counts.fraction), else the phase's
+    if( aJob.state == "running" )
+    {
+        const nlohmann::json& f = aJob.counts.is_object() && aJob.counts.contains( "fraction" ) ? aJob.counts["fraction"]
+                                                                                                 : nlohmann::json();
+        const double fraction = f.is_number() ? f.get<double>() : -1;
+
+        if( fraction > 0 && fraction < 1 )
+        {
+            const double spent = std::chrono::duration<double>( now - aJob.started ).count();
+            progress["eta_s"] = std::round( spent / fraction * ( 1 - fraction ) * 10 ) / 10;
+        }
+        else if( progress.contains( "phase_eta_s" ) )
+        {
+            progress["eta_s"] = progress["phase_eta_s"];
+        }
     }
 
     j["progress"] = progress;
@@ -254,11 +276,26 @@ void record( JOB& aJob, const std::string& aPhase, int aDone, int aTotal, const 
     aJob.done = aDone;
     aJob.total = aTotal;
     aJob.item = aItem;
+    aJob.rev++;
 
     if( !aCounts.is_null() )
         aJob.counts = aCounts;
 
     KopenapiEventNotify( "job" );
+    KopenapiEventNotify( "progress" );
+}
+
+
+/// @brief Under g_mutex: the title of the windows at a job's progress, at most every 250 ms; else empty
+std::string jobTitle( const JOB& aJob, const std::string& aPhase, int aDone, int aTotal )
+{
+    if( !g_titles || !wxThread::IsMain() || CLOCK::now() - g_titleShown < std::chrono::milliseconds( 250 ) )
+        return std::string();
+
+    g_titleShown = CLOCK::now();
+    return "API job " + aJob.method + ": " + aPhase
+           + ( aTotal > 0 ? " " + std::to_string( aDone ) + "/" + std::to_string( aTotal ) : std::string() )
+           + " (Esc stops)";
 }
 
 } // namespace
@@ -310,14 +347,7 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
         if( job.cancel )
             return false;
 
-        if( g_titles && CLOCK::now() - g_titleShown > std::chrono::milliseconds( 250 ) )
-        {
-            title = "API job " + job.method + ": " + aPhase
-                    + ( aTotal > 0 ? " " + std::to_string( aDone ) + "/" + std::to_string( aTotal ) : std::string() )
-                    + " (Esc stops)";
-            g_titleShown = CLOCK::now();
-        }
-
+        title = jobTitle( job, aPhase, aDone, aTotal );
         g_yielding = true;
     }
 
@@ -362,6 +392,38 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
 }
 
 
+bool KopenapiJobProgress( const std::string& aPhase, int aDone, int aTotal, const std::string& aItem,
+                          const nlohmann::json& aCounts )
+{
+    std::string title;
+    bool        cancelled = false;
+
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+        JOB*                        job = g_current ? g_current.get() : g_call.get();
+
+        if( g_yielding || !job )
+            return true;
+
+        record( *job, aPhase, aDone, aTotal, aItem, aCounts );
+
+        if( g_current )
+        {
+            cancelled = g_current->cancel;
+            title = jobTitle( *g_current, aPhase, aDone, aTotal );
+        }
+    }
+
+    g_changed.notify_all();
+
+    if( !title.empty() )
+        g_titles->Show( title );
+
+    KopenapiKeepUiAlive();
+    return !cancelled;
+}
+
+
 bool KopenapiJobHeld( uint64_t* aSerial, std::string* aBy, int* aN )
 {
     std::lock_guard<std::mutex> lock( g_mutex );
@@ -396,8 +458,12 @@ void KopenapiCallBegin( const std::string& aMethod )
 
 void KopenapiCallEnd()
 {
-    std::lock_guard<std::mutex> lock( g_mutex );
-    g_call.reset();
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+        g_call.reset();
+    }
+
+    KopenapiEventNotify( "progress" );
 }
 
 
@@ -409,10 +475,28 @@ nlohmann::json KopenapiCallProgress()
     if( !job || job->phase.empty() )
         return nullptr;
 
+    return describe( *job, false )["progress"];
+}
+
+
+nlohmann::json KopenapiRunningProgress()
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    const JOB*                  job = g_current ? g_current.get() : g_call.get();
+
+    if( !job || job->phase.empty() )
+        return nullptr;
+
     const nlohmann::json j = describe( *job, false );
-    nlohmann::json       progress = j["progress"];
-    progress["elapsed_s"] = j["elapsed_s"];
-    return progress;
+    nlohmann::json       out = { { "method", job->method }, { "rev", job->rev }, { "progress", j["progress"] } };
+
+    if( g_current )
+    {
+        out["job_id"] = job->Id();
+        out["paused"] = job->paused;
+    }
+
+    return out;
 }
 
 
@@ -487,6 +571,7 @@ void KOPENAPI_JOBS::Run( const std::string& aId, const std::function<KOPENAPI_RE
         {
             job->state = "cancelled";
             job->started = job->finished = CLOCK::now();
+            job->rev++;
             g_changed.notify_all();
             KopenapiEventNotify( "job" );
             return;
@@ -494,6 +579,7 @@ void KOPENAPI_JOBS::Run( const std::string& aId, const std::function<KOPENAPI_RE
 
         job->state = "running";
         job->started = job->phaseStarted = CLOCK::now();
+        job->rev++;
         g_current = job;
     }
 
@@ -533,11 +619,13 @@ void KOPENAPI_JOBS::Run( const std::string& aId, const std::function<KOPENAPI_RE
         job->finished = CLOCK::now();
         job->state = result.status >= 400 ? "failed" : job->cancel ? "cancelled" : "done";
         job->result = std::move( result );
+        job->rev++;
         g_current.reset();
     }
 
     g_changed.notify_all();
     KopenapiEventNotify( "job" );
+    KopenapiEventNotify( "progress" );
     wxLogMessage( "api job %s (%s): %s", aId, job->method, job->state );
 }
 
@@ -552,6 +640,7 @@ void KOPENAPI_JOBS::Fail( const std::string& aId, const KOPENAPI_RESULT& aResult
             it->second->state = "failed";
             it->second->started = it->second->finished = CLOCK::now();
             it->second->result = aResult;
+            it->second->rev++;
         }
     }
 
@@ -564,6 +653,8 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Status( const nlohmann::json& aArgs )
 {
     const std::string id = aArgs.value( "job_id", std::string() );
     const int         waitS = std::clamp( aArgs.value( "wait_s", 0 ), 0, 600 );
+    const bool        bySince = aArgs.contains( "since" ) && aArgs["since"].is_number_integer();
+    const int64_t     since = bySince ? aArgs["since"].get<int64_t>() : 0;
 
     std::unique_lock<std::mutex> lock( g_mutex );
     auto                         it = g_jobs.find( idOf( id ) );
@@ -572,7 +663,9 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Status( const nlohmann::json& aArgs )
         return KOPENAPI_RESULT::Error( 404, "no job '" + id + "' (the last " + std::to_string( KEEP ) + " are kept)" );
 
     std::shared_ptr<JOB> job = it->second;
-    g_changed.wait_for( lock, std::chrono::seconds( waitS ), [&] { return job->Finished(); } );
+    // since: returns as soon as anything changed after that rev (long poll), else at the end
+    g_changed.wait_for( lock, std::chrono::seconds( waitS ),
+                        [&] { return job->Finished() || ( bySince && (int64_t) job->rev > since ); } );
 
     return KOPENAPI_RESULT::Ok( describe( *job, true ) );
 }
@@ -598,8 +691,11 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Cancel( const nlohmann::json& aArgs )
         {
             job.keep = aArgs.value( "keep", false );
             job.stopReason = job.keep ? "job_cancel {keep}" : "job_cancel";
+            job.rev++;
         }
     }
+
+    g_changed.notify_all();
 
     // the job stops at its next safe point and still gives its result (what it did so far)
     return KOPENAPI_RESULT::Ok( { { "job_id", id }, { "stopping", true } } );
@@ -620,6 +716,8 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Pause( const nlohmann::json& aArgs, bool aPause )
     if( !job.Finished() && job.paused != aPause )
     {
         job.paused = aPause;
+        job.rev++;
+        g_changed.notify_all();
         KopenapiEventNotify( "job" );
         wxLogMessage( "api job %s (%s): %s", job.Id(), job.method, aPause ? "paused" : "resumed" );
     }
@@ -650,6 +748,8 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Step( const nlohmann::json& aArgs )
     job.stepBy = by;
     job.stepN = std::clamp( aArgs.value( "n", 1 ), 1, 100000 );
     ++job.stepSerial;
+    job.rev++;
+    g_changed.notify_all();
     KopenapiEventNotify( "job" );
     return KOPENAPI_RESULT::Ok( describe( job, false ) );
 }
@@ -716,8 +816,13 @@ KOPENAPI_RESULT openJobEvents( const nlohmann::json& aArgs, KOPENAPI_EVENT_POLL&
         key.erase( "elapsed_s" );
         key.erase( "queued_s" );
 
+        key.erase( "rev" );
+
         if( key.contains( "progress" ) )
-            key["progress"].erase( "phase_eta_s" );
+        {
+            for( const char* volatileKey : { "phase_eta_s", "eta_s", "elapsed_s" } )
+                key["progress"].erase( volatileKey );
+        }
 
         if( key != *last )
         {
@@ -738,3 +843,4 @@ KOPENAPI_REGISTER_EVENT_TOPIC( "job",
                                "a job's progress (job_id): 'progress' events as job_get without the result when "
                                "the phase, counts, pause or step change, then 'end' with the result",
                                openJobEvents );
+

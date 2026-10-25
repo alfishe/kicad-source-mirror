@@ -12,6 +12,7 @@
 /// keeps the generic model's offset / rotation / scale.
 #include "kopenapi_pcb.h"
 
+#include <kiplatform/io.h>
 #include <3d_math.h>
 #include <api/pcb_context.h>
 #include <board.h>
@@ -505,9 +506,8 @@ nlohmann::json apply( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const TRIM_
                                                       SFVEC3F( m.m_Scale.x, m.m_Scale.y, m.m_Scale.z ) );
             const double    plane = -( thickness + p );   // where the lead ends
 
-            std::error_code ec;
             std::ostringstream key;
-            key << source.string() << '|' << (long long) std::chrono::duration_cast<std::chrono::seconds>( fs::last_write_time( source, ec ).time_since_epoch() ).count() << '|';
+            key << source.string() << '|' << KIPLATFORM::IO::TimestampFile( wxString::FromUTF8( source.string() ) ) << '|';
 
             for( int i = 0; i < 16; ++i )
                 key << std::round( glm::value_ptr( matrix )[i] * 1e4 ) << ',';

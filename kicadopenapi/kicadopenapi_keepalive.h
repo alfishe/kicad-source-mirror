@@ -8,7 +8,11 @@
 
 #include <kicommon.h>
 
+#include <algorithm>
+#include <chrono>
 #include <functional>
+#include <mutex>
+#include <string>
 #include <widgets/progress_reporter_base.h>
 
 
@@ -68,6 +72,58 @@ protected:
         KopenapiKeepUiAlive();
         return true;
     }
+};
+
+
+/// @brief Progress reporter for KiCad algorithms that accept one (DRC, zone filler) in a call that
+/// reports progress: no dialog; hands aReport the algorithm's message, its phase (1-based) and the
+/// share of that phase done, at most every 50 ms and at each new phase or message (the UI kept
+/// alive in between); false from aReport cancels the algorithm
+class KICOMMON_API KOPENAPI_PROGRESS_REPORTER : public PROGRESS_REPORTER_BASE
+{
+public:
+    using REPORT = std::function<bool( const std::string& aMessage, int aPhase, double aPhaseFraction )>;
+
+    explicit KOPENAPI_PROGRESS_REPORTER( REPORT aReport ) :
+            PROGRESS_REPORTER_BASE( 1 ),
+            m_report( std::move( aReport ) )
+    {
+    }
+
+protected:
+    bool updateUI() override
+    {
+        wxString message;
+
+        {
+            std::lock_guard<std::mutex> lock( m_mutex );
+            message = m_rptMessage;
+        }
+
+        const int  phase = m_phase.load();
+        const auto now = std::chrono::steady_clock::now();
+
+        if( phase == m_lastPhase && message == m_lastMessage && now - m_lastReport < std::chrono::milliseconds( 50 ) )
+        {
+            KopenapiKeepUiAlive();
+            return true;
+        }
+
+        m_lastPhase = phase;
+        m_lastMessage = message;
+        m_lastReport = now;
+
+        const int    max = m_maxProgress.load();
+        const double fraction = max > 0 ? std::clamp( (double) m_progress.load() / max, 0.0, 1.0 ) : 0.0;
+
+        return m_report( message.ToStdString( wxConvUTF8 ), phase, fraction );
+    }
+
+private:
+    REPORT                                m_report;
+    int                                   m_lastPhase = -1;
+    wxString                              m_lastMessage;
+    std::chrono::steady_clock::time_point m_lastReport;
 };
 
 #endif

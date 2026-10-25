@@ -16,6 +16,7 @@
 #include <erc/erc_settings.h>
 #include <kicadopenapi_checks.h>
 #include <kicadopenapi_libraries.h>
+#include <kicadopenapi_registry.h>
 #include <kiway.h>
 #include <project_sch.h>
 #include <sch_edit_frame.h>
@@ -116,6 +117,22 @@ static KOPENAPI_RESULT h_sch_erc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     if( !advice.empty() )
         result["hints"] = advice;
 
+    // symbol pins <-> library footprint pads (sch_footprint_check), problems only
+    if( aArgs.value( "footprint_check", true ) )
+    {
+        if( std::optional<KOPENAPI_METHOD> check = KOPENAPI_REGISTRY::Get().Find( "sch_footprint_check" ) )
+        {
+            KOPENAPI_RESULT parts = check->handler( aCtx, { { "problems_only", true }, { "limit", 50 } } );
+
+            if( parts.status == 200 )
+            {
+                result["footprint_check"] = { { "parts", parts.body["parts"] },
+                                              { "problems", parts.body["problems"] },
+                                              { "items", parts.body.value( "items", nlohmann::json::array() ) } };
+            }
+        }
+    }
+
     return KOPENAPI_RESULT::Ok( result );
 }
 
@@ -124,5 +141,10 @@ KOPENAPI_REGISTER( "sch_erc",
                    "Run ERC (electrical rules check) on the open schematic with KiCad's own checker, like "
                    "`kicad-cli sch erc`: summary by severity and type, violations (type, severity, "
                    "description, sheet, items with uuid and position in mm), ignored checks; filter by "
-                   "severity and type glob; paginated. GUI: markers appear in the editor",
-                   KopenapiCheckSchema(), false, h_sch_erc, 600 );
+                   "severity and type glob; paginated. GUI: markers appear in the editor. The symbol "
+                   "libraries are read as they are on disk now (lib_symbol_mismatch); footprint_check: "
+                   "parts whose symbol pins find no pad on the library footprint, or whose footprint is "
+                   "missing (sch_footprint_check, problems only)",
+                   KopenapiCheckSchema( R"json({
+                        "footprint_check":{"type":"boolean","default":true,"description":"include sch_footprint_check problems"}})json"_json ),
+                   false, h_sch_erc, 600 );

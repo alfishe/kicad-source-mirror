@@ -186,7 +186,8 @@ long long KIPLATFORM::IO::TimestampDir( const wxString& aDirPath, const wxString
 
                 if( S_ISREG( entry_stat.st_mode ) )
                 {
-                    timestamp += entry_stat.st_mtime * 1000;
+                    timestamp += (long long) entry_stat.st_mtimespec.tv_sec * 1000
+                                 + entry_stat.st_mtimespec.tv_nsec / 1000000;
                     timestamp += entry_stat.st_size;
                 }
             }
@@ -203,6 +204,18 @@ long long KIPLATFORM::IO::TimestampDir( const wxString& aDirPath, const wxString
     return timestamp;
 }
 
+
+long long KIPLATFORM::IO::TimestampFile( const wxString& aFilePath )
+{
+    std::string path( aFilePath.fn_str() );
+    struct stat st;
+
+    if( path.empty() || stat( path.c_str(), &st ) != 0 || !S_ISREG( st.st_mode ) )
+        return 0;
+
+    const long long micros = (long long) st.st_mtimespec.tv_sec * 1000000 + st.st_mtimespec.tv_nsec / 1000;
+    return micros * 31 + (long long) st.st_size;
+}
 
 bool KIPLATFORM::IO::FlushToDisk( FILE* aFp )
 {

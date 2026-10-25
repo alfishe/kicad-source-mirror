@@ -1466,7 +1466,7 @@ void SCH_IO_KICAD_LEGACY_LIB_CACHE::Save( const std::optional<bool>& aOpt )
     formatter->Finish();
     formatter.reset();
 
-    m_fileModTime = KIPLATFORM::IO::TimestampDir( fn.GetPath(), fn.GetFullName() );
+    m_fileModTime = KIPLATFORM::IO::TimestampFile( fn.GetFullPath() );
     m_isModified = false;
 
     if( doSaveDocFile )

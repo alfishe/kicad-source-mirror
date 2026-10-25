@@ -41,6 +41,7 @@
 #include <geometry/shape_poly_set.h>
 #include <thread_pool.h>
 #include <filename_resolver.h>
+#include <kiplatform/io.h>
 
 
 void RENDER_3D_OPENGL::addObjectTriangles( const FILLED_CIRCLE_2D*                aCircle,
@@ -1951,8 +1952,31 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
 
         m_3dModelMap.clear();
         m_modelMount.clear();
+        m_modelFiles.clear();
         m_modelsMaterialMode = materialMode;
         m_modelsCache = cacheMgr;
+    }
+    else
+    {
+        // a kept model whose file was rewritten is read again (one file query per model)
+        std::lock_guard lock( m_renderMutex );
+
+        for( auto it = m_3dModelMap.begin(); it != m_3dModelMap.end(); )
+        {
+            auto file = m_modelFiles.find( it->first );
+
+            if( file == m_modelFiles.end() || file->second.first.empty()
+                || KIPLATFORM::IO::TimestampFile( file->second.first ) == file->second.second )
+            {
+                ++it;
+                continue;
+            }
+
+            retireRenderPtr( it->second );
+            m_modelMount.erase( it->first );
+            m_modelFiles.erase( file );
+            it = m_3dModelMap.erase( it );
+        }
     }
 
     std::set<wxString> used;
@@ -2103,6 +2127,7 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
                     std::lock_guard lock( m_renderMutex );
                     m_modelMount[fp_model.m_Filename] = { ModelSamplePoints( *modelPtr ),
                                                           ReadModelMountMeta( modelPath ) };
+                    m_modelFiles[fp_model.m_Filename] = { modelPath, KIPLATFORM::IO::TimestampFile( modelPath ) };
                 }
 
                 auto model = std::make_shared<MODEL_3D_DEFERRED>( *modelPtr, materialMode );
@@ -2139,6 +2164,7 @@ void RENDER_3D_OPENGL::load3dModels( std::stop_token aStop )
 
             retireRenderPtr( it->second );
             m_modelMount.erase( it->first );
+            m_modelFiles.erase( it->first );
             it = m_3dModelMap.erase( it );
         }
     }

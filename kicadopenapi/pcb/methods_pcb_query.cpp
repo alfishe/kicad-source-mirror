@@ -40,7 +40,9 @@ KOPENAPI_REGISTER( "pcb_query",
                    "numbers with units), A.inPolygon('x0 y0, x1 y1, ...'), A.inArea('name'); a call with no item "
                    "(inRect(...)) applies to A. Read-only. "
                    "Answer: count, items (select fields; properties as in KiCad's Properties panel, lengths in mm) "
-                   "or groups (group_by + aggregate: count, sum(x), min(x), max(x), avg(x), distinct(x)), "
+                   "or groups (group_by + aggregate: count, sum(x), min(x), max(x), avg(x), distinct(x)); "
+                   "zones are the board's and the footprints' (each zone row's owner: the footprint's reference, or "
+                   "'board'; A.parentRef() filters by it), "
                    "next_cursor, timing_ms, scanned; explain: true gives each top-level && term per item, "
                    "'misses' adds items failing exactly one term. Errors 400 carry the offset and close names",
                    R"json({"type":"object","properties":{

@@ -246,12 +246,72 @@ static KOPENAPI_RESULT h_design_parity( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     for( const nlohmann::json& n : pcb.body["nets"] )
         anonymous += n["anonymous_pads"].get<int>();
 
+    // ---- parts: symbol <-> placed footprint <-> library <-> 3D model ----
+    nlohmann::json parts;
+
+    if( aArgs.value( "parts", true ) )
+    {
+        auto refPad = []( const std::string& aPad ) -> std::pair<std::string, std::string>
+        {
+            const size_t dot = aPad.find( '.' );
+            return dot == std::string::npos ? std::make_pair( aPad, std::string() )
+                                            : std::make_pair( aPad.substr( 0, dot ), aPad.substr( dot + 1 ) );
+        };
+
+        std::map<std::string, std::set<std::string>> boardPadsOf;
+
+        for( const auto& [pad, net] : pcbNetOfPad )
+            boardPadsOf[refPad( pad ).first].insert( refPad( pad ).second );
+
+        for( const std::string& pad : padsWithoutNet )
+            boardPadsOf[refPad( pad ).first].insert( refPad( pad ).second );
+
+        std::map<std::string, std::set<std::string>> pinsWithoutPad;
+
+        for( const auto& [pad, net] : schNetOfPad )
+        {
+            const auto [ref, number] = refPad( pad );
+
+            if( schComps.count( ref ) && pcbComps.count( ref ) && !boardPadsOf[ref].count( number ) )
+                pinsWithoutPad[ref].insert( number );
+        }
+
+        LIST placed = list();
+
+        for( const auto& [ref, pins] : pinsWithoutPad )
+            placed.add( { { "ref", ref }, { "pins", pins }, { "footprint", pcbComps[ref]["footprint"] } } );
+
+        KOPENAPI_RESULT symbols = callMethod( aCtx, "sch_footprint_check", { { "problems_only", true }, { "limit", std::max( limit, 1 ) } } );
+        KOPENAPI_RESULT boardParts = callMethod( aCtx, "pcb_parts_check", { { "problems_only", true }, { "limit", std::max( limit, 1 ) } } );
+
+        const int symbolProblems = symbols.status == 200 ? symbols.body.value( "problems", 0 ) : 0;
+        const int boardProblems = boardParts.status == 200 ? boardParts.body.value( "with_problems", 0 ) : 0;
+
+        parts = { { "consistent", placed.count == 0 && symbolProblems == 0 && boardProblems == 0
+                                          && footprintDiff.count == 0 },
+                  { "pins_without_placed_pad", placed.json() },
+                  { "symbol_footprint_field_vs_placed", footprintDiff.json() } };
+
+        if( symbols.status == 200 )
+        {
+            parts["symbol_vs_library_footprint"] = { { "problems", symbolProblems },
+                                                     { "items", symbols.body.value( "items", nlohmann::json::array() ) } };
+        }
+
+        if( boardParts.status == 200 )
+        {
+            parts["placed_vs_library_and_models"] = { { "with_problems", boardProblems },
+                                                      { "counts", boardParts.body["counts"] },
+                                                      { "items", boardParts.body.value( "items", nlohmann::json::array() ) } };
+        }
+    }
+
     const bool consistent = missingOnBoard.count == 0 && missingInSchematic.count == 0 && valueDiff.count == 0
                             && footprintDiff.count == 0 && split.count == 0 && merged.count == 0
                             && onlySchematic.count == 0 && onlyBoard.count == 0 && netless.count == 0;
 
-    return KOPENAPI_RESULT::Ok(
-            { { "consistent", consistent },
+    nlohmann::json answer = {
+              { "consistent", consistent },
               { "components",
                 { { "schematic", schComps.size() },
                   { "board", pcbComps.size() },
@@ -276,7 +336,12 @@ static KOPENAPI_RESULT h_design_parity( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                   { "board_pad_without_net", netless.json() },
                   { "unconnected_pins", unconnected.json() },
                   { "unmapped_schematic_pins", sch.body["unmapped_pins"].size() },
-                  { "anonymous_board_pads_on_nets", anonymous } } } } );
+                  { "anonymous_board_pads_on_nets", anonymous } } } };
+
+    if( !parts.is_null() )
+        answer["parts"] = parts;
+
+    return KOPENAPI_RESULT::Ok( answer );
 }
 
 
@@ -351,9 +416,9 @@ static KOPENAPI_RESULT h_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         if( card.status != 200 )
             continue;
 
-        for( const nlohmann::json& p : card.body["pads"] )
+        for( const nlohmann::json& p : card.body.value( "pad_list", nlohmann::json::array() ) )
         {
-            if( p["pin"].is_string() )
+            if( p.contains( "pin" ) && p["pin"].is_string() )
                 boardPads.insert( p["pin"].get<std::string>() );
         }
 
@@ -472,7 +537,8 @@ static KOPENAPI_RESULT h_design_update_board( KOPENAPI_CONTEXT& aCtx, const nloh
     // 3. KiCad's Update PCB from Schematic
     nlohmann::json apply = { { "netlist", sch.body["netlist"] } };
 
-    for( const char* key : { "dry_run", "match", "delete_extra", "replace_footprints", "override_locks", "spread", "spread_width_mm" } )
+    for( const char* key : { "dry_run", "match", "delete_extra", "replace_footprints", "override_locks", "spread", "spread_width_mm",
+                             "list_limit", "full" } )
     {
         if( aArgs.contains( key ) )
             apply[key] = aArgs[key];
@@ -496,8 +562,8 @@ KOPENAPI_REGISTER( "design_update_board",
                    "Schematic -> board in one call (KiCad's Update PCB from Schematic): takes the open "
                    "schematic's netlist (unsaved edits included), opens the project's board or creates it "
                    "(layers), adds / updates / removes footprints and nets, lays new footprints out beside "
-                   "the board; report per change; dry_run to preview",
-                   R"json({"type":"object","properties":{
+                   "the board; report per change (cut to list_limit, default 50; full: true for all); dry_run to preview",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
                         "board_path":{"type":"string","description":"default: the schematic's project, .kicad_pcb"},
                         "create":{"type":"boolean","default":true},
                         "layers":{"type":"integer","default":2,"description":"copper layers of a new board"},
@@ -505,15 +571,20 @@ KOPENAPI_REGISTER( "design_update_board",
                         "match":{"type":"string","enum":["uuid","reference"],"default":"uuid"},
                         "delete_extra":{"type":"boolean","default":true},
                         "replace_footprints":{"type":"boolean","default":true},
-                        "override_locks":{"type":"boolean","default":false,"description":"locked footprints are not replaced or removed otherwise"}}})json"_json,
+                        "override_locks":{"type":"boolean","default":false,"description":"locked footprints are not replaced or removed otherwise"}}})json"_json, 50 ),
                    false, h_design_update_board, 600 );
 
 KOPENAPI_REGISTER( "design_parity",
                    "Compare schematic and board (both open): components (missing on either side, value / "
                    "footprint differences) and nets by connectivity through pads — identical, renamed, split "
-                   "or merged on the board, pads only on one side, unconnected pins; consistent flag",
+                   "or merged on the board, pads only on one side, unconnected pins; consistent flag (components "
+                   "and nets). parts (default on): symbol <-> footprint <-> 3D model cross-check with its own "
+                   "consistent flag — symbol pins without a pad on the placed footprint, symbol footprint field vs "
+                   "placed lib_id, symbol pins vs the library footprint (sch_footprint_check), placed footprint vs "
+                   "its library copy incl. 3D models, model files and metadata (pcb_parts_check); libraries as on disk now",
                    R"json({"type":"object","properties":{
-                        "list_limit":{"type":"integer","default":50,"description":"max listed items per finding"}}})json"_json,
+                        "list_limit":{"type":"integer","default":50,"description":"max listed items per finding"},
+                        "parts":{"type":"boolean","default":true,"description":"include the parts cross-check"}}})json"_json,
                    false, h_design_parity, 120 );
 
 KOPENAPI_REGISTER( "net_get",

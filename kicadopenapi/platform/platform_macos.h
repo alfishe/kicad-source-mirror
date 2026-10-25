@@ -22,6 +22,7 @@ SystemMemoryInfo SystemMemoryMacOS();
 AllocatorInfo AllocatorStatsMacOS();
 int64_t AllocatorTrimMacOS();
 void LowerCurrentThreadPriorityMacOS();
+void KeepProcessResponsiveMacOS();
 
 } // namespace kopenapi::platform
 

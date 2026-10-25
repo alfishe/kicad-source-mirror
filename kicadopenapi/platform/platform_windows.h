@@ -36,6 +36,7 @@ SystemMemoryInfo SystemMemoryWindows();
 AllocatorInfo AllocatorStatsWindows();
 int64_t AllocatorTrimWindows();
 void LowerCurrentThreadPriorityWindows();
+void KeepProcessResponsiveWindows();
 
 } // namespace kopenapi::platform
 

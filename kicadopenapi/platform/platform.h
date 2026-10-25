@@ -132,4 +132,9 @@ int64_t AllocatorTrim();
 /// Windows below normal)
 void LowerCurrentThreadPriority();
 
+/// @brief Keeps the OS from throttling this process while its windows are hidden or in the
+/// background (macOS App Nap, Windows power throttling): an agent drives a KiCad that is rarely
+/// frontmost.  Idempotent; idle system sleep stays allowed.  No-op on Linux.
+void KeepProcessResponsive();
+
 } // namespace kopenapi::platform

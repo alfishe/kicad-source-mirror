@@ -388,6 +388,10 @@ private:
     /// Per model file: sample points and mount metadata, for the lead clip
     std::map<wxString, std::pair<std::vector<SFVEC3F>, MODEL_MOUNT_META>> m_modelMount;
 
+    /// Per kept model file: the resolved path and its KIPLATFORM::IO::TimestampFile when it was
+    /// read; a reload drops a kept model whose file changed on disk
+    std::map<wxString, std::pair<wxString, long long>> m_modelFiles;
+
     /// Lead clip per footprint model, computed on first draw after a reload
     std::map<std::pair<const FOOTPRINT*, wxString>, std::optional<LEAD_CLIP>> m_leadClips;
     std::atomic<bool>    m_sceneBoundsValid{ false };

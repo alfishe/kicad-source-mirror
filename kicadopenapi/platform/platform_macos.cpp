@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <dlfcn.h>
 #include <cstdint>
 #include <libproc.h>
 #include <mach-o/dyld.h>
@@ -137,6 +138,56 @@ int64_t AllocatorTrimMacOS()
 void LowerCurrentThreadPriorityMacOS()
 {
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+}
+
+void KeepProcessResponsiveMacOS()
+{
+    // -[NSProcessInfo beginActivityWithOptions:reason:] through the Objective-C runtime: this file
+    // is plain C++ and the bridge links no Foundation (there the lookups fail and nothing happens)
+    static bool held = false;
+
+    if (held)
+        return;
+
+    using GetClass = void* (*)(const char*);
+    using RegisterName = void* (*)(const char*);
+    using PoolPush = void* (*)();
+    using PoolPop = void (*)(void*);
+
+    auto getClass = reinterpret_cast<GetClass>(dlsym(RTLD_DEFAULT, "objc_getClass"));
+    auto selector = reinterpret_cast<RegisterName>(dlsym(RTLD_DEFAULT, "sel_registerName"));
+    auto poolPush = reinterpret_cast<PoolPush>(dlsym(RTLD_DEFAULT, "objc_autoreleasePoolPush"));
+    auto poolPop = reinterpret_cast<PoolPop>(dlsym(RTLD_DEFAULT, "objc_autoreleasePoolPop"));
+    void* msgSend = dlsym(RTLD_DEFAULT, "objc_msgSend");
+
+    if (!getClass || !selector || !poolPush || !poolPop || !msgSend)
+        return;
+
+    void* processInfoClass = getClass("NSProcessInfo");
+    void* stringClass = getClass("NSString");
+
+    if (!processInfoClass || !stringClass)
+        return;
+
+    // NSActivityUserInitiatedAllowingIdleSystemSleep
+    constexpr uint64_t options = 0x00FFFFFFULL & ~(1ULL << 20);
+
+    void* pool = poolPush();
+    void* processInfo = reinterpret_cast<void* (*)(void*, void*)>(msgSend)(processInfoClass, selector("processInfo"));
+    void* reason = reinterpret_cast<void* (*)(void*, void*, const char*)>(msgSend)(
+            stringClass, selector("stringWithUTF8String:"), "kicadopenapi: driven by an agent");
+    void* activity = processInfo ? reinterpret_cast<void* (*)(void*, void*, uint64_t, void*)>(msgSend)(
+                                           processInfo, selector("beginActivityWithOptions:reason:"), options, reason)
+                                 : nullptr;
+
+    // held for the process's lifetime
+    if (activity)
+    {
+        reinterpret_cast<void* (*)(void*, void*)>(msgSend)(activity, selector("retain"));
+        held = true;
+    }
+
+    poolPop(pool);
 }
 
 } // namespace kopenapi::platform

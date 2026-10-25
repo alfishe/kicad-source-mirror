@@ -86,25 +86,7 @@ struct PLACE_GLOW_TRAITS
         return aFrame->GetBoard() ? aFrame->GetBoard()->ResolveItem( aId, true ) : nullptr;
     }
 
-    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn )
-    {
-        KIGFX::VIEW* view = aFrame->GetCanvas()->GetView();
-
-        auto one = [&]( EDA_ITEM* aOne )
-        {
-            if( aOn )
-                aOne->SetBrightened();
-            else
-                aOne->ClearBrightened();
-
-            view->Update( aOne, KIGFX::REPAINT );
-        };
-
-        one( aItem );
-
-        if( aItem->Type() == PCB_FOOTPRINT_T )
-            static_cast<FOOTPRINT*>( aItem )->RunOnChildren( [&]( BOARD_ITEM* aChild ) { one( aChild ); }, RECURSE_MODE::RECURSE );
-    }
+    static void Brighten( FRAME* aFrame, EDA_ITEM* aItem, bool aOn ) { KopenapiPcbBrighten( aFrame, aItem, aOn ); }
 
     static BOX2I Box( EDA_ITEM* aItem ) { return aItem->GetBoundingBox(); }
     static int   Mm() { return pcbIUScale.mmToIU( 1.0 ); }
@@ -176,6 +158,8 @@ nlohmann::json edgeFacing( FOOTPRINT* aFootprint, const BOX2I& aEdges );
 /// moved); the ratsnest figures are always for the whole board
 nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>* aOnly = nullptr )
 {
+    // one connectivity rebuild: airwires and open connections as every other method counts them
+    const KOPENAPI_UNROUTED open = KopenapiUnrouted( aBoard );
     SHAPE_POLY_SET outline;
     const bool     hasOutline = aBoard->GetBoardPolygonOutlines( outline, true ) && outline.OutlineCount() > 0;
     const BOX2I    edges = aBoard->GetBoardEdgesBoundingBox();
@@ -366,7 +350,7 @@ nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>*
                               { "connectors", connectors },
                               { "connector_problems", problems },
                               { "edge_overhang", overhanging },
-                              { "unrouted", connectivity->GetUnconnectedCount( true ) },
+                              { "unrouted", open.connections },
                               { "airwire_length_mm", toMm( airwires ) },
                               { "airwires", edgesCount },
                               { "ok", overlaps.empty() && outside.empty() && problems.empty() && hasOutline } };
@@ -375,6 +359,9 @@ nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>*
         report["edge_overhang_note"] = "connectors placed with their mating side over the board edge on purpose (the "
                                        "opening at the edge, the body's front beyond it, as the footprint draws it): "
                                        "not outside_board; edge_offset_mm in pcb_footprint_move sets it back";
+
+    report.update( KopenapiUnroutedJson( aBoard, false ) );
+    report.erase( "unrouted_left" );
 
     if( hasOutline )
         report["board_mm"] = { toMm( edges.GetWidth() ), toMm( edges.GetHeight() ) };
@@ -1855,6 +1842,10 @@ static KOPENAPI_RESULT h_pcb_placement_check( KOPENAPI_CONTEXT& aCtx, const nloh
 }
 
 
+// entries per list of pcb_place_auto's answer by default
+constexpr size_t PLACE_AUTO_LIST_CAP = 50;
+
+
 static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -2204,6 +2195,16 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( !groups.empty() )
         report["groups"] = groups;
     report["autoplacer"] = result == AR_COMPLETED ? "completed" : "failed";
+
+    const KOPENAPI_LIST_CAP cap( aArgs, PLACE_AUTO_LIST_CAP );
+
+    for( const char* key : { "courtyard_overlaps", "outside_board", "connectors", "connector_problems", "edge_overhang",
+                             "notes", "groups" } )
+    {
+        if( report.contains( key ) )
+            cap.Put( report, key, report[key] );
+    }
+
     return KOPENAPI_RESULT::Ok( report );
 }
 
@@ -2354,13 +2355,14 @@ KOPENAPI_REGISTER( "pcb_place_auto",
                    "parts (density, aspect); connectors along the edges; the rest by KiCad's autoplacer "
                    "(inside the outline, short airwires), then the given groups (a main part with the parts "
                    "that belong at its pins); unlocked footprints only; answers the placement check. Refine "
-                   "with pcb_place_group and pcb_footprint_move (near)",
-                   R"json({"type":"object","properties":{
+                   "with pcb_place_group and pcb_footprint_move (near); the answer's lists capped at list_limit "
+                   "(counts whole), full: true for all",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
                         "width_mm":{"type":"number"},"height_mm":{"type":"number"},
                         "x_mm":{"type":"number","default":20},"y_mm":{"type":"number","default":20},
                         "density":{"type":"number","default":0.35},"aspect":{"type":"number","default":1.5},
                         "connectors_to_edge":{"type":"boolean","default":true},
-                        "groups":{"type":"array","description":"functional blocks to pull together after the first placement, each as pcb_place_group takes it: {anchor, parts?, side?, gap_mm?, max_mm?}","items":{"type":"object"}}}})json"_json,
+                        "groups":{"type":"array","description":"functional blocks to pull together after the first placement, each as pcb_place_group takes it: {anchor, parts?, side?, gap_mm?, max_mm?}","items":{"type":"object"}}}})json"_json, PLACE_AUTO_LIST_CAP ),
                    false, h_pcb_place_auto, 600 );
 
 KOPENAPI_MARK_EDITING( "pcb_footprint_move", "pcb_place_auto", "pcb_place_group" );

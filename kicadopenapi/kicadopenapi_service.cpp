@@ -442,6 +442,16 @@ struct KICAD_OPENAPI_SERVICE::IMPL
     std::function<void()>             waker;
     std::function<void()>             shutdownHandler;
 
+    /// @brief GET /api/v1/progress: the running call's progress without touching the main thread
+    nlohmann::json progressJson() const
+    {
+        const std::string job = KOPENAPI_JOBS::Get().Busy();
+
+        return { { "busy", busyJson() },
+                 { "running", KopenapiRunningProgress() },
+                 { "job", job.empty() ? nlohmann::json() : nlohmann::json( job ) } };
+    }
+
     nlohmann::json statusJson() const
     {
         return { { "service", "kicadopenapi" },
@@ -709,6 +719,16 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::openApiJson() const
                     { "404", errorResponse } } } } }
         };
     }
+
+    paths["/api/v1/progress"] = {
+        { "get",
+          { { "operationId", "progress" },
+            { "summary", "The running call's progress, answered on the HTTP thread (never waits for KiCad): "
+                         "busy (method, running_ms, progress), running ({method, rev, progress, job_id + paused "
+                         "for a job} of the call reporting progress, else null), job (the queued or running "
+                         "job). Pushed instead: GET /api/v1/events?topic=progress; a job: job_get {since}" },
+            { "responses", { { "200", { { "description", "progress" } } } } } } }
+    };
 
     if( shutdownHandler )
     {
@@ -1513,6 +1533,51 @@ static void serveEvents( const httplib::Request& aReq, httplib::Response& aRes,
 }
 
 
+
+namespace
+{
+
+/// @brief The running call's progress, a job's or a plain call's: 'progress' events when it changes,
+/// 'idle' when none reports any
+KOPENAPI_RESULT openProgressEvents( const nlohmann::json&, KOPENAPI_EVENT_POLL& aPoll )
+{
+    auto last = std::make_shared<std::optional<nlohmann::json>>();
+
+    aPoll = [last]( std::vector<KOPENAPI_EVENT>& aOut )
+    {
+        nlohmann::json now = KopenapiRunningProgress();
+        nlohmann::json key = now;
+
+        if( key.is_object() )
+        {
+            key.erase( "rev" );
+
+            for( const char* volatileKey : { "phase_eta_s", "eta_s", "elapsed_s" } )
+                key["progress"].erase( volatileKey );
+        }
+
+        if( !*last || key != **last )
+        {
+            *last = std::move( key );
+            aOut.push_back( { now.is_null() ? "idle" : "progress", now.is_null() ? nlohmann::json::object() : now } );
+        }
+
+        return true;
+    };
+
+    return KOPENAPI_RESULT::Ok( nlohmann::json::object() );
+}
+
+} // namespace
+
+
+KOPENAPI_REGISTER_EVENT_TOPIC( "progress",
+                               "the progress of the running call, a job or a plain call (pcb_route, pcb_drc, "
+                               "pcb_zones_fill, pcb_stitch): 'progress' events {method, job_id (jobs), progress} "
+                               "when it changes, 'idle' when no call reports progress; the stream stays open",
+                               openProgressEvents );
+
+
 void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
 {
     // Exclusive listener (per OS, see platform layer): httplib's default SO_REUSEPORT would
@@ -1545,6 +1610,12 @@ void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
                  [this]( const httplib::Request&, httplib::Response& res )
                  {
                      reply( res, liveStatus() );
+                 } );
+
+    server->Get( "/api/v1/progress",
+                 [this]( const httplib::Request&, httplib::Response& res )
+                 {
+                     reply( res, KOPENAPI_RESULT::Ok( progressJson() ) );
                  } );
 
     server->Get( "/api/v1/openapi.json",
@@ -1833,6 +1904,9 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
 
     // A process without libraries is a silent failure for an agent: say so in the journal
     KopenapiCheckGlobalLibraryTables();
+
+    // a throttled background KiCad answers an agent's call in tens of seconds on a loaded host
+    kopenapi::platform::KeepProcessResponsive();
 
     std::fprintf( stderr, "kicadopenapi listening at http://%s:%d\n", KOPENAPI_HOST_ADDR,
                   m_impl->port );

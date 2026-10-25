@@ -84,7 +84,9 @@ void getFootprintPadNumbers( const wxString& aFootprint, PROJECT* aProject, std:
     if( !adapter )
         return;
 
-    adapter->LoadOne( fpID.GetLibNickname() );
+    // LoadOne() re-reads the whole library; a loaded one is kept current by LoadFootprint()
+    if( !adapter->IsLibraryLoaded( fpID.GetLibNickname() ) )
+        adapter->LoadOne( fpID.GetLibNickname() );
 
     std::unique_ptr<FOOTPRINT> footprint;
 

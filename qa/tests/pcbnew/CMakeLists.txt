@@ -69,6 +69,7 @@ set( QA_PCBNEW_SRCS
     test_footprint_editor_tabs.cpp
     test_footprint_import_reconciler.cpp
     test_footprint_library_adapter.cpp
+    test_library_parity_models.cpp
     test_footprint_load_save.cpp
     test_footprint_realignment.cpp
     test_cross_probe_selection.cpp
@@ -115,6 +116,7 @@ set( QA_PCBNEW_SRCS
     test_plot_pad_mask.cpp
     test_plot_footprint_scaled_text.cpp
     test_pcb_textbox.cpp
+    test_pcb_text_hull.cpp
     test_prettifier.cpp
     test_pcb_render_settings.cpp
     test_libeval_compiler.cpp

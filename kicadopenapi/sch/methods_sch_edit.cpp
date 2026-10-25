@@ -147,12 +147,55 @@ struct SYMBOL_AT
 };
 
 
+/// @brief The items of a sheet's screen
+std::vector<SCH_ITEM*> screenItems( SCH_SCREEN* aScreen )
+{
+    std::vector<SCH_ITEM*> items;
+
+    for( SCH_ITEM* item : aScreen->Items() )
+        items.push_back( item );
+
+    return items;
+}
+
+
 /// @brief Symbol by "uuid" or "ref" (unique among sheet instances); aError/aStatus set when not found
 std::optional<SYMBOL_AT> findSymbol( SCHEMATIC* aSchematic, const nlohmann::json& aArgs, int& aStatus, std::string& aError )
 {
-    const std::string uuid = aArgs.value( "uuid", std::string() );
+    std::string       uuid = aArgs.value( "uuid", std::string() );
     const std::string ref = aArgs.value( "ref", std::string() );
     std::vector<SYMBOL_AT> found;
+
+    if( uuid.empty() && ref.empty() )
+    {
+        aStatus = 400;
+        aError = "give 'uuid' or 'ref'";
+        return std::nullopt;
+    }
+
+    if( !uuid.empty() )
+    {
+        std::vector<SCH_ITEM*> symbols;
+
+        for( const SCH_SHEET_PATH& path : aSchematic->Hierarchy() )
+        {
+            for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+                symbols.push_back( item );
+        }
+
+        std::string error;
+
+        if( SCH_ITEM* hit = KopenapiSchMatchUuid( symbols, uuid, error ) )
+        {
+            uuid = str( hit->m_Uuid.AsString() );
+        }
+        else if( error.find( "ambiguous" ) != std::string::npos )
+        {
+            aStatus = 400;
+            aError = error;
+            return std::nullopt;
+        }
+    }
 
     for( const SCH_SHEET_PATH& path : aSchematic->Hierarchy() )
     {
@@ -166,13 +209,6 @@ std::optional<SYMBOL_AT> findSymbol( SCHEMATIC* aSchematic, const nlohmann::json
                 found.push_back( { symbol, path } );
             }
         }
-    }
-
-    if( uuid.empty() && ref.empty() )
-    {
-        aStatus = 400;
-        aError = "give 'uuid' or 'ref'";
-        return std::nullopt;
     }
 
     if( found.empty() )
@@ -2034,6 +2070,9 @@ static KOPENAPI_RESULT h_sch_items_move( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     SCH_SCREEN*         screen = sheet->LastScreen();
     std::set<SCH_ITEM*> anchors;
 
+    if( std::string error; !KopenapiSchExpandUuids( screenItems( screen ), wanted, error ) )
+        return KOPENAPI_RESULT::Error( 400, error );
+
     for( SCH_ITEM* item : screen->Items() )
     {
         if( wanted.erase( str( item->m_Uuid.AsString() ) ) )
@@ -2766,6 +2805,19 @@ static KOPENAPI_RESULT h_sch_item_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann
     const bool     overrideLocks = aArgs.value( "override_locks", false );
     SCH_SCREENS    screens( context->GetSchematic()->Root() );
 
+    {
+        std::vector<SCH_ITEM*> all;
+
+        for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+        {
+            for( SCH_ITEM* item : screen->Items() )
+                all.push_back( item );
+        }
+
+        if( std::string error; !KopenapiSchExpandUuids( all, wanted, error ) )
+            return KOPENAPI_RESULT::Error( 400, error );
+    }
+
     for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
     {
         std::vector<SCH_ITEM*> hits;
@@ -2839,6 +2891,20 @@ static KOPENAPI_RESULT schSetLocked( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         return KOPENAPI_RESULT::Error( 400, "say what: refs (symbols by reference, all their units) or uuids (sch_item_list, sch_symbol_list)" );
 
     SCHEMATIC*            schematic = context->GetSchematic();
+
+    if( !uuids.empty() )
+    {
+        std::vector<SCH_ITEM*> all;
+
+        for( const SCH_SHEET_PATH& path : schematic->Hierarchy() )
+        {
+            for( SCH_ITEM* item : path.LastScreen()->Items() )
+                all.push_back( item );
+        }
+
+        if( std::string error; !KopenapiSchExpandUuids( all, uuids, error ) )
+            return KOPENAPI_RESULT::Error( 400, error );
+    }
     SCH_COMMIT            commit( context->GetToolManager() );
     std::set<SCH_ITEM*>   seen;
     std::set<std::string> foundRefs, foundUuids;
@@ -4213,6 +4279,38 @@ std::optional<SCH_SHEET_PATH> sheetInstance( SCHEMATIC* aSchematic, const std::s
     if( byName.size() == 1 )
         return byName.front();
 
+    if( byName.empty() )
+    {
+        std::vector<SCH_SHEET_PATH> paths;
+        std::vector<SCH_ITEM*>      sheets;
+
+        for( const SCH_SHEET_PATH& path : aSchematic->Hierarchy() )
+        {
+            if( path.size() < 2 || path.at( path.size() - 2 )->IsVirtualRootSheet() )
+                continue;
+
+            paths.push_back( path );
+            sheets.push_back( path.Last() );
+        }
+
+        std::string error;
+
+        if( SCH_ITEM* hit = KopenapiSchMatchUuid( sheets, aWanted, error ) )
+        {
+            for( size_t i = 0; i < sheets.size(); ++i )
+            {
+                if( sheets[i] == hit )
+                    return paths[i];
+            }
+        }
+        else if( error.find( "ambiguous" ) != std::string::npos )
+        {
+            aStatus = 400;
+            aError = error;
+            return std::nullopt;
+        }
+    }
+
     aStatus = byName.empty() ? 404 : 409;
     aError = byName.empty() ? "sheet not found: " + aWanted + " (sch_sheet_list paths, or the sheet uuid)"
                             : "sheet name '" + aWanted + "' is used by several sheets: give the path";
@@ -4752,7 +4850,7 @@ KOPENAPI_REGISTER( "sch_symbol_update",
                                 "symbols, PWR_FLAGs, labels) and stretches / re-routes wiring shared with other "
                                 "parts." ) + EDIT_NOTE,
                    R"json({"type":"object","properties":{
-                        "uuid":{"type":"string"},"ref":{"type":"string","description":"lookup by reference"},
+                        "uuid":{"type":"string","description":"whole uuid or a unique prefix (4+ characters)"},"ref":{"type":"string","description":"lookup by reference"},
                         "new_ref":{"type":"string"},"value":{"type":"string"},"footprint":{"type":"string"},
                         "fields":{"type":"object","additionalProperties":{"type":"string"}},
                         "x_mm":{"type":"number"},"y_mm":{"type":"number"},
@@ -4771,7 +4869,7 @@ KOPENAPI_REGISTER( "sch_items_move",
                                 "among them are kept; wiring that belongs only to moved parts comes along; wires to "
                                 "the rest stretch and are re-routed orthogonally (warnings if not)." ) + EDIT_NOTE,
                    R"json({"type":"object","required":["uuids"],"properties":{
-                        "uuids":{"type":"array","items":{"type":"string"}},
+                        "uuids":{"type":"array","items":{"type":"string"},"description":"whole uuids or unique prefixes (4+ characters)"},
                         "dx_mm":{"type":"number","default":0},"dy_mm":{"type":"number","default":0},
                         "sheet":{"type":"string"},
                         "override_locks":{"type":"boolean","default":false}}})json"_json,
@@ -4811,7 +4909,7 @@ KOPENAPI_REGISTER( "sch_page_set",
 KOPENAPI_REGISTER( "sch_item_delete",
                    std::string( "Delete schematic items (symbols, labels, wires, no-connects...) by uuid." ) + EDIT_NOTE,
                    R"json({"type":"object","required":["uuids"],"properties":{
-                        "uuids":{"type":"array","items":{"type":"string"}},
+                        "uuids":{"type":"array","items":{"type":"string"},"description":"whole uuids or unique prefixes (4+ characters)"},
                         "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_sch_item_delete );
 
@@ -4926,7 +5024,7 @@ KOPENAPI_REGISTER( "sch_annotate",
 
 #define SCH_LOCK_SCHEMA R"json({"type":"object","properties":{
                         "refs":{"type":"array","items":{"type":"string"},"description":"symbols by reference: every unit and sheet instance"},
-                        "uuids":{"type":"array","items":{"type":"string"},"description":"any items (symbols, wires, labels, junctions, sheets) on any sheet"}}})json"_json
+                        "uuids":{"type":"array","items":{"type":"string"},"description":"any items (symbols, wires, labels, junctions, sheets) on any sheet; whole uuids or unique prefixes (4+ characters)"}}})json"_json
 
 KOPENAPI_REGISTER( "sch_lock",
                    "Lock schematic items (KiCad's lock flag, saved with the sheets): symbols by reference, any "

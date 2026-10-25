@@ -415,6 +415,9 @@ public:
 
     long long GetLibraryTimestamp( const wxString& aLibraryPath ) const override;
 
+    std::optional<long long> GetFootprintTimestamp( const wxString& aLibraryPath,
+                                                    const wxString& aFootprintName ) const override;
+
     void CreateLibrary( const wxString& aLibraryPath,
                         const std::map<std::string, UTF8>* aProperties = nullptr) override;
 

@@ -4208,6 +4208,14 @@ long long PCB_IO_KICAD_SEXPR::GetLibraryTimestamp( const wxString& aLibraryPath 
 }
 
 
+std::optional<long long> PCB_IO_KICAD_SEXPR::GetFootprintTimestamp( const wxString& aLibraryPath,
+                                                                    const wxString& aFootprintName ) const
+{
+    return KIPLATFORM::IO::TimestampFile( aLibraryPath + wxFileName::GetPathSeparator() + aFootprintName
+                                          + wxS( "." ) + FILEEXT::KiCadFootprintFileExtension );
+}
+
+
 void PCB_IO_KICAD_SEXPR::CreateLibrary( const wxString& aLibraryPath,
                                         const std::map<std::string, UTF8>* aProperties )
 {

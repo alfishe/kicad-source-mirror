@@ -2,6 +2,7 @@
 /// @brief 3D model geometry for inspection and seating (see kopenapi_occ.h).
 #include "kopenapi_occ.h"
 
+#include <kiplatform/io.h>
 #include <nlohmann/json.hpp>
 #include <wx/stdpaths.h>
 
@@ -193,11 +194,8 @@ KOPENAPI_MODEL_GEOMETRY KopenapiModelGeometry( const std::filesystem::path& aSte
                                                const std::vector<glm::vec3>& aHoles, double aThickness,
                                                const std::vector<std::vector<glm::vec2>>& aBoard )
 {
-    std::error_code    ec;
     std::ostringstream key;
-    key << "v2|" << aStep.string() << '|'
-        << std::chrono::duration_cast<std::chrono::seconds>(
-                   std::filesystem::last_write_time( aStep, ec ).time_since_epoch() ).count();
+    key << "v2|" << aStep.string() << '|' << KIPLATFORM::IO::TimestampFile( wxString::FromUTF8( aStep.string() ) );
 
     for( int c = 0; c < 4; ++c )
     {

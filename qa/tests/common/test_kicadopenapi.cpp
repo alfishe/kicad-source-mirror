@@ -22,6 +22,7 @@
 #include <kicadopenapi_args.h>
 #include <kicadopenapi_call_ticket.h>
 #include <kicadopenapi_undo.h>
+#include <kicadopenapi_util.h>
 #include <undo_redo_container.h>
 
 #include <atomic>
@@ -322,6 +323,106 @@ BOOST_AUTO_TEST_CASE( ArgsFormatsAreNotChecked )
                                               "properties":{"path":{"type":"string","format":"uri"}}})json"_json;
 
     BOOST_CHECK_EQUAL( KopenapiValidateArgs( "t_format", withFormat, { { "path", "/not a uri" } } ), "" );
+}
+
+
+BOOST_AUTO_TEST_CASE( GlobBraceAlternation )
+{
+    BOOST_CHECK( KopenapiGlob( "{J8,U37,R86}", "U37" ) );
+    BOOST_CHECK( !KopenapiGlob( "{J8,U37,R86}", "U3" ) );
+    BOOST_CHECK( KopenapiGlob( "{C,R}{1,2}", "R2" ) );
+    BOOST_CHECK( !KopenapiGlob( "{C,R}{1,2}", "R3" ) );
+    BOOST_CHECK( KopenapiGlob( "U{1,2*}", "U23" ) );
+    BOOST_CHECK( KopenapiGlob( "{a,{b,c}d}", "cd" ) );
+    BOOST_CHECK( KopenapiGlob( "x{1}", "x{1}" ) );     // no comma: literal braces
+    BOOST_CHECK( KopenapiGlob( "U*", "U12" ) );
+
+    const std::vector<std::string> alts = KopenapiGlobAlternatives( "U{1,2}*" );
+    BOOST_CHECK_EQUAL( alts.size(), 2u );
+}
+
+
+BOOST_AUTO_TEST_CASE( RefFilterReportsUnmatched )
+{
+    KOPENAPI_REF_FILTER filter( { { "ref", "{U1,X9}" }, { "refs", { "C*", "Q7" } } } );
+
+    BOOST_CHECK( filter.Error().empty() );
+    BOOST_CHECK( !filter.Empty() );
+
+    for( const char* ref : { "U1", "C3", "R1" } )
+        filter.Match( ref );
+
+    BOOST_CHECK( filter.Match( "U1" ) );
+    BOOST_CHECK( !filter.Match( "R1" ) );
+    BOOST_CHECK_EQUAL( filter.Unmatched().dump(), R"(["X9","Q7"])" );
+}
+
+
+BOOST_AUTO_TEST_CASE( ListCapCutsAndMarks )
+{
+    nlohmann::json out = nlohmann::json::object();
+    nlohmann::json list = nlohmann::json::array();
+
+    for( int i = 0; i < 25; ++i )
+        list.push_back( i );
+
+    KOPENAPI_LIST_CAP( nlohmann::json::object(), 10 ).Put( out, "uuids", list );
+    BOOST_CHECK_EQUAL( out["uuids"].size(), 10u );
+    BOOST_CHECK_EQUAL( out["uuids_total"].get<int>(), 25 );
+    BOOST_CHECK( out["truncated"].dump().find( "uuids" ) != std::string::npos );
+
+    nlohmann::json full = nlohmann::json::object();
+    KOPENAPI_LIST_CAP( { { "full", true } }, 10 ).Put( full, "uuids", list );
+    BOOST_CHECK_EQUAL( full["uuids"].size(), 25u );
+    BOOST_CHECK( !full.contains( "truncated" ) );
+
+    nlohmann::json three = nlohmann::json::object();
+    KOPENAPI_LIST_CAP( { { "list_limit", 3 } }, 10 ).Put( three, "uuids", list );
+    BOOST_CHECK_EQUAL( three["uuids"].size(), 3u );
+}
+
+
+BOOST_AUTO_TEST_CASE( ListCapPrefersFirst )
+{
+    nlohmann::json rows = nlohmann::json::array();
+
+    for( int i = 0; i < 10; ++i )
+        rows.push_back( { { "i", i }, { "routed", i != 2 && i != 7 } } );
+
+    nlohmann::json out = nlohmann::json::object();
+    KOPENAPI_LIST_CAP( { { "list_limit", 3 } }, 10 )
+            .PutPreferring( out, "results", rows,
+                            []( const nlohmann::json& aRow )
+                            {
+                                return !aRow["routed"].get<bool>();
+                            } );
+
+    BOOST_REQUIRE_EQUAL( out["results"].size(), 3u );
+    BOOST_CHECK_EQUAL( out["results"][0]["i"].get<int>(), 0 );
+    BOOST_CHECK_EQUAL( out["results"][1]["i"].get<int>(), 2 );
+    BOOST_CHECK_EQUAL( out["results"][2]["i"].get<int>(), 7 );
+    BOOST_CHECK_EQUAL( out["results_total"].get<int>(), 10 );
+}
+
+
+BOOST_AUTO_TEST_CASE( UuidMatchPrefix )
+{
+    const std::vector<std::string> uuids = { "0a1b2c3d-0000-4000-8000-000000000001", "0a1b2c3d-0000-4000-8000-000000000001",
+                                             "0a1bffff-0000-4000-8000-000000000002", "9f000000-0000-4000-8000-000000000003" };
+    std::string error;
+
+    BOOST_CHECK_EQUAL( KopenapiUuidMatch( uuids, uuids[3], error ), 3 );
+    BOOST_CHECK_EQUAL( KopenapiUuidMatch( uuids, "9F00", error ), 3 );
+    BOOST_CHECK_EQUAL( KopenapiUuidMatch( uuids, "0a1b2c", error ), 0 );
+
+    BOOST_CHECK_EQUAL( KopenapiUuidMatch( uuids, "0a1b", error ), -1 );
+    BOOST_CHECK( error.find( "ambiguous: 2 items" ) != std::string::npos );
+
+    BOOST_CHECK_EQUAL( KopenapiUuidMatch( uuids, "9f0", error ), -1 );
+    BOOST_CHECK( error.find( "at least 4" ) != std::string::npos );
+
+    BOOST_CHECK_EQUAL( KopenapiUuidMatch( uuids, "dead", error ), -1 );
+    BOOST_CHECK( error.find( "no item" ) != std::string::npos );
 }
 
 

@@ -145,11 +145,12 @@ static KOPENAPI_RESULT h_pcb_import_ses( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     for( PCB_TRACK* t : board->Tracks() )
         ( t->Type() == PCB_VIA_T ? vias : tracks )++;
 
-    return KOPENAPI_RESULT::Ok( { { "path", path },
-                                  { "tracks", tracks },
-                                  { "vias", vias },
-                                  { "other_nets_dropped", commit.Dropped() },
-                                  { "unrouted_left", (int) board->GetConnectivity()->GetUnconnectedCount( false ) } } );
+    nlohmann::json answer = { { "path", path },
+                              { "tracks", tracks },
+                              { "vias", vias },
+                              { "other_nets_dropped", commit.Dropped() } };
+    answer.update( KopenapiUnroutedJson( board ) );
+    return KOPENAPI_RESULT::Ok( answer );
 }
 
 

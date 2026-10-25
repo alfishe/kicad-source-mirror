@@ -247,8 +247,10 @@ static nlohmann::json netStats( BOARD* aBoard )
 
     nlohmann::json out = { { "total", total }, { "single_pad", singlePad }, { "without_pads", withoutPads } };
 
-    if( std::shared_ptr<CONNECTIVITY_DATA> conn = aBoard->GetConnectivity() )
-        out["unrouted_connections"] = conn->GetUnconnectedCount( false );
+    const KOPENAPI_UNROUTED unrouted = KopenapiUnrouted( aBoard );
+    out["unrouted_connections"] = unrouted.connections;
+    out["unrouted_nets"] = unrouted.nets;
+    out["zone_fills"] = unrouted.zoneFills;
 
     if( std::shared_ptr<NET_SETTINGS> settings = aBoard->GetDesignSettings().m_NetSettings )
         out["net_classes"] = settings->GetNetclasses().size() + 1;   // + Default

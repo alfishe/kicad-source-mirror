@@ -18,6 +18,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
@@ -38,6 +39,7 @@
 #include <board.h>
 #include <footprint.h>
 #include <footprint_library_adapter.h>
+#include <pad.h>
 #include <libraries/library_manager.h>
 #include <libraries/library_table.h>
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
@@ -522,6 +524,156 @@ BOOST_AUTO_TEST_CASE( RemovedLibraryStopsServingPreloadedFootprints )
     FOOTPRINT* fp = adapter.LoadFootprint( nickname, wxS( "R_0402_1005Metric" ), false );
     BOOST_CHECK_MESSAGE( !fp, "a library removed from the table must not keep serving preloaded "
                               "footprints" );
+}
+
+
+/**
+ * LoadFootprint() serves the current file: a footprint rewritten on disk (same size, same
+ * second) is read again on the next load, an unchanged library is not re-read, and removed
+ * or added footprints follow the disk without an explicit refresh.
+ */
+BOOST_AUTO_TEST_CASE( LoadFootprintServesCurrentFile )
+{
+    KI_TEST::SCOPED_TEMP_DIR tmpLib( "kicad_qa_adapter_fresh" );
+    KI_TEST::SCOPED_TEMP_DIR tmpTable( "kicad_qa_adapter_fresh_table" );
+
+    const std::filesystem::path libPath = tmpLib.CreateChildDir( "kicad_qa_adapter_fresh.pretty" );
+
+    const std::filesystem::path source =
+            std::filesystem::path( getResistorLibPath().ToStdString() ) / "R_0402_1005Metric.kicad_mod";
+    const std::filesystem::path target = libPath / "R_0402_1005Metric.kicad_mod";
+    const std::filesystem::path other = libPath / "R_Other.kicad_mod";
+
+    std::filesystem::copy_file( source, target );
+    std::filesystem::copy_file( source, other );
+
+    const wxString nickname = wxS( "FreshCheck" );
+    const wxString fpName = wxS( "R_0402_1005Metric" );
+
+    {
+        std::ofstream table( tmpTable.Path() / "fp-lib-table" );
+        table << "(fp_lib_table\n  (version 7)\n";
+        table << "  (lib (name \"" << nickname.ToStdString() << "\")(type \"KiCad\")(uri \""
+              << libPath.string() << "\")(options \"\")(descr \"\"))\n)\n";
+    }
+
+    LIBRARY_MANAGER manager;
+    manager.LoadProjectTables( tmpTable.PathStr(), { LIBRARY_TABLE_TYPE::FOOTPRINT } );
+
+    TEST_FOOTPRINT_LIBRARY_ADAPTER adapter( manager );
+    adapter.SeedLoadedLibrary( nickname, libPath.string() );
+    adapter.RefreshLibraryIfChanged( nickname );
+    BOOST_REQUIRE_EQUAL( adapter.GetFootprints( nickname, true ).size(), 2u );
+
+    auto padWidth =
+            [&]() -> int
+            {
+                std::unique_ptr<FOOTPRINT> fp( adapter.LoadFootprint( nickname, fpName, false ) );
+                BOOST_REQUIRE( fp );
+                BOOST_REQUIRE( fp->FindPadByNumber( wxS( "1" ) ) );
+                return fp->FindPadByNumber( wxS( "1" ) )->GetSize( PADSTACK::ALL_LAYERS ).x;
+            };
+
+    BOOST_CHECK_EQUAL( padWidth(), pcbIUScale.mmToIU( 0.54 ) );
+
+    // Unchanged files: loading must not re-enumerate the library
+    std::vector<FOOTPRINT*> cached = adapter.GetFootprints( nickname, true );
+
+    for( int i = 0; i < 20; ++i )
+        delete adapter.LoadFootprint( nickname, fpName, false );
+
+    BOOST_CHECK_MESSAGE( adapter.GetFootprints( nickname, true ) == cached,
+                         "loading an unchanged footprint re-read the library" );
+
+    // Same-length rewrite right away: the library timestamp may well stay the same
+    {
+        std::ifstream in( target );
+        std::string   text( ( std::istreambuf_iterator<char>( in ) ), std::istreambuf_iterator<char>() );
+        in.close();
+
+        const size_t pos = text.find( "(size 0.54 0.64)" );
+        BOOST_REQUIRE( pos != std::string::npos );
+        text.replace( pos, 16, "(size 0.64 0.64)" );
+
+        std::ofstream out( target, std::ios::binary | std::ios::trunc );
+        out << text;
+    }
+
+    BOOST_CHECK_EQUAL( padWidth(), pcbIUScale.mmToIU( 0.64 ) );
+
+    std::filesystem::remove( other );
+    std::unique_ptr<FOOTPRINT> removed( adapter.LoadFootprint( nickname, wxS( "R_Other" ), false ) );
+    BOOST_CHECK_MESSAGE( !removed, "a footprint deleted on disk is still served" );
+
+    std::filesystem::copy_file( source, libPath / "R_Added.kicad_mod" );
+    std::unique_ptr<FOOTPRINT> added( adapter.LoadFootprint( nickname, wxS( "R_Added" ), false ) );
+    BOOST_CHECK_MESSAGE( added, "a footprint added on disk is not found" );
+}
+
+
+/**
+ * The freshness check costs one file query per load, independent of the library size; a
+ * library timestamp walks the whole directory.  Prints both for a 300-footprint library.
+ */
+BOOST_AUTO_TEST_CASE( LoadFootprintFreshnessCost )
+{
+    KI_TEST::SCOPED_TEMP_DIR tmpLib( "kicad_qa_adapter_cost" );
+    KI_TEST::SCOPED_TEMP_DIR tmpTable( "kicad_qa_adapter_cost_table" );
+
+    const std::filesystem::path libPath = tmpLib.CreateChildDir( "kicad_qa_adapter_cost.pretty" );
+    const std::filesystem::path source =
+            std::filesystem::path( getResistorLibPath().ToStdString() ) / "R_0402_1005Metric.kicad_mod";
+
+    for( int i = 0; i < 300; ++i )
+        std::filesystem::copy_file( source, libPath / ( "R_" + std::to_string( i ) + ".kicad_mod" ) );
+
+    const wxString nickname = wxS( "CostCheck" );
+
+    {
+        std::ofstream table( tmpTable.Path() / "fp-lib-table" );
+        table << "(fp_lib_table\n  (version 7)\n";
+        table << "  (lib (name \"" << nickname.ToStdString() << "\")(type \"KiCad\")(uri \""
+              << libPath.string() << "\")(options \"\")(descr \"\"))\n)\n";
+    }
+
+    LIBRARY_MANAGER manager;
+    manager.LoadProjectTables( tmpTable.PathStr(), { LIBRARY_TABLE_TYPE::FOOTPRINT } );
+
+    TEST_FOOTPRINT_LIBRARY_ADAPTER adapter( manager );
+    adapter.SeedLoadedLibrary( nickname, libPath.string() );
+    adapter.RefreshLibraryIfChanged( nickname );
+    BOOST_REQUIRE_EQUAL( adapter.GetFootprints( nickname, true ).size(), 300u );
+
+    const int  rounds = 2000;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    for( int i = 0; i < rounds; ++i )
+        delete adapter.LoadFootprint( nickname, wxS( "R_" ) + wxString::Format( "%d", i % 300 ), false );
+
+    const auto t1 = std::chrono::steady_clock::now();
+
+    for( int i = 0; i < rounds / 10; ++i )
+        adapter.RefreshLibraryIfChanged( nickname );
+
+    const auto t2 = std::chrono::steady_clock::now();
+
+    PCB_IO_KICAD_SEXPR io;
+
+    for( int i = 0; i < rounds; ++i )
+        io.GetFootprintTimestamp( libPath.string(), wxS( "R_" ) + wxString::Format( "%d", i % 300 ) );
+
+    const auto t3 = std::chrono::steady_clock::now();
+
+    auto us = []( auto a, auto b, int n )
+    {
+        return std::chrono::duration<double, std::micro>( b - a ).count() / n;
+    };
+
+    BOOST_TEST_MESSAGE( wxString::Format( "300-footprint library: LoadFootprint %.1f us (file query %.1f us of it), "
+                                          "library timestamp %.1f us",
+                                          us( t0, t1, rounds ), us( t2, t3, rounds ), us( t1, t2, rounds / 10 ) ) );
+
+    BOOST_CHECK_MESSAGE( adapter.GetFootprints( nickname, true ).size() == 300u, "the library was re-read" );
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -40,7 +40,7 @@ nlohmann::json KopenapiCheckSchema( nlohmann::json aExtra )
     nlohmann::json properties = R"json({
         "severity":{"type":"array","items":{"type":"string","enum":["error","warning","exclusion"]},
                     "default":["error","warning"]},
-        "type":{"type":"string","description":"glob on the violation type, e.g. pin_not_connected or clearance"},
+        "type":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"glob on the violation type, e.g. pin_not_connected, clearance, {shorting_items,clearance}; or a list of globs; globs that matched no violation in type_unmatched"},
         "unconnected_limit":{"type":"integer","default":50,"description":"unconnected items listed"}})json"_json;
 
     for( const auto& [key, value] : aExtra.items() )
@@ -56,7 +56,12 @@ nlohmann::json KopenapiCheckResult( const std::vector<nlohmann::json>& aViolatio
 {
     int                        errors = 0, warnings = 0, excluded = 0;
     std::map<std::string, int> byType;
-    const std::string          typeGlob = aArgs.value( "type", std::string() );
+    nlohmann::json             typeArgs = nlohmann::json::object();
+
+    if( aArgs.contains( "type" ) )
+        typeArgs[aArgs["type"].is_array() ? "types" : "type"] = aArgs["type"];
+
+    KOPENAPI_REF_FILTER         typeFilter( typeArgs, "type", "types" );
     std::vector<nlohmann::json> rows;
 
     for( const nlohmann::json& v : aViolations )
@@ -72,7 +77,7 @@ nlohmann::json KopenapiCheckResult( const std::vector<nlohmann::json>& aViolatio
 
         byType[type]++;
 
-        if( KopenapiGlob( typeGlob, type ) )
+        if( typeFilter.Match( type ) )
             rows.push_back( v );
     }
 
@@ -94,6 +99,10 @@ nlohmann::json KopenapiCheckResult( const std::vector<nlohmann::json>& aViolatio
                           { "by_type", types },
                           { "unconnected_items", aUnconnected.size() } };
     result["unconnected"] = unconnected;
+
+    if( !typeFilter.Empty() )
+        result["type_unmatched"] = typeFilter.Unmatched();
+
     result["ignored_checks"] = aIgnoredChecks;
     return result;
 }

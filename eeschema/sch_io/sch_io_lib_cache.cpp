@@ -89,7 +89,7 @@ long long SCH_IO_LIB_CACHE::GetLibModificationTime()
     if( !fn.IsDir() )
     {
         m_isWritable = fn.IsFileWritable();
-        return fn.GetModificationTime().GetValue().GetValue();
+        return KIPLATFORM::IO::TimestampFile( fn.GetFullPath() );
     }
     else
     {
@@ -130,8 +130,11 @@ bool SCH_IO_LIB_CACHE::IsFileChanged() const
     if( !fn.IsOk() )
         return false;
 
-    if( !fn.IsDir() && fn.IsFileReadable() )
-        return fn.GetModificationTime().GetValue().GetValue() != m_fileModTime;
+    if( !fn.IsDir() )
+    {
+        const long long timestamp = KIPLATFORM::IO::TimestampFile( fn.GetFullPath() );
+        return timestamp != 0 && timestamp != m_fileModTime;
+    }
 
     if( fn.IsDir() && fn.IsDirReadable() )
     {
