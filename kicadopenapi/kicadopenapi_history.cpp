@@ -676,7 +676,7 @@ static KOPENAPI_RESULT h_checkpoint_list( KOPENAPI_CONTEXT&, const nlohmann::jso
 
 static KOPENAPI_RESULT h_rollback( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
-    if( const std::string job = KOPENAPI_JOBS::Get().Busy(); !job.empty() )
+    if( const std::string job = KOPENAPI_JOBS::Get().Busy( true ); !job.empty() )
         return KOPENAPI_RESULT::Error( 409, "job " + job + " is queued or running and owns the documents: "
                                             "job_get waits for it, job_cancel stops it" );
 

@@ -109,8 +109,9 @@ public:
     KOPENAPI_RESULT Step( const nlohmann::json& aArgs );
     KOPENAPI_RESULT List() const;
 
-    /// @brief "job-N (method)" of the queued or running job; empty when none
-    std::string Busy() const;
+    /// @brief "job-N (method)" of the queued or running job; empty when none.
+    /// aExceptRunning: not the job running now (a handler run as that job asks for others)
+    std::string Busy( bool aExceptRunning = false ) const;
 
 private:
     KOPENAPI_JOBS() = default;

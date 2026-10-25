@@ -849,13 +849,13 @@ KOPENAPI_RESULT KOPENAPI_JOBS::List() const
 }
 
 
-std::string KOPENAPI_JOBS::Busy() const
+std::string KOPENAPI_JOBS::Busy( bool aExceptRunning ) const
 {
     std::lock_guard<std::mutex> lock( g_mutex );
 
     for( const auto& [seq, job] : g_jobs )
     {
-        if( !job->Finished() )
+        if( !job->Finished() && !( aExceptRunning && job == g_current ) )
             return job->Id() + " (" + job->method + ")";
     }
 

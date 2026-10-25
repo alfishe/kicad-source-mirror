@@ -1216,7 +1216,8 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std
     }
 
     if( method->guiOnly && ctx.headless )
-        return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI" );
+        return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI"
+                                                    + std::string( aName == "app_quit" ? "; headless: POST /api/v1/shutdown" : "" ) );
 
     // unknown names first (a misspelt required name reads better as "did you mean"), then the
     // required ones and the plain top-level types (short messages), then the whole inputSchema
