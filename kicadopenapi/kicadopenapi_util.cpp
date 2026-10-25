@@ -125,8 +125,13 @@ KOPENAPI_REF_FILTER::KOPENAPI_REF_FILTER( const nlohmann::json& aArgs, const cha
 
         for( std::string& alt : KopenapiGlobAlternatives( aValue.get<std::string>() ) )
         {
-            if( !alt.empty() )
-                m_patterns.push_back( std::move( alt ) );
+            const bool negative = !alt.empty() && alt[0] == '!';
+
+            if( alt.size() > ( negative ? 1u : 0u ) )
+            {
+                m_patterns.push_back( negative ? alt.substr( 1 ) : std::move( alt ) );
+                m_negative.push_back( negative );
+            }
         }
     };
 
@@ -153,18 +158,20 @@ bool KOPENAPI_REF_FILTER::Match( const std::string& aRef )
     if( m_patterns.empty() )
         return true;
 
-    bool any = false;
+    bool positives = false, any = false, excluded = false;
 
     for( size_t i = 0; i < m_patterns.size(); ++i )
     {
+        positives |= !m_negative[i];
+
         if( globPlain( m_patterns[i], aRef ) )
         {
             m_hit[i] = 1;
-            any = true;
+            ( m_negative[i] ? excluded : any ) = true;
         }
     }
 
-    return any;
+    return ( any || !positives ) && !excluded;
 }
 
 
@@ -175,7 +182,7 @@ nlohmann::json KOPENAPI_REF_FILTER::Unmatched() const
     for( size_t i = 0; i < m_patterns.size(); ++i )
     {
         if( !m_hit[i] )
-            out.push_back( m_patterns[i] );
+            out.push_back( ( m_negative[i] ? "!" : "" ) + m_patterns[i] );
     }
 
     return out;

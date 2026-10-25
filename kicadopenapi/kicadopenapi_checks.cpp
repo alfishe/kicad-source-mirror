@@ -40,7 +40,7 @@ nlohmann::json KopenapiCheckSchema( nlohmann::json aExtra )
     nlohmann::json properties = R"json({
         "severity":{"type":"array","items":{"type":"string","enum":["error","warning","exclusion"]},
                     "default":["error","warning"]},
-        "type":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"glob on the violation type, e.g. pin_not_connected, clearance, {shorting_items,clearance}; or a list of globs; globs that matched no violation in type_unmatched"},
+        "type":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"glob on the violation type, e.g. pin_not_connected, clearance, {shorting_items,clearance}; or a list of globs; !glob leaves those types out (\"!track_dangling\", alone: every other type); globs that matched no violation in type_unmatched"},
         "unconnected_limit":{"type":"integer","default":50,"description":"unconnected items listed"}})json"_json;
 
     for( const auto& [key, value] : aExtra.items() )

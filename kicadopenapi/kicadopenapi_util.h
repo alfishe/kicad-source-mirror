@@ -21,8 +21,9 @@ KICOMMON_API std::vector<std::string> KopenapiGlobAlternatives( const std::strin
 
 /// @brief Reference filter of list / bulk methods: a glob under aGlobKey ("ref", braces allowed)
 /// and / or an array of references or globs under aListKey ("refs"); an item passes when any
-/// pattern matches.  Every pattern that matched nothing is reported (Unmatched), so a filter
-/// never yields an unexplained empty answer.
+/// pattern matches (or only "!glob" exclusions are given) and no "!glob" matches it.  Every
+/// pattern that matched nothing is reported (Unmatched), so a filter never yields an
+/// unexplained empty answer.
 class KICOMMON_API KOPENAPI_REF_FILTER
 {
 public:
@@ -42,6 +43,7 @@ public:
 
 private:
     std::vector<std::string> m_patterns;
+    std::vector<char>        m_negative;   ///< "!glob": items it matches are left out
     std::vector<char>        m_hit;
     std::string              m_error;
 };
