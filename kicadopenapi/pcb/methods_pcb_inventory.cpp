@@ -623,10 +623,55 @@ static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
                    return KopenapiNaturalLess( str( x->GetNumber() ), str( y->GetNumber() ) );
                } );
 
-    nlohmann::json padList = nlohmann::json::array();
+    const KOPENAPI_LIST_CAP cap( aArgs, 100 );
+    nlohmann::json          padList = nlohmann::json::array();
 
     for( const PAD* pad : pads )
-        padList.push_back( padJson( pad, true ) );
+    {
+        if( cap.Full() || padList.size() < cap.Limit() )
+            padList.push_back( padJson( pad, true ) );
+    }
+
+    // the airwires: each a pair of ends (REF.PAD, or a track / via end) and its length
+    nlohmann::json airwires = nlohmann::json::array();
+
+    if( std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity() )
+    {
+        if( RN_NET* rn = conn->GetRatsnestForNet( net->GetNetCode() ) )
+        {
+            std::vector<std::pair<double, nlohmann::json>> rows;
+
+            for( const CN_EDGE& edge : rn->GetEdges() )
+            {
+                nlohmann::json ends = nlohmann::json::array();
+
+                for( const std::shared_ptr<const CN_ANCHOR>& node : { edge.GetSourceNode(), edge.GetTargetNode() } )
+                {
+                    BOARD_CONNECTED_ITEM* parent = node ? node->Parent() : nullptr;
+                    const VECTOR2I        at = node ? node->Pos() : VECTOR2I();
+                    nlohmann::json        end = { { "at_mm", { mm( at.x ), mm( at.y ) } } };
+
+                    if( parent && parent->Type() == PCB_PAD_T )
+                        end["pin"] = str( static_cast<PAD*>( parent )->GetParentFootprint()->GetReference() ) + "."
+                                     + str( static_cast<PAD*>( parent )->GetNumber() );
+                    else if( parent )
+                        end["kind"] = parent->Type() == PCB_VIA_T ? "via" : parent->Type() == PCB_ZONE_T ? "zone" : "track";
+
+                    ends.push_back( end );
+                }
+
+                const double length = edge.GetSourceNode() && edge.GetTargetNode()
+                                              ? ( edge.GetSourceNode()->Pos() - edge.GetTargetNode()->Pos() ).EuclideanNorm()
+                                              : 0.0;
+                rows.emplace_back( length, nlohmann::json{ { "from", ends[0] }, { "to", ends[1] }, { "length_mm", mm( length ) } } );
+            }
+
+            std::stable_sort( rows.begin(), rows.end(), []( const auto& x, const auto& y ) { return x.first < y.first; } );
+
+            for( auto& [length, row] : rows )
+                airwires.push_back( std::move( row ) );
+        }
+    }
 
     nlohmann::json byLayer = nlohmann::json::object();
 
@@ -660,20 +705,29 @@ static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
             netClass["via_diameter_mm"] = mm( nc->GetViaDiameter() );
     }
 
-    return KOPENAPI_RESULT::Ok( { { "name", netName( net->GetNetname() ) },
-                                  { "code", net->GetNetCode() },
-                                  { "class", netClass },
-                                  { "pads", padList.size() },
-                                  { "pad_list", padList },
-                                  { "footprints", naturalSorted( a.footprints ) },
+    nlohmann::json answer = { { "name", netName( net->GetNetname() ) },
+                              { "code", net->GetNetCode() },
+                              { "class", netClass },
+                              { "pads", pads.size() },
+                              { "pad_list", padList },
+                              { "footprints", naturalSorted( a.footprints ) },
                                   { "routing",
                                     { { "length_mm", mm( a.length ) },
                                       { "length_by_layer_mm", byLayer },
                                       { "segments", a.segments },
                                       { "vias", a.vias },
                                       { "unrouted", unrouted( board, net->GetNetCode() ) } } },
-                                  { "zones", zones },
-                                  { "inferred", inferRole( board, net, a, pads ) } } );
+                              { "zones", zones },
+                              { "inferred", inferRole( board, net, a, pads ) } };
+
+    if( !cap.Full() && pads.size() > padList.size() )
+    {
+        answer["pad_list_total"] = pads.size();
+        answer["truncated"] = { "pad_list" };
+    }
+
+    cap.Put( answer["routing"], "unrouted_list", airwires );
+    return KOPENAPI_RESULT::Ok( answer );
 }
 
 
@@ -891,14 +945,16 @@ KOPENAPI_REGISTER( "pcb_net_list",
                    false, h_pcb_net_list );
 
 KOPENAPI_REGISTER( "pcb_net_get",
-                   "Net card: every pad in pad_list (ref.pin, function, pin type; pads is their count, as in "
-                   "pcb_footprint_get), footprints, net class rules, routed "
-                   "length per layer, vias, zones, unrouted connections, inferred role (power/ground/clock/"
+                   "Net card: its pads in pad_list (ref.pin, function, pin type; pads is their count, as in "
+                   "pcb_footprint_get; the first list_limit, default 100, full: true for all), footprints, net "
+                   "class rules, routed length per layer, vias, zones, unrouted connections with routing."
+                   "unrouted_list (each airwire: from / to as pin REF.PAD or kind track / via / zone, at_mm, "
+                   "length_mm; shortest first, cut to list_limit), inferred role (power/ground/clock/"
                    "reset/diff_pair/interface) with basis; look up by name, code or pin REF.PAD",
-                   R"json({"type":"object","properties":{
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
                         "name":{"type":"string"},
                         "code":{"type":"integer"},
-                        "pin":{"type":"string","description":"REF.PAD, e.g. U3.14"}}})json"_json,
+                        "pin":{"type":"string","description":"REF.PAD, e.g. U3.14"}}})json"_json, 100 ),
                    false, h_pcb_net_get );
 
 KOPENAPI_REGISTER( "pcb_footprint_get",

@@ -356,7 +356,9 @@ static KOPENAPI_RESULT h_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     nlohmann::json lookup = name.empty() ? nlohmann::json{ { "pin", pin } } : nlohmann::json{ { "name", name } };
 
     KOPENAPI_RESULT sch = callMethod( aCtx, "sch_net_get", lookup );
-    KOPENAPI_RESULT pcb = callMethod( aCtx, "pcb_net_get", lookup );
+    nlohmann::json  pcbLookup = lookup;
+    pcbLookup["full"] = true;
+    KOPENAPI_RESULT pcb = callMethod( aCtx, "pcb_net_get", pcbLookup );
 
     const bool schOpen = sch.status != 409 && sch.status != 503;
     const bool pcbOpen = pcb.status != 409 && pcb.status != 503;
@@ -411,7 +413,7 @@ static KOPENAPI_RESULT h_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     for( const std::string& n : names )
     {
         KOPENAPI_RESULT card = n == pcb.body.value( "name", std::string() ) ? pcb
-                                                                            : callMethod( aCtx, "pcb_net_get", { { "name", n } } );
+                                                                            : callMethod( aCtx, "pcb_net_get", { { "name", n }, { "full", true } } );
 
         if( card.status != 200 )
             continue;
