@@ -98,6 +98,7 @@ struct KOPENAPI_HISTORY::IMPL
     long                    seq = 0;
     long                    snapshotCount = 0;
     std::optional<ENTRY>    pending;
+    std::optional<MARK>     trial;   ///< a dry run done for real: the documents before it
     std::string             resetReason;
     long                    epoch = 0;   ///< documents opened / closed / reverted / rolled back
 
@@ -479,6 +480,55 @@ KOPENAPI_RESULT KOPENAPI_HISTORY::RollbackLastInCall( KOPENAPI_CONTEXT& aCtx )
 }
 
 
+bool KOPENAPI_HISTORY::TrialBegin( KOPENAPI_CONTEXT& aCtx, const std::string& aDomain )
+{
+    IMPL* d = impl();
+
+    if( d->trial )
+        return false;
+
+    MARK m = d->mark( aCtx );
+
+    if( !m.docs.count( aDomain ) )
+    {
+        IMPL::drop( m );
+        return false;
+    }
+
+    d->trial = std::move( m );
+    return true;
+}
+
+
+KOPENAPI_RESULT KOPENAPI_HISTORY::TrialRestore( KOPENAPI_CONTEXT& aCtx )
+{
+    IMPL* d = impl();
+
+    if( !d->trial )
+        return KOPENAPI_RESULT::Error( 409, "no trial is running" );
+
+    MARK trial = std::move( *d->trial );
+    d->trial.reset();
+
+    std::string    refused;
+    nlohmann::json documents = d->restore( aCtx, trial, refused );
+    IMPL::drop( trial );
+
+    if( !refused.empty() )
+        return KOPENAPI_RESULT::Error( 409, "cannot take the trial's edits back exactly: " + refused );
+
+    d->epoch++;
+
+    for( const auto& [domain, how] : documents.items() )
+    {
+        if( how == "failed" )
+            return KOPENAPI_RESULT::Error( 500, "taking the trial's edits back failed for " + domain + ": " + documents.dump() );
+    }
+
+    return KOPENAPI_RESULT::Ok( { { "documents", documents } } );
+}
+
+
 KOPENAPI_RESULT KOPENAPI_HISTORY::RestoreBeforePending( KOPENAPI_CONTEXT& aCtx )
 {
     IMPL* d = impl();
@@ -646,6 +696,9 @@ void KOPENAPI_HISTORY::Reset( const std::string& aDomain, const std::string& aRe
 
     if( d->pending )
         forget( d->pending->before );
+
+    if( d->trial )
+        forget( *d->trial );
 
     for( CHECKPOINT& c : d->checkpoints )
         forget( c.mark );
