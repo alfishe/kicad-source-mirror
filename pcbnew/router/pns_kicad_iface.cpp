@@ -303,8 +303,17 @@ public:
     int64_t ClearanceLookups() const { return m_clearanceLookups; }
     int64_t RuleEvaluations() const { return m_ruleEvaluations; }
 
+    /// @brief Pairs given by net code (P -> N) that count before the name rule
+    void SetExplicitDiffPairs( const std::map<int, int>* aPairs ) { m_explicitDiffPairs = aPairs; }
+
 private:
     BOARD_ITEM* getBoardItem( const PNS::ITEM* aItem, PCB_LAYER_ID aBoardLayer, int aIdx = 0 );
+
+    /// @brief An explicit pair's other net and the polarity of aNet in it (1 P, -1 N); 0 when none
+    int explicitPair( PNS::NET_HANDLE aNet, NETINFO_ITEM** aOther ) const;
+
+private:
+    const std::map<int, int>* m_explicitDiffPairs = nullptr;
 
 private:
     PNS::ROUTER_IFACE* m_routerIface;
@@ -1430,8 +1439,38 @@ int PNS_KICAD_IFACE_BASE::StackupHeight( int aFirstLayer, int aSecondLayer ) con
 }
 
 
+int PNS_PCBNEW_RULE_RESOLVER::explicitPair( PNS::NET_HANDLE aNet, NETINFO_ITEM** aOther ) const
+{
+    const NETINFO_ITEM* net = static_cast<NETINFO_ITEM*>( aNet );
+
+    if( !net || !m_explicitDiffPairs || m_explicitDiffPairs->empty() )
+        return 0;
+
+    for( const auto& [p, n] : *m_explicitDiffPairs )
+    {
+        if( net->GetNetCode() == p || net->GetNetCode() == n )
+        {
+            NETINFO_ITEM* other = m_board->FindNet( net->GetNetCode() == p ? n : p );
+
+            if( !other )
+                return 0;
+
+            *aOther = other;
+            return net->GetNetCode() == p ? 1 : -1;
+        }
+    }
+
+    return 0;
+}
+
+
 PNS::NET_HANDLE PNS_PCBNEW_RULE_RESOLVER::DpCoupledNet( PNS::NET_HANDLE aNet )
 {
+    NETINFO_ITEM* other = nullptr;
+
+    if( explicitPair( aNet, &other ) )
+        return other;
+
     return m_board->DpCoupledNet( static_cast<NETINFO_ITEM*>( aNet ) );
 }
 
@@ -1455,6 +1494,11 @@ int PNS_PCBNEW_RULE_RESOLVER::DpNetPolarity( PNS::NET_HANDLE aNet )
     if( NETINFO_ITEM* net = static_cast<NETINFO_ITEM*>( aNet ) )
         refName = net->GetNetname();
 
+    NETINFO_ITEM* other = nullptr;
+
+    if( int polarity = explicitPair( aNet, &other ) )
+        return polarity;
+
     wxString dummy1;
 
     return m_board->MatchDpSuffix( refName, dummy1 );
@@ -1466,6 +1510,15 @@ bool PNS_PCBNEW_RULE_RESOLVER::DpNetPair( const PNS::ITEM* aItem, PNS::NET_HANDL
 {
     if( !aItem || !aItem->Net() )
         return false;
+
+    NETINFO_ITEM* other = nullptr;
+
+    if( int polarity = explicitPair( aItem->Net(), &other ) )
+    {
+        aNetP = polarity > 0 ? aItem->Net() : other;
+        aNetN = polarity > 0 ? other : aItem->Net();
+        return true;
+    }
 
     wxString netNameP = static_cast<NETINFO_ITEM*>( aItem->Net() )->GetNetname();
     wxString netNameN, netNameCoupled;
@@ -2566,6 +2619,7 @@ void PNS_KICAD_IFACE_BASE::SyncWorld( PNS::NODE *aWorld )
     // clearance cache here....
     delete m_ruleResolver;
     m_ruleResolver = new PNS_PCBNEW_RULE_RESOLVER( m_board, this );
+    m_ruleResolver->SetExplicitDiffPairs( &m_explicitDiffPairs );
 
     aWorld->SetRuleResolver( m_ruleResolver );
     aWorld->SetMaxClearance( worstClearance + m_ruleResolver->ClearanceEpsilon() );

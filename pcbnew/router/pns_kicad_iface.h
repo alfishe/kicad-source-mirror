@@ -22,6 +22,7 @@
 #ifndef __PNS_KICAD_IFACE_H
 #define __PNS_KICAD_IFACE_H
 
+#include <map>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -126,6 +127,11 @@ public:
     int64_t ClearanceLookups() const;
     int64_t RuleEvaluations() const;
 
+    /// @brief Differential pairs given by their nets (P net code -> N net code), routed as pairs
+    /// besides the ones the board's name rule (BOARD::MatchDpSuffix) finds; set before SyncWorld
+    void SetExplicitDiffPairs( const std::map<int, int>& aPairs ) { m_explicitDiffPairs = aPairs; }
+    const std::map<int, int>& ExplicitDiffPairs() const { return m_explicitDiffPairs; }
+
     std::vector<LENGTH_DELAY_CALCULATION_ITEM> GetLengthDelayCalculationItems( const PNS::ITEM_SET& aLine,
                                                                                const NETCLASS*      aNetClass ) const;
 
@@ -154,6 +160,7 @@ protected:
     PNS::NODE* m_world;
     BOARD*     m_board;
     int        m_startLayer; // The starting layer, in PNS layer coordinates
+    std::map<int, int> m_explicitDiffPairs;
 };
 
 class PNS_KICAD_IFACE : public PNS_KICAD_IFACE_BASE
