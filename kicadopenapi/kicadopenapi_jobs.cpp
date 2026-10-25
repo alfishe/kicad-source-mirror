@@ -46,7 +46,7 @@ struct JOB
     CLOCK::time_point finished;
     std::optional<KOPENAPI_RESULT> result;
     std::atomic<bool> cancel{ false };
-    bool              keep = false;   ///< job_cancel {keep}: stop, apply nothing, keep the state
+    bool              keep = false;   ///< job_cancel {keep_timeline}: stop, apply nothing, keep the state
     bool              apply = true;   ///< job_cancel {apply: false}: stop, apply nothing
     bool              plainCall = false;   ///< a plain call that may outlast the client's wait
     bool              paused = false;
@@ -796,17 +796,32 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Cancel( const nlohmann::json& aArgs )
 
         if( !job.cancel.exchange( true ) )
         {
-            job.keep = aArgs.value( "keep", false );
-            job.apply = aArgs.value( "apply", true );
-            job.stopReason = job.keep ? "job_cancel {keep}" : !job.apply ? "job_cancel {apply: false}" : "job_cancel";
+            job.keep = aArgs.value( "keep_timeline", false ) || aArgs.value( "keep", false );
+            job.apply = aArgs.value( "apply", true ) && !job.keep;
+            job.stopReason = job.keep ? "job_cancel {keep_timeline}" : !job.apply ? "job_cancel {apply: false}" : "job_cancel";
             job.rev++;
         }
     }
 
     g_changed.notify_all();
 
+    bool apply = true, keep = false;
+
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+
+        if( auto it = g_jobs.find( idOf( id ) ); it != g_jobs.end() )
+        {
+            apply = it->second->apply;
+            keep = it->second->keep;
+        }
+    }
+
     // the job stops at its next safe point and still gives its result (what it did so far)
-    return KOPENAPI_RESULT::Ok( { { "job_id", id }, { "stopping", true } } );
+    return KOPENAPI_RESULT::Ok( { { "job_id", id },
+                                  { "stopping", true },
+                                  { "work_done", apply ? "applied" : "taken back" },
+                                  { "timeline_kept", keep } } );
 }
 
 

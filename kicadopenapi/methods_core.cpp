@@ -496,12 +496,14 @@ KOPENAPI_REGISTER( "job_cancel",
                    "far; grid: the nets legal in the round it stopped in, committed as one step). apply: false "
                    "stops it with nothing written, in whichever pass it stops (pcb_route answers applied: false; "
                    "copper already laid, a grid stage's before a later pns pass included, is taken back: "
-                   "taken_back true). keep: true is apply: false that also keeps its state: a grid route's timeline "
-                   "stays with every lane stopped at its last step, to branch from (pcb_route {from})",
+                   "taken_back true). keep_timeline: true is apply: false (the copper is taken back too) that keeps "
+                   "the job's state: a grid route's timeline stays with every lane stopped at its last step, to "
+                   "branch from (pcb_route {from}). Answers work_done (applied / taken back) and timeline_kept",
                    R"json({"type":"object","required":["job_id"],"properties":{
                         "job_id":{"type":"string"},
                         "apply":{"type":"boolean","default":true,"description":"false: nothing the job did is written (a pcb_route's copper so far taken back)"},
-                        "keep":{"type":"boolean","default":false,"description":"apply nothing and keep the job's state (a grid route's timeline lanes, to branch from)"}}})json"_json,
+                        "keep_timeline":{"type":"boolean","default":false,"description":"take the work back (as apply: false) and keep the job's state: a grid route's timeline lanes, to branch from"},
+                        "keep":{"type":"boolean","default":false,"description":"old name of keep_timeline (it keeps the timeline, not the copper)"}}})json"_json,
                    false, h_job_served );
 
 KOPENAPI_REGISTER( "job_pause",
