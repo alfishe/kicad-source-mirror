@@ -33,6 +33,72 @@
 #include <tools/zone_filler_tool.h>
 #include <zone.h>
 
+#include <wx/filename.h>
+#include <wx/log.h>
+
+
+bool KopenapiDesignRulesFromDisk( BOARD* aBoard, std::string* aError )
+{
+    struct STAMP
+    {
+        wxString   path;
+        bool       exists = false;
+        wxLongLong size = 0;
+        wxDateTime modified;
+
+        bool operator==( const STAMP& aOther ) const
+        {
+            return path == aOther.path && exists == aOther.exists && size == aOther.size
+                   && ( !exists || modified == aOther.modified );
+        }
+    };
+
+    static std::mutex                     s_mutex;
+    static std::map<const BOARD*, STAMP>  s_loaded;
+
+    std::shared_ptr<DRC_ENGINE> engine = aBoard ? aBoard->GetDesignSettings().m_DRCEngine : nullptr;
+
+    if( !engine )
+        return true;
+
+    STAMP      now;
+    wxFileName file( aBoard->GetDesignRulesPath() );
+    now.path = file.GetFullPath();
+    now.exists = file.FileExists();
+
+    if( now.exists )
+    {
+        now.size = file.GetSize();
+        now.modified = file.GetModificationTime();
+    }
+
+    std::lock_guard<std::mutex> lock( s_mutex );
+    auto                        it = s_loaded.find( aBoard );
+
+    if( it != s_loaded.end() && it->second == now && engine->RulesValid() )
+        return true;
+
+    KOPENAPI_KEEP_UNSAVED keep;
+
+    try
+    {
+        engine->InitEngine( file );
+    }
+    catch( const PARSE_ERROR& error )
+    {
+        if( aError )
+            *aError = "custom design rules do not compile: " + error.What().ToStdString( wxConvUTF8 );
+
+        return false;
+    }
+
+    if( it != s_loaded.end() )
+        wxLogMessage( "kicadopenapi: design rules %s changed on disk: read again", now.path );
+
+    s_loaded[aBoard] = now;
+    return true;
+}
+
 
 namespace
 {
@@ -104,17 +170,8 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     std::shared_ptr<DRC_ENGINE> engine = board->GetDesignSettings().m_DRCEngine;
 
-    if( !engine->RulesValid() )
-    {
-        try
-        {
-            engine->InitEngine( board->GetDesignRulesPath() );
-        }
-        catch( const PARSE_ERROR& error )
-        {
-            return KOPENAPI_RESULT::Error( 422, "custom design rules do not compile: " + error.What().ToStdString( wxConvUTF8 ) );
-        }
-    }
+    if( std::string error; !KopenapiDesignRulesFromDisk( board, &error ) )
+        return KOPENAPI_RESULT::Error( 422, error );
 
     if( aArgs.value( "refill_zones", false ) )
     {

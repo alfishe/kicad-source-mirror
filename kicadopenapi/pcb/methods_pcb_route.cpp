@@ -2156,6 +2156,9 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
 
     BOARD* board = context->GetBoard();
 
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     // a spot: [x_mm, y_mm] or {at: [x_mm, y_mm], layer}
     auto spotOf = [&]( const nlohmann::json& aSpot, VECTOR2I& aAt, std::optional<PCB_LAYER_ID>& aLayer ) -> std::string
     {
@@ -2902,6 +2905,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return *busy;
 
     BOARD* board = context->GetBoard();
+
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     const auto started = std::chrono::steady_clock::now();
     ROUTE_PROFILE              profile;
     ROUTE_PROFILES::BIND       bindProfile( board, profile );
@@ -7029,6 +7036,10 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         return KopenapiNoBoard();
 
     BOARD*        board = context->GetBoard();
+
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     const wxString netName = wxString::FromUTF8( aArgs.value( "net", std::string( "GND" ) ) );
     NETINFO_ITEM* net = KopenapiFindNet( board, aArgs.value( "net", std::string( "GND" ) ) );
 
@@ -8561,6 +8572,9 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     BOARD* board = context->GetBoard();
 
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     // the path: a pad, points, a pad; a point may carry "via": the layer the track continues on
     struct STEP
     {
@@ -9711,6 +9725,10 @@ static KOPENAPI_RESULT h_pcb_fanout( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         return KopenapiNoBoard();
 
     BOARD*         board = context->GetBoard();
+
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
     const wxString ref = wxString::FromUTF8( aArgs.value( "ref", std::string() ) );
     FOOTPRINT*     fp = nullptr;
 
