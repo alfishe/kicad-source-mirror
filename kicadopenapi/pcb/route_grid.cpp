@@ -4206,9 +4206,26 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     bool                complete = false;
     double              firstMs = -1;
 
+    // the race between variants counts routing time only: not while a paused job waits
+    double     heldMs = 0;
+    auto       tick = CLOCK::now();
+    const auto activeMs = [&]() { return msSince( routing ) - heldMs; };
+
     for( size_t left = runs.size(); left > 0; )
     {
         std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
+
+        {
+            uint64_t    serial = 0;
+            std::string by;
+            int         n = 0;
+            const double slice = msSince( tick );
+
+            tick = CLOCK::now();
+
+            if( aParams.held && aParams.held( serial, by, n ) )
+                heldMs += slice;
+        }
 
         for( size_t k = 0; k < runs.size(); ++k )
         {
@@ -4217,7 +4234,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
             done[k].get();
             finished[k] = true;
-            finishedMs[k] = msSince( routing );
+            finishedMs[k] = activeMs();
             --left;
 
             if( firstMs < 0 && !runs[k]->Halted() )
@@ -4235,7 +4252,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
             }
         }
 
-        if( firstMs >= 0 && left > 0 && msSince( routing ) > firstMs + std::max( 2000.0, firstMs / 4 ) )
+        if( firstMs >= 0 && left > 0 && activeMs() > firstMs + std::max( 2000.0, firstMs / 4 ) )
         {
             for( size_t j = 0; j < runs.size(); ++j )
             {
