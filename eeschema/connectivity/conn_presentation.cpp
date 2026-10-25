@@ -18,6 +18,7 @@
  */
 
 #include <connectivity/conn_presentation.h>
+#include <model_thread.h>
 #include <netclass.h>
 #include <sch_item.h>
 #include <connectivity/conn_facade.h>
@@ -35,7 +36,7 @@
 std::optional<wxString> SCH_CONNECTIVITY::AppendConnectionInfo(
         const SCH_ITEM& aItem, std::vector<MSG_PANEL_ITEM>& aList, const SCH_SHEET_PATH* aPath )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     wxString name;
     bool isBus;
 

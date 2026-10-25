@@ -219,6 +219,25 @@ bool KOPENAPI_REGISTRY::IsEditing( const std::string& aName ) const
 }
 
 
+bool KOPENAPI_REGISTRY::MarkConcurrentReads( std::initializer_list<const char*> aNames )
+{
+    KOPENAPI_REGISTRY& reg = Get();
+    std::lock_guard<std::mutex> lock( reg.m_mutex );
+
+    for( const char* name : aNames )
+        reg.m_concurrentReads.insert( name );
+
+    return true;
+}
+
+
+bool KOPENAPI_REGISTRY::IsConcurrentRead( const std::string& aName ) const
+{
+    std::lock_guard<std::mutex> lock( m_mutex );
+    return m_concurrentReads.count( aName ) > 0 && m_editing.count( aName ) == 0;
+}
+
+
 void KOPENAPI_REGISTRY::ReleaseDocuments() const
 {
     std::vector<KOPENAPI_DOC_RELEASE> releasers;

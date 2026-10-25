@@ -18,6 +18,8 @@
 #include <base_units.h>
 #include <board.h>
 #include <board_commit.h>
+#include <chrono>
+#include <optional>
 #include <board_design_settings.h>
 #include <connectivity/connectivity_data.h>
 #include <ratsnest/ratsnest_data.h>
@@ -1912,6 +1914,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         outline->SetEnd( origin + VECTOR2I( toIU( w ), toIU( h ) ) );
         commit.Add( outline );
         commit.Push( _( "Board outline (API)" ) );
+        KopenapiKeepUiAlive();
         commit = BOARD_COMMIT( context->GetToolManager() );
         edges = board->GetBoardEdgesBoundingBox();
 
@@ -1991,6 +1994,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( !placed.empty() )
     {
         commit.Push( _( "Connectors to the edges (API)" ) );
+        KopenapiKeepUiAlive();
         commit = BOARD_COMMIT( context->GetToolManager() );
     }
 
@@ -2081,6 +2085,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         }
 
         commit.Push( _( "Main parts spread (API)" ) );
+        KopenapiKeepUiAlive();
         commit = BOARD_COMMIT( context->GetToolManager() );
 
         rest.erase( std::remove_if( rest.begin(), rest.end(),
@@ -2100,23 +2105,72 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     }
 
     board->BuildConnectivity();
-    AR_AUTOPLACER autoplacer( board );
+    KopenapiKeepUiAlive();
+
+    // the placer's own connectivity of every footprint: built from the board, which it only reads
+    std::optional<AR_AUTOPLACER> placer;
+    KopenapiCompute( [&]() { placer.emplace( board ); } );
+    AR_AUTOPLACER& autoplacer = *placer;
+
     KOPENAPI_KEEPALIVE_REPORTER reporter;
     autoplacer.SetProgressReporter( &reporter );
+
+    // The search for each part's place only reads the board: off the GUI thread, readers alongside.
+    // Each part moves here; the moves go to the board in short commits (one undo step in the end),
+    // so the editor shows them as they come and readers see a consistent board between parts
+    autoplacer.SetComputeRunner( []( const std::function<void()>& aSearch ) { KopenapiCompute( aSearch ); } );
+
+    using CLOCK = std::chrono::steady_clock;
+    constexpr auto BATCH = std::chrono::milliseconds( 30 );
+    CLOCK::time_point lastPush = CLOCK::now();
+    bool              pushed = false;
+    int               batches = 0;
+
+    auto pushBatch = [&]()
+    {
+        if( commit.Empty() )
+            return;
+
+        commit.Push( _( "Autoplace footprints (API)" ), pushed ? APPEND_UNDO : 0 );
+        pushed = true;
+        batches++;
+        lastPush = CLOCK::now();
+    };
+
+    autoplacer.SetRefreshCallback(
+            [&]( FOOTPRINT* aFootprint )
+            {
+                KopenapiKeepUiAlive();
+
+                if( aFootprint && CLOCK::now() - lastPush >= BATCH )
+                {
+                    pushBatch();
+                    KopenapiKeepUiAlive();   // a push refreshes connectivity: paint before the readers
+                }
+
+                KopenapiReadPoint();
+                KopenapiKeepUiAlive();
+                return 0;
+            } );
     autoplacer.SetOverlay( std::make_shared<KIGFX::VIEW_OVERLAY>() );   // it draws its matrix unconditionally
 
     const AR_RESULT result = rest.empty() ? AR_COMPLETED : autoplacer.AutoplaceFootprints( rest, &commit, false );
 
     if( result == AR_COMPLETED )
     {
-        if( !rest.empty() )
-            commit.Push( _( "Autoplace footprints (API)" ) );
+        pushBatch();
+    }
+    else if( result == AR_CANCELLED )
+    {
+        pushBatch();
+        notes.push_back( "stopped: the parts placed so far are kept" );
     }
     else
     {
         commit.Revert();
         notes.push_back( "KiCad's autoplacer did not complete" );
     }
+
 
     for( FOOTPRINT* fp : rest )
         placed.push_back( fp->m_Uuid );
@@ -2187,6 +2241,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     }
 
     refreshGui( aCtx, board );
+    KopenapiKeepUiAlive();
     glow( aCtx, placed );
 
     nlohmann::json report = placementReport( board );
@@ -2194,7 +2249,8 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
     if( !groups.empty() )
         report["groups"] = groups;
-    report["autoplacer"] = result == AR_COMPLETED ? "completed" : "failed";
+    report["autoplacer"] = result == AR_COMPLETED ? "completed" : result == AR_CANCELLED ? "stopped" : "failed";
+    report["autoplacer_commits"] = batches;
 
     const KOPENAPI_LIST_CAP cap( aArgs, PLACE_AUTO_LIST_CAP );
 

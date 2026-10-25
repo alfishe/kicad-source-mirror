@@ -2,6 +2,8 @@
 /// @brief kicadopenapi schematic document methods: sch_open, sch_close, sch_save, sch_revert, and
 /// the "sch" document provider.  Compiled into the eeschema kiface; registered when it loads.
 #include <kicadopenapi_util.h>
+#include <kicadopenapi_change_feed.h>
+#include <model_thread.h>
 #include <kicadopenapi_legacy_save.h>
 #include <kicadopenapi_lock.h>
 #include <kicadopenapi_service.h>
@@ -65,18 +67,84 @@ static SCH_EDIT_FRAME* guiFrame( KOPENAPI_CONTEXT& aCtx, bool aCreate )
 }
 
 
+/// @brief Records every commit of the schematic in the change feed (owner thread); a commit
+/// reports its added, removed and changed items as separate change sets
+class SCHEMATIC_CHANGE_FEED : public SCHEMATIC_LISTENER
+{
+public:
+    void OnSchItemsAdded( SCHEMATIC&, std::vector<SCH_ITEM*>& aItems ) override
+    {
+        KOPENAPI_CHANGE_FEED::Record( "sch", ids( aItems ), {}, {} );
+    }
+
+    void OnSchItemsRemoved( SCHEMATIC&, std::vector<SCH_ITEM*>& aItems ) override
+    {
+        KOPENAPI_CHANGE_FEED::Record( "sch", {}, {}, ids( aItems ) );
+    }
+
+    void OnSchItemsChanged( SCHEMATIC&, std::vector<SCH_ITEM*>& aItems ) override
+    {
+        KOPENAPI_CHANGE_FEED::Record( "sch", {}, ids( aItems ), {} );
+    }
+
+    /// @brief Listens to this schematic; a different one than before resets the feed
+    void Follow( SCHEMATIC* aSchematic )
+    {
+        if( !aSchematic || !MODEL_THREAD::MayWrite() )
+            return;
+
+        aSchematic->AddListener( this );
+
+        if( aSchematic != m_schematic )
+        {
+            m_schematic = aSchematic;
+            KOPENAPI_CHANGE_FEED::Reset( "sch" );
+        }
+    }
+
+private:
+    static std::vector<std::string> ids( const std::vector<SCH_ITEM*>& aItems )
+    {
+        std::vector<std::string> out;
+        out.reserve( aItems.size() );
+
+        for( const SCH_ITEM* item : aItems )
+            out.push_back( item->m_Uuid.AsStdString() );
+
+        return out;
+    }
+
+    SCHEMATIC* m_schematic = nullptr;
+};
+
+
+static SCHEMATIC_CHANGE_FEED& schematicChangeFeed()
+{
+    static SCHEMATIC_CHANGE_FEED* s_feed = new SCHEMATIC_CHANGE_FEED();   // schematics keep a pointer to it
+    return *s_feed;
+}
+
+
 std::shared_ptr<SCH_CONTEXT> KopenapiSchContext( KOPENAPI_CONTEXT& aCtx )
 {
+    std::shared_ptr<SCH_CONTEXT> context;
+
     if( aCtx.headless )
-        return s_headless;
+    {
+        context = s_headless;
+    }
+    else if( SCH_EDIT_FRAME* frame = guiFrame( aCtx, false ) )
+    {
+        context = CreateSchFrameContext( frame );
 
-    SCH_EDIT_FRAME* frame = guiFrame( aCtx, false );
+        if( context->GetCurrentFileName().IsEmpty() )
+            context = nullptr;
+    }
 
-    if( !frame )
-        return nullptr;
+    if( context )
+        schematicChangeFeed().Follow( context->GetSchematic() );
 
-    std::shared_ptr<SCH_CONTEXT> context = CreateSchFrameContext( frame );
-    return context->GetCurrentFileName().IsEmpty() ? nullptr : context;
+    return context;
 }
 
 

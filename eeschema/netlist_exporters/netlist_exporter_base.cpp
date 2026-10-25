@@ -35,6 +35,7 @@
 #include <schematic.h>
 #include <advanced_config.h>
 #include <connectivity/conn_facade.h>
+#include <model_thread.h>
 #include <reporter.h>
 #include <richio.h>
 
@@ -78,7 +79,11 @@ void NETLIST_EXPORTER_BASE::rebuildConnectivity()
 {
     m_exportNets.clear();
     m_exportItemNets.clear();
-    m_schematic->RebuildConnectivity();
+
+    // A leased reader exports what the document's owner published; only a writer rebuilds
+    if( MODEL_THREAD::MayWrite() )
+        m_schematic->RebuildConnectivity();
+
     m_exportSheets = m_schematic->Hierarchy();
 
     if( ADVANCED_CFG::GetCfg().m_ConnectivityEngine )

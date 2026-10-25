@@ -360,6 +360,8 @@ FONTCONFIG::FF_RESULT FONTCONFIG::FindFont( const wxString& aFontName, wxString&
 
     if( retval == FF_RESULT::FF_ERROR )
     {
+        std::lock_guard lock( g_fontConfigMutex );
+
         if( s_reporter )
             s_reporter->Report( wxString::Format( _( "Error loading font '%s'." ), qualifiedFontName ) );
     }
@@ -374,11 +376,17 @@ FONTCONFIG::FF_RESULT FONTCONFIG::FindFont( const wxString& aFontName, wxString&
             if( retval == FF_RESULT::FF_SUBSTITUTE )
                 retval = FF_RESULT::FF_OK;
         }
-        else if( s_reporter )
+        else
         {
-            s_reporter->Report( wxString::Format( _( "Font '%s' not found; substituting '%s'." ),
-                                                  qualifiedFontName,
-                                                  fontName ) );
+            // under the lock: a reporter scope ending on another thread waits until this report is done
+            std::lock_guard lock( g_fontConfigMutex );
+
+            if( s_reporter )
+            {
+                s_reporter->Report( wxString::Format( _( "Font '%s' not found; substituting '%s'." ),
+                                                      qualifiedFontName,
+                                                      fontName ) );
+            }
         }
     }
 

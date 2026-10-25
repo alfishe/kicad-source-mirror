@@ -18,6 +18,7 @@
  */
 
 #include "conn_bindings.h"
+#include <model_thread.h>
 
 #include <algorithm>
 #include <map>
@@ -31,7 +32,7 @@ namespace SCH_CONNECTIVITY
 BUNDLE_INPUT PrepareBundle( const PARTITION& aPartition, const RECORD_STORE::RECORD_CACHE& aRecords,
                             SESSION_KEYS& aKeys )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     BUNDLE_INPUT result;
     result.parent = aPartition.anchor;
 
@@ -225,7 +226,7 @@ SLOT_STORE::SLOT_STORE( CACHE_VERSIONS& aVersions, SESSION_KEYS& aKeys ) :
 
 void SLOT_STORE::Update( const COMPONENT_CACHE<BUNDLE_BINDING>& aBundles )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     try
     {
         std::set<SLOT_KEY, KEY_LESS> live( m_slots.Entries().key_comp() );

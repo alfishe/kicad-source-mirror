@@ -201,6 +201,19 @@ public:
     void RunTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aTestFootprints,
                    BOARD_COMMIT* aCommit = nullptr );
 
+    /**
+     * The first part of RunTests: settings, then the caches the tests read (board connectivity
+     * included) regenerated.  It writes the board; RunProviders after it only reads it.
+     *
+     * @return false when cancelled or the caches could not be built (no tests to run).
+     */
+    bool PrepareTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aTestFootprints );
+
+    /**
+     * The second part of RunTests: the test providers, after PrepareTests.
+     */
+    void RunProviders( EDA_UNITS aUnits );
+
     bool IsErrorLimitExceeded( int error_code );
 
     /**
@@ -338,6 +351,8 @@ public:
                             const VECTOR2I& aCollisionPos, BOARD_ITEM* aCollidingItem );
 
 private:
+    void setTestProviders( std::vector<std::unique_ptr<DRC_TEST_PROVIDER>> aProviders );
+
     void addRule( std::shared_ptr<DRC_RULE>& rule )
     {
         m_rules.push_back(rule);
@@ -377,6 +392,7 @@ protected:
     std::vector<std::shared_ptr<DRC_RULE>>  m_rules;
     bool                                    m_rulesValid;
     std::vector<DRC_TEST_PROVIDER*>         m_testProviders;
+    std::vector<std::unique_ptr<DRC_TEST_PROVIDER>> m_ownedProviders;
 
     std::vector<int>           m_errorLimits;
     mutable std::mutex         m_errorLimitsMutex;

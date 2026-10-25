@@ -19,6 +19,7 @@
  */
 
 #include <sch_render_settings.h>
+#include <model_thread.h>
 #include <scintilla_tricks.h>
 #include <netclass.h>
 #include <wx/log.h>
@@ -462,21 +463,26 @@ void SCH_FIELD::swapData( SCH_ITEM* aItem )
 
 COLOR4D SCH_FIELD::GetFieldColor() const
 {
+    auto resolvedColor = m_lastResolvedColor;
+
     if( GetTextColor() != COLOR4D::UNSPECIFIED )
     {
-        m_lastResolvedColor = GetTextColor();
+        resolvedColor = GetTextColor();
     }
     else
     {
         SCH_LABEL_BASE* parentLabel = dynamic_cast<SCH_LABEL_BASE*>( GetParent() );
 
         if( parentLabel && !parentLabel->IsConnectivityDirty() )
-            m_lastResolvedColor = parentLabel->GetEffectiveNetClass()->GetSchematicColor();
+            resolvedColor = parentLabel->GetEffectiveNetClass()->GetSchematicColor();
         else
-            m_lastResolvedColor = GetTextColor();
+            resolvedColor = GetTextColor();
     }
 
-    return m_lastResolvedColor;
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedColor = resolvedColor;
+
+    return resolvedColor;
 }
 
 

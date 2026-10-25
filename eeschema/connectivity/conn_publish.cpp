@@ -18,6 +18,7 @@
  */
 
 #include "conn_publish.h"
+#include <model_thread.h>
 
 #include <algorithm>
 #include <iterator>
@@ -440,7 +441,7 @@ void PUBLICATION::Update( const COMPONENT_CACHE<BUNDLE_BINDING>& aBundles,
                           const RECORD_STORE::RECORD_CACHE& aRecords, std::span<const FRAME_INSTANCE> aFrame,
                           const INPUT_STORE& aInputs )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     COMPONENTS                  current;
     std::map<NODE_ID, uint64_t> versions;
     std::set<NODE_ID>           unchanged;

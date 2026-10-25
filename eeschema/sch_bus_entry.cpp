@@ -19,6 +19,7 @@
  */
 
 #include <connectivity/conn_presentation.h>
+#include <model_thread.h>
 #include <sch_draw_panel.h>
 #include <bitmaps.h>
 #include <core/mirror.h>
@@ -233,12 +234,17 @@ const BOX2I SCH_BUS_ENTRY_BASE::GetBoundingBox() const
 
 COLOR4D SCH_BUS_ENTRY_BASE::GetBusEntryColor() const
 {
-    if( m_stroke.GetColor() != COLOR4D::UNSPECIFIED )
-        m_lastResolvedColor = m_stroke.GetColor();
-    else if( IsConnectable() && !IsConnectivityDirty() )
-        m_lastResolvedColor = GetEffectiveNetClass()->GetSchematicColor();
+    auto resolvedColor = m_lastResolvedColor;
 
-    return m_lastResolvedColor;
+    if( m_stroke.GetColor() != COLOR4D::UNSPECIFIED )
+        resolvedColor = m_stroke.GetColor();
+    else if( IsConnectable() && !IsConnectivityDirty() )
+        resolvedColor = GetEffectiveNetClass()->GetSchematicColor();
+
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedColor = resolvedColor;
+
+    return resolvedColor;
 }
 
 
@@ -264,12 +270,17 @@ void SCH_BUS_ENTRY_BASE::SetBusEntryColor( const COLOR4D& aColor )
 
 LINE_STYLE SCH_BUS_ENTRY_BASE::GetEffectiveLineStyle() const
 {
-    if( m_stroke.GetLineStyle() != LINE_STYLE::DEFAULT )
-        m_lastResolvedLineStyle = m_stroke.GetLineStyle();
-    else if( IsConnectable() && !IsConnectivityDirty() )
-        m_lastResolvedLineStyle = (LINE_STYLE) GetEffectiveNetClass()->GetLineStyle();
+    auto resolvedLineStyle = m_lastResolvedLineStyle;
 
-    return m_lastResolvedLineStyle;
+    if( m_stroke.GetLineStyle() != LINE_STYLE::DEFAULT )
+        resolvedLineStyle = m_stroke.GetLineStyle();
+    else if( IsConnectable() && !IsConnectivityDirty() )
+        resolvedLineStyle = (LINE_STYLE) GetEffectiveNetClass()->GetLineStyle();
+
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedLineStyle = resolvedLineStyle;
+
+    return resolvedLineStyle;
 }
 
 
@@ -282,23 +293,33 @@ void SCH_BUS_ENTRY_BASE::SetLineStyle( LINE_STYLE aStyle )
 
 int SCH_BUS_WIRE_ENTRY::GetPenWidth() const
 {
-    if( m_stroke.GetWidth() > 0 )
-        m_lastResolvedWidth = m_stroke.GetWidth();
-    else if( IsConnectable() && !IsConnectivityDirty() )
-        m_lastResolvedWidth = GetEffectiveNetClass()->GetWireWidth();
+    auto resolvedWidth = m_lastResolvedWidth;
 
-    return m_lastResolvedWidth;
+    if( m_stroke.GetWidth() > 0 )
+        resolvedWidth = m_stroke.GetWidth();
+    else if( IsConnectable() && !IsConnectivityDirty() )
+        resolvedWidth = GetEffectiveNetClass()->GetWireWidth();
+
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedWidth = resolvedWidth;
+
+    return resolvedWidth;
 }
 
 
 int SCH_BUS_BUS_ENTRY::GetPenWidth() const
 {
-    if( m_stroke.GetWidth() > 0 )
-        m_lastResolvedWidth = m_stroke.GetWidth();
-    else if( IsConnectable() && !IsConnectivityDirty() )
-        m_lastResolvedWidth = GetEffectiveNetClass()->GetBusWidth();
+    auto resolvedWidth = m_lastResolvedWidth;
 
-    return m_lastResolvedWidth;
+    if( m_stroke.GetWidth() > 0 )
+        resolvedWidth = m_stroke.GetWidth();
+    else if( IsConnectable() && !IsConnectivityDirty() )
+        resolvedWidth = GetEffectiveNetClass()->GetBusWidth();
+
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedWidth = resolvedWidth;
+
+    return resolvedWidth;
 }
 
 

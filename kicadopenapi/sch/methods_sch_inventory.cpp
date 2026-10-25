@@ -889,3 +889,5 @@ KOPENAPI_REGISTER( "sch_netlist",
                    "every net with role and its pads as REF.PAD, pins without a footprint pad, components "
                    "(ref, value, footprint, on_board, dnp); input for schematic/board comparison",
                    R"json({"type":"object","properties":{}})json"_json, false, h_sch_netlist );
+
+KOPENAPI_MARK_CONCURRENT_READS( "sch_sheet_list", "sch_symbol_list" );

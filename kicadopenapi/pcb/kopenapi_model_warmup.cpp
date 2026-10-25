@@ -10,6 +10,7 @@
 #include <libraries/library_manager.h>
 #include <pgm_base.h>
 #include <project_pcb.h>
+#include <kicadopenapi_keepalive.h>
 #include <kicadopenapi_memory.h>
 
 #include <wx/filename.h>
@@ -76,7 +77,7 @@ const char* mustStop( int64_t aBudget )
 } // namespace
 
 
-void KopenapiStopWarmModels()
+void KopenapiStopWarmModels( bool aKeepUiAlive )
 {
     STATE&                    s = state();
     std::vector<std::jthread> threads;
@@ -89,6 +90,9 @@ void KopenapiStopWarmModels()
 
     for( std::jthread& t : threads )
         t.request_stop();
+
+    if( aKeepUiAlive && !threads.empty() )
+        KopenapiRunOffMain( [&]() { threads.clear(); } );
 
     threads.clear();   // joins
 

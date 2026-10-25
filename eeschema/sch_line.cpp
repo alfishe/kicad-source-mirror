@@ -19,6 +19,7 @@
  */
 
 #include <connectivity/conn_presentation.h>
+#include <model_thread.h>
 #include <base_units.h>
 #include <bitmaps.h>
 #include <string_utils.h>
@@ -394,14 +395,19 @@ void SCH_LINE::SetLineColor( const double r, const double g, const double b, con
 
 COLOR4D SCH_LINE::GetLineColor() const
 {
-    if( m_stroke.GetColor() != COLOR4D::UNSPECIFIED )
-        m_lastResolvedColor = m_stroke.GetColor();
-    else if( !IsConnectable() )
-        m_lastResolvedColor = COLOR4D::UNSPECIFIED;
-    else if( !IsConnectivityDirty() )
-        m_lastResolvedColor = GetEffectiveNetClass()->GetSchematicColor();
+    auto resolvedColor = m_lastResolvedColor;
 
-    return m_lastResolvedColor;
+    if( m_stroke.GetColor() != COLOR4D::UNSPECIFIED )
+        resolvedColor = m_stroke.GetColor();
+    else if( !IsConnectable() )
+        resolvedColor = COLOR4D::UNSPECIFIED;
+    else if( !IsConnectivityDirty() )
+        resolvedColor = GetEffectiveNetClass()->GetSchematicColor();
+
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedColor = resolvedColor;
+
+    return resolvedColor;
 }
 
 
@@ -423,14 +429,19 @@ LINE_STYLE SCH_LINE::GetLineStyle() const
 
 LINE_STYLE SCH_LINE::GetEffectiveLineStyle() const
 {
-    if( m_stroke.GetLineStyle() != LINE_STYLE::DEFAULT )
-        m_lastResolvedLineStyle = m_stroke.GetLineStyle();
-    else if( !IsConnectable() )
-        m_lastResolvedLineStyle = LINE_STYLE::SOLID;
-    else if( !IsConnectivityDirty() )
-        m_lastResolvedLineStyle = (LINE_STYLE) GetEffectiveNetClass()->GetLineStyle();
+    auto resolvedLineStyle = m_lastResolvedLineStyle;
 
-    return m_lastResolvedLineStyle;
+    if( m_stroke.GetLineStyle() != LINE_STYLE::DEFAULT )
+        resolvedLineStyle = m_stroke.GetLineStyle();
+    else if( !IsConnectable() )
+        resolvedLineStyle = LINE_STYLE::SOLID;
+    else if( !IsConnectivityDirty() )
+        resolvedLineStyle = (LINE_STYLE) GetEffectiveNetClass()->GetLineStyle();
+
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedLineStyle = resolvedLineStyle;
+
+    return resolvedLineStyle;
 }
 
 
@@ -457,20 +468,22 @@ int SCH_LINE::GetPenWidth() const
         return schIUScale.MilsToIU( DEFAULT_LINE_WIDTH_MILS );
 
     case LAYER_WIRE:
-        if( m_stroke.GetWidth() > 0 )
-            m_lastResolvedWidth = m_stroke.GetWidth();
-        else if( !IsConnectivityDirty() )
-            m_lastResolvedWidth = GetEffectiveNetClass()->GetWireWidth();
-
-        return m_lastResolvedWidth;
-
     case LAYER_BUS:
-        if( m_stroke.GetWidth() > 0 )
-            m_lastResolvedWidth = m_stroke.GetWidth();
-        else if( !IsConnectivityDirty() )
-            m_lastResolvedWidth = GetEffectiveNetClass()->GetBusWidth();
+    {
+        int resolvedWidth = m_lastResolvedWidth;
 
-        return m_lastResolvedWidth;
+        if( m_stroke.GetWidth() > 0 )
+            resolvedWidth = m_stroke.GetWidth();
+        else if( !IsConnectivityDirty() && m_layer == LAYER_WIRE )
+            resolvedWidth = GetEffectiveNetClass()->GetWireWidth();
+        else if( !IsConnectivityDirty() )
+            resolvedWidth = GetEffectiveNetClass()->GetBusWidth();
+
+        if( MODEL_THREAD::MayWrite() )
+            m_lastResolvedWidth = resolvedWidth;
+
+        return resolvedWidth;
+    }
     }
 }
 

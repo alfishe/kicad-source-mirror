@@ -18,6 +18,7 @@
  */
 
 #include "conn_engine.h"
+#include <model_thread.h>
 #include <wx/thread.h>
 #include <algorithm>
 #include <iterator>
@@ -194,7 +195,7 @@ std::set<RECORD_KEY, KEY_LESS> ENGINE::ercIslands() const
 
 std::vector<DRIVER_CONFLICT> ENGINE::DriverConflicts() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<DRIVER_CONFLICT> result;
     std::map<INST_ID, std::map<KIID, VECTOR2I>> positions;
     const auto reported = ercIslands();
@@ -225,7 +226,7 @@ std::vector<DRIVER_CONFLICT> ENGINE::DriverConflicts() const
 
 std::vector<WIRE_ENDPOINT> ENGINE::DanglingWireEndpoints() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<WIRE_ENDPOINT> result;
     const auto reported = ercIslands();
 
@@ -272,7 +273,7 @@ std::vector<WIRE_ENDPOINT> ENGINE::DanglingWireEndpoints() const
 
 std::vector<FLOATING_WIRE> ENGINE::FloatingWires() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<FLOATING_WIRE> result;
 
     for( const auto& [key, island] : m_published.Auxiliary().Islands() )
@@ -315,7 +316,7 @@ std::vector<FLOATING_WIRE> ENGINE::FloatingWires() const
 
 std::vector<BUS_NET_CONFLICT> ENGINE::BusNetConflicts() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<BUS_NET_CONFLICT> result;
     const auto reported = ercIslands();
 
@@ -371,7 +372,7 @@ std::vector<BUS_NET_CONFLICT> ENGINE::BusNetConflicts() const
 
 std::vector<BUS_BUS_CONFLICT> ENGINE::BusBusConflicts() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<BUS_BUS_CONFLICT> result;
     std::map<INST_ID, std::map<KIID, VECTOR2I>> positions;
     const auto reported = ercIslands();
@@ -443,7 +444,7 @@ std::vector<BUS_BUS_CONFLICT> ENGINE::BusBusConflicts() const
 
 std::vector<BUS_ENTRY_CONFLICT> ENGINE::BusEntryConflicts() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<BUS_ENTRY_CONFLICT> result;
     const auto& rows = m_published.Rows();
     const auto& islandOf = m_published.Auxiliary().IslandOf();
@@ -513,7 +514,7 @@ std::vector<BUS_ENTRY_CONFLICT> ENGINE::BusEntryConflicts() const
 
 std::vector<NO_CONNECT_PIN_CONFLICT> ENGINE::NoConnectPinConflicts() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     struct GROUP
     {
         std::set<KIID> pins;
@@ -563,7 +564,7 @@ std::vector<NO_CONNECT_PIN_CONFLICT> ENGINE::NoConnectPinConflicts() const
 
 std::vector<NO_CONNECT_FLAG_ERROR> ENGINE::NoConnectFlagErrors() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     struct NET
     {
         uint32_t pins = 0;
@@ -645,7 +646,7 @@ std::vector<NO_CONNECT_FLAG_ERROR> ENGINE::NoConnectFlagErrors() const
 
 std::vector<UNCONNECTED_PIN> ENGINE::UnconnectedPins() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     struct SOURCE
     {
         const PIN_FACT* pin = nullptr;
@@ -831,7 +832,7 @@ std::vector<UNCONNECTED_PIN> ENGINE::UnconnectedPins() const
 
 std::vector<LABEL_WIRE_CONFLICT> ENGINE::LabelWireConflicts() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::map<std::pair<KIID_PATH, VECTOR2I>, LABEL_WIRE_CONFLICT, SHEET_POSITION_LESS> locations;
 
     for( const auto& [key, neighbors] : m_published.Auxiliary().NeighborsOf() )
@@ -873,7 +874,7 @@ std::vector<LABEL_WIRE_CONFLICT> ENGINE::LabelWireConflicts() const
 
 std::vector<FOUR_WAY_JUNCTION> ENGINE::FourWayJunctions() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     struct CONTACTS
     {
         std::map<KIID, const PIN_FACT*> pins;
@@ -953,7 +954,7 @@ std::vector<FOUR_WAY_JUNCTION> ENGINE::FourWayJunctions() const
 
 std::vector<NETCLASS_REFERENCE> ENGINE::NetclassReferences() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<NETCLASS_REFERENCE> result;
 
     for( const auto& [instance, entry] : m_inputs.Instances().Entries() )
@@ -965,7 +966,7 @@ std::vector<NETCLASS_REFERENCE> ENGINE::NetclassReferences() const
 
 std::vector<UNMAPPED_PIN_CANDIDATE> ENGINE::UnmappedPinCandidates() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<UNMAPPED_PIN_CANDIDATE> result;
     const auto& auxiliary = m_published.Auxiliary();
 
@@ -992,14 +993,14 @@ std::vector<UNMAPPED_PIN_CANDIDATE> ENGINE::UnmappedPinCandidates() const
 
 std::vector<PIN_MAP_FACT> ENGINE::PinMapSymbols( SCREEN_ID aScreen ) const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     const auto* screen = m_inputs.FindScreen( aScreen );
     return screen ? screen->value.pinMaps : std::vector<PIN_MAP_FACT>();
 }
 
 std::vector<LIBRARY_SYMBOL_FACT> ENGINE::LibrarySymbols( const KIID_PATH& aPath ) const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     const auto id = m_keys.FindInstance( aPath );
     const auto* entry = id ? m_inputs.Instances().Find( *id ) : nullptr;
     return entry ? m_inputs.InstanceScreenFacts( *id ).LibrarySymbols()
@@ -1008,7 +1009,7 @@ std::vector<LIBRARY_SYMBOL_FACT> ENGINE::LibrarySymbols( const KIID_PATH& aPath 
 
 std::vector<VARIANT_SYMBOL_FACT> ENGINE::VariantSymbols( const KIID_PATH& aPath ) const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     const auto id = m_keys.FindInstance( aPath );
     const auto* entry = id ? m_inputs.Instances().Find( *id ) : nullptr;
     return entry ? entry->value.variantSymbols : std::vector<VARIANT_SYMBOL_FACT>();
@@ -1016,7 +1017,7 @@ std::vector<VARIANT_SYMBOL_FACT> ENGINE::VariantSymbols( const KIID_PATH& aPath 
 
 std::vector<FOOTPRINT_SOURCE> ENGINE::FootprintSources() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<FOOTPRINT_SOURCE> result;
 
     for( INST_ID id : instancesInPageOrder() )
@@ -1046,7 +1047,7 @@ std::vector<FOOTPRINT_SOURCE> ENGINE::FootprintSources() const
 
 std::vector<MULTI_UNIT_GROUP> ENGINE::MultiUnitSymbols() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::map<wxString, MULTI_UNIT_GROUP> groups;
 
     for( INST_ID id : instancesInPageOrder() )
@@ -1080,7 +1081,7 @@ std::vector<MULTI_UNIT_GROUP> ENGINE::MultiUnitSymbols() const
 
 std::vector<DUPLICATE_SHEET_ERROR> ENGINE::DuplicateSheetNames() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<DUPLICATE_SHEET_ERROR> result;
 
     for( const auto& [instance, entry] : m_inputs.Instances().Entries() )
@@ -1106,7 +1107,7 @@ std::vector<DUPLICATE_SHEET_ERROR> ENGINE::DuplicateSheetNames() const
 
 std::vector<FIELD_NAME_ERROR> ENGINE::InvalidFieldNames() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<FIELD_NAME_ERROR> result;
 
     for( const auto& [instance, entry] : m_inputs.Instances().Entries() )
@@ -1121,7 +1122,7 @@ std::vector<FIELD_NAME_ERROR> ENGINE::InvalidFieldNames() const
 
 std::vector<SOURCE_LOCATION> ENGINE::EmptyLabels() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<SOURCE_LOCATION> result;
 
     for( INST_ID instance : instancesInPageOrder() )
@@ -1143,7 +1144,7 @@ std::vector<SOURCE_LOCATION> ENGINE::EmptyLabels() const
 
 std::vector<SOURCE_LOCATION> ENGINE::WiredImplicitPowerPins() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<SOURCE_LOCATION> result;
     const auto& auxiliary = m_published.Auxiliary();
 
@@ -1177,7 +1178,7 @@ std::vector<SOURCE_LOCATION> ENGINE::WiredImplicitPowerPins() const
 
 std::vector<SOURCE_LOCATION> ENGINE::InvalidPinNotation() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<SOURCE_LOCATION> result;
 
     for( INST_ID instance : instancesInPageOrder() )
@@ -1203,7 +1204,7 @@ std::vector<SOURCE_LOCATION> ENGINE::InvalidPinNotation() const
 
 std::vector<OFF_GRID_ENDPOINT> ENGINE::OffGridEndpoints( int aGrid ) const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<OFF_GRID_ENDPOINT> result;
     const auto offGrid = [aGrid]( const VECTOR2I& point )
     {
@@ -1267,7 +1268,7 @@ std::vector<OFF_GRID_ENDPOINT> ENGINE::OffGridEndpoints( int aGrid ) const
 
 std::vector<GROUND_PIN_ERROR> ENGINE::GroundPinErrors() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     const auto isGround = []( const wxString& name )
     {
         const wxString upper = name.Upper();
@@ -1331,7 +1332,7 @@ std::vector<GROUND_PIN_ERROR> ENGINE::GroundPinErrors() const
 
 std::vector<LABEL_CONNECTION_ERROR> ENGINE::LabelConnectionErrors() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     struct CONNECTIONS
     {
         size_t                    count = 0;
@@ -1488,7 +1489,7 @@ std::vector<LABEL_CONNECTION_ERROR> ENGINE::LabelConnectionErrors() const
 
 std::vector<LABEL_LOCATION> ENGINE::DanglingDirectives() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<LABEL_LOCATION> result;
 
     for( const auto& [key, island] : m_published.Auxiliary().Islands() )
@@ -1509,7 +1510,7 @@ std::vector<LABEL_LOCATION> ENGINE::DanglingDirectives() const
 
 std::vector<ERC_PIN_NET> ENGINE::PinNets() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::map<NAME_ID, ERC_PIN_NET, NAME_LESS> nets( NAME_LESS{ &m_keys } );
     const auto netFor = [&]( const ITEM_KEY& key ) -> ERC_PIN_NET*
     {
@@ -1557,7 +1558,7 @@ std::vector<ERC_PIN_NET> ENGINE::PinNets() const
 
 std::vector<MULTI_UNIT_CONFLICT> ENGINE::MultiUnitPinConflicts() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     struct PIN_ON_NET
     {
         LABEL_LOCATION location;
@@ -1620,7 +1621,7 @@ std::vector<MULTI_UNIT_CONFLICT> ENGINE::MultiUnitPinConflicts() const
 
 std::vector<NAMED_ITEM> ENGINE::NamedItems() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<NAMED_ITEM> result;
     const auto unescapeNetName = []( wxString name )
     {
@@ -1662,7 +1663,7 @@ std::vector<NAMED_ITEM> ENGINE::NamedItems() const
 
 std::vector<LABEL_LOCATION> ENGINE::SingleGlobalLabels() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::map<std::string, std::optional<LABEL_LOCATION>> labels;
 
     for( INST_ID inst : islandInstances( m_published.Auxiliary().Islands() ) )
@@ -1694,7 +1695,7 @@ std::vector<LABEL_LOCATION> ENGINE::SingleGlobalLabels() const
 
 std::vector<HIERARCHY_ERROR> ENGINE::HierarchyErrors() const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     using ERROR_KIND = HIERARCHY_ERROR::KIND;
     struct PORTS
     {

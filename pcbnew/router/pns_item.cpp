@@ -19,6 +19,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <atomic>
 #include "pns_node.h"
 #include "pns_item.h"
 #include "pns_line.h"
@@ -361,8 +362,8 @@ const NODE* ITEM::OwningNode() const
 
 LINKED_ITEM::UNIQ_ID LINKED_ITEM::genNextUid()
 {
-    static UNIQ_ID uidCount = 0; // fixme: make atomic
-    return uidCount++;
+    static std::atomic<UNIQ_ID> uidCount{ 0 };
+    return uidCount.fetch_add( 1, std::memory_order_relaxed );
 }
 
 } // namespace PNS

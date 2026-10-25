@@ -910,3 +910,6 @@ KOPENAPI_REGISTER( "sch_subcircuit",
                         "max_part_pins":{"type":"integer","default":3,"description":"parts with more pins are boundary, not expanded"},
                         "max_fanout":{"type":"integer","default":30,"description":"do not expand through nets with more pins; 0 = no limit"}}})json"_json,
                    false, h_sch_subcircuit );
+
+KOPENAPI_MARK_CONCURRENT_READS( "sch_interface_map", "sch_net_search", "sch_net_trace", "sch_path_find",
+                                "sch_power_tree", "sch_subcircuit", "sch_symbol_neighbors" );

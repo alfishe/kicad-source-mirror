@@ -18,6 +18,7 @@
  */
 
 #include "conn_text.h"
+#include <model_thread.h>
 #include "conn_inputs.h"
 #include "conn_tasks.h"
 
@@ -82,7 +83,7 @@ INPUT_STORE::INPUT_STORE( CACHE_VERSIONS& aVersions, SESSION_KEYS& aKeys ) :
 
 bool INPUT_STORE::ExternalSourcesChanged( const SCH_SHEET_LIST& aPaths, bool aContextUnchanged ) const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     INPUT_TEXT_SCOPE frame;
 
     if( TEXT_EVAL::ENVIRONMENT::Current()->IsCollectingSources() )
@@ -185,7 +186,7 @@ bool INPUT_STORE::ExternalSourcesChanged( const SCH_SHEET_LIST& aPaths, bool aCo
 
 const INPUT_STORE::SCREEN_CACHE::ENTRY& INPUT_STORE::Screen( const SCH_SCREEN& aScreen )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     const SCREEN_ID id = aScreen.ConnectivityId();
     const uint64_t  revision = aScreen.ConnectivityRevision();
     const auto      stamp = m_screenRevisions.find( id );
@@ -230,7 +231,7 @@ const INPUT_STORE::SCREEN_CACHE::ENTRY& INPUT_STORE::storeScreen( const SCH_SCRE
 const INPUT_STORE::INSTANCE_CACHE::ENTRY& INPUT_STORE::Instance( const SCH_SCREEN& aScreen, const SCH_SHEET_PATH& aPath,
                                                                 uint64_t aTextEpoch )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     if( aPath.LastScreen() != &aScreen )
         throw std::invalid_argument( "Connectivity instance does not refer to source screen" );
@@ -289,7 +290,7 @@ const INPUT_STORE::INSTANCE_CACHE::ENTRY& INPUT_STORE::Instance( const SCH_SCREE
 
 const INPUT_STORE::GEOMETRY_CACHE::ENTRY& INPUT_STORE::Geometry( SCREEN_ID aScreen )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     const auto* source = m_screens.Find( aScreen );
 
     if( !source )
@@ -317,7 +318,7 @@ const INPUT_STORE::GEOMETRY_CACHE::ENTRY& INPUT_STORE::Geometry( SCREEN_ID aScre
 
 const INPUT_STORE::ISLAND_CACHE::ENTRY& INPUT_STORE::Islands( SCREEN_ID aScreen, const UNIT_SIGNATURE& aUnits )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     const auto&         geometry = Geometry( aScreen );
     const ISLAND_LOOKUP lookup{ aScreen, aUnits };
@@ -344,7 +345,7 @@ const INPUT_STORE::ISLAND_CACHE::ENTRY& INPUT_STORE::Islands( SCREEN_ID aScreen,
 
 std::vector<FRAME_INSTANCE> INPUT_STORE::Capture( const SCH_SHEET_LIST& aPaths, uint64_t aTextEpoch )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     INPUT_TEXT_SCOPE inputText;
     auto frame = CaptureHierarchy( aPaths, m_keys );
@@ -418,7 +419,7 @@ std::vector<FRAME_INSTANCE> INPUT_STORE::Capture( const SCH_SHEET_LIST& aPaths, 
 
 void INPUT_STORE::Invalidate()
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     m_screenRevisions.clear();
     m_symbolRevisions.clear();
     m_instanceInputs.clear();
@@ -441,7 +442,7 @@ void INPUT_STORE::Clear()
 
 void INPUT_STORE::Retain( const std::set<SCREEN_ID>& aScreens, const std::set<INST_ID>& aInstances )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     // Views refer only to retained instances; their unit vectors remain unchanged
     std::set<ISLAND_LOOKUP, ISLAND_LESS> liveIslands;
 

@@ -2156,6 +2156,7 @@ KOPENAPI_REGISTER( "pcb_stackup_set",
                    false, h_pcb_stackup_set );
 
 KOPENAPI_MARK_EDITING( "pcb_stackup_set" );
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_stackup_get" );
 
 KOPENAPI_REGISTER( "pcb_signal_check",
                    "Digital signal checks of docs/pcb/routing-rules-digital-hsdd.md on the routed board, each only "

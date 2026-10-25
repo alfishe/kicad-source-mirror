@@ -635,3 +635,5 @@ KOPENAPI_REGISTER( "sch_bus_get",
                         "id":{"type":"string","description":"bus id, e.g. sp-dx/Sheet2#3"},
                         "member":{"type":"string","description":"net name: every bus it enters"}}})json"_json,
                    false, h_sch_bus_get );
+
+KOPENAPI_MARK_CONCURRENT_READS( "sch_bus_get", "sch_bus_list" );

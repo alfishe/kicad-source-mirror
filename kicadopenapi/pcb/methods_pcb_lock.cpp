@@ -292,3 +292,4 @@ KOPENAPI_REGISTER( "pcb_lock_list",
                    R"json({"type":"object","properties":{}})json"_json, false, h_pcb_lock_list );
 
 KOPENAPI_MARK_EDITING( "pcb_lock", "pcb_unlock" );
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_lock_list" );

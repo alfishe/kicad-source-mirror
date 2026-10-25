@@ -287,6 +287,40 @@ int64_t AllocatorTrim()
 #endif
 }
 
+THREAD::THREAD(std::size_t stackBytes, std::function<void()> body)
+{
+    auto* heapBody = new std::function<void()>(std::move(body));
+#if defined(_WIN32)
+    m_handle = StartThreadWindows(stackBytes, heapBody);
+#else
+    m_handle = StartThreadPosix(stackBytes, heapBody);
+#endif
+
+    if (!m_handle)
+        delete heapBody;
+}
+
+
+THREAD::~THREAD()
+{
+    Join();
+}
+
+
+void THREAD::Join()
+{
+    if (!m_handle)
+        return;
+
+#if defined(_WIN32)
+    JoinThreadWindows(m_handle);
+#else
+    JoinThreadPosix(m_handle);
+#endif
+    m_handle = nullptr;
+}
+
+
 void LowerCurrentThreadPriority()
 {
 #if defined(_WIN32)

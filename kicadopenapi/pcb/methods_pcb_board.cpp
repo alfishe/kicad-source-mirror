@@ -1201,3 +1201,4 @@ KOPENAPI_REGISTER( "pcb_rules_set",
                    false, h_pcb_rules_set );
 
 KOPENAPI_MARK_EDITING( "pcb_netlist_apply", "pcb_outline_set", "pcb_rules_set" );
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_rules_get" );

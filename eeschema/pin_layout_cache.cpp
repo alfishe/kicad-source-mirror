@@ -18,6 +18,8 @@
  */
 
 #include "pin_layout_cache.h"
+#include <array>
+#include <cstdint>
 #include <font/font.h>
 #include <gr_text.h>
 #include <geometry/direction45.h>
@@ -33,8 +35,17 @@
 // Small margin in internal units between the pin text and the pin line
 static const int PIN_TEXT_MARGIN = 4;
 
+std::recursive_mutex& PIN_LAYOUT_CACHE::Mutex( const SCH_PIN& aPin )
+{
+    static std::array<std::recursive_mutex, 64> stripes;
+    return stripes[( reinterpret_cast<std::uintptr_t>( &aPin ) >> 6 ) % stripes.size()];
+}
+
+
 std::optional<PIN_LAYOUT_CACHE::TEXT_INFO> PIN_LAYOUT_CACHE::GetPinNumberInfo( int aShadowWidth )
 {
+    std::lock_guard lock( Mutex( m_pin ) );
+
     recomputeCaches();
 
     if( m_pin.GetShownNumber().IsEmpty() || !m_pin.GetParentSymbol()->GetShowPinNumbers() )
@@ -162,6 +173,8 @@ PIN_LAYOUT_CACHE::PIN_LAYOUT_CACHE( const SCH_PIN& aPin ) :
 
 void PIN_LAYOUT_CACHE::MarkDirty( int aDirtyFlags )
 {
+    std::lock_guard lock( Mutex( m_pin ) );
+
     m_dirtyFlags |= aDirtyFlags;
 }
 
@@ -169,6 +182,8 @@ void PIN_LAYOUT_CACHE::MarkDirty( int aDirtyFlags )
 void PIN_LAYOUT_CACHE::SetRenderParameters( int aNameThickness, int aNumberThickness,
                                             bool aShowElectricalType, bool aShowAltIcons )
 {
+    std::lock_guard lock( Mutex( m_pin ) );
+
     if( aNameThickness != m_nameThickness )
     {
         MarkDirty( DIRTY_FLAGS::NAME );
@@ -390,6 +405,8 @@ void PIN_LAYOUT_CACHE::transformTextForPin( TEXT_INFO& aInfo ) const
 BOX2I PIN_LAYOUT_CACHE::GetPinBoundingBox( bool aIncludeLabelsOnInvisiblePins,
                                            bool aIncludeNameAndNumber, bool aIncludeElectricalType )
 {
+    std::lock_guard lock( Mutex( m_pin ) );
+
     if( const SCH_SYMBOL* symbol = dynamic_cast<const SCH_SYMBOL*>( m_pin.GetParentSymbol() ) )
     {
         SCH_PIN* const libPin = m_pin.GetLibPin();
@@ -730,6 +747,8 @@ OPT_BOX2I PIN_LAYOUT_CACHE::getUntransformedDecorationBox() const
 
 OPT_BOX2I PIN_LAYOUT_CACHE::GetPinNameBBox()
 {
+    std::lock_guard lock( Mutex( m_pin ) );
+
     recomputeCaches();
     OPT_BOX2I box = getUntransformedPinNameBox();
 
@@ -742,6 +761,8 @@ OPT_BOX2I PIN_LAYOUT_CACHE::GetPinNameBBox()
 
 OPT_BOX2I PIN_LAYOUT_CACHE::GetPinNumberBBox()
 {
+    std::lock_guard lock( Mutex( m_pin ) );
+
     recomputeCaches();
     OPT_BOX2I box = getUntransformedPinNumberBox();
 
@@ -754,6 +775,8 @@ OPT_BOX2I PIN_LAYOUT_CACHE::GetPinNumberBBox()
 
 OPT_BOX2I PIN_LAYOUT_CACHE::GetAltIconBBox()
 {
+    std::lock_guard lock( Mutex( m_pin ) );
+
     OPT_BOX2I box = getUntransformedAltIconBox();
 
     if( box )
@@ -765,6 +788,8 @@ OPT_BOX2I PIN_LAYOUT_CACHE::GetAltIconBBox()
 
 std::optional<PIN_LAYOUT_CACHE::TEXT_INFO> PIN_LAYOUT_CACHE::GetPinNameInfo( int aShadowWidth )
 {
+    std::lock_guard lock( Mutex( m_pin ) );
+
     recomputeCaches();
     wxString name = m_pin.GetShownName();
 
@@ -876,6 +901,8 @@ std::optional<PIN_LAYOUT_CACHE::TEXT_INFO> PIN_LAYOUT_CACHE::GetPinNameInfo( int
 std::optional<PIN_LAYOUT_CACHE::TEXT_INFO>
 PIN_LAYOUT_CACHE::GetPinElectricalTypeInfo( int aShadowWidth )
 {
+    std::lock_guard lock( Mutex( m_pin ) );
+
     recomputeCaches();
 
     if( !m_showElectricalType )

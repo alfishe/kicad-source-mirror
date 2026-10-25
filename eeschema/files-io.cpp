@@ -22,6 +22,7 @@
 
 
 #include <algorithm>
+#include <optional>
 
 #include <confirm.h>
 #include <common.h>
@@ -33,6 +34,8 @@
 #include <eeschema_settings.h>
 #include <id.h>
 #include <kiface_base.h>
+#include <kicadopenapi_jobs.h>
+#include <kicadopenapi_keepalive.h>
 #include <kiplatform/app.h>
 #include <kiplatform/ui.h>
 #include <libraries/legacy_cache_reconcile.h>
@@ -176,8 +179,19 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     if( KISTATUSBAR* statusBar = dynamic_cast<KISTATUSBAR*>( GetStatusBar() ) )
         statusBar->ClearWarningMessages( "load" );
 
-    WX_PROGRESS_REPORTER progressReporter( this, is_new ? _( "Create Schematic" ) : _( "Load Schematic" ), 1,
-                                           PR_CAN_ABORT );
+    // an API call: no dialog (it costs the main loop more than the steps it reports); the UI is
+    // kept alive at each step instead
+    std::optional<WX_PROGRESS_REPORTER> progressDialog;
+    KOPENAPI_KEEPALIVE_REPORTER         apiProgress;
+    PROGRESS_REPORTER_BASE&             progressReporter =
+            KopenapiCallActive() ? static_cast<PROGRESS_REPORTER_BASE&>( apiProgress )
+                                 : progressDialog.emplace( this, is_new ? _( "Create Schematic" ) : _( "Load Schematic" ),
+                                                           1, PR_CAN_ABORT );
+    auto hideProgress = [&]()
+    {
+        if( progressDialog )
+            progressDialog->Hide();
+    };
     WX_STRING_REPORTER loadReporter;
     LOAD_INFO_REPORTER_SCOPE loadReporterScope( &loadReporter );
 
@@ -227,7 +241,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     // for these formats.
     if( isNonKicadImport )
     {
-        progressReporter.Hide();
+        hideProgress();
         return importFile( fullFileName, schFileType, nullptr );
     }
 
@@ -285,7 +299,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
                 msg.Printf( _( "'%s' is not a recognised schematic format." ), fullFileName );
             }
 
-            progressReporter.Hide();
+            hideProgress();
             DisplayErrorMessage( this, msg );
         }
     }
@@ -401,7 +415,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         {
             newSchematic->CreateDefaultScreens();
             msg.Printf( _( "Error loading schematic '%s'." ), fullFileName );
-            progressReporter.Hide();
+            hideProgress();
             DisplayErrorMessage( this, msg, ffe.Problem() );
 
             failedLoad = true;
@@ -410,7 +424,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         {
             newSchematic->CreateDefaultScreens();
             msg.Printf( _( "Error loading schematic '%s'." ), fullFileName );
-            progressReporter.Hide();
+            hideProgress();
             DisplayErrorMessage( this, msg, ioe.What() );
 
             failedLoad = true;
@@ -419,7 +433,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         {
             newSchematic->CreateDefaultScreens();
             msg.Printf( _( "Memory exhausted loading schematic '%s'." ), fullFileName );
-            progressReporter.Hide();
+            hideProgress();
             DisplayErrorMessage( this, msg, wxEmptyString );
 
             failedLoad = true;
@@ -431,6 +445,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         // cause any issues on macOS and Windows.  If it does, it will have to be conditionally
         // compiled.
         Raise();
+        KopenapiKeepUiAlive();
 
         if( failedLoad )
         {
@@ -690,6 +705,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         // This allows us to use the drawing sheet embedded in the schematic (if any)
         // instead of the default one.
         LoadDrawingSheet();
+        KopenapiKeepUiAlive();
 
         wxLogTrace( traceSchCurrentSheet, "Before CheckForMissingSymbolInstances: Current sheet path='%s', size=%zu",
                     GetCurrentSheet().Path().AsString(), GetCurrentSheet().size() );
@@ -729,6 +745,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
 
         RecalculateConnections( &dummy, GLOBAL_CLEANUP, &progressReporter );
         dummy.Push( _( "Schematic Cleanup" ), SKIP_UNDO | SKIP_SET_DIRTY | SKIP_CONNECTIVITY | DELETE_REMOVED_ITEMS );
+        KopenapiKeepUiAlive();
 
         // Migrate conflicting bus definitions, but only for files old enough to store them.
         // The connection graph must be rebuilt first so GetBusesNeedingMigration() can see the
@@ -739,7 +756,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         if( DIALOG_MIGRATE_BUSES::ShouldPrompt(
                     schFileVersion, Schematic().ConnectionGraph()->GetBusesNeedingMigration().size() ) )
         {
-            progressReporter.Hide();
+            hideProgress();
 
             // The rebuild below frees the subgraphs the dialog caches, and a progress update can
             // dispatch queued UI events into its still-bound handlers, so destroy the dialog first.
@@ -749,7 +766,8 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
             }
 
             OnModify();
-            progressReporter.Show();
+            if( progressDialog )
+                progressDialog->Show();
 
             // Relabeling the conflicting buses changes connectivity, so rebuild it.
             RecalculateConnections( &dummy, GLOBAL_CLEANUP, &progressReporter );
@@ -778,6 +796,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     GetScreen()->ClearDrawingState();
 
     TestDanglingEnds();
+    KopenapiKeepUiAlive();
 
     UpdateHierarchyNavigator( false, true );
     CallAfter(

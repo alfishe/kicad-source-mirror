@@ -309,7 +309,14 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
     {
         std::lock_guard<std::mutex> lock( g_mutex );
 
-        if( g_yielding || !wxThread::IsMain() )
+        // a compute worker of the job: progress and stop, no yield (the main loop runs meanwhile)
+        if( g_current && KopenapiInComputeWorker() )
+        {
+            record( *g_current, aPhase, aDone, aTotal, aItem, aCounts );
+            return !g_current->cancel;
+        }
+
+        if( g_yielding || !KopenapiOnDispatchThread() )
             return true;
 
         if( !g_current && !g_call )
@@ -389,6 +396,20 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
     std::lock_guard<std::mutex> lock( g_mutex );
     g_yielding = false;
     return !g_current->cancel;
+}
+
+
+bool KopenapiJobRunning()
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    return g_current != nullptr;
+}
+
+
+bool KopenapiCallActive()
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    return g_current != nullptr || g_call != nullptr;
 }
 
 

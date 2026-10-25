@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,10 @@ AllocatorInfo AllocatorStatsWindows();
 int64_t AllocatorTrimWindows();
 void LowerCurrentThreadPriorityWindows();
 void KeepProcessResponsiveWindows();
+
+/// @brief Runs and deletes *body on a new thread; the handle for JoinThreadWindows, nullptr on failure
+void* StartThreadWindows(std::size_t stackBytes, std::function<void()>* body);
+void JoinThreadWindows(void* handle);
 
 } // namespace kopenapi::platform
 

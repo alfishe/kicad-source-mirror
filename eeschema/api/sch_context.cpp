@@ -96,7 +96,17 @@ public:
         if( m_frame->GetCurrentSheet().Last() != &m_frame->Schematic().Root() )
         {
             SCH_SHEET_PATH rootSheetPath = m_frame->Schematic().Hierarchy().at( 0 );
-            m_frame->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &rootSheetPath );
+
+            // on that sheet already: no change of sheet, whose redraw the reload repeats
+            if( m_frame->GetCurrentSheet() != rootSheetPath )
+            {
+                m_frame->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &rootSheetPath );
+            }
+            else
+            {
+                m_frame->GetToolManager()->RunAction( ACTIONS::cancelInteractive );
+                m_frame->GetToolManager()->RunAction( ACTIONS::selectionClear );
+            }
         }
 
         SCH_SCREENS screenList( m_frame->Schematic().Root() );

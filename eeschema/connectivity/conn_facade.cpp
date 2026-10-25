@@ -18,6 +18,7 @@
  */
 
 #include "conn_facade.h"
+#include <model_thread.h>
 #include "conn_netchain_input.h"
 #include "conn_netchain_manager.h"
 #include "conn_text.h"
@@ -366,7 +367,7 @@ struct FACADE_STATE
 
     const PUBLISHED_COMPONENT* Net( NODE_ID aNode, INST_ID aInstance ) const
     {
-        wxASSERT( wxThread::IsMain() );
+        wxASSERT( MODEL_THREAD::IsModelThread() );
         const auto found = netItems.find( aNode );
 
         if( found == netItems.end() || !found->second->instances.contains( aInstance ) || !Screen( aInstance ) )
@@ -486,7 +487,7 @@ struct FACADE_STATE
 
     const ITEM_RESULT* Row( const ITEM_KEY& aItem ) const
     {
-        wxASSERT( wxThread::IsMain() );
+        wxASSERT( MODEL_THREAD::IsModelThread() );
 
         const SCH_SCREEN* screen = Screen( aItem.inst );
 
@@ -539,7 +540,7 @@ SUBSCRIPTION& SUBSCRIPTION::operator=( SUBSCRIPTION&& aOther ) noexcept
 
 void SUBSCRIPTION::Reset()
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     if( auto state = m_state.lock() )
         state->listeners.erase( m_id );
@@ -558,7 +559,7 @@ FACADE::~FACADE()
 
 SUBSCRIPTION FACADE::Subscribe( std::function<void( const CHANGE_SET& )> aListener )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     if( !aListener )
         throw std::invalid_argument( "Connectivity listener is empty" );
@@ -574,7 +575,7 @@ SUBSCRIPTION FACADE::Subscribe( std::function<void( const CHANGE_SET& )> aListen
 void FACADE::Recalculate( SCHEMATIC& aSchematic, bool aRebuild,
                            const std::function<void( SCH_ITEM* )>& aChangedHandler )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     if( !aSchematic.IsValid() )
         throw std::invalid_argument( "Cannot apply connectivity without a schematic project" );
@@ -843,7 +844,7 @@ void FACADE::Recalculate( SCHEMATIC& aSchematic, bool aRebuild,
 
 void FACADE::Update( SCHEMATIC& aSchematic, bool aRebuild )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     try
     {
@@ -880,7 +881,7 @@ bool FACADE::UpdateShadow( SCHEMATIC& aSchematic, const SCH_SHEET_LIST& aPaths, 
 
 void FACADE::ApplyNetclasses( NET_SETTINGS& aSettings ) const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::map<wxString, std::set<wxString>> assignments;
 
     for( const auto& [name, classes] : Published().Netclasses() )
@@ -922,7 +923,7 @@ void FACADE::ApplyNetclasses( NET_SETTINGS& aSettings ) const
 
 void FACADE::updateModel( SCHEMATIC& aSchematic, const SCH_SHEET_LIST& aPaths, bool aRebuild )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     TEXT_ENVIRONMENT environment;
     INPUT_TEXT_SCOPE frame( environment );
@@ -947,7 +948,7 @@ void FACADE::updateModel( SCHEMATIC& aSchematic, const SCH_SHEET_LIST& aPaths, b
 
 void FACADE::Update( const SCH_SHEET_LIST& aPaths, uint64_t aTextEpoch, const BUS_ALIASES& aAliases, bool aRebuild )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     m_state->textContext.reset();
     m_state->publicationApplied = false;
@@ -994,7 +995,7 @@ void FACADE::Clear()
 
 PUBLICATION_HOLD::PUBLICATION_HOLD( const FACADE& aFacade ) : m_state( aFacade.m_state )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     ++aFacade.m_state->publicationHolds;
 }
 
@@ -1010,7 +1011,7 @@ const ENGINE& FACADE::Engine() const { return m_state->engine; }
 
 void FACADE::PrepareTextChecks( SCHEMATIC& aSchematic, bool aIncludeDrawingSheet )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     m_state->textChecks.reset();
     const auto paths = m_state->SourcePaths( aSchematic );
     const auto vcs = sourceProjectContext( aSchematic );
@@ -1061,7 +1062,7 @@ void FACADE::PrepareTextChecks( SCHEMATIC& aSchematic, bool aIncludeDrawingSheet
 
 std::vector<TEXT_CHECK_FACT> FACADE::TextChecks( const KIID_PATH& aPath, bool aDrawingSheet ) const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     if( !m_state->textChecks )
         throw std::logic_error( "Text sources have not been prepared" );
@@ -1076,7 +1077,7 @@ std::vector<TEXT_CHECK_FACT> FACADE::TextChecks( const KIID_PATH& aPath, bool aD
 
 void FACADE::PrepareSimulationModels( SCHEMATIC& aSchematic )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     m_state->simulationModels.reset();
     const auto vcs = sourceProjectContext( aSchematic );
 
@@ -1091,7 +1092,7 @@ void FACADE::PrepareSimulationModels( SCHEMATIC& aSchematic )
 
 std::vector<SIMULATION_MODEL_FACT> FACADE::SimulationModels( const KIID_PATH& aPath ) const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     if( !m_state->simulationModels )
         throw std::logic_error( "Simulation sources have not been prepared" );

@@ -523,12 +523,25 @@ void RN_NET::OptimizeRNEdges()
                                        } );
         }
     }
+
+    sortEdges();
+}
+
+
+void RN_NET::sortEdges()
+{
+    std::stable_sort( m_rnEdges.begin(), m_rnEdges.end(),
+                      []( const CN_EDGE& a, const CN_EDGE& b )
+                      {
+                          return a.StableSortCompare( b );
+                      } );
 }
 
 
 void RN_NET::UpdateNet()
 {
     compute();
+    sortEdges();
 
     m_dirty = false;
 }

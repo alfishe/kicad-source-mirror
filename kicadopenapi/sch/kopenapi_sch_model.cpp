@@ -1,4 +1,5 @@
 #include "kopenapi_sch_model.h"
+#include <model_thread.h>
 
 #include <advanced_config.h>
 #include <connection_graph.h>
@@ -200,8 +201,18 @@ std::vector<std::string> staleConnectivitySheets( SCHEMATIC* aSchematic )
 
 void ensureConnectivity( SCHEMATIC* aSchematic )
 {
-    if( staleConnectivitySheets( aSchematic ).empty() )
+    std::vector<std::string> before = staleConnectivitySheets( aSchematic );
+
+    if( before.empty() )
         return;
+
+    // A leased reader never rebuilds: the document's owner keeps connectivity current after
+    // every edit, so a stale sheet here means the owner has not got to it yet
+    if( !MODEL_THREAD::MayWrite() )
+    {
+        throw KOPENAPI_RETRY_LATER( "connectivity is being rebuilt; retry", CONNECTIVITY_RETRY_AFTER_S,
+                                    { { "stale_sheets", before } } );
+    }
 
     std::string cause;
 

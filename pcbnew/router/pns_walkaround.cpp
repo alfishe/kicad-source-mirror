@@ -158,7 +158,7 @@ bool WALKAROUND::singleStep()
         using namespace std::chrono;
         auto start_time = steady_clock::now();
 
-        int timeout_ms = ADVANCED_CFG::GetCfg().m_PNSProcessClusterTimeout;
+        int timeout_ms = Settings().ClusterTimeout();
 
         PNS_DBG( Dbg(), BeginGroup, wxString::Format( "cluster-details [cw %d]", aCw?1:0 ), 1 );
 

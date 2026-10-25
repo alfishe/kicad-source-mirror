@@ -137,6 +137,10 @@ protected:
     bool syncDimension( PNS::NODE* aWorld, PCB_DIMENSION_BASE* aDimension );
     bool syncGraphicalItem( PNS::NODE* aWorld, PCB_SHAPE* aItem );
     bool syncZone( PNS::NODE* aWorld, ZONE* aZone, SHAPE_POLY_SET* aBoardOutline );
+
+    /// @brief A rule area the router cannot triangulate: logged here, asked about in the editor
+    virtual void reportMalformedZone( ZONE* aZone );
+
     bool syncBarcode( PNS::NODE* aWorld, PCB_BARCODE* aBarcode );
     bool inheritTrackWidthAndDpGap( PNS::ITEM* aItem, const VECTOR2I& aStartPosition, int* aInheritedWidth, int *aInheritedGap );
     std::vector<LENGTH_DELAY_CALCULATION_ITEM> getLengthDelayCalculationItems( const PNS::ITEM_SET& aLine,
@@ -181,6 +185,8 @@ public:
     void SetCommitFlags( int aCommitFlags ) { m_commitFlags = aCommitFlags; }
 
 protected:
+    void reportMalformedZone( ZONE* aZone ) override;
+
     BOARD_CONNECTED_ITEM* createBoardItem( PNS::ITEM* aItem );
     void                  modifyBoardItem( PNS::ITEM* aItem );
 

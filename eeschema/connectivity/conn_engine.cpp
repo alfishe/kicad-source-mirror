@@ -18,6 +18,7 @@
  */
 
 #include "conn_engine.h"
+#include <model_thread.h>
 #include "conn_tasks.h"
 #include <wx/thread.h>
 #include <algorithm>
@@ -36,7 +37,7 @@ ENGINE::ENGINE() :
 
 void ENGINE::Update( const SCH_SHEET_LIST& aPaths, uint64_t aTextEpoch, const BUS_ALIASES& aAliases, bool aRebuild )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     try
     {
@@ -83,7 +84,7 @@ void ENGINE::Update( const SCH_SHEET_LIST& aPaths, uint64_t aTextEpoch, const BU
 
 std::vector<CLAIM> ENGINE::DriverCandidates( NODE_ID aComponent ) const
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     const auto component = m_published.Components().find( aComponent );
 
     if( component == m_published.Components().end() )
@@ -116,7 +117,7 @@ std::vector<CLAIM> ENGINE::DriverCandidates( NODE_ID aComponent ) const
 
 void ENGINE::Clear()
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     clearStages();
     m_published.Clear();
 }

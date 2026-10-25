@@ -12,9 +12,11 @@
 #include <windows.h>
 #include <malloc.h>
 #include <psapi.h>
+#include <process.h>
 
 #include <algorithm>
 #include <iterator>
+#include <memory>
 
 namespace kopenapi::platform
 {
@@ -421,6 +423,29 @@ void LowerCurrentThreadPriorityWindows()
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 }
+
+static unsigned __stdcall runThreadBody(void* arg)
+{
+    std::unique_ptr<std::function<void()>> body(static_cast<std::function<void()>*>(arg));
+    (*body)();
+    return 0;
+}
+
+
+void* StartThreadWindows(std::size_t stackBytes, std::function<void()>* body)
+{
+    const uintptr_t handle = _beginthreadex(nullptr, static_cast<unsigned>(stackBytes), runThreadBody, body,
+                                            STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    return handle ? reinterpret_cast<void*>(handle) : nullptr;
+}
+
+
+void JoinThreadWindows(void* handle)
+{
+    WaitForSingleObject(static_cast<HANDLE>(handle), INFINITE);
+    CloseHandle(static_cast<HANDLE>(handle));
+}
+
 
 void KeepProcessResponsiveWindows()
 {

@@ -25,6 +25,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <vector>
 
@@ -393,6 +394,10 @@ private:
 
     /// @brief Cache of nets to pattern-matched netclasses
     std::map<wxString, std::shared_ptr<NETCLASS>> m_effectiveNetclassCache;
+
+    /// @brief Guards the resolution caches: the board and the schematic of a project resolve net
+    /// classes from their own threads
+    mutable std::recursive_mutex m_cacheMutex;
 
     /// @brief Members consulted when a cached bus inherits its effective class.
     std::map<wxString, std::set<wxString>> m_netclassBusMembers;

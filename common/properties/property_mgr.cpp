@@ -48,8 +48,7 @@ void PROPERTY_MANAGER::RegisterType( TYPE_ID aType, const wxString& aName )
 
 PROPERTY_BASE* PROPERTY_MANAGER::GetProperty( TYPE_ID aType, const wxString& aProperty ) const
 {
-    if( m_dirty )
-        const_cast<PROPERTY_MANAGER*>( this )->Rebuild();
+    ensureBuilt();
 
     auto it = m_classes.find( aType );
 
@@ -85,8 +84,7 @@ PROPERTY_BASE* PROPERTY_MANAGER::GetProperty( const INSPECTABLE* aObject, const 
 
 const std::vector<PROPERTY_BASE*>& PROPERTY_MANAGER::GetProperties( TYPE_ID aType ) const
 {
-    if( m_dirty )
-        const_cast<PROPERTY_MANAGER*>( this )->Rebuild();
+    ensureBuilt();
 
     auto it = m_classes.find( aType );
 
@@ -110,8 +108,7 @@ std::vector<PROPERTY_BASE*> PROPERTY_MANAGER::GetProperties( const INSPECTABLE* 
 
 const std::map<PROPERTY_BASE*, int>& PROPERTY_MANAGER::GetDisplayOrder( TYPE_ID aType ) const
 {
-    if( m_dirty )
-        const_cast<PROPERTY_MANAGER*>( this )->Rebuild();
+    ensureBuilt();
 
     auto it = m_classes.find( aType );
 
@@ -124,8 +121,7 @@ const std::map<PROPERTY_BASE*, int>& PROPERTY_MANAGER::GetDisplayOrder( TYPE_ID 
 
 const std::vector<wxString>& PROPERTY_MANAGER::GetGroupDisplayOrder( TYPE_ID aType ) const
 {
-    if( m_dirty )
-        const_cast<PROPERTY_MANAGER*>( this )->Rebuild();
+    ensureBuilt();
 
     auto it = m_classes.find( aType );
 
@@ -303,10 +299,31 @@ bool PROPERTY_MANAGER::IsOfType( TYPE_ID aDerived, TYPE_ID aBase ) const
 
 void PROPERTY_MANAGER::Rebuild()
 {
+    std::lock_guard<std::mutex> lock( m_rebuildMutex );
+
     for( std::pair<const TYPE_ID, CLASS_DESC>& classEntry : m_classes )
         classEntry.second.rebuild();
 
-    m_dirty = false;
+    m_dirty.store( false, std::memory_order_release );
+}
+
+
+void PROPERTY_MANAGER::ensureBuilt() const
+{
+    if( !m_dirty.load( std::memory_order_acquire ) )
+        return;
+
+    std::lock_guard<std::mutex> lock( m_rebuildMutex );
+
+    if( !m_dirty.load( std::memory_order_relaxed ) )
+        return;
+
+    PROPERTY_MANAGER* self = const_cast<PROPERTY_MANAGER*>( this );
+
+    for( std::pair<const TYPE_ID, CLASS_DESC>& classEntry : self->m_classes )
+        classEntry.second.rebuild();
+
+    m_dirty.store( false, std::memory_order_release );
 }
 
 

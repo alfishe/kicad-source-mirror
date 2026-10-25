@@ -367,18 +367,24 @@ nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::v
     filler.SetProgressReporter( &reporter );
     const bool   ok = filler.Fill( aZones );
 
+    KopenapiKeepUiAlive();
+
     if( ok )
         commit.Push( _( "Fill zones (API)" ) );
     else
         commit.Revert();
 
+    KopenapiKeepUiAlive();
+    KopenapiReadPoint();
     board->BuildConnectivity();
+    KopenapiKeepUiAlive();
     board->GetConnectivity()->RecalculateRatsnest();
 
     nlohmann::json zones = nlohmann::json::array();
 
     for( ZONE* zone : aZones )
     {
+        KopenapiKeepUiAlive();
         nlohmann::json z = zoneJson( board, zone );
 
         // a polygon cut short would mislead: one over the limit is left out, its point count kept
@@ -397,6 +403,8 @@ nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::v
 
     if( !aCtx.headless && aCtx.kiway )
     {
+        KopenapiKeepUiAlive();
+
         if( auto* frame = ZONE_GLOW_TRAITS::Frame( aCtx.kiway ) )
             frame->GetCanvas()->Refresh();
 
@@ -407,6 +415,8 @@ nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::v
 
         KopenapiGlow<ZONE_GLOW_TRAITS>( aCtx.kiway, ids, ids.size() > 1 ? 300 : 0 );
     }
+
+    KopenapiKeepUiAlive();
 
     nlohmann::json out = { { "filled", ok } };
 
@@ -1450,3 +1460,4 @@ KOPENAPI_REGISTER( "pcb_keepout_list",
                    false, h_pcb_keepout_list );
 
 KOPENAPI_MARK_EDITING( "pcb_zone_add", "pcb_zones_fill", "pcb_zone_update", "pcb_zone_delete", "pcb_keepout_add" );
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_keepout_list", "pcb_zone_list" );

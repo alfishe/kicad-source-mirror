@@ -1770,7 +1770,7 @@ bool ZONE_FILLER::Fill( const std::vector<ZONE*>& aZones, bool aCheck, wxWindow*
                         cancelled = true;
                 }
 
-                status = ret.wait_for( std::chrono::milliseconds( 100 ) );
+                status = ret.wait_for( std::chrono::milliseconds( 20 ) );
             }
         }
     }

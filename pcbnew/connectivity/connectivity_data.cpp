@@ -28,6 +28,7 @@
 #include <initializer_list>
 
 #include <connectivity/connectivity_data.h>
+#include <model_thread.h>
 #include <connectivity/connectivity_algo.h>
 #include <properties/property.h>
 #include <connectivity/from_to_cache.h>
@@ -77,6 +78,9 @@ CONNECTIVITY_DATA::~CONNECTIVITY_DATA()
 
 bool CONNECTIVITY_DATA::Add( BOARD_ITEM* aItem )
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     m_connAlgo->Add( aItem );
     return true;
 }
@@ -84,6 +88,9 @@ bool CONNECTIVITY_DATA::Add( BOARD_ITEM* aItem )
 
 bool CONNECTIVITY_DATA::Remove( BOARD_ITEM* aItem )
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     m_connAlgo->Remove( aItem );
     return true;
 }
@@ -91,6 +98,9 @@ bool CONNECTIVITY_DATA::Remove( BOARD_ITEM* aItem )
 
 bool CONNECTIVITY_DATA::Update( BOARD_ITEM* aItem )
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     m_connAlgo->Remove( aItem );
     m_connAlgo->Add( aItem );
     return true;
@@ -99,6 +109,9 @@ bool CONNECTIVITY_DATA::Update( BOARD_ITEM* aItem )
 
 bool CONNECTIVITY_DATA::Build( BOARD* aBoard, PROGRESS_REPORTER* aReporter )
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     aBoard->CacheTriangulation( aReporter );
 
     std::unique_lock<KISPINLOCK> lock( m_lock, std::try_to_lock );
@@ -144,6 +157,9 @@ bool CONNECTIVITY_DATA::Build( BOARD* aBoard, PROGRESS_REPORTER* aReporter )
 
 void CONNECTIVITY_DATA::RefreshNetcodeMap( BOARD* aBoard )
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     m_netcodeMap.clear();
 
     for( NETINFO_ITEM* net : aBoard->GetNetInfo() )
@@ -223,6 +239,9 @@ void CONNECTIVITY_DATA::addRatsnestCluster( const std::shared_ptr<CN_CLUSTER>& a
 
 void CONNECTIVITY_DATA::RecalculateRatsnest( BOARD_COMMIT* aCommit  )
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
 
     // We can take over the lock here if called in the same thread
     // This is to prevent redraw during a RecalculateRatsnets process
@@ -284,6 +303,9 @@ void CONNECTIVITY_DATA::internalRecalculateRatsnest( BOARD_COMMIT* aCommit  )
 
 void CONNECTIVITY_DATA::BlockRatsnestItems( const std::vector<BOARD_ITEM*>& aItems )
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     std::vector<BOARD_CONNECTED_ITEM*> citems;
 
     for( BOARD_ITEM* item : aItems )
@@ -417,6 +439,9 @@ void CONNECTIVITY_DATA::HideLocalRatsnest()
 
 void CONNECTIVITY_DATA::PropagateNets( BOARD_COMMIT* aCommit )
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     m_connAlgo->PropagateNets( aCommit );
 }
 
@@ -574,6 +599,9 @@ unsigned int CONNECTIVITY_DATA::GetUnconnectedCount( bool aVisibleOnly ) const
 
 void CONNECTIVITY_DATA::ClearRatsnest()
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     for( RN_NET* net : m_nets )
         net->Clear();
 }
@@ -990,6 +1018,9 @@ RN_NET* CONNECTIVITY_DATA::GetRatsnestForNet( int aNet )
 
 void CONNECTIVITY_DATA::MarkItemNetAsDirty( BOARD_ITEM *aItem )
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     if ( aItem->Type() == PCB_FOOTPRINT_T)
     {
         for( PAD* pad : static_cast<FOOTPRINT*>( aItem )->Pads() )
@@ -1003,6 +1034,9 @@ void CONNECTIVITY_DATA::MarkItemNetAsDirty( BOARD_ITEM *aItem )
 
 void CONNECTIVITY_DATA::RemoveInvalidRefs()
 {
+    if( m_shared )
+        MODEL_THREAD::CheckWrite( "board connectivity" );
+
     m_connAlgo->RemoveInvalidRefs();
 
     for( RN_NET* rnNet : m_nets )

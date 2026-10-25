@@ -101,6 +101,16 @@ DRC_ENGINE::DRC_ENGINE( BOARD* aBoard, BOARD_DESIGN_SETTINGS *aSettings ) :
 }
 
 
+void DRC_ENGINE::setTestProviders( std::vector<std::unique_ptr<DRC_TEST_PROVIDER>> aProviders )
+{
+    m_ownedProviders = std::move( aProviders );
+    m_testProviders.clear();
+
+    for( const std::unique_ptr<DRC_TEST_PROVIDER>& provider : m_ownedProviders )
+        m_testProviders.push_back( provider.get() );
+}
+
+
 DRC_ENGINE::~DRC_ENGINE()
 {
     m_rules.clear();
@@ -787,7 +797,7 @@ void DRC_ENGINE::compileRules()
 
 void DRC_ENGINE::InitEngine( const std::shared_ptr<DRC_RULE>& rule )
 {
-    m_testProviders = DRC_SHOWMATCHES_PROVIDER_REGISTRY::Instance().GetShowMatchesProviders();
+    setTestProviders( DRC_SHOWMATCHES_PROVIDER_REGISTRY::Instance().CreateShowMatchesProviders() );
 
     for( DRC_TEST_PROVIDER* provider : m_testProviders )
     {
@@ -848,7 +858,7 @@ void DRC_ENGINE::InitEngine( const std::shared_ptr<DRC_RULE>& rule )
 
 void DRC_ENGINE::InitEngine( const wxFileName& aRulePath )
 {
-    m_testProviders = DRC_TEST_PROVIDER_REGISTRY::Instance().GetTestProviders();
+    setTestProviders( DRC_TEST_PROVIDER_REGISTRY::Instance().CreateTestProviders() );
 
     for( DRC_TEST_PROVIDER* provider : m_testProviders )
     {
@@ -929,6 +939,16 @@ void DRC_ENGINE::RunTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aT
 {
     PROF_TIMER timer;
 
+    if( PrepareTests( aUnits, aReportAllTrackErrors, aTestFootprints ) )
+        RunProviders( aUnits );
+
+    timer.Stop();
+    wxLogTrace( traceDrcProfile, "DRC took %0.3f ms", timer.msecs() );
+}
+
+
+bool DRC_ENGINE::PrepareTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aTestFootprints )
+{
     SetUserUnits( aUnits );
 
     m_reportAllTrackErrors = aReportAllTrackErrors;
@@ -952,11 +972,17 @@ void DRC_ENGINE::RunTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aT
     cacheGenerator.SetDRCEngine( this );
 
     if( !cacheGenerator.Run() )         // ... and regenerate them.
-        return;
+        return false;
 
     // Recompute component classes
     m_board->GetComponentClassManager().ForceComponentClassRecalculation();
 
+    return true;
+}
+
+
+void DRC_ENGINE::RunProviders( EDA_UNITS aUnits )
+{
     int timestamp = m_board->GetTimeStamp();
 
     for( DRC_TEST_PROVIDER* provider : m_testProviders )
@@ -972,9 +998,6 @@ void DRC_ENGINE::RunTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aT
         providerTimer.Stop();
         wxLogTrace( traceDrcProfile, "DRC provider '%s' took %0.3f ms", provider->GetName(), providerTimer.msecs() );
     }
-
-    timer.Stop();
-    wxLogTrace( traceDrcProfile, "DRC took %0.3f ms", timer.msecs() );
 
     // DRC tests are multi-threaded; anything that causes us to attempt to re-generate the
     // caches while DRC is running is problematic.

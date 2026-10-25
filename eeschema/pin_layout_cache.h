@@ -21,6 +21,7 @@
 #pragma once
 
 #include <font/text_attributes.h>
+#include <mutex>
 #include <optional>
 
 #include <geometry/circle.h>
@@ -49,6 +50,9 @@ class PIN_LAYOUT_CACHE
 {
 public:
     PIN_LAYOUT_CACHE( const SCH_PIN& aPin );
+
+    /// @brief Guards a pin's cache: leased readers measure pins together
+    static std::recursive_mutex& Mutex( const SCH_PIN& aPin );
 
     enum DIRTY_FLAGS
     {

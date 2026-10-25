@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -131,6 +132,27 @@ int64_t AllocatorTrim();
 /// @brief Runs the calling thread at background priority (macOS QoS utility, Linux nice 10,
 /// Windows below normal)
 void LowerCurrentThreadPriority();
+
+/// @brief A thread with a stack of the given size: std::thread takes the platform default (512 KB on
+/// macOS), too small for KiCad code written for the main thread's 8 MB.  Joined on destruction
+class THREAD
+{
+public:
+    THREAD() = default;
+    THREAD(std::size_t stackBytes, std::function<void()> body);
+    ~THREAD();
+
+    THREAD(const THREAD&) = delete;
+    THREAD& operator=(const THREAD&) = delete;
+
+    /// @brief false when the thread could not be started (body not run)
+    bool Started() const { return m_handle != nullptr; }
+
+    void Join();
+
+private:
+    void* m_handle = nullptr;
+};
 
 /// @brief Keeps the OS from throttling this process while its windows are hidden or in the
 /// background (macOS App Nap, Windows power throttling): an agent drives a KiCad that is rarely

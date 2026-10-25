@@ -67,6 +67,8 @@ set( QA_COMMON_SRCS
     test_item_realignment.cpp
     test_json_schema_validator.cpp
     test_kicadopenapi.cpp
+    test_kicadopenapi_owner.cpp
+    test_model_thread.cpp
     test_kiplatform_timestamp.cpp
     test_ki_any.cpp
     test_library_tables.cpp

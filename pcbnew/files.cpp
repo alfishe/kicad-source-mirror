@@ -20,7 +20,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <pcb/kopenapi_board_load.h>
 #include <pcb/kopenapi_model_warmup.h>
+#include <kicadopenapi_jobs.h>
+#include <kicadopenapi_keepalive.h>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -486,7 +490,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     wxFileName wx_filename( fullFileName );
     wxString   msg;
 
-    KopenapiStopWarmModels();   // the earlier board's models: their project may go
+    KopenapiStopWarmModels( true );   // the earlier board's models: their project may go
 
     if( Kiface().IsSingle() )
         KIPLATFORM::APP::RegisterApplicationRestart( fullFileName );
@@ -555,8 +559,19 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     if( KISTATUSBAR* statusBar = dynamic_cast<KISTATUSBAR*>( GetStatusBar() ) )
         statusBar->ClearWarningMessages( "load" );
 
-    WX_PROGRESS_REPORTER progressReporter( this, is_new ? _( "Create PCB" ) : _( "Load PCB" ), 1,
-                                           PR_CAN_ABORT );
+    // an API call: no dialog (it costs the main loop more than the steps it reports); the UI is
+    // kept alive at each step instead
+    std::optional<WX_PROGRESS_REPORTER> progressDialog;
+    KOPENAPI_KEEPALIVE_REPORTER         apiProgress;
+    PROGRESS_REPORTER_BASE&             progressReporter =
+            KopenapiCallActive() ? static_cast<PROGRESS_REPORTER_BASE&>( apiProgress )
+                                 : progressDialog.emplace( this, is_new ? _( "Create PCB" ) : _( "Load PCB" ), 1,
+                                                           PR_CAN_ABORT );
+    auto hideProgress = [&]()
+    {
+        if( progressDialog )
+            progressDialog->Hide();
+    };
     WX_STRING_REPORTER loadReporter;
     LOAD_INFO_REPORTER_SCOPE loadReporterScope( &loadReporter );
 
@@ -570,7 +585,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
 
     if( pluginType == PCB_IO_MGR::FILE_TYPE_NONE )
     {
-        progressReporter.Hide();
+        hideProgress();
         DisplayErrorMessage( this, _( "File format is not supported" ), wxEmptyString );
         return false;
     }
@@ -724,7 +739,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
                     };
 
             std::unique_ptr<BOARD> loaded =
-                    BOARD_LOADER::Load( fullFileName, pluginType, &Prj(), loaderOptions );
+                    KopenapiLoadBoard( fullFileName, pluginType, &Prj(), loaderOptions );
 
             if( loaded && props.count( IMPORT_PROJ_PROPS::NET_NAME_MAP ) )
             {
@@ -749,7 +764,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         catch( const FUTURE_FORMAT_ERROR& ffe )
         {
             msg.Printf( _( "Error loading PCB '%s'." ), fullFileName );
-            progressReporter.Hide();
+            hideProgress();
             DisplayErrorMessage( this, msg, ffe.Problem() );
 
             failedLoad = true;
@@ -762,7 +777,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         catch( const IO_ERROR& ioe )
         {
             msg.Printf( _( "Error loading PCB '%s'." ), fullFileName );
-            progressReporter.Hide();
+            hideProgress();
             DisplayErrorMessage( this, msg, ioe.What() );
 
             failedLoad = true;
@@ -770,7 +785,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         catch( const std::bad_alloc& )
         {
             msg.Printf( _( "Memory exhausted loading PCB '%s'" ), fullFileName );
-            progressReporter.Hide();
+            hideProgress();
             DisplayErrorMessage( this, msg, wxEmptyString );
 
             failedLoad = true;
@@ -808,6 +823,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         SetBoard( loadedBoard, false, &progressReporter );
         wxLogTrace( traceAllegroPerf, wxT( "Post-load SetBoard: %.3f ms" ),
                     postLoadTimer.msecs( true ) );
+        KopenapiKeepUiAlive();
 
         if( loadedBoard->m_LegacyDesignSettingsLoaded )
         {
@@ -929,6 +945,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     GetBoard()->BuildConnectivity( &progressReporter );
     wxLogTrace( traceAllegroPerf, wxT( "Post-load BuildConnectivity: %.3f ms" ),
                 connectivityTimer.msecs( true ) );
+    KopenapiKeepUiAlive();
 
     // Load project settings after setting up board; some of them depend on the nets list
     LoadProjectSettings();
@@ -951,6 +968,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     OnBoardLoaded();
     wxLogTrace( traceAllegroPerf, wxT( "Post-load OnBoardLoaded: %.3f ms" ),
                 connectivityTimer.msecs( true ) );
+    KopenapiKeepUiAlive();
     wxLogTrace( traceAllegroPerf, wxT( "=== Post-load pipeline total: %.3f ms ===" ),
                 connectivityTimer.msecs() );
 

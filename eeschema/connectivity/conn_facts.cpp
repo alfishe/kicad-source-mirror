@@ -18,6 +18,7 @@
  */
 
 #include "conn_facts.h"
+#include <model_thread.h>
 #include "conn_pin_name.h"
 #include "conn_text.h"
 
@@ -139,7 +140,7 @@ bool LIBRARY_FIELD_FACT::Matches( const LIBRARY_FIELD_FACT& aOther, int aCompare
 std::vector<SIMULATION_MODEL_FACT> ExtractSimulationModelFacts( const SCH_SHEET_PATH& aPath,
                                                                const wxString& aVariantName )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     if( INPUT_TEXT_SCOPE::Active() )
         throw std::logic_error( "Simulation sources require published connectivity text" );
@@ -168,7 +169,7 @@ std::vector<SIMULATION_MODEL_FACT> ExtractSimulationModelFacts( const SCH_SHEET_
 std::optional<VARIANT_SYMBOL_FACT> ExtractVariantSymbolFact( const SCH_SYMBOL& aSymbol,
                                                            const SCH_SHEET_PATH& aPath )
 {
-    wxASSERT( wxIsMainThread() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     SCH_SYMBOL_INSTANCE instance;
 
     if( !aSymbol.GetInstance( instance, aPath.Path() ) )
@@ -191,7 +192,7 @@ std::optional<VARIANT_SYMBOL_FACT> ExtractVariantSymbolFact( const SCH_SYMBOL& a
 
 LIBRARY_SYMBOL_FACT ExtractLibrarySymbolFact( const LIB_SYMBOL& aSymbol )
 {
-    wxASSERT( wxIsMainThread() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     LIBRARY_SYMBOL_FACT result;
     result.hasEmbeddedSymbol = true;
     result.unitCount = aSymbol.GetUnitCount();
@@ -459,7 +460,7 @@ bool SCREEN_FACTS::operator==( const SCREEN_FACTS& aOther ) const
 SCREEN_FACTS ExtractScreenFacts( const SCH_SCREEN& aScreen, std::shared_ptr<const LIBRARY_SYMBOL_FACTS> aLibrarySymbols,
                                  const SCREEN_FACTS* aUnchangedNonLines )
 {
-    wxASSERT( wxIsMainThread() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     const EE_RTREE&                   items = aScreen.Items();
     SCREEN_FACTS                      result;
     std::vector<const SCH_RULE_AREA*> areas;
@@ -804,7 +805,7 @@ SCREEN_FACTS ExtractScreenFacts( const SCH_SCREEN& aScreen, std::shared_ptr<cons
 
 std::vector<TEXT_ASSERTION> ExtractTextAssertions( const wxString& aText )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<TEXT_ASSERTION> result;
 
     if( !aText.Contains( wxS( "${" ) ) )
@@ -836,7 +837,7 @@ std::vector<TEXT_ASSERTION> ExtractTextAssertions( const wxString& aText )
 
 std::vector<TEXT_CHECK_FACT> ExtractDrawingSheetTextChecks( const SCH_SCREEN& aScreen, const SCH_SHEET_PATH& aPath )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<TEXT_CHECK_FACT> result;
 
     if( const SCHEMATIC* schematic = aScreen.Schematic(); schematic && schematic->IsValid() )
@@ -877,7 +878,7 @@ std::vector<TEXT_CHECK_FACT> ExtractDrawingSheetTextChecks( const SCH_SCREEN& aS
 
 std::vector<TEXT_CHECK_FACT> ExtractTextChecks( const SCH_SCREEN& aScreen, const SCH_SHEET_PATH& aPath )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<TEXT_CHECK_FACT> result;
     auto append = [&]( const KIID& assertionItem, const KIID& item, const VECTOR2I& assertionPosition,
                        const wxString& raw, bool expandEnvironment, auto&& resolve )
@@ -1053,7 +1054,7 @@ std::vector<UNIT_FACT> ExtractUnitFacts( const LIB_SYMBOL& aSymbol )
 INSTANCE_FACTS ExtractInstanceFacts( const SCREEN_FACTS& aFacts, const SCH_SCREEN& aScreen,
                                      const SCH_SHEET_PATH& aPath )
 {
-    wxASSERT( wxIsMainThread() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
 
     if( aPath.LastScreen() != &aScreen )
         throw std::invalid_argument( "Connectivity instance does not reference its screen" );

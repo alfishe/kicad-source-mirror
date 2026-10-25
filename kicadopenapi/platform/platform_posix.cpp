@@ -12,9 +12,11 @@
 #include <spawn.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -282,6 +284,44 @@ int WaitProcessPosix(long pid, int timeoutMs)
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+}
+
+static void* runThreadBody(void* arg)
+{
+    std::unique_ptr<std::function<void()>> body(static_cast<std::function<void()>*>(arg));
+    (*body)();
+    return nullptr;
+}
+
+
+void* StartThreadPosix(std::size_t stackBytes, std::function<void()>* body)
+{
+    pthread_attr_t attr;
+
+    if (pthread_attr_init(&attr) != 0)
+        return nullptr;
+
+    pthread_attr_setstacksize(&attr, stackBytes);
+
+    auto* thread = new pthread_t;
+    const int rc = pthread_create(thread, &attr, runThreadBody, body);
+    pthread_attr_destroy(&attr);
+
+    if (rc != 0)
+    {
+        delete thread;
+        return nullptr;
+    }
+
+    return thread;
+}
+
+
+void JoinThreadPosix(void* handle)
+{
+    auto* thread = static_cast<pthread_t*>(handle);
+    pthread_join(*thread, nullptr);
+    delete thread;
 }
 
 } // namespace kopenapi::platform

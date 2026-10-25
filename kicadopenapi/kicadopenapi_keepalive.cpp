@@ -2,6 +2,9 @@
 /// @brief UI keep-alive during API calls (see kicadopenapi_keepalive.h).
 #include <kicadopenapi_keepalive.h>
 #include <kicadopenapi_jobs.h>
+#include <kicadopenapi_journal.h>
+#include <model_thread.h>
+#include <platform.h>
 
 #include <libraries/library_manager.h>
 
@@ -17,7 +20,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <exception>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -26,6 +33,10 @@ namespace
 {
 std::chrono::steady_clock::time_point g_lastPump;
 bool                                  g_pumping = false;
+thread_local bool                     tlComputeWorker = false;
+
+/// KiCad code is written for the main thread's stack (8 MB); the router recurses deeply
+constexpr size_t COMPUTE_STACK_BYTES = 16 * 1024 * 1024;
 } // namespace
 
 
@@ -41,13 +52,15 @@ void KopenapiKeepUiAlive()
 
     const auto now = std::chrono::steady_clock::now();
 
-    if( now - g_lastPump < std::chrono::milliseconds( 30 ) )
+    if( now - g_lastPump < std::chrono::milliseconds( 15 ) )
         return;
 
     g_pumping = true;
 
-    // paint, size, timers: yes; mouse / keyboard and the API's own calls (thread events): no
-    loop->YieldFor( wxEVT_CATEGORY_UI | wxEVT_CATEGORY_TIMER );
+    // paint, size, timers: yes; the API's own calls (thread events): no; mouse / keyboard only
+    // during a job (its input filter lets navigation through)
+    loop->YieldFor( wxEVT_CATEGORY_UI | wxEVT_CATEGORY_TIMER
+                    | ( KopenapiJobRunning() ? wxEVT_CATEGORY_USER_INPUT : 0 ) );
 
     g_pumping = false;
     g_lastPump = std::chrono::steady_clock::now();
@@ -56,7 +69,7 @@ void KopenapiKeepUiAlive()
 
 void KopenapiYieldAll()
 {
-    if( !wxTheApp || !wxThread::IsMain() || g_pumping )
+    if( !wxTheApp || !KopenapiOnDispatchThread() || g_pumping )
         return;
 
     wxEventLoopBase* loop = wxEventLoopBase::GetActive();
@@ -87,6 +100,103 @@ void KopenapiRunOffMain( const std::function<void()>& aWork )
         KopenapiKeepUiAlive();
 
     done.get();   // rethrows
+}
+
+
+void KopenapiReadPoint()
+{
+    // ending the write admits the readers waiting through it; taking it again waits for them
+    MODEL_THREAD::READ_WINDOW window;
+}
+
+
+bool KopenapiInComputeWorker()
+{
+    return tlComputeWorker;
+}
+
+
+void KopenapiCompute( const std::function<void()>& aWork )
+{
+    MODEL_THREAD::READ_WINDOW window;
+
+    wxEventLoopBase* loop = wxTheApp && wxThread::IsMain() ? wxEventLoopBase::GetActive() : nullptr;
+
+    // KICAD_OPENAPI_MAIN_DISPATCH: the model before the rework, everything on the main thread (A/B)
+    static const bool onMain = std::getenv( "KICAD_OPENAPI_MAIN_DISPATCH" ) != nullptr;
+
+    if( !loop || !loop->IsRunning() || g_pumping || onMain )
+    {
+        aWork();
+        return;
+    }
+
+    std::mutex              mutex;
+    std::condition_variable finished;
+    bool                    done = false;
+    std::exception_ptr      error;
+    const std::string       operation = KOPENAPI_JOURNAL::Operation();
+
+    kopenapi::platform::THREAD worker( COMPUTE_STACK_BYTES,
+                                       [&]()
+                                       {
+                                           wxLog::SetThreadActiveTarget( KOPENAPI_JOURNAL::ThreadTarget() );
+                                           tlComputeWorker = true;
+
+                                           {
+                                               KOPENAPI_JOURNAL::SCOPED_OPERATION scope( operation );
+                                               MODEL_THREAD::SCOPE reader( MODEL_THREAD::KIND::READER );
+
+                                               try
+                                               {
+                                                   aWork();
+                                               }
+                                               catch( ... )
+                                               {
+                                                   error = std::current_exception();
+                                               }
+                                           }
+
+                                           tlComputeWorker = false;
+                                           wxLog::SetThreadActiveTarget( nullptr );
+
+                                           {
+                                               std::lock_guard<std::mutex> lock( mutex );
+                                               done = true;
+                                           }
+
+                                           finished.notify_all();
+                                       } );
+
+    if( !worker.Started() )
+    {
+        aWork();
+        return;
+    }
+
+    // paint, size, timers; during a job also the navigation its input filter lets through
+    const long categories = wxEVT_CATEGORY_UI | wxEVT_CATEGORY_TIMER
+                            | ( KopenapiJobRunning() ? wxEVT_CATEGORY_USER_INPUT : 0 );
+
+    g_pumping = true;
+
+    for( ;; )
+    {
+        loop->YieldFor( categories );
+
+        std::unique_lock<std::mutex> lock( mutex );
+
+        if( finished.wait_for( lock, std::chrono::milliseconds( 8 ), [&]() { return done; } ) )
+            break;
+    }
+
+    g_pumping = false;
+    g_lastPump = std::chrono::steady_clock::now();
+
+    worker.Join();
+
+    if( error )
+        std::rethrow_exception( error );
 }
 
 

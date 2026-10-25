@@ -700,6 +700,8 @@ const std::map<wxString, std::shared_ptr<NETCLASS>>& NET_SETTINGS::GetCompositeN
 
 void NET_SETTINGS::ClearNetclasses()
 {
+    std::lock_guard lock( m_cacheMutex );
+
     m_netClasses.clear();
     m_impicitNetClasses.clear();
     ClearAllCaches();
@@ -839,6 +841,8 @@ void NET_SETTINGS::ClearChainPatternAssignments( NET_CHAIN_SOURCE aSource )
 
 void NET_SETTINGS::ClearCacheForNet( const wxString& netName )
 {
+    std::lock_guard lock( m_cacheMutex );
+
     std::set<wxString> pending{ netName };
 
     while( !pending.empty() )
@@ -866,6 +870,8 @@ void NET_SETTINGS::ClearCacheForNet( const wxString& netName )
 
 void NET_SETTINGS::ClearAllCaches()
 {
+    std::lock_guard lock( m_cacheMutex );
+
     m_effectiveNetclassCache.clear();
     m_compositeNetClasses.clear();
     m_netclassBusMembers.clear();
@@ -984,18 +990,24 @@ bool NET_SETTINGS::RenameNets( const std::map<wxString, wxString>& aNewNames )
 
 bool NET_SETTINGS::HasEffectiveNetClass( const wxString& aNetName ) const
 {
+    std::lock_guard lock( m_cacheMutex );
+
     return m_effectiveNetclassCache.count( aNetName ) > 0;
 }
 
 
 std::shared_ptr<NETCLASS> NET_SETTINGS::GetCachedEffectiveNetClass( const wxString& aNetName ) const
 {
+    std::lock_guard lock( m_cacheMutex );
+
     return m_effectiveNetclassCache.at( aNetName );
 }
 
 
 std::shared_ptr<NETCLASS> NET_SETTINGS::GetEffectiveNetClass( const wxString& aNetName )
 {
+    std::lock_guard lock( m_cacheMutex );
+
     // Lambda to fetch an explicit netclass. Returns a nullptr if not found
     auto getExplicitNetclass =
             [this]( const wxString& netclass ) -> std::shared_ptr<NETCLASS>
@@ -1171,6 +1183,8 @@ std::shared_ptr<NETCLASS> NET_SETTINGS::GetEffectiveNetClass( const wxString& aN
 
 void NET_SETTINGS::RecomputeEffectiveNetclasses()
 {
+    std::lock_guard lock( m_cacheMutex );
+
     for( auto& [ncName, nc] : m_compositeNetClasses )
     {
         // Note this needs to be a copy in case we now need to add the default netclass

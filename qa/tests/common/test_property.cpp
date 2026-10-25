@@ -24,6 +24,9 @@
 #include <inspectable_impl.h>
 #include <properties/property_mgr.h>
 
+#include <thread>
+#include <vector>
+
 using namespace std;
 
 class A : public INSPECTABLE
@@ -440,5 +443,25 @@ BOOST_AUTO_TEST_CASE( DuplicateProperty )
     PROPERTY_BASE* afterRebuild = propMgr.GetProperty( TYPE_HASH( B ), "C" );
     BOOST_CHECK_EQUAL( afterRebuild, original );
 }
+
+
+BOOST_AUTO_TEST_CASE( ConcurrentReadersRebuildOnce )
+{
+    PROPERTY_BASE* added = new PROPERTY<A, int>( "Concurrent", &A::setA, &A::getA );
+    propMgr.AddProperty( added );
+
+    std::vector<PROPERTY_BASE*> found( 8, nullptr );
+    std::vector<std::thread>    readers;
+
+    for( size_t t = 0; t < found.size(); ++t )
+        readers.emplace_back( [&, t]() { found[t] = propMgr.GetProperty( TYPE_HASH( B ), "Concurrent" ); } );
+
+    for( std::thread& r : readers )
+        r.join();
+
+    for( PROPERTY_BASE* prop : found )
+        BOOST_CHECK_EQUAL( prop, added );
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()

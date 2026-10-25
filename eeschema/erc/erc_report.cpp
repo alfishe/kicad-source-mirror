@@ -211,11 +211,25 @@ nlohmann::json ERC_REPORT::GetJsonReport()
         }
     }
 
+    // Descriptions resolve per-instance fields on the item's sheet: make each sheet current once
+    // for its violations instead of switching (and re-resolving every screen's references) twice
+    // per violation
+    const SCH_SHEET_PATH savedSheet = m_sch->CurrentSheet();
+    bool                 switched = false;
+
     for( const SCH_SHEET_PATH& sheet : sheetList )
     {
         RC_JSON::ERC_SHEET jsonSheet;
         jsonSheet.path = sheet.PathHumanReadable();
         jsonSheet.uuid_path = sheet.Path().AsString();
+
+        if( !orderedItems[sheet].empty() && !( m_sch->CurrentSheet() == sheet ) )
+        {
+            SCH_SHEET_PATH target = sheet;
+            m_sch->SetCurrentSheet( target );
+            target.UpdateAllScreenReferences();
+            switched = true;
+        }
 
         for( ERC_ITEM* item : orderedItems[sheet] )
         {
@@ -228,6 +242,15 @@ nlohmann::json ERC_REPORT::GetJsonReport()
         }
 
         reportHead.sheets.push_back( jsonSheet );
+    }
+
+    if( switched )
+    {
+        SCH_SHEET_PATH restore = savedSheet;
+        m_sch->SetCurrentSheet( restore );
+
+        if( restore.size() )
+            restore.UpdateAllScreenReferences();
     }
 
     for( const std::reference_wrapper<RC_ITEM>& item : ERC_ITEM::GetItemsWithSeverities() )

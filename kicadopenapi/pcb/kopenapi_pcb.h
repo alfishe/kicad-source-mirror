@@ -20,6 +20,7 @@
 #include <kicadopenapi_registry.h>
 
 class BOARD;
+class CONNECTIVITY_DATA;
 class FOOTPRINT;
 class FP_3DMODEL;
 class PCB_CONTEXT;
@@ -132,6 +133,9 @@ struct KOPENAPI_UNROUTED
 };
 
 KOPENAPI_UNROUTED KopenapiUnrouted( BOARD* aBoard, bool aRebuild = true );
+
+/// @brief True when no net of aConn awaits a connectivity or ratsnest update
+bool KopenapiConnectivityCurrent( CONNECTIVITY_DATA& aConn );
 
 /// @brief KopenapiUnrouted as answer fields: unrouted_connections, unrouted_nets, zone_fills and
 /// unrouted_left (the same number as unrouted_connections, kept for older callers)

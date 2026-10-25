@@ -269,7 +269,7 @@ void RATSNEST_VIEW_ITEM::ViewDraw( int aLayer, KIGFX::VIEW* aView ) const
             gal->SetStrokeColor( color );  // using the default ratsnest color for not highlighted
 
         // Every line of a net is stroked in one colour on one layer, so their order is not
-        // observable and the sort in GetEdges() would be paid on every frame
+        // observable
         for( const CN_EDGE& edge : net->GetUnsortedEdges() )
         {
             if( !edge.IsVisible() )

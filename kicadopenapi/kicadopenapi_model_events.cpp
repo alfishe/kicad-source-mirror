@@ -2,6 +2,7 @@
 /// @brief Guarded model-change notifications (see kicadopenapi_model_events.h).
 #include <kicadopenapi_model_events.h>
 #include <kicadopenapi_registry.h>
+#include <kicadopenapi_jobs.h>
 
 #include <wx/log.h>
 #include <wx/string.h>
@@ -78,7 +79,7 @@ void KOPENAPI_MODEL_EVENTS::Post( const EVENT& aEvent )
 {
     HUB& h = hub();
 
-    if( !wxThread::IsMain() )
+    if( !KopenapiOnDispatchThread() )
         return;
 
     if( h.delivering )

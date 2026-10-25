@@ -2,6 +2,7 @@
 /// @brief Core kicadopenapi methods available in every host (GUI and headless).
 #include "kicadopenapi_registry.h"
 #include "kicadopenapi_journal.h"
+#include "kicadopenapi_change_feed.h"
 #include "kicadopenapi_service.h"
 #include "platform/platform.h"
 
@@ -522,3 +523,32 @@ KOPENAPI_REGISTER( "job_step",
 
 KOPENAPI_REGISTER( "job_list", "The last 32 jobs, newest first, with state and progress (no results)",
                    R"json({"type":"object","properties":{}})json"_json, false, h_job_served );
+
+static KOPENAPI_RESULT h_doc_changes( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
+{
+    const std::string domain = aArgs.value( "domain", std::string( "pcb" ) );
+
+    if( domain != "pcb" && domain != "sch" )
+        return KOPENAPI_RESULT::Error( 400, "domain: pcb or sch" );
+
+    return KOPENAPI_RESULT::Ok( KOPENAPI_CHANGE_FEED::Since( domain, aArgs.value( "since", uint64_t( 0 ) ),
+                                                             std::clamp( aArgs.value( "limit", 100 ), 1, 1000 ),
+                                                             aArgs.value( "fold", false ) ) );
+}
+
+
+KOPENAPI_REGISTER( "doc_changes",
+                   "What changed in a document since a version: one change set per commit (API call, job "
+                   "batch, GUI edit) with item ids added / changed / removed and its source; poll with "
+                   "since=next_since. truncated: the reader missed change sets (or the document was "
+                   "replaced: reset) and re-reads the document. Answered while jobs run",
+                   R"json({"type":"object","properties":{
+                        "domain":{"type":"string","enum":["pcb","sch"],"default":"pcb"},
+                        "since":{"type":"integer","default":0,"description":"The version last seen (next_since)"},
+                        "limit":{"type":"integer","default":100,"minimum":1,"maximum":1000},
+                        "fold":{"type":"boolean","default":false,
+                                "description":"One change set for the whole span (an item added then removed drops out)"}}})json"_json,
+                   false, h_doc_changes );
+
+
+KOPENAPI_MARK_CONCURRENT_READS( "ping", "documents", "doc_changes" );

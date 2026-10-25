@@ -92,6 +92,12 @@ public:
                        bool                               aSkipRatsnestUpdate = false );
 
     /**
+     * A board's own connectivity, which readers of the board share: its writes are checked
+     * (MODEL_THREAD::CheckWrite).  Private connectivity (a placer's, a local ratsnest) is not.
+     */
+    void SetShared() { m_shared = true; }
+
+    /**
      * Build the connectivity database for the board aBoard.
      */
     bool Build( BOARD* aBoard, PROGRESS_REPORTER* aReporter = nullptr );
@@ -300,6 +306,8 @@ private:
 
     /// Used to suppress ratsnest calculations on dynamic ratsnests
     bool                            m_skipRatsnestUpdate;
+
+    bool                            m_shared = false;
 
     KISPINLOCK                      m_lock;
 

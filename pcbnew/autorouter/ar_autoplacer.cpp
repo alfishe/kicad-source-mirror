@@ -765,7 +765,14 @@ AR_RESULT AR_AUTOPLACER::AutoplaceFootprints( std::vector<FOOTPRINT*>& aFootprin
         m_matrix.m_GridRouting = pcbIUScale.mmToIU( 0.25 );
 
     // Compute footprint parameters used in autoplace
-    if( genPlacementRoutingMatrix( ) == 0 )
+    int matrixOk = 0;
+
+    if( m_computeRunner )
+        m_computeRunner( [&]() { matrixOk = genPlacementRoutingMatrix(); } );
+    else
+        matrixOk = genPlacementRoutingMatrix();
+
+    if( matrixOk == 0 )
         return AR_FAILURE;
 
     int placedCount = 0;
@@ -784,17 +791,13 @@ AR_RESULT AR_AUTOPLACER::AutoplaceFootprints( std::vector<FOOTPRINT*>& aFootprin
         }
     }
 
+    // each footprint enters the commit when it is moved: a caller may push the commit between two
+    // footprints
     for( FOOTPRINT* footprint : aFootprints )
-    {
         footprint->SetNeedsPlaced( true );
-        aCommit->Modify( footprint );
-    }
 
     for( FOOTPRINT* footprint : offboardMods )
-    {
         footprint->SetNeedsPlaced( true );
-        aCommit->Modify( footprint );
-    }
 
     for( FOOTPRINT* footprint : m_board->Footprints() )
     {
@@ -817,7 +820,17 @@ AR_RESULT AR_AUTOPLACER::AutoplaceFootprints( std::vector<FOOTPRINT*>& aFootprin
 
     FOOTPRINT* footprint;
 
-    while( ( footprint = pickFootprint() ) != nullptr )
+    auto pickNext = [&]()
+    {
+        if( m_computeRunner )
+            m_computeRunner( [&]() { footprint = pickFootprint(); } );
+        else
+            footprint = pickFootprint();
+
+        return footprint;
+    };
+
+    while( pickNext() != nullptr )
     {
         // Display some info about activity, footprint placement can take a while:
 
@@ -825,12 +838,16 @@ AR_RESULT AR_AUTOPLACER::AutoplaceFootprints( std::vector<FOOTPRINT*>& aFootprin
             m_progressReporter->SetTitle( wxString::Format( _( "Autoplacing %s" ),
                                                             footprint->GetReference() ) );
 
-        error = getOptimalFPPlacement( footprint );
+        if( m_computeRunner )
+            m_computeRunner( [&]() { error = getOptimalFPPlacement( footprint ); } );
+        else
+            error = getOptimalFPPlacement( footprint );
 
         if( error == AR_ABORT_PLACEMENT )
             break;
 
         // Place footprint.
+        aCommit->Modify( footprint );
         placeFootprint( footprint, true, m_curPosition );
 
         genModuleOnRoutingMatrix( footprint );

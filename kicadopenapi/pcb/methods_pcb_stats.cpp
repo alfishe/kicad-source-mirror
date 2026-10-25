@@ -386,3 +386,5 @@ KOPENAPI_REGISTER( "pcb_clearance_stats",
                    "Slow board metrics: copper areas, minimum track-to-track clearance, minimum drill; "
                    "O(n^2) in track count, can take tens of seconds on large boards",
                    R"json({"type":"object","properties":{}})json"_json, false, h_pcb_clearance_stats, 600 );
+
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_stats" );

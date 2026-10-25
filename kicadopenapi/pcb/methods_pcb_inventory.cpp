@@ -10,9 +10,12 @@
 #include <base_units.h>
 #include <board.h>
 #include <board_design_settings.h>
+#include <connectivity/connectivity_algo.h>
 #include <connectivity/connectivity_data.h>
 #include <footprint.h>
+#include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
+#include <model_thread.h>
 #include <netclass.h>
 #include <netinfo.h>
 #include <pad.h>
@@ -189,18 +192,44 @@ std::string KopenapiZoneFillState( BOARD* aBoard, nlohmann::json* aStale )
 }
 
 
+bool KopenapiConnectivityCurrent( CONNECTIVITY_DATA& aConn )
+{
+    const std::shared_ptr<CN_CONNECTIVITY_ALGO> algo = aConn.GetConnectivityAlgo();
+
+    for( int net = 0; net < aConn.GetNetCount(); ++net )
+    {
+        if( algo && net < algo->NetCount() && algo->IsNetDirty( net ) )
+            return false;
+
+        // as CONNECTIVITY_DATA::updateRatsnest: net 0 and nets without nodes are never computed
+        RN_NET* rn = net > 0 ? aConn.GetRatsnestForNet( net ) : nullptr;
+
+        if( rn && rn->IsDirty() && rn->GetNodeCount() > 0 )
+            return false;
+    }
+
+    return true;
+}
+
+
 KOPENAPI_UNROUTED KopenapiUnrouted( BOARD* aBoard, bool aRebuild )
 {
     KOPENAPI_UNROUTED out;
     out.zoneFills = KopenapiZoneFillState( aBoard );
 
-    if( aRebuild )
+    std::shared_ptr<CONNECTIVITY_DATA> conn = aBoard->GetConnectivity();
+
+    if( aRebuild && MODEL_THREAD::MayWrite() )
     {
         aBoard->BuildConnectivity();
         aBoard->GetConnectivity()->RecalculateRatsnest();
+        conn = aBoard->GetConnectivity();
     }
-
-    std::shared_ptr<CONNECTIVITY_DATA> conn = aBoard->GetConnectivity();
+    else if( aRebuild && conn && !KopenapiConnectivityCurrent( *conn ) )
+    {
+        // a reader never rebuilds: the owner, which keeps connectivity current, answers
+        throw KOPENAPI_RETRY_LATER( "board connectivity is being updated", 1 );
+    }
 
     if( !conn )
         return out;
@@ -849,3 +878,6 @@ KOPENAPI_REGISTER( "pcb_netlist",
                    "reference/number counted as anonymous), pads without a net, footprints (ref, value, "
                    "footprint, board_only, dnp); input for schematic/board comparison",
                    R"json({"type":"object","properties":{}})json"_json, false, h_pcb_netlist );
+
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_footprint_get", "pcb_footprint_list", "pcb_net_get", "pcb_net_list",
+                                "pcb_netlist" );
