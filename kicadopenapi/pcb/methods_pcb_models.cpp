@@ -1014,13 +1014,16 @@ bool KopenapiAssemblyBox( BOARD* aBoard, double aLo[3], double aHi[3] )
 }
 
 
-std::map<const FOOTPRINT*, double> KopenapiFootprintHeights( BOARD* aBoard )
+std::map<const FOOTPRINT*, double> KopenapiFootprintHeights( BOARD* aBoard, const std::set<const FOOTPRINT*>* aOnly )
 {
     const double thickness = aBoard->GetDesignSettings().GetBoardThickness() / pcbIUScale.IU_PER_MM;
     std::vector<std::tuple<FOOTPRINT*, std::filesystem::path, glm::mat4>> jobs;
 
     for( FOOTPRINT* fp : aBoard->Footprints() )
     {
+        if( aOnly && !aOnly->count( fp ) )
+            continue;
+
         for( const FP_3DMODEL& m : fp->Models() )
         {
             if( !m.m_Show )

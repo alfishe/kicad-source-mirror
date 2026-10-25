@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <vector>
 #include <string>
 
@@ -110,7 +111,9 @@ nlohmann::json KopenapiLeadTrimRefresh( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aCo
 
 /// @brief Height of every footprint with a shown 3D model, in mm from the board surface on its own
 /// side (model boxes, cached geometry); footprints without a readable model are absent
-std::map<const FOOTPRINT*, double> KopenapiFootprintHeights( BOARD* aBoard );
+/// @param aOnly when given, only these footprints
+std::map<const FOOTPRINT*, double> KopenapiFootprintHeights( BOARD* aBoard,
+                                                             const std::set<const FOOTPRINT*>* aOnly = nullptr );
 
 nlohmann::json KopenapiPanelEdgeJson( FOOTPRINT* aFootprint, const std::string& aMethod = "auto" );
 

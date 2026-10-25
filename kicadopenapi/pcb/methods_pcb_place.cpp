@@ -35,6 +35,7 @@
 #include <pcb_track.h>
 #include <zone.h>
 #include <pcb_edit_frame.h>
+#include <pcb_field.h>
 #include <pcb_shape.h>
 #include <pcb_text.h>
 #include <string_utils.h>
@@ -45,6 +46,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <set>
 
@@ -147,6 +149,247 @@ bool isConnector( FOOTPRINT* aFootprint )
     return ( !ref.empty() && ( ref[0] == 'J' || ref[0] == 'P' ) && ref.size() > 1 && std::isdigit( (unsigned char) ref[1] ) )
            || lib.rfind( "Connector", 0 ) == 0 || lib.rfind( "TerminalBlock", 0 ) == 0;
 }
+
+
+/// @brief Room under a footprint for lower parts on its side (a daughterboard over its headers):
+/// its field max_height_under_mm
+std::optional<double> roomUnder( const FOOTPRINT* aFootprint )
+{
+    double value = 0.0;
+
+    if( const PCB_FIELD* field = aFootprint->GetField( wxS( "max_height_under_mm" ) );
+        field && field->GetText().ToCDouble( &value ) && value > 0 )
+    {
+        return value;
+    }
+
+    return std::nullopt;
+}
+
+
+/// @brief What of a raised footprint is in the way of a part under it: its pads with the header body
+/// around them (1 mm)
+SHAPE_POLY_SET raisedArea( FOOTPRINT* aFootprint )
+{
+    SHAPE_POLY_SET area;
+
+    for( PAD* pad : aFootprint->Pads() )
+        pad->TransformShapeToPolygon( area, pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu, pcbIUScale.mmToIU( 1.0 ), ARC_HIGH_DEF,
+                                      ERROR_OUTSIDE );
+
+    area.Simplify();
+    return area;
+}
+
+
+/// @brief Heights (3D models) of aParts, only when some footprint of the board has room under it
+std::map<const FOOTPRINT*, double> heightsIfRoomUnder( BOARD* aBoard, const std::vector<FOOTPRINT*>& aParts )
+{
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        if( roomUnder( fp ) )
+        {
+            const std::set<const FOOTPRINT*> only( aParts.begin(), aParts.end() );
+            return KopenapiFootprintHeights( aBoard, &only );
+        }
+    }
+
+    return {};
+}
+
+
+/// @brief Nets that are rails by role, whatever their pad count: ground / power by name, or with a
+/// power pin of a part on them
+std::set<int> railNets( BOARD* aBoard )
+{
+    std::set<int> rails;
+
+    for( NETINFO_ITEM* net : aBoard->GetNetInfo() )
+    {
+        if( net->GetNetCode() <= 0 )
+            continue;
+
+        const std::string role = KopenapiNetRoleFromName( str( UnescapeString( net->GetNetname() ) ) ).value( "role", "" );
+
+        if( role == "ground" || role == "power" )
+            rails.insert( net->GetNetCode() );
+    }
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( PAD* pad : fp->Pads() )
+        {
+            if( pad->GetNetCode() > 0 && pad->GetPinType().StartsWith( wxS( "power" ) ) )
+                rails.insert( pad->GetNetCode() );
+        }
+    }
+
+    return rails;
+}
+
+
+/// @brief Groups of a footprint's pads that share a net and sit at most two pitches apart (supply
+/// pins 59 / 60 take one capacitor): pad -> group id
+std::map<PAD*, int> padGroups( FOOTPRINT* aFootprint )
+{
+    std::vector<PAD*> pads;
+
+    for( PAD* pad : aFootprint->Pads() )
+    {
+        if( pad->GetNetCode() > 0 )
+            pads.push_back( pad );
+    }
+
+    double pitch = std::numeric_limits<double>::max();
+
+    for( size_t i = 0; i < pads.size(); ++i )
+    {
+        for( size_t j = i + 1; j < pads.size(); ++j )
+            pitch = std::min( pitch, double( ( pads[i]->GetPosition() - pads[j]->GetPosition() ).EuclideanNorm() ) );
+    }
+
+    std::vector<size_t> parent( pads.size() );
+    std::iota( parent.begin(), parent.end(), 0 );
+
+    std::function<size_t( size_t )> root = [&]( size_t i ) { return parent[i] == i ? i : parent[i] = root( parent[i] ); };
+
+    for( size_t i = 0; i < pads.size(); ++i )
+    {
+        for( size_t j = i + 1; j < pads.size(); ++j )
+        {
+            if( pads[i]->GetNetCode() == pads[j]->GetNetCode()
+                && ( pads[i]->GetPosition() - pads[j]->GetPosition() ).EuclideanNorm() <= 2.0 * pitch + 1 )
+            {
+                parent[root( i )] = root( j );
+            }
+        }
+    }
+
+    std::map<PAD*, int> groups;
+
+    for( size_t i = 0; i < pads.size(); ++i )
+        groups[pads[i]] = int( root( i ) );
+
+    return groups;
+}
+
+
+/// @brief Groups per net (pads of aFootprint)
+std::map<int, int> groupsPerNet( FOOTPRINT* aFootprint )
+{
+    std::map<int, std::set<int>> seen;
+
+    for( const auto& [pad, group] : padGroups( aFootprint ) )
+        seen[pad->GetNetCode()].insert( group );
+
+    std::map<int, int> count;
+
+    for( const auto& [net, groups] : seen )
+        count[net] = int( groups.size() );
+
+    return count;
+}
+
+
+/// @brief A capacitor's value in farads from its Value text ("100n", "0.1uF", "4u7", "10uF");
+/// none when it does not read
+std::optional<double> faradsOf( const FOOTPRINT* aFootprint )
+{
+    const std::string text = str( aFootprint->GetValue() );
+    std::string       number;
+    size_t            i = 0;
+
+    for( ; i < text.size() && ( std::isdigit( (unsigned char) text[i] ) || text[i] == '.' || text[i] == ',' ); ++i )
+        number += text[i] == ',' ? '.' : text[i];
+
+    if( number.empty() || number == "." )
+        return std::nullopt;
+
+    static const std::vector<std::pair<std::string, double>> prefixes = {
+        { "p", 1e-12 }, { "n", 1e-9 }, { "u", 1e-6 }, { "\xC2\xB5", 1e-6 }, { "m", 1e-3 } };
+    std::optional<double> prefix;
+
+    for( const auto& [name, value] : prefixes )
+    {
+        if( text.compare( i, name.size(), name ) == 0 )
+        {
+            prefix = value;
+            i += name.size();
+            break;
+        }
+    }
+
+    if( !prefix )
+    {
+        if( i < text.size() && ( text[i] == 'F' || text[i] == 'f' ) )
+            return std::atof( number.c_str() );
+
+        return std::nullopt;
+    }
+
+    // 4u7: the prefix stands for the decimal point
+    std::string fraction;
+
+    for( ; i < text.size() && std::isdigit( (unsigned char) text[i] ); ++i )
+        fraction += text[i];
+
+    if( !fraction.empty() )
+    {
+        if( number.find( '.' ) != std::string::npos )
+            return std::nullopt;
+
+        number += "." + fraction;
+    }
+
+    return std::atof( number.c_str() ) * *prefix;
+}
+
+
+/// @brief The board outline and its edges, for "inside the outline" tests of many positions
+struct OUTLINE
+{
+    SHAPE_POLY_SET   polygon;
+    std::vector<SEG> edges;
+    bool             ok = false;
+
+    explicit OUTLINE( BOARD* aBoard )
+    {
+        ok = aBoard->GetBoardPolygonOutlines( polygon, true ) && polygon.OutlineCount() > 0;
+
+        for( auto it = polygon.CIterateSegmentsWithHoles(); ok && it; it++ )
+            edges.push_back( *it );
+    }
+
+    /// @brief aArea wholly inside: no edge crosses its box and its middle is inside, or nothing of
+    /// it is left after taking the board away
+    bool Contains( const SHAPE_POLY_SET& aArea ) const
+    {
+        if( !ok )
+            return true;
+
+        const BOX2I box = aArea.BBox();
+        bool        crossed = false;
+
+        for( const SEG& seg : edges )
+        {
+            BOX2I segBox( seg.A, VECTOR2I( 0, 0 ) );
+            segBox.Merge( seg.B );
+
+            if( box.Intersects( segBox ) )
+            {
+                crossed = true;
+                break;
+            }
+        }
+
+        if( !crossed )
+            return polygon.Contains( box.Centre() );
+
+        SHAPE_POLY_SET out = aArea;
+        out.BooleanSubtract( polygon );
+        return out.IsEmpty() || out.Area() < pcbIUScale.mmToIU( 0.01 ) * (double) pcbIUScale.mmToIU( 1.0 );
+    }
+};
 
 
 struct PANEL_EDGE;
@@ -678,10 +921,58 @@ nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>*
 
     std::sort( pairs.begin(), pairs.end() );
 
+    // a part under a raised footprint (field max_height_under_mm) that fits and keeps off its pads
+    std::map<size_t, double>   rooms;
+    std::set<const FOOTPRINT*> lower;
+
+    for( const auto& [i, j] : pairs )
+    {
+        for( const auto& [r, o] : { std::pair( i, j ), std::pair( j, i ) } )
+        {
+            if( std::optional<double> room = roomUnder( fps[r] ); room && !roomUnder( fps[o] ) )
+            {
+                rooms[r] = *room;
+                lower.insert( fps[o] );
+            }
+        }
+    }
+
+    const std::map<const FOOTPRINT*, double> heights = lower.empty() ? std::map<const FOOTPRINT*, double>()
+                                                                     : KopenapiFootprintHeights( aBoard, &lower );
+    std::map<size_t, SHAPE_POLY_SET>         raisedAreas;
+    nlohmann::json                           underRaised = nlohmann::json::array();
+
+    auto fitsUnder = [&]( size_t aRaised, size_t aOther )
+    {
+        if( !rooms.count( aRaised ) || fps[aRaised]->IsFlipped() != fps[aOther]->IsFlipped() )
+            return false;
+
+        auto h = heights.find( fps[aOther] );
+
+        if( h == heights.end() || h->second > rooms[aRaised] )
+            return false;
+
+        if( !raisedAreas.count( aRaised ) )
+            raisedAreas[aRaised] = raisedArea( fps[aRaised] );
+
+        SHAPE_POLY_SET both = areas[aOther];
+        both.BooleanIntersection( raisedAreas[aRaised] );
+
+        if( !both.IsEmpty() )
+            return false;
+
+        underRaised.push_back( { { "ref", str( fps[aOther]->GetReference() ) }, { "under", str( fps[aRaised]->GetReference() ) },
+                                 { "height_mm", h->second }, { "max_height_under_mm", rooms[aRaised] } } );
+        return true;
+    };
+
     nlohmann::json overlaps = nlohmann::json::array();
 
     for( const auto& [i, j] : pairs )
     {
+        if( fitsUnder( i, j ) || fitsUnder( j, i ) )
+            continue;
+
         // as DRC's courtyard test: per side, the two courtyards closer than the courtyard clearance
         // rule (0: touching counts); a part without courtyards by its body box, on its own side
         bool           hit = false;
@@ -889,6 +1180,9 @@ nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>*
         if( !report["copper_conflicts"].empty() )
             report["ok"] = false;
     }
+
+    if( !underRaised.empty() )
+        report["under_raised"] = underRaised;
 
     if( !overhanging.empty() )
         report["edge_overhang_note"] = "connectors placed with their mating side over the board edge on purpose (the "
@@ -1122,9 +1416,96 @@ std::optional<PANEL_EDGE> markedEdge( FOOTPRINT* aFootprint )
 }
 
 
-/// @param aMethod auto (marker, else inference), marker, infer
+/// @brief The board edge an edge-finger connector (ISA / PCI card edge) sits on: four or more pads
+/// without holes, most of them within 0.5 mm of one straight line of the board outline.  The line
+/// spans the fingers; its normal points out of the board.
+std::optional<PANEL_EDGE> fingerEdge( FOOTPRINT* aFootprint )
+{
+    BOARD*            board = aFootprint->GetBoard();
+    std::vector<PAD*> fingers;
+
+    for( PAD* pad : aFootprint->Pads() )
+    {
+        if( !pad->HasHole() && !pad->GetNumber().IsEmpty() )
+            fingers.push_back( pad );
+    }
+
+    SHAPE_POLY_SET outline;
+
+    if( !board || fingers.size() < 4 || !board->GetBoardPolygonOutlines( outline, true ) || outline.OutlineCount() == 0 )
+        return std::nullopt;
+
+    const int   touch = pcbIUScale.mmToIU( 0.5 );
+    const BOX2I span = aFootprint->GetBoundingBox( false );
+    const int   reach = span.GetWidth() + span.GetHeight();
+    SEG         best;
+    size_t      bestCount = 0;
+
+    for( auto it = outline.CIterateSegmentsWithHoles(); it; it++ )
+    {
+        const SEG seg = *it;
+
+        if( seg.Length() < pcbIUScale.mmToIU( 2.0 ) || seg.Distance( span.Centre() ) > reach )
+            continue;
+
+        // the whole straight line: a card edge cut by a notch is two segments of one line
+        const VECTOR2I along = ( seg.B - seg.A ).Resize( reach );
+        const SEG      line( seg.A - along, seg.B + along );
+        size_t         count = 0;
+
+        for( PAD* pad : fingers )
+        {
+            if( pad->GetEffectiveShape( pad->GetPrincipalLayer() )->Collide( line, touch ) )
+                count++;
+        }
+
+        if( count > bestCount )
+        {
+            bestCount = count;
+            best = line;
+        }
+    }
+
+    if( bestCount < 4 || bestCount * 10 < fingers.size() * 6 )
+        return std::nullopt;
+
+    // the line over the fingers' extent
+    const VECTOR2D dir = VECTOR2D( best.B - best.A ).Resize( 1.0 );
+    double         lo = std::numeric_limits<double>::max(), hi = std::numeric_limits<double>::lowest();
+
+    for( PAD* pad : fingers )
+    {
+        const BOX2I box = pad->GetBoundingBox();
+
+        for( const VECTOR2I& corner : { box.GetOrigin(), box.GetEnd() } )
+        {
+            const double t = VECTOR2D( best.LineProject( corner ) - best.A ).Dot( dir );
+            lo = std::min( lo, t );
+            hi = std::max( hi, t );
+        }
+    }
+
+    const VECTOR2I a = best.A + VECTOR2I( KiROUND( dir.x * lo ), KiROUND( dir.y * lo ) );
+    const VECTOR2I b = best.A + VECTOR2I( KiROUND( dir.x * hi ), KiROUND( dir.y * hi ) );
+    VECTOR2D       n( -dir.y, dir.x );
+    const VECTOR2I probe = SEG( a, b ).Center() + VECTOR2I( KiROUND( n.x * touch ), KiROUND( n.y * touch ) );
+
+    if( outline.Contains( probe ) )
+        n = -n;
+
+    return PANEL_EDGE{ SEG( a, b ), n, "board edge (fingers)", "high" };
+}
+
+
+/// @param aMethod auto (edge fingers on the outline, else marker, else inference), marker, infer
 std::optional<PANEL_EDGE> panelEdge( FOOTPRINT* aFootprint, const std::string& aMethod )
 {
+    if( aMethod != "marker" )
+    {
+        if( std::optional<PANEL_EDGE> fingers = fingerEdge( aFootprint ) )
+            return fingers;
+    }
+
     if( aMethod != "infer" )
     {
         if( std::optional<PANEL_EDGE> marked = markedEdge( aFootprint ) )
@@ -1233,6 +1614,7 @@ struct NEAR_OPTIONS
     std::string           partPad;          ///< pad number of the part to bring to the target; else by net
     double                hostRingMm = 0;   ///< keep this far from the target footprint's courtyard (fan-out room)
     bool                  gapGiven = false; ///< gap_mm asked for (else a default that may be narrowed)
+    std::optional<double> partHeight;       ///< of the part (3D model): it may go under raised footprints with room
 };
 
 struct NEAR_PLACEMENT
@@ -1242,6 +1624,104 @@ struct NEAR_PLACEMENT
     PAD*        partPad = nullptr;
     double      padDistanceMm = 0;
     std::string direction;
+    std::string under;   ///< the raised footprint the part went under
+};
+
+
+/// @brief Where a part may go on its side of the board: clear of the other courtyards (a raised
+/// footprint with room for the part: of its pads only), and inside the board outline
+class PLACE_SPACE
+{
+public:
+    /// @param aAround the middle of the search, aReach how far from it
+    /// @param aHost a footprint kept aHostRing clear (fan-out room), or null
+    PLACE_SPACE( BOARD* aBoard, FOOTPRINT* aPart, const VECTOR2I& aAround, int aReach, FOOTPRINT* aHost, int aHostRing,
+                 std::optional<double> aPartHeight ) :
+            m_outline( aBoard ),
+            m_part( aPart )
+    {
+        BOX2I around( aAround, VECTOR2I( 0, 0 ) );
+        around.Inflate( aReach + std::max( aPart->GetBoundingBox( false ).GetWidth(), aPart->GetBoundingBox( false ).GetHeight() ) );
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            if( fp == aPart || fp->IsFlipped() != aPart->IsFlipped() )
+                continue;
+
+            SHAPE_POLY_SET area = courtyard( fp );
+            bool           under = false;
+
+            if( fp == aHost && aHostRing > 0 )
+            {
+                area.Inflate( aHostRing, CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, ARC_HIGH_DEF );
+            }
+            else if( std::optional<double> room = roomUnder( fp ); room && aPartHeight && *aPartHeight <= *room )
+            {
+                m_raised.emplace_back( fp, area );
+                area = raisedArea( fp );
+                under = true;
+            }
+
+            const BOX2I box = area.BBox();
+
+            if( box.Intersects( around ) || under )
+                m_obstacles.emplace_back( std::move( area ), box );
+        }
+
+        m_edges = aBoard->GetBoardEdgesBoundingBox();
+    }
+
+    /// @brief aArea (the part's courtyard grown by the gap) moved by aDelta: clear of the others and
+    /// inside the board outline
+    bool Free( const SHAPE_POLY_SET& aArea, const BOX2I& aAreaBox, const VECTOR2I& aDelta ) const
+    {
+        BOX2I box = aAreaBox;
+        box.Move( aDelta );
+
+        if( m_edges.GetWidth() > 0 && m_edges.GetHeight() > 0 && !m_edges.Contains( box ) )
+            return false;
+
+        for( const auto& [obstacle, obstacleBox] : m_obstacles )
+        {
+            if( !obstacleBox.Intersects( box ) )
+                continue;
+
+            SHAPE_POLY_SET moved = aArea;
+            moved.Move( aDelta );
+            moved.BooleanIntersection( obstacle );
+
+            if( !moved.IsEmpty() )
+                return false;
+        }
+
+        SHAPE_POLY_SET moved = aArea;
+        moved.Move( aDelta );
+        return m_outline.Contains( moved );
+    }
+
+    /// @brief The raised footprint the part's courtyard (where it is now) is under, or empty
+    std::string Under() const
+    {
+        const SHAPE_POLY_SET body = courtyard( m_part );
+
+        for( const auto& [fp, area] : m_raised )
+        {
+            SHAPE_POLY_SET both = body;
+            both.BooleanIntersection( area );
+
+            if( !both.IsEmpty() )
+                return str( fp->GetReference() );
+        }
+
+        return {};
+    }
+
+private:
+    OUTLINE                                              m_outline;
+    FOOTPRINT*                                           m_part;
+    std::vector<std::pair<SHAPE_POLY_SET, BOX2I>>       m_obstacles;
+    std::vector<std::pair<FOOTPRINT*, SHAPE_POLY_SET>>  m_raised;
+    BOX2I                                                m_edges;
 };
 
 
@@ -1299,34 +1779,9 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
         return result;
     }
 
-    const int reach = toIU( aOptions.maxMm );
-    const int gap = toIU( aOptions.gapMm );
-
-    // the parts on the same side within reach
-    std::vector<std::pair<SHAPE_POLY_SET, BOX2I>> obstacles;
-    BOX2I                                         around( target, VECTOR2I( 0, 0 ) );
-
-    around.Inflate( reach + std::max( aPart->GetBoundingBox( false ).GetWidth(), aPart->GetBoundingBox( false ).GetHeight() ) );
-
-    for( FOOTPRINT* fp : aBoard->Footprints() )
-    {
-        if( fp == aPart || fp->IsFlipped() != aPart->IsFlipped() )
-            continue;
-
-        SHAPE_POLY_SET area = courtyard( fp );
-
-        // the target's package keeps a ring free for the tracks leaving its pins
-        if( fp == host && aOptions.hostRingMm > 0 )
-            area.Inflate( toIU( aOptions.hostRingMm ), CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, ARC_HIGH_DEF );
-
-        const BOX2I box = area.BBox();
-
-        if( box.Intersects( around ) )
-            obstacles.emplace_back( std::move( area ), box );
-    }
-
-    const BOX2I edges = aBoard->GetBoardEdgesBoundingBox();
-    const bool  hasEdges = edges.GetWidth() > 0 && edges.GetHeight() > 0;
+    const int         reach = toIU( aOptions.maxMm );
+    const int         gap = toIU( aOptions.gapMm );
+    const PLACE_SPACE space( aBoard, aPart, target, reach, host, toIU( std::max( 0.0, aOptions.hostRingMm ) ), aOptions.partHeight );
 
     // directions: along the target footprint's axes, the side its pad is nearest to first
     const EDA_ANGLE base = host->GetOrientation();
@@ -1385,29 +1840,7 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
 
         const BOX2I areaBox = area.BBox();
 
-        auto free = [&]( const VECTOR2I& aDelta )
-        {
-            BOX2I box = areaBox;
-            box.Move( aDelta );
-
-            if( hasEdges && !edges.Contains( box ) )
-                return false;
-
-            for( const auto& [obstacle, obstacleBox] : obstacles )
-            {
-                if( !obstacleBox.Intersects( box ) )
-                    continue;
-
-                SHAPE_POLY_SET moved = area;
-                moved.Move( aDelta );
-                moved.BooleanIntersection( obstacle );
-
-                if( !moved.IsEmpty() )
-                    return false;
-            }
-
-            return true;
-        };
+        auto free = [&]( const VECTOR2I& aDelta ) { return space.Free( area, areaBox, aDelta ); };
 
         for( PAD* pad : aPart->Pads() )
         {
@@ -1480,17 +1913,23 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
     }
 
     result.padDistanceMm = toMm( ( result.partPad->GetPosition() - target ).EuclideanNorm() );
+    result.under = space.Under();
     return result;
 }
 
 
 nlohmann::json nearJson( const NEAR_PLACEMENT& aPlacement, PAD* aTarget )
 {
-    return { { "target", str( aTarget->GetParentFootprint()->GetReference() ) + "." + str( aTarget->GetNumber() ) },
+    nlohmann::json row = { { "target", str( aTarget->GetParentFootprint()->GetReference() ) + "." + str( aTarget->GetNumber() ) },
              { "net", str( UnescapeString( aTarget->GetNetname() ) ) },
              { "pad", str( aPlacement.partPad->GetNumber() ) },
              { "pad_distance_mm", std::round( aPlacement.padDistanceMm * 100 ) / 100 },
              { "direction", aPlacement.direction } };
+
+    if( !aPlacement.under.empty() )
+        row["under"] = aPlacement.under;
+
+    return row;
 }
 
 
@@ -1519,6 +1958,45 @@ std::optional<std::string> nearOptions( const nlohmann::json& aFrom, NEAR_OPTION
 }
 
 
+/// @brief The least move that takes aPart (staged) off the others' courtyards (aGapMm clear) and
+/// keeps it inside the outline: rings around where it is, 0.1 mm apart up to 2 mm, then 0.25 mm,
+/// its turn kept.  The distance moved (0: it was free), or none when nothing is free within aMaxMm.
+std::optional<double> nudge( BOARD* aBoard, FOOTPRINT* aPart, double aGapMm, double aMaxMm, std::optional<double> aHeight )
+{
+    const VECTOR2I    start = aPart->GetPosition();
+    const PLACE_SPACE space( aBoard, aPart, start, toIU( aMaxMm ), nullptr, 0, aHeight );
+    SHAPE_POLY_SET    area = courtyard( aPart );
+
+    if( aGapMm > 0 )
+        area.Inflate( toIU( aGapMm ), CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, ARC_HIGH_DEF );
+
+    const BOX2I box = area.BBox();
+
+    if( space.Free( area, box, VECTOR2I( 0, 0 ) ) )
+        return 0.0;
+
+    for( double r = 0.1; r <= aMaxMm + 1e-9; r += r < 2.0 - 1e-9 ? 0.1 : 0.25 )
+    {
+        const double arc = r < 2.0 ? 0.1 : 0.25;
+        const int    steps = 4 * std::max( 2, int( std::ceil( 2 * M_PI * r / arc / 4 ) ) );
+
+        for( int k = 0; k < steps; ++k )
+        {
+            const double   angle = 2 * M_PI * k / steps;
+            const VECTOR2I delta( KiROUND( toIU( r ) * std::cos( angle ) ), KiROUND( toIU( r ) * std::sin( angle ) ) );
+
+            if( space.Free( area, box, delta ) )
+            {
+                aPart->SetPosition( start + delta );
+                return r;
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+
 /// @brief Pads 0.65 mm apart or closer (QFP, QFN, LGA, BGA)
 bool finePitch( FOOTPRINT* aFootprint )
 {
@@ -1537,11 +2015,14 @@ bool finePitch( FOOTPRINT* aFootprint )
 
 /// @brief Places the parts of a functional block around its main part: each next to the pad of the
 /// anchor it belongs to.  A part's pad goes to the anchor pad of its most specific shared net (the
-/// net with the fewest pads on the board); a part sharing two nets with the anchor (a decoupling
-/// capacitor between a supply pin and ground) takes a free supply pad whose ground pad is nearest.
-/// Parts are staged in aCommit; aOut gets placed / unplaced.
+/// net with the fewest pads on the board); a part across two rails of the anchor (a decoupling
+/// capacitor) takes a free supply pad (adjacent pads of one rail count as one) whose ground pad is
+/// nearest, the smallest value first.  Rails are told by role (railNets), not by pad count.  Order:
+/// parts on two nets of their own (a crystal), decoupling, the rest.  Parts are staged in aCommit;
+/// aOut gets placed / unplaced (and decoupling_far: capacitors over aDecapMaxMm from their pin).
 void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::vector<FOOTPRINT*> aParts,
-                 const NEAR_OPTIONS& aOptions, bool aOpposite, nlohmann::json& aOut, std::vector<KIID>& aMoved )
+                 const NEAR_OPTIONS& aOptions, bool aOpposite, double aDecapMaxMm, nlohmann::json& aOut,
+                 std::vector<KIID>& aMoved )
 {
     std::map<int, int> netPads;
 
@@ -1551,7 +2032,10 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             netPads[pad->GetNetCode()]++;
     }
 
-    std::map<int, std::vector<PAD*>> anchorPads;
+    const std::set<int>                      rails = railNets( aBoard );
+    const std::map<PAD*, int>                groupOf = padGroups( aAnchor );
+    const std::map<const FOOTPRINT*, double> heights = heightsIfRoomUnder( aBoard, aParts );
+    std::map<int, std::vector<PAD*>>         anchorPads;
 
     for( PAD* pad : aAnchor->Pads() )
     {
@@ -1564,7 +2048,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         FOOTPRINT*       part;
         std::vector<int> nets;      // shared with the anchor, most specific first
         double           area;
-        int              ownNets = 0;   // of them, nets with few pads (not the rails)
+        int              ownNets = 0;          // of them, nets that are not rails
+        bool             decoupling = false;   // across two rails of the anchor
+        double           farads = 1.0;
     };
 
     std::vector<MEMBER>     members;
@@ -1587,7 +2073,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         std::stable_sort( member.nets.begin(), member.nets.end(), [&]( int a, int b ) { return netPads[a] < netPads[b]; } );
 
         for( int net : member.nets )
-            member.ownNets += netPads[net] <= 4 ? 1 : 0;
+            member.ownNets += rails.count( net ) ? 0 : 1;
 
         // one rail in common is no bond with the anchor (everything shares ground): such a part
         // belongs to a member, if to anything; two nets in common is a part across the anchor's pins
@@ -1597,16 +2083,24 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             continue;
         }
 
+        member.decoupling = member.ownNets == 0;
+        member.farads = faradsOf( part ).value_or( 1.0 );
         members.push_back( member );
     }
 
-    // the most bound first: a crystal on two nets of its own, then parts on one such net, the
-    // capacitors on the rails last; among equals the most specific net, then big before small
+    auto rank = []( const MEMBER& m ) { return m.ownNets >= 2 ? 0 : m.decoupling ? 1 : 2; };
+
+    // the most bound first: a crystal on two nets of its own, the decoupling capacitors (smallest
+    // value first: nearest its pin), then parts on one net of their own; among equals the most
+    // specific net, then big before small
     std::stable_sort( members.begin(), members.end(),
                       [&]( const MEMBER& a, const MEMBER& b )
                       {
-                          if( a.ownNets != b.ownNets )
-                              return a.ownNets > b.ownNets;
+                          if( rank( a ) != rank( b ) )
+                              return rank( a ) < rank( b );
+
+                          if( a.decoupling && a.farads != b.farads )
+                              return a.farads < b.farads;
 
                           if( netPads[a.nets.front()] != netPads[b.nets.front()] )
                               return netPads[a.nets.front()] < netPads[b.nets.front()];
@@ -1615,8 +2109,16 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
                       } );
 
     std::set<PAD*>          taken;
+    std::set<int>           takenGroups;
     nlohmann::json          placed = nlohmann::json::array();
+    nlohmann::json          farAway = nlohmann::json::array();
     std::vector<FOOTPRINT*> done;
+
+    auto heightOf = [&]( FOOTPRINT* aPart ) -> std::optional<double>
+    {
+        auto it = heights.find( aPart );
+        return it == heights.end() ? std::nullopt : std::optional<double>( it->second );
+    };
 
     for( const MEMBER& member : members )
     {
@@ -1626,7 +2128,8 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         for( PAD* candidate : anchorPads[net] )
         {
-            double score = taken.count( candidate ) ? 1e6 : 0;
+            auto   group = groupOf.find( candidate );
+            double score = taken.count( candidate ) ? 1e6 : group != groupOf.end() && takenGroups.count( group->second ) ? 1e5 : 0;
 
             if( member.nets.size() > 1 )
             {
@@ -1646,17 +2149,10 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         }
 
         // a small part already placed on that net (a crystal before its load capacitors): next to
-        // its pad rather than across it at the anchor's
+        // its pad rather than across it at the anchor's; never on a rail
         PAD* viaPad = nullptr;
-        int  netPads = 0;   // a small net only (a crystal's, 2 - 4 pads): never a rail
 
-        for( FOOTPRINT* fp : aBoard->Footprints() )
-        {
-            for( PAD* pad : fp->Pads() )
-                netPads += pad->GetNetCode() == net;
-        }
-
-        for( FOOTPRINT* placedPart : netPads <= 4 ? done : std::vector<FOOTPRINT*>() )
+        for( FOOTPRINT* placedPart : rails.count( net ) ? std::vector<FOOTPRINT*>() : done )
         {
             if( placedPart->Pads().size() > 4 )
                 continue;
@@ -1678,6 +2174,10 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             target = viaPad;
 
         taken.insert( target );
+
+        if( auto group = groupOf.find( target ); group != groupOf.end() )
+            takenGroups.insert( group->second );
+
         aCommit.Modify( member.part );
 
         if( ( aAnchor->IsFlipped() != member.part->IsFlipped() ) != aOpposite )
@@ -1685,6 +2185,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         NEAR_OPTIONS options = aOptions;
         options.partPad.clear();
+        options.partHeight = heightOf( member.part );
 
         // a fine-pitch anchor (0.65 mm or less) keeps a ring for its fan-out, unless asked otherwise
         if( options.hostRingMm < 0 )
@@ -1702,6 +2203,27 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         {
             options.gapMm = 0.5;      // no room with the default gap: the narrow one
             placement = placeNear( aBoard, member.part, target, options );
+        }
+
+        // a decoupling capacitor kept out by the ring: inside it when that brings it within reach
+        if( placement.ok && member.decoupling && placement.padDistanceMm > aDecapMaxMm && options.hostRingMm > 0 && !viaPad )
+        {
+            const VECTOR2I  pos = member.part->GetPosition();
+            const EDA_ANGLE angle = member.part->GetOrientation();
+            NEAR_OPTIONS    tight = options;
+
+            tight.hostRingMm = 0;
+
+            if( NEAR_PLACEMENT closer = placeNear( aBoard, member.part, target, tight );
+                closer.ok && closer.padDistanceMm < placement.padDistanceMm )
+            {
+                placement = closer;
+            }
+            else
+            {
+                member.part->SetOrientation( angle );
+                member.part->SetPosition( pos );
+            }
         }
 
         if( !placement.ok )
@@ -1723,7 +2245,43 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         row["y_mm"] = toMm( member.part->GetPosition().y );
         row["rotation_deg"] = member.part->GetOrientation().AsDegrees();
         row["side"] = member.part->IsFlipped() ? "bottom" : "top";
+
+        if( member.decoupling )
+        {
+            row["decoupling"] = true;
+
+            if( placement.padDistanceMm > aDecapMaxMm )
+            {
+                farAway.push_back( { { "ref", row["ref"] }, { "target", row["target"] }, { "pad_distance_mm", row["pad_distance_mm"] },
+                                 { "decap_max_mm", aDecapMaxMm } } );
+            }
+        }
+
         placed.push_back( row );
+    }
+
+    // parts placed at the anchor before (by an earlier call): hosts for parts bound to them
+    std::vector<FOOTPRINT*> earlier;
+    BOX2I                   anchorBox = courtyard( aAnchor ).BBox();
+
+    anchorBox.Inflate( toIU( aOptions.maxMm ) );
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        if( fp == aAnchor || isConnector( fp ) || std::find( aParts.begin(), aParts.end(), fp ) != aParts.end()
+            || !anchorBox.Contains( fp->GetPosition() ) )
+        {
+            continue;
+        }
+
+        for( PAD* pad : fp->Pads() )
+        {
+            if( anchorPads.count( pad->GetNetCode() ) && !rails.count( pad->GetNetCode() ) )
+            {
+                earlier.push_back( fp );
+                break;
+            }
+        }
     }
 
     // parts bound to a member, not to the anchor (the second capacitor of a filter, a LED behind its
@@ -1739,22 +2297,28 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             FOOTPRINT* part = *it;
             PAD*       target = nullptr;
 
-            for( FOOTPRINT* host : done )
+            for( const std::vector<FOOTPRINT*>* hosts : { &done, &earlier } )
             {
-                for( PAD* hostPad : host->Pads() )
+                for( FOOTPRINT* host : *hosts )
                 {
-                    if( hostPad->GetNetCode() <= 0 || netPads[hostPad->GetNetCode()] > 4 )
-                        continue;
-
-                    for( PAD* pad : part->Pads() )
+                    for( PAD* hostPad : host->Pads() )
                     {
-                        if( pad->GetNetCode() == hostPad->GetNetCode()
-                            && ( !target || netPads[hostPad->GetNetCode()] < netPads[target->GetNetCode()] ) )
+                        if( hostPad->GetNetCode() <= 0 || rails.count( hostPad->GetNetCode() ) )
+                            continue;
+
+                        for( PAD* pad : part->Pads() )
                         {
-                            target = hostPad;
+                            if( pad->GetNetCode() == hostPad->GetNetCode()
+                                && ( !target || netPads[hostPad->GetNetCode()] < netPads[target->GetNetCode()] ) )
+                            {
+                                target = hostPad;
+                            }
                         }
                     }
                 }
+
+                if( target )
+                    break;
             }
 
             if( !target )
@@ -1770,6 +2334,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
             NEAR_OPTIONS options = aOptions;
             options.partPad.clear();
+            options.partHeight = heightOf( part );
 
             const NEAR_PLACEMENT placement = placeNear( aBoard, part, target, options );
 
@@ -1808,42 +2373,36 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
     aOut["anchor"] = str( aAnchor->GetReference() );
     aOut["placed"] = placed;
     aOut["unplaced"] = unplaced;
+
+    if( !farAway.empty() )
+        aOut["decoupling_far"] = farAway;
 }
 
 
-/// @brief The parts of a group request: named ones, or (none named) every unlocked part with a pad on a
-/// small net of the anchor (at most max_net_pads pads on the board: a crystal and its capacitors,
-/// pull-ups, a feedback divider - not everything on the rails)
-/// @brief Decoupling capacitors of the anchor guessed from the schematic: two-pad C parts across two
-/// rails of the anchor, the ones drawn nearest to it on its sheet, as many per supply rail as the
-/// anchor has pads on it.  Appended to aParts; aNote says what was taken.
-std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnchor,
-                                              std::vector<FOOTPRINT*>& aParts, bool aOverrideLocks, nlohmann::json& aNote )
+struct SYMBOL_SPOT
+{
+    std::string sheet;
+    double      x, y;
+};
+
+
+/// @brief Where the open schematic draws each symbol, by reference; none when no schematic is open
+std::optional<std::map<std::string, SYMBOL_SPOT>> schematicSpots( KOPENAPI_CONTEXT& aCtx )
 {
     std::optional<KOPENAPI_METHOD> list = KOPENAPI_REGISTRY::Get().Find( "sch_symbol_list" );
 
     if( !list )
-        return KOPENAPI_RESULT::Error( 503, "decoupling: the schematic editor module is not loaded" );
-
-    struct SYMBOL_SPOT
-    {
-        std::string sheet;
-        double      x, y;
-    };
+        return std::nullopt;
 
     std::map<std::string, SYMBOL_SPOT> drawn;
-    nlohmann::json               query = { { "limit", 1000 } };
+    nlohmann::json                     query = { { "limit", 1000 } };
 
     while( true )
     {
         KOPENAPI_RESULT page = list->handler( aCtx, query );
 
         if( page.status != 200 )
-        {
-            return KOPENAPI_RESULT::Error( page.status == 409 ? 409 : 422,
-                                           "decoupling: schematic: the schematic is not open (sch_open), or name the "
-                                           "capacitors in parts" );
-        }
+            return std::nullopt;
 
         for( const nlohmann::json& row : page.body.value( "items", nlohmann::json::array() ) )
         {
@@ -1859,7 +2418,30 @@ std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBo
         query["cursor"] = page.body["next_cursor"];
     }
 
-    auto home = drawn.find( str( aAnchor->GetReference() ) );
+    return drawn;
+}
+
+
+/// @brief Decoupling capacitors of the anchor guessed from the schematic: two-pad C parts across two
+/// rails of the anchor, the ones drawn nearest to it on its sheet, as many per supply rail as the
+/// anchor has supply pin groups on it (adjacent pins count once).  Appended to aParts; aNote says
+/// what was taken.
+std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnchor,
+                                              std::vector<FOOTPRINT*>& aParts, bool aOverrideLocks, nlohmann::json& aNote )
+{
+    if( !KOPENAPI_REGISTRY::Get().Find( "sch_symbol_list" ) )
+        return KOPENAPI_RESULT::Error( 503, "decoupling: the schematic editor module is not loaded" );
+
+    const std::optional<std::map<std::string, SYMBOL_SPOT>> spots = schematicSpots( aCtx );
+
+    if( !spots )
+    {
+        return KOPENAPI_RESULT::Error( 409, "decoupling: schematic: the schematic is not open (sch_open), or name the "
+                                            "capacitors in parts, or decoupling: per_pin" );
+    }
+
+    const std::map<std::string, SYMBOL_SPOT>& drawn = *spots;
+    auto                                      home = drawn.find( str( aAnchor->GetReference() ) );
 
     if( home == drawn.end() )
         return KOPENAPI_RESULT::Error( 422, "decoupling: " + str( aAnchor->GetReference() ) + " is not in the open schematic" );
@@ -1887,18 +2469,13 @@ std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBo
         }
     }
 
-    std::map<int, int> netPads, anchorPads;
+    std::map<int, int> netPads;
+    std::map<int, int> anchorGroups = groupsPerNet( aAnchor );
 
     for( FOOTPRINT* fp : aBoard->Footprints() )
     {
         for( PAD* pad : fp->Pads() )
             netPads[pad->GetNetCode()]++;
-    }
-
-    for( PAD* pad : aAnchor->Pads() )
-    {
-        if( pad->GetNetCode() > 0 )
-            anchorPads[pad->GetNetCode()]++;
     }
 
     struct RAIL_CAPACITOR
@@ -1923,7 +2500,7 @@ std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBo
         const int a = fp->Pads()[0]->GetNetCode(), b = fp->Pads()[1]->GetNetCode();
 
         // across two rails of the anchor
-        if( a == b || !anchorPads.count( a ) || !anchorPads.count( b ) || !rails.count( a ) || !rails.count( b ) )
+        if( a == b || !anchorGroups.count( a ) || !anchorGroups.count( b ) || !rails.count( a ) || !rails.count( b ) )
             continue;
 
         auto at = drawn.find( ref );
@@ -1947,7 +2524,7 @@ std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBo
 
     for( const RAIL_CAPACITOR& c : candidates )
     {
-        if( taken[c.supply] >= anchorPads[c.supply] )
+        if( taken[c.supply] >= anchorGroups[c.supply] )
             continue;
 
         taken[c.supply]++;
@@ -1956,12 +2533,192 @@ std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBo
     }
 
     aNote = { { "chosen", chosen }, { "candidates", candidates.size() },
-              { "by", "capacitors across two rails of the anchor, nearest to it on its schematic sheet, one per supply pad: "
-                      "a guess - check it, or name them in parts" } };
+              { "by", "capacitors across two rails of the anchor, nearest to it on its schematic sheet, one per supply pin "
+                      "group (adjacent pins of a rail count once): a guess - check it, name them in parts, or decoupling: "
+                      "per_pin" } };
     return std::nullopt;
 }
 
 
+/// @brief Decoupling capacitors by supply pin: every C part across a supply rail and a ground goes to
+/// one part on that rail (more than two pads, connectors aside) - the one drawn nearest to it in the
+/// open schematic (on the board when none is open) that still has a supply pin group (adjacent pins
+/// of a rail count once) without one.  Capacitors of 1 uF and more are bulk: one per part and rail.
+/// So a row of capacitors drawn for several ICs is split by count.  The anchor's share is appended
+/// to aParts; aNote lists it.
+void addDecouplingPerPin( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnchor, std::vector<FOOTPRINT*>& aParts,
+                          bool aOverrideLocks, nlohmann::json& aNote )
+{
+    const std::set<int> rails = railNets( aBoard );
+    std::set<int>       grounds;
+
+    for( NETINFO_ITEM* net : aBoard->GetNetInfo() )
+    {
+        if( net->GetNetCode() > 0
+            && KopenapiNetRoleFromName( str( UnescapeString( net->GetNetname() ) ) ).value( "role", "" ) == "ground" )
+        {
+            grounds.insert( net->GetNetCode() );
+        }
+    }
+
+    const std::optional<std::map<std::string, SYMBOL_SPOT>> drawn = schematicSpots( aCtx );
+
+    // the parts on each supply rail with their pin groups on it
+    std::map<int, std::vector<std::pair<FOOTPRINT*, int>>> users;
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        if( fp->Pads().size() <= 2 || isConnector( fp ) )
+            continue;
+
+        for( const auto& [net, groups] : groupsPerNet( fp ) )
+        {
+            if( rails.count( net ) && !grounds.count( net ) )
+                users[net].emplace_back( fp, groups );
+        }
+    }
+
+    struct CAPACITOR
+    {
+        FOOTPRINT* part;
+        int        supply;
+        bool       bulk;
+    };
+
+    std::vector<CAPACITOR> caps;
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        const std::string ref = str( fp->GetReference() );
+
+        if( fp == aAnchor || fp->Pads().size() != 2 || ref.empty() || ref[0] != 'C' || ( fp->IsLocked() && !aOverrideLocks )
+            || std::find( aParts.begin(), aParts.end(), fp ) != aParts.end() )
+        {
+            continue;
+        }
+
+        const int a = fp->Pads()[0]->GetNetCode(), b = fp->Pads()[1]->GetNetCode();
+        const int supply = grounds.count( a ) && !grounds.count( b ) ? b : grounds.count( b ) && !grounds.count( a ) ? a : 0;
+
+        if( supply <= 0 || !rails.count( supply ) || !users.count( supply ) )
+            continue;
+
+        caps.push_back( { fp, supply, faradsOf( fp ).value_or( 0.0 ) >= 1e-6 } );
+    }
+
+    auto padDistance = [&]( FOOTPRINT* aCap, FOOTPRINT* aUser, int aNet )
+    {
+        double nearest = std::numeric_limits<double>::max();
+
+        for( PAD* pad : aUser->Pads() )
+        {
+            if( pad->GetNetCode() == aNet )
+                nearest = std::min( nearest, toMm( ( pad->GetPosition() - aCap->GetPosition() ).EuclideanNorm() ) );
+        }
+
+        return nearest;
+    };
+
+    auto distance = [&]( const CAPACITOR& aCap, FOOTPRINT* aUser )
+    {
+        if( drawn )
+        {
+            auto c = drawn->find( str( aCap.part->GetReference() ) );
+            auto u = drawn->find( str( aUser->GetReference() ) );
+
+            if( c != drawn->end() && u != drawn->end() && c->second.sheet == u->second.sheet )
+                return std::hypot( c->second.x - u->second.x, c->second.y - u->second.y );
+
+            return 1e6 + padDistance( aCap.part, aUser, aCap.supply );
+        }
+
+        return padDistance( aCap.part, aUser, aCap.supply );
+    };
+
+    struct OPTION
+    {
+        double     distance;
+        size_t     cap;
+        FOOTPRINT* user;
+    };
+
+    std::vector<OPTION> options;
+
+    for( size_t i = 0; i < caps.size(); ++i )
+    {
+        for( const auto& [user, groups] : users[caps[i].supply] )
+            options.push_back( { distance( caps[i], user ), i, user } );
+    }
+
+    std::stable_sort( options.begin(), options.end(), []( const OPTION& x, const OPTION& y ) { return x.distance < y.distance; } );
+
+    std::map<std::pair<FOOTPRINT*, int>, int> quota, bulkQuota;
+
+    for( const auto& [net, list] : users )
+    {
+        for( const auto& [user, groups] : list )
+        {
+            quota[{ user, net }] = groups;
+            bulkQuota[{ user, net }] = 1;
+        }
+    }
+
+    std::vector<FOOTPRINT*> owner( caps.size(), nullptr );
+
+    for( const OPTION& o : options )
+    {
+        if( owner[o.cap] )
+            continue;
+
+        int& left = ( caps[o.cap].bulk ? bulkQuota : quota )[{ o.user, caps[o.cap].supply }];
+
+        if( left > 0 )
+        {
+            left--;
+            owner[o.cap] = o.user;
+        }
+    }
+
+    nlohmann::json chosen = nlohmann::json::array();
+    nlohmann::json spare = nlohmann::json::array();
+    const auto     anchorGroups = groupsPerNet( aAnchor );
+
+    for( size_t i = 0; i < caps.size(); ++i )
+    {
+        const std::string ref = str( caps[i].part->GetReference() );
+
+        if( owner[i] == aAnchor )
+        {
+            aParts.push_back( caps[i].part );
+            chosen.push_back( { { "ref", ref }, { "rail", str( UnescapeString( aBoard->FindNet( caps[i].supply )->GetNetname() ) ) },
+                                { "value", str( caps[i].part->GetValue() ) }, { "bulk", caps[i].bulk } } );
+        }
+        else if( !owner[i] && anchorGroups.count( caps[i].supply ) )
+        {
+            spare.push_back( ref );
+        }
+    }
+
+    nlohmann::json groups = nlohmann::json::object();
+
+    for( const auto& [net, count] : anchorGroups )
+    {
+        if( rails.count( net ) && !grounds.count( net ) )
+            groups[str( UnescapeString( aBoard->FindNet( net )->GetNetname() ) )] = count;
+    }
+
+    aNote = { { "chosen", chosen }, { "supply_pin_groups", groups }, { "by", drawn ? "schematic distance" : "board distance" },
+              { "rule", "one capacitor under 1 uF per supply pin group (adjacent pins of a rail count once) and one bulk "
+                        "capacitor per rail, each capacitor to the part on its rail nearest to it with a share left" } };
+
+    if( !spare.empty() )
+        aNote["unassigned"] = spare;
+}
+
+
+/// @brief The parts of a group request: named ones, or (none named) every unlocked part with a pad on a
+/// small net of the anchor (at most max_net_pads pads on the board: a crystal and its capacitors,
+/// pull-ups, a feedback divider - not everything on the rails)
 std::optional<KOPENAPI_RESULT> groupParts( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, const nlohmann::json& aGroup,
                                            FOOTPRINT*& aAnchor, std::vector<FOOTPRINT*>& aParts, bool aOverrideLocks )
 {
@@ -2284,6 +3041,9 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
 
             nearOptions( m, options );
             options.hostRingMm = std::max( 0.0, options.hostRingMm );
+
+            if( const auto heights = heightsIfRoomUnder( board, { fp } ); heights.count( fp ) )
+                options.partHeight = heights.at( fp );
 
             const NEAR_PLACEMENT placement = placeNear( board, fp, target, options );
 
@@ -2903,7 +3663,8 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         BOARD_COMMIT   groupCommit( context->GetToolManager() );
         nlohmann::json row = nlohmann::json::object();
 
-        placeGroup( board, groupCommit, anchor, parts, options, group.value( "side", std::string( "same" ) ) == "opposite", row,
+        placeGroup( board, groupCommit, anchor, parts, options, group.value( "side", std::string( "same" ) ) == "opposite",
+                    group.value( "decap_max_mm", 3.0 ), row,
                     placed );
         groupCommit.Push( _( "Place group (API)" ) );
         groups.push_back( row );
@@ -3013,52 +3774,116 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( !context )
         return KopenapiNoBoard();
 
-    BOARD*                  board = context->GetBoard();
-    FOOTPRINT*              anchor = nullptr;
-    std::vector<FOOTPRINT*> parts;
-    NEAR_OPTIONS            options;
-
-    if( std::optional<KOPENAPI_RESULT> error = groupParts( aCtx, board, aArgs, anchor, parts, aArgs.value( "override_locks", false ) ) )
-        return *error;
-
-    if( std::optional<std::string> wrong = nearOptions( aArgs, options, 1.0 ) )
-        return KOPENAPI_RESULT::Error( 400, *wrong );
-
-    nlohmann::json decoupling;
-
-    if( aArgs.contains( "decoupling" ) )
-    {
-        if( aArgs["decoupling"] != "schematic" )
-            return KOPENAPI_RESULT::Error( 400, "decoupling: \"schematic\" (guess the anchor's rail capacitors from the open schematic)" );
-
-        if( std::optional<KOPENAPI_RESULT> error = addDecoupling( aCtx, board, anchor, parts, aArgs.value( "override_locks", false ),
-                                                                  decoupling ) )
-        {
-            return *error;
-        }
-    }
-
-    const std::string side = aArgs.value( "side", std::string( "same" ) );
+    BOARD*            board = context->GetBoard();
+    const bool        batch = aArgs.contains( "groups" );
+    const bool        overrideLocks = aArgs.value( "override_locks", false );
     const std::string onCopperMode = aArgs.value( "on_copper", std::string( "report" ) );
 
     if( onCopperMode != "report" && onCopperMode != "refuse" && onCopperMode != "rip" )
         return KOPENAPI_RESULT::Error( 400, "on_copper: report, refuse or rip" );
 
-    if( side != "same" && side != "opposite" )
-        return KOPENAPI_RESULT::Error( 400, "side: same (as the anchor) or opposite (under it, on the other side of the board)" );
+    if( batch == aArgs.contains( "anchor" ) )
+        return KOPENAPI_RESULT::Error( 400, "give anchor (one block) or groups (several, in order), not both" );
 
-    if( parts.empty() )
-        return KOPENAPI_RESULT::Error( 422, "no parts: none named, none found in the schematic block and none on a small net of "
-                                                    + str( anchor->GetReference() ) + " (name them: parts)" );
+    if( batch && ( !aArgs["groups"].is_array() || aArgs["groups"].empty() ) )
+        return KOPENAPI_RESULT::Error( 400, "groups: [{anchor, parts | from_schematic, decoupling, ...}, ...]" );
 
-    BOARD_COMMIT      commit( context->GetToolManager() );
-    std::vector<KIID> moved;
-    nlohmann::json    out = nlohmann::json::object();
+    const nlohmann::json      specs = batch ? aArgs["groups"] : nlohmann::json::array( { aArgs } );
+    BOARD_COMMIT              commit( context->GetToolManager() );
+    std::vector<KIID>         moved;
+    std::set<const FOOTPRINT*> movedFps;
+    nlohmann::json            rows = nlohmann::json::array();
 
-    placeGroup( board, commit, anchor, parts, options, side == "opposite", out, moved );
+    for( size_t i = 0; i < specs.size(); ++i )
+    {
+        const nlohmann::json&   spec = specs[i];
+        const std::string       where = batch ? "groups/" + std::to_string( i ) + ": " : "";
+        FOOTPRINT*              anchor = nullptr;
+        std::vector<FOOTPRINT*> parts;
+        NEAR_OPTIONS            options;
 
-    if( !decoupling.is_null() )
-        out["decoupling"] = decoupling;
+        auto fail = [&]( const KOPENAPI_RESULT& aError )
+        {
+            commit.Revert();
+            KOPENAPI_RESULT error = aError;
+
+            if( batch && error.body.contains( "error" ) && error.body["error"].value( "message", nlohmann::json() ).is_string() )
+                error.body["error"]["message"] = where + error.body["error"]["message"].get<std::string>();
+
+            return error;
+        };
+
+        if( std::optional<KOPENAPI_RESULT> error = groupParts( aCtx, board, spec, anchor, parts, overrideLocks ) )
+            return fail( *error );
+
+        // a block of a batch leaves the parts an earlier block placed where they are, unless it names them
+        if( batch && !spec.contains( "parts" ) )
+        {
+            std::erase_if( parts, [&]( FOOTPRINT* fp ) { return movedFps.count( fp ) > 0; } );
+        }
+
+        if( std::optional<std::string> wrong = nearOptions( spec, options, 1.0 ) )
+            return fail( KOPENAPI_RESULT::Error( 400, *wrong ) );
+
+        const std::string side = spec.value( "side", std::string( "same" ) );
+        const double      decapMax = spec.value( "decap_max_mm", 3.0 );
+
+        if( side != "same" && side != "opposite" )
+            return fail( KOPENAPI_RESULT::Error( 400, "side: same (as the anchor) or opposite (under it, on the other side of the board)" ) );
+
+        nlohmann::json decoupling;
+
+        if( spec.contains( "decoupling" ) )
+        {
+            if( spec["decoupling"] == "per_pin" )
+            {
+                addDecouplingPerPin( aCtx, board, anchor, parts, overrideLocks, decoupling );
+            }
+            else if( spec["decoupling"] == "schematic" )
+            {
+                if( std::optional<KOPENAPI_RESULT> error = addDecoupling( aCtx, board, anchor, parts, overrideLocks, decoupling ) )
+                    return fail( *error );
+            }
+            else
+            {
+                return fail( KOPENAPI_RESULT::Error( 400, "decoupling: \"per_pin\" (each supply pin group of the anchor its share of "
+                                                          "its rail's capacitors) or \"schematic\" (the capacitors drawn nearest to it)" ) );
+            }
+        }
+
+        nlohmann::json out = nlohmann::json::object();
+
+        if( parts.empty() )
+        {
+            if( !batch )
+            {
+                return fail( KOPENAPI_RESULT::Error( 422, "no parts: none named, none found in the schematic block and none on a small "
+                                                          "net of " + str( anchor->GetReference() ) + " (name them: parts)" ) );
+            }
+
+            out = { { "anchor", str( anchor->GetReference() ) }, { "placed", nlohmann::json::array() },
+                    { "unplaced", nlohmann::json::array() }, { "note", "no parts left for this block" } };
+        }
+        else
+        {
+            const size_t before = moved.size();
+
+            placeGroup( board, commit, anchor, parts, options, side == "opposite", decapMax, out, moved );
+
+            for( size_t k = before; k < moved.size(); ++k )
+            {
+                if( FOOTPRINT* fp = dynamic_cast<FOOTPRINT*>( board->ResolveItem( moved[k], true ) ) )
+                    movedFps.insert( fp );
+            }
+        }
+
+        if( !decoupling.is_null() )
+            out["decoupling"] = decoupling;
+
+        rows.push_back( out );
+    }
+
+    nlohmann::json out = batch ? nlohmann::json( { { "groups", rows } } ) : rows[0];
 
     if( moved.empty() )
     {
@@ -3066,11 +3891,6 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
         out["applied"] = false;
         return KOPENAPI_RESULT::Ok( out );
     }
-
-    std::set<const FOOTPRINT*> movedFps;
-
-    for( FOOTPRINT* part : parts )
-        movedFps.insert( part );
 
     if( aArgs.value( "dry_run", false ) )
     {
@@ -3090,7 +3910,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     const nlohmann::json conflictsBefore = copperConflicts( board, movedFps );
 
-    commit.Push( _( "Place group (API)" ) );
+    commit.Push( batch ? _( "Place groups (API)" ) : _( "Place group (API)" ) );
     refreshGui( aCtx, board );
     glow( aCtx, moved );
 
@@ -3108,34 +3928,234 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
 }
 
 
+static const char* PLACE_GROUP_BLOCK = R"json({
+    "anchor":{"type":"string","description":"reference of the main part; it does not move"},
+    "parts":{"type":"array","items":{"type":"string"}},
+    "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
+    "depth":{"type":"integer","description":"from_schematic: how far sch_subcircuit grows (default 2)"},
+    "decoupling":{"type":"string","enum":["per_pin","schematic"],"description":"add the anchor's decoupling capacitors: per_pin - each supply pin group of the anchor (adjacent pins of a rail count once) one capacitor under 1 uF of its rail plus one bulk per rail, the rail's capacitors split among the parts on it by count, each to the part drawn nearest to it (schematic if open, else board); schematic - C parts across two of its rails drawn nearest to it on its sheet, one per supply pin group (a guess). The answer's decoupling.chosen lists them"},
+    "decap_max_mm":{"type":"number","default":3,"description":"a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far"},
+    "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
+    "side":{"type":"string","enum":["same","opposite"],"default":"same"},
+    "gap_mm":{"type":"number","default":1.0,"description":"between courtyards (room for tracks between the parts; TC-13 2 layers: 0.5 mm routed 68 of 81, 1.0 mm 73); by default a part that finds no place at 1.0 mm takes 0.5"},
+    "fanout_ring_mm":{"type":"number","description":"keep this far from the anchor's courtyard (room for the tracks leaving its pins); default 1.0 for a fine-pitch anchor (pads 0.65 mm apart or closer), else 0; parts that find no place with it come as close as the courtyards allow"},
+    "max_mm":{"type":"number","default":25,"description":"how far from the anchor's pad a part may end up"}})json";
+
+
+static nlohmann::json placeGroupSchema()
+{
+    nlohmann::json block = nlohmann::json::parse( PLACE_GROUP_BLOCK );
+    nlohmann::json props = block;
+
+    props["groups"] = { { "type", "array" },
+                        { "description", "several blocks in one call and one undo step, placed in this order (a block "
+                                         "sees the ones before it; parts an earlier block placed stay unless named)" },
+                        { "items", { { "type", "object" }, { "required", { "anchor" } }, { "properties", block } } } };
+    props["override_locks"] = { { "type", "boolean" }, { "default", false } };
+    props["on_copper"] = nlohmann::json::parse( R"json({"type":"string","enum":["report","refuse","rip"],"default":"report","description":"the moved pads under or within clearance (DRC rules) of other nets' tracks, vias, pads or zone fills: report lists them as copper_conflicts (ok false); refuse moves nothing (applied false, the conflicts listed); rip removes the conflicting unlocked tracks and vias in the same undo step (ripped) and lists the connections that opened (opened); zone fills are listed, refill with pcb_zones_fill"})json" );
+    props["dry_run"] = { { "type", "boolean" }, { "default", false } };
+
+    return { { "type", "object" }, { "properties", props } };
+}
+
+
 KOPENAPI_REGISTER( "pcb_place_group",
                    "Place the parts of a functional block around its main part (anchor), each next to the "
                    "anchor pad it belongs to and turned so its own pad faces it: a crystal and its "
                    "capacitors at the oscillator pins, pull-ups at their pins, a regulator's parts, and "
-                   "decoupling capacitors - each at its own supply pin (a part between two nets of the "
-                   "anchor takes a free supply pad with the nearest ground pad). parts: the references "
+                   "decoupling capacitors - each at its own supply pin group, smallest value first (a part "
+                   "between two rails of the anchor takes a free supply pad with the nearest ground pad). "
+                   "Rails are told by role (ground / power names, power pins), never by pad count: a "
+                   "summing or bias net with many pads is a signal of the block. parts: the references "
                    "(e.g. from sch_subcircuit); without it, every unlocked part (connectors aside) on a small "
                    "net of the anchor (max_net_pads); from_schematic: the members of the anchor's block in the "
                    "open schematic. A part bound to a member rather than to the anchor goes next to that "
-                   "member. decoupling: \"schematic\" adds the rail capacitors drawn nearest to the anchor (a guess, "
-                   "listed in the answer). side opposite: on the other side of the board, under the pads. "
+                   "member, or to a part placed at the anchor by an earlier call. decoupling: per_pin / "
+                   "schematic (listed in the answer). Parts stay inside the board outline; a part low enough "
+                   "(3D model) may go under a footprint with the field max_height_under_mm (a daughterboard "
+                   "over its headers: only its pads are in the way; the row says under). side opposite: on "
+                   "the other side of the board, under the pads. groups: several blocks in one call, in order. "
                    "One undo step; answers per part the target pad, pad distance, position, and the "
                    "placement check",
-                   R"json({"type":"object","required":["anchor"],"properties":{
-                        "anchor":{"type":"string","description":"reference of the main part; it does not move"},
-                        "parts":{"type":"array","items":{"type":"string"}},
-                        "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
-                        "depth":{"type":"integer","description":"from_schematic: how far sch_subcircuit grows (default 2)"},
-                        "decoupling":{"type":"string","enum":["schematic"],"description":"add the anchor's decoupling capacitors guessed from the open schematic: C parts across two of its rails, nearest to it on its sheet, one per supply pad (the answer's decoupling.chosen lists them)"},
-                        "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
-                        "side":{"type":"string","enum":["same","opposite"],"default":"same"},
-                        "gap_mm":{"type":"number","default":1.0,"description":"between courtyards (room for tracks between the parts; TC-13 2 layers: 0.5 mm routed 68 of 81, 1.0 mm 73); by default a part that finds no place at 1.0 mm takes 0.5"},
-                        "fanout_ring_mm":{"type":"number","description":"keep this far from the anchor's courtyard (room for the tracks leaving its pins); default 1.0 for a fine-pitch anchor (pads 0.65 mm apart or closer), else 0; parts that find no place with it come as close as the courtyards allow"},
-                        "max_mm":{"type":"number","default":25,"description":"how far from the anchor's pad a part may end up"},
+                   placeGroupSchema(), false, h_pcb_place_group, 120 );
+
+static KOPENAPI_RESULT h_pcb_place_legalize( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*              board = context->GetBoard();
+    KOPENAPI_REF_FILTER filter( aArgs );
+    const double        gap = aArgs.value( "gap_mm", 0.1 );
+    const double        maxMm = aArgs.value( "max_mm", 5.0 );
+    const bool          overrideLocks = aArgs.value( "override_locks", false );
+
+    if( !filter.Error().empty() )
+        return KOPENAPI_RESULT::Error( 400, filter.Error() );
+
+    if( gap < 0 || gap > 5 || maxMm <= 0 || maxMm > 50 )
+        return KOPENAPI_RESULT::Error( 400, "gap_mm 0 … 5, max_mm up to 50" );
+
+    std::vector<FOOTPRINT*> all( board->Footprints().begin(), board->Footprints().end() );
+    std::map<FOOTPRINT*, bool> movable;
+
+    for( FOOTPRINT* fp : all )
+        movable[fp] = ( !fp->IsLocked() || overrideLocks ) && filter.Match( str( fp->GetReference() ) );
+
+    const std::map<const FOOTPRINT*, double> heights = heightsIfRoomUnder( board, all );
+    BOARD_COMMIT                             commit( context->GetToolManager() );
+    std::map<FOOTPRINT*, VECTOR2I>           from;
+    std::map<std::string, nlohmann::json>    stuck;
+
+    // the mover of a pair: a part that may move, not a connector if the other may, the smaller one
+    auto mover = [&]( FOOTPRINT* aA, FOOTPRINT* aB ) -> FOOTPRINT*
+    {
+        if( !movable[aA] || !movable[aB] )
+            return movable[aA] ? aA : movable[aB] ? aB : nullptr;
+
+        if( isConnector( aA ) != isConnector( aB ) )
+            return isConnector( aA ) ? aB : aA;
+
+        return courtyard( aA ).Area() <= courtyard( aB ).Area() ? aA : aB;
+    };
+
+    for( int round = 0; round < 6; ++round )
+    {
+        const nlohmann::json report = placementReport( board );
+        std::set<FOOTPRINT*> movedNow;
+        bool                 progress = false;
+
+        for( const nlohmann::json& row : report["courtyard_overlaps"] )
+        {
+            FOOTPRINT* a = findFootprint( board, row.value( "a", std::string() ) );
+            FOOTPRINT* b = findFootprint( board, row.value( "b", std::string() ) );
+
+            if( !a || !b )
+                continue;
+
+            const std::string key = row["a"].get<std::string>() + "|" + row["b"].get<std::string>();
+            FOOTPRINT*        part = mover( a, b );
+
+            if( !part )
+            {
+                stuck[key] = { { "a", row["a"] }, { "b", row["b"] }, { "reason", "neither may move (locked, or not in ref / refs)" } };
+                continue;
+            }
+
+            if( movedNow.count( a ) || movedNow.count( b ) )
+                continue;
+
+            auto tryMove = [&]( FOOTPRINT* aPart ) -> std::optional<double>
+            {
+                if( !from.count( aPart ) )
+                {
+                    commit.Modify( aPart );
+                    from[aPart] = aPart->GetPosition();
+                }
+
+                auto h = heights.find( aPart );
+                return nudge( board, aPart, gap, maxMm, h == heights.end() ? std::nullopt : std::optional<double>( h->second ) );
+            };
+
+            std::optional<double> moved = tryMove( part );
+            FOOTPRINT*            other = part == a ? b : a;
+
+            // the other one, when it may move and the first finds no place
+            if( !moved && movable[other] )
+            {
+                moved = tryMove( other );
+
+                if( moved )
+                    part = other;
+            }
+
+            if( !moved )
+            {
+                stuck[key] = { { "a", row["a"] }, { "b", row["b"] }, { "moving", str( part->GetReference() ) },
+                               { "reason", "no free place within max_mm" } };
+                continue;
+            }
+
+            stuck.erase( key );
+
+            if( *moved > 0 )
+            {
+                movedNow.insert( part );
+                progress = true;
+            }
+        }
+
+        if( !progress )
+            break;
+    }
+
+    nlohmann::json            rows = nlohmann::json::array();
+    std::vector<KIID>         moved;
+    std::set<const FOOTPRINT*> movedFps;
+
+    for( const auto& [fp, start] : from )
+    {
+        if( fp->GetPosition() == start )
+            continue;
+
+        rows.push_back( { { "ref", str( fp->GetReference() ) },
+                          { "from_mm", { toMm( start.x ), toMm( start.y ) } },
+                          { "to_mm", { toMm( fp->GetPosition().x ), toMm( fp->GetPosition().y ) } },
+                          { "moved_mm", std::round( toMm( ( fp->GetPosition() - start ).EuclideanNorm() ) * 100 ) / 100 } } );
+        moved.push_back( fp->m_Uuid );
+        movedFps.insert( fp );
+    }
+
+    std::sort( rows.begin(), rows.end(), []( const nlohmann::json& x, const nlohmann::json& y )
+               { return KopenapiNaturalLess( x["ref"].get<std::string>(), y["ref"].get<std::string>() ); } );
+
+    nlohmann::json left = nlohmann::json::array();
+
+    for( const auto& [key, row] : stuck )
+        left.push_back( row );
+
+    nlohmann::json out = { { "moved", rows }, { "moved_count", rows.size() }, { "left", left } };
+
+    if( !filter.Empty() && !filter.Unmatched().empty() )
+        out["unmatched"] = filter.Unmatched();
+
+    if( moved.empty() || aArgs.value( "dry_run", false ) )
+    {
+        commit.Revert();
+        out["applied"] = false;
+        return KOPENAPI_RESULT::Ok( out );
+    }
+
+    commit.Push( _( "Legalize placement (API)" ) );
+    refreshGui( aCtx, board );
+    glow( aCtx, moved );
+
+    out["applied"] = true;
+    out["check"] = placementReport( board, &movedFps );
+    out["courtyard_overlaps_left"] = placementReport( board )["courtyard_overlaps"].size();
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
+KOPENAPI_REGISTER( "pcb_place_legalize",
+                   "Take parts off courtyard overlaps by the least move: for each overlapping pair one part moves "
+                   "(one that may: unlocked and in ref / refs; not a connector when the other may move; else the "
+                   "smaller) to the nearest spot clear of every courtyard (gap_mm) and inside the board outline, "
+                   "its rotation kept, a few rounds until nothing overlaps. A part low enough may stay under a "
+                   "footprint with room under it (field max_height_under_mm). One undo step; answers moved "
+                   "(from, to, moved_mm), left (pairs it could not part, why), the placement check of the moved "
+                   "parts (copper conflicts included) and courtyard_overlaps_left",
+                   R"json({"type":"object","properties":{
+                        "ref":{"type":"string","description":"glob of the parts that may move (braces, !glob exclusions); default every unlocked part"},
+                        "refs":{"type":"array","items":{"type":"string"}},
+                        "gap_mm":{"type":"number","default":0.1,"description":"clearance between courtyards after the move"},
+                        "max_mm":{"type":"number","default":5,"description":"the farthest a part may move"},
                         "override_locks":{"type":"boolean","default":false},
-                        "on_copper":{"type":"string","enum":["report","refuse","rip"],"default":"report","description":"the moved pads under or within clearance (DRC rules) of other nets' tracks, vias, pads or zone fills: report lists them as copper_conflicts (ok false); refuse moves nothing (applied false, the conflicts listed); rip removes the conflicting unlocked tracks and vias in the same undo step (ripped) and lists the connections that opened (opened); zone fills are listed, refill with pcb_zones_fill"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
-                   false, h_pcb_place_group, 120 );
+                   false, h_pcb_place_legalize, 120 );
+
 
 KOPENAPI_REGISTER( "pcb_footprint_move",
                    "Place footprints: several at once in one undo step - position (mm) of the origin, the "
@@ -3156,6 +4176,7 @@ KOPENAPI_REGISTER( "pcb_footprint_move",
                             "with":{"type":"array","items":{"type":"string"},"description":"references that keep their place relative to this footprint: they turn about its origin and shift with it (a placed block moves as one)"},
                             "near":{"type":"string","description":"REF.PAD of another part: place this one next to that pad (instead of x_mm / y_mm); with side bottom / top it may sit under the pad on the other side"},
                             "near_pad":{"type":"string","description":"near: the pad of this part to bring to the target (default: its pad on the target's net)"},
+                            "fanout_ring_mm":{"type":"number","default":0,"description":"near: keep this far from the target footprint's courtyard (room for the tracks leaving its pins)"},
                             "near_direction":{"type":"string","enum":["auto","left","right","up","down"],"default":"auto","description":"near: which way from the target pad (on the board); auto tries all four, the side the pad is on first"},
                             "gap_mm":{"type":"number","default":0.25,"description":"near: gap between courtyards"},
                             "max_mm":{"type":"number","default":25,"description":"near: give up beyond this pad-to-pad distance"},
