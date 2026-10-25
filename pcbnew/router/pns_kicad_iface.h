@@ -122,6 +122,10 @@ public:
     PNS::RULE_RESOLVER* GetRuleResolver() override;
     PNS::DEBUG_DECORATOR* GetDebugDecorator() override;
 
+    /// @brief The rule resolver's clearance lookups past its caches and the rule evaluations they took
+    int64_t ClearanceLookups() const;
+    int64_t RuleEvaluations() const;
+
     std::vector<LENGTH_DELAY_CALCULATION_ITEM> GetLengthDelayCalculationItems( const PNS::ITEM_SET& aLine,
                                                                                const NETCLASS*      aNetClass ) const;
 

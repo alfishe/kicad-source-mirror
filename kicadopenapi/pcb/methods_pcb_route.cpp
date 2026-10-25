@@ -603,6 +603,8 @@ struct ROUTE_PROFILE
     double syncMs = 0;    ///< the router's world built from the board
     double moveMs = 0;    ///< the router's path search (every Move of the head)
     double totalMs = 0;   ///< whole attempts (world, routing, guard, commit)
+    int64_t clearanceLookups = 0;   ///< the router's clearances looked up past its caches
+    int64_t ruleEvaluations = 0;    ///< ... and the design rule evaluations they took
 
     struct TALLY
     {
@@ -1277,6 +1279,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
 
     std::optional<bool> early;
     KopenapiCompute( [&]() { early = search(); } );
+
+    profile.clearanceLookups += iface->ClearanceLookups();
+    profile.ruleEvaluations += iface->RuleEvaluations();
 
     if( early )
         return *early;
@@ -6842,6 +6847,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
                               { "profile", { { "attempts", profile.attempts },
                                              { "dead_legs_skipped", profile.deadLegsSkipped },
+                                             { "clearance_lookups", profile.clearanceLookups },
+                                             { "rule_evaluations", profile.ruleEvaluations },
                                              { "via_spots_blocked", profile.viaSpotsBlocked },
                                              { "via_spots_off_board", profile.viaSpotsOffBoard },
                                              { "rip_ups_skipped", profile.ripUpsSkipped },
@@ -9905,7 +9912,8 @@ KOPENAPI_REGISTER( "pcb_route",
                    "(other_nets_moved: pieces and length before / after); a row still routed at the end is "
                    "joined by copper; per connection "
                    "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
-                   "profile (attempts; dead_legs_skipped / via_spots_blocked / rip_ups_skipped / rip_ups_walled: tries not made; "
+                   "profile (attempts; clearance_lookups / rule_evaluations: the router's clearances past its caches and the design "
+                   "rule evaluations they took; dead_legs_skipped / via_spots_blocked / rip_ups_skipped / rip_ups_walled: tries not made; "
                    "rip_ups_planned: rip-ups whose routes a plan chose; rip_ups_second: routes taken out that had no way back "
                    "and moved others in turn; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at); "
