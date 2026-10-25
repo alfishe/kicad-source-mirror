@@ -1913,7 +1913,7 @@ SHOVE::SHOVE_STATUS SHOVE::shoveMainLoop()
 
         m_iter++;
 
-        if( st == SH_INCOMPLETE || timeLimit.Expired() || m_iter >= iterLimit )
+        if( st == SH_INCOMPLETE || timeLimit.Expired() || m_iter >= iterLimit || Settings().StopRequested() )
         {
             PNS_DBG( Dbg(), Message, wxString::Format( "Fail [time limit expired: %d iter %d iter limit %d",
                                                timeLimit.Expired()?1:0, m_iter, iterLimit ) );
