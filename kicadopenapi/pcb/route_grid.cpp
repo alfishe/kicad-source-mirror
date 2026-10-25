@@ -142,13 +142,7 @@ struct WORLD
     int                            slack = 0;
     SHAPE_POLY_SET                 outline;
 
-    /// @brief An end let out by the second lattice: copper from inside its pad to a cell of the grid
-    struct EXIT
-    {
-        int        end = 0;
-        uint32_t   state = 0;   ///< the grid state the copper ends on
-        GRID_TRACK track;
-    };
+    using EXIT = GRID_EXIT;
 
     struct NET
     {
@@ -3612,24 +3606,8 @@ GRID_NET_RESULT toGeometry( const WORLD& aWorld, const GRID_PARAMS& aParams, con
 {
     GRID_NET_RESULT out = GridPathGeometry( aWorld.grid, aWorld.cells, aParams.layers, aNet.paths, aNet.reached );
 
-    if( aIndex >= aWorld.nets.size() )
-        return out;
-
-    // an exit's copper where the net's copper starts on its cell
-    for( const WORLD::EXIT& exit : aWorld.nets[aIndex].exits )
-    {
-        const bool used = std::any_of( aNet.paths.begin(), aNet.paths.end(),
-                                       [&]( const std::vector<uint32_t>& p ) { return std::count( p.begin(), p.end(), exit.state ) > 0; } );
-
-        if( !used )
-            continue;
-
-        for( size_t k = 1; k < exit.track.points.size(); ++k )
-            out.length += ( exit.track.points[k] - exit.track.points[k - 1] ).EuclideanNorm();
-
-        out.tracks.push_back( exit.track );
-        out.halfCellExits.push_back( exit.end );
-    }
+    if( aIndex < aWorld.nets.size() )
+        GridAddExits( out, aWorld.nets[aIndex].exits, aNet.paths );
 
     return out;
 }
@@ -4104,6 +4082,9 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         {
             lane.world = print;
 
+            for( const WORLD::NET& n : world.nets )
+                lane.exits.push_back( n.exits );
+
             // the tiles the edit changed, and one around each
             const std::vector<uint64_t>& now = tiles;
             std::vector<bool>           edited( now.size(), false );
@@ -4162,7 +4143,10 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         tl->lanes.resize( runs.size() );
 
         for( const WORLD::NET& n : world.nets )
+        {
             tl->netCodes.push_back( n.code );
+            tl->exits.push_back( n.exits );
+        }
 
         tl->world = print;
         tl->rules = rules;

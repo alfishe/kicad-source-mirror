@@ -62,9 +62,9 @@ nlohmann::json stepJson( const GRID_TIMELINE& aT, const GRID_STEP& aStep, size_t
 }
 
 
-nlohmann::json pathJson( const GRID_TIMELINE& aT, const GRID_PATH& aPath )
+nlohmann::json pathJson( const GRID_TIMELINE& aT, const GRID_LANE& aLane, int aNet, const GRID_PATH& aPath )
 {
-    const GRID_NET_RESULT g = aT.Geometry( aPath );
+    const GRID_NET_RESULT g = aT.Geometry( aLane, aNet, aPath );
     nlohmann::json        tracks = nlohmann::json::array();
     nlohmann::json        vias = nlohmann::json::array();
 
@@ -308,7 +308,7 @@ KOPENAPI_RESULT timelineQuery( const std::shared_ptr<GRID_TIMELINE>& t, const nl
         nlohmann::json row = { { "net", t->netNames[n] }, { "path", now[n] } };
 
         if( geometry )
-            row.update( pathJson( *t, L.paths[now[n]] ) );
+            row.update( pathJson( *t, L, (int) n, L.paths[now[n]] ) );
 
         changed.push_back( row );
     }

@@ -106,6 +106,14 @@ struct GRID_TRACK
     std::vector<VECTOR2I> points;
 };
 
+/// @brief An end let out by the second lattice: copper from inside its pad to a cell of the grid
+struct GRID_EXIT
+{
+    int        end = 0;
+    uint32_t   state = 0;   ///< the grid state the copper ends on
+    GRID_TRACK track;
+};
+
 /// @brief An end that fixed copper walls in: the room it has and what closes it
 struct GRID_WALL
 {

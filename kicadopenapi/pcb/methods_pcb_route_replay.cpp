@@ -517,12 +517,12 @@ private:
         aEvent.Skip();
     }
 
-    const GRID_NET_RESULT& geometry( uint32_t aPath )
+    const GRID_NET_RESULT& geometry( int aNet, uint32_t aPath )
     {
         auto it = m_geometry.find( aPath );
 
         if( it == m_geometry.end() )
-            it = m_geometry.emplace( aPath, m_timeline->Geometry( lane().paths[aPath] ) ).first;
+            it = m_geometry.emplace( aPath, m_timeline->Geometry( lane(), aNet, lane().paths[aPath] ) ).first;
 
         return it->second;
     }
@@ -704,7 +704,7 @@ void REPLAY::Redraw()
 
         double width, via;
         netSizes( aNet, width, via );
-        const GRID_NET_RESULT& g = geometry( m_table[aNet] );
+        const GRID_NET_RESULT& g = geometry( aNet, m_table[aNet] );
 
         ov.SetIsFill( false );
         ov.SetIsStroke( true );
