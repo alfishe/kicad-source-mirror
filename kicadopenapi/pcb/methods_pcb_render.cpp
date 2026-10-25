@@ -19,6 +19,12 @@
 #include <jobs/job_export_pcb_png.h>
 #include <jobs/job_pcb_render.h>
 #include <kicadopenapi_image.h>
+#include <kicadopenapi_util.h>
+#include <pad.h>
+#include <pcbnew_settings.h>
+#include <settings/color_settings.h>
+#include <settings/settings_manager.h>
+#include <string_utils.h>
 #include <kiway.h>
 #include <pcbnew_jobs_handler.h>
 #include <reporter.h>
@@ -30,8 +36,11 @@
 #include <climits>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
+#include <limits>
 #include <map>
 #include <optional>
+#include <set>
 
 
 namespace
@@ -290,6 +299,175 @@ static int drawRatsnest( BOARD* aBoard, wxImage& aImage, const BOX2I& aWindow, d
 }
 
 
+/// @brief Pixels covered by a polygon set (outlines with their holes, even-odd per polygon) are set
+/// in aMask; aToPx maps board units to pixel coordinates
+static void fillMask( const SHAPE_POLY_SET& aShape, std::vector<uint8_t>& aMask, int aW, int aH,
+                      const std::function<VECTOR2D( const VECTOR2I& )>& aToPx )
+{
+    struct EDGE
+    {
+        double x0, y0, x1, y1;
+    };
+
+    for( int o = 0; o < aShape.OutlineCount(); ++o )
+    {
+        std::vector<EDGE> edges;
+        double            top = std::numeric_limits<double>::max(), bottom = -top;
+
+        for( int c = -1; c < aShape.HoleCount( o ); ++c )
+        {
+            const SHAPE_LINE_CHAIN& chain = c < 0 ? aShape.COutline( o ) : aShape.CHole( o, c );
+            const int               n = chain.PointCount();
+
+            for( int i = 0; i < n; ++i )
+            {
+                const VECTOR2D a = aToPx( chain.CPoint( i ) ), b = aToPx( chain.CPoint( ( i + 1 ) % n ) );
+
+                if( a.y == b.y )
+                    continue;
+
+                edges.push_back( { a.x, a.y, b.x, b.y } );
+                top = std::min( { top, a.y, b.y } );
+                bottom = std::max( { bottom, a.y, b.y } );
+            }
+        }
+
+        if( edges.empty() )
+            continue;
+
+        // rows by pixel centre; edges sorted by their upper end and swept
+        std::sort( edges.begin(), edges.end(),
+                   []( const EDGE& a, const EDGE& b ) { return std::min( a.y0, a.y1 ) < std::min( b.y0, b.y1 ); } );
+
+        const int           y0 = std::max( 0, (int) std::floor( top ) ), y1 = std::min( aH - 1, (int) std::ceil( bottom ) );
+        size_t              next = 0;
+        std::vector<size_t> active;
+        std::vector<double> xs;
+
+        for( int y = y0; y <= y1; ++y )
+        {
+            const double cy = y + 0.5;
+
+            while( next < edges.size() && std::min( edges[next].y0, edges[next].y1 ) <= cy )
+                active.push_back( next++ );
+
+            std::erase_if( active, [&]( size_t e ) { return std::max( edges[e].y0, edges[e].y1 ) <= cy; } );
+            xs.clear();
+
+            for( size_t e : active )
+            {
+                const EDGE& g = edges[e];
+
+                if( std::min( g.y0, g.y1 ) <= cy && cy < std::max( g.y0, g.y1 ) )
+                    xs.push_back( g.x0 + ( cy - g.y0 ) * ( g.x1 - g.x0 ) / ( g.y1 - g.y0 ) );
+            }
+
+            std::sort( xs.begin(), xs.end() );
+
+            for( size_t k = 0; k + 1 < xs.size(); k += 2 )
+            {
+                const int xa = std::max( 0, (int) std::ceil( xs[k] - 0.5 ) );
+                const int xb = std::min( aW - 1, (int) std::floor( xs[k + 1] - 0.5 ) );
+
+                for( int x = xa; x <= xb; ++x )
+                    aMask[(size_t) y * aW + x] = 1;
+            }
+        }
+    }
+}
+
+
+/// @brief highlight_nets: the copper of these nets (tracks, vias, pads, zone fills on the drawn
+/// copper layers) stays as drawn, the rest of the image fades toward the background by aDim.
+/// Returns {nets, items}
+static nlohmann::json highlightNets( BOARD* aBoard, const std::set<int>& aNets, const LSET& aLayers, wxImage& aImage,
+                                     const BOX2I& aWindow, double aPxPerIU, bool aMirror, const KIGFX::COLOR4D& aBackground,
+                                     double aDim )
+{
+    const int            w = aImage.GetWidth(), h = aImage.GetHeight();
+    std::vector<uint8_t> mask( (size_t) w * h, 0 );
+    const int            maxError = std::max( 1, KiROUND( 0.25 / aPxPerIU ) );
+    BOX2I                window = aWindow;
+    int                  items = 0;
+
+    window.Inflate( maxError );
+
+    auto toPx = [&]( const VECTOR2I& aAt )
+    {
+        const double x = aMirror ? aWindow.GetRight() - aAt.x : aAt.x - aWindow.GetLeft();
+        return VECTOR2D( x * aPxPerIU, ( aAt.y - aWindow.GetTop() ) * aPxPerIU );
+    };
+
+    auto take = [&]( BOARD_ITEM* aItem )
+    {
+        if( !window.Intersects( aItem->GetBoundingBox() ) )
+            return;
+
+        bool counted = false;
+
+        for( PCB_LAYER_ID layer : LSET( aItem->GetLayerSet() & aLayers & LSET::AllCuMask() ).Seq() )
+        {
+            SHAPE_POLY_SET poly;
+
+            if( aItem->Type() == PCB_ZONE_T )
+            {
+                ZONE* zone = static_cast<ZONE*>( aItem );
+
+                if( !zone->HasFilledPolysForLayer( layer ) )
+                    continue;
+
+                poly = *zone->GetFilledPolysList( layer );
+            }
+            else
+            {
+                aItem->TransformShapeToPolygon( poly, layer, 0, maxError, ERROR_OUTSIDE );
+            }
+
+            fillMask( poly, mask, w, h, toPx );
+            counted = true;
+        }
+
+        items += counted ? 1 : 0;
+    };
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        if( aNets.count( track->GetNetCode() ) )
+            take( track );
+    }
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( PAD* pad : fp->Pads() )
+        {
+            if( aNets.count( pad->GetNetCode() ) )
+                take( pad );
+        }
+    }
+
+    for( ZONE* zone : aBoard->Zones() )
+    {
+        if( !zone->GetIsRuleArea() && aNets.count( zone->GetNetCode() ) )
+            take( zone );
+    }
+
+    const double   keep = 1.0 - std::clamp( aDim, 0.0, 1.0 );
+    const double   bg[3] = { aBackground.r * 255.0, aBackground.g * 255.0, aBackground.b * 255.0 };
+    unsigned char* px = aImage.GetData();
+
+    for( size_t i = 0; i < mask.size(); ++i )
+    {
+        if( mask[i] )
+            continue;
+
+        for( int c = 0; c < 3; ++c )
+            px[3 * i + c] = (unsigned char) KiROUND( bg[c] + ( px[3 * i + c] - bg[c] ) * keep );
+    }
+
+    return { { "items", items } };
+}
+
+
 static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -332,6 +510,59 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     const int dpi = aArgs.value( "dpi", 150 );
     BOARD*    board = context->GetBoard();
+
+    // highlight_nets: names or globs ("USB_*"); every one must match a net
+    std::set<int>  highlight;
+    nlohmann::json highlighted = nlohmann::json::array();
+    const nlohmann::json highlightArg = aArgs.value( "highlight_nets", nlohmann::json() );
+
+    if( !highlightArg.is_null() )
+    {
+        if( !highlightArg.is_array() && !highlightArg.is_string() )
+            return KOPENAPI_RESULT::Error( 400, "highlight_nets: net names or globs, e.g. [\"GND\", \"USB_*\"]" );
+
+        const nlohmann::json list = highlightArg.is_string() ? nlohmann::json::array( { highlightArg } ) : highlightArg;
+
+        for( const nlohmann::json& n : list )
+        {
+            if( !n.is_string() )
+                return KOPENAPI_RESULT::Error( 400, "highlight_nets: net names or globs, e.g. [\"GND\", \"USB_*\"]" );
+
+            const std::string name = n.get<std::string>();
+            bool              found = false;
+
+            if( name.find_first_of( "*?{" ) != std::string::npos )
+            {
+                for( NETINFO_ITEM* net : board->GetNetInfo() )
+                {
+                    const std::string netName = UnescapeString( net->GetNetname() ).ToStdString( wxConvUTF8 );
+
+                    if( net->GetNetCode() > 0 && KopenapiGlob( name, netName ) )
+                    {
+                        found = true;
+
+                        if( highlight.insert( net->GetNetCode() ).second )
+                            highlighted.push_back( netName );
+                    }
+                }
+            }
+            else if( NETINFO_ITEM* net = KopenapiFindNet( board, name ); net && net->GetNetCode() > 0 )
+            {
+                found = true;
+
+                if( highlight.insert( net->GetNetCode() ).second )
+                    highlighted.push_back( UnescapeString( net->GetNetname() ).ToStdString( wxConvUTF8 ) );
+            }
+
+            if( !found )
+                return KopenapiNoSuchNet( board, name, "highlight_nets: " );
+        }
+    }
+
+    const double dim = aArgs.value( "highlight_dim", 0.75 );
+
+    if( dim < 0 || dim > 1 )
+        return KOPENAPI_RESULT::Error( 400, "highlight_dim: 0 (no fading) to 1 (the rest is background)" );
 
     if( dpi < 30 || dpi > RENDER_MAX_DPI )
         return KOPENAPI_RESULT::Error( 400, "dpi: 30 to " + std::to_string( RENDER_MAX_DPI ) );
@@ -464,6 +695,7 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         zone->SetFilledPolysList( layer, fill );
 
     wxImage         image;
+    nlohmann::json  highlightInfo;
     KOPENAPI_RESULT read = readImage( out, status, reporter.GetMessages(), false, 0, image );
 
     if( read.status != 200 )
@@ -476,6 +708,25 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     if( !sheet && !want.IsEmpty() && want.GetSize() != image.GetSize() )
         image = image.GetSubImage( want );
+
+    if( !highlight.empty() )
+    {
+        wxString theme = job.m_colorTheme;
+
+        if( theme.IsEmpty() )
+        {
+            if( PCBNEW_SETTINGS* settings = GetAppSettings<PCBNEW_SETTINGS>( "pcbnew" ) )
+                theme = settings->m_ColorTheme;
+        }
+
+        const KIGFX::COLOR4D background = job.m_blackAndWhite ? KIGFX::COLOR4D::WHITE
+                                                              : ::GetColorSettings( theme )->GetColor( LAYER_PCB_BACKGROUND );
+        nlohmann::json       info = highlightNets( board, highlight, layersOf( layers ), image, window, pxPerIU,
+                                                   job.m_mirror, background, dim );
+        info["nets"] = highlighted;
+        info["dim"] = dim;
+        highlightInfo = info;
+    }
 
     int ratsnest = -1;
 
@@ -492,6 +743,9 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     if( ratsnest >= 0 )
         result["ratsnest_drawn"] = ratsnest;
+
+    if( !highlightInfo.is_null() )
+        result["highlighted"] = highlightInfo;
 
     if( byRegion )
         result["region_mm"] = region;
@@ -815,7 +1069,8 @@ KOPENAPI_REGISTER( "pcb_render_layers",
 KOPENAPI_REGISTER( "pcb_render",
                    "Render the open board (unsaved edits included) to a PNG image with KiCad's own plotter, "
                    "like `kicad-cli pcb export png`: layers as a list (F.Cu,F.SilkS,Edge.Cuts...) or a preset "
-                   "(front, back, copper, assembly), the ratsnest over it on request; the whole board cropped to the drawing, or a region drawn "
+                   "(front, back, copper, assembly), the ratsnest over it on request, nets highlighted (highlight_nets: the "
+                   "rest dimmed); the whole board cropped to the drawing, or a region drawn "
                    "alone at a high dpi for detail; an image over 64 megapixels is refused (422) with what it "
                    "would cost (memory, CPU) and the dpi / region that fit; GUI and headless; over MCP an image",
                    R"json({"type":"object","properties":{
@@ -829,7 +1084,9 @@ KOPENAPI_REGISTER( "pcb_render",
                         "black_and_white":{"type":"boolean","default":false},
                         "theme":{"type":"string"},
                         "zones":{"type":["string","boolean"],"enum":["filled","outline","hidden",true,false],"default":"filled","description":"outline: each pour drawn as its edge (the tracks and pads under it show); hidden: no pours; true / false: filled / hidden"},
-                        "ratsnest":{"type":"boolean","default":false,"description":"draw the open connections (ratsnest) over the image; the answer counts them (ratsnest_drawn)"}}})json"_json,
+                        "ratsnest":{"type":"boolean","default":false,"description":"draw the open connections (ratsnest) over the image; the answer counts them (ratsnest_drawn)"},
+                        "highlight_nets":{"type":["string","array"],"items":{"type":"string"},"description":"net names or globs (\"USB_*\", \"{GND,+3V3}\"): their copper on the drawn copper layers (tracks, vias, pads, pours) stays as drawn, everything else fades toward the background; the answer's highlighted {nets, items, dim}; a name matching no net is a 404 with did_you_mean"},
+                        "highlight_dim":{"type":"number","default":0.75,"minimum":0,"maximum":1,"description":"how far the rest fades: 0 not at all, 1 to the background"}}})json"_json,
                    false, h_pcb_render, 300 );
 
 KOPENAPI_REGISTER( "pcb_render_3d",
