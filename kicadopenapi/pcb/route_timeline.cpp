@@ -102,10 +102,10 @@ void GRID_LANE::Add( GRID_STEP aStep, const GRID_PATH* aPath )
 }
 
 
-void GRID_LANE::AddDead( int aNet, int aEnd )
+void GRID_LANE::AddDead( int aNet, int aEnd, bool aKeepOut )
 {
     std::lock_guard<std::recursive_mutex> lock( *m_mutex );
-    dead.push_back( { (uint32_t) steps.size(), aNet, aEnd } );
+    dead.push_back( { (uint32_t) steps.size(), aNet, aEnd, aKeepOut } );
 }
 
 

@@ -67,12 +67,14 @@ public:
     /// @brief Per net: the exits over that board (world set); empty the run's
     std::vector<std::vector<GRID_EXIT>> exits;
 
-    /// @brief Ends found walled in by fixed copper: from the search before step `step`
+    /// @brief Ends found walled in by fixed copper (keepOut: and the chips' via keep-out): from the
+    /// search before step `step`
     struct DEAD
     {
         uint32_t step;
         int32_t  net;
         int32_t  end;
+        bool     keepOut = false;
     };
 
     std::vector<DEAD>      dead;
@@ -95,7 +97,7 @@ public:
     /// @brief After a net was taken: its copper now, deduplicated by content
     void Add( GRID_STEP aStep, const GRID_PATH* aPath );
 
-    void AddDead( int aNet, int aEnd );
+    void AddDead( int aNet, int aEnd, bool aKeepOut = false );
 
     /// @brief A branch's start: the parent's steps up to aStep (inclusive) with their paths, crowded
     /// places, keys and finished rounds

@@ -1540,7 +1540,10 @@ public:
         m_nets.resize( m_w.nets.size() );
 
         for( const WORLD::NET& n : m_w.nets )
+        {
             m_dead.emplace_back( n.ends.size(), false );
+            m_keepDead.emplace_back( n.ends.size(), false );
+        }
 
         m_expandedBy.assign( m_w.nets.size(), 0 );
 
@@ -2527,7 +2530,7 @@ private:
         for( ; m_replayDead < m_replay->dead.size() && m_replay->dead[m_replayDead].step <= m_replayAt; ++m_replayDead )
         {
             const GRID_LANE::DEAD& d = m_replay->dead[m_replayDead];
-            m_dead[d.net][d.end] = true;
+            ( d.keepOut ? m_keepDead : m_dead )[d.net][d.end] = true;
         }
 
         const WORLD::NET& wn = m_w.nets[aNet];
@@ -3022,7 +3025,8 @@ private:
 
         for( size_t e = 0; e < wn.ends.size(); ++e )
         {
-            if( e != first && !wn.ends[e].empty() && !wn.walled[e] && !m_dead[aNet][e] )
+            if( e != first && !wn.ends[e].empty() && !wn.walled[e] && !m_dead[aNet][e]
+                && !( m_keepOut && m_keepDead[aNet][e] ) )
                 left.push_back( (int) e );
         }
 
@@ -3034,14 +3038,14 @@ private:
             if( end < 0 )
             {
                 // nothing but fixed copper in the way: no round will reach them
-                if( m_walledIn )
+                if( m_walledIn || m_keepWalledIn )
                 {
                     for( int e : left )
                     {
-                        m_dead[aNet][e] = true;
+                        ( m_walledIn ? m_dead : m_keepDead )[aNet][e] = true;
 
                         if( m_lane )
-                            m_lane->AddDead( aNet, e );
+                            m_lane->AddDead( aNet, e, !m_walledIn );
                     }
                 }
 
@@ -3112,11 +3116,13 @@ private:
 
         const int span = std::max( bx1 - bx0, by1 - by0 );
         m_walledIn = false;
+        m_keepWalledIn = false;
         m_keepRefused = false;
         int                   bestEnd = -1;
         float                 bestCost = std::numeric_limits<float>::max();
         std::vector<uint32_t> best;
         bool                  widened = false;
+        bool                  flooded = false;
         int       margin = std::max( (int) ( pcbIUScale.mmToIU( 2.0 ) / g.cell ), m_oneWindow ? span : span * 3 / 10 );
 
         // far apart: the tiles' distance to the ends guides the search round what is in the way
@@ -3157,7 +3163,26 @@ private:
 
                 // a via the keep-out refused is no fixed copper: the stage without it tries again
                 m_walledIn = ( whole || closed ) && !aHard && !m_overBudget && !m_keepRefused && !stopped();
+
+                // only the keep-out in the way: no search reaches them while it holds
+                m_keepWalledIn = ( whole || closed ) && !aHard && !m_overBudget && m_keepRefused && m_keepOut && !stopped();
                 return -1;
+            }
+
+            // a wider window helps only if the ends can be reached at all: a flood over the board's
+            // open states says when they cannot (each wider window would search all it holds)
+            if( bestEnd < 0 && !flooded )
+            {
+                flooded = true;
+                bool keepRefused = false;
+
+                if( !reachable( aNet, aTree, aHard, keepRefused ) )
+                {
+                    // as the whole board's search would have found it: fixed copper alone, or with the keep-out
+                    m_walledIn = !aHard && !keepRefused;
+                    m_keepWalledIn = !aHard && keepRefused && m_keepOut;
+                    return -1;
+                }
             }
 
             widened = widened || end >= 0;
@@ -3266,6 +3291,120 @@ private:
         }
 
         return m_guides.emplace( std::move( key ), std::move( out ) ).first->second;
+    }
+
+    /// @brief Whether any end marked as a target of the current search can be reached from aTree over
+    /// the whole board (aHard: other nets' copper closed).  Its moves are a superset of the A*'s (the
+    /// same cells, corners and vias, no turn rule), so false means no window of the search reaches one.  aKeepRefused: it met
+    /// a via spot only the chips' keep-out closed
+    bool reachable( int aNet, const std::vector<uint32_t>& aTree, bool aHard, bool& aKeepRefused )
+    {
+        const WORLD::NET& wn = m_w.nets[aNet];
+        const PLAN_GRID&  g = m_w.grid;
+        const size_t      cells = m_w.cells;
+        const int         k = wn.sizes;
+        const int         L = m_w.L;
+        const uint32_t    stamp = m_stamp;
+
+        m_flooded.assign( (size_t) L * cells, false );
+        m_floodQueue.clear();
+
+        auto open = [&]( uint32_t n )
+        {
+            if( m_node[n].target == stamp )
+                return true;
+
+            if( !m_w.TrackOk( k, n, wn.code ) )
+                return false;
+
+            return !aHard || m_w.InOwnEnd( n, wn.code ) || !m_occTrack[k][n];
+        };
+
+        for( uint32_t s : aTree )
+        {
+            if( !m_flooded[s] )
+            {
+                m_flooded[s] = true;
+                m_floodQueue.push_back( s );
+            }
+        }
+
+        int64_t visited = 0;
+
+        for( size_t q = 0; q < m_floodQueue.size(); ++q )
+        {
+            const uint32_t s = m_floodQueue[q];
+
+            if( m_node[s].target == stamp )
+            {
+                m_expanded += visited;
+                return true;
+            }
+
+            if( ( ++visited & 65535 ) == 0 && stopped() )
+                break;
+
+            const int l = (int) ( s / cells );
+            const int i = (int) ( s % cells );
+            const int x = i % g.nx, y = i / g.nx;
+
+            for( int d = 0; d < 8; ++d )
+            {
+                const int nx = x + DX[d], ny = y + DY[d];
+
+                if( nx < 0 || ny < 0 || nx >= g.nx || ny >= g.ny )
+                    continue;
+
+                const uint32_t n = (uint32_t) ( (size_t) l * cells + g.Index( nx, ny ) );
+
+                if( m_flooded[n] )
+                    continue;
+
+                // as the search: a diagonal step may not cut the corner between two closed cells
+                if( d & 1 )
+                {
+                    const uint32_t a = (uint32_t) ( (size_t) l * cells + g.Index( nx, y ) );
+                    const uint32_t b = (uint32_t) ( (size_t) l * cells + g.Index( x, ny ) );
+
+                    if( !m_w.TrackOk( k, a, wn.code ) && !m_w.TrackOk( k, b, wn.code ) )
+                        continue;
+                }
+
+                if( open( n ) )
+                {
+                    m_flooded[n] = true;
+                    m_floodQueue.push_back( n );
+                }
+            }
+
+            if( !wn.vias || L < 2 || !m_w.ViaOk( k, (uint32_t) i, wn.code ) )
+                continue;
+
+            if( m_keepOut && ( m_w.keep[i] & ~wn.chips ) )
+            {
+                aKeepRefused = true;
+                continue;
+            }
+
+            if( aHard && m_occVia[k][i] )
+                continue;
+
+            for( int to = 0; to < L; ++to )
+            {
+                const uint32_t n = (uint32_t) ( (size_t) to * cells + i );
+
+                if( to != l && !m_flooded[n] && open( n ) )
+                {
+                    m_flooded[n] = true;
+                    m_floodQueue.push_back( n );
+                }
+            }
+        }
+
+        m_expanded += visited;
+
+        // stopped: as if reachable, the search itself stops
+        return stopped();
     }
 
     int searchIn( int aNet, const std::vector<uint32_t>& aTree, const std::vector<int>& aLeft, float aPf, bool aHard,
@@ -3510,6 +3649,8 @@ private:
     };
 
     std::vector<NODE>     m_node;
+    std::vector<bool>     m_flooded;      ///< reachable(): states reached
+    std::vector<uint32_t> m_floodQueue;
     std::vector<uint8_t>  m_dir;
     std::vector<int>      m_targetEnd;
     uint32_t              m_stamp = 0;
@@ -3518,8 +3659,10 @@ private:
     float                 m_lastCost = 0;
     bool                  m_walledIn = false;   ///< the last search failed over the whole board on fixed copper alone
     bool                  m_keepRefused = false;   ///< the last search met a via spot only the chips' keep-out closed
+    bool                  m_keepWalledIn = false;  ///< the last search failed over the whole board on fixed copper and the keep-out
 
     std::vector<std::vector<bool>> m_dead;   ///< per net, per end: walled in by fixed copper
+    std::vector<std::vector<bool>> m_keepDead;   ///< per net, per end: walled in while the chips' via keep-out holds
 
     std::vector<std::vector<std::array<DISK, 2>>> m_trackDisk;   ///< [from sizes][onto sizes]: track, via
     std::vector<std::vector<std::array<DISK, 2>>> m_viaDisk;
@@ -3984,10 +4127,10 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     std::vector<GRID_STRATEGY> strategies = aParams.strategies;
 
     // one lane's search state per state: occupancy per sizes, history, node, direction, end, fights,
-    // bundle band; per cell: via occupancy per sizes, via history, fights
+    // bundle band, the reach flood's queue; per cell: via occupancy per sizes, via history, fights
     const int64_t states = (int64_t) world.L * world.cells;
     const int64_t K = (int64_t) world.sizes.size();
-    result.laneBytes = states * ( 2 * K + 4 + 16 + 1 + 4 + 3 + 4 ) + (int64_t) world.cells * ( 2 * K + 4 + 3 );
+    result.laneBytes = states * ( 2 * K + 4 + 16 + 1 + 4 + 3 + 4 + 4 ) + (int64_t) world.cells * ( 2 * K + 4 + 3 );
 
     int64_t budget = aParams.memoryBudget;
 
