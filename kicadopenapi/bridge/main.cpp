@@ -122,7 +122,9 @@ void Usage()
                  "  --start-timeout DUR     wait for a started instance (env KICAD_MCP_START_TIMEOUT)\n"
                  "  --kicad PATH            GUI executable (env KICAD_MCP_KICAD; default: next to the bridge)\n"
                  "  --kicad-cli PATH        kicad-cli executable (env KICAD_MCP_KICAD_CLI; default: next to the bridge)\n"
-                 "  --discovery-dir DIR     discovery directory (default <tmp>/kicad/openapi)\n";
+                 "  --discovery-dir DIR     discovery directory (default <tmp>/kicad/openapi)\n"
+                 "Instances start from a snapshot of a macOS .app bundle (<bundle dir>/run-snapshots/), so a\n"
+                 "rebuild does not change files under them; env KICAD_MCP_RUN_SNAPSHOT=0 starts the bundle itself.\n";
 }
 
 std::optional<Config> ParseConfig(int argc, char** argv)
@@ -548,6 +550,9 @@ private:
     /// aProgressToken (string or number): the instance's progress meanwhile as notifications/progress
     std::optional<bridge::HttpResult> Forward(const std::string& line, const json& id, const json& aProgressToken = json());
 
+    /// @brief After a receive timeout: the job the server runs now and how to get its result
+    std::string RunningWork(const std::string& host, int port);
+
     json CallBridgeMethod(const std::string& name, const json& args);
 
     /// @brief MCP `search`: the bound instance's methods + matching bridge methods
@@ -610,6 +615,14 @@ std::optional<bridge::Instance> Bridge::Start(const std::string& mode, const std
     if (!path.empty())
     {
         argv.push_back(path);
+    }
+
+    // started from a snapshot of the build: a rebuild does not change the files under it
+    if (const char* snap = std::getenv("KICAD_MCP_RUN_SNAPSHOT"); !snap || std::string(snap) != "0")
+    {
+        std::string note;
+        argv[0] = platform::RunSnapshot(argv[0], note).string();
+        Log(note);
     }
 
     const fs::path log = NewLogFile(mode);
@@ -741,6 +754,18 @@ bool Bridge::EnsureBound(std::string& error)
     return false;
 }
 
+/// @brief How long a forwarded call waits for its answer; env KICAD_MCP_RECEIVE_TIMEOUT_S (tests)
+static int ReceiveTimeoutSeconds()
+{
+    static const int seconds = []
+    {
+        const char* env = std::getenv("KICAD_MCP_RECEIVE_TIMEOUT_S");
+        const int value = env ? std::atoi(env) : 0;
+        return value > 0 ? value : bridge::kPostReceiveTimeoutSeconds;
+    }();
+    return seconds;
+}
+
 std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const json& id, const json& aProgressToken)
 {
     std::string host;
@@ -763,7 +788,7 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
         } relock{m_mutex};
         m_mutex.unlock();
         ProgressWatch watch(host, port, aProgressToken);
-        return bridge::Post(host, port, path, line);
+        return bridge::Post(host, port, path, line, ReceiveTimeoutSeconds());
     };
 
     long pid = m_pid;
@@ -794,7 +819,12 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
     if (!result.ok)
     {
         std::string message = "cannot reach " + m_url + " (" + result.error + ")";
-        if (m_cfg.pinnedUrl.empty() && !platform::ProcessAlive(pid))
+        if (result.error == "receive timeout" && platform::ProcessAlive(pid))
+        {
+            message = "no answer within " + std::to_string(ReceiveTimeoutSeconds())
+                      + " s; the call may still run on the server and its changes will stand. " + RunningWork(host, port);
+        }
+        else if (m_cfg.pinnedUrl.empty() && !platform::ProcessAlive(pid))
         {
             message += "; the instance is gone — the next call binds to another instance (policy '"
                        + m_cfg.policy + "'); check instance_list before mutating";
@@ -808,6 +838,29 @@ std::optional<bridge::HttpResult> Bridge::Forward(const std::string& line, const
         return std::nullopt;
     }
     return result;
+}
+
+std::string Bridge::RunningWork(const std::string& host, int port)
+{
+    bridge::HttpResult jobs = bridge::Post(host, port, "/api/v1/job_list", "{}", 5);
+    if (jobs.ok && jobs.status == 200)
+    {
+        json body = json::parse(jobs.body, nullptr, false);
+        if (body.is_object() && body.contains("jobs") && body["jobs"].is_array())
+        {
+            for (const json& job : body["jobs"])
+            {
+                const std::string state = job.value("state", std::string());
+                if (state == "queued" || state == "running")
+                {
+                    const std::string jobId = job.value("job_id", std::string());
+                    return "It runs as " + jobId + " (" + job.value("method", std::string()) + ", " + state
+                           + "): job_get {job_id: \"" + jobId + "\", wait_s: 60} gives its result, job_cancel stops it";
+                }
+            }
+        }
+    }
+    return "No job runs now: edit_log and api_trace show what it did; api_call_result gives a late call's result";
 }
 
 json Bridge::ListInstances()

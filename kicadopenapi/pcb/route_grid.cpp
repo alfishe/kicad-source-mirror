@@ -1,6 +1,7 @@
 #include "route_grid.h"
 #include "route_raster.h"
 #include "route_timeline.h"
+#include "kopenapi_pcb.h"
 
 #include <kicadopenapi_memory.h>
 
@@ -27,6 +28,8 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
+#include <deque>
 #include <queue>
 #include <set>
 #include <thread>
@@ -103,6 +106,14 @@ struct DISK
     }
 };
 
+/// @brief A shape a map was made of: copper of an owner (-1 none may pass) and how far its cells reach
+struct MARK
+{
+    std::shared_ptr<const SHAPE> shape;
+    int                          inflate;
+    int32_t                      owner;
+};
+
 /// @brief The board as the search sees it: read once, shared by every variant, never written
 struct WORLD
 {
@@ -124,6 +135,21 @@ struct WORLD
     /// @brief Deep inside its own end's copper a path crowds nobody: the end's copper is there anyway
     bool InOwnEnd( uint32_t aState, int aNet ) const { return endOf[aState] == aNet; }
 
+    /// @brief While the world is built: the shapes of each map (sizes x plane: the track layers, then
+    /// the vias), their reach over the exact distance (slack) and the board's outline
+    std::vector<std::vector<MARK>> marks;
+    int                            planes = 0;
+    int                            slack = 0;
+    SHAPE_POLY_SET                 outline;
+
+    /// @brief An end let out by the second lattice: copper from inside its pad to a cell of the grid
+    struct EXIT
+    {
+        int        end = 0;
+        uint32_t   state = 0;   ///< the grid state the copper ends on
+        GRID_TRACK track;
+    };
+
     struct NET
     {
         int                                code = 0;
@@ -134,10 +160,12 @@ struct WORLD
         double                             span = 0;  ///< half perimeter of the ends' box, cells
         bool                               finePitch = false;
         std::vector<bool>                  walled;    ///< per end: fixed copper parts it from the other ends
+        std::vector<GRID_WALL>             walls;     ///< the walled ends: room and what closes it
         uint32_t                           chips = 0; ///< the chips (keep bits) it has a pad on
         std::vector<std::pair<int, int>>   holes;     ///< cells of its through-hole ends (on every layer already)
         int                                group = -1;
         int                                rank = 0;
+        std::vector<EXIT>                  exits;
     };
 
     std::vector<NET> nets;
@@ -175,6 +203,7 @@ void findPockets( WORLD& aWorld )
     {
         const int k = aNet.sizes;
         aNet.walled.assign( aNet.ends.size(), false );
+        aNet.walls.clear();
 
         auto open = [&]( uint32_t s ) { return aWorld.TrackOk( k, s, aNet.code ) || aWorld.InOwnEnd( s, aNet.code ); };
 
@@ -185,6 +214,38 @@ void findPockets( WORLD& aWorld )
 
             std::unordered_set<uint32_t> seen( aNet.ends[e].begin(), aNet.ends[e].end() );
             std::vector<uint32_t>        todo( aNet.ends[e].begin(), aNet.ends[e].end() );
+            // (owner, plane, octant round the end) -> nearest closed state, count: overlapping halos
+            // of several nets leave no owner (-1), the octants still part what closes it
+            std::map<std::tuple<int32_t, bool, int>, std::pair<uint32_t, int>> closedBy;
+            std::unordered_set<uint64_t>                                       closedCells;
+
+            VECTOR2I centre( 0, 0 );
+
+            for( uint32_t s : aNet.ends[e] )
+                centre += g.Centre( (int) ( s % cells ) ) / (int) aNet.ends[e].size();
+
+            auto closed = [&]( uint32_t n, bool aVia )
+            {
+                const int32_t  owner = aVia ? aWorld.via[k][n % cells] : aWorld.track[k][n];
+                const VECTOR2I d = g.Centre( (int) ( n % cells ) ) - centre;
+                const int      octant = (int) std::floor( ( std::atan2( (double) d.y, (double) d.x ) + M_PI ) / ( M_PI / 4 ) ) % 8;
+                auto [it, fresh] = closedBy.try_emplace( { owner, aVia, octant }, n | ( aVia ? 0x80000000u : 0 ), 0 );
+
+                if( closedCells.size() < 1024 )
+                    closedCells.insert( ( (uint64_t) aVia << 32 ) | ( aVia ? n % cells : n ) );
+                it->second.second++;
+
+                if( !fresh )
+                {
+                    const uint32_t was = it->second.first & 0x7fffffffu;
+
+                    if( ( g.Centre( (int) ( n % cells ) ) - centre ).SquaredEuclideanNorm()
+                        < ( g.Centre( (int) ( was % cells ) ) - centre ).SquaredEuclideanNorm() )
+                    {
+                        it->second.first = n | ( aVia ? 0x80000000u : 0 );
+                    }
+                }
+            };
 
             while( !todo.empty() && seen.size() <= POCKET_STATES )
             {
@@ -195,7 +256,9 @@ void findPockets( WORLD& aWorld )
 
                 auto visit = [&]( uint32_t n )
                 {
-                    if( open( n ) && seen.insert( n ).second )
+                    if( !open( n ) )
+                        closed( n, false );
+                    else if( seen.insert( n ).second )
                         todo.push_back( n );
                 };
 
@@ -215,10 +278,17 @@ void findPockets( WORLD& aWorld )
                     visit( (uint32_t) ( (size_t) l * cells + g.Index( nx, ny ) ) );
                 }
 
-                if( aNet.vias && aWorld.L > 1 && aWorld.ViaOk( k, (uint32_t) i, aNet.code ) )
+                if( aNet.vias && aWorld.L > 1 )
                 {
-                    for( int to = 0; to < aWorld.L; ++to )
-                        visit( (uint32_t) ( (size_t) to * cells + i ) );
+                    if( aWorld.ViaOk( k, (uint32_t) i, aNet.code ) )
+                    {
+                        for( int to = 0; to < aWorld.L; ++to )
+                            visit( (uint32_t) ( (size_t) to * cells + i ) );
+                    }
+                    else
+                    {
+                        closed( (uint32_t) i, true );
+                    }
                 }
             }
 
@@ -231,6 +301,40 @@ void findPockets( WORLD& aWorld )
                                  && std::none_of( aNet.ends[o].begin(), aNet.ends[o].end(),
                                                   [&]( uint32_t s ) { return seen.count( s ) > 0; } );
             }
+
+            if( !aNet.walled[e] )
+                continue;
+
+            GRID_WALL wall;
+            wall.end = (int) e;
+            wall.room = seen.size();
+            std::set<int> layers;
+
+            for( uint32_t s : aNet.ends[e] )
+                layers.insert( (int) ( s / cells ) );
+
+            wall.layers = (int) layers.size();
+
+            for( const auto& [key, nearby] : closedBy )
+            {
+                const int32_t  owner = std::get<0>( key );
+                const bool     via = nearby.first & 0x80000000u;
+                const uint32_t n = nearby.first & 0x7fffffffu;
+                wall.by.push_back( { owner, g.Centre( (int) ( n % cells ) ), via ? -1 : (int) ( n / cells ), nearby.second } );
+            }
+
+            for( uint64_t c : closedCells )
+            {
+                const bool     via = c >> 32;
+                const uint32_t n = (uint32_t) c;
+                wall.closed.emplace_back( g.Centre( (int) ( n % cells ) ), via ? -1 : (int) ( n / cells ) );
+            }
+
+            // the nearest first
+            std::sort( wall.by.begin(), wall.by.end(),
+                       [&]( const GRID_WALL::BY& a, const GRID_WALL::BY& b )
+                       { return ( a.at - centre ).SquaredEuclideanNorm() < ( b.at - centre ).SquaredEuclideanNorm(); } );
+            aNet.walls.push_back( std::move( wall ) );
         }
     };
 
@@ -249,6 +353,296 @@ void findPockets( WORLD& aWorld )
 
     for( auto& job : jobs )
         job.get();
+}
+
+
+inline void own( int32_t& aCell, int32_t aOwner );
+
+
+/// @brief A second lattice half a cell off the first, for fine-pitch pads the first walls in: a
+/// pad whose way out runs between the cell centres (its part off the grid's phase) leaves along
+/// it.  The copper from inside the pad to a free cell of the grid is fixed before the search (an
+/// exit) and the end starts on that cell; other nets keep their clearance from it.  Only walled ends
+/// at fine-pitch parts are tried, each in a window round its pad, so the cost stays local; the
+/// distances there are exact (the shapes the maps were made of, without their slack)
+std::pair<int, int> halfCellExits( WORLD& aWorld, const std::vector<GRID_NET>& aNets, const GRID_PARAMS& aParams )
+{
+    int tried = 0, won = 0;
+
+    const PLAN_GRID& g = aWorld.grid;
+    const size_t     cells = aWorld.cells;
+    const int        half = g.cell / 2;
+    const bool       outlined = aWorld.outline.OutlineCount() > 0;
+
+    for( size_t n = 0; n < aWorld.nets.size() && n < aNets.size(); ++n )
+    {
+        WORLD::NET& net = aWorld.nets[n];
+        const int   k = net.sizes;
+        const int   hw = aWorld.sizes[k].halfWidth;
+
+        for( size_t e = 0; e < net.ends.size() && e < aNets[n].ends.size(); ++e )
+        {
+            PAD* pad = dynamic_cast<PAD*>( aNets[n].ends[e] );
+            int  cx = 0, cy = 0;
+
+            if( !net.walled[e] || !pad || !g.CellOf( pad->GetPosition(), cx, cy ) || !aWorld.fine[g.Index( cx, cy )] )
+                continue;
+
+            tried++;
+
+            const VECTOR2I size = pad->GetBoundingBox().GetSize();
+            const int      R = std::min( 40, (int) std::ceil( ( std::max( size.x, size.y ) / 2.0 + pcbIUScale.mmToIU( 1.0 ) ) / g.cell ) );
+            const int      W = 2 * R + 1;
+            const BOX2I    window( g.Centre( cx - R, cy - R ) - VECTOR2I( g.cell, g.cell ),
+                                   VECTOR2I( ( W + 1 ) * g.cell, ( W + 1 ) * g.cell ) );
+
+            std::set<uint32_t> others;
+
+            for( size_t o = 0; o < net.ends.size(); ++o )
+            {
+                if( o != e )
+                    others.insert( net.ends[o].begin(), net.ends[o].end() );
+            }
+
+            // a cell of the grid with room: it meets another end, or the room is too big to be a pocket
+            std::map<uint32_t, bool> roomy;
+
+            auto hasRoom = [&]( uint32_t aStart )
+            {
+                auto [it, fresh] = roomy.try_emplace( aStart, false );
+
+                if( !fresh )
+                    return it->second;
+
+                auto open = [&]( uint32_t s ) { return aWorld.TrackOk( k, s, net.code ) || aWorld.InOwnEnd( s, net.code ); };
+                std::unordered_set<uint32_t> seen = { aStart };
+                std::vector<uint32_t>        todo = { aStart };
+
+                while( !todo.empty() && !it->second )
+                {
+                    const uint32_t s = todo.back();
+                    todo.pop_back();
+
+                    if( others.count( s ) || seen.size() > POCKET_STATES )
+                    {
+                        it->second = true;
+                        break;
+                    }
+
+                    const int l = (int) ( s / cells ), i = (int) ( s % cells );
+                    const int x = i % g.nx, y = i / g.nx;
+
+                    for( int d = 0; d < 8; ++d )
+                    {
+                        const int nx = x + DX[d], ny = y + DY[d];
+
+                        if( nx < 0 || ny < 0 || nx >= g.nx || ny >= g.ny )
+                            continue;
+
+                        if( ( d & 1 ) && !open( (uint32_t) ( (size_t) l * cells + g.Index( nx, y ) ) )
+                            && !open( (uint32_t) ( (size_t) l * cells + g.Index( x, ny ) ) ) )
+                        {
+                            continue;
+                        }
+
+                        const uint32_t to = (uint32_t) ( (size_t) l * cells + g.Index( nx, ny ) );
+
+                        if( open( to ) && seen.insert( to ).second )
+                            todo.push_back( to );
+                    }
+
+                    if( net.vias && aWorld.L > 1 && aWorld.ViaOk( k, (uint32_t) i, net.code ) )
+                    {
+                        for( int to = 0; to < aWorld.L; ++to )
+                        {
+                            const uint32_t t = (uint32_t) ( (size_t) to * cells + i );
+
+                            if( open( t ) && seen.insert( t ).second )
+                                todo.push_back( t );
+                        }
+                    }
+                }
+
+                return it->second;
+            };
+
+            std::optional<WORLD::EXIT> found;
+
+            for( int l = 0; l < aWorld.L && !found; ++l )
+            {
+                const PCB_LAYER_ID layer = aParams.layers[l];
+
+                if( std::none_of( net.ends[e].begin(), net.ends[e].end(), [&]( uint32_t s ) { return (int) ( s / cells ) == l; } )
+                    || !pad->FlashLayer( layer ) )
+                {
+                    continue;
+                }
+
+                const std::shared_ptr<SHAPE> copper = pad->GetEffectiveShape( layer );
+                std::vector<const MARK*>     nearby;
+
+                for( const MARK& m : aWorld.marks[(size_t) k * aWorld.planes + l] )
+                {
+                    BOX2I bb = m.shape->BBox();
+                    bb.Inflate( m.inflate );
+
+                    if( m.owner != net.code && bb.Intersects( window ) )
+                        nearby.push_back( &m );
+                }
+
+                auto freeAt = [&]( const VECTOR2I& p )
+                {
+                    if( outlined && !aWorld.outline.Contains( p ) )
+                        return false;
+
+                    return std::none_of( nearby.begin(), nearby.end(),
+                                         [&]( const MARK* m ) { return m->shape->Collide( p, m->inflate - aWorld.slack ); } );
+                };
+
+                auto freeSeg = [&]( const VECTOR2I& a, const VECTOR2I& b )
+                {
+                    if( outlined && ( !aWorld.outline.Contains( a ) || !aWorld.outline.Contains( b ) ) )
+                        return false;
+
+                    const SEG sg( a, b );
+                    return std::none_of( nearby.begin(), nearby.end(),
+                                         [&]( const MARK* m ) { return m->shape->Collide( sg, m->inflate - aWorld.slack ); } );
+                };
+
+                for( const VECTOR2I& phase : { VECTOR2I( half, half ), VECTOR2I( half, 0 ), VECTOR2I( 0, half ) } )
+                {
+                    if( found )
+                        break;
+
+                    auto at = [&]( int aCell ) { return g.Centre( cx - R + aCell % W, cy - R + aCell / W ) + phase; };
+
+                    std::vector<int> parent( (size_t) W * W, -2 );   // -2 not seen, -1 a start inside the pad
+                    std::deque<int>  todo;
+
+                    for( int c = 0; c < W * W; ++c )
+                    {
+                        if( copper && copper->Collide( at( c ), 0 ) && freeAt( at( c ) ) )
+                        {
+                            parent[c] = -1;
+                            todo.push_back( c );
+                        }
+                    }
+
+                    while( !todo.empty() && !found )
+                    {
+                        const int      c = todo.front();
+                        const VECTOR2I p = at( c );
+                        const int      bx = cx - R + c % W, by = cy - R + c / W;
+                        todo.pop_front();
+
+                        // onto the grid: the cells half a cell away
+                        for( int hy = 0; hy <= ( phase.y ? 1 : 0 ) && !found; ++hy )
+                        {
+                            for( int hx = 0; hx <= ( phase.x ? 1 : 0 ) && !found; ++hx )
+                            {
+                                const int x = bx + hx, y = by + hy;
+
+                                if( x < 0 || y < 0 || x >= g.nx || y >= g.ny )
+                                    continue;
+
+                                const uint32_t state = (uint32_t) ( (size_t) l * cells + g.Index( x, y ) );
+
+                                if( !aWorld.TrackOk( k, state, net.code ) || !freeSeg( p, g.Centre( x, y ) ) || !hasRoom( state ) )
+                                    continue;
+
+                                WORLD::EXIT exit;
+                                exit.end = (int) e;
+                                exit.state = state;
+                                exit.track.layer = layer;
+                                exit.track.points.push_back( g.Centre( x, y ) );
+
+                                for( int q = c; q >= 0; q = parent[q] )
+                                    exit.track.points.push_back( at( q ) );
+
+                                std::reverse( exit.track.points.begin(), exit.track.points.end() );
+
+                                // corners only where the direction changes
+                                std::vector<VECTOR2I> corners;
+
+                                for( const VECTOR2I& pt : exit.track.points )
+                                {
+                                    if( corners.size() >= 2 )
+                                    {
+                                        const VECTOR2I d1 = corners.back() - corners[corners.size() - 2], d2 = pt - corners.back();
+
+                                        if( (int64_t) d1.x * d2.y == (int64_t) d1.y * d2.x && (int64_t) d1.x * d2.x + (int64_t) d1.y * d2.y > 0 )
+                                        {
+                                            corners.back() = pt;
+                                            continue;
+                                        }
+                                    }
+
+                                    corners.push_back( pt );
+                                }
+
+                                exit.track.points = std::move( corners );
+                                found = std::move( exit );
+                            }
+                        }
+
+                        for( int d = 0; d < 8 && !found; ++d )
+                        {
+                            const int nx = c % W + DX[d], ny = c / W + DY[d];
+
+                            if( nx < 0 || ny < 0 || nx >= W || ny >= W || parent[ny * W + nx] != -2 )
+                                continue;
+
+                            if( freeSeg( p, at( ny * W + nx ) ) )
+                            {
+                                parent[ny * W + nx] = c;
+                                todo.push_back( ny * W + nx );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if( !found )
+                continue;
+
+            const int i = (int) ( found->state % cells );
+            net.ends[e] = { found->state };
+            net.endBox[e] = { i % g.nx, i / g.nx, i % g.nx, i / g.nx };
+            net.walled[e] = false;
+            net.walls.erase( std::remove_if( net.walls.begin(), net.walls.end(), [&]( const GRID_WALL& w ) { return w.end == (int) e; } ),
+                             net.walls.end() );
+
+            // the exit's copper: the other nets keep their clearance from it
+            const int    l = (int) ( found->state / cells );
+            const size_t offset = (size_t) l * cells;
+
+            for( size_t z = 0; z < aWorld.sizes.size(); ++z )
+            {
+                const SIZES& sz = aWorld.sizes[z];
+                const int    clearance = std::max( sz.clearance, aWorld.sizes[k].clearance );
+
+                for( size_t q = 1; q < found->track.points.size(); ++q )
+                {
+                    const SHAPE_SEGMENT seg( found->track.points[q - 1], found->track.points[q], 2 * hw );
+                    std::vector<int32_t>& map = aWorld.track[z];
+                    g.Each( seg, clearance + sz.halfWidth + aWorld.slack, offset, [&]( size_t c ) { return map[c] < 0; },
+                            [&]( size_t c ) { own( map[c], net.code ); } );
+
+                    if( sz.viaRadius > 0 )
+                    {
+                        std::vector<int32_t>& vias = aWorld.via[z];
+                        g.Each( seg, clearance + sz.viaRadius + aWorld.slack, 0, [&]( size_t c ) { return vias[c] < 0; },
+                                [&]( size_t c ) { own( vias[c], net.code ); } );
+                    }
+                }
+            }
+
+            net.exits.push_back( std::move( *found ) );
+            won++;
+        }
+    }
+
+    return { tried, won };
 }
 
 
@@ -441,13 +835,6 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
 
     // The board is read here, on the calling thread: each shape with its reach per map; the cells
     // are filled afterwards, one map plane (sizes x layer, or the via plane) per worker
-    struct MARK
-    {
-        std::shared_ptr<const SHAPE> shape;
-        int                          inflate;
-        int32_t                      owner;
-    };
-
     const int                      planes = L + 1;   // the track layers, then the vias
     std::vector<std::vector<MARK>> marks( aWorld.sizes.size() * planes );
     size_t                         k = 0;
@@ -463,24 +850,47 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
         const bool   vias = sz.viaRadius > 0;
 
         PCB_TRACK probeTrack( aBoard );
+        probeTrack.SetFlags( ROUTER_TRANSIENT );
         probeTrack.SetNetCode( sample[k] );
         probeTrack.SetWidth( 2 * sz.halfWidth );
 
         PCB_VIA probeVia( aBoard );
+        probeVia.SetFlags( ROUTER_TRANSIENT );
         probeVia.SetNetCode( sample[k] );
         probeVia.SetViaType( VIATYPE::THROUGH );
         probeVia.SetLayerPair( F_Cu, B_Cu );
         probeVia.SetWidth( PADSTACK::ALL_LAYERS, std::max( 2 * sz.viaRadius, 1 ) );
         probeVia.SetDrill( std::max( sz.viaDrill, 1 ) );
 
+        // the probe stands at the item: rules conditioned on a place (inside a courtyard) apply
+        // where the item is; a custom rule may go below the class clearance, not below the board's
         auto rule = [&]( DRC_CONSTRAINT_T aType, BOARD_ITEM* aProbe, BOARD_ITEM* aItem, PCB_LAYER_ID aLayer, int aFloor )
         {
             if( drc )
             {
+                const VECTOR2I at = aItem->GetPosition();
+
+                if( aProbe == &probeTrack )
+                {
+                    probeTrack.SetStart( at );
+                    probeTrack.SetEnd( at );
+                }
+                else if( aProbe == &probeVia )
+                {
+                    probeVia.SetPosition( at );
+                }
+
                 DRC_CONSTRAINT c = drc->EvalRules( aType, aProbe, aItem, aLayer );
 
                 if( c.GetValue().HasMin() )
+                {
+                    const bool custom = c.GetParentRule() && !c.GetParentRule()->IsImplicit();
+
+                    if( custom && aType == CLEARANCE_CONSTRAINT )
+                        return std::max( c.GetValue().Min(), std::max( ds.m_MinClearance, 0 ) );
+
                     return std::max( c.GetValue().Min(), aFloor );
+                }
             }
 
             return aFloor;
@@ -668,6 +1078,9 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
                 continue;
             }
 
+            if( aParams.fillsOut && !zone->IsTeardropArea() )
+                continue;
+
             copperItem( zone, ownerOf( zone ), false,
                         [&]( PCB_LAYER_ID aLayer ) -> std::shared_ptr<SHAPE>
                         {
@@ -706,10 +1119,17 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
             f.get();
     }
 
-    // outside the outline
-    SHAPE_POLY_SET outline;
+    aWorld.marks = std::move( marks );
+    aWorld.planes = planes;
+    aWorld.slack = slack;
 
-    if( aBoard->GetBoardPolygonOutlines( outline, true ) && outline.OutlineCount() > 0 )
+    // outside the outline
+    SHAPE_POLY_SET& outline = aWorld.outline;
+
+    if( !aBoard->GetBoardPolygonOutlines( outline, true ) )
+        outline.RemoveAllContours();
+
+    if( outline.OutlineCount() > 0 )
     {
         std::vector<uint8_t> inside( cells, 0 );
         grid.Mark( outline, 0, inside );
@@ -813,7 +1233,7 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
 
             for( PAD* b : fp->Pads() )
             {
-                if( a != b )
+                if( KopenapiPadNeighbours( a, b ) )
                     pitch = std::min( pitch, (double) ( a->GetPosition() - b->GetPosition() ).EuclideanNorm() );
             }
         }
@@ -2698,6 +3118,7 @@ private:
 
         const int span = std::max( bx1 - bx0, by1 - by0 );
         m_walledIn = false;
+        m_keepRefused = false;
         int                   bestEnd = -1;
         float                 bestCost = std::numeric_limits<float>::max();
         std::vector<uint32_t> best;
@@ -2740,7 +3161,8 @@ private:
                     return bestEnd;
                 }
 
-                m_walledIn = ( whole || closed ) && !aHard && !m_overBudget && !stopped();
+                // a via the keep-out refused is no fixed copper: the stage without it tries again
+                m_walledIn = ( whole || closed ) && !aHard && !m_overBudget && !m_keepRefused && !stopped();
                 return -1;
             }
 
@@ -3034,7 +3456,11 @@ private:
                 relax( n, step * c + ( turn == 1 ? 3.0f : turn == 2 ? 8.0f : 0.0f ), d, nx, ny, l );
             }
 
-            if( wn.vias && L > 1 && m_w.ViaOk( k, (uint32_t) i, wn.code ) && !( m_keepOut && ( m_w.keep[i] & ~wn.chips ) ) )
+            if( wn.vias && L > 1 && m_keepOut && ( m_w.keep[i] & ~wn.chips ) )
+            {
+                m_keepRefused = m_keepRefused || m_w.ViaOk( k, (uint32_t) i, wn.code );
+            }
+            else if( wn.vias && L > 1 && m_w.ViaOk( k, (uint32_t) i, wn.code ) )
             {
                 const uint16_t occ = m_occVia[k][i];
 
@@ -3097,6 +3523,7 @@ private:
     bool                  m_hitEdge = false;    ///< the last window's search tried to step out of it
     float                 m_lastCost = 0;
     bool                  m_walledIn = false;   ///< the last search failed over the whole board on fixed copper alone
+    bool                  m_keepRefused = false;   ///< the last search met a via spot only the chips' keep-out closed
 
     std::vector<std::vector<bool>> m_dead;   ///< per net, per end: walled in by fixed copper
 
@@ -3181,9 +3608,30 @@ private:
 };
 
 
-GRID_NET_RESULT toGeometry( const WORLD& aWorld, const GRID_PARAMS& aParams, const NEGOTIATION::NET_STATE& aNet )
+GRID_NET_RESULT toGeometry( const WORLD& aWorld, const GRID_PARAMS& aParams, const NEGOTIATION::NET_STATE& aNet, size_t aIndex )
 {
-    return GridPathGeometry( aWorld.grid, aWorld.cells, aParams.layers, aNet.paths, aNet.reached );
+    GRID_NET_RESULT out = GridPathGeometry( aWorld.grid, aWorld.cells, aParams.layers, aNet.paths, aNet.reached );
+
+    if( aIndex >= aWorld.nets.size() )
+        return out;
+
+    // an exit's copper where the net's copper starts on its cell
+    for( const WORLD::EXIT& exit : aWorld.nets[aIndex].exits )
+    {
+        const bool used = std::any_of( aNet.paths.begin(), aNet.paths.end(),
+                                       [&]( const std::vector<uint32_t>& p ) { return std::count( p.begin(), p.end(), exit.state ) > 0; } );
+
+        if( !used )
+            continue;
+
+        for( size_t k = 1; k < exit.track.points.size(); ++k )
+            out.length += ( exit.track.points[k] - exit.track.points[k - 1] ).EuclideanNorm();
+
+        out.tracks.push_back( exit.track );
+        out.halfCellExits.push_back( exit.end );
+    }
+
+    return out;
 }
 
 } // namespace
@@ -3435,6 +3883,10 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     WORLD world;
     buildWorld( aBoard, nets, aParams, world );
     findPockets( world );
+    const auto halfFrom = CLOCK::now();
+    std::tie( result.halfCellTried, result.halfCellWon ) = halfCellExits( world, nets, aParams );
+    result.halfCellMs = msSince( halfFrom );
+    std::vector<std::vector<MARK>>().swap( world.marks );
     buildTiles( world );
     result.buildMs = msSince( started );
     result.cell = world.grid.cell;
@@ -3893,8 +4345,13 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
                       []( const auto& a, const auto& b ) { return a.second > b.second; } );
     result.costliest.resize( std::min<size_t>( result.costliest.size(), 10 ) );
 
-    for( const auto& net : win.Nets() )
-        result.nets.push_back( toGeometry( world, aParams, net ) );
+    for( size_t n = 0; n < win.Nets().size(); ++n )
+    {
+        result.nets.push_back( toGeometry( world, aParams, win.Nets()[n], n ) );
+
+        if( n < world.nets.size() )
+            result.nets.back().walls = world.nets[n].walls;
+    }
 
     if( !asAsked.empty() )
     {

@@ -197,6 +197,14 @@ namespace KIPLATFORM
         bool SupportsKeyState();
 
         /**
+         * The distance the pointer moves with a button held before it is a drag.
+         *
+         * @param aVertical selects the Y distance, else X.
+         * @return pixels, or -1 when the platform cannot tell (no display).
+         */
+        int GetDragThreshold( bool aVertical );
+
+        /**
          * Returns the mouse position in screen coordinates.
          * If we've just warped the cursor, returns the new coordinates.
          * While a pointer is injected (SetInjectedPointer()), returns its position.

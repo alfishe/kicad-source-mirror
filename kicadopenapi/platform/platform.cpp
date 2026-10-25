@@ -307,4 +307,14 @@ void KeepProcessResponsive()
 #endif
 }
 
+fs::path RunSnapshot(const fs::path& exe, std::string& note)
+{
+#if defined(__APPLE__)
+    return RunSnapshotMacOS(exe, note);
+#else
+    note = "no snapshot on this system: runs from the build";
+    return exe;
+#endif
+}
+
 } // namespace kopenapi::platform

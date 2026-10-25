@@ -449,7 +449,28 @@ static KOPENAPI_RESULT h_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     }
 
     if( sch.status != 200 && boardNets.empty() )
-        return KOPENAPI_RESULT::Error( 404, "net not found in the open documents" );
+    {
+        // the close names either document knows
+        nlohmann::json close = nlohmann::json::array();
+
+        for( const KOPENAPI_RESULT* r : { &sch, &pcb } )
+        {
+            if( r->body.contains( "error" ) )
+            {
+                for( const nlohmann::json& n : r->body["error"].value( "did_you_mean", nlohmann::json::array() ) )
+                {
+                    if( std::find( close.begin(), close.end(), n ) == close.end() )
+                        close.push_back( n );
+                }
+            }
+        }
+
+        KOPENAPI_RESULT result = KOPENAPI_RESULT::Error(
+                404, close.empty() ? std::string( "net not found in the open documents" )
+                                   : "net not found in the open documents; did you mean '" + close[0].get<std::string>() + "'?" );
+        result.body["error"]["did_you_mean"] = close;
+        return result;
+    }
 
     nlohmann::json onlySch = nlohmann::json::array(), onlyBoard = nlohmann::json::array();
 

@@ -244,8 +244,15 @@ BOARD_STATE_APPLIED BoardStateApply( BOARD* aBoard, BOARD_COMMIT& aCommit, const
 
             if( FOOTPRINT* fp = dynamic_cast<FOOTPRINT*>( item ) )
             {
-                for( PAD* pad : fp->Pads() )
-                    remap( pad );
+                // pads, and the copper shapes and zones a footprint carries: all hold a net of the
+                // temp board, freed with it
+                fp->RunOnChildren(
+                        [&]( BOARD_ITEM* aChild )
+                        {
+                            if( BOARD_CONNECTED_ITEM* c = dynamic_cast<BOARD_CONNECTED_ITEM*>( aChild ) )
+                                remap( c );
+                        },
+                        RECURSE_MODE::RECURSE );
 
                 // the parsed class belongs to the temp board's manager
                 std::unordered_set<wxString> classes;

@@ -7,6 +7,7 @@
 
 #include <kicadopenapi_glow.h>
 #include <eda_draw_frame.h>
+#include <eda_item.h>
 #include <class_draw_panel_gal.h>
 #include <gal/color4d.h>
 #include <kiid.h>

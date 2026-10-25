@@ -106,10 +106,15 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     const int span = std::max( region.GetWidth(), region.GetHeight() );
     region.Inflate( std::max( pcbIUScale.mmToIU( 3.0 ), span * 3 / 10 ) );
 
-    BOX2I edges = board->GetBoardEdgesBoundingBox();
+    const BOX2I edges = board->GetBoardEdgesBoundingBox();
+    const bool  hasEdges = edges.GetWidth() > 0 && edges.GetHeight() > 0;
 
-    if( edges.GetWidth() > 0 && edges.GetHeight() > 0 )
+    if( hasEdges && aReq.wholeBoard )
+        region = edges;
+    else if( hasEdges )
         region = region.Intersect( edges );
+
+    plan.wholeBoard = aReq.wholeBoard;
 
     // A cell of about a quarter of a track and its clearance (a fine-pitch pad's way out between its
     // neighbours stays open), on a 0.05 mm step, coarser when the box is large
@@ -126,6 +131,12 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     grid.nx = region.GetWidth() / cell + 1;
     grid.ny = region.GetHeight() / cell + 1;
     plan.cell = cell;
+
+    // the box's sides that cut the board (beyond them the board goes on)
+    const bool cutSide[4] = { hasEdges && region.GetLeft() > edges.GetLeft() + cell, hasEdges && region.GetTop() > edges.GetTop() + cell,
+                              hasEdges && region.GetRight() < edges.GetRight() - cell,
+                              hasEdges && region.GetBottom() < edges.GetBottom() - cell };
+    bool       reachedCut = false;
 
     const size_t         cells = (size_t) grid.nx * grid.ny;
     std::vector<uint8_t> track( cells * L, 0 );   // a track's centre may not be here, per layer
@@ -173,10 +184,12 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
 
     // the board's rule for our net against an item, as DRC and the router see it
     PCB_TRACK probeTrack( board );
+    probeTrack.SetFlags( ROUTER_TRANSIENT );
     probeTrack.SetNetCode( net );
     probeTrack.SetWidth( aReq.trackWidth );
 
     PCB_VIA probeVia( board );
+    probeVia.SetFlags( ROUTER_TRANSIENT );
     probeVia.SetNetCode( net );
     probeVia.SetViaType( VIATYPE::THROUGH );
     probeVia.SetLayerPair( F_Cu, B_Cu );
@@ -655,6 +668,12 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         const int x = c % grid.nx;
         const int y = c / grid.nx;
 
+        if( ( x == 0 && cutSide[0] ) || ( y == 0 && cutSide[1] ) || ( x == grid.nx - 1 && cutSide[2] )
+            || ( y == grid.ny - 1 && cutSide[3] ) )
+        {
+            reachedCut = true;
+        }
+
         auto relax = [&]( int aNext, int aCost, int8_t aDir )
         {
             if( g[s] + aCost < g[aNext] )
@@ -684,9 +703,9 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                 continue;
 
             const int turn = ( dirIn[s] >= 0 && dirIn[s] != d ) ? 6 : 0;
-            const int near = nearPad[base + grid.Index( x2, y2 )] ? ESCAPE_COST : 0;
+            const int nearby = nearPad[base + grid.Index( x2, y2 )] ? ESCAPE_COST : 0;
             const int cross = softCost( trackSoft, base + grid.Index( x2, y2 ) );
-            relax( l * (int) cells + grid.Index( x2, y2 ), ( ( d & 1 ) ? 14 : 10 ) + turn + near + cross, (int8_t) d );
+            relax( l * (int) cells + grid.Index( x2, y2 ), ( ( d & 1 ) ? 14 : 10 ) + turn + nearby + cross, (int8_t) d );
         }
 
         if( vias && !via[c] )
@@ -703,7 +722,89 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     }
 
     if( reached < 0 )
+    {
+        // the start's room goes on past the box: once more over the whole board
+        if( open.empty() && reachedCut && !aReq.wholeBoard )
+        {
+            ROUTE_PLAN_REQUEST wide = aReq;
+            wide.wholeBoard = true;
+
+            ROUTE_PLAN again = PlanRoute( wide );
+            again.ms += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
+            return again;
+        }
+
+        // all the start reaches searched: is it the start's room or the target's that is shut
+        if( open.empty() )
+        {
+            constexpr size_t ROOM = 20000;
+            std::vector<uint8_t> seen( states, 0 );
+            std::vector<int>     todo;
+
+            for( int s : goals )
+                todo.push_back( s );
+
+            for( const auto& [s, esc] : goalEscapes )
+                todo.push_back( s );
+
+            size_t room = 0;
+
+            for( int s : todo )
+                seen[s] = 1;
+
+            while( !todo.empty() && room <= ROOM )
+            {
+                const int s = todo.back();
+                todo.pop_back();
+                room++;
+
+                const int l = s / (int) cells, c = s % (int) cells, x = c % grid.nx, y = c / grid.nx;
+
+                for( int d = 0; d < 8; d += 2 )
+                {
+                    const int x2 = x + DX[d], y2 = y + DY[d];
+
+                    if( x2 < 0 || y2 < 0 || x2 >= grid.nx || y2 >= grid.ny )
+                        continue;
+
+                    const int n = l * (int) cells + grid.Index( x2, y2 );
+
+                    if( !track[n] && !seen[n] )
+                    {
+                        seen[n] = 1;
+                        todo.push_back( n );
+                    }
+                }
+
+                if( vias && !via[c] )
+                {
+                    for( int l2 = 0; l2 < L; ++l2 )
+                    {
+                        const int n = l2 * (int) cells + c;
+
+                        if( !track[n] && !seen[n] )
+                        {
+                            seen[n] = 1;
+                            todo.push_back( n );
+                        }
+                    }
+                }
+            }
+
+            if( room <= ROOM && (size_t) plan.expanded > room )
+            {
+                plan.boxedEnd = 2;
+                plan.boxedRoom = room;
+            }
+            else if( (size_t) plan.expanded <= ROOM )
+            {
+                plan.boxedEnd = 1;
+                plan.boxedRoom = (size_t) plan.expanded;
+            }
+        }
+
         return finish();
+    }
 
     // The path, start first: a corner where the direction changes, a via where the layer does
     std::vector<int> path;

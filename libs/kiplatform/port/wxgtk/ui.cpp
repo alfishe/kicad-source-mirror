@@ -435,6 +435,17 @@ bool KIPLATFORM::UI::SupportsKeyState()
 }
 
 
+int KIPLATFORM::UI::GetDragThreshold( bool aVertical )
+{
+    // without GTK settings (no display) wxSystemSettings reads gtk-dnd-drag-threshold from a null
+    // object and returns an unset value
+    if( !gtk_settings_get_default() )
+        return -1;
+
+    return wxSystemSettings::GetMetric( aVertical ? wxSYS_DRAG_Y : wxSYS_DRAG_X );
+}
+
+
 #if defined( GDK_WINDOWING_WAYLAND ) && defined( KICAD_WAYLAND )
 
 static bool wayland_warp_pointer( GtkWidget* aWidget, GdkDisplay* aDisplay, GdkWindow* aWindow,

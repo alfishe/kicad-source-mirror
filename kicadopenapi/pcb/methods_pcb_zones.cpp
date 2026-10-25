@@ -507,7 +507,7 @@ static KOPENAPI_RESULT h_pcb_zone_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     NETINFO_ITEM* net = KopenapiFindNet( board, aArgs.value( "net", std::string() ) );
 
     if( !net )
-        return KOPENAPI_RESULT::Error( 404, "net not found: " + aArgs.value( "net", std::string() ) + " (pcb_net_list)" );
+        return KopenapiNoSuchNet( board, aArgs.value( "net", std::string() ) );
 
     LSET layers;
 
@@ -1120,7 +1120,7 @@ static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
         setNet = KopenapiFindNet( board, aArgs.value( "set_net", std::string() ) );
 
         if( !setNet || setNet->GetNetCode() <= 0 )
-            return KOPENAPI_RESULT::Error( 404, "set_net: no such net on the board" );
+            return KopenapiNoSuchNet( board, aArgs.value( "set_net", std::string() ), "set_net: " );
     }
 
     SHAPE_LINE_CHAIN outline;

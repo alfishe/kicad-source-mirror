@@ -307,6 +307,20 @@ void KOPENAPI_HISTORY::AfterEdit( KOPENAPI_CONTEXT& aCtx, const KOPENAPI_RESULT&
     d->pending.reset();
     entry.status = aResult.status;
 
+    if( aResult.status < 400 && aCtx.headless )
+    {
+        // a pcb_* call edits the board only; a call of no document domain may edit any
+        const std::string prefix = entry.method.substr( 0, entry.method.find( '_' ) );
+        const auto        histories = KOPENAPI_REGISTRY::Get().DocumentHistories();
+        const bool        ownDomain = histories.count( prefix ) > 0;
+
+        for( const auto& [domain, history] : histories )
+        {
+            if( history.edited && ( !ownDomain || domain == prefix ) )
+                history.edited( aCtx );
+        }
+    }
+
     // A successful call that changed nothing (a pointer move, a zoom through pcb_action) is no
     // step: it would only push real steps out of the log
     if( aResult.status < 400 && d->unchangedSince( aCtx, entry.before ) )
@@ -456,6 +470,34 @@ KOPENAPI_RESULT KOPENAPI_HISTORY::RollbackLastInCall( KOPENAPI_CONTEXT& aCtx )
     }
 
     return result;
+}
+
+
+KOPENAPI_RESULT KOPENAPI_HISTORY::RestoreBeforePending( KOPENAPI_CONTEXT& aCtx )
+{
+    IMPL* d = impl();
+
+    if( !d->pending )
+        return KOPENAPI_RESULT::Error( 409, "no editing call is running" );
+
+    if( d->pending->before.docs.empty() )
+        return KOPENAPI_RESULT::Error( 409, "the running call has no mark of the documents before it (no copy could be made)" );
+
+    std::string    refused;
+    nlohmann::json documents = d->restore( aCtx, d->pending->before, refused );
+
+    if( !refused.empty() )
+        return KOPENAPI_RESULT::Error( 409, "cannot take the call's edits back exactly: " + refused );
+
+    d->epoch++;
+
+    for( const auto& [domain, how] : documents.items() )
+    {
+        if( how == "failed" )
+            return KOPENAPI_RESULT::Error( 500, "taking the call's edits back failed for " + domain + ": " + documents.dump() );
+    }
+
+    return KOPENAPI_RESULT::Ok( { { "documents", documents } } );
 }
 
 

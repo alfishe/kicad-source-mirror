@@ -101,8 +101,8 @@ TOOL_DISPATCHER::TOOL_DISPATCHER( TOOL_MANAGER* aToolMgr ) :
     m_lastKeyTime( 0 ),
     m_toolMgr( aToolMgr )
 {
-    m_sysDragMinX = wxSystemSettings::GetMetric( wxSYS_DRAG_X );
-    m_sysDragMinY = wxSystemSettings::GetMetric( wxSYS_DRAG_Y );
+    m_sysDragMinX = KIPLATFORM::UI::GetDragThreshold( false );
+    m_sysDragMinY = KIPLATFORM::UI::GetDragThreshold( true );
 
     m_sysDragMinX = m_sysDragMinX != -1 ? m_sysDragMinX : DragDistanceThreshold;
     m_sysDragMinY = m_sysDragMinY != -1 ? m_sysDragMinY : DragDistanceThreshold;

@@ -751,7 +751,7 @@ std::optional<KOPENAPI_RESULT> avoidNetsArg( BOARD* aBoard, const nlohmann::json
         NETINFO_ITEM* net = KopenapiFindNet( aBoard, name );
 
         if( !net || net->GetNetCode() <= 0 )
-            return KOPENAPI_RESULT::Error( 404, "avoid_nets: no net '" + name + "' on the board" );
+            return KopenapiNoSuchNet( aBoard, name, "avoid_nets: " );
 
         for( PCB_LAYER_ID layer : layers.Seq() )
         {
@@ -858,7 +858,7 @@ static KOPENAPI_RESULT h_pcb_free_area( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         NETINFO_ITEM*     net = KopenapiFindNet( board, name );
 
         if( !net || net->GetNetCode() <= 0 )
-            return KOPENAPI_RESULT::Error( 404, "inside_net: no net '" + name + "' on the board" );
+            return KopenapiNoSuchNet( board, name, "inside_net: " );
 
         LSET layers = LSET::AllCuMask( board->GetCopperLayerCount() );
 
@@ -1232,10 +1232,10 @@ static KOPENAPI_RESULT h_pcb_silk_fit( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     }
 
     // in a region: centred in it unless near_mm says otherwise
-    std::optional<VECTOR2I> near = pointArg( aArgs, "near_mm" );
+    std::optional<VECTOR2I> nearby = pointArg( aArgs, "near_mm" );
 
-    if( !near && region.OutlineCount() )
-        near = region.BBox().Centre();
+    if( !nearby && region.OutlineCount() )
+        nearby = region.BBox().Centre();
 
     const bool ignore = aArgs.value( "ignore_obstacles", false );
     const int  stepMm = iu( std::clamp( aArgs.value( "step_mm", region.OutlineCount() ? 0.1 : 0.5 ), 0.05, 5.0 ) );
@@ -1243,7 +1243,7 @@ static KOPENAPI_RESULT h_pcb_silk_fit( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     search( [&]( double aS ) -> std::optional<BOX2I>
             {
                 const VECTOR2I               sz = scaled( aS );
-                const std::vector<FREE_SPOT> f = findFree( board, bottom, gap, sz.x, sz.y, near, 1, stepMm,
+                const std::vector<FREE_SPOT> f = findFree( board, bottom, gap, sz.x, sz.y, nearby, 1, stepMm,
                                                            region.OutlineCount() ? &region : nullptr, ignore,
                                                            aArgs.value( "avoid_tracks", true ) );
                 return f.empty() ? std::nullopt : std::optional<BOX2I>( f.front().box );

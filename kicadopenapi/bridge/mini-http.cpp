@@ -548,9 +548,10 @@ void SetExtraHeader(const std::string& name, const std::string& value)
     s_extraHeaders += name + ": " + value + "\r\n";
 }
 
-HttpResult Post(const std::string& host, int port, const std::string& path, const std::string& body)
+HttpResult Post(const std::string& host, int port, const std::string& path, const std::string& body,
+                int receiveTimeoutSeconds)
 {
-    return Send("POST", host, port, path, body, 300);
+    return Send("POST", host, port, path, body, receiveTimeoutSeconds);
 }
 
 HttpResult Get(const std::string& host, int port, const std::string& path, int receiveTimeoutSeconds)

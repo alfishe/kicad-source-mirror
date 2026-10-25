@@ -3539,9 +3539,9 @@ static KOPENAPI_RESULT h_sch_power_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         // wires connect at their ends: split the one hung on
         commit.Remove( tapped, screen );
 
-        for( const VECTOR2I& far : { tapped->GetStartPoint(), tapped->GetEndPoint() } )
+        for( const VECTOR2I& distant : { tapped->GetStartPoint(), tapped->GetEndPoint() } )
         {
-            auto* half = new SCH_LINE( far, LAYER_WIRE );
+            auto* half = new SCH_LINE( distant, LAYER_WIRE );
             half->SetEndPoint( tap );
             commit.Add( half, screen );
             touched.push_back( half->m_Uuid );
@@ -3640,11 +3640,11 @@ static KOPENAPI_RESULT h_sch_item_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     const std::string       netGlob = aArgs.value( "net", std::string() );
-    std::optional<VECTOR2I> near;
+    std::optional<VECTOR2I> nearby;
     const int               radius = toIU( aArgs.value( "radius_mm", 5.08 ) );
 
     if( aArgs.contains( "near" ) && aArgs["near"].is_object() )
-        near = VECTOR2I( toIU( aArgs["near"].value( "x_mm", 0.0 ) ), toIU( aArgs["near"].value( "y_mm", 0.0 ) ) );
+        nearby = VECTOR2I( toIU( aArgs["near"].value( "x_mm", 0.0 ) ), toIU( aArgs["near"].value( "y_mm", 0.0 ) ) );
 
     // Net of every connectable item on this sheet instance
     std::map<const SCH_ITEM*, std::string> netOf;
@@ -3718,9 +3718,9 @@ static KOPENAPI_RESULT h_sch_item_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( !KopenapiGlob( netGlob, row.value( "net", std::string() ) ) )
             continue;
 
-        if( near )
+        if( nearby )
         {
-            const BOX2I probe( *near - VECTOR2I( radius, radius ), VECTOR2I( 2 * radius, 2 * radius ) );
+            const BOX2I probe( *nearby - VECTOR2I( radius, radius ), VECTOR2I( 2 * radius, 2 * radius ) );
 
             if( !item->GetBoundingBox().Intersects( probe ) )
                 continue;

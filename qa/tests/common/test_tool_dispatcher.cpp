@@ -261,6 +261,12 @@ struct WX_INPUT_FIXTURE
         dispatcher.DispatchWxEvent( event );
     }
 
+    void expect( const std::vector<int>& aEvents )
+    {
+        BOOST_CHECK_EQUAL_COLLECTIONS( recorder->m_events.begin(), recorder->m_events.end(), aEvents.begin(),
+                                       aEvents.end() );
+    }
+
     KIGFX::VIEW                      view;
     FAKE_VIEW_CONTROLS               controls;
     TOOL_MANAGER                     mgr;
@@ -277,7 +283,7 @@ BOOST_AUTO_TEST_CASE( Click )
     send( wxEVT_LEFT_DOWN, 100, 100, true );
     send( wxEVT_LEFT_UP, 100, 100, false );
 
-    BOOST_CHECK( recorder->m_events == std::vector<int>( { TA_MOUSE_DOWN, TA_MOUSE_CLICK } ) );
+    expect( { TA_MOUSE_DOWN, TA_MOUSE_CLICK } );
 }
 
 BOOST_AUTO_TEST_CASE( Drag )
@@ -286,7 +292,7 @@ BOOST_AUTO_TEST_CASE( Drag )
     send( wxEVT_MOTION, 300, 100, true );
     send( wxEVT_LEFT_UP, 300, 100, false );
 
-    BOOST_CHECK( recorder->m_events == std::vector<int>( { TA_MOUSE_DOWN, TA_MOUSE_DRAG, TA_MOUSE_UP } ) );
+    expect( { TA_MOUSE_DOWN, TA_MOUSE_DRAG, TA_MOUSE_UP } );
 }
 
 BOOST_AUTO_TEST_CASE( DoubleClick )
@@ -296,7 +302,7 @@ BOOST_AUTO_TEST_CASE( DoubleClick )
     send( wxEVT_LEFT_DCLICK, 100, 100, true );
     send( wxEVT_LEFT_UP, 100, 100, false );
 
-    BOOST_CHECK( recorder->m_events == std::vector<int>( { TA_MOUSE_DOWN, TA_MOUSE_CLICK, TA_MOUSE_DBLCLICK } ) );
+    expect( { TA_MOUSE_DOWN, TA_MOUSE_CLICK, TA_MOUSE_DBLCLICK } );
 }
 
 // The second press far from the first is a fast click-drag, not a double click
@@ -308,8 +314,7 @@ BOOST_AUTO_TEST_CASE( FastClickDrag )
     send( wxEVT_MOTION, 400, 100, true );
     send( wxEVT_LEFT_UP, 400, 100, false );
 
-    BOOST_CHECK( recorder->m_events
-                 == std::vector<int>( { TA_MOUSE_DOWN, TA_MOUSE_CLICK, TA_MOUSE_DOWN, TA_MOUSE_DRAG, TA_MOUSE_UP } ) );
+    expect( { TA_MOUSE_DOWN, TA_MOUSE_CLICK, TA_MOUSE_DOWN, TA_MOUSE_DRAG, TA_MOUSE_UP } );
 }
 
 BOOST_AUTO_TEST_SUITE_END()

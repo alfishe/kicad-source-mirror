@@ -303,7 +303,29 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         { "copper", "F.Cu,B.Cu,Edge.Cuts" },
         { "assembly", "F.Fab,F.SilkS,Edge.Cuts" } };
 
-    std::string layers = aArgs.value( "layers", std::string( "front" ) );
+    // a preset, a comma list or an array of layer names (as the other methods take them)
+    std::string layers = "front";
+
+    if( aArgs.contains( "layers" ) && aArgs["layers"].is_array() )
+    {
+        layers.clear();
+
+        for( const nlohmann::json& l : aArgs["layers"] )
+        {
+            if( !l.is_string() )
+                return KOPENAPI_RESULT::Error( 400, "layers: a preset, \"F.Cu,B.Cu\" or [\"F.Cu\", \"B.Cu\"]" );
+
+            layers += ( layers.empty() ? "" : "," ) + l.get<std::string>();
+        }
+    }
+    else if( aArgs.contains( "layers" ) && aArgs["layers"].is_string() )
+    {
+        layers = aArgs["layers"].get<std::string>();
+    }
+    else if( aArgs.contains( "layers" ) && !aArgs["layers"].is_null() )
+    {
+        return KOPENAPI_RESULT::Error( 400, "layers: a preset, \"F.Cu,B.Cu\" or [\"F.Cu\", \"B.Cu\"]" );
+    }
 
     if( auto preset = presets.find( layers ); preset != presets.end() )
         layers = preset->second;
@@ -379,7 +401,11 @@ static KOPENAPI_RESULT h_pcb_render( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     // zones: filled (as plotted), outline (each fill drawn as its edge: what is under a pour shows),
     // hidden; the fills are swapped for the render only and put back
-    const std::string zoneMode = aArgs.value( "zones", std::string( "filled" ) );
+    // (true / false as the other methods' flags: filled / hidden)
+    const nlohmann::json zonesArg = aArgs.value( "zones", nlohmann::json( "filled" ) );
+    const std::string    zoneMode = zonesArg.is_boolean() ? ( zonesArg.get<bool>() ? "filled" : "hidden" )
+                                    : zonesArg.is_string() ? zonesArg.get<std::string>()
+                                                           : std::string();
 
     if( zoneMode != "filled" && zoneMode != "outline" && zoneMode != "hidden" )
         return KOPENAPI_RESULT::Error( 400, "zones: filled, outline or hidden" );
@@ -793,7 +819,7 @@ KOPENAPI_REGISTER( "pcb_render",
                    "alone at a high dpi for detail; an image over 64 megapixels is refused (422) with what it "
                    "would cost (memory, CPU) and the dpi / region that fit; GUI and headless; over MCP an image",
                    R"json({"type":"object","properties":{
-                        "layers":{"type":"string","default":"front","description":"preset front/back/copper/assembly or layer list"},
+                        "layers":{"type":["string","array"],"items":{"type":"string"},"default":"front","description":"preset front/back/copper/assembly, a comma list \"F.Cu,B.Cu\" or an array [\"F.Cu\", \"B.Cu\"]"},
                         "dpi":{"type":"integer","default":150,"minimum":30,"maximum":25400,"description":"the whole board: keep it low (150); a region: as high as the detail needs (only the region is drawn)"},
                         "crop":{"type":"boolean","default":true},
                         "region":{"type":"array","items":{"type":"number"},"description":"[x0_mm, y0_mm, x1_mm, y1_mm]: only this part of the board is drawn (memory and time follow the region's size at this dpi)"},
@@ -802,7 +828,7 @@ KOPENAPI_REGISTER( "pcb_render",
                         "mirror":{"type":"boolean","default":false},
                         "black_and_white":{"type":"boolean","default":false},
                         "theme":{"type":"string"},
-                        "zones":{"type":"string","enum":["filled","outline","hidden"],"default":"filled","description":"outline: each pour drawn as its edge (the tracks and pads under it show); hidden: no pours"},
+                        "zones":{"type":["string","boolean"],"enum":["filled","outline","hidden",true,false],"default":"filled","description":"outline: each pour drawn as its edge (the tracks and pads under it show); hidden: no pours; true / false: filled / hidden"},
                         "ratsnest":{"type":"boolean","default":false,"description":"draw the open connections (ratsnest) over the image; the answer counts them (ratsnest_drawn)"}}})json"_json,
                    false, h_pcb_render, 300 );
 

@@ -624,7 +624,22 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     }
 
     if( !found )
-        return KOPENAPI_RESULT::Error( 404, "net not found" );
+    {
+        std::vector<std::string> names;
+
+        for( const NET_ENTRY& entry : nets )
+            names.push_back( entry.name );
+
+        const std::vector<std::string> close = name.empty() ? std::vector<std::string>()
+                                                            : KopenapiDidYouMean( names, str( UnescapeString( name ) ) );
+        KOPENAPI_RESULT result = KOPENAPI_RESULT::Error(
+                404, close.empty() ? std::string( "net not found" ) : std::string( "net not found" ) + "; did you mean '" + close.front() + "'?" );
+
+        if( !name.empty() )
+            result.body["error"]["did_you_mean"] = close;
+
+        return result;
+    }
 
     nlohmann::json        sheets = nlohmann::json::array();
     nlohmann::json        allPins = nlohmann::json::array();

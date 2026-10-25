@@ -225,6 +225,15 @@ void parentRefFunc( LIBEVAL::CONTEXT* aCtx, void* aSelf )
 }
 
 
+/// @brief A track's or arc's length in mm; 0 for anything else
+void lengthFunc( LIBEVAL::CONTEXT* aCtx, void* aSelf )
+{
+    BOARD_ITEM* item = itemOf( aCtx, aSelf );
+    const bool  track = item && ( item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T );
+    pushNumber( aCtx, track ? mmOf( static_cast<PCB_TRACK*>( item )->GetLength() ) : 0.0 );
+}
+
+
 void courtyardFunc( LIBEVAL::CONTEXT* aCtx, void* aSelf )
 {
     BOARD_ITEM* item = itemOf( aCtx, aSelf );
@@ -341,6 +350,7 @@ const std::map<wxString, QUERY_FUNCTION>& queryFunctions()
         add( wxS( "mount()" ), mountFunc );
         add( wxS( "parentRef()" ), parentRefFunc );
         add( wxS( "courtyard()" ), courtyardFunc );
+        add( wxS( "length()" ), lengthFunc );
         add( wxS( "inRect(x0, y0, x1, y1)" ), inRectFunc );
         add( wxS( "touchesRect(x0, y0, x1, y1)" ), touchesRectFunc );
         add( wxS( "inPolygon('x0 y0, x1 y1, ...')" ), inPolygonFunc );
@@ -973,6 +983,7 @@ struct FIELD
     bool        function;   ///< a value expression (A.side(), ...)
     wxString    property;   ///< property display name (spaces)
     PROGRAM     program;
+    std::string builtin;    ///< uuid / kind / owner: what every row carries
 };
 
 
@@ -999,6 +1010,77 @@ std::vector<TYPE_ID> kindTypes( const std::set<std::string>& aKinds )
     }
 
     return out;
+}
+
+
+/// @brief A length property of the queried kinds compared with a plain number ("A.Position_X > 83"):
+/// KiCad reads the number in internal units (nm), so the condition silently matches nothing or
+/// everything.  Zero is fine.  Returns the offending term, empty if none
+std::string unitlessLengthTerm( const std::set<std::string>& aKinds, const std::string& aExpression, int& aOffset )
+{
+    // quoted strings blanked, offsets kept
+    std::string text = aExpression;
+    char        quote = 0;
+
+    for( char& ch : text )
+    {
+        if( quote )
+        {
+            quote = ch == quote ? 0 : quote;
+            ch = ' ';
+        }
+        else if( ch == '\'' || ch == '"' )
+        {
+            quote = ch;
+            ch = ' ';
+        }
+    }
+
+    static const std::regex propFirst( R"(\b([AB])\.([A-Za-z_]\w*)\s*(==|!=|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)(?![\w.]))" );
+    static const std::regex numberFirst( R"((?:^|[^\w.])(-?\d+(?:\.\d+)?)\s*(==|!=|<=|>=|<|>)\s*([AB])\.([A-Za-z_]\w*)(?!\s*\())" );
+
+    PROPERTY_MANAGER& propMgr = PROPERTY_MANAGER::Instance();
+
+    auto isLength = [&]( std::string aName )
+    {
+        std::replace( aName.begin(), aName.end(), '_', ' ' );
+
+        for( TYPE_ID type : kindTypes( aKinds ) )
+        {
+            if( PROPERTY_BASE* property = propMgr.GetProperty( type, wxString::FromUTF8( aName ) ) )
+                return property->Display() == PT_SIZE || property->Display() == PT_COORD;
+        }
+
+        return false;
+    };
+
+    for( std::sregex_iterator it( text.begin(), text.end(), propFirst ), end; it != end; ++it )
+    {
+        const std::smatch& m = *it;
+        const size_t       after = (size_t) ( m.position( 0 ) + m.length( 0 ) );
+
+        if( after < text.size() && text[after] == '(' )
+            continue;
+
+        if( std::stod( m[4].str() ) != 0.0 && isLength( m[2].str() ) )
+        {
+            aOffset = (int) m.position( 0 );
+            return aExpression.substr( (size_t) m.position( 0 ), (size_t) m.length( 0 ) );
+        }
+    }
+
+    for( std::sregex_iterator it( text.begin(), text.end(), numberFirst ), end; it != end; ++it )
+    {
+        const std::smatch& m = *it;
+
+        if( std::stod( m[1].str() ) != 0.0 && isLength( m[4].str() ) )
+        {
+            aOffset = (int) m.position( 1 );
+            return aExpression.substr( (size_t) m.position( 1 ), (size_t) ( m.position( 0 ) + m.length( 0 ) - m.position( 1 ) ) );
+        }
+    }
+
+    return std::string();
 }
 
 
@@ -1036,6 +1118,16 @@ bool prepareField( const std::string& aName, FIELD& aField, COMPILE_ERROR& aErro
     aField.name = aName;
     aField.function = aName.find( '(' ) != std::string::npos;
     std::string name = aName.rfind( "A.", 0 ) == 0 ? aName.substr( 2 ) : aName;
+
+    for( const char* builtin : { "uuid", "kind", "owner" } )
+    {
+        if( wxString::FromUTF8( name ).CmpNoCase( builtin ) == 0 )
+        {
+            aField.function = false;
+            aField.builtin = builtin;
+            return true;
+        }
+    }
 
     if( !aField.function )
     {
@@ -1077,6 +1169,18 @@ bool prepareField( const std::string& aName, FIELD& aField, COMPILE_ERROR& aErro
 
 nlohmann::json fieldValue( const FIELD& aField, BOARD_ITEM* aItem, PCBEXPR_CONTEXT& aCtx )
 {
+    if( aField.builtin == "uuid" )
+        return aItem->m_Uuid.AsStdString();
+
+    if( aField.builtin == "kind" )
+        return kindOf( aItem );
+
+    if( aField.builtin == "owner" )
+    {
+        const FOOTPRINT* owner = aItem->GetParentFootprint();
+        return owner ? owner->GetReference().ToStdString( wxConvUTF8 ) : std::string( "board" );
+    }
+
     if( aField.function )
     {
         aCtx.Reset();
@@ -1193,6 +1297,16 @@ std::vector<ORDER_KEY> orderKeys( const nlohmann::json& aArgs )
 }
 
 
+/// uuids sort as text: a natural sort reads their hex digits as numbers
+int compareKey( const ORDER_KEY& aKey, const nlohmann::json& aX, const nlohmann::json& aY )
+{
+    if( aX.is_string() && aY.is_string() && wxString( aKey.name ).IsSameAs( "uuid", false ) )
+        return aX.get_ref<const std::string&>().compare( aY.get_ref<const std::string&>() );
+
+    return compareJson( aX, aY );
+}
+
+
 void sortRows( std::vector<nlohmann::json>& aRows, const std::vector<ORDER_KEY>& aKeys )
 {
     if( aKeys.empty() )
@@ -1205,7 +1319,7 @@ void sortRows( std::vector<nlohmann::json>& aRows, const std::vector<ORDER_KEY>&
                           {
                               const nlohmann::json& x = a.contains( k.name ) ? a[k.name] : nlohmann::json();
                               const nlohmann::json& y = b.contains( k.name ) ? b[k.name] : nlohmann::json();
-                              const int             c = compareJson( x, y );
+                              const int             c = compareKey( k, x, y );
 
                               if( c != 0 )
                                   return k.descending ? c > 0 : c < 0;
@@ -1267,6 +1381,7 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
 
     // where, with its top-level terms for explain
     const std::string where = aArgs.value( "where", std::string() );
+    std::string       typeHint;
     const nlohmann::json explainArg = aArgs.value( "explain", nlohmann::json( false ) );
     const bool        explainMisses = explainArg.is_string() && explainArg.get<std::string>() == "misses";
     const bool        explain = explainMisses || ( explainArg.is_boolean() && explainArg.get<bool>() );
@@ -1282,6 +1397,44 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
 
         if( !whereProgram )
             return compileError( "where", where, error );
+
+        int               termOffset = -1;
+        const std::string unitless = unitlessLengthTerm( kinds, where, termOffset );
+
+        // A.Type == 'X' for a type none of the kinds in from has (vias are not in from: tracks)
+        {
+            static const std::map<std::string, std::string> kindOfType = {
+                { "via", "vias" },       { "track", "tracks" },   { "pad", "pads" },          { "footprint", "footprints" },
+                { "zone", "zones" },     { "graphic", "drawings" }, { "text", "texts" },      { "text box", "texts" },
+                { "group", "groups" } };
+            static const std::regex typeEq( R"(\bType\s*==\s*['"]([^'"]+)['"]|['"]([^'"]+)['"]\s*==\s*[AB]\.Type\b)", std::regex::icase );
+
+            for( auto it = std::sregex_iterator( where.begin(), where.end(), typeEq ); it != std::sregex_iterator(); ++it )
+            {
+                std::string name = ( *it )[1].matched ? ( *it )[1].str() : ( *it )[2].str();
+                std::string lower = name;
+                std::transform( lower.begin(), lower.end(), lower.begin(), []( unsigned char c ) { return (char) std::tolower( c ); } );
+                auto k = kindOfType.find( lower );
+
+                if( k != kindOfType.end() && !kinds.count( k->second ) )
+                {
+                    typeHint = "A.Type '" + name + "' is never true in from " + nlohmann::json( std::vector<std::string>( kinds.begin(), kinds.end() ) ).dump()
+                               + ": those are in from '" + k->second + "' (add it, or from: 'items')";
+                    break;
+                }
+            }
+        }
+
+        if( !unitless.empty() )
+        {
+            KOPENAPI_RESULT r = KOPENAPI_RESULT::Error(
+                    400, "where: '" + unitless + "' compares a length with a plain number, which KiCad reads in "
+                         "internal units (nm): add the unit (mm / mil / in), e.g. 83mm" );
+            r.body["error"]["expression"] = where;
+            r.body["error"]["term"] = unitless;
+            r.body["error"]["offset"] = termOffset;
+            return r;
+        }
 
         if( explain )
         {
@@ -1315,10 +1468,29 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
 
     std::vector<std::string> groupNames;
 
+    static const std::string AGGREGATE_FORM = "aggregate is {output name: function}, function count, sum(x), min(x), "
+                                              "max(x), avg(x) or distinct(x) of a field x; the groups come from the "
+                                              "top-level group_by (field names), e.g. {from: 'tracks', group_by: 'Net', "
+                                              "aggregate: {tracks: 'count', length: 'sum(Length)'}} (Length: A.length(), mm)";
+
+    // group_by: a field name or a list of them
     if( aArgs.contains( "group_by" ) )
     {
-        for( const auto& g : aArgs["group_by"] )
+        const nlohmann::json& g = aArgs["group_by"];
+
+        if( g.is_string() )
+        {
             groupNames.push_back( g.get<std::string>() );
+        }
+        else if( g.is_array() && std::all_of( g.begin(), g.end(), []( const nlohmann::json& v ) { return v.is_string(); } ) )
+        {
+            for( const auto& v : g )
+                groupNames.push_back( v.get<std::string>() );
+        }
+        else
+        {
+            return KOPENAPI_RESULT::Error( 400, "group_by: a field name or a list of them (e.g. 'Net' or ['Net', 'Layer'])" );
+        }
     }
 
     struct AGGREGATE
@@ -1332,8 +1504,17 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
 
     if( aArgs.contains( "aggregate" ) )
     {
+        if( !aArgs["aggregate"].is_object() )
+            return KOPENAPI_RESULT::Error( 400, AGGREGATE_FORM );
+
         for( const auto& [out, spec] : aArgs["aggregate"].items() )
         {
+            if( out == "group_by" )
+                return KOPENAPI_RESULT::Error( 400, "aggregate: group_by is not an aggregate but a top-level argument; " + AGGREGATE_FORM );
+
+            if( !spec.is_string() )
+                return KOPENAPI_RESULT::Error( 400, "aggregate '" + out + "': " + AGGREGATE_FORM );
+
             const std::string s = spec.get<std::string>();
             AGGREGATE         a;
             a.out = out;
@@ -1347,13 +1528,13 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
                 const size_t open = s.find( '(' );
 
                 if( open == std::string::npos || s.back() != ')' )
-                    return KOPENAPI_RESULT::Error( 400, "aggregate '" + out + "': count, sum(x), min(x), max(x), avg(x), distinct(x)" );
+                    return KOPENAPI_RESULT::Error( 400, "aggregate '" + out + "': '" + s + "' is no function; " + AGGREGATE_FORM );
 
                 a.fn = s.substr( 0, open );
                 a.field = s.substr( open + 1, s.size() - open - 2 );
 
                 if( a.fn != "sum" && a.fn != "min" && a.fn != "max" && a.fn != "avg" && a.fn != "distinct" )
-                    return KOPENAPI_RESULT::Error( 400, "aggregate '" + out + "': unknown function '" + a.fn + "'" );
+                    return KOPENAPI_RESULT::Error( 400, "aggregate '" + out + "': unknown function '" + a.fn + "'; " + AGGREGATE_FORM );
             }
 
             aggregates.push_back( a );
@@ -1471,6 +1652,9 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
     // shape
     const CLOCK::time_point t2 = CLOCK::now();
     nlohmann::json          answer = { { "count", matched.size() }, { "scanned", scanned } };
+
+    if( !typeHint.empty() )
+        answer["hint"] = typeHint;
 
     auto itemRow = [&]( BOARD_ITEM* aItem, const std::vector<std::string>& aNames ) -> nlohmann::json
     {
@@ -1622,7 +1806,7 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
                               {
                                   for( const ORDER_KEY& k : order )
                                   {
-                                      const int c = compareJson( keys[a][k.name], keys[b][k.name] );
+                                      const int c = compareKey( k, keys[a][k.name], keys[b][k.name] );
 
                                       if( c != 0 )
                                           return k.descending ? c > 0 : c < 0;
@@ -1663,7 +1847,7 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
 
         if( explainMisses )
         {
-            nlohmann::json near = nlohmann::json::array();
+            nlohmann::json nearby = nlohmann::json::array();
 
             for( auto& [item, results] : misses )
             {
@@ -1674,10 +1858,10 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
                     e[terms[t]] = (bool) results[t];
 
                 row["explain"] = e;
-                near.push_back( row );
+                nearby.push_back( row );
             }
 
-            answer["near_misses"] = near;
+            answer["near_misses"] = nearby;
         }
     }
 

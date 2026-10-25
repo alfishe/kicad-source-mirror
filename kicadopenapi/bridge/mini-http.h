@@ -34,9 +34,14 @@ std::string HeaderValue(const HttpResult& result, const std::string& name);
 /// @brief Parses "http://host[:port][/path]" (default port 80, default path "/")
 bool ParseUrl(const std::string& url, std::string& host, int& port, std::string& path);
 
+/// @brief How long a POST waits for its answer. The server answers a call that may run longer
+/// with the job it runs as before this (KICAD_OPENAPI_SYNC_JOB_S, 240 s)
+constexpr int kPostReceiveTimeoutSeconds = 300;
+
 /// @brief Blocking POST with Content-Type: application/json. Handles both
 /// Content-Length and chunked response bodies (SSE answers are chunked).
-HttpResult Post(const std::string& host, int port, const std::string& path, const std::string& body);
+HttpResult Post(const std::string& host, int port, const std::string& path, const std::string& body,
+                int receiveTimeoutSeconds = kPostReceiveTimeoutSeconds);
 
 /// @brief Adds a header to every request from now on (e.g. X-Kicad-Session: the caller's identity)
 void SetExtraHeader(const std::string& name, const std::string& value);

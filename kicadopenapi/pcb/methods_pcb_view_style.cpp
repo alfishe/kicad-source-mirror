@@ -138,7 +138,7 @@ static KOPENAPI_RESULT h_pcb_view_style( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         }
         else
         {
-            return KOPENAPI_RESULT::Error( 404, "no net named " + name );
+            return KopenapiNoSuchNet( board, name );
         }
     }
 

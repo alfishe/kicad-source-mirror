@@ -277,6 +277,12 @@ bool KIPLATFORM::UI::SupportsKeyState()
 }
 
 
+int KIPLATFORM::UI::GetDragThreshold( bool aVertical )
+{
+    return wxSystemSettings::GetMetric( aVertical ? wxSYS_DRAG_Y : wxSYS_DRAG_X );
+}
+
+
 wxPoint KIPLATFORM::UI::GetMousePosition()
 {
     if( const INJECTED_POINTER* injected = GetInjectedPointer() )

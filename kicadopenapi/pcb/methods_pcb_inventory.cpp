@@ -58,6 +58,43 @@ NETINFO_ITEM* KopenapiFindNet( BOARD* aBoard, const std::string& aName )
 }
 
 
+std::vector<std::string> KopenapiNetSuggestions( BOARD* aBoard, const std::string& aName )
+{
+    std::vector<std::string> names;
+
+    for( NETINFO_ITEM* net : aBoard->GetNetInfo() )
+    {
+        if( net->GetNetCode() > 0 )
+            names.push_back( std::string( UnescapeString( net->GetNetname() ).ToUTF8() ) );
+    }
+
+    return KopenapiDidYouMean( names, aName );
+}
+
+
+bool KopenapiPadNeighbours( const PAD* aA, const PAD* aB )
+{
+    return aA != aB && ( aA->GetLayerSet() & aB->GetLayerSet() & LSET::AllCuMask() ).any() && aA->GetPosition() != aB->GetPosition();
+}
+
+
+KOPENAPI_RESULT KopenapiNoSuchNet( BOARD* aBoard, const std::string& aName, const std::string& aWhat )
+{
+    const std::vector<std::string> close = KopenapiNetSuggestions( aBoard, aName );
+    std::string                    message = aWhat + "no net '" + aName + "' on the board";
+
+    if( !close.empty() )
+        message += "; did you mean '" + close.front() + "'?";
+    else
+        message += " (pcb_net_list)";
+
+    KOPENAPI_RESULT result = KOPENAPI_RESULT::Error( 404, message );
+    result.body["error"]["net"] = aName;
+    result.body["error"]["did_you_mean"] = close;
+    return result;
+}
+
+
 static const char* footprintType( const FOOTPRINT* aFp )
 {
     if( aFp->GetAttributes() & FP_THROUGH_HOLE )
@@ -527,7 +564,9 @@ static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     }
 
     if( !net || net->GetNetCode() <= 0 )
-        return KOPENAPI_RESULT::Error( 404, "net not found" );
+        return aArgs.contains( "name" ) && aArgs["name"].is_string()
+                       ? KopenapiNoSuchNet( board, aArgs["name"].get<std::string>() )
+                       : KOPENAPI_RESULT::Error( 404, "net not found" );
 
     std::map<int, NET_INFO_AGG> agg = aggregate( board );
     const NET_INFO_AGG&         a = agg[net->GetNetCode()];

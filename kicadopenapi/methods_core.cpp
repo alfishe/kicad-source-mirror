@@ -476,7 +476,9 @@ KOPENAPI_REGISTER( "job_get",
                    "State of a job (queued, running, done, failed, cancelled), its progress (phase, done / total, "
                    "item at work, counts so far: pcb_route connections / done / routed / failed / unrouted_left / "
                    "vias / length_mm / pass, pcb_drc provider / violations, ...; elapsed_s, eta_s, phase_eta_s), "
-                   "rev, stop_reason; once finished, status and result: the body the call itself gives (a "
+                   "rev (this job's own change counter for since: it starts at 0 with every job and is no document "
+                   "revision; whether a document has unsaved edits: instance_list / status \"unsaved\"), "
+                   "stop_reason; once finished, status and result: the body the call itself gives (a "
                    "cancelled job gives what it did until it stopped). wait_s waits up to that long for it to "
                    "finish; with since (a rev from an earlier answer) it answers as soon as anything changed "
                    "after that rev (long poll). Answers even while KiCad is busy",
@@ -488,17 +490,23 @@ KOPENAPI_REGISTER( "job_get",
 
 KOPENAPI_REGISTER( "job_cancel",
                    "Ask a job to stop: a queued one never runs, a running one stops at its next safe point and "
-                   "finishes with what it has done (job_get: state cancelled, its result). keep: true stops "
-                   "it without applying anything and keeps its state: a grid route's timeline stays with every "
-                   "lane stopped at its last step, to branch from (pcb_route {from})",
+                   "finishes with what it has done (job_get: state cancelled, its result). By default what it "
+                   "did is applied: a cancelled pcb_route keeps the connections it routed (pns: those done so "
+                   "far; grid: the nets legal in the round it stopped in, committed as one step). apply: false "
+                   "stops it with nothing written, in whichever pass it stops (pcb_route answers applied: false; "
+                   "copper already laid, a grid stage's before a later pns pass included, is taken back: "
+                   "taken_back true). keep: true is apply: false that also keeps its state: a grid route's timeline "
+                   "stays with every lane stopped at its last step, to branch from (pcb_route {from})",
                    R"json({"type":"object","required":["job_id"],"properties":{
                         "job_id":{"type":"string"},
-                        "keep":{"type":"boolean","default":false}}})json"_json,
+                        "apply":{"type":"boolean","default":true,"description":"false: nothing the job did is written (a pcb_route's copper so far taken back)"},
+                        "keep":{"type":"boolean","default":false,"description":"apply nothing and keep the job's state (a grid route's timeline lanes, to branch from)"}}})json"_json,
                    false, h_job_served );
 
 KOPENAPI_REGISTER( "job_pause",
                    "Pause a job at its next safe point (a queued one starts paused): KiCad stays usable and "
-                   "reading calls answer meanwhile; job_get says paused. A grid route (pcb_route engine grid) "
+                   "reading calls answer meanwhile; job_get says paused, and held once it waits at a safe point "
+                   "(step.served == step.serial: the last job_step is used up). A grid route (pcb_route engine grid) "
                    "pauses every variant between two nets, its timeline readable (pcb_route_timeline). "
                    "job_resume goes on, job_step goes a bit further, job_cancel stops",
                    R"json({"type":"object","required":["job_id"],"properties":{

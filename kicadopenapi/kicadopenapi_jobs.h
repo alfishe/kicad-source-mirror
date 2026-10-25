@@ -12,6 +12,7 @@
 #include <kicommon.h>
 #include <kicadopenapi_registry.h>
 
+#include <chrono>
 #include <functional>
 #include <string>
 
@@ -53,6 +54,10 @@ KICOMMON_API bool KopenapiJobCancelled();
 /// (a grid route: its timeline, every lane stopped at its last step).  Any thread
 KICOMMON_API bool KopenapiJobKeep();
 
+/// @brief Stopped by job_cancel {apply: false} or {keep: true}: whatever the job did is not applied
+/// (taken back when it was written as it went).  Any thread
+KICOMMON_API bool KopenapiJobDiscard();
+
 /// @brief The running job is paused (job_pause) and not asked to stop.  aSerial / aBy / aN: the last
 /// job_step (the serial grows with each), so a worker thread of the job can go that far and wait
 /// again.  Any thread
@@ -71,14 +76,18 @@ class KICOMMON_API KOPENAPI_JOBS
 public:
     static KOPENAPI_JOBS& Get();
 
-    /// @brief HTTP thread: a new queued job; empty and aWhy when one is queued or running
-    std::string Add( const std::string& aMethod, std::string& aWhy );
+    /// @brief HTTP thread: a new queued job; empty and aWhy when one is queued or running.
+    /// aPlainCall: a plain call run as a job (plain_call in its status)
+    std::string Add( const std::string& aMethod, std::string& aWhy, bool aPlainCall = false );
 
     /// @brief Main thread: runs aCall as the job aId (nothing when it was cancelled while queued)
     void Run( const std::string& aId, const std::function<KOPENAPI_RESULT()>& aCall );
 
     /// @brief The job could not be started (service stopping): it fails with aResult
     void Fail( const std::string& aId, const KOPENAPI_RESULT& aResult );
+
+    /// @brief HTTP thread: waits up to aFor for the job to end; true and its result when it has
+    bool Wait( const std::string& aId, std::chrono::milliseconds aFor, KOPENAPI_RESULT& aResult );
 
     /// @brief job_get / job_cancel / job_list (HTTP thread)
     KOPENAPI_RESULT Status( const nlohmann::json& aArgs );

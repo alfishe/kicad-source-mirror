@@ -564,6 +564,11 @@ struct KICAD_OPENAPI_SERVICE::IMPL
     /// @brief job_start: checks the call, queues it as a job, answers its job_id at once
     KOPENAPI_RESULT startJob( const nlohmann::json& aArgs, const std::string& aCaller ) const;
 
+    /// @brief Queues a checked call as a job; its id, else empty and aRefused (409 / 503)
+    std::string queueJob( const std::string& aName, const nlohmann::json& aArgs,
+                          std::shared_ptr<std::chrono::steady_clock::time_point> aStarted,
+                          KOPENAPI_RESULT& aRefused, bool aPlainCall = false ) const;
+
     void traceCall( const std::string& aName, const nlohmann::json& aArgs, const KOPENAPI_RESULT& aOutcome,
                     std::chrono::steady_clock::time_point aReceived,
                     std::chrono::steady_clock::time_point aStarted ) const;
@@ -940,6 +945,63 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std
 }
 
 
+/// @brief How long a plain call of a method that may run longer waits for it before it answers the
+/// job it runs as; env KICAD_OPENAPI_SYNC_JOB_S sets it (tests)
+static std::chrono::seconds syncJobWait()
+{
+    static const int sec = []
+    {
+        const char* env = std::getenv( "KICAD_OPENAPI_SYNC_JOB_S" );
+        const int   v = env ? std::atoi( env ) : 0;
+        return v > 0 ? v : 240;
+    }();
+
+    return std::chrono::seconds( sec );
+}
+
+
+/// @brief The job's own result once it ends within aWait, else {job_id, running: true, hint}
+static KOPENAPI_RESULT awaitJob( const std::shared_ptr<std::atomic<bool>>& aAlive, const std::string& aId,
+                                 const std::string& aMethod, std::chrono::seconds aWait )
+{
+    const auto      deadline = std::chrono::steady_clock::now() + aWait;
+    KOPENAPI_RESULT result;
+
+    while( !KOPENAPI_JOBS::Get().Wait( aId, std::chrono::milliseconds( 250 ), result ) )
+    {
+        if( !aAlive->load() )
+            return KOPENAPI_RESULT::Error( 503, "service stopping while " + aId + " (" + aMethod
+                                                        + ") was running; it may have completed (edit_log)" );
+
+        if( std::chrono::steady_clock::now() < deadline )
+            continue;
+
+        KOPENAPI_RESULT status = KOPENAPI_JOBS::Get().Status( { { "job_id", aId } } );
+        nlohmann::json  body = { { "job_id", aId },
+                                 { "method", aMethod },
+                                 { "running", true },
+                                 { "waited_s", aWait.count() },
+                                 { "hint", "not done within " + std::to_string( aWait.count() )
+                                                   + " s, it runs on as a job and its changes will stand: "
+                                                     "job_get {job_id: \"" + aId + "\", wait_s: 60} gives its "
+                                                     "result, job_cancel stops it (edits get 409 meanwhile)" } };
+
+        if( status.body.is_object() )
+        {
+            for( const char* key : { "state", "progress", "rev" } )
+            {
+                if( status.body.contains( key ) )
+                    body[key] = status.body[key];
+            }
+        }
+
+        return KOPENAPI_RESULT::Ok( body );
+    }
+
+    return result;
+}
+
+
 /// @brief Methods the service answers itself on the HTTP thread: no main thread, no job
 static bool servedByService( const std::string& aName )
 {
@@ -966,20 +1028,38 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::startJob( const nlohmann::json& aAr
     if( std::optional<KOPENAPI_RESULT> bad = checkCall( name, args, method ) )
         return *bad;
 
-    std::string       why;
-    const std::string id = KOPENAPI_JOBS::Get().Add( name, why );
+    KOPENAPI_RESULT   refused;
+    const std::string id = queueJob( name, args, nullptr, refused );
 
     if( id.empty() )
-        return KOPENAPI_RESULT::Error( 409, why );
+        return refused;
+
+    return KOPENAPI_RESULT::Ok( { { "job_id", id }, { "method", name }, { "state", "queued" } } );
+}
+
+
+std::string KICAD_OPENAPI_SERVICE::IMPL::queueJob( const std::string& aName, const nlohmann::json& aArgs,
+                                                   std::shared_ptr<std::chrono::steady_clock::time_point> aStarted,
+                                                   KOPENAPI_RESULT& aRefused, bool aPlainCall ) const
+{
+    std::string       why;
+    const std::string id = KOPENAPI_JOBS::Get().Add( aName, why, aPlainCall );
+
+    if( id.empty() )
+    {
+        aRefused = KOPENAPI_RESULT::Error( 409, why );
+        return id;
+    }
 
     if( !wxTheApp )
     {
-        KOPENAPI_JOBS::Get().Fail( id, KOPENAPI_RESULT::Error( 503, "no application event loop" ) );
-        return KOPENAPI_RESULT::Error( 503, "no application event loop" );
+        aRefused = KOPENAPI_RESULT::Error( 503, "no application event loop" );
+        KOPENAPI_JOBS::Get().Fail( id, aRefused );
+        return std::string();
     }
 
     auto job = std::make_shared<std::function<void()>>(
-            [id, call = mainCall( name, args, nullptr ), aliveFlag = alive]()
+            [id, call = mainCall( aName, aArgs, std::move( aStarted ) ), aliveFlag = alive]()
             {
                 if( !aliveFlag->load() )
                     KOPENAPI_JOBS::Get().Fail( id, KOPENAPI_RESULT::Error( 503, "service stopping" ) );
@@ -994,7 +1074,7 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::startJob( const nlohmann::json& aAr
     if( waker )
         waker();
 
-    return KOPENAPI_RESULT::Ok( { { "job_id", id }, { "method", name }, { "state", "queued" } } );
+    return id;
 }
 
 
@@ -1055,8 +1135,24 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     const auto received = tracing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     auto       started = tracing ? std::make_shared<std::chrono::steady_clock::time_point>( received ) : nullptr;
 
-    KOPENAPI_RESULT outcome = runInMain( alive, waker, mainCall( aName, aArgs, started ),
-                                         callTimeout( method->timeoutSec ), aName );
+    const std::chrono::seconds timeout = callTimeout( method->timeoutSec );
+    std::optional<KOPENAPI_RESULT> outcomeAsJob;
+
+    // may outlast the client's wait (bridge: kPostReceiveTimeoutSeconds): runs as a job and answers
+    // its job_id when it is not done by then
+    if( timeout > syncJobWait() )
+    {
+        KOPENAPI_RESULT   refused;
+        const std::string id = queueJob( aName, aArgs, started, refused, true );
+
+        if( !id.empty() )
+            outcomeAsJob = awaitJob( alive, id, aName, syncJobWait() );
+        else if( KOPENAPI_REGISTRY::Get().IsEditing( aName ) || refused.status != 409 )
+            return refused;
+    }
+
+    KOPENAPI_RESULT outcome = outcomeAsJob ? std::move( *outcomeAsJob )
+                                           : runInMain( alive, waker, mainCall( aName, aArgs, started ), timeout, aName );
 
     if( !tracing )
         return outcome;

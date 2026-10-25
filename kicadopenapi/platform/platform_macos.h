@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 
 namespace kopenapi::platform
 {
@@ -23,6 +24,7 @@ AllocatorInfo AllocatorStatsMacOS();
 int64_t AllocatorTrimMacOS();
 void LowerCurrentThreadPriorityMacOS();
 void KeepProcessResponsiveMacOS();
+std::filesystem::path RunSnapshotMacOS(const std::filesystem::path& exe, std::string& note);
 
 } // namespace kopenapi::platform
 

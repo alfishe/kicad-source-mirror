@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <cctype>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -764,4 +765,94 @@ long KopenapiUuidMatch( const std::vector<std::string>& aUuids, const std::strin
     aError = "uuid prefix '" + aId + "' is ambiguous: " + std::to_string( hits.size() )
              + " items start with it (" + listed + "); use the full uuid";
     return -1;
+}
+
+
+std::vector<std::string> KopenapiDidYouMean( const std::vector<std::string>& aNames, const std::string& aWanted,
+                                             size_t aMax )
+{
+    auto lower = []( std::string s )
+    {
+        std::transform( s.begin(), s.end(), s.begin(), []( unsigned char c ) { return (char) std::tolower( c ); } );
+        return s;
+    };
+
+    auto leaf = []( const std::string& s )
+    {
+        // "RESET/" (active low) keeps its trailing slash: the leaf is what follows the last inner '/'
+        const size_t end = s.size() > 1 && s.back() == '/' ? s.size() - 1 : s.size();
+        const size_t cut = s.rfind( '/', end - 1 );
+        return cut == std::string::npos || end == 0 ? s : s.substr( cut + 1 );
+    };
+
+    auto distance = []( const std::string& a, const std::string& b )
+    {
+        std::vector<size_t> row( b.size() + 1 );
+
+        for( size_t j = 0; j <= b.size(); ++j )
+            row[j] = j;
+
+        for( size_t i = 1; i <= a.size(); ++i )
+        {
+            size_t diag = row[0];
+            row[0] = i;
+
+            for( size_t j = 1; j <= b.size(); ++j )
+            {
+                const size_t up = row[j];
+                row[j] = std::min( { row[j] + 1, row[j - 1] + 1, diag + ( a[i - 1] == b[j - 1] ? 0 : 1 ) } );
+                diag = up;
+            }
+        }
+
+        return row[b.size()];
+    };
+
+    const std::string wanted = lower( aWanted );
+    const std::string wantedLeaf = lower( leaf( aWanted ) );
+    const size_t      allowed = std::max<size_t>( 2, wantedLeaf.size() / 4 );
+
+    std::vector<std::pair<size_t, std::string>> ranked;
+
+    for( const std::string& name : aNames )
+    {
+        if( name == aWanted )
+            continue;
+
+        const std::string n = lower( name );
+        const std::string nLeaf = lower( leaf( name ) );
+        size_t            score = SIZE_MAX;
+
+        if( n.size() > wanted.size() && n.compare( n.size() - wanted.size(), wanted.size(), wanted ) == 0
+            && n[n.size() - wanted.size() - 1] == '/' )
+        {
+            score = 0;
+        }
+        else if( n == wanted )
+        {
+            score = 1;
+        }
+        else if( nLeaf == wantedLeaf )
+        {
+            score = 2;
+        }
+        else if( const size_t d = distance( nLeaf, wantedLeaf ); d <= allowed )
+        {
+            score = 3 + d;
+        }
+
+        if( score != SIZE_MAX )
+            ranked.emplace_back( score, name );
+    }
+
+    std::stable_sort( ranked.begin(), ranked.end(),
+                      []( const auto& a, const auto& b )
+                      { return a.first != b.first ? a.first < b.first : a.second.size() < b.second.size(); } );
+
+    std::vector<std::string> out;
+
+    for( size_t i = 0; i < ranked.size() && out.size() < aMax; ++i )
+        out.push_back( ranked[i].second );
+
+    return out;
 }

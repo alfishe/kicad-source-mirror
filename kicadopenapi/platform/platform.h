@@ -137,4 +137,12 @@ void LowerCurrentThreadPriority();
 /// frontmost.  Idempotent; idle system sleep stays allowed.  No-op on Linux.
 void KeepProcessResponsive();
 
+/// @brief The program a process should be started from so that rebuilding the original does not
+/// pull files from under it: on macOS a clone of exe's .app bundle (APFS clonefile, no data
+/// copied) in <bundle dir>/run-snapshots/<stamp>/, made once per build (stamp: the bundle's
+/// executables, plug-ins and frameworks by size and time), and exe's path inside it; snapshots
+/// older than a week beyond the newest three are removed.  exe itself where there is no bundle or
+/// the clone fails (note says why).
+std::filesystem::path RunSnapshot(const std::filesystem::path& exe, std::string& note);
+
 } // namespace kopenapi::platform

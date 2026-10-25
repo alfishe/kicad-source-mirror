@@ -5,6 +5,8 @@
 /// back in, with KiCad's own exporter / importer; the import is one undo step.
 #include "kopenapi_pcb.h"
 
+#include <netinfo.h>
+
 #include <api/pcb_context.h>
 #include <board.h>
 #include <board_commit.h>
@@ -95,7 +97,14 @@ static KOPENAPI_RESULT h_pcb_import_ses( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     for( const nlohmann::json& n : aArgs.value( "nets", nlohmann::json::array() ) )
     {
         if( n.is_string() )
-            nets.insert( wxString::FromUTF8( n.get<std::string>() ) );
+        {
+            NETINFO_ITEM* net = KopenapiFindNet( board, n.get<std::string>() );
+
+            if( !net )
+                return KopenapiNoSuchNet( board, n.get<std::string>(), "nets: " );
+
+            nets.insert( net->GetNetname() );
+        }
     }
 
     // nets given: the other nets' copper stays as it is (locked meanwhile, the import keeps locked

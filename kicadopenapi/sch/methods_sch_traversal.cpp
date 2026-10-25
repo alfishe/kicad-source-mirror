@@ -196,7 +196,22 @@ static KOPENAPI_RESULT h_sch_net_trace( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return KOPENAPI_RESULT::Error( 400, "give 'pin' (REF.PIN) or 'net' (name)" );
 
     if( !net )
-        return KOPENAPI_RESULT::Error( 404, "net or pin not found" );
+    {
+        std::vector<std::string> names;
+
+        for( const NET_ENTRY& entry : nets )
+            names.push_back( entry.name );
+
+        const std::vector<std::string> close = name.empty() ? std::vector<std::string>()
+                                                            : KopenapiDidYouMean( names, str( UnescapeString( name ) ) );
+        KOPENAPI_RESULT result = KOPENAPI_RESULT::Error(
+                404, close.empty() ? std::string( "net or pin not found" ) : std::string( "net or pin not found" ) + "; did you mean '" + close.front() + "'?" );
+
+        if( !name.empty() )
+            result.body["error"]["did_you_mean"] = close;
+
+        return result;
+    }
 
     if( !start && !net->instances.empty() )
         start = &net->instances.front().path;
@@ -572,20 +587,20 @@ static KOPENAPI_RESULT h_sch_interface_map( KOPENAPI_CONTEXT& aCtx, const nlohma
         for( int pin : pins )
         {
             const int      net = g.pins[pin].net;
-            nlohmann::json far = nlohmann::json::array();
+            nlohmann::json distant = nlohmann::json::array();
             int            farCount = 0;
 
             for( int other : g.netPins[net] )
             {
                 if( g.pins[other].ref != ref && farCount++ < listLimit )
-                    far.push_back( g.pins[other].id );
+                    distant.push_back( g.pins[other].id );
             }
 
             pinList.push_back( { { "pin", g.pins[pin].number },
                                  { "name", g.pins[pin].name },
                                  { "net", g.nets[net].name },
                                  { "role", g.netRole[net] == "signal" && g.netIsPower[net] ? std::string( "power" ) : g.netRole[net] },
-                                 { "far_end", far },
+                                 { "far_end", distant },
                                  { "far_end_count", farCount } } );
         }
 

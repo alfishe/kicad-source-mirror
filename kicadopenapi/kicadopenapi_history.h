@@ -45,6 +45,10 @@ public:
     /// "before" becomes the state rolled back to (undoing it later goes there)
     KOPENAPI_RESULT RollbackLastInCall( KOPENAPI_CONTEXT& aCtx );
 
+    /// @brief The documents back to where the editing call running now found them (it applies
+    /// nothing: job_cancel {apply: false}); the call is still logged when it ends
+    KOPENAPI_RESULT RestoreBeforePending( KOPENAPI_CONTEXT& aCtx );
+
     /// @brief The document of aDomain was opened / closed / reverted: its earlier marks no longer
     /// apply (the other domain's marks stay; log entries stay)
     void Reset( const std::string& aDomain, const std::string& aReason );

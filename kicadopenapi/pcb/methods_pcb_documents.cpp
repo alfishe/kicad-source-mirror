@@ -50,10 +50,63 @@ static PCB_EDIT_FRAME* guiFrame( KOPENAPI_CONTEXT& aCtx, bool aCreate )
 }
 
 
+/// @brief Headless: any change of a board item marks the board unsaved, whichever call made it
+/// (DRC markers are not saved with the board)
+class UNSAVED_WATCH : public BOARD_LISTENER
+{
+public:
+    void OnBoardItemAdded( BOARD&, BOARD_ITEM* aItem ) override { touch( aItem ); }
+    void OnBoardItemsAdded( BOARD&, std::vector<BOARD_ITEM*>& aItems ) override { touch( aItems ); }
+    void OnBoardItemRemoved( BOARD&, BOARD_ITEM* aItem ) override { touch( aItem ); }
+    void OnBoardItemsRemoved( BOARD&, std::vector<BOARD_ITEM*>& aItems ) override { touch( aItems ); }
+    void OnBoardItemChanged( BOARD&, BOARD_ITEM* aItem ) override { touch( aItem ); }
+    void OnBoardItemsChanged( BOARD&, std::vector<BOARD_ITEM*>& aItems ) override { touch( aItems ); }
+    void OnBoardNetSettingsChanged( BOARD& ) override { mark(); }
+
+    void OnBoardCompositeUpdate( BOARD&, std::vector<BOARD_ITEM*>& aAdded, std::vector<BOARD_ITEM*>& aRemoved,
+                                 std::vector<BOARD_ITEM*>& aChanged ) override
+    {
+        touch( aAdded );
+        touch( aRemoved );
+        touch( aChanged );
+    }
+
+private:
+    static void mark()
+    {
+        if( s_headless )
+            s_headless->SetContentModified( true );
+    }
+
+    static void touch( const BOARD_ITEM* aItem )
+    {
+        if( aItem && aItem->Type() != PCB_MARKER_T )
+            mark();
+    }
+
+    static void touch( const std::vector<BOARD_ITEM*>& aItems )
+    {
+        for( const BOARD_ITEM* item : aItems )
+        {
+            if( item && item->Type() != PCB_MARKER_T )
+                return mark();
+        }
+    }
+};
+
+
 std::shared_ptr<PCB_CONTEXT> KopenapiPcbContext( KOPENAPI_CONTEXT& aCtx )
 {
     if( aCtx.headless )
+    {
+        static UNSAVED_WATCH watch;
+
+        // the board object changes on open / revert / rollback; adding twice is a no-op
+        if( s_headless && s_headless->GetBoard() )
+            s_headless->GetBoard()->AddListener( &watch );
+
         return s_headless;
+    }
 
     PCB_EDIT_FRAME* frame = guiFrame( aCtx, false );
 
@@ -521,6 +574,51 @@ static KOPENAPI_RESULT h_pcb_revert( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
 // ---- edit history (kicadopenapi_history.h) --------------------------------------------------
 
+/// @brief The internal board copy, not prettified but broken into lines before the lists of the first
+/// nesting levels: the compact writer puts the whole board on one line, and the reader takes lines of
+/// up to 16 MB only (LINE_READER_LINE_DEFAULT_MAX)
+class LINED_FILE_OUTPUTFORMATTER : public FILE_OUTPUTFORMATTER
+{
+public:
+    using FILE_OUTPUTFORMATTER::FILE_OUTPUTFORMATTER;
+
+protected:
+    void write( const char* aOutBuf, int aCount ) override
+    {
+        m_buf.clear();
+        m_buf.reserve( (size_t) aCount + aCount / 16 + 1 );
+
+        for( int i = 0; i < aCount; ++i )
+        {
+            const char c = aOutBuf[i];
+
+            if( m_escape )
+                m_escape = false;
+            else if( m_quoted )
+                m_escape = c == '\\', m_quoted = c != '"';
+            else if( c == '"' )
+                m_quoted = true;
+            else if( c == '(' && m_depth++ < 4 && m_started )
+                m_buf.push_back( '\n' );
+            else if( c == ')' )
+                m_depth--;
+
+            m_started = true;
+            m_buf.push_back( c );
+        }
+
+        FILE_OUTPUTFORMATTER::write( m_buf.data(), (int) m_buf.size() );
+    }
+
+private:
+    std::string m_buf;
+    int         m_depth = 0;
+    bool        m_quoted = false;
+    bool        m_escape = false;
+    bool        m_started = false;
+};
+
+
 static KOPENAPI_DOC_HISTORY history()
 {
     KOPENAPI_DOC_HISTORY h;
@@ -579,8 +677,8 @@ static KOPENAPI_DOC_HISTORY history()
         // pass of a saved file (half the time of a copy of a large board, taken before every edit)
         try
         {
-            FILE_OUTPUTFORMATTER out( target.GetFullPath() );
-            PCB_IO_KICAD_SEXPR   io;
+            LINED_FILE_OUTPUTFORMATTER out( target.GetFullPath() );
+            PCB_IO_KICAD_SEXPR         io;
             io.FormatBoardToFormatter( &out, s_headless->GetBoard() );
 
             if( !out.Finish() )   // written to a sibling temporary file until here
@@ -608,13 +706,22 @@ static KOPENAPI_DOC_HISTORY history()
         {
             board = BOARD_LOADER::Load( copy.GetFullPath(), PCB_IO_MGR::KICAD_SEXP, project );
         }
-        catch( const IO_ERROR& )
+        catch( const IO_ERROR& e )
         {
+            wxLogWarning( "Board copy %s not loaded back: %s", copy.GetFullPath(), e.What() );
+            return false;
+        }
+        catch( const std::exception& e )
+        {
+            wxLogWarning( "Board copy %s not loaded back: %s", copy.GetFullPath(), e.what() );
             return false;
         }
 
         if( !board )
+        {
+            wxLogWarning( "Board copy %s not loaded back", copy.GetFullPath() );
             return false;
+        }
 
         // Back under the document's own path, unsaved, with the custom rules beside it (the loader
         // looked for them beside the copy)
@@ -636,6 +743,13 @@ static KOPENAPI_DOC_HISTORY history()
                                                              GetAppSettings<PCBNEW_SETTINGS>( "pcbnew" ), aCtx.kiway );
         s_headless->SetContentModified( true );
         return true;
+    };
+
+    // BOARD_COMMIT marks only an editor frame modified
+    h.edited = []( KOPENAPI_CONTEXT& aCtx )
+    {
+        if( aCtx.headless && s_headless )
+            s_headless->SetContentModified( true );
     };
 
     return h;

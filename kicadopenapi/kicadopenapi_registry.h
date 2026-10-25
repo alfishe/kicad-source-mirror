@@ -128,6 +128,10 @@ struct KOPENAPI_DOC_HISTORY
 
     /// @brief Headless: load the copy from aDir back as the open document (its own path, unsaved)
     std::function<bool( KOPENAPI_CONTEXT&, const std::string& aDir )> restore;
+
+    /// @brief Headless: an editing call succeeded; mark the open document unsaved when its commits
+    /// do not (status, the bridge's idle stop and app_quit read that flag)
+    std::function<void( KOPENAPI_CONTEXT& )> edited;
 };
 
 

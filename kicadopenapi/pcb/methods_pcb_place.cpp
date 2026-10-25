@@ -28,6 +28,10 @@
 #include <kicadopenapi_util.h>
 #include <kiway.h>
 #include <pad.h>
+#include <connectivity/connectivity_algo.h>
+#include <drc/drc_engine.h>
+#include <pcb_track.h>
+#include <zone.h>
 #include <pcb_edit_frame.h>
 #include <pcb_shape.h>
 #include <pcb_text.h>
@@ -153,6 +157,448 @@ std::optional<PANEL_EDGE> panelEdge( FOOTPRINT* aFootprint, const std::string& a
 nlohmann::json edgeFacing( FOOTPRINT* aFootprint, const BOX2I& aEdges );
 
 
+/// @brief Copper of other nets under or within clearance of these footprints' pads: tracks, vias,
+/// filled zones and other footprints' pads, the clearance as DRC has it for the pair (custom rules,
+/// net classes, board minimum).  aItems: the conflicting tracks / vias, for on_copper rip
+nlohmann::json copperConflicts( BOARD* aBoard, const std::set<const FOOTPRINT*>& aFootprints,
+                                std::vector<PCB_TRACK*>* aItems = nullptr )
+{
+    nlohmann::json               out = nlohmann::json::array();
+    const BOARD_DESIGN_SETTINGS& ds = aBoard->GetDesignSettings();
+    std::shared_ptr<DRC_ENGINE>  drc = ds.m_DRCEngine;
+    const int                    widest = std::max( { ds.GetBiggestClearanceValue(), ds.m_MinClearance, 1 } );
+    std::set<PCB_TRACK*>         seenItems;
+
+    auto required = [&]( BOARD_ITEM* aA, BOARD_ITEM* aB, PCB_LAYER_ID aLayer )
+    {
+        int need = ds.m_MinClearance;
+
+        if( drc )
+        {
+            const DRC_CONSTRAINT c = drc->EvalRules( CLEARANCE_CONSTRAINT, aA, aB, aLayer );
+
+            if( c.GetValue().HasMin() )
+                need = c.GetValue().Min();
+        }
+
+        return std::max( need, 0 );
+    };
+
+    for( const FOOTPRINT* cfp : aFootprints )
+    {
+        if( !cfp )
+            continue;
+
+        FOOTPRINT* fp = const_cast<FOOTPRINT*>( cfp );
+        BOX2I      fpReach;
+
+        for( PAD* pad : fp->Pads() )
+            fpReach.Merge( pad->GetBoundingBox() );
+
+        fpReach.Inflate( widest );
+
+        std::vector<PCB_TRACK*> nearTracks;
+        std::vector<FOOTPRINT*> nearFps;
+        std::vector<ZONE*>      nearZones;
+
+        for( PCB_TRACK* track : aBoard->Tracks() )
+        {
+            if( fpReach.Intersects( track->GetBoundingBox() ) )
+                nearTracks.push_back( track );
+        }
+
+        for( FOOTPRINT* otherFp : aBoard->Footprints() )
+        {
+            if( otherFp != fp && fpReach.Intersects( otherFp->GetBoundingBox( false ) ) )
+                nearFps.push_back( otherFp );
+        }
+
+        for( ZONE* zone : aBoard->Zones() )
+        {
+            if( !zone->GetIsRuleArea() && fpReach.Intersects( zone->GetBoundingBox() ) )
+                nearZones.push_back( zone );
+        }
+
+        for( PAD* pad : fp->Pads() )
+        {
+            BOX2I reach = pad->GetBoundingBox();
+            reach.Inflate( widest );
+
+            auto add = [&]( BOARD_ITEM* aOther, const wxString& aOtherNet, const std::string& aKind, PCB_LAYER_ID aLayer,
+                            int aActual, int aNeed )
+            {
+                nlohmann::json row = { { "ref", str( fp->GetReference() ) },
+                                       { "pad", str( pad->GetNumber() ) },
+                                       { "net", str( UnescapeString( pad->GetNetname() ) ) },
+                                       { "other_net", str( UnescapeString( aOtherNet ) ) },
+                                       { "kind", aKind },
+                                       { "item", str( aOther->m_Uuid.AsString() ) },
+                                       { "layer", str( aBoard->GetLayerName( aLayer ) ) },
+                                       { "distance_mm", toMm( aActual ) },
+                                       { "required_mm", toMm( aNeed ) } };
+
+                if( aKind == "pad" )
+                    row["other_pad"] = str( static_cast<PAD*>( aOther )->GetParentFootprint()->GetReference() ) + "."
+                                       + str( static_cast<PAD*>( aOther )->GetNumber() );
+
+                if( aKind == "zone" )
+                    row["hint"] = "the fill predates the move: pcb_zones_fill refills around the pad";
+
+                out.push_back( row );
+            };
+
+            for( PCB_LAYER_ID layer : pad->GetLayerSet().CuStack() )
+            {
+                std::shared_ptr<SHAPE> shape = pad->GetEffectiveShape( layer );
+
+                auto collides = [&]( BOARD_ITEM* aOther, const SHAPE* aOtherShape, int& aActual, int& aNeed )
+                {
+                    aNeed = required( pad, aOther, layer );
+                    aActual = 0;
+                    return shape->Collide( aOtherShape, std::max( aNeed - 1, 0 ), &aActual );
+                };
+
+                for( PCB_TRACK* track : nearTracks )
+                {
+                    if( !track->IsOnLayer( layer ) || ( pad->GetNetCode() > 0 && track->GetNetCode() == pad->GetNetCode() )
+                        || !reach.Intersects( track->GetBoundingBox() ) )
+                    {
+                        continue;
+                    }
+
+                    std::shared_ptr<SHAPE> other = track->GetEffectiveShape( layer );
+                    int                    actual = 0, need = 0;
+
+                    if( collides( track, other.get(), actual, need ) )
+                    {
+                        add( track, track->GetNetname(), track->Type() == PCB_VIA_T ? "via" : "track", layer, actual, need );
+
+                        if( aItems && seenItems.insert( track ).second )
+                            aItems->push_back( track );
+                    }
+                }
+
+                for( FOOTPRINT* otherFp : nearFps )
+                {
+                    if( !reach.Intersects( otherFp->GetBoundingBox( false ) ) )
+                        continue;
+
+                    for( PAD* otherPad : otherFp->Pads() )
+                    {
+                        if( !otherPad->IsOnLayer( layer ) || ( pad->GetNetCode() > 0 && otherPad->GetNetCode() == pad->GetNetCode() )
+                            || !reach.Intersects( otherPad->GetBoundingBox() ) )
+                        {
+                            continue;
+                        }
+
+                        std::shared_ptr<SHAPE> other = otherPad->GetEffectiveShape( layer );
+                        int                    actual = 0, need = 0;
+
+                        // a pad pair is reported once, from the moved footprint first in the board's order
+                        if( aFootprints.count( otherFp ) && otherFp->m_Uuid < fp->m_Uuid )
+                            continue;
+
+                        if( collides( otherPad, other.get(), actual, need ) )
+                            add( otherPad, otherPad->GetNetname(), "pad", layer, actual, need );
+                    }
+                }
+
+                for( ZONE* zone : nearZones )
+                {
+                    if( !zone->IsOnLayer( layer ) || !zone->HasFilledPolysForLayer( layer )
+                        || ( pad->GetNetCode() > 0 && zone->GetNetCode() == pad->GetNetCode() )
+                        || !reach.Intersects( zone->GetBoundingBox() ) )
+                    {
+                        continue;
+                    }
+
+                    const std::shared_ptr<SHAPE_POLY_SET>& fill = zone->GetFilledPolysList( layer );
+                    const int                              need = required( pad, zone, layer );
+                    int                                    actual = 0;
+
+                    if( fill && fill->OutlineCount() > 0 && fill->Collide( shape.get(), std::max( need - 1, 0 ), &actual ) )
+                        add( zone, zone->GetNetname(), "zone", layer, actual, need );
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
+
+/// @brief A track / via end that sat on a pad of a footprint about to move (the copper stays where
+/// it is, the pad goes)
+struct ATTACHED_END
+{
+    PCB_TRACK*   item = nullptr;
+    VECTOR2I     at;
+    PCB_LAYER_ID layer = UNDEFINED_LAYER;
+    std::string  pad;   ///< REF.PAD it was on
+};
+
+
+static bool padCovers( PAD* aPad, const VECTOR2I& aAt, PCB_LAYER_ID aLayer )
+{
+    if( !aPad->IsOnLayer( aLayer ) )
+        return false;
+
+    std::shared_ptr<SHAPE> shape = aPad->GetEffectiveShape( aLayer );
+    return shape && shape->Collide( aAt, 0 );
+}
+
+
+/// @brief Ends of tracks / vias on the pads of these footprints, of the pad's net, before they move
+std::vector<ATTACHED_END> attachedEnds( BOARD* aBoard, const std::set<const FOOTPRINT*>& aFootprints )
+{
+    std::vector<ATTACHED_END> out;
+
+    for( const FOOTPRINT* cfp : aFootprints )
+    {
+        if( !cfp )
+            continue;
+
+        BOX2I reach = const_cast<FOOTPRINT*>( cfp )->GetBoundingBox( false );
+
+        for( PCB_TRACK* track : aBoard->Tracks() )
+        {
+            if( !reach.Intersects( track->GetBoundingBox() ) )
+                continue;
+
+            std::vector<std::pair<VECTOR2I, PCB_LAYER_ID>> ends;
+
+            if( track->Type() == PCB_VIA_T )
+            {
+                for( PCB_LAYER_ID layer : LSET::AllCuMask().Seq() )
+                {
+                    if( track->IsOnLayer( layer ) )
+                        ends.emplace_back( track->GetStart(), layer );
+                }
+            }
+            else
+            {
+                ends = { { track->GetStart(), track->GetLayer() }, { track->GetEnd(), track->GetLayer() } };
+            }
+
+            std::set<std::pair<int64_t, int64_t>> done;
+
+            for( const auto& [at, layer] : ends )
+            {
+                for( PAD* pad : cfp->Pads() )
+                {
+                    if( pad->GetNetCode() <= 0 || pad->GetNetCode() != track->GetNetCode() || !padCovers( pad, at, layer )
+                        || !done.insert( { at.x, at.y } ).second )
+                    {
+                        continue;
+                    }
+
+                    out.push_back( { track, at, layer, str( cfp->GetReference() ) + "." + str( pad->GetNumber() ) } );
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
+
+/// @brief After the move: the attached ends that now sit on a pad of another net (a short the move
+/// made) and those that no pad of their net holds any more (dangling)
+void attachedAfterMove( BOARD* aBoard, const std::vector<ATTACHED_END>& aEnds, nlohmann::json& aShorts, nlohmann::json& aDangling )
+{
+    aShorts = nlohmann::json::array();
+    aDangling = nlohmann::json::array();
+
+    for( const ATTACHED_END& e : aEnds )
+    {
+        PAD* other = nullptr;
+        bool held = false;
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            if( !fp->GetBoundingBox( false ).Contains( e.at ) )
+                continue;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( !padCovers( pad, e.at, e.layer ) )
+                    continue;
+
+                if( pad->GetNetCode() == e.item->GetNetCode() )
+                    held = true;
+                else if( !other )
+                    other = pad;
+            }
+        }
+
+        nlohmann::json row = { { "item", str( e.item->m_Uuid.AsString() ) },
+                               { "kind", e.item->Type() == PCB_VIA_T ? "via" : e.item->Type() == PCB_ARC_T ? "arc" : "track" },
+                               { "net", str( UnescapeString( e.item->GetNetname() ) ) },
+                               { "layer", str( aBoard->GetLayerName( e.layer ) ) },
+                               { "at_mm", { toMm( e.at.x ), toMm( e.at.y ) } },
+                               { "was_on", e.pad } };
+
+        if( other )
+        {
+            row["pad"] = str( other->GetParentFootprint()->GetReference() ) + "." + str( other->GetNumber() );
+            row["pad_net"] = str( UnescapeString( other->GetNetname() ) );
+            aShorts.push_back( row );
+        }
+        else if( !held )
+        {
+            aDangling.push_back( row );
+        }
+    }
+}
+
+
+/// @brief The conflicts found before a push (aBefore) with those after it: a push propagates nets,
+/// so floating copper under a moved pad takes the pad's net and would no longer show as another
+/// net's; such rows say net_changed_to
+nlohmann::json mergeConflicts( BOARD* aBoard, const nlohmann::json& aBefore, const nlohmann::json& aAfter )
+{
+    nlohmann::json        out = nlohmann::json::array();
+    std::set<std::string> seen;
+
+    for( nlohmann::json row : aBefore )
+    {
+        // ripped since: gone from the board
+        if( !aBoard->ResolveItem( KIID( row["item"].get<std::string>() ), true ) )
+            continue;
+
+        const std::string key = row["ref"].get<std::string>() + "." + row["pad"].get<std::string>() + "|"
+                                + row["item"].get<std::string>() + "|" + row["layer"].get<std::string>();
+
+        if( BOARD_CONNECTED_ITEM* item = dynamic_cast<BOARD_CONNECTED_ITEM*>(
+                    aBoard->ResolveItem( KIID( row["item"].get<std::string>() ), true ) ) )
+        {
+            const std::string now = str( UnescapeString( item->GetNetname() ) );
+
+            if( now != row["other_net"].get<std::string>() )
+                row["net_changed_to"] = now;
+        }
+
+        seen.insert( key );
+        out.push_back( row );
+    }
+
+    for( const nlohmann::json& row : aAfter )
+    {
+        const std::string key = row["ref"].get<std::string>() + "." + row["pad"].get<std::string>() + "|"
+                                + row["item"].get<std::string>() + "|" + row["layer"].get<std::string>();
+
+        if( !seen.count( key ) )
+            out.push_back( row );
+    }
+
+    return out;
+}
+
+
+/// @brief on_copper for moved footprints, before their commit is pushed: refuse (true: the caller
+/// reverts), rip (the unlocked conflicting tracks / vias removed in the same commit, listed in
+/// aOut.ripped; their nets in aRippedNets), report (nothing here)
+bool onCopper( BOARD* aBoard, BOARD_COMMIT& aCommit, const std::set<const FOOTPRINT*>& aFootprints,
+               const std::string& aMode, nlohmann::json& aOut, std::map<int, size_t>& aRippedNets )
+{
+    if( aMode == "report" )
+        return false;
+
+    std::vector<PCB_TRACK*> items;
+    const nlohmann::json    conflicts = copperConflicts( aBoard, aFootprints, &items );
+
+    if( conflicts.empty() )
+        return false;
+
+    if( aMode == "refuse" )
+    {
+        aOut["applied"] = false;
+        aOut["ok"] = false;
+        aOut["copper_conflicts"] = conflicts;
+        aOut["reason"] = "on_copper refuse: the moved pads would touch copper of other nets; nothing was moved";
+        return true;
+    }
+
+    aBoard->BuildConnectivity();
+    std::shared_ptr<CONNECTIVITY_DATA> conn = aBoard->GetConnectivity();
+    conn->RecalculateRatsnest();
+    nlohmann::json ripped = nlohmann::json::array();
+
+    for( PCB_TRACK* item : items )
+    {
+        if( item->IsLocked() )
+            continue;
+
+        if( !aRippedNets.count( item->GetNetCode() ) )
+        {
+            RN_NET* rn = conn->GetRatsnestForNet( item->GetNetCode() );
+            aRippedNets[item->GetNetCode()] = rn ? rn->GetEdges().size() : 0;
+        }
+
+        ripped.push_back( { { "uuid", str( item->m_Uuid.AsString() ) },
+                            { "kind", item->Type() == PCB_VIA_T ? "via" : "track" },
+                            { "net", str( UnescapeString( item->GetNetname() ) ) } } );
+        aCommit.Remove( item );
+    }
+
+    aOut["ripped"] = ripped;
+    return false;
+}
+
+
+/// @brief After a rip: the connections the removed copper left open, per net (airwires now less before)
+nlohmann::json openedByRip( BOARD* aBoard, const std::map<int, size_t>& aBefore )
+{
+    nlohmann::json out = nlohmann::json::array();
+
+    if( aBefore.empty() )
+        return out;
+
+    aBoard->BuildConnectivity();
+    std::shared_ptr<CONNECTIVITY_DATA> conn = aBoard->GetConnectivity();
+    conn->RecalculateRatsnest();
+
+    for( const auto& [net, before] : aBefore )
+    {
+        RN_NET*        rn = conn->GetRatsnestForNet( net );
+        nlohmann::json ends = nlohmann::json::array();
+        const size_t   now = rn ? rn->GetEdges().size() : 0;
+
+        if( rn )
+        {
+            for( const CN_EDGE& edge : rn->GetEdges() )
+            {
+                std::string names[2];
+                int         k = 0;
+
+                for( const std::shared_ptr<const CN_ANCHOR>& node : { edge.GetSourceNode(), edge.GetTargetNode() } )
+                {
+                    BOARD_CONNECTED_ITEM* parent = node ? node->Parent() : nullptr;
+
+                    if( parent && parent->Type() == PCB_PAD_T )
+                        names[k] = str( static_cast<PAD*>( parent )->GetParentFootprint()->GetReference() ) + "."
+                                   + str( static_cast<PAD*>( parent )->GetNumber() );
+                    else if( parent )
+                        names[k] = parent->Type() == PCB_VIA_T ? "via" : "track";
+
+                    ++k;
+                }
+
+                if( ends.size() < 20 )
+                    ends.push_back( { names[0], names[1] } );
+            }
+        }
+
+        NETINFO_ITEM* info = aBoard->FindNet( net );
+        out.push_back( { { "net", info ? str( UnescapeString( info->GetNetname() ) ) : std::string() },
+                         { "opened", (int) now - (int) before },
+                         { "airwires", ends } } );
+    }
+
+    return out;
+}
+
+
 /// @brief Placement findings: courtyard overlaps, parts outside the board, connectors, ratsnest.
 /// @param aOnly when given, overlaps / outside / connectors only for these footprints (the ones just
 /// moved); the ratsnest figures are always for the whole board
@@ -187,20 +633,42 @@ nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>*
                [&]( size_t a, size_t b ) { return boxes[a].GetLeft() < boxes[b].GetLeft(); } );
 
     std::vector<std::pair<size_t, size_t>> pairs;
+    std::shared_ptr<DRC_ENGINE>            drc = aBoard->GetDesignSettings().m_DRCEngine;
+    int                                    maxCourtyardClearance = 0;
+
+    if( DRC_CONSTRAINT worst; drc && drc->QueryWorstConstraint( COURTYARD_CLEARANCE_CONSTRAINT, worst ) )
+        maxCourtyardClearance = std::max( worst.GetValue().Min(), 0 );
+
+    // both sides' courtyards: DRC tests the front and the back ones of every pair
+    std::vector<BOX2I> reach = boxes;
+
+    for( size_t i = 0; i < fps.size(); ++i )
+    {
+        for( PCB_LAYER_ID side : { F_CrtYd, B_CrtYd } )
+        {
+            if( fps[i]->GetCourtyard( side ).OutlineCount() )
+                reach[i].Merge( fps[i]->GetCourtyard( side ).BBox() );
+        }
+    }
+
+    std::sort( byLeft.begin(), byLeft.end(), [&]( size_t a, size_t b ) { return reach[a].GetLeft() < reach[b].GetLeft(); } );
 
     for( size_t si = 0; si < byLeft.size(); ++si )
     {
         const size_t i = byLeft[si];
 
-        for( size_t sj = si + 1; sj < byLeft.size() && boxes[byLeft[sj]].GetLeft() <= boxes[i].GetRight(); ++sj )
+        for( size_t sj = si + 1; sj < byLeft.size() && reach[byLeft[sj]].GetLeft() <= reach[i].GetRight() + maxCourtyardClearance; ++sj )
         {
             const size_t j = byLeft[sj];
 
-            if( fps[i]->IsFlipped() != fps[j]->IsFlipped() || !boxes[i].Intersects( boxes[j] )
-                || !( wanted( i ) || wanted( j ) ) )
-            {
+            if( !( wanted( i ) || wanted( j ) ) )
                 continue;
-            }
+
+            BOX2I bi = reach[i];
+            bi.Inflate( maxCourtyardClearance );
+
+            if( !bi.Intersects( reach[j] ) )
+                continue;
 
             pairs.emplace_back( std::min( i, j ), std::max( i, j ) );
         }
@@ -212,14 +680,70 @@ nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>*
 
     for( const auto& [i, j] : pairs )
     {
-        SHAPE_POLY_SET both = areas[i];
-        both.BooleanIntersection( areas[j] );
+        // as DRC's courtyard test: per side, the two courtyards closer than the courtyard clearance
+        // rule (0: touching counts); a part without courtyards by its body box, on its own side
+        bool           hit = false;
+        nlohmann::json row = { { "a", str( fps[i]->GetReference() ) }, { "b", str( fps[j]->GetReference() ) } };
 
-        if( both.OutlineCount() > 0 && areaMm2( both.Area() ) > 0.01 )
+        for( PCB_LAYER_ID side : { F_CrtYd, B_CrtYd } )
         {
-            overlaps.push_back( { { "a", str( fps[i]->GetReference() ) }, { "b", str( fps[j]->GetReference() ) },
-                                  { "area_mm2", std::round( areaMm2( both.Area() ) * 100.0 ) / 100.0 } } );
+            const SHAPE_POLY_SET& ca = fps[i]->GetCourtyard( side );
+            const SHAPE_POLY_SET& cb = fps[j]->GetCourtyard( side );
+
+            if( hit || !ca.OutlineCount() || !cb.OutlineCount() )
+                continue;
+
+            int clearance = 0;
+
+            if( drc )
+            {
+                const DRC_CONSTRAINT c = drc->EvalRules( COURTYARD_CLEARANCE_CONSTRAINT, fps[i], fps[j], side == F_CrtYd ? F_Cu : B_Cu );
+
+                if( c.GetSeverity() == RPT_SEVERITY_IGNORE )
+                    continue;
+
+                clearance = c.GetValue().HasMin() ? c.GetValue().Min() : 0;
+
+                if( clearance < 0 )
+                    continue;
+            }
+
+            int actual = 0;
+
+            if( ca.Collide( &cb, clearance, &actual ) )
+            {
+                hit = true;
+                SHAPE_POLY_SET both = ca;
+                both.BooleanIntersection( cb );
+                row["area_mm2"] = std::round( areaMm2( both.Area() ) * 100.0 ) / 100.0;
+                row["side"] = side == F_CrtYd ? "front" : "back";
+
+                if( clearance > 0 )
+                {
+                    row["clearance_mm"] = toMm( clearance );
+                    row["actual_mm"] = toMm( actual );
+                }
+            }
         }
+
+        const bool bare = ( !fps[i]->GetCourtyard( F_CrtYd ).OutlineCount() && !fps[i]->GetCourtyard( B_CrtYd ).OutlineCount() )
+                          || ( !fps[j]->GetCourtyard( F_CrtYd ).OutlineCount() && !fps[j]->GetCourtyard( B_CrtYd ).OutlineCount() );
+
+        if( !hit && bare && fps[i]->IsFlipped() == fps[j]->IsFlipped() )
+        {
+            SHAPE_POLY_SET both = areas[i];
+            both.BooleanIntersection( areas[j] );
+
+            if( both.OutlineCount() > 0 && areaMm2( both.Area() ) > 0.01 )
+            {
+                hit = true;
+                row["area_mm2"] = std::round( areaMm2( both.Area() ) * 100.0 ) / 100.0;
+                row["by"] = "body box (no courtyard)";
+            }
+        }
+
+        if( hit )
+            overlaps.push_back( row );
     }
 
     // a courtyard box no outline edge (cut-outs included) enters, with its centre inside the board,
@@ -354,6 +878,15 @@ nlohmann::json placementReport( BOARD* aBoard, const std::set<const FOOTPRINT*>*
                               { "airwire_length_mm", toMm( airwires ) },
                               { "airwires", edgesCount },
                               { "ok", overlaps.empty() && outside.empty() && problems.empty() && hasOutline } };
+
+    // the moved parts' pads against other nets' copper (the whole board's copper: DRC)
+    if( aOnly )
+    {
+        report["copper_conflicts"] = copperConflicts( aBoard, *aOnly );
+
+        if( !report["copper_conflicts"].empty() )
+            report["ok"] = false;
+    }
 
     if( !overhanging.empty() )
         report["edge_overhang_note"] = "connectors placed with their mating side over the board edge on purpose (the "
@@ -991,7 +1524,7 @@ bool finePitch( FOOTPRINT* aFootprint )
     {
         for( PAD* b : aFootprint->Pads() )
         {
-            if( a != b && ( a->GetPosition() - b->GetPosition() ).EuclideanNorm() <= toIU( 0.65 ) )
+            if( KopenapiPadNeighbours( a, b ) && ( a->GetPosition() - b->GetPosition() ).EuclideanNorm() <= toIU( 0.65 ) )
                 return true;
         }
     }
@@ -1543,6 +2076,10 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         return KOPENAPI_RESULT::Error( 400, "give 'moves': [{ref, x_mm, y_mm, rotation_deg?, side?}]" );
 
     const std::string reportScope = aArgs.value( "report", std::string( "moved" ) );
+    const std::string onCopperMode = aArgs.value( "on_copper", std::string( "report" ) );
+
+    if( onCopperMode != "report" && onCopperMode != "refuse" && onCopperMode != "rip" )
+        return KOPENAPI_RESULT::Error( 400, "on_copper: report, refuse or rip" );
 
     if( reportScope != "moved" && reportScope != "full" && reportScope != "none" )
         return KOPENAPI_RESULT::Error( 400, "report: moved, full or none" );
@@ -1646,6 +2183,24 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         }
 
         plan.emplace_back( fp, move );
+    }
+
+    const bool ripAttached = aArgs.value( "rip_attached", false );
+    std::vector<ATTACHED_END> attached;
+
+    {
+        std::set<const FOOTPRINT*> moving;
+
+        for( auto& [fp, m] : plan )
+        {
+            moving.insert( fp );
+
+            for( const nlohmann::json& ref : m.value( "with", nlohmann::json::array() ) )
+                moving.insert( findFootprint( board, ref.get<std::string>() ) );
+        }
+
+        moving.erase( nullptr );
+        attached = attachedEnds( board, moving );
     }
 
     BOARD_COMMIT      commit( context->GetToolManager() );
@@ -1770,6 +2325,66 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
         carry( fp, m, posBefore, angleBefore );
     }
 
+    std::set<const FOOTPRINT*> movedFps;
+
+    for( auto& [fp, m] : plan )
+    {
+        movedFps.insert( fp );
+
+        for( const nlohmann::json& ref : m.value( "with", nlohmann::json::array() ) )
+            movedFps.insert( findFootprint( board, ref.get<std::string>() ) );
+    }
+
+    movedFps.erase( nullptr );
+
+    nlohmann::json        copperOut = nlohmann::json::object();
+    std::map<int, size_t> rippedNets;
+
+    if( onCopper( board, commit, movedFps, onCopperMode, copperOut, rippedNets ) )
+    {
+        commit.Revert();
+        return KOPENAPI_RESULT::Ok( copperOut );
+    }
+
+    // the copper that stayed where the moved pads were: now on another net's pad, or on none
+    nlohmann::json shortsCreated, danglingAtPads;
+    attachedAfterMove( board, attached, shortsCreated, danglingAtPads );
+
+    nlohmann::json ripAttachedOut = nlohmann::json::array();
+    nlohmann::json keptLocked = nlohmann::json::array();
+
+    if( ripAttached )
+    {
+        std::set<std::string> gone;
+
+        for( const nlohmann::json& r : copperOut.value( "ripped", nlohmann::json::array() ) )
+            gone.insert( r["uuid"].get<std::string>() );
+
+        for( const ATTACHED_END& e : attached )
+        {
+            const std::string id = str( e.item->m_Uuid.AsString() );
+
+            if( !gone.insert( id ).second )
+                continue;
+
+            nlohmann::json row = { { "uuid", id },
+                                   { "kind", e.item->Type() == PCB_VIA_T ? "via" : e.item->Type() == PCB_ARC_T ? "arc" : "track" },
+                                   { "net", str( UnescapeString( e.item->GetNetname() ) ) },
+                                   { "was_on", e.pad } };
+
+            if( e.item->IsLocked() )
+            {
+                keptLocked.push_back( row );
+                continue;
+            }
+
+            ripAttachedOut.push_back( row );
+            commit.Remove( e.item );
+        }
+    }
+
+    const nlohmann::json conflictsBefore = copperConflicts( board, movedFps );
+
     commit.Push( _( "Move footprints (API)" ) );
     refreshGui( aCtx, board );
     glow( aCtx, moved );
@@ -1778,22 +2393,55 @@ static KOPENAPI_RESULT h_pcb_footprint_move( KOPENAPI_CONTEXT& aCtx, const nlohm
     nlohmann::json report = nlohmann::json::object();
 
     if( reportScope == "moved" )
-    {
-        std::set<const FOOTPRINT*> movedFps;
-
-        for( auto& [fp, m] : plan )
-        {
-            movedFps.insert( fp );
-
-            for( const nlohmann::json& ref : m.value( "with", nlohmann::json::array() ) )
-                movedFps.insert( findFootprint( board, ref.get<std::string>() ) );
-        }
-
         report = placementReport( board, &movedFps );
-    }
     else if( reportScope == "full" )
-    {
         report = placementReport( board );
+
+    if( copperOut.contains( "ripped" ) )
+    {
+        report["ripped"] = copperOut["ripped"];
+        report["opened"] = openedByRip( board, rippedNets );
+    }
+
+    // the copper check of the moved parts holds whatever the report scope
+    report["copper_conflicts"] = mergeConflicts( board, conflictsBefore, copperConflicts( board, movedFps ) );
+
+    if( !report["copper_conflicts"].empty() && report.contains( "ok" ) )
+        report["ok"] = false;
+
+    // copper left where the moved pads were (rip_attached: taken out in the same step)
+    if( ripAttached )
+    {
+        report["ripped_attached"] = ripAttachedOut;
+
+        if( !keptLocked.empty() )
+            report["attached_locked"] = keptLocked;
+
+        auto stillThere = [&]( const nlohmann::json& aRows )
+        {
+            nlohmann::json kept = nlohmann::json::array();
+
+            for( const nlohmann::json& r : aRows )
+            {
+                if( board->ResolveItem( KIID( r["item"].get<std::string>() ), true ) )
+                    kept.push_back( r );
+            }
+
+            return kept;
+        };
+
+        shortsCreated = stillThere( shortsCreated );
+        danglingAtPads = stillThere( danglingAtPads );
+    }
+
+    report["shorts_created"] = shortsCreated;
+    report["dangling_at_pads"] = danglingAtPads;
+
+    if( !shortsCreated.empty() )
+    {
+        report["ok"] = false;
+        report["hint"] = "copper of the old pad places now touches pads of other nets: rollback, or move again with "
+                         "rip_attached: true (or pcb_tracks_delete those items)";
     }
 
     report["report"] = reportScope;
@@ -1855,6 +2503,27 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
     BOARD*       board = context->GetBoard();
     BOARD_COMMIT commit( context->GetToolManager() );
+
+    const std::string onCopperMode = aArgs.value( "on_copper", std::string( "report" ) );
+
+    if( onCopperMode != "report" && onCopperMode != "refuse" && onCopperMode != "rip" )
+        return KOPENAPI_RESULT::Error( 400, "on_copper: report, refuse or rip" );
+
+    // where the unlocked parts were: on_copper refuse puts the conflicting ones back
+    struct WAS
+    {
+        VECTOR2I     pos;
+        EDA_ANGLE    angle;
+        PCB_LAYER_ID side;
+    };
+
+    std::map<FOOTPRINT*, WAS> was;
+
+    for( FOOTPRINT* fp : board->Footprints() )
+    {
+        if( !fp->IsLocked() )
+            was[fp] = { fp->GetPosition(), fp->GetOrientation(), fp->GetLayer() };
+    }
     nlohmann::json notes = nlohmann::json::array();
 
     std::vector<FOOTPRINT*> all;
@@ -2036,15 +2705,15 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
                 continue;
 
             const BOX2I c = courtyard( fp ).BBox();
-            const int   room = toIU( 2.0 ), near = toIU( 1.0 );
+            const int   room = toIU( 2.0 ), nearby = toIU( 1.0 );
 
-            if( c.GetLeft() <= edges.GetLeft() + near )
+            if( c.GetLeft() <= edges.GetLeft() + nearby )
                 left = std::max( left, c.GetRight() + room );
-            else if( c.GetRight() >= edges.GetRight() - near )
+            else if( c.GetRight() >= edges.GetRight() - nearby )
                 right = std::min( right, c.GetLeft() - room );
-            else if( c.GetTop() <= edges.GetTop() + near )
+            else if( c.GetTop() <= edges.GetTop() + nearby )
                 top = std::max( top, c.GetBottom() + room );
-            else if( c.GetBottom() >= edges.GetBottom() - near )
+            else if( c.GetBottom() >= edges.GetBottom() - nearby )
                 bottom = std::min( bottom, c.GetTop() - room );
         }
 
@@ -2186,10 +2855,82 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         groups.push_back( row );
     }
 
+    // the placed parts' pads against other nets' copper
+    std::set<const FOOTPRINT*> placedFps;
+
+    for( const KIID& id : placed )
+    {
+        if( FOOTPRINT* fp = dynamic_cast<FOOTPRINT*>( board->ResolveItem( id, true ) ) )
+            placedFps.insert( fp );
+    }
+
+    nlohmann::json        copperOut = nlohmann::json::object();
+    std::map<int, size_t> rippedNets;
+
+    if( onCopperMode == "refuse" )
+    {
+        std::set<FOOTPRINT*> back;
+
+        for( const nlohmann::json& c : copperConflicts( board, placedFps ) )
+        {
+            if( FOOTPRINT* fp = board->FindFootprintByReference( wxString::FromUTF8( c["ref"].get<std::string>() ) );
+                fp && was.count( fp ) )
+            {
+                back.insert( fp );
+            }
+        }
+
+        if( !back.empty() )
+        {
+            BOARD_COMMIT   restore( context->GetToolManager() );
+            nlohmann::json refused = nlohmann::json::array();
+
+            for( FOOTPRINT* fp : back )
+            {
+                restore.Modify( fp );
+
+                if( fp->GetLayer() != was[fp].side )
+                    fp->Flip( fp->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );
+
+                fp->SetOrientation( was[fp].angle );
+                fp->SetPosition( was[fp].pos );
+                refused.push_back( str( fp->GetReference() ) );
+                placedFps.erase( fp );
+            }
+
+            restore.Push( _( "Autoplace: parts back off other nets' copper (API)" ) );
+            copperOut["refused"] = refused;
+        }
+    }
+    else if( onCopperMode == "rip" )
+    {
+        BOARD_COMMIT rip( context->GetToolManager() );
+        onCopper( board, rip, placedFps, "rip", copperOut, rippedNets );
+
+        if( !rippedNets.empty() )
+            rip.Push( _( "Autoplace: rip other nets' copper (API)" ) );
+        else
+            rip.Revert();
+    }
+
     refreshGui( aCtx, board );
     glow( aCtx, placed );
 
-    nlohmann::json report = placementReport( board );
+    nlohmann::json report = placementReport( board, nullptr );
+    report["copper_conflicts"] = copperConflicts( board, placedFps );
+
+    if( !report["copper_conflicts"].empty() )
+        report["ok"] = false;
+
+    for( const char* key : { "refused", "ripped" } )
+    {
+        if( copperOut.contains( key ) )
+            report[key] = copperOut[key];
+    }
+
+    if( !rippedNets.empty() )
+        report["opened"] = openedByRip( board, rippedNets );
+
     report["notes"] = notes;
 
     if( !groups.empty() )
@@ -2199,7 +2940,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     const KOPENAPI_LIST_CAP cap( aArgs, PLACE_AUTO_LIST_CAP );
 
     for( const char* key : { "courtyard_overlaps", "outside_board", "connectors", "connector_problems", "edge_overhang",
-                             "notes", "groups" } )
+                             "notes", "groups", "copper_conflicts" } )
     {
         if( report.contains( key ) )
             cap.Put( report, key, report[key] );
@@ -2242,6 +2983,10 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
     }
 
     const std::string side = aArgs.value( "side", std::string( "same" ) );
+    const std::string onCopperMode = aArgs.value( "on_copper", std::string( "report" ) );
+
+    if( onCopperMode != "report" && onCopperMode != "refuse" && onCopperMode != "rip" )
+        return KOPENAPI_RESULT::Error( 400, "on_copper: report, refuse or rip" );
 
     if( side != "same" && side != "opposite" )
         return KOPENAPI_RESULT::Error( 400, "side: same (as the anchor) or opposite (under it, on the other side of the board)" );
@@ -2266,24 +3011,43 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
         return KOPENAPI_RESULT::Ok( out );
     }
 
-    if( aArgs.value( "dry_run", false ) )
-    {
-        commit.Revert();
-        out["applied"] = false;
-        return KOPENAPI_RESULT::Ok( out );
-    }
-
-    commit.Push( _( "Place group (API)" ) );
-    refreshGui( aCtx, board );
-    glow( aCtx, moved );
-
     std::set<const FOOTPRINT*> movedFps;
 
     for( FOOTPRINT* part : parts )
         movedFps.insert( part );
 
+    if( aArgs.value( "dry_run", false ) )
+    {
+        out["copper_conflicts"] = copperConflicts( board, movedFps );
+        commit.Revert();
+        out["applied"] = false;
+        return KOPENAPI_RESULT::Ok( out );
+    }
+
+    std::map<int, size_t> rippedNets;
+
+    if( onCopper( board, commit, movedFps, onCopperMode, out, rippedNets ) )
+    {
+        commit.Revert();
+        return KOPENAPI_RESULT::Ok( out );
+    }
+
+    const nlohmann::json conflictsBefore = copperConflicts( board, movedFps );
+
+    commit.Push( _( "Place group (API)" ) );
+    refreshGui( aCtx, board );
+    glow( aCtx, moved );
+
     out["applied"] = true;
     out["check"] = placementReport( board, &movedFps );
+    out["check"]["copper_conflicts"] = mergeConflicts( board, conflictsBefore, out["check"]["copper_conflicts"] );
+
+    if( !out["check"]["copper_conflicts"].empty() )
+        out["check"]["ok"] = false;
+
+    if( out.contains( "ripped" ) )
+        out["opened"] = openedByRip( board, rippedNets );
+
     return KOPENAPI_RESULT::Ok( out );
 }
 
@@ -2313,6 +3077,7 @@ KOPENAPI_REGISTER( "pcb_place_group",
                         "fanout_ring_mm":{"type":"number","description":"keep this far from the anchor's courtyard (room for the tracks leaving its pins); default 1.0 for a fine-pitch anchor (pads 0.65 mm apart or closer), else 0; parts that find no place with it come as close as the courtyards allow"},
                         "max_mm":{"type":"number","default":25,"description":"how far from the anchor's pad a part may end up"},
                         "override_locks":{"type":"boolean","default":false},
+                        "on_copper":{"type":"string","enum":["report","refuse","rip"],"default":"report","description":"the moved pads under or within clearance (DRC rules) of other nets' tracks, vias, pads or zone fills: report lists them as copper_conflicts (ok false); refuse moves nothing (applied false, the conflicts listed); rip removes the conflicting unlocked tracks and vias in the same undo step (ripped) and lists the connections that opened (opened); zone fills are listed, refill with pcb_zones_fill"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_place_group, 120 );
 
@@ -2324,8 +3089,11 @@ KOPENAPI_REGISTER( "pcb_footprint_move",
                    "courtyards allow, turned so the part's pad on that net faces it (no coordinates to "
                    "compute; a whole block: pcb_place_group); with: parts that move and turn together with it (a "
                    "placed block as one); locked ones need override_locks; answers where they are now and the "
-                   "placement check of the moved footprints (overlaps, outside the board, airwire length; report: "
-                   "full for the whole board)",
+                   "placement check of the moved footprints (overlaps, outside the board, other nets' copper "
+                   "under the moved pads: on_copper, airwire length; report: full for the whole board); tracks "
+                   "and vias stay where they are: copper that ended on a moved pad and now sits on a pad of another "
+                   "net is listed in shorts_created (ok false), copper no pad of its net holds any more in "
+                   "dangling_at_pads (each with was_on REF.PAD); rip_attached: true removes it in the same step)",
                    R"json({"type":"object","required":["moves"],"properties":{
                         "moves":{"type":"array","items":{"type":"object","required":["ref"],"properties":{
                             "ref":{"type":"string"},"x_mm":{"type":"number"},"y_mm":{"type":"number"},
@@ -2341,6 +3109,8 @@ KOPENAPI_REGISTER( "pcb_footprint_move",
                             "edge":{"type":"string","enum":["left","right","top","bottom"],"description":"put the connector on that board edge facing out (facing + anchor panel_edge + the edge coordinate); give the other coordinate"},
                             "facing":{"type":"string","enum":["left","right","up","down"],"description":"connectors: turn so the mating side faces this way (panel edge from the footprint's marker or inferred from its body, see pcb_footprint_get panel_edge)"}}}},
                         "override_locks":{"type":"boolean","default":false},
+                        "on_copper":{"type":"string","enum":["report","refuse","rip"],"default":"report","description":"the moved pads under or within clearance (DRC rules) of other nets' tracks, vias, pads or zone fills: report lists them as copper_conflicts (ok false); refuse moves nothing (applied false, the conflicts listed); rip removes the conflicting unlocked tracks and vias in the same undo step (ripped) and lists the connections that opened (opened); zone fills are listed, refill with pcb_zones_fill"},
+                        "rip_attached":{"type":"boolean","default":false,"description":"remove the tracks and vias that ended on the moved parts' pads (they stay where the pads were) in the same undo step: ripped_attached (locked ones kept: attached_locked)"},
                         "report":{"type":"string","enum":["moved","full","none"],"default":"moved","description":"placement check in the answer: for the footprints moved (overlaps with any part, outside the board, connector facing; ratsnest of the whole board), the whole board, or none"}}})json"_json,
                    false, h_pcb_footprint_move );
 
@@ -2362,6 +3132,7 @@ KOPENAPI_REGISTER( "pcb_place_auto",
                         "x_mm":{"type":"number","default":20},"y_mm":{"type":"number","default":20},
                         "density":{"type":"number","default":0.35},"aspect":{"type":"number","default":1.5},
                         "connectors_to_edge":{"type":"boolean","default":true},
+                        "on_copper":{"type":"string","enum":["report","refuse","rip"],"default":"report","description":"placed pads under or within clearance of other nets' copper (tracks, vias, pads, zone fills): report lists them as copper_conflicts (ok false); refuse puts the parts with conflicts back where they were before the call (refused); rip removes the conflicting unlocked tracks and vias (ripped, opened)"},
                         "groups":{"type":"array","description":"functional blocks to pull together after the first placement, each as pcb_place_group takes it: {anchor, parts?, side?, gap_mm?, max_mm?}","items":{"type":"object"}}}})json"_json, PLACE_AUTO_LIST_CAP ),
                    false, h_pcb_place_auto, 600 );
 

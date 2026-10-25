@@ -16,6 +16,13 @@
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <sys/clonefile.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <vector>
 
 namespace kopenapi::platform
 {
@@ -188,6 +195,116 @@ void KeepProcessResponsiveMacOS()
     }
 
     poolPop(pool);
+}
+
+std::filesystem::path RunSnapshotMacOS(const std::filesystem::path& exe, std::string& note)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path        bundle;
+
+    for (fs::path p = exe.parent_path(); !p.empty() && p != p.root_path(); p = p.parent_path())
+    {
+        if (p.extension() == ".app")
+        {
+            bundle = p;
+            break;
+        }
+    }
+
+    if (bundle.empty())
+    {
+        note = "not in an .app bundle: runs as is";
+        return exe;
+    }
+
+    // FNV-1a over the program files' names, sizes and times
+    uint64_t h = 1469598103934665603ull;
+    auto     mix = [&](const std::string& text)
+    {
+        for (unsigned char c : text)
+            h = (h ^ c) * 1099511628211ull;
+    };
+
+    for (const char* dir : {"Contents/MacOS", "Contents/PlugIns", "Contents/Frameworks"})
+    {
+        std::vector<std::string> entries;
+
+        for (fs::recursive_directory_iterator it(bundle / dir, ec), end; !ec && it != end; it.increment(ec))
+        {
+            if (!it->is_regular_file(ec))
+                continue;
+
+            const long long when = (long long) it->last_write_time(ec).time_since_epoch().count();
+            entries.push_back(it->path().lexically_relative(bundle).string() + ":" + std::to_string((unsigned long long) it->file_size(ec))
+                              + ":" + std::to_string(when));
+        }
+
+        std::sort(entries.begin(), entries.end());
+
+        for (const std::string& e : entries)
+            mix(e);
+    }
+
+    char stamp[17];
+    std::snprintf(stamp, sizeof(stamp), "%016llx", (unsigned long long) h);
+
+    const fs::path root = bundle.parent_path() / "run-snapshots";
+    const fs::path home = root / stamp;
+    const fs::path copy = home / bundle.filename();
+    const fs::path target = copy / exe.lexically_relative(bundle);
+
+    if (fs::exists(home / "complete", ec) && fs::exists(target, ec))
+    {
+        note = "runs from snapshot " + home.string();
+        return target;
+    }
+
+    fs::create_directories(root, ec);
+    const fs::path partial = root / (std::string(stamp) + ".partial-" + std::to_string(getpid()));
+    fs::remove_all(partial, ec);
+    fs::create_directories(partial, ec);
+
+    if (clonefile(bundle.c_str(), (partial / bundle.filename()).c_str(), 0) != 0)
+    {
+        note = "snapshot failed (clonefile errno " + std::to_string(errno) + "): runs from the build";
+        fs::remove_all(partial, ec);
+        return exe;
+    }
+
+    if (FILE* f = std::fopen((partial / "complete").c_str(), "w"))
+        std::fclose(f);
+
+    fs::rename(partial, home, ec);
+
+    if (ec)   // another process made it meanwhile
+        fs::remove_all(partial, ec);
+
+    // older snapshots: keep the newest three, and any younger than a week (a process may run from it)
+    std::vector<std::pair<fs::file_time_type, fs::path>> old;
+
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
+    {
+        if (it->is_directory(ec) && it->path() != home)
+            old.emplace_back(it->last_write_time(ec), it->path());
+    }
+
+    std::sort(old.begin(), old.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    const auto weekAgo = fs::file_time_type::clock::now() - std::chrono::hours(24 * 7);
+
+    const auto hourAgo = fs::file_time_type::clock::now() - std::chrono::hours(1);
+
+    for (size_t k = 0; k < old.size(); ++k)
+    {
+        const bool partialLeft = old[k].second.filename().string().find(".partial-") != std::string::npos
+                                 && old[k].first < hourAgo;
+
+        if (partialLeft || (k >= 2 && old[k].first < weekAgo))
+            fs::remove_all(old[k].second, ec);
+    }
+
+    note = "runs from snapshot " + home.string();
+    return fs::exists(target, ec) ? target : exe;
 }
 
 } // namespace kopenapi::platform

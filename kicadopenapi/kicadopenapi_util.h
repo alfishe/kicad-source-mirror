@@ -70,6 +70,12 @@ KICOMMON_API nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nl
 /// "RESET/") is kept; KiCad auto names ("Net-(...)", "unconnected-(...)") are not guessed from.
 KICOMMON_API nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName );
 
+/// @brief Names close to aWanted among aNames, best first (at most aMax): the same name under a
+/// hierarchical prefix ("~{USB_BOOT}" -> "/RP2040/~{USB_BOOT}"), the same leaf with another prefix,
+/// the same name in another case, then small spelling differences of the leaf
+KICOMMON_API std::vector<std::string> KopenapiDidYouMean( const std::vector<std::string>& aNames,
+                                                          const std::string& aWanted, size_t aMax = 5 );
+
 /// @brief Connector-like reference designator (J1, P2, X3, CN4, XS1, XP1, CON5): where nets leave the board
 KICOMMON_API bool KopenapiIsConnectorRef( const std::string& aRef );
 

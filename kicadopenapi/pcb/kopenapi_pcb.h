@@ -21,6 +21,7 @@
 
 class BOARD;
 class FOOTPRINT;
+class PAD;
 class FP_3DMODEL;
 class PCB_CONTEXT;
 class PROJECT;
@@ -158,6 +159,17 @@ class NETINFO_ITEM;
  * @brief Board net by name, as the answers spell it (unescaped, e.g. "Net-(U1-X1/CLK)") or in KiCad's stored form
  */
 NETINFO_ITEM* KopenapiFindNet( BOARD* aBoard, const std::string& aName );
+
+/// @brief Board net names close to aName (KopenapiDidYouMean over the unescaped names)
+std::vector<std::string> KopenapiNetSuggestions( BOARD* aBoard, const std::string& aName );
+
+/// @brief 404 for a net name not on the board: "<aWhat>no net '<name>' on the board", with
+/// error.did_you_mean (close names, e.g. the same name under its sheet prefix) and error.net
+KOPENAPI_RESULT KopenapiNoSuchNet( BOARD* aBoard, const std::string& aName, const std::string& aWhat = std::string() );
+
+/// @brief Two pads of a part that count for its pitch: on a copper layer both have, apart (the two
+/// sides of an edge connector's finger, or a pad stacked on another, are not neighbours)
+bool KopenapiPadNeighbours( const PAD* aA, const PAD* aB );
 
 /**
  * @brief Validate a net's stored driver edge block ({family, tr_ps, tr_def, rout_ohm, swing_v, nm_v, driver})

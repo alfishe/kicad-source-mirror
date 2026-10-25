@@ -314,6 +314,9 @@ private:
     // collideSimple inner loop and walks the DRC engine map otherwise.
     std::optional<bool> m_hasUserPhysicalConstraint;
 
+    // Cached for the routing session: the board's biggest clearance, how far a rule can reach
+    std::optional<int> m_biggestClearance;
+
     std::unordered_map<CLEARANCE_CACHE_KEY, int> m_clearanceCache;
     std::unordered_map<TEMP_CLEARANCE_CACHE_KEY, int>    m_tempClearanceCache;
     std::unordered_map<HULL_CACHE_KEY, SHAPE_LINE_CHAIN> m_hullCache;
@@ -636,17 +639,53 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
         dummyTrack.SetNet( static_cast<NETINFO_ITEM*>( aLineItem->Net() ) );
         dummyTrack.SetWidth( line->Width() );
 
-        for( int i = 0; i < chain.SegmentCount(); i++ )
+        // Only the segments within reach of the opposing item decide its clearance: a rule
+        // area another part of the line crosses (a courtyard at the start pad) does not apply
+        // to an obstacle far from it
+        BOX2I reach;
+        bool  useReach = false;
+
+        if( aOpposingItem )
         {
-            dummyTrack.SetStart( chain.CPoint( i ) );
-            dummyTrack.SetEnd( chain.CPoint( i + 1 ) );
+            reach = aOpposingItem->GetBoundingBox();
+            if( !m_biggestClearance )
+                m_biggestClearance = std::max( m_board->GetDesignSettings().GetBiggestClearanceValue(), 0 );
 
-            DRC_CONSTRAINT segConstraint = aLineIsFirst
-                ? drcEngine->EvalRules( hostType, &dummyTrack, aOpposingItem, board_layer )
-                : drcEngine->EvalRules( hostType, aOpposingItem, &dummyTrack, board_layer );
+            reach.Inflate( line->Width() / 2 + *m_biggestClearance );
+            useReach = true;
+        }
 
-            if( pickSmallerConstraint( bestConstraint, segConstraint ) )
+        for( int pass = 0; pass < 2; pass++ )
+        {
+            bool evaluated = false;
+
+            for( int i = 0; i < chain.SegmentCount(); i++ )
+            {
+                if( useReach )
+                {
+                    BOX2I segBox( chain.CPoint( i ), VECTOR2I( 0, 0 ) );
+                    segBox.Merge( chain.CPoint( i + 1 ) );
+
+                    if( !segBox.Intersects( reach ) )
+                        continue;
+                }
+
+                dummyTrack.SetStart( chain.CPoint( i ) );
+                dummyTrack.SetEnd( chain.CPoint( i + 1 ) );
+                evaluated = true;
+
+                DRC_CONSTRAINT segConstraint = aLineIsFirst
+                    ? drcEngine->EvalRules( hostType, &dummyTrack, aOpposingItem, board_layer )
+                    : drcEngine->EvalRules( hostType, aOpposingItem, &dummyTrack, board_layer );
+
+                if( pickSmallerConstraint( bestConstraint, segConstraint ) )
+                    break;
+            }
+
+            if( evaluated || !useReach )
                 break;
+
+            useReach = false;   // nothing within reach: the line as a whole
         }
 
         return bestConstraint;
@@ -830,6 +869,7 @@ void PNS_PCBNEW_RULE_RESOLVER::ClearCaches()
     m_tempClearanceCache.clear();
     m_hullCache.clear();
     m_hasUserPhysicalConstraint.reset();
+    m_biggestClearance.reset();
 }
 
 

@@ -33,6 +33,10 @@ struct ROUTE_PLAN_REQUEST
 
     /// @brief No track of this connection across these (ways out of other nets' pads kept open)
     std::vector<std::pair<PCB_LAYER_ID, SHAPE_SEGMENT>> keepOut;
+
+    /// @brief Search the whole board, not a box round the ends (the box's search reached its cut
+    /// sides and found nothing)
+    bool wholeBoard = false;
 };
 
 /// @brief A route through free space: corners on a layer, and through vias where it changes layer
@@ -47,10 +51,16 @@ struct ROUTE_PLAN
     std::vector<int> crossed;   ///< the soft copper the path runs through (indexes into the request's soft)
 
     int    vias = 0;
+    bool   wholeBoard = false;   ///< searched over the whole board (the box round the ends was too small)
     double length = 0;     ///< board units, along the cells
     int    cell = 0;       ///< grid pitch used
     long   expanded = 0;   ///< search states taken
     double ms = 0;
+
+    /// @brief Not found after searching all the start could reach: the end shut in a small room of
+    /// its own (0 neither or not known, 1 the start, 2 the target) and how many states that room has
+    int    boxedEnd = 0;
+    size_t boxedRoom = 0;
 };
 
 /**

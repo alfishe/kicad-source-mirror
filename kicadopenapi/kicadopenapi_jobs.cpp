@@ -47,7 +47,10 @@ struct JOB
     std::optional<KOPENAPI_RESULT> result;
     std::atomic<bool> cancel{ false };
     bool              keep = false;   ///< job_cancel {keep}: stop, apply nothing, keep the state
+    bool              apply = true;   ///< job_cancel {apply: false}: stop, apply nothing
+    bool              plainCall = false;   ///< a plain call that may outlast the client's wait
     bool              paused = false;
+    bool              held = false;        ///< paused and waiting at a step point
     uint64_t          stepSerial = 0;      ///< job_step requests so far
     std::string       stepBy;
     int               stepN = 0;
@@ -87,6 +90,9 @@ nlohmann::json describe( const JOB& aJob, bool aWithResult )
     const CLOCK::time_point now = CLOCK::now();
     nlohmann::json          j = { { "job_id", aJob.Id() }, { "method", aJob.method }, { "state", aJob.state },
                                   { "rev", aJob.rev } };
+
+    if( aJob.plainCall )
+        j["plain_call"] = true;
 
     if( aJob.state == "queued" )
     {
@@ -138,10 +144,14 @@ nlohmann::json describe( const JOB& aJob, bool aWithResult )
         j["stop_reason"] = aJob.stopReason;
 
     if( !aJob.Finished() )
+    {
         j["paused"] = aJob.paused;
+        j["held"] = aJob.held;
+    }
 
     if( aJob.stepSerial > 0 )
-        j["step"] = { { "serial", aJob.stepSerial }, { "by", aJob.stepBy }, { "n", aJob.stepN } };
+        j["step"] = { { "serial", aJob.stepSerial }, { "served", aJob.stepServed }, { "by", aJob.stepBy },
+                      { "n", aJob.stepN } };
 
     if( aWithResult && aJob.result )
     {
@@ -374,6 +384,13 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
                 job.stepServed = job.stepSerial;
                 break;
             }
+
+            if( !job.held )
+            {
+                job.held = true;
+                job.rev++;
+                g_changed.notify_all();
+            }
         }
 
         if( !shown && g_titles )
@@ -388,6 +405,13 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
 
     std::lock_guard<std::mutex> lock( g_mutex );
     g_yielding = false;
+
+    if( g_current->held )
+    {
+        g_current->held = false;
+        g_current->rev++;
+    }
+
     return !g_current->cancel;
 }
 
@@ -494,6 +518,9 @@ nlohmann::json KopenapiRunningProgress()
     {
         out["job_id"] = job->Id();
         out["paused"] = job->paused;
+
+        if( job->plainCall )
+            out["plain_call"] = true;
     }
 
     return out;
@@ -514,6 +541,13 @@ bool KopenapiJobKeep()
 }
 
 
+bool KopenapiJobDiscard()
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    return g_current && g_current->cancel && ( g_current->keep || !g_current->apply );
+}
+
+
 bool KopenapiJobYielding()
 {
     std::lock_guard<std::mutex> lock( g_mutex );
@@ -528,7 +562,7 @@ KOPENAPI_JOBS& KOPENAPI_JOBS::Get()
 }
 
 
-std::string KOPENAPI_JOBS::Add( const std::string& aMethod, std::string& aWhy )
+std::string KOPENAPI_JOBS::Add( const std::string& aMethod, std::string& aWhy, bool aPlainCall )
 {
     std::lock_guard<std::mutex> lock( g_mutex );
 
@@ -545,6 +579,7 @@ std::string KOPENAPI_JOBS::Add( const std::string& aMethod, std::string& aWhy )
     auto job = std::make_shared<JOB>();
     job->seq = ++g_seq;
     job->method = aMethod;
+    job->plainCall = aPlainCall;
     g_jobs[job->seq] = job;
 
     while( g_jobs.size() > KEEP )
@@ -649,6 +684,31 @@ void KOPENAPI_JOBS::Fail( const std::string& aId, const KOPENAPI_RESULT& aResult
 }
 
 
+bool KOPENAPI_JOBS::Wait( const std::string& aId, std::chrono::milliseconds aFor, KOPENAPI_RESULT& aResult )
+{
+    std::unique_lock<std::mutex> lock( g_mutex );
+    auto                         it = g_jobs.find( idOf( aId ) );
+
+    if( it == g_jobs.end() )
+    {
+        aResult = KOPENAPI_RESULT::Error( 404, "no job '" + aId + "'" );
+        return true;
+    }
+
+    std::shared_ptr<JOB> job = it->second;
+
+    if( !g_changed.wait_for( lock, aFor, [&] { return job->Finished(); } ) )
+        return false;
+
+    if( job->result )
+        aResult = *job->result;
+    else
+        aResult = KOPENAPI_RESULT::Error( 409, "job " + aId + " was cancelled before it started; nothing changed" );
+
+    return true;
+}
+
+
 KOPENAPI_RESULT KOPENAPI_JOBS::Status( const nlohmann::json& aArgs )
 {
     const std::string id = aArgs.value( "job_id", std::string() );
@@ -690,7 +750,8 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Cancel( const nlohmann::json& aArgs )
         if( !job.cancel.exchange( true ) )
         {
             job.keep = aArgs.value( "keep", false );
-            job.stopReason = job.keep ? "job_cancel {keep}" : "job_cancel";
+            job.apply = aArgs.value( "apply", true );
+            job.stopReason = job.keep ? "job_cancel {keep}" : !job.apply ? "job_cancel {apply: false}" : "job_cancel";
             job.rev++;
         }
     }

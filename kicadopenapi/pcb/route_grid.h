@@ -71,6 +71,7 @@ struct GRID_PARAMS
     float                     pfStart = 1.0f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
     float                     pfGrowth = 1.6f; ///< and how much it grows each round (VPR's pres_fac_mult)
     bool                      record = false;  ///< keep each variant's timeline (GRID_RESULT::timeline)
+    bool                      fillsOut = false; ///< zone fills (but teardrops') are no obstacle: the caller takes them out (a dry run that would)
     /// @brief A paused job: true while the variants wait between two nets; aSerial / aBy / aN the last
     /// job_step (KopenapiJobHeld).  Any thread
     std::function<bool( uint64_t& aSerial, std::string& aBy, int& aN )> held;
@@ -105,6 +106,29 @@ struct GRID_TRACK
     std::vector<VECTOR2I> points;
 };
 
+/// @brief An end that fixed copper walls in: the room it has and what closes it
+struct GRID_WALL
+{
+    int    end = 0;     ///< index into the net's ends
+    size_t room = 0;    ///< free states reachable from the end
+    int    layers = 0;  ///< routing layers the end is on
+
+    /// @brief Who closes the room: a net that alone may pass there (-1 none: keep-out, edge, a hole,
+    /// a pad of no net), the blocked cell nearest the end and on which routing layer (-1 the via plane)
+    struct BY
+    {
+        int      owner = 0;
+        VECTOR2I at;
+        int      layer = 0;
+        int      cells = 0;
+    };
+
+    std::vector<BY> by;
+
+    /// @brief The closed cells round the room (up to 1024): centre and routing layer, -1 the via plane
+    std::vector<std::pair<VECTOR2I, int>> closed;
+};
+
 struct GRID_NET_RESULT
 {
     std::vector<GRID_TRACK> tracks;
@@ -112,6 +136,8 @@ struct GRID_NET_RESULT
     std::vector<bool>       reached;   ///< per end: joined to the first end
     bool                    complete = false;
     double                  length = 0;   ///< board units
+    std::vector<GRID_WALL>  walls;     ///< ends that fixed copper walls in before any search
+    std::vector<int>        halfCellExits;   ///< ends let out on the lattice half a cell off (their exit is in tracks)
 };
 
 /// @brief A net still crowded when negotiation ended: the first place and the nets there
@@ -133,6 +159,9 @@ struct GRID_RESULT
     long                         expanded = 0;
     double                       buildMs = 0;
     double                       routeMs = 0;
+    int                          halfCellTried = 0;   ///< walled fine-pitch ends tried on the half-cell lattice
+    int                          halfCellWon = 0;     ///< ... let out there
+    double                       halfCellMs = 0;      ///< their search (part of buildMs)
     std::vector<std::string>     variantsTried;
     int64_t                      laneBytes = 0;       ///< one lane's search state (estimate)
     int                          lanesMemoryAllows = 0; ///< within GRID_PARAMS::memoryBudget

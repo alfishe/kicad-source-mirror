@@ -383,6 +383,7 @@ static KOPENAPI_RESULT h_pcb_net_roles( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 continue;
 
             PCB_TRACK probe( board );
+            probe.SetFlags( ROUTER_TRANSIENT );
             probe.SetLayer( F_Cu );
             probe.SetStart( f.pad->GetPosition() );
             probe.SetEnd( f.pad->GetPosition() );

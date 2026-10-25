@@ -112,6 +112,10 @@ void GRID_LANE::AddDead( int aNet, int aEnd )
 void GRID_LANE::ForkFrom( const GRID_LANE& aParent, size_t aStep )
 {
     std::lock_guard<std::recursive_mutex> lock( aParent.Mutex() );
+
+    if( aParent.steps.empty() )
+        return;
+
     aStep = std::min( aStep, aParent.steps.size() - 1 );
 
     strategy = aParent.strategy;
@@ -155,11 +159,15 @@ void GRID_LANE::ForkFrom( const GRID_LANE& aParent, size_t aStep )
     m_keys.assign( aParent.m_keys.begin(), aParent.m_keys.begin() + (long) ( aStep / KEY + 1 ) );
     aParent.TableAt( aStep, m_table );
 
+    // the rounds finished before the step; a round 0 step (none finished) or a lane that kept fewer
+    // rounds than its step's number (a warm lane numbers on from its parent's) takes what there is
     const GRID_STEP& last = steps.back();
-    const size_t     rounds = last.stage == 0 ? (size_t) last.round - 1 : aParent.histByRound.size();
+    const size_t     rounds = last.stage != 0 ? aParent.histByRound.size() : last.round > 0 ? (size_t) last.round - 1 : 0;
 
-    histByRound.assign( aParent.histByRound.begin(), aParent.histByRound.begin() + (long) rounds );
-    heatByRound.assign( aParent.heatByRound.begin(), aParent.heatByRound.begin() + (long) rounds );
+    histByRound.assign( aParent.histByRound.begin(),
+                        aParent.histByRound.begin() + (long) std::min( rounds, aParent.histByRound.size() ) );
+    heatByRound.assign( aParent.heatByRound.begin(),
+                        aParent.heatByRound.begin() + (long) std::min( rounds, aParent.heatByRound.size() ) );
 
     dead.clear();
 

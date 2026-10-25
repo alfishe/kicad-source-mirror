@@ -29,6 +29,7 @@
 #include <wx/dialog.h>
 #include <wx/image.h>
 #include <wx/nonownedwnd.h>
+#include <wx/settings.h>
 #include <wx/window.h>
 #include <wx/msw/registry.h>
 
@@ -201,6 +202,12 @@ bool KIPLATFORM::UI::AllowIconsInMenus()
 bool KIPLATFORM::UI::SupportsKeyState()
 {
     return true;
+}
+
+
+int KIPLATFORM::UI::GetDragThreshold( bool aVertical )
+{
+    return wxSystemSettings::GetMetric( aVertical ? wxSYS_DRAG_Y : wxSYS_DRAG_X );
 }
 
 

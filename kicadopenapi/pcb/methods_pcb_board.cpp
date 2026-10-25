@@ -783,7 +783,11 @@ bool writeCustomRules( const wxString& aPath, const std::string& aText )
 }
 
 
-nlohmann::json rulesJson( BOARD* aBoard )
+// member nets listed per class by default
+constexpr size_t RULES_LIST_CAP = 20;
+
+
+nlohmann::json rulesJson( BOARD* aBoard, const KOPENAPI_LIST_CAP& aCap )
 {
     BOARD_DESIGN_SETTINGS&         bds = aBoard->GetDesignSettings();
     std::shared_ptr<NET_SETTINGS>& net = bds.m_NetSettings;
@@ -847,14 +851,19 @@ nlohmann::json rulesJson( BOARD* aBoard )
     }
 
     for( nlohmann::json& c : classes )
-        c["nets"] = members.count( c["name"] ) ? members[c["name"]] : nlohmann::json::array();
+    {
+        nlohmann::json nets = members.count( c["name"] ) ? members[c["name"]] : nlohmann::json::array();
+        c["net_count"] = nets.size();
+        aCap.Put( c, "nets", std::move( nets ) );
+    }
 
-    return { { "copper_layers", aBoard->GetCopperLayerCount() },
-             { "thickness_mm", toMm( bds.GetBoardThickness() ) },
-             { "constraints", constraints },
-             { "netclasses", classes },
-             { "netclass_patterns", patterns },
-             { "custom_rules", customRules( aBoard ) } };
+    nlohmann::json out = { { "copper_layers", aBoard->GetCopperLayerCount() },
+                           { "thickness_mm", toMm( bds.GetBoardThickness() ) },
+                           { "constraints", constraints },
+                           { "netclasses", classes },
+                           { "custom_rules", customRules( aBoard ) } };
+    aCap.Put( out, "netclass_patterns", std::move( patterns ) );
+    return out;
 }
 
 } // namespace
@@ -867,7 +876,7 @@ static KOPENAPI_RESULT h_pcb_rules_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( !context )
         return KopenapiNoBoard();
 
-    return KOPENAPI_RESULT::Ok( rulesJson( context->GetBoard() ) );
+    return KOPENAPI_RESULT::Ok( rulesJson( context->GetBoard(), KOPENAPI_LIST_CAP( aArgs, RULES_LIST_CAP ) ) );
 }
 
 
@@ -1098,7 +1107,7 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     context->SetContentModified();
 
-    nlohmann::json result = rulesJson( board );
+    nlohmann::json result = rulesJson( board, KOPENAPI_LIST_CAP( aArgs, RULES_LIST_CAP ) );
 
     // values the board's minimums override: KiCad's router and DRC use the larger one
     nlohmann::json warnings = nlohmann::json::array();
@@ -1178,16 +1187,18 @@ KOPENAPI_REGISTER( "pcb_outline_set",
 KOPENAPI_REGISTER( "pcb_rules_get",
                    "Board design rules: copper layer count, thickness, board-wide minimum constraints "
                    "(clearance, track width, via, drill, edge and hole clearances, mm), net classes with "
-                   "their values and member nets, net class pattern assignments, the custom rules (.kicad_dru text)",
-                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_rules_get );
+                   "their values and member nets (net_count; nets capped at list_limit, full: true for all), net class pattern "
+                   "assignments, the custom rules (.kicad_dru text)",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{}})json"_json, RULES_LIST_CAP ), false, h_pcb_rules_get );
 
 KOPENAPI_REGISTER( "pcb_rules_set",
                    "Set board design rules (all or nothing): copper_layers, thickness_mm, constraints {name: "
                    "mm} as listed by pcb_rules_get, netclasses [{name ('Default' edits the default), "
                    "clearance_mm, track_width_mm, via_diameter_mm, via_drill_mm, diff_pair_width_mm, "
                    "diff_pair_gap_mm, nets: [names or patterns like '+*V*', 'GND']}] - e.g. a Power class "
-                   "0.5 mm wide for the rails; custom_rules (KiCad's rule language); answers the rules as now in force",
-                   R"json({"type":"object","properties":{
+                   "0.5 mm wide for the rails; custom_rules (KiCad's rule language); answers the rules as now in force "
+                   "(as pcb_rules_get: member nets capped at list_limit)",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
                         "copper_layers":{"type":"integer"},
                         "thickness_mm":{"type":"number"},
                         "custom_rules":{"type":"string","description":"the project's custom rules (.kicad_dru text, e.g. (version 1) (rule ...)); written at once, refused (422, nothing changed) when it does not compile; \"\" removes them"},
@@ -1197,7 +1208,7 @@ KOPENAPI_REGISTER( "pcb_rules_set",
                             "via_diameter_mm":{"type":"number"},"via_drill_mm":{"type":"number"},
                             "diff_pair_width_mm":{"type":"number"},"diff_pair_gap_mm":{"type":"number"},
                             "nets":{"type":"array","items":{"type":"string"},"description":"the class's nets / patterns: replaces its earlier ones, and the nets leave other classes; [] empties it"},
-                            "delete":{"type":"boolean","description":"remove this class and its net patterns"}}}}}})json"_json,
+                            "delete":{"type":"boolean","description":"remove this class and its net patterns"}}}}}})json"_json, RULES_LIST_CAP ),
                    false, h_pcb_rules_set );
 
 KOPENAPI_MARK_EDITING( "pcb_netlist_apply", "pcb_outline_set", "pcb_rules_set" );
