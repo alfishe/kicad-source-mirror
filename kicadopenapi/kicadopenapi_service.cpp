@@ -2586,6 +2586,54 @@ void KICAD_OPENAPI_SERVICE::Stop()
 }
 
 
+void KICAD_OPENAPI_SERVICE::RequestStop( const std::string& aWhy )
+{
+    nlohmann::json busy = Busy();
+
+    if( busy.is_null() )
+        wxLogMessage( "kicadopenapi: stopping (%s)", aWhy );
+    else
+        wxLogMessage( "kicadopenapi: stopping (%s); asking %s to stop", aWhy, busy.dump() );
+
+    KopenapiStopAll( "the service stops: " + aWhy );
+}
+
+
+nlohmann::json KICAD_OPENAPI_SERVICE::Busy() const
+{
+    if( const std::string job = KOPENAPI_JOBS::Get().Busy(); !job.empty() )
+    {
+        nlohmann::json busy = { { "job", job } };
+
+        if( nlohmann::json progress = KopenapiCallProgress(); !progress.is_null() )
+            busy["progress"] = progress;
+
+        return busy;
+    }
+
+    return m_impl->busyJson();
+}
+
+
+void KICAD_OPENAPI_SERVICE::Abandon()
+{
+    std::error_code ec;
+    fs::path        file = kopenapi::platform::DiscoveryDir()
+                    / ( std::to_string( kopenapi::platform::CurrentPid() ) + ".json" );
+    fs::path        tmp = file;
+
+    tmp += ".tmp";
+    fs::remove( file, ec );
+    fs::remove( tmp, ec );
+}
+
+
+void KICAD_OPENAPI_SERVICE::InstallStopRequestHandler( void ( *aHandler )() )
+{
+    kopenapi::platform::InstallStopRequestHandler( aHandler );
+}
+
+
 bool KICAD_OPENAPI_SERVICE::NoModalUi()
 {
     static const bool agent = std::getenv( "KICAD_OPENAPI_AGENT" ) != nullptr;

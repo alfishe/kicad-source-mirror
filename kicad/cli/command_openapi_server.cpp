@@ -26,15 +26,17 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <thread>
 
 #include <cli/exit_codes.h>
 #include <kicadopenapi_journal.h>
 #include <kicadopenapi_service.h>
 #include <wx/app.h>
 #include <wx/crt.h>
+#include <wx/log.h>
 #include <wx/process.h>
 
 #define ARG_PATH "path"
@@ -46,10 +48,72 @@
 static constexpr std::chrono::milliseconds IDLE_WAIT( 100 );
 
 static std::atomic_bool g_openApiExitRequested{ false };
+static std::atomic_int  g_openApiStopSignals{ 0 };
 
-static void openApiSignalHandler( int )
+static void openApiStopRequested()
 {
+    g_openApiStopSignals.fetch_add( 1 );
     g_openApiExitRequested.store( true );
+}
+
+
+/// How long a stop waits for the running call to reach a safe point (KICAD_OPENAPI_STOP_GRACE_S)
+static std::chrono::milliseconds stopGrace()
+{
+    const char*  env = std::getenv( "KICAD_OPENAPI_STOP_GRACE_S" );
+    const double sec = env ? std::atof( env ) : 0;
+    return std::chrono::milliseconds( static_cast<long long>( ( sec > 0 ? sec : 10 ) * 1000 ) );
+}
+
+
+/// @brief Stop() with a deadline: past the grace period, or on another stop signal, the process
+/// exits without waiting for the call that does not stop (the journal says which)
+static void stopWithin( KICAD_OPENAPI_SERVICE& aService, std::chrono::milliseconds aGrace )
+{
+    std::mutex              mutex;
+    std::condition_variable stoppedCv;
+    bool                    stopped = false;
+    const int               signalsBefore = g_openApiStopSignals.load();
+    const auto              deadline = std::chrono::steady_clock::now() + aGrace;
+
+    std::thread watchdog(
+            [&]()
+            {
+                std::unique_lock<std::mutex> lock( mutex );
+
+                while( !stopped )
+                {
+                    stoppedCv.wait_for( lock, std::chrono::milliseconds( 100 ) );
+
+                    if( stopped )
+                        return;
+
+                    const bool again = g_openApiStopSignals.load() > signalsBefore;
+
+                    if( !again && std::chrono::steady_clock::now() < deadline )
+                        continue;
+
+                    wxLog::SetThreadActiveTarget( KOPENAPI_JOURNAL::ThreadTarget() );
+                    const nlohmann::json busy = aService.Busy();
+                    wxLogError( "kicadopenapi: not stopped %s; exiting without waiting for %s",
+                                again ? "before a second stop request"
+                                      : wxString::Format( "within %.1f s", aGrace.count() / 1000.0 ),
+                                busy.is_null() ? std::string( "the service" ) : busy.dump() );
+                    aService.Abandon();
+                    std::fflush( nullptr );
+                    std::_Exit( CLI::EXIT_CODES::ERR_UNKNOWN );
+                }
+            } );
+
+    aService.Stop();
+
+    {
+        std::lock_guard<std::mutex> lock( mutex );
+        stopped = true;
+    }
+
+    stoppedCv.notify_all();
+    watchdog.join();
 }
 
 
@@ -141,15 +205,10 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
 
     // armed before the service starts: a /shutdown or a signal during the preload below is kept
     g_openApiExitRequested.store( false );
-    auto oldSigInt = std::signal( SIGINT, openApiSignalHandler );
-    auto oldSigTerm = std::signal( SIGTERM, openApiSignalHandler );
+    KICAD_OPENAPI_SERVICE::InstallStopRequestHandler( openApiStopRequested );
 
     if( !service.Start( m_argParser.get<int>( ARG_PORT ) ) )
-    {
-        std::signal( SIGINT, oldSigInt );
-        std::signal( SIGTERM, oldSigTerm );
         return EXIT_CODES::ERR_UNKNOWN;
-    }
 
     // a document given on the command line opens before the first request is served: a board or
     // schematic, or both of a project
@@ -181,8 +240,6 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
         {
             wxFprintf( stderr, _( "Cannot open %s: give a .kicad_pcb, .kicad_sch or .kicad_pro\n" ), preload );
             service.Stop();
-            std::signal( SIGINT, oldSigInt );
-            std::signal( SIGTERM, oldSigTerm );
             return EXIT_CODES::ERR_ARGS;
         }
 
@@ -214,18 +271,24 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
     std::printf( "kicadopenapi headless server listening at http://127.0.0.1:%d\n", service.Port() );
     std::fflush( stdout );
 
+    std::string why = "shutdown request";
+
     while( !g_openApiExitRequested.load() )
     {
         wxTheApp->ProcessPendingEvents();
         waker.WaitForWork();
 
         if( parentPid > 0 && !wxProcess::Exists( parentPid ) )
+        {
+            why = "parent process ended";
             break;
+        }
     }
 
-    std::signal( SIGINT, oldSigInt );
-    std::signal( SIGTERM, oldSigTerm );
+    if( g_openApiStopSignals.load() > 0 )
+        why = "stop signal";
 
-    service.Stop();
+    service.RequestStop( why );
+    stopWithin( service, stopGrace() );
     return EXIT_CODES::OK;
 }

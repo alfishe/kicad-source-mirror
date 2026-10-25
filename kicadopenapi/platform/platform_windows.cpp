@@ -194,6 +194,29 @@ void InstallTerminationHandlerWindows(void (*handler)())
     SetConsoleCtrlHandler(onConsoleControl, TRUE);
 }
 
+static void (*s_stopRequestHandler)() = nullptr;
+
+static BOOL WINAPI onConsoleStop(DWORD event)
+{
+    if (s_stopRequestHandler)
+    {
+        s_stopRequestHandler();
+    }
+
+    if (event == CTRL_CLOSE_EVENT || event == CTRL_LOGOFF_EVENT || event == CTRL_SHUTDOWN_EVENT)
+    {
+        // returning ends the process at once: wait here until the host has stopped and exits
+        Sleep(INFINITE);
+    }
+    return TRUE;
+}
+
+void InstallStopRequestHandlerWindows(void (*handler)())
+{
+    s_stopRequestHandler = handler;
+    SetConsoleCtrlHandler(onConsoleStop, TRUE);
+}
+
 PipeProcess SpawnWithStdinPipeWindows(const std::vector<std::string>& argv, const std::filesystem::path& logFile,
                                       std::string& error)
 {

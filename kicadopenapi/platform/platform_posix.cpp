@@ -178,6 +178,33 @@ void InstallTerminationHandlerPosix(void (*handler)())
     std::signal(SIGHUP, kopenapiOnTerminationSignal);
 }
 
+static void (*s_stopRequestHandler)() = nullptr;
+
+extern "C" void kopenapiOnStopSignal(int)
+{
+    if (s_stopRequestHandler)
+    {
+        s_stopRequestHandler();
+    }
+}
+
+void InstallStopRequestHandlerPosix(void (*handler)())
+{
+    s_stopRequestHandler = handler;
+
+    struct sigaction action{};
+    action.sa_handler = kopenapiOnStopSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+
+    for (int sig : {SIGINT, SIGTERM, SIGHUP})
+    {
+        sigaction(sig, &action, nullptr);
+    }
+
+    std::signal(SIGPIPE, SIG_IGN);
+}
+
 PipeProcess SpawnWithStdinPipePosix(const std::vector<std::string>& argv, const std::filesystem::path& logFile,
                                     std::string& error)
 {
