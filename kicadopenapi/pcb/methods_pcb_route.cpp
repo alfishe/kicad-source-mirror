@@ -29,6 +29,7 @@
 #include <project/net_settings.h>
 #include <geometry/shape_circle.h>
 #include <geometry/shape_segment.h>
+#include <connectivity/connectivity_algo.h>
 #include <connectivity/connectivity_data.h>
 #include <ratsnest/ratsnest_data.h>
 #include <footprint.h>
@@ -8240,6 +8241,137 @@ static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 }
 
 
+/// @brief Copper of one net as a graph of board items (pads, tracks, vias, zones) by what
+/// connectivity says touches what
+class NET_COPPER_GRAPH
+{
+public:
+    NET_COPPER_GRAPH( BOARD* aBoard, int aNetCode )
+    {
+        std::shared_ptr<CONNECTIVITY_DATA>    conn = aBoard->GetConnectivity();
+        std::shared_ptr<CN_CONNECTIVITY_ALGO> algo = conn ? conn->GetConnectivityAlgo() : nullptr;
+
+        if( !algo )
+            return;
+
+        for( BOARD_CONNECTED_ITEM* item : conn->GetNetItems( aNetCode, { PCB_PAD_T, PCB_TRACE_T, PCB_ARC_T, PCB_VIA_T, PCB_ZONE_T } ) )
+        {
+            m_next[item];
+
+            if( item->Type() == PCB_PAD_T )
+                m_pads.push_back( static_cast<PAD*>( item ) );
+
+            if( !algo->ItemExists( item ) )
+                continue;
+
+            for( CN_ITEM* cn : algo->ItemEntry( item ).GetItems() )
+            {
+                for( CN_ITEM* other : cn->ConnectedItems() )
+                {
+                    if( other->Valid() && other->Parent() != item && other->Parent()->GetNetCode() == aNetCode )
+                        m_next[item].insert( other->Parent() );
+                }
+            }
+        }
+    }
+
+    const std::vector<PAD*>& Pads() const { return m_pads; }
+
+    /// @brief Component id of every item when aGone are taken out (gone items get -1)
+    std::map<const BOARD_CONNECTED_ITEM*, int> Components( const std::set<const BOARD_CONNECTED_ITEM*>& aGone ) const
+    {
+        std::map<const BOARD_CONNECTED_ITEM*, int> id;
+        int                                        next = 0;
+
+        for( const auto& [start, unused] : m_next )
+        {
+            if( aGone.count( start ) )
+            {
+                id[start] = -1;
+                continue;
+            }
+
+            if( id.count( start ) )
+                continue;
+
+            std::deque<const BOARD_CONNECTED_ITEM*> queue{ start };
+            id[start] = next;
+
+            while( !queue.empty() )
+            {
+                const BOARD_CONNECTED_ITEM* at = queue.front();
+                queue.pop_front();
+
+                for( const BOARD_CONNECTED_ITEM* n : m_next.at( at ) )
+                {
+                    if( !aGone.count( n ) && !id.count( n ) )
+                    {
+                        id[n] = next;
+                        queue.push_back( n );
+                    }
+                }
+            }
+
+            next++;
+        }
+
+        return id;
+    }
+
+    /// @brief Pads that touch copper (tracks, vias, zones) now and touch none once aGone are taken out
+    std::vector<PAD*> PadsCut( const std::set<const BOARD_CONNECTED_ITEM*>& aGone ) const
+    {
+        std::vector<PAD*> out;
+
+        for( PAD* pad : m_pads )
+        {
+            int copper = 0, left = 0;
+
+            for( const BOARD_CONNECTED_ITEM* n : m_next.at( pad ) )
+            {
+                if( n->Type() == PCB_PAD_T )
+                    continue;
+
+                copper++;
+                left += !aGone.count( n );
+            }
+
+            if( copper > 0 && left == 0 )
+                out.push_back( pad );
+        }
+
+        return out;
+    }
+
+    /// @brief Do the pads other than aSkip stay joined as they are when aGone are taken out
+    bool OthersKeepJoined( const std::set<const BOARD_CONNECTED_ITEM*>& aGone, const std::set<const PAD*>& aSkip ) const
+    {
+        const std::map<const BOARD_CONNECTED_ITEM*, int> before = Components( {} );
+        const std::map<const BOARD_CONNECTED_ITEM*, int> after = Components( aGone );
+        std::map<int, int>                               mapped;   ///< component before -> after
+
+        for( const PAD* pad : m_pads )
+        {
+            if( aSkip.count( pad ) )
+                continue;
+
+            const int b = before.at( pad ), a = after.at( pad );
+
+            if( auto it = mapped.find( b ); it == mapped.end() )
+                mapped[b] = a;
+            else if( it->second != a )
+                return false;
+        }
+
+        return true;
+    }
+
+private:
+    std::map<const BOARD_CONNECTED_ITEM*, std::set<const BOARD_CONNECTED_ITEM*>> m_next;
+    std::vector<PAD*>                                                          m_pads;
+};
+
+
 static KOPENAPI_RESULT h_pcb_tracks_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -8257,6 +8389,42 @@ static KOPENAPI_RESULT h_pcb_tracks_delete( KOPENAPI_CONTEXT& aCtx, const nlohma
 
     if( error )
         return *error;
+
+    board->BuildConnectivity();
+    board->GetConnectivity()->RecalculateRatsnest();   // the item links the graphs below read
+
+    // between: only the copper the two pads use alone; what other pads of the net need stays
+    std::set<const PAD*> betweenPads;
+    nlohmann::json       keptShared = nlohmann::json::array();
+
+    if( aArgs.contains( "between" ) && !aArgs.contains( "uuids" ) && !selected.empty() )
+    {
+        const nlohmann::json& b = aArgs["between"];
+        PAD*                  a = *findPad( board, b[0].get<std::string>() );
+        PAD*                  z = *findPad( board, b[1].get<std::string>(), a, a );
+        NET_COPPER_GRAPH      graph( board, a->GetNetCode() );
+        std::set<const BOARD_CONNECTED_ITEM*> gone;
+        std::vector<PCB_TRACK*>               exclusive;
+
+        betweenPads = { a, z };
+
+        for( PCB_TRACK* track : selected )
+        {
+            gone.insert( track );
+
+            if( graph.OthersKeepJoined( gone, betweenPads ) )
+            {
+                exclusive.push_back( track );
+            }
+            else
+            {
+                gone.erase( track );
+                keptShared.push_back( str( track->m_Uuid.AsString() ) );
+            }
+        }
+
+        selected = std::move( exclusive );
+    }
 
     const bool               overrideLocks = aArgs.value( "override_locks", false );
     const bool               dryRun = aArgs.value( "dry_run", false );
@@ -8354,12 +8522,56 @@ static KOPENAPI_RESULT h_pcb_tracks_delete( KOPENAPI_CONTEXT& aCtx, const nlohma
     if( cut )
         out["cut"] = cutCount;
 
+    if( aArgs.contains( "between" ) && !aArgs.contains( "uuids" ) )
+    {
+        out["kept_shared_count"] = keptShared.size();
+        cap.Put( out, "kept_shared", keptShared );
+    }
+
+    // pads left with no copper of their net that had some (a via over a neighbouring pad of the
+    // net is that pad's copper too); the pads of between are meant to lose theirs
+    nlohmann::json padsCut = nlohmann::json::array();
+
+    if( !doomed.empty() && !cut )
+    {
+        std::set<const BOARD_CONNECTED_ITEM*> gone( doomed.begin(), doomed.end() );
+        std::set<int>                         netCodes;
+
+        for( PCB_TRACK* track : doomed )
+            netCodes.insert( track->GetNetCode() );
+
+        for( int code : netCodes )
+        {
+            if( code <= 0 )
+                continue;
+
+            for( PAD* pad : NET_COPPER_GRAPH( board, code ).PadsCut( gone ) )
+            {
+                if( !betweenPads.count( pad ) )
+                    padsCut.push_back( str( pad->GetParentFootprint()->GetReference() ) + "." + str( pad->GetNumber() ) );
+            }
+        }
+    }
+
+    out["pads_cut_count"] = padsCut.size();
+    cap.Put( out, "pads_cut", padsCut );
+
     if( doomed.empty() )
     {
         out["reason"] = !locked.empty() ? "everything selected is locked (override_locks: true)"
+                        : !keptShared.empty() ? "the copper joining these two pads is shared with other pads of the net "
+                                                "(kept_shared): delete between one of them and the pad it serves"
                         : aArgs.contains( "between" ) ? "no copper joins these two pads"
                                                       : "nothing matches";
         return KOPENAPI_RESULT::Ok( out );
+    }
+
+    if( !padsCut.empty() && aArgs.value( "keep_pads", false ) )
+    {
+        KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 409, "the deletion would leave pads with no copper of their net that "
+                                                               "have some now (pads_cut); nothing deleted" );
+        refused.body["pads_cut"] = padsCut;
+        return refused;
     }
 
     {
@@ -8662,12 +8874,17 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
         STEP step{ VECTOR2I( pcbIUScale.mmToIU( at[0].get<double>() ), pcbIUScale.mmToIU( at[1].get<double>() ) ), std::nullopt };
 
-        if( p.is_object() && p.contains( "via" ) )
+        if( p.is_object() && ( p.contains( "via" ) || p.contains( "layer" ) ) )
         {
-            step.via = p["via"].is_string() ? parseLayer( board, p["via"].get<std::string>() ) : std::nullopt;
+            const nlohmann::json& name = p.contains( "via" ) ? p["via"] : p["layer"];
+
+            if( p.contains( "via" ) && p.contains( "layer" ) && p["via"] != p["layer"] )
+                return KOPENAPI_RESULT::Error( 400, "points: via and layer name the same thing (the layer the track continues on); give one" );
+
+            step.via = name.is_string() ? parseLayer( board, name.get<std::string>() ) : std::nullopt;
 
             if( !step.via )
-                return KOPENAPI_RESULT::Error( 400, "points: via is an enabled copper layer" );
+                return KOPENAPI_RESULT::Error( 400, "points: via is the enabled copper layer the track continues on, e.g. {at: [x_mm, y_mm], via: \"B.Cu\"}" );
         }
 
         steps.push_back( step );
@@ -10376,12 +10593,14 @@ KOPENAPI_REGISTER( "pcb_track_list",
 
 KOPENAPI_REGISTER( "pcb_tracks_delete",
                    "Remove tracks and vias in one undo step: by uuids, or the ones passing every filter given - "
-                   "net / nets (unroute them), between two pads (undo one connection: the copper joining them), "
-                   "region, layer, kinds. Pads, zones and footprints are never touched; locked copper is kept "
-                   "(override_locks). dry_run tells what would go. Answers counts (tracks, vias, length), per net "
-                   "(most first) and per layer, the box, the first uuids (list_limit, full: true for all) and the "
-                   "connections now open (unrouted); route again with pcb_route / pcb_route_connection / "
-                   "pcb_track_add",
+                   "net / nets (unroute them), between two pads (undo one connection: the copper joining them that "
+                   "no other pad of the net needs; the shared rest stays, kept_shared), region, layer, kinds. Pads, "
+                   "zones and footprints are never touched; locked copper is kept (override_locks). dry_run tells "
+                   "what would go. Answers counts (tracks, vias, length), per net (most first) and per layer, the "
+                   "box, the first uuids (list_limit, full: true for all), pads_cut (pads that touch copper of "
+                   "their net now and would touch none, e.g. a via sitting on a neighbouring pad; keep_pads: true "
+                   "refuses then, 409) and the connections now open (unrouted); route again with pcb_route / "
+                   "pcb_route_connection / pcb_track_add",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
                         "uuids":{"type":"array","items":{"type":"string"},"description":"exactly these (pcb_track_list); the filters below are ignored"},
                         "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
@@ -10393,6 +10612,7 @@ KOPENAPI_REGISTER( "pcb_tracks_delete",
                         "kinds":{"type":"array","items":{"type":"string","enum":["track","via"]}},
                         "refill_zones":{"type":"boolean","default":false},
                         "override_locks":{"type":"boolean","default":false},
+                        "keep_pads":{"type":"boolean","default":false,"description":"refuse (409, nothing deleted) when a pad would lose all copper of its net (pads_cut); the pads of between excepted"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json ),
                    false, h_pcb_tracks_delete, 300 );
 
@@ -10426,7 +10646,7 @@ KOPENAPI_REGISTER( "pcb_track_add",
                         "from":{"type":"string","description":"REF.PAD: start at its centre, on its net"},
                         "to":{"type":"string","description":"REF.PAD of the same net: end at its centre"},
                         "net":{"type":"string","description":"needed without 'from'"},
-                        "points":{"type":"array","description":"[x_mm, y_mm] or {at: [x_mm, y_mm], via: 'B.Cu'}","items":{}},
+                        "points":{"type":"array","description":"[x_mm, y_mm] (a corner), or {at: [x_mm, y_mm], via: 'B.Cu'}: a through via there and the track continues on that layer ('layer' is the same key, as in pcb_route waypoints)","items":{"oneOf":[{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},{"type":"object","required":["at"],"properties":{"at":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"via":{"description":"copper layer to continue on, e.g. B.Cu"},"layer":{"description":"the same as via"}}}]}},
                         "layer":{"type":"string","description":"start layer; default F.Cu (B.Cu from a bottom SMD pad)"},
                         "width_mm":{"type":"number"},
                         "via_diameter_mm":{"type":"number","description":"via size of this call (default the net class's)"},"via_drill_mm":{"type":"number"},
