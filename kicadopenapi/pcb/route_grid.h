@@ -35,7 +35,7 @@ struct GRID_VARIANT_PROGRESS
     int         crowded = 0;
     int         net = 0;    ///< nets taken in this stage (of nets)
     int         nets = 0;
-    long        expanded = 0;
+    int64_t     expanded = 0;
 };
 
 /// @brief How one variant searches: net order, layer directions, negotiation schedule, A* weight
@@ -164,7 +164,7 @@ struct GRID_RESULT
     int                          rounds = 0;
     int                          conflictsLeft = 0;   ///< nets dropped to make the rest legal
     int                          cell = 0;
-    long                         expanded = 0;
+    int64_t                      expanded = 0;
     double                       buildMs = 0;
     double                       routeMs = 0;
     int                          halfCellTried = 0;   ///< walled fine-pitch ends tried on the half-cell lattice
@@ -188,19 +188,19 @@ struct GRID_RESULT
     /// @brief Per variant tried: when it finished, its search states per stage, ends joined, vias
     struct VARIANT_STATS
     {
-        std::string       name;
-        double            ms = 0;
-        std::vector<long> expandedByStage;
-        long              reached = 0;
-        long              vias = 0;
-        bool              abandoned = false;
+        std::string          name;
+        double               ms = 0;
+        std::vector<int64_t> expandedByStage;
+        long                 reached = 0;
+        long                 vias = 0;
+        bool                 abandoned = false;
     };
 
     std::vector<VARIANT_STATS> variantStats;
     std::vector<int>             crowdedByRound;   ///< the winner's nets still crowded after each round
     std::vector<CROWDING>        crowdedAtEnd;     ///< still crowded when its rounds ended
-    std::vector<long>            expandedByStage;   ///< the winner's: rounds, legalising, the short again, fewer vias
-    std::vector<std::pair<int, long>> costliest;   ///< the winner's nets that took the most search states
+    std::vector<int64_t>         expandedByStage;   ///< the winner's: rounds, legalising, the short again, fewer vias
+    std::vector<std::pair<int, int64_t>> costliest;   ///< the winner's nets that took the most search states
     std::shared_ptr<GRID_TIMELINE>    timeline;    ///< with GRID_PARAMS::record: every variant's steps
 };
 

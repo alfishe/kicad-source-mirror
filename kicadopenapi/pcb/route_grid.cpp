@@ -64,6 +64,12 @@ constexpr double TILE_MM = 1.0;
 constexpr float  GUIDE_OPEN = 0.05f;
 constexpr int    GUIDE_SPAN = 4;
 
+// a search toward more ends than this finds the nearest through buckets of cells
+constexpr size_t END_BUCKETS_FROM = 256;
+
+// the guides one variant keeps (recomputed when dropped: the same values)
+constexpr size_t GUIDE_CACHE_BYTES = 128u << 20;
+
 // an end whose free cells run out within this many states is in a pocket of fixed copper
 constexpr size_t POCKET_STATES = 20000;
 
@@ -2087,9 +2093,9 @@ public:
     int                           Round() const { return m_round; }
     int                           Conflicting() const { return m_conflicting; }
     int                           Dropped() const { return m_dropped; }
-    long                          Expanded() const { return m_expanded; }
-    const std::vector<long>&      ExpandedBy() const { return m_expandedBy; }
-    const std::vector<long>&      ExpandedByStage() const { return m_byStage; }
+    int64_t                       Expanded() const { return m_expanded; }
+    const std::vector<int64_t>&   ExpandedBy() const { return m_expandedBy; }
+    const std::vector<int64_t>&   ExpandedByStage() const { return m_byStage; }
     const std::vector<int>&       ByRound() const { return m_byRound; }
     const std::vector<CROWDING>&  Crowded() const { return m_crowded; }
 
@@ -2991,7 +2997,7 @@ private:
 
     void route( int aNet, float aPf, bool aHard )
     {
-        const long before = m_expanded;
+        const int64_t before = m_expanded;
 
         if( replaying() )
             takeRecorded( aNet );
@@ -3290,6 +3296,14 @@ private:
             out[n] = (uint16_t) std::min( d, 65535.0f );
         }
 
+        // a net of hundreds of ends makes a guide per search: the cache stays within its budget
+        if( m_guideBytes + out.size() * sizeof( uint16_t ) > GUIDE_CACHE_BYTES )
+        {
+            m_guides.clear();
+            m_guideBytes = 0;
+        }
+
+        m_guideBytes += out.size() * sizeof( uint16_t );
         return m_guides.emplace( std::move( key ), std::move( out ) ).first->second;
     }
 
@@ -3429,16 +3443,60 @@ private:
                 m_box = { std::min( m_box[0], x0 ), std::min( m_box[1], y0 ), std::max( m_box[2], x1 ), std::max( m_box[3], y1 ) };
         }
 
+        auto boxDistance = [&]( int e, int x, int y )
+        {
+            const auto& b = wn.endBox[e];
+            const int   dx = std::max( { b[0] - x, 0, x - b[2] } );
+            const int   dy = std::max( { b[1] - y, 0, y - b[3] } );
+            return 10 * std::max( dx, dy ) + 4 * std::min( dx, dy );
+        };
+
+        // many ends: looked up by buckets of cells, nearest rings first (the same minimum)
+        const bool bucketed = aLeft.size() > END_BUCKETS_FROM;
+
+        if( bucketed )
+            m_endIndex.Build( wn.endBox, aLeft, g.nx, g.ny );
+
         auto h = [&]( int x, int y, int l )
         {
             int best = INT_MAX;
 
-            for( int e : aLeft )
+            if( bucketed )
             {
-                const auto& b = wn.endBox[e];
-                const int   dx = std::max( { b[0] - x, 0, x - b[2] } );
-                const int   dy = std::max( { b[1] - y, 0, y - b[3] } );
-                best = std::min( best, 10 * std::max( dx, dy ) + 4 * std::min( dx, dy ) );
+                const END_INDEX& ix = m_endIndex;
+                const int        bx = x / ix.B, by = y / ix.B;
+                const int        rings = std::max( ix.nx, ix.ny );
+
+                for( int r = 0; r <= rings; ++r )
+                {
+                    // a box in ring r is at least (r - 1) * B + 1 cells away on one axis
+                    if( r > 0 && best <= 10 * ( ( r - 1 ) * ix.B + 1 ) )
+                        break;
+
+                    for( int cy = by - r; cy <= by + r; ++cy )
+                    {
+                        if( cy < 0 || cy >= ix.ny )
+                            continue;
+
+                        const bool edgeRow = cy == by - r || cy == by + r;
+
+                        for( int cx = bx - r; cx <= bx + r; cx += ( edgeRow || r == 0 ) ? 1 : 2 * r )
+                        {
+                            if( cx < 0 || cx >= ix.nx )
+                                continue;
+
+                            const size_t c = (size_t) cy * ix.nx + cx;
+
+                            for( int q = ix.start[c]; q < ix.start[c + 1]; ++q )
+                                best = std::min( best, boxDistance( ix.items[q], x, y ) );
+                        }
+                    }
+                }
+            }
+            else
+            {
+                for( int e : aLeft )
+                    best = std::min( best, boxDistance( e, x, y ) );
             }
 
             if( m_guide )
@@ -3465,8 +3523,8 @@ private:
             open.push( { h( x, y, (int) ( s / cells ) ), 0, s } );
         }
 
-        const long budget = 4L * ( x1 - x0 + 1 ) * ( y1 - y0 + 1 ) * L;
-        long       taken = 0;
+        const int64_t budget = 4LL * ( x1 - x0 + 1 ) * ( y1 - y0 + 1 ) * L;
+        int64_t       taken = 0;
         m_overBudget = false;
         m_hitEdge = false;
 
@@ -3648,6 +3706,47 @@ private:
         int32_t  parent = -1;
     };
 
+    /// @brief The ends left of a search by buckets of B x B cells (each end in every bucket its box meets)
+    struct END_INDEX
+    {
+        static constexpr int B = 32;
+
+        int              nx = 0, ny = 0;
+        std::vector<int> start;   ///< per bucket: its first item; one more at the end
+        std::vector<int> items;
+
+        void Build( const std::vector<std::array<int, 4>>& aBoxes, const std::vector<int>& aEnds, int aCellsX, int aCellsY )
+        {
+            nx = ( aCellsX + B - 1 ) / B;
+            ny = ( aCellsY + B - 1 ) / B;
+            start.assign( (size_t) nx * ny + 1, 0 );
+
+            auto each = [&]( int aEnd, auto&& aFn )
+            {
+                const auto& b = aBoxes[aEnd];
+
+                for( int cy = std::max( 0, b[1] / B ); cy <= std::min( ny - 1, b[3] / B ); ++cy )
+                {
+                    for( int cx = std::max( 0, b[0] / B ); cx <= std::min( nx - 1, b[2] / B ); ++cx )
+                        aFn( (size_t) cy * nx + cx );
+                }
+            };
+
+            for( int e : aEnds )
+                each( e, [&]( size_t c ) { start[c + 1]++; } );
+
+            for( size_t c = 0; c + 1 < start.size(); ++c )
+                start[c + 1] += start[c];
+
+            items.assign( start.back(), 0 );
+            std::vector<int> fill( start.begin(), start.end() - 1 );
+
+            for( int e : aEnds )
+                each( e, [&]( size_t c ) { items[fill[c]++] = e; } );
+        }
+    };
+
+    END_INDEX             m_endIndex;
     std::vector<NODE>     m_node;
     std::vector<bool>     m_flooded;      ///< reachable(): states reached
     std::vector<uint32_t> m_floodQueue;
@@ -3709,15 +3808,16 @@ private:
     std::atomic<bool>      m_abandoned{ false };
     std::atomic<int>       m_taken{ 0 };
     std::atomic<int>       m_takenOf{ 0 };
-    std::atomic<long>      m_expandedShown{ 0 };
+    std::atomic<int64_t>   m_expandedShown{ 0 };
     int                    m_dropped = 0;
     std::vector<int>       m_byRound;   ///< nets still crowded after each round
-    std::vector<long>      m_expandedBy;   ///< search states per net, all rounds
+    std::vector<int64_t>   m_expandedBy;   ///< search states per net, all rounds
     std::map<std::vector<int>, std::vector<uint16_t>> m_guides;   ///< per end set, via scale, net
+    size_t                                            m_guideBytes = 0;
     const std::vector<uint16_t>*                      m_guide = nullptr;
-    std::vector<long>      m_byStage;      ///< search states: rounds, legalising, the short again, fewer vias
+    std::vector<int64_t>   m_byStage;      ///< search states: rounds, legalising, the short again, fewer vias
     std::vector<CROWDING>  m_crowded;   ///< nets still crowded when the rounds ended
-    long                   m_expanded = 0;
+    int64_t                m_expanded = 0;
 
     const GRID_TIMELINE*   m_timeline = nullptr;
     GRID_LANE*             m_lane = nullptr;
