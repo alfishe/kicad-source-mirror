@@ -8714,6 +8714,7 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     };
 
     std::vector<PAD_STUB> padStubs;
+    std::map<const PCB_TRACK*, size_t> pieceOf;   ///< the pieces a segment was cut into at its pad stubs
 
     auto dropVia = [&]( const VECTOR2I& aAt )
     {
@@ -8745,27 +8746,59 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     {
         if( steps[i].at != steps[i - 1].at )
         {
-            auto track = std::make_unique<PCB_TRACK>( board );
-            track->SetStart( steps[i - 1].at );
-            track->SetEnd( steps[i].at );
-            track->SetWidth( width );
-            track->SetLayer( layer );
-            track->SetNet( net );
-            length += track->GetLength();
+            const VECTOR2I a = steps[i - 1].at;
+            const VECTOR2I b = steps[i].at;
+            PAD*           startPad = i == 1 && fromPad && !steps[0].via && !widthGiven ? fromPad : nullptr;
+            PAD*           endPad = i + 1 == steps.size() && toPad && !widthGiven ? toPad : nullptr;
 
-            PAD* endPad = i == 1 && fromPad && !steps[0].via ? fromPad
-                          : i + 1 == steps.size() && toPad   ? toPad
-                                                             : nullptr;
-
-            if( endPad && !widthGiven )
+            // only the stub that leaves a pad may neck: the rest of a long segment keeps the width
+            auto reach = [&]( PAD* aPad )
             {
-                const STUB_NECK neck = padNeck( board, endPad, width, layer );
-                track->SetWidth( neck.width );
-                padStubs.push_back( { track.get(), endPad, neck.why } );
-            }
+                const int clearance = netclass && netclass->HasClearance() ? netclass->GetClearance() : 0;
+                return KiROUND( aPad->GetBoundingBox().GetSize().EuclideanNorm() / 2.0 ) + 2 * std::max( width, clearance );
+            };
 
-            changed.push_back( track.get() );
-            made.push_back( std::move( track ) );
+            const double   span = ( b - a ).EuclideanNorm();
+            const VECTOR2I dir = b - a;
+
+            if( startPad && endPad && reach( startPad ) + reach( endPad ) >= span )
+                endPad = nullptr;
+
+            // the part between the stubs: [from, to]
+            const VECTOR2I from = !startPad ? a : reach( startPad ) < span ? a + dir.Resize( reach( startPad ) ) : b;
+            const VECTOR2I to = !endPad ? b : reach( endPad ) < span ? b - dir.Resize( reach( endPad ) ) : a;
+
+            auto addTrack = [&]( const VECTOR2I& aStart, const VECTOR2I& aEnd, PAD* aStubPad )
+            {
+                auto track = std::make_unique<PCB_TRACK>( board );
+                track->SetStart( aStart );
+                track->SetEnd( aEnd );
+                track->SetWidth( width );
+                track->SetLayer( layer );
+                track->SetNet( net );
+
+                if( aStubPad )
+                {
+                    const STUB_NECK neck = padNeck( board, aStubPad, width, layer );
+                    track->SetWidth( neck.width );
+                    padStubs.push_back( { track.get(), aStubPad, neck.why } );
+                }
+
+                pieceOf[track.get()] = i;
+                changed.push_back( track.get() );
+                made.push_back( std::move( track ) );
+            };
+
+            length += span;
+
+            if( startPad )
+                addTrack( a, from, startPad );
+
+            if( from != to )
+                addTrack( from, to, nullptr );
+
+            if( endPad )
+                addTrack( to, b, endPad );
         }
 
         if( steps[i].via && *steps[i].via != layer )
@@ -8815,6 +8848,33 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
 
         violations = guard( board, changed, {}, zoneMode == "refill" );
+    }
+
+    // a stub that kept the full width joins the rest of its segment again
+    for( size_t k = 1; k < made.size(); )
+    {
+        PCB_TRACK* prev = made[k - 1].get();
+        PCB_TRACK* cur = made[k].get();
+
+        if( pieceOf.count( prev ) && pieceOf.count( cur ) && pieceOf[prev] == pieceOf[cur] && prev->GetEnd() == cur->GetStart()
+            && prev->GetLayer() == cur->GetLayer() && prev->GetWidth() == cur->GetWidth()
+            && SEG( prev->GetStart(), cur->GetEnd() ).LineDistance( prev->GetEnd() ) <= 2
+            && ( prev->GetEnd() - prev->GetStart() ).Dot( cur->GetEnd() - cur->GetStart() ) > 0 )
+        {
+            prev->SetEnd( cur->GetEnd() );
+
+            for( PAD_STUB& stub : padStubs )
+            {
+                if( stub.track == cur )
+                    stub.track = prev;
+            }
+
+            changed.erase( std::remove( changed.begin(), changed.end(), cur ), changed.end() );
+            made.erase( made.begin() + k );
+            continue;
+        }
+
+        k++;
     }
 
     nlohmann::json necked = nlohmann::json::array();
