@@ -21,6 +21,7 @@
 
 #include <kicadopenapi_args.h>
 #include <kicadopenapi_call_ticket.h>
+#include <kicadopenapi_registry.h>
 #include <kicadopenapi_undo.h>
 #include <kicadopenapi_util.h>
 #include <undo_redo_container.h>
@@ -323,6 +324,18 @@ BOOST_AUTO_TEST_CASE( ArgsFormatsAreNotChecked )
                                               "properties":{"path":{"type":"string","format":"uri"}}})json"_json;
 
     BOOST_CHECK_EQUAL( KopenapiValidateArgs( "t_format", withFormat, { { "path", "/not a uri" } } ), "" );
+}
+
+
+BOOST_AUTO_TEST_CASE( ConcurrentReadMarks )
+{
+    KOPENAPI_REGISTRY::MarkConcurrentReads( { "qa_read_only", "qa_read_and_edit" } );
+    KOPENAPI_REGISTRY::MarkEditing( { "qa_read_and_edit" } );
+
+    const KOPENAPI_REGISTRY& reg = KOPENAPI_REGISTRY::Get();
+    BOOST_CHECK( reg.IsConcurrentRead( "qa_read_only" ) );
+    BOOST_CHECK( !reg.IsConcurrentRead( "qa_read_and_edit" ) );
+    BOOST_CHECK( !reg.IsConcurrentRead( "qa_unmarked" ) );
 }
 
 

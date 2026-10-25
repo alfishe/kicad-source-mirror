@@ -65,3 +65,5 @@ KOPENAPI_REGISTER( "pcb_query",
                         "explain":{"oneOf":[{"type":"boolean"},{"type":"string","enum":["misses"]}],"default":false},
                         "deadline_ms":{"type":"number","description":"stop the scan after this time (answer 504)"}}})json"_json,
                    false, h_pcb_query );
+
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_query" );

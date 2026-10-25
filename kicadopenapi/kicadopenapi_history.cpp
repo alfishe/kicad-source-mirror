@@ -300,6 +300,12 @@ void KOPENAPI_HISTORY::AfterEdit( KOPENAPI_CONTEXT& aCtx, const KOPENAPI_RESULT&
 {
     IMPL* d = impl();
 
+    for( const auto& [domain, history] : KOPENAPI_REGISTRY::Get().DocumentHistories() )
+    {
+        if( history.afterEdit )
+            history.afterEdit( aCtx );
+    }
+
     if( !d->pending )
         return;
 
@@ -670,6 +676,10 @@ static KOPENAPI_RESULT h_checkpoint_list( KOPENAPI_CONTEXT&, const nlohmann::jso
 
 static KOPENAPI_RESULT h_rollback( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
+    if( const std::string job = KOPENAPI_JOBS::Get().Busy(); !job.empty() )
+        return KOPENAPI_RESULT::Error( 409, "job " + job + " is queued or running and owns the documents: "
+                                            "job_get waits for it, job_cancel stops it" );
+
     return KOPENAPI_HISTORY::Get().Rollback( aCtx, aArgs );
 }
 

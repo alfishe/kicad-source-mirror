@@ -104,6 +104,7 @@
 #include "cli/command_gerber_diff.h"
 #include "cli/command_api_server.h"
 #include "cli/command_openapi_server.h"
+#include "cli/command_openapi_run.h"
 #include "cli/command_version.h"
 #include "cli/exit_codes.h"
 
@@ -230,6 +231,7 @@ static CLI::GERBER_DIFF_COMMAND        gerberDiffCmd{};
 static CLI::VERSION_COMMAND            versionCmd{};
 static CLI::API_SERVER_COMMAND         apiServerCmd{};
 static CLI::OPENAPI_SERVER_COMMAND     openApiServerCmd{};
+static CLI::OPENAPI_RUN_COMMAND        openApiRunCmd{};
 
 // clang-format off
 static std::vector<COMMAND_ENTRY> commandStack = {
@@ -396,6 +398,9 @@ static std::vector<COMMAND_ENTRY> commandStack = {
     },
     {
         &openApiServerCmd,
+    },
+    {
+        &openApiRunCmd,
     }
 };
 // clang-format on

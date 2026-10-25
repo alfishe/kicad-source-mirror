@@ -23,6 +23,8 @@
 
 #include <kicommon.h>
 
+#include <kicadopenapi_registry.h>
+
 class KIWAY;
 
 
@@ -46,6 +48,15 @@ public:
     /// for the main thread, so an idle loop can wake at once instead of polling.
     /// Set before Start().
     void SetMainLoopWaker( std::function<void()> aWaker );
+
+    /// @brief Runs aFn where API calls run (the main thread in GUI, the owner strand headless)
+    /// and waits for it; the host's own document work (opening what it was started with) goes
+    /// through it.  Rethrows what aFn throws.
+    void RunOnOwner( const std::function<void()>& aFn );
+
+    /// @brief One call the way POST /api/v1/{aName} runs it (jobs, leases, journal); any thread but
+    /// the main thread of a GUI process.  The batch runner (kicad-cli openapi-run) uses it
+    KOPENAPI_RESULT Invoke( const std::string& aName, const nlohmann::json& aArgs );
 
     /// @brief Enables POST /api/v1/shutdown (headless host only; GUI processes are never shut down
     /// over HTTP).  The handler runs on an HTTP worker and must only signal the host.

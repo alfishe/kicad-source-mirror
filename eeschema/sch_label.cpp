@@ -20,6 +20,7 @@
  */
 
 #include <connectivity/conn_presentation.h>
+#include <model_thread.h>
 #include <advanced_config.h>
 #include <connectivity/conn_facade.h>
 #include <wx/thread.h>
@@ -282,7 +283,7 @@ bool SCH_LABEL_BASE::IsType( const std::vector<KICAD_T>& aScanTypes ) const
     const std::vector<SCH_ITEM*>* connectedItems = &publishedItems;
 
     // The engine never fills legacy connected items; its published adjacency replaces them
-    if( ADVANCED_CFG::GetCfg().m_ConnectivityEngine && wxThread::IsMain() )
+    if( ADVANCED_CFG::GetCfg().m_ConnectivityEngine && MODEL_THREAD::IsModelThread() )
     {
         if( const auto connection = schematic->Connectivity().Connection( m_Uuid, schematic->CurrentSheet().Path() ) )
             publishedItems = connection->ConnectedItems();
@@ -350,12 +351,17 @@ void SCH_LABEL_BASE::swapData( SCH_ITEM* aItem )
 
 COLOR4D SCH_LABEL_BASE::GetLabelColor() const
 {
-    if( GetTextColor() != COLOR4D::UNSPECIFIED )
-        m_lastResolvedColor = GetTextColor();
-    else if( !IsConnectivityDirty() )
-        m_lastResolvedColor = GetEffectiveNetClass()->GetSchematicColor();
+    auto resolvedColor = m_lastResolvedColor;
 
-    return m_lastResolvedColor;
+    if( GetTextColor() != COLOR4D::UNSPECIFIED )
+        resolvedColor = GetTextColor();
+    else if( !IsConnectivityDirty() )
+        resolvedColor = GetEffectiveNetClass()->GetSchematicColor();
+
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedColor = resolvedColor;
+
+    return resolvedColor;
 }
 
 

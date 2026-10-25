@@ -1798,6 +1798,8 @@ BOX2I SCH_PIN::GetBoundingBox( bool aIncludeLabelsOnInvisiblePins, bool aInclude
 
 PIN_LAYOUT_CACHE& SCH_PIN::GetLayoutCache() const
 {
+    std::lock_guard lock( PIN_LAYOUT_CACHE::Mutex( *this ) );
+
     if( !m_layoutCache )
         m_layoutCache = std::make_unique<PIN_LAYOUT_CACHE>( *this );
 

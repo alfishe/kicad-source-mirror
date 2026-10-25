@@ -18,6 +18,7 @@
  */
 
 #include "conn_records.h"
+#include <model_thread.h>
 #include "conn_tasks.h"
 
 #include <wx/thread.h>
@@ -37,7 +38,7 @@ RECORD_STORE::RECORD_STORE( CACHE_VERSIONS& aVersions, SESSION_KEYS& aKeys ) :
 void RECORD_STORE::Update( const std::vector<FRAME_INSTANCE>& aFrame, INPUT_STORE& aInputs,
                            const BUS_ALIASES& aAliases )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     try
     {
         const bool                             aliasesChanged = m_parses.SetAliases( aAliases );

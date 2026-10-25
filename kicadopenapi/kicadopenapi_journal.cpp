@@ -1,6 +1,7 @@
 #include "kicadopenapi_journal.h"
 
 #include <platform.h>
+#include "kicadopenapi_jobs.h"
 
 #include <chrono>
 #include <cstdio>
@@ -68,6 +69,10 @@ std::string isoTime( long long aMillis )
 }
 
 
+/// @brief The operation of this thread's SCOPED_OPERATION; empty: the process-wide one
+thread_local std::string tlOperation;
+
+
 /// @brief Replaces wxLogGui (dialogs) and wxLogStderr for the whole process
 class JOURNAL_LOG_TARGET : public wxLog
 {
@@ -83,12 +88,13 @@ protected:
         const std::string message = aMsg.ToStdString( wxConvUTF8 );
         const std::string time = isoTime( millis );
         const char*       level = levelName( aLevel );
-        const bool        mainThread = wxThread::IsMain();
+        const char*       thread = wxThread::IsMain() ? "main" : KopenapiOnDispatchThread() ? "owner" : "worker";
 
         JOURNAL_STATE&              s = state();
         std::lock_guard<std::mutex> lock( s.mutex );
 
-        const std::string line = time + " " + level + " [" + s.operation + "] " + message;
+        const std::string operation = tlOperation.empty() ? s.operation : tlOperation;
+        const std::string line = time + " " + level + " [" + operation + "] " + message;
 
         if( s.log.is_open() )
             s.log << line << std::endl;
@@ -113,8 +119,8 @@ protected:
                                  { "time", time },
                                  { "level", level },
                                  { "message", message },
-                                 { "operation", s.operation },
-                                 { "thread", mainThread ? "main" : "worker" },
+                                 { "operation", operation },
+                                 { "thread", thread },
                                  { "source", source } };
 
         if( aLevel == wxLOG_Warning )
@@ -165,6 +171,13 @@ void KOPENAPI_JOURNAL::Install( const std::string& aAppName )
 }
 
 
+wxLog* KOPENAPI_JOURNAL::ThreadTarget()
+{
+    static JOURNAL_LOG_TARGET* target = new JOURNAL_LOG_TARGET();
+    return target;
+}
+
+
 void KOPENAPI_JOURNAL::SetOperation( const std::string& aOperation )
 {
     std::lock_guard<std::mutex> lock( state().mutex );
@@ -172,18 +185,26 @@ void KOPENAPI_JOURNAL::SetOperation( const std::string& aOperation )
 }
 
 
-KOPENAPI_JOURNAL::SCOPED_OPERATION::SCOPED_OPERATION( const std::string& aOperation )
+std::string KOPENAPI_JOURNAL::Operation()
 {
+    if( !tlOperation.empty() )
+        return tlOperation;
+
     std::lock_guard<std::mutex> lock( state().mutex );
-    m_previous = state().operation;
-    state().operation = aOperation;
+    return state().operation;
+}
+
+
+KOPENAPI_JOURNAL::SCOPED_OPERATION::SCOPED_OPERATION( const std::string& aOperation ) :
+        m_previous( tlOperation )
+{
+    tlOperation = aOperation;
 }
 
 
 KOPENAPI_JOURNAL::SCOPED_OPERATION::~SCOPED_OPERATION()
 {
-    std::lock_guard<std::mutex> lock( state().mutex );
-    state().operation = m_previous;
+    tlOperation = m_previous;
 }
 
 

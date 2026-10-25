@@ -63,6 +63,7 @@
 #include <limits>
 #include <deque>
 #include <map>
+#include <mutex>
 #include <tuple>
 #include <thread>
 #include <cmath>
@@ -70,6 +71,7 @@
 #include <set>
 
 #include <kicadopenapi_jobs.h>
+#include <model_thread.h>
 
 
 namespace
@@ -102,6 +104,9 @@ public:
 
 PCB_TOOL_BASE* routeHost( TOOL_MANAGER* aManager )
 {
+    // a tool builds wx menus in the GUI and takes an id from an unguarded counter: owner thread only
+    wxASSERT( !KopenapiInComputeWorker() );
+
     if( KOPENAPI_ROUTE_HOST* host = aManager->GetTool<KOPENAPI_ROUTE_HOST>() )
         return host;
 
@@ -624,7 +629,49 @@ struct ROUTE_PROFILE
     long                 job = -1;   ///< the job or gap the routes are laid for now
 };
 
-static ROUTE_PROFILE s_routeProfile;
+/// @brief The profile of the pcb_route call running on a board; a scratch one outside such a call
+class ROUTE_PROFILES
+{
+public:
+    class BIND
+    {
+    public:
+        BIND( const BOARD* aBoard, ROUTE_PROFILE& aProfile ) : m_board( aBoard )
+        {
+            std::lock_guard<std::mutex> lock( mutex() );
+            map()[aBoard] = &aProfile;
+        }
+
+        ~BIND()
+        {
+            std::lock_guard<std::mutex> lock( mutex() );
+            map().erase( m_board );
+        }
+
+    private:
+        const BOARD* m_board;
+    };
+
+    static ROUTE_PROFILE& Of( const BOARD* aBoard, ROUTE_PROFILE& aScratch )
+    {
+        std::lock_guard<std::mutex> lock( mutex() );
+        auto                        it = map().find( aBoard );
+        return it != map().end() ? *it->second : aScratch;
+    }
+
+private:
+    static std::mutex& mutex()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    static std::map<const BOARD*, ROUTE_PROFILE*>& map()
+    {
+        static std::map<const BOARD*, ROUTE_PROFILE*> m;
+        return m;
+    }
+};
 
 
 static nlohmann::json tallies( const std::map<std::string, ROUTE_PROFILE::TALLY>& aTallies )
@@ -895,7 +942,9 @@ static void trimOverOwnCopper( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard )
 
 bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
 {
-    BOARD*     board = aContext.GetBoard();
+    BOARD*         board = aContext.GetBoard();
+    ROUTE_PROFILE  scratch;
+    ROUTE_PROFILE& profile = ROUTE_PROFILES::Of( board, scratch );
     const auto started = std::chrono::steady_clock::now();
 
     auto iface = std::make_unique<KOPENAPI_PNS_IFACE>();
@@ -904,324 +953,337 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     // create a preview group that EraseView then updates on a null view)
     iface->SetHostTool( routeHost( aContext.GetToolManager() ) );
 
-    PNS::ROUTING_SETTINGS settings( nullptr, "" );
-    settings.SetMode( aReq.mode );
-
-    // The same result on every run: the router's wall-clock limits (made for a hand on the mouse) are
-    // lifted for the call, its iteration limits bound the work (a shove through a dense row can take
-    // 50 ms an iteration: the editor's 250 would run past any clock)
-    settings.SetShoveTimeLimit( 60000 );
-    settings.SetShoveIterationLimit( 100 );
-
-    struct CLUSTER_TIMEOUT
-    {
-        int& limit = const_cast<ADVANCED_CFG&>( ADVANCED_CFG::GetCfg() ).m_PNSProcessClusterTimeout;
-        int  previous = limit;
-        CLUSTER_TIMEOUT() { limit = 10000; }
-        ~CLUSTER_TIMEOUT() { limit = previous; }
-    } clusterTimeout;
-
-    // the router is a process-wide singleton: the editor's own router is current again afterwards
-    struct RESTORE_ROUTER
-    {
-        PNS::ROUTER* previous = PNS::ROUTER::GetInstance();
-        ~RESTORE_ROUTER() { PNS::ROUTER::SetInstance( previous ); }
-    } restoreRouter;
-
+    // The search only reads the board: in the GUI it runs on a worker while the main thread paints
+    // and navigates, and readers read alongside until the route is committed
+    PNS::ROUTING_SETTINGS                   settings( nullptr, "" );
     std::vector<std::unique_ptr<PCB_SHAPE>> frontItems;   // the ways out kept open, as the router sees them
+    std::optional<PNS::ROUTER::THREAD_SCOPE> commitScope;   // outlives the router: current while it is
+    std::unique_ptr<PNS::ROUTER>            router;
+    PNS::PLACEMENT_ALGO*                    placer = nullptr;
+    std::chrono::steady_clock::time_point   synced;
+    VECTOR2I                                start;
+    VECTOR2I                                target;
+    PNS_LAYER_RANGE                         targetLayers;
+    bool                                    reached = false;
+    bool                                    fixed = false;
 
-    auto router = std::make_unique<PNS::ROUTER>();
-    router->SetInterface( iface.get() );
-    router->LoadSettings( &settings );
-    router->SyncWorld();
-
-    // a way out of another net's pad kept open is that net's copper to the router: it walks around
-    if( aReq.fronts && !aReq.diffPair )
+    auto search = [&]() -> std::optional<bool>
     {
-        for( const ESCAPE_FRONT& front : *aReq.fronts )
+        settings.SetMode( aReq.mode );
+
+        // The same result on every run: the router's wall-clock limits (made for a hand on the mouse) are
+        // lifted for the call, its iteration limits bound the work (a shove through a dense row can take
+        // 50 ms an iteration: the editor's 250 would run past any clock)
+        settings.SetShoveTimeLimit( 60000 );
+        settings.SetShoveIterationLimit( 100 );
+        settings.SetClusterTimeout( 10000 );
+
+        // our router is current on this thread only: the editor's router stays current for the editor
+        PNS::ROUTER::THREAD_SCOPE routerScope;
+
+        router = std::make_unique<PNS::ROUTER>();
+        router->SetInterface( iface.get() );
+        router->LoadSettings( &settings );
+        router->SyncWorld();
+
+        // a way out of another net's pad kept open is that net's copper to the router: it walks around
+        if( aReq.fronts && !aReq.diffPair )
         {
-            if( !front.open || front.pad->GetNetCode() == aReq.from->GetNetCode() )
-                continue;
+            for( const ESCAPE_FRONT& front : *aReq.fronts )
+            {
+                if( !front.open || front.pad->GetNetCode() == aReq.from->GetNetCode() )
+                    continue;
 
-            auto item = std::make_unique<PCB_SHAPE>( board, SHAPE_T::SEGMENT );
-            item->SetStart( front.shape.GetSeg().A );
-            item->SetEnd( front.shape.GetSeg().B );
-            item->SetWidth( front.shape.GetWidth() );
-            item->SetLayer( front.layer );
-            item->SetNet( front.pad->GetNet() );
+                auto item = std::make_unique<PCB_SHAPE>( board, SHAPE_T::SEGMENT );
+                item->SetStart( front.shape.GetSeg().A );
+                item->SetEnd( front.shape.GetSeg().B );
+                item->SetWidth( front.shape.GetWidth() );
+                item->SetLayer( front.layer );
+                item->SetNet( front.pad->GetNet() );
 
-            auto solid = std::make_unique<PNS::SOLID>();
-            solid->SetLayer( iface->GetPNSLayerFromBoardLayer( front.layer ) );
-            solid->SetNet( front.pad->GetNet() );
-            solid->SetParent( item.get() );
-            solid->SetShape( front.shape.Clone() );
-            solid->SetPos( front.shape.GetSeg().Center() );
-            solid->SetRoutable( false );
-            router->GetWorld()->Add( std::move( solid ) );
-            frontItems.push_back( std::move( item ) );
+                auto solid = std::make_unique<PNS::SOLID>();
+                solid->SetLayer( iface->GetPNSLayerFromBoardLayer( front.layer ) );
+                solid->SetNet( front.pad->GetNet() );
+                solid->SetParent( item.get() );
+                solid->SetShape( front.shape.Clone() );
+                solid->SetPos( front.shape.GetSeg().Center() );
+                solid->SetRoutable( false );
+                router->GetWorld()->Add( std::move( solid ) );
+                frontItems.push_back( std::move( item ) );
+            }
         }
-    }
 
-    const auto synced = std::chrono::steady_clock::now();
-    s_routeProfile.syncMs += msSince( started, synced );
-    router->SetMode( aReq.diffPair ? PNS::PNS_MODE_ROUTE_DIFF_PAIR : PNS::PNS_MODE_ROUTE_SINGLE );
+        synced = std::chrono::steady_clock::now();
+        profile.syncMs += msSince( started, synced );
+        router->SetMode( aReq.diffPair ? PNS::PNS_MODE_ROUTE_DIFF_PAIR : PNS::PNS_MODE_ROUTE_SINGLE );
 
-    PNS::ITEM* startItem = router->GetWorld()->FindItemByParent( aReq.from );
+        PNS::ITEM* startItem = router->GetWorld()->FindItemByParent( aReq.from );
 
-    if( !startItem )
-    {
-        aOut["routed"] = false;
-        aOut["reason"] = "the router does not know the start pad";
-        return false;
-    }
-
-    const VECTOR2I      start = aReq.fromPos.value_or( aReq.from->GetPosition() );
-    PNS::SIZES_SETTINGS sizes( router->Sizes() );
-    iface->SetStartLayerFromPCBNew( aReq.layer );
-    iface->ImportSizes( sizes, startItem, nullptr, start );
-    sizes.AddLayerPair( iface->GetPNSLayerFromBoardLayer( F_Cu ), iface->GetPNSLayerFromBoardLayer( B_Cu ) );
-
-    if( aReq.viaDiameter > 0 )
-        sizes.SetViaDiameter( aReq.viaDiameter );
-
-    if( aReq.viaDrill > 0 )
-        sizes.SetViaDrill( aReq.viaDrill );
-
-    if( aReq.width > 0 )
-        sizes.SetTrackWidth( aReq.width );
-
-    if( aReq.neckWidth > 0 && aReq.neckWidth < sizes.TrackWidth() )
-    {
-        aOut["necked_from_mm"] = toMm( sizes.TrackWidth() );
-        sizes.SetTrackWidth( aReq.neckWidth );
-    }
-
-    // a pair without diff-pair rules: the track width, the gap the clearance
-    if( aReq.diffPair && sizes.DiffPairWidth() <= 0 )
-        sizes.SetDiffPairWidth( sizes.TrackWidth() );
-
-    if( aReq.diffPair && sizes.DiffPairGap() <= 0 )
-        sizes.SetDiffPairGap( sizes.Clearance() );
-
-    router->UpdateSizes( sizes );
-
-    aOut["net"] = str( UnescapeString( aReq.from->GetNetname() ) );
-    aOut["layer"] = str( board->GetLayerName( aReq.layer ) );
-    aOut["mode"] = aReq.mode == PNS::RM_Shove ? "shove" : "walkaround";
-    aOut["track_width_mm"] = toMm( sizes.TrackWidth() );
-    aOut["clearance_mm"] = toMm( sizes.Clearance() );
-
-    if( aReq.diffPair )
-    {
-        aOut["diff_pair"] = { { "width_mm", toMm( sizes.DiffPairWidth() ) }, { "gap_mm", toMm( sizes.DiffPairGap() ) } };
-
-        if( !aReq.vias.empty() )
+        if( !startItem )
         {
             aOut["routed"] = false;
-            aOut["reason"] = "a differential pair is routed without waypoints";
+            aOut["reason"] = "the router does not know the start pad";
             return false;
         }
-    }
 
-    if( !router->StartRouting( start, startItem, iface->GetPNSLayerFromBoardLayer( aReq.layer ) ) )
-    {
-        aOut["routed"] = false;
-        aOut["reason"] = "could not start: " + str( router->FailureReason() );
-        return false;
-    }
+        start = aReq.fromPos.value_or( aReq.from->GetPosition() );
+        PNS::SIZES_SETTINGS sizes( router->Sizes() );
+        iface->SetStartLayerFromPCBNew( aReq.layer );
+        iface->ImportSizes( sizes, startItem, nullptr, start );
+        sizes.AddLayerPair( iface->GetPNSLayerFromBoardLayer( F_Cu ), iface->GetPNSLayerFromBoardLayer( B_Cu ) );
 
-    auto move = [&]( const VECTOR2I& aAt, PNS::ITEM* aItem )
-    {
-        const auto from = std::chrono::steady_clock::now();
-        router->Move( aAt, aItem );
-        s_routeProfile.moveMs += msSince( from );
-    };
+        if( aReq.viaDiameter > 0 )
+            sizes.SetViaDiameter( aReq.viaDiameter );
 
-    // Vias on the way: route to the point, drop a through via there, continue on the next layer
-    PNS::PLACEMENT_ALGO* placer = router->Placer();
+        if( aReq.viaDrill > 0 )
+            sizes.SetViaDrill( aReq.viaDrill );
 
-    for( const auto& [at, viaLayer] : aReq.vias )
-    {
-        if( !viaLayer )
+        if( aReq.width > 0 )
+            sizes.SetTrackWidth( aReq.width );
+
+        if( aReq.neckWidth > 0 && aReq.neckWidth < sizes.TrackWidth() )
         {
-            // a corner: route to the point and fix what is there, on the same layer
+            aOut["necked_from_mm"] = toMm( sizes.TrackWidth() );
+            sizes.SetTrackWidth( aReq.neckWidth );
+        }
+
+        // a pair without diff-pair rules: the track width, the gap the clearance
+        if( aReq.diffPair && sizes.DiffPairWidth() <= 0 )
+            sizes.SetDiffPairWidth( sizes.TrackWidth() );
+
+        if( aReq.diffPair && sizes.DiffPairGap() <= 0 )
+            sizes.SetDiffPairGap( sizes.Clearance() );
+
+        router->UpdateSizes( sizes );
+
+        aOut["net"] = str( UnescapeString( aReq.from->GetNetname() ) );
+        aOut["layer"] = str( board->GetLayerName( aReq.layer ) );
+        aOut["mode"] = aReq.mode == PNS::RM_Shove ? "shove" : "walkaround";
+        aOut["track_width_mm"] = toMm( sizes.TrackWidth() );
+        aOut["clearance_mm"] = toMm( sizes.Clearance() );
+
+        if( aReq.diffPair )
+        {
+            aOut["diff_pair"] = { { "width_mm", toMm( sizes.DiffPairWidth() ) }, { "gap_mm", toMm( sizes.DiffPairGap() ) } };
+
+            if( !aReq.vias.empty() )
+            {
+                aOut["routed"] = false;
+                aOut["reason"] = "a differential pair is routed without waypoints";
+                return false;
+            }
+        }
+
+        if( !router->StartRouting( start, startItem, iface->GetPNSLayerFromBoardLayer( aReq.layer ) ) )
+        {
+            aOut["routed"] = false;
+            aOut["reason"] = "could not start: " + str( router->FailureReason() );
+            return false;
+        }
+
+        auto move = [&]( const VECTOR2I& aAt, PNS::ITEM* aItem )
+        {
+            const auto from = std::chrono::steady_clock::now();
+            router->Move( aAt, aItem );
+            profile.moveMs += msSince( from );
+        };
+
+        // Vias on the way: route to the point, drop a through via there, continue on the next layer
+        placer = router->Placer();
+
+        for( const auto& [at, viaLayer] : aReq.vias )
+        {
+            if( !viaLayer )
+            {
+                // a corner: route to the point and fix what is there, on the same layer
+                move( at, nullptr );
+                move( at, nullptr );
+
+                const bool there = placer->CurrentEnd() == at;
+
+                // FixRoute answers whether the route is finished: here it only fixes what leads to the point
+                if( there )
+                    router->FixRoute( at, nullptr, false, false );
+
+                if( !there || !router->RoutingInProgress() )
+                {
+                    const VECTOR2I end = placer->CurrentEnd();
+                    router->StopRouting();
+                    iface->Staged().Revert();
+                    aOut["routed"] = false;
+                    aOut["reason"] = "blocked before the waypoint at " + std::to_string( toMm( at.x ) ) + ", "
+                                     + std::to_string( toMm( at.y ) );
+                    aOut["stopped_at_mm"] = { toMm( end.x ), toMm( end.y ) };
+                    aOut["toward_mm"] = { toMm( at.x ), toMm( at.y ) };
+                    return false;
+                }
+
+                continue;
+            }
+
+            const PCB_LAYER_ID layer = *viaLayer;
+
+            // a via with no track before it (at the point the route stands on) ends the routing in PNS,
+            // and moving on from there uses a placer that has let go of its world
+            if( placer->CurrentStart() == at )
+            {
+                router->StopRouting();
+                iface->Staged().Revert();
+                aOut["routed"] = false;
+                aOut["reason"] = "the via at " + std::to_string( toMm( at.x ) ) + ", " + std::to_string( toMm( at.y ) )
+                                 + " is where the route already stands (its start): move it along the way";
+                return false;
+            }
+
+            PNS::SIZES_SETTINGS viaSizes( router->Sizes() );
+            viaSizes.SetViaType( VIATYPE::THROUGH );
+            viaSizes.ClearLayerPairs();
+            viaSizes.AddLayerPair( router->GetCurrentLayer(), iface->GetPNSLayerFromBoardLayer( layer ) );
+            router->UpdateSizes( viaSizes );
+
+            if( !router->IsPlacingVia() )
+                router->ToggleViaPlacement();
+
             move( at, nullptr );
             move( at, nullptr );
 
-            const bool there = placer->CurrentEnd() == at;
-
-            // FixRoute answers whether the route is finished: here it only fixes what leads to the point
-            if( there )
-                router->FixRoute( at, nullptr, false, false );
-
-            if( !there || !router->RoutingInProgress() )
+            if( placer->CurrentEnd() != at )
             {
                 const VECTOR2I end = placer->CurrentEnd();
                 router->StopRouting();
                 iface->Staged().Revert();
                 aOut["routed"] = false;
-                aOut["reason"] = "blocked before the waypoint at " + std::to_string( toMm( at.x ) ) + ", "
-                                 + std::to_string( toMm( at.y ) );
+                aOut["reason"] = "blocked before the via at " + std::to_string( toMm( at.x ) ) + ", " + std::to_string( toMm( at.y ) );
                 aOut["stopped_at_mm"] = { toMm( end.x ), toMm( end.y ) };
-                aOut["toward_mm"] = { toMm( at.x ), toMm( at.y ) };
+                    aOut["toward_mm"] = { toMm( at.x ), toMm( at.y ) };
                 return false;
             }
 
-            continue;
-        }
+            router->FixRoute( at, nullptr, false, false );
 
-        const PCB_LAYER_ID layer = *viaLayer;
-
-        // a via with no track before it (at the point the route stands on) ends the routing in PNS,
-        // and moving on from there uses a placer that has let go of its world
-        if( placer->CurrentStart() == at )
-        {
-            router->StopRouting();
-            iface->Staged().Revert();
-            aOut["routed"] = false;
-            aOut["reason"] = "the via at " + std::to_string( toMm( at.x ) ) + ", " + std::to_string( toMm( at.y ) )
-                             + " is where the route already stands (its start): move it along the way";
-            return false;
-        }
-
-        PNS::SIZES_SETTINGS viaSizes( router->Sizes() );
-        viaSizes.SetViaType( VIATYPE::THROUGH );
-        viaSizes.ClearLayerPairs();
-        viaSizes.AddLayerPair( router->GetCurrentLayer(), iface->GetPNSLayerFromBoardLayer( layer ) );
-        router->UpdateSizes( viaSizes );
-
-        if( !router->IsPlacingVia() )
-            router->ToggleViaPlacement();
-
-        move( at, nullptr );
-        move( at, nullptr );
-
-        if( placer->CurrentEnd() != at )
-        {
-            const VECTOR2I end = placer->CurrentEnd();
-            router->StopRouting();
-            iface->Staged().Revert();
-            aOut["routed"] = false;
-            aOut["reason"] = "blocked before the via at " + std::to_string( toMm( at.x ) ) + ", " + std::to_string( toMm( at.y ) );
-            aOut["stopped_at_mm"] = { toMm( end.x ), toMm( end.y ) };
-                aOut["toward_mm"] = { toMm( at.x ), toMm( at.y ) };
-            return false;
-        }
-
-        router->FixRoute( at, nullptr, false, false );
-
-        if( !router->SwitchLayer( iface->GetPNSLayerFromBoardLayer( layer ) ) )
-        {
-            router->StopRouting();
-            iface->Staged().Revert();
-            aOut["routed"] = false;
-            aOut["reason"] = "could not change layer at the via";
-            return false;
-        }
-    }
-
-    VECTOR2I        target;
-    PNS::ITEM*      targetItem = nullptr;
-    PNS_LAYER_RANGE targetLayers;
-
-    if( aReq.to )
-    {
-        target = aReq.toPos;
-        targetItem = router->GetWorld()->FindItemByParent( aReq.to );
-
-        if( targetItem )
-            targetLayers = targetItem->Layers();
-    }
-    else if( aReq.toFreeLayer )
-    {
-        target = aReq.toPos;
-        const int l = iface->GetPNSLayerFromBoardLayer( *aReq.toFreeLayer );
-        targetLayers = PNS_LAYER_RANGE( l, l );
-    }
-    else if( !router->GetNearestRatnestAnchor( target, targetLayers, targetItem ) )
-    {
-        router->StopRouting();
-        aOut["routed"] = false;
-        aOut["reason"] = "nothing left to connect on this net from that pad";
-        return false;
-    }
-
-    // a pair follows the cursor as a hand moves it: in steps of about a millimetre (a jump to the
-    // target leaves the coupled walk nothing to start from)
-    if( aReq.diffPair )
-    {
-        std::vector<VECTOR2I> path = { placer->CurrentStart() };
-        path.insert( path.end(), aReq.guide.begin(), aReq.guide.end() );
-        path.push_back( target );
-
-        // a pair that has not left its start pads after a few steps does not fit there: each further
-        // step only searches the same gateways again (seconds each on a dense board)
-        constexpr int STUCK_STEPS = 3;
-        int           empty = 0;
-
-        for( size_t leg = 1; leg < path.size() && empty < STUCK_STEPS; ++leg )
-        {
-            const VECTOR2I from = path[leg - 1];
-            const VECTOR2I to = path[leg];
-            const int      steps = std::max( 1, (int) ( ( to - from ).EuclideanNorm() / pcbIUScale.mmToIU( 1.0 ) ) );
-
-            for( int k = 1; k <= steps && empty < STUCK_STEPS; ++k )
+            if( !router->SwitchLayer( iface->GetPNSLayerFromBoardLayer( layer ) ) )
             {
-                if( leg + 1 < path.size() || k < steps )
-                {
-                    move( from + ( to - from ) * k / steps, nullptr );
-                    empty = placer->HasPlacedAnything() ? 0 : empty + 1;
-                }
+                router->StopRouting();
+                iface->Staged().Revert();
+                aOut["routed"] = false;
+                aOut["reason"] = "could not change layer at the via";
+                return false;
             }
         }
 
-        if( empty >= STUCK_STEPS )
+        PNS::ITEM* targetItem = nullptr;
+
+        if( aReq.to )
+        {
+            target = aReq.toPos;
+            targetItem = router->GetWorld()->FindItemByParent( aReq.to );
+
+            if( targetItem )
+                targetLayers = targetItem->Layers();
+        }
+        else if( aReq.toFreeLayer )
+        {
+            target = aReq.toPos;
+            const int l = iface->GetPNSLayerFromBoardLayer( *aReq.toFreeLayer );
+            targetLayers = PNS_LAYER_RANGE( l, l );
+        }
+        else if( !router->GetNearestRatnestAnchor( target, targetLayers, targetItem ) )
         {
             router->StopRouting();
-            iface->Staged().Revert();
-            s_routeProfile.pairsStuck++;
             aOut["routed"] = false;
-            aOut["reason"] = "the pair did not leave its start pads";
+            aOut["reason"] = "nothing left to connect on this net from that pad";
             return false;
         }
-    }
 
-    // Move towards the target until the head stops changing (as the editor's Attempt Finish)
-    VECTOR2I             previous;
-    int                  tries = 8;
+        // a pair follows the cursor as a hand moves it: in steps of about a millimetre (a jump to the
+        // target leaves the coupled walk nothing to start from)
+        if( aReq.diffPair )
+        {
+            std::vector<VECTOR2I> path = { placer->CurrentStart() };
+            path.insert( path.end(), aReq.guide.begin(), aReq.guide.end() );
+            path.push_back( target );
 
-    do
-    {
-        previous = placer->CurrentEnd();
-        move( target, targetItem );
-    } while( placer->CurrentEnd() != previous && --tries );
+            // a pair that has not left its start pads after a few steps does not fit there: each further
+            // step only searches the same gateways again (seconds each on a dense board)
+            constexpr int STUCK_STEPS = 3;
+            int           empty = 0;
 
-    // At the target point and on one of its layers (an SMD pad is on one side only): what the
-    // editor's Finish requires too
-    // (the pair's placer answers the cursor as its end: it finishes only when it snapped onto the
-    // target pads, which FixRoute tells)
-    bool reached = aReq.diffPair || ( placer->CurrentEnd() == target && targetLayers.Overlaps( router->GetCurrentLayer() ) );
+            for( size_t leg = 1; leg < path.size() && empty < STUCK_STEPS; ++leg )
+            {
+                const VECTOR2I from = path[leg - 1];
+                const VECTOR2I to = path[leg];
+                const int      steps = std::max( 1, (int) ( ( to - from ).EuclideanNorm() / pcbIUScale.mmToIU( 1.0 ) ) );
 
-    if( reached && aReq.endViaLayer )
-    {
-        PNS::SIZES_SETTINGS viaSizes( router->Sizes() );
-        viaSizes.SetViaType( VIATYPE::THROUGH );
-        viaSizes.ClearLayerPairs();
-        viaSizes.AddLayerPair( router->GetCurrentLayer(), iface->GetPNSLayerFromBoardLayer( *aReq.endViaLayer ) );
-        router->UpdateSizes( viaSizes );
+                for( int k = 1; k <= steps && empty < STUCK_STEPS; ++k )
+                {
+                    if( leg + 1 < path.size() || k < steps )
+                    {
+                        move( from + ( to - from ) * k / steps, nullptr );
+                        empty = placer->HasPlacedAnything() ? 0 : empty + 1;
+                    }
+                }
+            }
 
-        if( !router->IsPlacingVia() )
-            router->ToggleViaPlacement();
+            if( empty >= STUCK_STEPS )
+            {
+                router->StopRouting();
+                iface->Staged().Revert();
+                profile.pairsStuck++;
+                aOut["routed"] = false;
+                aOut["reason"] = "the pair did not leave its start pads";
+                return false;
+            }
+        }
 
-        move( target, nullptr );
-        move( target, nullptr );
-        reached = placer->CurrentEnd() == target;
-    }
+        // Move towards the target until the head stops changing (as the editor's Attempt Finish)
+        VECTOR2I             previous;
+        int                  tries = 8;
 
-    // Fix the line in the router, then commit it to the board (as the router tool does); our
-    // interface stages the commit instead of pushing it
-    // a free spot has no item to end on: the line is finished there, as the editor's End does
-    const bool fixed = reached && router->FixRoute( target, targetItem, !aReq.to && aReq.toFreeLayer.has_value(), false );
+        do
+        {
+            previous = placer->CurrentEnd();
+            move( target, targetItem );
+        } while( placer->CurrentEnd() != previous && --tries );
+
+        // At the target point and on one of its layers (an SMD pad is on one side only): what the
+        // editor's Finish requires too
+        // (the pair's placer answers the cursor as its end: it finishes only when it snapped onto the
+        // target pads, which FixRoute tells)
+        reached = aReq.diffPair || ( placer->CurrentEnd() == target && targetLayers.Overlaps( router->GetCurrentLayer() ) );
+
+        if( reached && aReq.endViaLayer )
+        {
+            PNS::SIZES_SETTINGS viaSizes( router->Sizes() );
+            viaSizes.SetViaType( VIATYPE::THROUGH );
+            viaSizes.ClearLayerPairs();
+            viaSizes.AddLayerPair( router->GetCurrentLayer(), iface->GetPNSLayerFromBoardLayer( *aReq.endViaLayer ) );
+            router->UpdateSizes( viaSizes );
+
+            if( !router->IsPlacingVia() )
+                router->ToggleViaPlacement();
+
+            move( target, nullptr );
+            move( target, nullptr );
+            reached = placer->CurrentEnd() == target;
+        }
+
+        // Fix the line in the router, then commit it to the board (as the router tool does); our
+        // interface stages the commit instead of pushing it
+        // a free spot has no item to end on: the line is finished there, as the editor's End does
+        fixed = reached && router->FixRoute( target, targetItem, !aReq.to && aReq.toFreeLayer.has_value(), false );
+
+        return std::nullopt;
+    };
+
+    std::optional<bool> early;
+    KopenapiCompute( [&]() { early = search(); } );
+
+    if( early )
+        return *early;
+
+    // the commit runs on this thread: our router is current here for it
+    commitScope.emplace();
+    PNS::ROUTER::SetInstance( router.get() );
 
     if( fixed )
         router->CommitRouting();
@@ -1403,7 +1465,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     for( BOARD_ITEM* item : iface->m_added )
     {
         if( int net = otherNet( item ) )
-            s_routeProfile.shovedNets.insert( net );
+            profile.shovedNets.insert( net );
     }
 
     for( const auto* items : { &iface->m_modified, &iface->m_removed } )
@@ -1411,7 +1473,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         for( BOARD_ITEM* item : *items )
         {
             if( int net = otherNet( item ) )
-                s_routeProfile.shovedNets.insert( net );
+                profile.shovedNets.insert( net );
         }
     }
 
@@ -1771,20 +1833,22 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     const auto   started = std::chrono::steady_clock::now();
     const size_t before = aAdded.size();
     const bool   ok = routeOneImpl( aContext, aReq, aOut, aAdded );
+    ROUTE_PROFILE  scratch;
+    ROUTE_PROFILE& profile = ROUTE_PROFILES::Of( aContext.GetBoard(), scratch );
 
     const double ms = msSince( started );
-    s_routeProfile.attempts++;
+    profile.attempts++;
 
     for( size_t i = before; ok && !aReq.dryRun && i < aAdded.size(); ++i )
-        s_routeProfile.laid[aAdded[i]] = { s_routeProfile.pass, s_routeProfile.job, s_routeProfile.attempts };
-    s_routeProfile.totalMs += ms;
+        profile.laid[aAdded[i]] = { profile.pass, profile.job, profile.attempts };
+    profile.totalMs += ms;
 
     const size_t      viaCount = std::count_if( aReq.vias.begin(), aReq.vias.end(), []( const auto& v ) { return v.second.has_value(); } );
     const std::string kind = aReq.planned ? "planned"
                              : viaCount >= 2 ? "two_vias"
                              : viaCount == 1 ? "one_via"
                              : aReq.mode == PNS::RM_Shove ? "shove" : "walkaround";
-    for( ROUTE_PROFILE::TALLY* t : { &s_routeProfile.byKind[kind], &s_routeProfile.byPass[s_routeProfile.pass] } )
+    for( ROUTE_PROFILE::TALLY* t : { &profile.byKind[kind], &profile.byPass[profile.pass] } )
     {
         t->tries++;
         t->routed += ok;
@@ -1799,7 +1863,7 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
         if( at != std::string::npos )
             reason.resize( at );
 
-        ROUTE_PROFILE::TALLY& f = s_routeProfile.byFailure[reason];
+        ROUTE_PROFILE::TALLY& f = profile.byFailure[reason];
         f.tries++;
         f.ms += ms;
     }
@@ -2711,7 +2775,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     BOARD* board = context->GetBoard();
     const auto started = std::chrono::steady_clock::now();
-    s_routeProfile = {};
+    ROUTE_PROFILE              profile;
+    ROUTE_PROFILES::BIND       bindProfile( board, profile );
 
     // each net's copper before the call (pieces, length): what shove moved of other nets is told
     auto copperOf = [&]()
@@ -3433,13 +3498,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( offBoard( aEnd, aAt ) )
             {
-                s_routeProfile.viaSpotsOffBoard++;
+                profile.viaSpotsOffBoard++;
                 return true;
             }
 
             if( viaBlocked( aEnd, aAt ) )
             {
-                s_routeProfile.viaSpotsBlocked++;
+                profile.viaSpotsBlocked++;
                 return true;
             }
 
@@ -3507,12 +3572,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     auto makePlan = [&]( const ROUTE_PLAN_REQUEST& aReq )
     {
-        const ROUTE_PLAN plan = PlanRoute( aReq );
+        // the plan only reads the board: off the GUI thread, readers read alongside
+        ROUTE_PLAN plan;
+        KopenapiCompute( [&]() { plan = PlanRoute( aReq ); } );
 
-        s_routeProfile.plans++;
-        s_routeProfile.plansFound += plan.found;
-        s_routeProfile.plansWholeBoard += plan.wholeBoard;
-        s_routeProfile.planMs += plan.ms;
+        profile.plans++;
+        profile.plansFound += plan.found;
+        profile.plansWholeBoard += plan.wholeBoard;
+        profile.planMs += plan.ms;
         return plan;
     };
 
@@ -3525,16 +3592,16 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         struct TIMED
         {
             JOB&                                  job;
-            long                                  outer = s_routeProfile.job;
+            long                                  outer = profile.job;
             std::chrono::steady_clock::time_point from = std::chrono::steady_clock::now();
             ~TIMED()
             {
                 job.ms += msSince( from );
-                s_routeProfile.job = outer;
+                profile.job = outer;
             }
         } timed{ aJob };
 
-        s_routeProfile.job = &aJob - jobs.data();
+        profile.job = &aJob - jobs.data();
 
         bool ok = false;
 
@@ -3742,7 +3809,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             const PCB_LAYER_ID   layer = pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
 
             if( !exits.empty() )
-                s_routeProfile.padExitsTried++;
+                profile.padExitsTried++;
 
             for( const auto& [score, corner] : exits )
             {
@@ -3762,7 +3829,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( ok )
             {
-                s_routeProfile.padExitsWon++;
+                profile.padExitsWon++;
                 aAttempt["left_pad_by"] = tried.back();
             }
             else
@@ -3858,7 +3925,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                         if( deadFirstVia.count( { v.x, v.y } ) || deadLastVia.count( { v.x, v.y } ) )
                         {
-                            s_routeProfile.deadLegsSkipped++;
+                            profile.deadLegsSkipped++;
                             continue;
                         }
 
@@ -3894,7 +3961,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     {
                         if( deadFirstVia.count( { va.x, va.y } ) )
                         {
-                            s_routeProfile.deadLegsSkipped++;
+                            profile.deadLegsSkipped++;
                             break;
                         }
 
@@ -3903,7 +3970,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                         if( deadLastVia.count( { vb.x, vb.y } ) )
                         {
-                            s_routeProfile.deadLegsSkipped++;
+                            profile.deadLegsSkipped++;
                             continue;
                         }
 
@@ -4943,7 +5010,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             GridTimelineKeep( aTimeline );
         };
 
-        const GRID_RESULT gr = RouteOnGrid( board, gridNets, params );
+        // the grid search only reads the board: off the GUI thread, readers read alongside
+        GRID_RESULT gr;
+        KopenapiCompute( [&]() { gr = RouteOnGrid( board, gridNets, params ); } );
         nlohmann::json    timelineOut;
 
         if( gr.timeline && ( !aBranch || gr.timeline != aBranch->timeline ) )
@@ -5693,7 +5762,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 nlohmann::json attempt;
                 int            tries = 0;
 
-                s_routeProfile.pass = "retry";
+                profile.pass = "retry";
 
                 // until a rip-up has moved routes, the board has only gained copper since the first
                 // pass: the forward way failed there already
@@ -5814,13 +5883,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     // walled in by copper that cannot move
                     if( !planned )
                     {
-                        s_routeProfile.ripUpsWalled++;
+                        profile.ripUpsWalled++;
                         return {};
                     }
 
                     if( !planned->empty() )
                     {
-                        s_routeProfile.ripUpsPlanned++;
+                        profile.ripUpsPlanned++;
                         return *planned;
                     }
                 }
@@ -5882,7 +5951,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 // board, the same one fails again
                 if( ripFailed[index].count( { boardVersion, victims } ) )
                 {
-                    s_routeProfile.ripUpsSkipped++;
+                    profile.ripUpsSkipped++;
                     break;
                 }
 
@@ -5924,7 +5993,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 nlohmann::json attempt;
                 int            tries = 0;
-                s_routeProfile.pass = "rip_up";
+                profile.pass = "rip_up";
                 bool           ok = tryRoute( job, attempt, tries, false, true );
                 nlohmann::json victimAttempts = nlohmann::json::array();
                 const char*    failedAt = ok ? nullptr : "route";
@@ -5961,7 +6030,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                         if( second && !second->empty() )
                         {
-                            s_routeProfile.ripUpsSecond++;
+                            profile.ripUpsSecond++;
 
                             BOARD_COMMIT         secondRip( context->GetToolManager() );
                             std::set<PCB_TRACK*> pieces;
@@ -6114,7 +6183,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 undo.Push( _( "Rip up undone (API)" ) );
                 board->GetConnectivity()->RecalculateRatsnest();
                 ripFailed[index].insert( { boardVersion, victims } );
-                s_routeProfile.ripUpsFailedAt[failedAt]++;
+                profile.ripUpsFailedAt[failedAt]++;
 
                 nlohmann::json takenOut = nlohmann::json::array();
 
@@ -6133,7 +6202,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     tryDeadline.reset();
 
     // Gaps between two pieces of a net's copper: from the end of one piece to the other
-    s_routeProfile.pass = "gaps";
+    profile.pass = "gaps";
     std::vector<long> gapRowOf( gaps.size(), -1 );
 
     for( size_t gapIndex = 0; gapIndex < gaps.size(); ++gapIndex )
@@ -6147,7 +6216,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             continue;
 
         gapRowOf[gapIndex] = (long) results.size();
-        s_routeProfile.job = -2 - (long) gapIndex;
+        profile.job = -2 - (long) gapIndex;
 
         auto* a = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( gap.a, true ) );
         auto* b = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( gap.b, true ) );
@@ -6235,8 +6304,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     if( !dryRun && !rail && !grid && aArgs.value( "clean_up", true ) )
     {
-        s_routeProfile.pass = "clean_up";
-        s_routeProfile.job = -1;
+        profile.pass = "clean_up";
+        profile.job = -1;
 
         struct CLEAN_TRY
         {
@@ -6340,7 +6409,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             }
 
             cleanTried++;
-            s_routeProfile.job = (long) c.index;
+            profile.job = (long) c.index;
 
             const int netCode = job.from->GetNetCode();
             std::vector<std::unique_ptr<PCB_TRACK>> saved;
@@ -6523,9 +6592,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 auto who = [&]( PCB_TRACK* aTrack ) -> nlohmann::json
                 {
-                    auto it = s_routeProfile.laid.find( aTrack->m_Uuid );
+                    auto it = profile.laid.find( aTrack->m_Uuid );
 
-                    if( it == s_routeProfile.laid.end() )
+                    if( it == profile.laid.end() )
                         return { { "uuid", aTrack->m_Uuid.AsStdString() }, { "key", copperKey( aTrack ) } };
 
                     return { { "uuid", aTrack->m_Uuid.AsStdString() }, { "key", copperKey( aTrack ) }, { "pass", it->second.pass },
@@ -6648,7 +6717,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     nlohmann::json                              moved = nlohmann::json::array();
     const std::map<int, std::pair<int, double>> copperAfter = copperOf();
 
-    for( int net : s_routeProfile.shovedNets )
+    for( int net : profile.shovedNets )
     {
         auto before = copperBefore.find( net );
         auto after = copperAfter.find( net );
@@ -6688,9 +6757,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( PCB_TRACK* t : board->Tracks() )
         {
-            auto it = s_routeProfile.laid.find( t->m_Uuid );
+            auto it = profile.laid.find( t->m_Uuid );
 
-            if( it == s_routeProfile.laid.end() || it->second.job == -1 )
+            if( it == profile.laid.end() || it->second.job == -1 )
                 continue;
 
             nlohmann::json seg = { { "kind", t->Type() == PCB_VIA_T ? "via" : "track" },
@@ -6770,27 +6839,27 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "unrouted_nets", openAtEnd->nets },
                               { "zone_fills", openAtEnd->zoneFills },
                               { "ms", std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() },
-                              { "profile", { { "attempts", s_routeProfile.attempts },
-                                             { "dead_legs_skipped", s_routeProfile.deadLegsSkipped },
-                                             { "via_spots_blocked", s_routeProfile.viaSpotsBlocked },
-                                             { "via_spots_off_board", s_routeProfile.viaSpotsOffBoard },
-                                             { "rip_ups_skipped", s_routeProfile.ripUpsSkipped },
-                                             { "rip_ups_planned", s_routeProfile.ripUpsPlanned },
-                                             { "rip_ups_walled", s_routeProfile.ripUpsWalled },
-                                             { "rip_ups_failed_at", s_routeProfile.ripUpsFailedAt },
-                                             { "rip_ups_second", s_routeProfile.ripUpsSecond },
-                                             { "pairs_stuck", s_routeProfile.pairsStuck },
-                                             { "pad_exits", { { "tried", s_routeProfile.padExitsTried }, { "won", s_routeProfile.padExitsWon } } },
-                                             { "plans", s_routeProfile.plans },
-                                             { "plans_found", s_routeProfile.plansFound },
-                                             { "plans_whole_board", s_routeProfile.plansWholeBoard },
-                                             { "plan_ms", std::round( s_routeProfile.planMs ) },
-                                             { "sync_ms", std::round( s_routeProfile.syncMs ) },
-                                             { "move_ms", std::round( s_routeProfile.moveMs ) },
-                                             { "route_ms", std::round( s_routeProfile.totalMs - s_routeProfile.syncMs ) },
-                                             { "by_kind", tallies( s_routeProfile.byKind ) },
-                                             { "failed_by", tallies( s_routeProfile.byFailure ) },
-                                             { "by_pass", tallies( s_routeProfile.byPass ) } } } };
+                              { "profile", { { "attempts", profile.attempts },
+                                             { "dead_legs_skipped", profile.deadLegsSkipped },
+                                             { "via_spots_blocked", profile.viaSpotsBlocked },
+                                             { "via_spots_off_board", profile.viaSpotsOffBoard },
+                                             { "rip_ups_skipped", profile.ripUpsSkipped },
+                                             { "rip_ups_planned", profile.ripUpsPlanned },
+                                             { "rip_ups_walled", profile.ripUpsWalled },
+                                             { "rip_ups_failed_at", profile.ripUpsFailedAt },
+                                             { "rip_ups_second", profile.ripUpsSecond },
+                                             { "pairs_stuck", profile.pairsStuck },
+                                             { "pad_exits", { { "tried", profile.padExitsTried }, { "won", profile.padExitsWon } } },
+                                             { "plans", profile.plans },
+                                             { "plans_found", profile.plansFound },
+                                             { "plans_whole_board", profile.plansWholeBoard },
+                                             { "plan_ms", std::round( profile.planMs ) },
+                                             { "sync_ms", std::round( profile.syncMs ) },
+                                             { "move_ms", std::round( profile.moveMs ) },
+                                             { "route_ms", std::round( profile.totalMs - profile.syncMs ) },
+                                             { "by_kind", tallies( profile.byKind ) },
+                                             { "failed_by", tallies( profile.byFailure ) },
+                                             { "by_pass", tallies( profile.byPass ) } } } };
 
     cap.Put( answer, "other_nets_moved", std::move( moved ) );
 
@@ -6888,8 +6957,12 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         else
             fillCommit.Revert();
 
+        KopenapiKeepUiAlive();
+        KopenapiReadPoint();
         board->BuildConnectivity();
+        KopenapiKeepUiAlive();
         board->GetConnectivity()->RecalculateRatsnest();
+        KopenapiKeepUiAlive();
     };
 
     refill();
@@ -6999,6 +7072,10 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         for( size_t endIndex = 0; endIndex < ends.size(); ++endIndex )
         {
             const auto& [item, pos] = ends[endIndex];
+
+            // between ends the board is consistent: paint, and let waiting readers in
+            KopenapiKeepUiAlive();
+            KopenapiReadPoint();
 
             const int            open = KopenapiUnrouted( board, false ).connections;
             const nlohmann::json counts = { { "pass", pass + 1 },
@@ -7128,17 +7205,45 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
             std::map<std::pair<int, int>, bool> planeAt;
 
-            for( const VECTOR2I& at : candidates )
-                planeAt.emplace( std::make_pair( at.x, at.y ), onPlane( at ) );
+            // the 400 best spots (on the plane first, then the shortest stub; ties in candidate
+            // order), keys computed once: a zone island yields tens of thousands of spots
+            struct SPOT_KEY
+            {
+                bool   plane;
+                double stub;
+                size_t index;
+            };
 
-            std::stable_sort( candidates.begin(), candidates.end(), [&]( const VECTOR2I& x, const VECTOR2I& y )
-                              {
-                                  const bool px = planeAt[{ x.x, x.y }], py = planeAt[{ y.x, y.y }];
-                                  return px != py ? px : stubLength( x ) < stubLength( y );
-                              } );
+            std::vector<SPOT_KEY> keys;
+            keys.reserve( candidates.size() );
 
-            if( candidates.size() > 400 )
-                candidates.resize( 400 );
+            for( size_t i = 0; i < candidates.size(); ++i )
+            {
+                const VECTOR2I& at = candidates[i];
+                const bool      plane = planeAt.emplace( std::make_pair( at.x, at.y ), onPlane( at ) ).first->second;
+                keys.push_back( { plane, static_cast<double>( stubLength( at ) ), i } );
+            }
+
+            const size_t keep = std::min<size_t>( keys.size(), 400 );
+            std::partial_sort( keys.begin(), keys.begin() + keep, keys.end(),
+                               []( const SPOT_KEY& x, const SPOT_KEY& y )
+                               {
+                                   if( x.plane != y.plane )
+                                       return x.plane;
+
+                                   if( x.stub != y.stub )
+                                       return x.stub < y.stub;
+
+                                   return x.index < y.index;
+                               } );
+
+            std::vector<VECTOR2I> best;
+            best.reserve( keep );
+
+            for( size_t i = 0; i < keep; ++i )
+                best.push_back( candidates[keys[i].index] );
+
+            candidates = std::move( best );
 
             const int offPlaneBefore = offPlaneSkipped;
             std::map<std::string, int> underSkipped;   // spots under a part's body, per part
@@ -7239,6 +7344,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                     }
 
                     commit.Push( _( "Stitching via (API)" ) );
+                    KopenapiKeepUiAlive();
                     fresh_vias.push_back( { item, added.end()[hasTrack ? -2 : -1], hasTrack ? added.back() : niluuid, at, layer } );
                     placed.push_back( { { "via", str( fresh_vias.back().via.AsString() ) },
                                         { "at_mm", { toMm( at.x ), toMm( at.y ) } },
@@ -7334,6 +7440,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     {
         board->BuildConnectivity();
+        KopenapiKeepUiAlive();
         std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
         BOARD_COMMIT                       tidy( context->GetToolManager() );
         std::set<std::pair<int, int>>      gone;
@@ -7369,7 +7476,9 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         }
     }
 
+    KopenapiKeepUiAlive();
     showRoutes( aCtx, added );
+    KopenapiKeepUiAlive();
 
     nlohmann::json answer = { { "net", str( netName ) },
                                   { "vias", placed },
@@ -7400,6 +7509,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                                             if( zone->GetNetCode() != net->GetNetCode() || zone->GetIsRuleArea() )
                                                 continue;
 
+                                            KopenapiKeepUiAlive();
                                             nlohmann::json            pieces = KopenapiZoneIslands( board, zone );
                                             std::map<std::string, size_t> mainOf;
 
@@ -7437,6 +7547,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     for( const char* key : { "vias", "not_reached", "islands_left" } )
         cap.Put( out, key, answer[key] );
 
+    KopenapiKeepUiAlive();
     out.update( KopenapiUnroutedJson( board ) );
     return KOPENAPI_RESULT::Ok( out );
 }
@@ -10035,3 +10146,4 @@ KOPENAPI_REGISTER( "pcb_route_strategies",
                    false, h_pcb_route_strategies );
 
 KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_tracks_cleanup", "pcb_track_add", "pcb_via_add", "pcb_fanout" );
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_track_list" );

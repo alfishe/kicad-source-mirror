@@ -180,9 +180,17 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     // Every track error by default: with one error per track KiCad keeps whichever segment its
     // threads report first, so repeated runs differ (seen on Sprinter DX: 2..4 clearance errors)
     engine->SetProgressReporter( &reporter );
+
+    // The caches the tests read (connectivity, R-trees) are built here, by the owner; the tests
+    // only read the board (off the GUI thread, readers read alongside); markers reach the board in
+    // the commit below
     engine->SetLogReporter( &watch );
-    engine->RunTests( EDA_UNITS::MM, aArgs.value( "all_track_errors", true ), false );
+
+    if( engine->PrepareTests( EDA_UNITS::MM, aArgs.value( "all_track_errors", true ), false ) )
+        KopenapiCompute( [&]() { engine->RunProviders( EDA_UNITS::MM ); } );
+
     engine->SetLogReporter( nullptr );
+
     engine->SetProgressReporter( nullptr );
 
     const bool stopped = reporter.IsCancelled();

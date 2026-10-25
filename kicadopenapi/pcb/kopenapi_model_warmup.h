@@ -13,8 +13,9 @@ class BOARD;
 /// largest files first, and stops under memory pressure or once its budget is spent.
 void KopenapiWarmModels( BOARD* aBoard );
 
-/// @brief Stops the warm-up and waits for it (at most the model being read)
-void KopenapiStopWarmModels();
+/// @brief Stops the warm-up and waits for it (at most the model being read); aKeepUiAlive: the UI
+/// paints meanwhile (not from a destructor)
+void KopenapiStopWarmModels( bool aKeepUiAlive = false );
 
 /// @brief State for memory_summary: running, models done / queued, bytes, why it stopped
 nlohmann::json KopenapiWarmModelsStatus();

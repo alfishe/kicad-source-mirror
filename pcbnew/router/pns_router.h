@@ -186,6 +186,22 @@ public:
     /// @brief Make another router the current one (a temporary router restores the previous one)
     static void SetInstance( ROUTER* aRouter );
 
+    /// @brief While alive, routers made on this thread are current on this thread only: the editor's
+    /// router stays current everywhere else and a router used off the main thread never sees it
+    class THREAD_SCOPE
+    {
+    public:
+        THREAD_SCOPE();
+        ~THREAD_SCOPE();
+
+        THREAD_SCOPE( const THREAD_SCOPE& ) = delete;
+        THREAD_SCOPE& operator=( const THREAD_SCOPE& ) = delete;
+
+    private:
+        bool    m_prevScoped;
+        ROUTER* m_prevRouter;
+    };
+
     void ClearWorld();
 
     /// @brief Builds the world from the board now

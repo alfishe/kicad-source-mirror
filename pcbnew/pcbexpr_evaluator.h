@@ -244,9 +244,10 @@ public:
         return self;
     }
 
-    LIBEVAL::FUNC_CALL_REF Get( const wxString& name )
+    LIBEVAL::FUNC_CALL_REF Get( const wxString& name ) const
     {
-        return m_funcs[ name ];
+        auto it = m_funcs.find( name );
+        return it != m_funcs.end() ? it->second : LIBEVAL::FUNC_CALL_REF();
     }
 
     bool IsGeometryDependent( const wxString& name ) const

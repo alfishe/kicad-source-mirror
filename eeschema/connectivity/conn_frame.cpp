@@ -18,6 +18,7 @@
  */
 
 #include "conn_frame.h"
+#include <model_thread.h>
 
 #include <sch_screen.h>
 #include <sch_sheet_path.h>
@@ -29,7 +30,7 @@ namespace SCH_CONNECTIVITY
 {
 std::vector<FRAME_INSTANCE> CaptureHierarchy( const SCH_SHEET_LIST& aPaths, SESSION_KEYS& aKeys )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::map<KIID_PATH, std::pair<const SCH_SHEET_PATH*, size_t>> paths;
 
     for( const SCH_SHEET_PATH& path : aPaths )

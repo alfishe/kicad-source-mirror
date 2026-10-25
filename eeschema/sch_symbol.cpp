@@ -19,6 +19,9 @@
  */
 
 #include <netclass.h>
+#include <array>
+#include <cstdint>
+#include <mutex>
 #include <api/api_enums.h>
 #include <connectivity/conn_text.h>
 #include <api/api_utils.h>
@@ -4862,6 +4865,13 @@ void SCH_SYMBOL::AddVariant( const SCH_SHEET_PATH& aInstance, const SCH_SYMBOL_V
 }
 
 
+static std::mutex& variantCacheMutex( const SCH_SYMBOL* aSymbol )
+{
+    static std::array<std::mutex, 64> stripes;
+    return stripes[( reinterpret_cast<std::uintptr_t>( aSymbol ) >> 6 ) % stripes.size()];
+}
+
+
 LIB_SYMBOL* SCH_SYMBOL::GetVariantLibSymbol( const wxString&      aVariantName,
                                               const SCH_SHEET_PATH& aPath ) const
 {
@@ -4884,17 +4894,28 @@ LIB_SYMBOL* SCH_SYMBOL::GetVariantLibSymbol( const wxString&      aVariantName,
     // Cache by LIB_ID string so hierarchical instances sharing the same alternate symbol
     // reuse a single flattened copy regardless of sheet path or variant name.  Failed
     // resolutions are cached as nullptr to keep unresolvable overrides from hitting the
-    // library adapter on every paint.
-    auto cacheIt = m_variantSymbolCache.find( libIdStr );
+    // library adapter on every paint.  Leased readers resolve together: the library is read
+    // outside the lock and the first result kept.
+    std::mutex& cacheMutex = variantCacheMutex( this );
 
-    if( cacheIt != m_variantSymbolCache.end() )
-        return cacheIt->second.get();
+    {
+        std::lock_guard lock( cacheMutex );
+        auto            cacheIt = m_variantSymbolCache.find( libIdStr );
+
+        if( cacheIt != m_variantSymbolCache.end() )
+            return cacheIt->second.get();
+    }
+
+    const auto keep =
+            [&]( std::unique_ptr<LIB_SYMBOL> aSymbol ) -> LIB_SYMBOL*
+            {
+                std::lock_guard lock( cacheMutex );
+                auto [it, inserted] = m_variantSymbolCache.try_emplace( libIdStr, std::move( aSymbol ) );
+                return it->second.get();
+            };
 
     if( libId == m_lib_id )
-    {
-        m_variantSymbolCache[libIdStr] = nullptr;
-        return nullptr;
-    }
+        return keep( nullptr );
 
     SCHEMATIC* schematic = Schematic();
 
@@ -4910,25 +4931,19 @@ LIB_SYMBOL* SCH_SYMBOL::GetVariantLibSymbol( const wxString&      aVariantName,
     {
         if( LIB_SYMBOL* libSymbol = adapter->LoadSymbol( libId ) )
         {
-            std::unique_ptr<LIB_SYMBOL>& cached = m_variantSymbolCache[libIdStr];
+            std::unique_ptr<LIB_SYMBOL> flat = libSymbol->Flatten();
 
-            cached = libSymbol->Flatten();
+            if( m_part && flat && !ValidateVariantSymbolCompatibility( *m_part, *flat ).empty() )
+                flat.reset();
 
-            if( m_part && cached && !ValidateVariantSymbolCompatibility( *m_part, *cached ).empty() )
-            {
-                cached.reset();
-                return nullptr;
-            }
-
-            return cached.get();
+            return keep( std::move( flat ) );
         }
     }
     catch( const IO_ERROR& )
     {
     }
 
-    m_variantSymbolCache[libIdStr] = nullptr;
-    return nullptr;
+    return keep( nullptr );
 }
 
 

@@ -19,6 +19,7 @@
  */
 
 #include <connectivity/conn_presentation.h>
+#include <model_thread.h>
 #include <netclass.h>
 #include <sch_draw_panel.h>
 #include <trigo.h>
@@ -126,25 +127,30 @@ std::vector<int> SCH_JUNCTION::ViewGetLayers() const
 
 SHAPE_CIRCLE SCH_JUNCTION::getEffectiveShape() const
 {
-    if( m_diameter != 0 )
-        m_lastResolvedDiameter = m_diameter;
-    else if( Schematic() )
-        m_lastResolvedDiameter = Schematic()->Settings().GetJunctionSize();
-    else
-        m_lastResolvedDiameter = schIUScale.MilsToIU( DEFAULT_JUNCTION_DIAM );
+    auto resolvedDiameter = m_lastResolvedDiameter;
 
-    if( m_lastResolvedDiameter != 1 )  // Diameter 1 means user doesn't want to draw junctions
+    if( m_diameter != 0 )
+        resolvedDiameter = m_diameter;
+    else if( Schematic() )
+        resolvedDiameter = Schematic()->Settings().GetJunctionSize();
+    else
+        resolvedDiameter = schIUScale.MilsToIU( DEFAULT_JUNCTION_DIAM );
+
+    if( resolvedDiameter != 1 )  // Diameter 1 means user doesn't want to draw junctions
     {
         // If we know what we're connected to, then enforce a minimum size of 170% of the
         // connected wire width:
         if( !IsConnectivityDirty() )
         {
-            m_lastResolvedDiameter = std::max<int>( m_lastResolvedDiameter,
-                                                    GetEffectiveNetClass()->GetWireWidth() * 1.7 );
+            resolvedDiameter = std::max<int>( resolvedDiameter,
+                                              GetEffectiveNetClass()->GetWireWidth() * 1.7 );
         }
     }
 
-    return SHAPE_CIRCLE( m_pos, std::max( m_lastResolvedDiameter / 2, 1 ) );
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedDiameter = resolvedDiameter;
+
+    return SHAPE_CIRCLE( m_pos, std::max( resolvedDiameter / 2, 1 ) );
 }
 
 
@@ -209,12 +215,17 @@ void SCH_JUNCTION::SetDiameter( int aDiameter )
 
 COLOR4D SCH_JUNCTION::GetJunctionColor() const
 {
-    if( m_color != COLOR4D::UNSPECIFIED )
-        m_lastResolvedColor = m_color;
-    else if( !IsConnectivityDirty() )
-        m_lastResolvedColor = GetEffectiveNetClass()->GetSchematicColor();
+    auto resolvedColor = m_lastResolvedColor;
 
-    return m_lastResolvedColor;
+    if( m_color != COLOR4D::UNSPECIFIED )
+        resolvedColor = m_color;
+    else if( !IsConnectivityDirty() )
+        resolvedColor = GetEffectiveNetClass()->GetSchematicColor();
+
+    if( MODEL_THREAD::MayWrite() )
+        m_lastResolvedColor = resolvedColor;
+
+    return resolvedColor;
 }
 
 

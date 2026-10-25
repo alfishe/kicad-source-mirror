@@ -132,6 +132,10 @@ struct KOPENAPI_DOC_HISTORY
     /// @brief Headless: an editing call succeeded; mark the open document unsaved when its commits
     /// do not (status, the bridge's idle stop and app_quit read that flag)
     std::function<void( KOPENAPI_CONTEXT& )> edited;
+
+    /// @brief After every editing call, on the owner: the document's derived data (a board's
+    /// ratsnest) brought up to date, so readers find nothing to rebuild
+    std::function<void( KOPENAPI_CONTEXT& )> afterEdit;
 };
 
 
@@ -276,6 +280,15 @@ public:
 
     bool IsEditing( const std::string& aName ) const;
 
+    /// @brief Methods that only read documents: no frames, no library waits, no cache filled
+    /// without MODEL_THREAD::MayWrite().  A headless service answers them on the HTTP thread under
+    /// a read lease, so they never wait for a call or job; a handler that throws
+    /// KOPENAPI_RETRY_LATER (stale schematic connectivity) is sent to the owner instead
+    static bool MarkConcurrentReads( std::initializer_list<const char*> aNames );
+
+    /// @brief Marked by MarkConcurrentReads and not by MarkEditing
+    bool IsConcurrentRead( const std::string& aName ) const;
+
     std::optional<KOPENAPI_METHOD> Find( const std::string& aName ) const;
 
     /// @brief Keyword search for the MCP `search` tool: query tokens are matched against method
@@ -304,6 +317,7 @@ private:
     std::map<std::string, KOPENAPI_HANDLER>     m_viewBenchmarks;
     std::map<std::string, KOPENAPI_EVENT_TOPIC> m_eventTopics;
     std::set<std::string>                       m_editing;
+    std::set<std::string>                       m_concurrentReads;
 };
 
 
@@ -322,6 +336,10 @@ private:
 /// @brief The methods of this file that change documents: KOPENAPI_MARK_EDITING( "sch_wire", ... )
 #define KOPENAPI_MARK_EDITING( ... )                                                        \
     static const bool kopenapi_editing_reg = KOPENAPI_REGISTRY::MarkEditing( { __VA_ARGS__ } )
+
+/// @brief The methods of this file that read concurrently (see KOPENAPI_REGISTRY::MarkConcurrentReads)
+#define KOPENAPI_MARK_CONCURRENT_READS( ... )                                               \
+    static const bool kopenapi_concurrent_reads_reg = KOPENAPI_REGISTRY::MarkConcurrentReads( { __VA_ARGS__ } )
 
 #define KOPENAPI_REGISTER_VIEW_BENCHMARK( aDomain, aHandler )                              \
     static const bool kopenapi_view_bench_reg = KOPENAPI_REGISTRY::AddViewBenchmark( aDomain, aHandler )

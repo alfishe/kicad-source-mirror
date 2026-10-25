@@ -5076,4 +5076,5 @@ KOPENAPI_REGISTER( "sch_sheet_pin_add",
                         "create_labels":{"type":"boolean","default":false,"description":"a hierarchical label per pin inside the sheet's file"}}})json" ),
                    false, h_sch_sheet_pin_add );
 
-KOPENAPI_MARK_EDITING( "sch_symbol_add", "sch_symbol_update", "sch_items_move", "sch_item_delete", "sch_connect", "sch_wire", "sch_rewire", "sch_texts_settle", "sch_power_add", "sch_label_add", "sch_no_connect", "sch_annotate", "sch_lock", "sch_unlock", "sch_sheet_add", "sch_sheet_pin_add" );
+KOPENAPI_MARK_EDITING( "sch_symbol_add", "sch_symbol_update", "sch_items_move", "sch_item_delete", "sch_connect", "sch_wire", "sch_rewire", "sch_texts_settle", "sch_power_add", "sch_label_add", "sch_no_connect", "sch_annotate", "sch_lock", "sch_unlock", "sch_sheet_add", "sch_sheet_pin_add", "sch_blocks_arrange", "sch_page_set" );
+KOPENAPI_MARK_CONCURRENT_READS( "sch_item_list" );

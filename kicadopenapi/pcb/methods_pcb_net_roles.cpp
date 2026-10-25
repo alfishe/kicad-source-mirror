@@ -1109,3 +1109,5 @@ KOPENAPI_REGISTER( "pcb_net_roles_set",
                         "accept_bundles":{"type":"array","items":{"type":"string"}},
                         "clear":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_net_roles_set );
+
+KOPENAPI_MARK_EDITING( "pcb_net_roles_set" );

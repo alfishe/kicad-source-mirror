@@ -36,6 +36,8 @@
 #include <set>
 #include <vector>
 #include <memory>
+#include <atomic>
+#include <mutex>
 #include <eda_units.h>
 
 class PROPERTY_BASE;
@@ -383,8 +385,14 @@ private:
     /// Map of all available types
     std::unordered_map<TYPE_ID, CLASS_DESC> m_classes;
 
+    /// Rebuild the property lists if a registration changed them; safe from several readers
+    void ensureBuilt() const;
+
     /// Flag indicating that the list of properties needs to be rebuild (RebuildProperties())
-    bool m_dirty;
+    mutable std::atomic<bool> m_dirty;
+
+    /// Serializes the rebuild a reader triggers
+    mutable std::mutex m_rebuildMutex;
 
     std::map<TYPE_ID,
              std::vector<std::pair<PROPERTY_LISTENER_HANDLE, PROPERTY_LISTENER>>> m_listeners;

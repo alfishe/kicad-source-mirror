@@ -14,6 +14,8 @@
 #include <json_common.h>
 #include <kicommon.h>
 
+class wxLog;
+
 
 class KICOMMON_API KOPENAPI_JOURNAL
 {
@@ -22,10 +24,18 @@ public:
     /// main thread; the current operation starts as "startup".
     static void Install( const std::string& aAppName );
 
-    /// @brief Operation that log records are attributed to (main-thread work in progress)
+    /// @brief A journal log target for wxLog::SetThreadActiveTarget on a thread that works on the
+    /// documents (records go to the journal at once, not buffered for the main thread); never
+    /// deleted
+    static wxLog* ThreadTarget();
+
+    /// @brief Operation that log records are attributed to when their thread is in no SCOPED_OPERATION
     static void SetOperation( const std::string& aOperation );
 
-    /// @brief Sets the operation for a scope and restores the previous one
+    /// @brief The operation this thread's log records are attributed to now
+    static std::string Operation();
+
+    /// @brief Sets the operation of this thread's log records for a scope and restores the previous one
     class KICOMMON_API SCOPED_OPERATION
     {
     public:

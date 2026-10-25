@@ -845,3 +845,5 @@ KOPENAPI_REGISTER( "pcb_render_3d",
                         "floor":{"type":"boolean","default":false},
                         "quality":{"type":"string","enum":["basic","high"],"default":"basic"}}})json"_json,
                    false, h_pcb_render_3d, 600 );
+
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_layer_list" );

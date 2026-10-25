@@ -133,6 +133,10 @@ public:
     void SetShoveTimeLimit( int aMilliseconds ) { m_shoveTimeLimit.Set( aMilliseconds ); }
     void SetShoveIterationLimit( int aIterations ) { m_shoveIterationLimit = aIterations; }
 
+    /// @brief Wall-clock limit of one walkaround cluster in ms; 0 means the advanced config value
+    int ClusterTimeout() const;
+    void SetClusterTimeout( int aMilliseconds ) { m_clusterTimeout = aMilliseconds; }
+
     int WalkaroundIterationLimit() const { return m_walkaroundIterationLimit; };
     TIME_LIMIT WalkaroundTimeLimit() const;
 
@@ -203,6 +207,7 @@ private:
 
     TIME_LIMIT m_shoveTimeLimit;
     TIME_LIMIT m_walkaroundTimeLimit;
+    int        m_clusterTimeout = 0;
 };
 
 }

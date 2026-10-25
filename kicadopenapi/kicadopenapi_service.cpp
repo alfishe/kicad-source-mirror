@@ -8,6 +8,8 @@
 #include "kicadopenapi_remote.h"
 #include "kicadopenapi_libraries.h"
 #include "kicadopenapi_jobs.h"
+#include "threading/kicadopenapi_doc_gate.h"
+#include "kicadopenapi_change_feed.h"
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +25,7 @@
 #include "kicadopenapi_args.h"
 #include "kicadopenapi_call_ticket.h"
 #include <cmath>
+#include <condition_variable>
 #include <mutex>
 #include <deque>
 #include <map>
@@ -38,10 +41,12 @@
 #include <kiway.h>
 #include <wx/app.h>
 #include <wx/log.h>
+#include <wx/timer.h>
 #include <kicadopenapi_util.h>
 #include <wx/datetime.h>
 
 #include <platform.h>
+#include <model_thread.h>
 
 static const char* const KOPENAPI_VERSION = "0.2.0";
 static const char* const KOPENAPI_HOST_ADDR = "127.0.0.1";
@@ -322,14 +327,198 @@ private:
 };
 
 
+using DISPATCH_TASK = std::shared_ptr<std::function<void()>>;
+
+
+/// @brief Where API calls and jobs run.  Calls go before jobs; a job's safe point serves the
+/// calls queued so far (ServeQueuedCalls).
+class CALL_DISPATCH
+{
+public:
+    virtual ~CALL_DISPATCH() = default;
+
+    /// @brief Any thread
+    virtual void QueueCall( DISPATCH_TASK aTask ) = 0;
+    virtual void QueueJob( DISPATCH_TASK aTask ) = 0;
+
+    /// @brief On the dispatch thread: runs the calls queued now, none of what arrives meanwhile
+    virtual void ServeQueuedCalls() = 0;
+
+    virtual bool OnDispatchThread() const = 0;
+};
+
+
+/// @brief GUI: the wx main loop, by thread events
+class MAIN_LOOP_DISPATCH : public CALL_DISPATCH
+{
+public:
+    void QueueCall( DISPATCH_TASK aTask ) override { queue( MAIN_GATE_HANDLER::Get(), std::move( aTask ) ); }
+
+    void QueueJob( DISPATCH_TASK aTask ) override { queue( MAIN_GATE_HANDLER::Jobs(), std::move( aTask ) ); }
+
+    void ServeQueuedCalls() override
+    {
+        MAIN_GATE_HANDLER& gate = MAIN_GATE_HANDLER::Get();
+
+        // one event per ProcessPendingEvents
+        for( int left = gate.Queued(); left > 0 && gate.Queued() > 0; --left )
+            gate.ProcessPendingEvents();
+    }
+
+    bool OnDispatchThread() const override { return wxThread::IsMain(); }
+
+private:
+    static void queue( MAIN_GATE_HANDLER& aGate, DISPATCH_TASK aTask )
+    {
+        auto* event = new wxThreadEvent();
+        event->SetPayload( std::move( aTask ) );
+        aGate.Queue( event );
+    }
+};
+
+
+/// @brief Headless: the document owner strand, one std::thread running queued closures in a
+/// MODEL_THREAD writer scope, with no wx event dispatch.  The main thread never touches the
+/// documents while it runs.
+class OWNER_STRAND_DISPATCH : public CALL_DISPATCH
+{
+public:
+    OWNER_STRAND_DISPATCH() : m_thread( STACK_BYTES, [this]() { run(); } ) {}
+
+    ~OWNER_STRAND_DISPATCH() override { Stop(); }
+
+    void QueueCall( DISPATCH_TASK aTask ) override { push( m_calls, std::move( aTask ) ); }
+
+    void QueueJob( DISPATCH_TASK aTask ) override { push( m_jobs, std::move( aTask ) ); }
+
+    void ServeQueuedCalls() override
+    {
+        size_t left;
+
+        {
+            std::lock_guard<std::mutex> lock( m_mutex );
+            left = m_calls.size();
+        }
+
+        for( ; left > 0; --left )
+        {
+            DISPATCH_TASK task;
+
+            {
+                std::lock_guard<std::mutex> lock( m_mutex );
+
+                if( m_calls.empty() )
+                    return;
+
+                task = std::move( m_calls.front() );
+                m_calls.pop_front();
+            }
+
+            ( *task )();
+        }
+    }
+
+    bool OnDispatchThread() const override { return std::this_thread::get_id() == m_threadId.load(); }
+
+    /// @brief Runs what is still queued (the tasks see the service stopping) and joins
+    void Stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock( m_mutex );
+            m_stop = true;
+        }
+
+        m_cv.notify_all();
+
+        if( !OnDispatchThread() )
+            m_thread.Join();
+    }
+
+private:
+    void push( std::deque<DISPATCH_TASK>& aQueue, DISPATCH_TASK aTask )
+    {
+        {
+            std::lock_guard<std::mutex> lock( m_mutex );
+            aQueue.push_back( std::move( aTask ) );
+        }
+
+        m_cv.notify_one();
+    }
+
+    void run()
+    {
+        m_threadId = std::this_thread::get_id();
+        wxLog::SetThreadActiveTarget( KOPENAPI_JOURNAL::ThreadTarget() );
+        MODEL_THREAD::SCOPE owner( MODEL_THREAD::KIND::OWNER );
+
+        for( ;; )
+        {
+            DISPATCH_TASK task;
+
+            {
+                std::unique_lock<std::mutex> lock( m_mutex );
+                m_cv.wait( lock, [this]() { return m_stop || !m_calls.empty() || !m_jobs.empty(); } );
+
+                std::deque<DISPATCH_TASK>& queue = !m_calls.empty() ? m_calls : m_jobs;
+
+                if( queue.empty() )
+                    break;
+
+                task = std::move( queue.front() );
+                queue.pop_front();
+            }
+
+            ( *task )();
+        }
+
+        wxLog::SetThreadActiveTarget( nullptr );
+    }
+
+    std::mutex                m_mutex;
+    std::condition_variable   m_cv;
+    std::deque<DISPATCH_TASK> m_calls;
+    std::deque<DISPATCH_TASK> m_jobs;
+    bool                      m_stop = false;
+    std::atomic<std::thread::id> m_threadId;
+
+    /// KiCad code is written for the main thread's stack (8 MB); handlers keep large frames
+    static constexpr size_t   STACK_BYTES = 16 * 1024 * 1024;
+
+    kopenapi::platform::THREAD m_thread;
+};
+
+
+static MAIN_LOOP_DISPATCH                 s_mainLoopDispatch;
+static std::atomic<CALL_DISPATCH*>        s_dispatch{ &s_mainLoopDispatch };
+
+
+static CALL_DISPATCH& dispatch()
+{
+    return *s_dispatch.load();
+}
+
+
 void KopenapiServeQueuedCalls()
 {
-    MAIN_GATE_HANDLER& gate = MAIN_GATE_HANDLER::Get();
-
-    // one event per ProcessPendingEvents; what arrives meanwhile waits for the next safe point
-    for( int left = gate.Queued(); left > 0 && gate.Queued() > 0; --left )
-        gate.ProcessPendingEvents();
+    dispatch().ServeQueuedCalls();
 }
+
+
+bool KopenapiOnDispatchThread()
+{
+    return dispatch().OnDispatchThread();
+}
+
+
+/// @brief How long a lease read waits for the owner's write before it queues on the strand
+static constexpr std::chrono::milliseconds LEASE_WAIT{ 200 };
+
+/// @brief A lease read past this while a write waits is journaled (revoked, then stuck)
+static constexpr std::chrono::milliseconds LEASE_BUDGET{ 2000 };
+
+
+/// @brief The owner strand's write through MODEL_THREAD::WRITE_SECTION
+static thread_local std::optional<KOPENAPI_WRITE_SCOPE> tlOwnerWrite;
 
 
 /// @brief Run aFn on the main (GUI/event-loop) thread and wait for its result on the calling HTTP
@@ -386,9 +575,7 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
                 }
             } );
 
-    auto* event = new wxThreadEvent();
-    event->SetPayload( job );
-    MAIN_GATE_HANDLER::Get().Queue( event );
+    dispatch().QueueCall( job );
 
     if( aWaker )
         aWaker();
@@ -430,6 +617,68 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
 }
 
 
+/// @brief How late the GUI main thread serves its native events (KICAD_OPENAPI_MAIN_PROBE=1): a
+/// 20 ms timer on the main thread; each sample is how much later than due it fired, the wait a
+/// paint or a wheel event has too.  GET /api/v1/main_loop reads it (?reset=1 clears).
+/// (A posted call, CallAfter, would measure wx's own queue, which yields for paint and input skip.)
+class MAIN_LOOP_PROBE : public wxTimer
+{
+public:
+    MAIN_LOOP_PROBE()
+    {
+        m_last = std::chrono::steady_clock::now();
+        Start( INTERVAL_MS );
+    }
+
+    ~MAIN_LOOP_PROBE() override { Stop(); }
+
+    void Notify() override
+    {
+        const auto   now = std::chrono::steady_clock::now();
+        const double late = std::chrono::duration<double, std::milli>( now - m_last ).count() - INTERVAL_MS;
+        m_last = now;
+
+        std::lock_guard<std::mutex> lock( m_mutex );
+
+        if( m_samples.size() < MAX_SAMPLES )
+            m_samples.push_back( std::max( 0.0, late ) );
+    }
+
+    nlohmann::json Json( bool aReset )
+    {
+        std::lock_guard<std::mutex> lock( m_mutex );
+        std::vector<double>         v = m_samples;
+        nlohmann::json              out = { { "n", v.size() }, { "interval_ms", INTERVAL_MS } };
+
+        if( !v.empty() )
+        {
+            std::sort( v.begin(), v.end() );
+            auto at = [&]( double q ) { return v[(size_t) ( q * ( v.size() - 1 ) )]; };
+            out["p50_ms"] = at( 0.5 );
+            out["p95_ms"] = at( 0.95 );
+            out["p99_ms"] = at( 0.99 );
+            out["max_ms"] = v.back();
+            out["over_50ms"] = std::count_if( v.begin(), v.end(), []( double x ) { return x > 50; } );
+            out["over_100ms"] = std::count_if( v.begin(), v.end(), []( double x ) { return x > 100; } );
+            out["over_250ms"] = std::count_if( v.begin(), v.end(), []( double x ) { return x > 250; } );
+        }
+
+        if( aReset )
+            m_samples.clear();
+
+        return out;
+    }
+
+private:
+    static constexpr int    INTERVAL_MS = 20;
+    static constexpr size_t MAX_SAMPLES = 1 << 20;
+
+    std::chrono::steady_clock::time_point m_last;
+    std::mutex                            m_mutex;
+    std::vector<double>                   m_samples;
+};
+
+
 struct KICAD_OPENAPI_SERVICE::IMPL
 {
     KOPENAPI_CONTEXT                  ctx;
@@ -441,6 +690,25 @@ struct KICAD_OPENAPI_SERVICE::IMPL
     fs::path                          discoveryFile;
     std::function<void()>             waker;
     std::function<void()>             shutdownHandler;
+    std::unique_ptr<OWNER_STRAND_DISPATCH> strand;
+    std::unique_ptr<KOPENAPI_DOC_GATE>     gate;   ///< every document; the owner (strand or main thread) writes
+    mutable std::atomic<uint64_t>          leaseReadsServed{ 0 };
+    mutable std::atomic<uint64_t>          leaseReadsToOwner{ 0 };   ///< leased, then answered by the owner
+
+    /// GUI: the main thread owns the documents and holds the write except in KopenapiCompute
+    std::optional<MODEL_THREAD::SCOPE>         mainOwner;
+    std::optional<MODEL_THREAD::WRITE_SECTION> mainWrite;
+
+    /// How long a lease read waits for the owner's write: headless the strand's writes are short;
+    /// GUI the main thread writes until it computes, so a read that finds it writing queues at once
+    std::chrono::milliseconds leaseWait{ 0 };
+
+    std::unique_ptr<MAIN_LOOP_PROBE> mainProbe;
+
+    /// @brief A lease read on this (HTTP) thread; nullopt: not granted in time or retry on the strand
+    std::optional<KOPENAPI_RESULT> leaseRead( const std::string& aName, const nlohmann::json& aArgs ) const;
+
+    nlohmann::json gateJson() const;
 
     /// @brief GET /api/v1/progress: the running call's progress without touching the main thread
     nlohmann::json progressJson() const
@@ -461,7 +729,38 @@ struct KICAD_OPENAPI_SERVICE::IMPL
                  { "port", port },
                  { "headless", ctx.headless },
                  { "busy", busyJson() },
+                 { "model_gate", gateJson() },
+                 { "claim", claimJson() },
+                 { "changes", KOPENAPI_CHANGE_FEED::Status() },
                  { "job", KOPENAPI_JOBS::Get().Busy().empty() ? nlohmann::json() : nlohmann::json( KOPENAPI_JOBS::Get().Busy() ) } };
+    }
+
+    /// @brief Who holds the documents as their only writer, or null; any thread.
+    /// long: a queued or running job, or a call that serves others at its safe points: other
+    /// edits are refused (409 with this claim), reads are answered.  short: a call that runs
+    /// to its end: edits posted meanwhile wait and run after it, in order.
+    nlohmann::json claimJson() const
+    {
+        if( const std::string job = KOPENAPI_JOBS::Get().Busy(); !job.empty() )
+            return { { "kind", "long" }, { "source", "job:" + job } };
+
+        std::lock_guard<std::mutex> lock( traceMutex );
+
+        if( busyMethod.empty() )
+            return nullptr;
+
+        return { { "kind", KopenapiJobYielding() ? "long" : "short" }, { "source", "api:" + busyMethod } };
+    }
+
+    /// @brief A 409 for an edit refused by a long claim
+    KOPENAPI_RESULT refusedByClaim( const std::string& aWhy ) const
+    {
+        KOPENAPI_RESULT result = KOPENAPI_RESULT::Error( 409, aWhy );
+
+        if( result.body.contains( "error" ) && result.body["error"].is_object() )
+            result.body["error"]["claim"] = claimJson();
+
+        return result;
     }
 
     /// @brief The call holding the main thread (method, running_ms, progress), or null; any thread
@@ -612,8 +911,13 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::liveStatus() const
 {
     ensureKifaces();
 
+    std::optional<KOPENAPI_RESULT> leased;
+
+    if( gate )
+        leased = leaseRead( "documents", nlohmann::json::object() );
+
     // while a call holds the main thread, answer with the documents seen last
-    if( !busyJson().is_null() )
+    if( !leased && !busyJson().is_null() )
     {
         nlohmann::json status = statusJson();
         std::lock_guard<std::mutex> lock( traceMutex );
@@ -624,12 +928,14 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::liveStatus() const
     }
 
     KOPENAPI_CONTEXT ctxCopy = ctx;
-    KOPENAPI_RESULT  docs = runInMain( alive, waker,
-                                       [ctxCopy]() mutable
-                                       {
-                                           return KOPENAPI_RESULT::Ok(
-                                                   KOPENAPI_REGISTRY::Get().Documents( ctxCopy ) );
-                                       } );
+    KOPENAPI_RESULT  docs = leased && leased->status == 200
+                                    ? KOPENAPI_RESULT::Ok( std::move( leased->body["documents"] ) )
+                                    : runInMain( alive, waker,
+                                                 [ctxCopy]() mutable
+                                                 {
+                                                     return KOPENAPI_RESULT::Ok(
+                                                             KOPENAPI_REGISTRY::Get().Documents( ctxCopy ) );
+                                                 } );
 
     if( docs.status != 200 )
         return docs;
@@ -1067,9 +1373,7 @@ std::string KICAD_OPENAPI_SERVICE::IMPL::queueJob( const std::string& aName, con
                     KOPENAPI_JOBS::Get().Run( id, call );
             } );
 
-    auto* event = new wxThreadEvent();
-    event->SetPayload( job );
-    MAIN_GATE_HANDLER::Jobs().Queue( event );
+    dispatch().QueueJob( job );
 
     if( waker )
         waker();
@@ -1127,13 +1431,24 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     if( KOPENAPI_REGISTRY::Get().IsEditing( aName ) )
     {
         if( const std::string job = KOPENAPI_JOBS::Get().Busy(); !job.empty() )
-            return KOPENAPI_RESULT::Error( 409, "job " + job + " is queued or running and owns the documents: "
-                                                "job_get waits for it, job_cancel stops it" );
+            return refusedByClaim( "job " + job + " is queued or running and owns the documents: "
+                                   "job_get waits for it, job_cancel stops it" );
     }
 
     const bool tracing = traceOn.load( std::memory_order_relaxed );
     const auto received = tracing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     auto       started = tracing ? std::make_shared<std::chrono::steady_clock::time_point>( received ) : nullptr;
+
+    if( gate && KOPENAPI_REGISTRY::Get().IsConcurrentRead( aName ) )
+    {
+        if( std::optional<KOPENAPI_RESULT> read = leaseRead( aName, aArgs ) )
+        {
+            if( tracing )
+                traceCall( aName, aArgs, *read, received, received );
+
+            return *read;
+        }
+    }
 
     const std::chrono::seconds timeout = callTimeout( method->timeoutSec );
     std::optional<KOPENAPI_RESULT> outcomeAsJob;
@@ -1159,6 +1474,99 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
 
     traceCall( aName, aArgs, outcome, received, *started );
     return outcome;
+}
+
+
+std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::leaseRead( const std::string&    aName,
+                                                                     const nlohmann::json& aArgs ) const
+{
+    const std::string   holder = "api:" + aName;
+    KOPENAPI_READ_LEASE lease = gate->Acquire( holder, std::nullopt,
+                                               std::chrono::duration_cast<std::chrono::microseconds>( leaseWait ) );
+
+    // GUI: while a call or job holds the main thread, it lends the documents at its next compute
+    // (a queued call would wait for the whole call); an idle main thread answers at once
+    while( !lease && !ctx.headless && alive->load()
+           && ( !busyJson().is_null() || !KOPENAPI_JOBS::Get().Busy().empty() ) )
+    {
+        lease = gate->Acquire( holder, std::nullopt, std::chrono::milliseconds( 100 ) );
+    }
+
+    if( !lease )
+        return std::nullopt;
+
+    // wxLog keeps a thread's records for the main loop unless the thread has its own target
+    thread_local const bool logTarget = ( wxLog::SetThreadActiveTarget( KOPENAPI_JOURNAL::ThreadTarget() ), true );
+    (void) logTarget;
+
+    MODEL_THREAD::SCOPE                reader( MODEL_THREAD::KIND::READER );
+    MODEL_THREAD::REFUSE_WRITES        readOnly;
+    KOPENAPI_JOURNAL::SCOPED_OPERATION operation( "api:" + aName );
+    KOPENAPI_CONTEXT                   ctxCopy = ctx;
+
+    try
+    {
+        std::optional<KOPENAPI_METHOD> method = KOPENAPI_REGISTRY::Get().Find( aName );
+
+        if( !method )
+            return std::nullopt;
+
+        KOPENAPI_RESULT result = method->handler( ctxCopy, aArgs );
+        leaseReadsServed++;
+
+        if( result.status < 400 )
+        {
+            addPoints( result.body, 0 );
+        }
+        else
+        {
+            const std::string message = result.body.contains( "error" ) && result.body["error"].is_object()
+                                                ? result.body["error"].value( "message", std::string() )
+                                                : std::string();
+            wxLogWarning( "%s", wxString::FromUTF8( "api:" + aName + " failed (" + std::to_string( result.status )
+                                                    + "): " + message ) );
+        }
+
+        return result;
+    }
+    catch( const KOPENAPI_RETRY_LATER& )
+    {
+        leaseReadsToOwner++;
+        return std::nullopt;
+    }
+    catch( const MODEL_THREAD::WRITE_REFUSED& )
+    {
+        leaseReadsToOwner++;
+        return std::nullopt;   // a read that would write: the owner answers it
+    }
+    catch( const std::exception& e )
+    {
+        return KOPENAPI_RESULT::Error( 500, e.what() );
+    }
+}
+
+
+nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::gateJson() const
+{
+    if( !gate )
+        return nullptr;
+
+    const KOPENAPI_DOC_GATE::STATS st = gate->Stats();
+    auto ms = []( std::chrono::microseconds d ) { return std::round( d.count() / 100.0 ) / 10; };
+
+    return { { "version", gate->Version() },
+             { "lease_reads", leaseReadsServed.load() },
+             { "lease_reads_to_owner", leaseReadsToOwner.load() },
+             { "leases_granted", st.leasesGranted },
+             { "leases_active", st.leasesActive },
+             { "writes", st.writes },
+             { "revoked", st.revoked },
+             { "stuck", st.stuck },
+             { "max_lease_hold_ms", ms( st.maxLeaseHold ) },
+             { "mean_lease_hold_ms", st.leasesGranted ? ms( st.totalLeaseHold / (long long) st.leasesGranted ) : 0.0 },
+             { "max_write_wait_ms", ms( st.maxWriteWait ) },
+             { "write_violations", MODEL_THREAD::WriteViolations() },
+             { "writes_refused", MODEL_THREAD::WritesRefused() } };
 }
 
 
@@ -1195,10 +1603,10 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                                   owner = self->busyMethod;
                               }
 
-                              return KOPENAPI_RESULT::Error( 409, !job.empty()
-                                                                          ? "a job owns the documents: job_list, job_cancel"
-                                                                          : owner + " is running and owns the documents (reading calls "
-                                                                                    "answer meanwhile); retry once it ends" );
+                              return self->refusedByClaim( !job.empty()
+                                                                   ? "a job owns the documents: job_list, job_cancel"
+                                                                   : owner + " is running and owns the documents (reading calls "
+                                                                             "answer meanwhile); retry once it ends" );
                           }
 
                           std::string busyBefore;
@@ -1230,6 +1638,9 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                                   impl->busyMethod = before;
                               }
                           } busyEnd{ self, busyBefore };
+
+                          // headless: the call holds the documents exclusively (readers under leases wait)
+                          MODEL_THREAD::WRITE_SECTION writeSection;
 
                           // Log records during the call are attributed to this method
                           KOPENAPI_JOURNAL::SCOPED_OPERATION scope( operation );
@@ -1273,6 +1684,9 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
 
                           if( result.status < 400 )
                               addPoints( result.body, 0 );
+
+                          // the change feed follows a document opened or replaced by the call
+                          KOPENAPI_REGISTRY::Get().Documents( ctxCopy );
 
                           if( editing )
                               KOPENAPI_HISTORY::Get().AfterEdit( ctxCopy, result );
@@ -1708,6 +2122,15 @@ void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
                      reply( res, liveStatus() );
                  } );
 
+    server->Get( "/api/v1/main_loop",
+                 [this]( const httplib::Request& req, httplib::Response& res )
+                 {
+                     if( !mainProbe )
+                         reply( res, KOPENAPI_RESULT::Error( 404, "start the GUI with KICAD_OPENAPI_MAIN_PROBE=1" ) );
+                     else
+                         reply( res, KOPENAPI_RESULT::Ok( mainProbe->Json( req.has_param( "reset" ) ) ) );
+                 } );
+
     server->Get( "/api/v1/progress",
                  [this]( const httplib::Request&, httplib::Response& res )
                  {
@@ -1790,6 +2213,36 @@ void KICAD_OPENAPI_SERVICE::PreloadKifaces()
 }
 
 
+void KICAD_OPENAPI_SERVICE::RunOnOwner( const std::function<void()>& aFn )
+{
+    if( !m_impl->strand || m_impl->strand->OnDispatchThread() )
+    {
+        aFn();
+        return;
+    }
+
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> finished = done->get_future();
+
+    m_impl->strand->QueueCall( std::make_shared<std::function<void()>>(
+            [&aFn, done]()
+            {
+                try
+                {
+                    MODEL_THREAD::WRITE_SECTION writeSection;
+                    aFn();
+                    done->set_value();
+                }
+                catch( ... )
+                {
+                    done->set_exception( std::current_exception() );
+                }
+            } ) );
+
+    finished.get();
+}
+
+
 void KICAD_OPENAPI_SERVICE::SetMainLoopWaker( std::function<void()> aWaker )
 {
     m_impl->waker = std::move( aWaker );
@@ -1854,16 +2307,21 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     m_impl->appName = wxTheApp ? wxTheApp->GetAppName().ToStdString() : std::string( "kicad" );
     m_impl->port = 0;
 
+    auto poolReady = std::make_shared<std::promise<void>>();
+    std::future<void> poolBuilt = poolReady->get_future();
+
     for( int i = 0; i < PORT_PROBE_COUNT; ++i )
     {
         // A fresh server per attempt: httplib decommissions a server after a failed bind
         m_impl->server = std::make_unique<httplib::Server>();
-        m_impl->server->new_task_queue = []
+        m_impl->server->new_task_queue = [poolReady]
         {
             // standing threads for them: the pool adds one only when none is idle as a connection
             // comes, so a burst of streams could otherwise wait behind each other
-            return new httplib::ThreadPool( CPPHTTPLIB_THREAD_POOL_COUNT + MAX_EVENT_STREAMS,
-                                            CPPHTTPLIB_THREAD_POOL_MAX_COUNT + MAX_EVENT_STREAMS );
+            auto* pool = new httplib::ThreadPool( CPPHTTPLIB_THREAD_POOL_COUNT + MAX_EVENT_STREAMS,
+                                                  CPPHTTPLIB_THREAD_POOL_MAX_COUNT + MAX_EVENT_STREAMS );
+            poolReady->set_value();
+            return pool;
         };
         m_impl->registerRoutes();
 
@@ -1885,6 +2343,49 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
 
     m_impl->alive->store( true );
     MAIN_GATE_HANDLER::Get();   // created on the main thread
+    MAIN_GATE_HANDLER::Jobs();
+
+    // headless: calls and jobs run on the owner strand; GUI: on the main thread, which lends the
+    // documents to readers while it computes.  KICAD_OPENAPI_MAIN_DISPATCH keeps the main loop
+    // without leases (A/B comparison)
+    if( !std::getenv( "KICAD_OPENAPI_MAIN_DISPATCH" ) )
+    {
+        KOPENAPI_DOC_GATE::OPTIONS options;
+        options.leaseBudget = LEASE_BUDGET;
+        m_impl->gate = std::make_unique<KOPENAPI_DOC_GATE>( options );
+        m_impl->gate->SetViolationSink(
+                []( const KOPENAPI_LEASE_VIOLATION& aViolation )
+                {
+                    wxLogWarning( "model gate: read lease of %s %s (held %lld ms, budget %lld ms)",
+                                  aViolation.holder,
+                                  aViolation.kind == KOPENAPI_LEASE_VIOLATION::KIND::REVOKED ? "revoked" : "stuck",
+                                  (long long) std::chrono::duration_cast<std::chrono::milliseconds>( aViolation.held ).count(),
+                                  (long long) std::chrono::duration_cast<std::chrono::milliseconds>( aViolation.budget ).count() );
+                } );
+
+        KOPENAPI_DOC_GATE* gate = m_impl->gate.get();
+        MODEL_THREAD::SetWriteHooks( [gate]() { tlOwnerWrite.emplace( gate->BeginWrite() ); },
+                                     []()
+                                     {
+                                         tlOwnerWrite->Commit();
+                                         tlOwnerWrite.reset();
+                                     } );
+
+        if( m_impl->ctx.headless )
+        {
+            m_impl->leaseWait = LEASE_WAIT;
+            m_impl->strand = std::make_unique<OWNER_STRAND_DISPATCH>();
+            s_dispatch = m_impl->strand.get();
+        }
+        else
+        {
+            m_impl->mainOwner.emplace( MODEL_THREAD::KIND::OWNER );
+            m_impl->mainWrite.emplace();
+        }
+    }
+
+    if( !m_impl->ctx.headless && std::getenv( "KICAD_OPENAPI_MAIN_PROBE" ) )
+        m_impl->mainProbe = std::make_unique<MAIN_LOOP_PROBE>();
 
     if( std::getenv( "KICAD_OPENAPI_TRACE" ) )
     {
@@ -1900,6 +2401,11 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     // The socket is already bound, so clients can connect as soon as Start() returns;
     // listen_after_bind() blocks in this thread until Stop().
     m_impl->thread = std::thread( [srv = m_impl->server.get()]() { srv->listen_after_bind(); } );
+
+    // The pool's threads exist before Start() returns, so they are never created while the
+    // kifaces load (see upstream-issues A50: GCC 13 ASan allocates thread contexts and a loaded
+    // library's globals from one unlocked allocator)
+    poolBuilt.wait_for( std::chrono::seconds( 10 ) );
 
     // After app_restart clients find this process only once the documents it reopens are open
     // (or the host reports its start-up opening finished): their next call (e.g. a 3D view of
@@ -2048,11 +2554,28 @@ void KICAD_OPENAPI_SERVICE::Stop()
         m_impl->thread.join();
 
     m_impl->server.reset();
+    m_impl->mainProbe.reset();
     m_impl->port = 0;
     s_currentPort = 0;
 
     // Headless documents live in the kifaces; drop them while the project/settings still exist
-    KOPENAPI_REGISTRY::Get().ReleaseDocuments();
+    RunOnOwner( []() { KOPENAPI_REGISTRY::Get().ReleaseDocuments(); } );
+
+    if( m_impl->strand )
+    {
+        m_impl->strand->Stop();
+        s_dispatch = &s_mainLoopDispatch;
+        m_impl->strand.reset();
+    }
+
+    m_impl->mainWrite.reset();
+    m_impl->mainOwner.reset();
+
+    if( m_impl->gate )
+    {
+        MODEL_THREAD::SetWriteHooks( nullptr, nullptr );
+        m_impl->gate.reset();
+    }
 
     if( !m_impl->discoveryFile.empty() )
     {
@@ -2079,6 +2602,12 @@ void KICAD_OPENAPI_SERVICE::SetOverrideLock( bool aOverride )
 bool KICAD_OPENAPI_SERVICE::OverrideLock()
 {
     return s_overrideLock;
+}
+
+
+KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::Invoke( const std::string& aName, const nlohmann::json& aArgs )
+{
+    return m_impl->invokeParsed( aName, aArgs.is_null() ? nlohmann::json::object() : aArgs );
 }
 
 

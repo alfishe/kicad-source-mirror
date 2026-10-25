@@ -18,6 +18,7 @@
  */
 
 #include "conn_components.h"
+#include <model_thread.h>
 
 #include <wx/thread.h>
 
@@ -25,7 +26,7 @@ namespace SCH_CONNECTIVITY
 {
 std::vector<NODE_INPUT> RecordNodes( const RECORD_STORE::RECORD_CACHE& aRecords, KIND aKind, SESSION_KEYS& aKeys )
 {
-    wxASSERT( wxThread::IsMain() );
+    wxASSERT( MODEL_THREAD::IsModelThread() );
     std::vector<NODE_INPUT> result;
     result.reserve( aRecords.Entries().size() );
 

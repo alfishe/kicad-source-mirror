@@ -50,6 +50,12 @@ KICOMMON_API nlohmann::json KopenapiRunningProgress();
 /// @brief The running job was asked to stop (job_cancel, Esc, a window close)
 KICOMMON_API bool KopenapiJobCancelled();
 
+/// @brief A job runs now (its input filter is installed).  Any thread
+KICOMMON_API bool KopenapiJobRunning();
+
+/// @brief An API call or job runs now (no one to answer a question in a dialog).  Any thread
+KICOMMON_API bool KopenapiCallActive();
+
 /// @brief Stopped by job_cancel {keep: true}: the job applies nothing and keeps its state for later
 /// (a grid route: its timeline, every lane stopped at its last step).  Any thread
 KICOMMON_API bool KopenapiJobKeep();
@@ -66,6 +72,9 @@ KICOMMON_API bool KopenapiJobHeld( uint64_t* aSerial = nullptr, std::string* aBy
 /// @brief Main thread: runs the API calls queued for it now (none of what arrives meanwhile);
 /// GUI and headless (kicadopenapi_service.cpp)
 KICOMMON_API void KopenapiServeQueuedCalls();
+
+/// @brief True on the thread API calls run on: the main thread in GUI, the owner strand headless
+KICOMMON_API bool KopenapiOnDispatchThread();
 
 /// @brief The main thread is at a safe point of a job or a plain call: a call running now is nested in the job
 KICOMMON_API bool KopenapiJobYielding();

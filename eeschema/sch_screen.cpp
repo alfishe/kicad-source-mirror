@@ -286,7 +286,7 @@ void SCH_SCREEN::Append( SCH_ITEM* aItem, bool aUpdateLibSymbol )
         if( IsConnectivitySource( aItem ) )
             BumpConnectivityRevision( aItem->Type() );
         else
-            m_connectivityItems.reset();
+            resetConnectivityItems();
 
         --m_modification_sync;
     }
@@ -368,7 +368,7 @@ bool SCH_SCREEN::Remove( SCH_ITEM* aItem, bool aUpdateLibSymbol )
     if( retv && IsConnectivitySource( aItem ) )
         BumpConnectivityRevision( aItem->Type() );
     else if( retv )
-        m_connectivityItems.reset();
+        resetConnectivityItems();
 
     // Check if the library symbol for the removed schematic symbol is still required.
     if( retv && aItem->Type() == SCH_SYMBOL_T && aUpdateLibSymbol )
@@ -943,6 +943,13 @@ void SCH_SCREEN::BumpConnectivityRevision( KICAD_T aChangedType )
     if( aChangedType != SCH_LINE_T )
         ++m_connectivitySymbolRevision;
 
+    resetConnectivityItems();
+}
+
+
+void SCH_SCREEN::resetConnectivityItems()
+{
+    std::unique_lock lock( m_connectivityItemsMutex );
     m_connectivityItems.reset();
 }
 
@@ -968,6 +975,19 @@ bool SCH_SCREEN::IsConnectivitySource( const SCH_ITEM* aItem )
 
 SCH_ITEM* SCH_SCREEN::GetConnectivityItem( const KIID& aId ) const
 {
+    {
+        std::shared_lock lock( m_connectivityItemsMutex );
+
+        if( m_connectivityItems )
+        {
+            const auto it = m_connectivityItems->find( aId );
+            return it == m_connectivityItems->end() ? nullptr : it->second;
+        }
+    }
+
+    // Leased readers may get here together: one builds the index, the others wait for it
+    std::unique_lock lock( m_connectivityItemsMutex );
+
     if( !m_connectivityItems )
     {
         auto& index = m_connectivityItems.emplace();

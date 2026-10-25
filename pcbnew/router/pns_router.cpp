@@ -19,6 +19,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <atomic>
 #include <cstdio>
 #include <memory>
 #include <vector>
@@ -58,11 +59,31 @@ namespace PNS {
 
 // an ugly singleton for drawing debug items within the router context.
 // To be fixed sometime in the future.
-static ROUTER* theRouter;
+static std::atomic<ROUTER*> theRouter{ nullptr };
+
+// A thread inside a THREAD_SCOPE sees only the routers made on it, never the editor's one
+static thread_local bool    tlScoped = false;
+static thread_local ROUTER* tlRouter = nullptr;
+
+
+ROUTER::THREAD_SCOPE::THREAD_SCOPE() :
+        m_prevScoped( tlScoped ),
+        m_prevRouter( tlRouter )
+{
+    tlScoped = true;
+    tlRouter = nullptr;
+}
+
+
+ROUTER::THREAD_SCOPE::~THREAD_SCOPE()
+{
+    tlScoped = m_prevScoped;
+    tlRouter = m_prevRouter;
+}
 
 ROUTER::ROUTER()
 {
-    theRouter = this;
+    SetInstance( this );
 
     m_state = IDLE;
     m_mode = PNS_MODE_ROUTE_SINGLE;
@@ -83,20 +104,28 @@ ROUTER::ROUTER()
 
 ROUTER* ROUTER::GetInstance()
 {
-    return theRouter;
+    return tlScoped ? tlRouter : theRouter.load();
 }
 
 
 void ROUTER::SetInstance( ROUTER* aRouter )
 {
-    theRouter = aRouter;
+    if( tlScoped )
+        tlRouter = aRouter;
+    else
+        theRouter.store( aRouter );
 }
 
 
 ROUTER::~ROUTER()
 {
     ClearWorld();
-    theRouter = nullptr;
+
+    if( tlRouter == this )
+        tlRouter = nullptr;
+
+    ROUTER* self = this;
+    theRouter.compare_exchange_strong( self, nullptr );
     delete m_logger;
 }
 

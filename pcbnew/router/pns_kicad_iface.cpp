@@ -1956,38 +1956,60 @@ std::unique_ptr<PNS::VIA> PNS_KICAD_IFACE_BASE::syncVia( PCB_VIA* aVia )
 }
 
 
+void PNS_KICAD_IFACE_BASE::reportMalformedZone( ZONE* aZone )
+{
+    UNITS_PROVIDER unitsProvider( pcbIUScale, GetUnits() );
+    wxLogWarning( _( "%s is malformed: the router cannot handle it." ),
+                  aZone->GetItemDescription( &unitsProvider, true ) );
+}
+
+
+void PNS_KICAD_IFACE::reportMalformedZone( ZONE* aZone )
+{
+    if( !wxIsMainThread() )
+    {
+        PNS_KICAD_IFACE_BASE::reportMalformedZone( aZone );
+        return;
+    }
+
+    UNITS_PROVIDER unitsProvider( pcbIUScale, GetUnits() );
+    wxString       msg = wxString::Format( _( "%s is malformed." ),
+                                           aZone->GetItemDescription( &unitsProvider, true ) );
+
+    KIDIALOG dlg( nullptr, msg, KIDIALOG::KD_WARNING );
+    dlg.ShowDetailedText( _( "This zone cannot be handled by the router.\n"
+                             "Please verify it is not a self-intersecting polygon." ) );
+    dlg.DoNotShowCheckbox( __FILE__, __LINE__ );
+    dlg.ShowModal();
+}
+
+
 bool PNS_KICAD_IFACE_BASE::syncZone( PNS::NODE* aWorld, ZONE* aZone, SHAPE_POLY_SET* aBoardOutline )
 {
-    // If this ever becomes multi-threaded, we'll need to lose the 'static's.  But for now they
-    // will help performance a tiny bit.
-    static wxString       msg;
-    static SHAPE_POLY_SET polyStorage;
-    SHAPE_POLY_SET*       poly = &polyStorage;
-
     if( !aZone->GetIsRuleArea() || !aZone->HasKeepoutParametersSet() )
         return false;
 
     LSET layers = aZone->GetLayerSet();
 
+    // The zone's own outline is only read: a router may sync it off the main thread while others
+    // read the board, so a missing triangulation is built on a local copy
+    SHAPE_POLY_SET        polyStorage;
+    const SHAPE_POLY_SET* poly = &polyStorage;
+
     // GetBoardOutline() is expensive.  Only use it in the router where we have to.
     if( aZone->GetParentFootprint() )
         polyStorage = aZone->GetBoardOutline();
-    else
+    else if( aZone->Outline()->IsTriangulationUpToDate() )
         poly = aZone->Outline();
+    else
+        polyStorage = *aZone->Outline();
 
-    poly->CacheTriangulation();
+    if( poly == &polyStorage )
+        polyStorage.CacheTriangulation();
 
     if( !poly->IsTriangulationUpToDate() )
     {
-        UNITS_PROVIDER unitsProvider( pcbIUScale, GetUnits() );
-        msg.Printf( _( "%s is malformed." ), aZone->GetItemDescription( &unitsProvider, true ) );
-
-        KIDIALOG dlg( nullptr, msg, KIDIALOG::KD_WARNING );
-        dlg.ShowDetailedText( _( "This zone cannot be handled by the router.\n"
-                                 "Please verify it is not a self-intersecting polygon." ) );
-        dlg.DoNotShowCheckbox( __FILE__, __LINE__ );
-        dlg.ShowModal();
-
+        reportMalformedZone( aZone );
         return false;
     }
 

@@ -19,6 +19,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <advanced_config.h>
 #include <geometry/direction45.h>
 #include <settings/parameters.h>
 
@@ -121,6 +122,12 @@ const DIRECTION_45 ROUTING_SETTINGS::InitialDirection() const
         return DIRECTION_45( DIRECTION_45::NE );
     else
         return DIRECTION_45( DIRECTION_45::N );
+}
+
+
+int ROUTING_SETTINGS::ClusterTimeout() const
+{
+    return m_clusterTimeout > 0 ? m_clusterTimeout : ADVANCED_CFG::GetCfg().m_PNSProcessClusterTimeout;
 }
 
 

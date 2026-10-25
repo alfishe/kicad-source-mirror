@@ -162,6 +162,7 @@ BOARD::BOARD() :
 
     // Initialize ratsnest
     m_connectivity.reset( new CONNECTIVITY_DATA() );
+    m_connectivity->SetShared();
 
     // Set flag bits on these that will only be cleared if these are loaded from a legacy file
     m_LegacyVisibleLayers.reset().set( Rescue );

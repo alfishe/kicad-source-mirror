@@ -68,6 +68,17 @@ public:
 
     void SetProgressReporter( PROGRESS_REPORTER* aReporter ) { m_progressReporter = aReporter; }
 
+    /**
+     * Run the choice of the next footprint and the search for its position through \a aRunner
+     * (e.g. on a worker thread while the caller keeps its UI alive).  Both only read the board
+     * (they write the placer's own state: its matrix, connectivity and the footprints' placement
+     * flag); the footprint is moved after them, on the calling thread.
+     */
+    void SetComputeRunner( std::function<void( const std::function<void()>& )> aRunner )
+    {
+        m_computeRunner = std::move( aRunner );
+    }
+
 private:
     void drawPlacementRoutingMatrix();  // draw the working area (shows free and occupied areas)
     int genPlacementRoutingMatrix();
@@ -127,4 +138,5 @@ private:
     std::unique_ptr<CONNECTIVITY_DATA>          m_connectivity;
     std::function<int( FOOTPRINT* aFootprint )> m_refreshCallback;
     PROGRESS_REPORTER*                          m_progressReporter;
+    std::function<void( const std::function<void()>& )> m_computeRunner;
 };

@@ -186,18 +186,26 @@ int CLI::OPENAPI_SERVER_COMMAND::doPerform( KIWAY& aKiway )
             return EXIT_CODES::ERR_ARGS;
         }
 
-        for( KIWAY::FACE_T face : { KIWAY::FACE_SCH, KIWAY::FACE_PCB } )
-            aKiway.KiFACE( face );
+        service.RunOnOwner(
+                [&]()
+                {
+                    for( KIWAY::FACE_T face : { KIWAY::FACE_SCH, KIWAY::FACE_PCB } )
+                        aKiway.KiFACE( face );
 
-        for( const auto& [method, path] : opens )
-        {
-            std::optional<KOPENAPI_METHOD> open = KOPENAPI_REGISTRY::Get().Find( method );
-            KOPENAPI_RESULT result = open ? open->handler( ctx, { { "path", path.ToStdString( wxConvUTF8 ) } } )
-                                          : KOPENAPI_RESULT::Error( 500, method + std::string( " not available" ) );
+                    for( const auto& [method, path] : opens )
+                    {
+                        std::optional<KOPENAPI_METHOD> open = KOPENAPI_REGISTRY::Get().Find( method );
+                        KOPENAPI_RESULT result =
+                                open ? open->handler( ctx, { { "path", path.ToStdString( wxConvUTF8 ) } } )
+                                     : KOPENAPI_RESULT::Error( 500, method + std::string( " not available" ) );
 
-            if( result.status != 200 )
-                wxFprintf( stderr, _( "Cannot open %s: %s\n" ), path, From_UTF8( result.body.dump().c_str() ) );
-        }
+                        if( result.status != 200 )
+                        {
+                            wxFprintf( stderr, _( "Cannot open %s: %s\n" ), path,
+                                       From_UTF8( result.body.dump().c_str() ) );
+                        }
+                    }
+                } );
     }
 
     service.PreloadKifaces();

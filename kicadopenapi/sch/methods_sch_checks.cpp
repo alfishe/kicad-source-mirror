@@ -20,6 +20,8 @@
 #include <kiway.h>
 #include <project_sch.h>
 #include <sch_edit_frame.h>
+#include <tool/actions.h>
+#include <tool/tool_manager.h>
 #include <schematic.h>
 #include <libraries/symbol_library_adapter.h>
 
@@ -61,14 +63,15 @@ static KOPENAPI_RESULT h_sch_erc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     kopenapi_sch::ensureConnectivity( schematic );
 
+    // The editor only drops its selection (it may hold old markers); the run itself is the
+    // frame-less one in both modes, so GUI and headless ERC never differ (the frame run also
+    // cleans up wires)
     if( frame )
-        frame->ClearErcMarkers();
-
-    kopenapi_sch::ensureConnectivity( schematic );
+        frame->GetToolManager()->RunAction( ACTIONS::selectionClear );
 
     KOPENAPI_KEEPALIVE_REPORTER reporter;
     ERC_TESTER tester( schematic );
-    tester.RunTests( nullptr, frame, aCtx.kiway ? aCtx.kiway->KiFACE( KIWAY::FACE_CVPCB ) : nullptr,
+    tester.RunTests( nullptr, nullptr, aCtx.kiway ? aCtx.kiway->KiFACE( KIWAY::FACE_CVPCB ) : nullptr,
                      &schematic->Project(), &reporter );
 
     if( frame )

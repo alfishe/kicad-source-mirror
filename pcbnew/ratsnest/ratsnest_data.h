@@ -90,41 +90,22 @@ public:
 
     unsigned int GetNodeCount() const { return m_nodes.size(); }
 
-    const std::vector<CN_EDGE>& GetEdges() const
-    {
-        // Use a const_cast to allow sorting in the const method
-        // This is safe because we're not changing the logical content of the vector,
-        // just the ordering of elements
-        std::stable_sort( const_cast<std::vector<CN_EDGE>&>( m_rnEdges ).begin(),
-                          const_cast<std::vector<CN_EDGE>&>( m_rnEdges ).end(),
-                          []( const CN_EDGE& a, const CN_EDGE& b )
-                          {
-                              return a.StableSortCompare( b );
-                          } );
-        return m_rnEdges;
-    }
-    std::vector<CN_EDGE>& GetEdges()
-    {
-        std::stable_sort( m_rnEdges.begin(), m_rnEdges.end(),
-                          []( const CN_EDGE& a, const CN_EDGE& b )
-                          {
-                              return a.StableSortCompare( b );
-                          } );
-        return m_rnEdges;
-    }
+    /**
+     * Return the ratsnest edges in stable order.  Every rebuild of the net establishes the
+     * order, so the getters do not modify the net and concurrent readers are safe.
+     */
+    const std::vector<CN_EDGE>& GetEdges() const { return m_rnEdges; }
+    std::vector<CN_EDGE>& GetEdges() { return m_rnEdges; }
 
     /**
      * Return the ratsnest edges in no particular order.
      *
-     * Unlike GetEdges(), this does not sort, so it is cheap to call repeatedly.  Use it wherever
-     * the order of the edges cannot be observed, such as drawing them.
+     * Use it wherever the order of the edges cannot be observed, such as drawing them.
      */
     const std::vector<CN_EDGE>& GetUnsortedEdges() const { return m_rnEdges; }
 
     /**
      * Return the total length of the ratsnest airlines (unrouted connections) for this net.
-     *
-     * Unlike GetEdges(), this does not sort the edges, so it is cheap to call repeatedly.
      */
     int64_t GetTotalAirlineLength() const
     {
@@ -144,6 +125,9 @@ protected:
 
     /// Compute the minimum spanning tree using Filter-Kruskal.  \a aEdges is reordered.
     void kruskalMST( std::vector<CN_EDGE>& aEdges );
+
+    /// Put m_rnEdges into the stable order returned by GetEdges().
+    void sortEdges();
 
 protected:
     /// Vector of nodes

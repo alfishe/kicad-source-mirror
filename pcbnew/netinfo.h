@@ -288,10 +288,8 @@ public:
     /// board storing net list available.
     static NETINFO_ITEM* OrphanedItem()
     {
-        static NETINFO_ITEM* g_orphanedItem;
-
-        if( !g_orphanedItem )
-            g_orphanedItem = new NETINFO_ITEM( nullptr, wxEmptyString, NETINFO_LIST::UNCONNECTED );
+        static NETINFO_ITEM* g_orphanedItem =
+                new NETINFO_ITEM( nullptr, wxEmptyString, NETINFO_LIST::UNCONNECTED );
 
         return g_orphanedItem;
     }

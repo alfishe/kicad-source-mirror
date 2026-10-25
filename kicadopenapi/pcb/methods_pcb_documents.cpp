@@ -2,6 +2,8 @@
 /// @brief kicadopenapi PCB document methods: pcb_open, pcb_close, pcb_save, pcb_revert, and the
 /// "pcb" document provider.  Compiled into the pcbnew kiface; registered when it loads.
 #include <kicadopenapi_util.h>
+#include <kicadopenapi_change_feed.h>
+#include <model_thread.h>
 #include <kicadopenapi_legacy_save.h>
 #include <kicadopenapi_lock.h>
 #include <kicadopenapi_service.h>
@@ -12,6 +14,7 @@
 #include <api/headless_pcb_context.h>
 #include <api/pcb_context.h>
 #include <board.h>
+#include <connectivity/connectivity_data.h>
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 #include <richio.h>
 #include <board_loader.h>
@@ -95,26 +98,101 @@ private:
 };
 
 
+/// @brief Records every commit of the board in the change feed (owner thread)
+class BOARD_CHANGE_FEED : public BOARD_LISTENER
+{
+public:
+    void OnBoardItemAdded( BOARD&, BOARD_ITEM* aItem ) override { KOPENAPI_CHANGE_FEED::Record( "pcb", { id( aItem ) }, {}, {} ); }
+    void OnBoardItemRemoved( BOARD&, BOARD_ITEM* aItem ) override { KOPENAPI_CHANGE_FEED::Record( "pcb", {}, {}, { id( aItem ) } ); }
+    void OnBoardItemChanged( BOARD&, BOARD_ITEM* aItem ) override { KOPENAPI_CHANGE_FEED::Record( "pcb", {}, { id( aItem ) }, {} ); }
+
+    void OnBoardItemsAdded( BOARD&, std::vector<BOARD_ITEM*>& aItems ) override
+    {
+        KOPENAPI_CHANGE_FEED::Record( "pcb", ids( aItems ), {}, {} );
+    }
+
+    void OnBoardItemsRemoved( BOARD&, std::vector<BOARD_ITEM*>& aItems ) override
+    {
+        KOPENAPI_CHANGE_FEED::Record( "pcb", {}, {}, ids( aItems ) );
+    }
+
+    void OnBoardItemsChanged( BOARD&, std::vector<BOARD_ITEM*>& aItems ) override
+    {
+        KOPENAPI_CHANGE_FEED::Record( "pcb", {}, ids( aItems ), {} );
+    }
+
+    void OnBoardCompositeUpdate( BOARD&, std::vector<BOARD_ITEM*>& aAdded, std::vector<BOARD_ITEM*>& aRemoved,
+                                 std::vector<BOARD_ITEM*>& aChanged ) override
+    {
+        KOPENAPI_CHANGE_FEED::Record( "pcb", ids( aAdded ), ids( aChanged ), ids( aRemoved ) );
+    }
+
+    /// @brief Listens to this board; a different board than before resets the feed
+    void Follow( BOARD* aBoard )
+    {
+        if( !aBoard || !MODEL_THREAD::MayWrite() )
+            return;
+
+        aBoard->AddListener( this );
+
+        if( aBoard != m_board )
+        {
+            m_board = aBoard;
+            KOPENAPI_CHANGE_FEED::Reset( "pcb" );
+        }
+    }
+
+private:
+    static std::string id( const BOARD_ITEM* aItem ) { return aItem->m_Uuid.AsStdString(); }
+
+    static std::vector<std::string> ids( const std::vector<BOARD_ITEM*>& aItems )
+    {
+        std::vector<std::string> out;
+        out.reserve( aItems.size() );
+
+        for( const BOARD_ITEM* item : aItems )
+            out.push_back( id( item ) );
+
+        return out;
+    }
+
+    BOARD* m_board = nullptr;
+};
+
+
+static BOARD_CHANGE_FEED& boardChangeFeed()
+{
+    static BOARD_CHANGE_FEED* s_feed = new BOARD_CHANGE_FEED();   // boards keep a pointer to it: never freed
+    return *s_feed;
+}
+
+
 std::shared_ptr<PCB_CONTEXT> KopenapiPcbContext( KOPENAPI_CONTEXT& aCtx )
 {
+    std::shared_ptr<PCB_CONTEXT> context;
+
     if( aCtx.headless )
     {
+        context = s_headless;
+
         static UNSAVED_WATCH watch;
 
         // the board object changes on open / revert / rollback; adding twice is a no-op
-        if( s_headless && s_headless->GetBoard() )
-            s_headless->GetBoard()->AddListener( &watch );
+        if( context && context->GetBoard() && MODEL_THREAD::MayWrite() )
+            context->GetBoard()->AddListener( &watch );
+    }
+    else if( PCB_EDIT_FRAME* frame = guiFrame( aCtx, false ) )
+    {
+        context = CreatePcbFrameContext( frame );
 
-        return s_headless;
+        if( context->GetCurrentFileName().IsEmpty() )
+            context = nullptr;
     }
 
-    PCB_EDIT_FRAME* frame = guiFrame( aCtx, false );
+    if( context )
+        boardChangeFeed().Follow( context->GetBoard() );
 
-    if( !frame )
-        return nullptr;
-
-    std::shared_ptr<PCB_CONTEXT> context = CreatePcbFrameContext( frame );
-    return context->GetCurrentFileName().IsEmpty() ? nullptr : context;
+    return context;
 }
 
 
@@ -664,6 +742,24 @@ static KOPENAPI_DOC_HISTORY history()
         }
 
         return frame->GetUndoCommandCount() == aDepth;
+    };
+
+    // A headless commit (no board editor) updates the connectivity of what it changed but leaves
+    // the ratsnest to the editor, which is not there: the nets it touched are computed here, as the
+    // editor's commit does
+    h.afterEdit = []( KOPENAPI_CONTEXT& aCtx )
+    {
+        if( !aCtx.headless || !s_headless || !s_headless->GetBoard() )
+            return;
+
+        BOARD*                             board = s_headless->GetBoard();
+        std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
+
+        if( conn && !KopenapiConnectivityCurrent( *conn ) )
+        {
+            conn->RecalculateRatsnest();
+            board->UpdateRatsnestExclusions();
+        }
     };
 
     h.snapshot = []( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )

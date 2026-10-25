@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <stddef.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -739,11 +740,14 @@ public:
     double m_LastZoomLevel;
 
 private:
+    void resetConnectivityItems();
+
     const uint64_t                                             m_connectivityId;
     std::shared_ptr<CONNECTIVITY_SOURCE>                       m_connectivitySource;
     uint64_t                                                   m_connectivityRevision = 1;
     uint64_t                                                   m_connectivitySymbolRevision = 1;
     mutable std::optional<std::unordered_map<KIID, SCH_ITEM*>> m_connectivityItems;
+    mutable std::shared_mutex                                  m_connectivityItemsMutex;
 
     wxString    m_fileName;                 // File used to load the screen.
     int         m_fileFormatVersionAtLoad;

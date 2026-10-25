@@ -656,3 +656,4 @@ KOPENAPI_REGISTER( "pcb_graphic_add",
                    false, h_pcb_graphic_add );
 
 KOPENAPI_MARK_EDITING( "pcb_text_add", "pcb_graphic_add", "pcb_item_delete", "pcb_items_move", "pcb_text_update" );
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_drawing_list" );

@@ -28,6 +28,21 @@ KICOMMON_API void KopenapiYieldAll();
 KICOMMON_API void KopenapiRunOffMain( const std::function<void()>& aWork );
 
 
+/// @brief Work that only reads the documents (a route search, DRC tests); API readers may read
+/// meanwhile.  On the GUI main thread it runs on a worker while the main loop keeps painting and,
+/// during a job, navigating (the job's input filter); elsewhere (the headless owner) right here.
+/// Either way inside a MODEL_THREAD::READ_WINDOW.  aWork must not write the documents nor touch
+/// windows; it may call KopenapiJobStep (progress, stop).  Rethrows what aWork throws.
+/// KICAD_OPENAPI_MAIN_DISPATCH runs it right here on the main thread too (A/B)
+KICOMMON_API void KopenapiCompute( const std::function<void()>& aWork );
+
+/// @brief A point in a long edit where the documents are consistent: API readers waiting for them
+/// read now, before the edit goes on (the owner's write ends and is taken again)
+KICOMMON_API void KopenapiReadPoint();
+
+/// @brief True on a worker of KopenapiCompute
+KICOMMON_API bool KopenapiInComputeWorker();
+
 #include <wx/toplevel.h>
 #include <wx/weakref.h>
 
@@ -65,6 +80,19 @@ class KICOMMON_API KOPENAPI_KEEPALIVE_REPORTER : public PROGRESS_REPORTER_BASE
 {
 public:
     KOPENAPI_KEEPALIVE_REPORTER() : PROGRESS_REPORTER_BASE( 1 ) {}
+
+    /// Algorithms that only step phases (ERC) never ask for a refresh: each phase is a pump
+    void AdvancePhase() override
+    {
+        PROGRESS_REPORTER_BASE::AdvancePhase();
+        KopenapiKeepUiAlive();
+    }
+
+    void AdvancePhase( const wxString& aMessage ) override
+    {
+        PROGRESS_REPORTER_BASE::AdvancePhase( aMessage );
+        KopenapiKeepUiAlive();
+    }
 
 protected:
     bool updateUI() override

@@ -353,6 +353,7 @@ set( KICOMMON_SRCS
     string_utils.cpp
     systemdirsappend.cpp
     thread_pool.cpp
+    model_thread.cpp
     ui_events.cpp
     title_block.cpp
     trace_helpers.cpp
@@ -419,8 +420,11 @@ list( APPEND KICOMMON_SRCS
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_progress.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/methods_memory.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_model_events.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_change_feed.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_remote.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/kicadopenapi_legacy_save.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/threading/kicadopenapi_doc_gate.cpp
+    ${CMAKE_SOURCE_DIR}/kicadopenapi/threading/kicadopenapi_doc_owner.cpp
     # earlier-version file formats (one directory per target), see legacy_formats.h
     ${CMAKE_SOURCE_DIR}/kicadopenapi/legacy_formats/legacy_formats.cpp
     ${CMAKE_SOURCE_DIR}/kicadopenapi/legacy_formats/sexpr_tree.cpp

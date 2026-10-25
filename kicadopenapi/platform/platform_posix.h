@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,9 @@ PipeProcess SpawnWithStdinPipePosix(const std::vector<std::string>& argv, const 
 bool WritePipePosix(std::intptr_t handle, const void* data, std::size_t size);
 void ClosePipePosix(std::intptr_t handle);
 int WaitProcessPosix(long pid, int timeoutMs);
+/// @brief Runs and deletes *body on a new thread; the handle for JoinThreadPosix, nullptr on failure
+void* StartThreadPosix(std::size_t stackBytes, std::function<void()>* body);
+void JoinThreadPosix(void* handle);
 
 } // namespace kopenapi::platform
 

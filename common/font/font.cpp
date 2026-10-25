@@ -121,7 +121,8 @@ private:
 
 static MARKUP_CACHE s_markupCache( 1024 );
 static std::mutex s_markupCacheMutex;
-static std::mutex s_defaultFontMutex;;
+static std::mutex s_defaultFontMutex;
+static std::mutex s_fontMapMutex;
 
 
 FONT::FONT()
@@ -148,10 +149,12 @@ FONT* FONT::GetFont( const wxString& aFontName, bool aBold, bool aItalic,
 
     std::tuple<wxString, bool, bool, bool> key = { aFontName, aBold, aItalic, aForDrawingSheet };
 
+    std::lock_guard lock( s_fontMapMutex );
+
     FONT* font = nullptr;
 
-    if( s_fontMap.find( key ) != s_fontMap.end() )
-        font = s_fontMap[key];
+    if( auto it = s_fontMap.find( key ); it != s_fontMap.end() )
+        font = it->second;
 
     if( !font )
         font = OUTLINE_FONT::LoadFont( aFontName, aBold, aItalic, aEmbeddedFiles, aForDrawingSheet );

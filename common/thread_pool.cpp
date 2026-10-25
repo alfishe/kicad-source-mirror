@@ -17,44 +17,57 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <atomic>
+#include <mutex>
+
 #include <advanced_config.h>
 #include <pgm_base.h>
 #include <thread_pool.h>
 
-static thread_pool* tp = nullptr;
-static bool         tp_owned = false;  // True if we created the thread pool ourselves
+static std::atomic<thread_pool*> tp{ nullptr };
+static bool                      tp_owned = false;  // True if we created the thread pool ourselves
+static std::mutex                tp_mutex;
 
 thread_pool& GetKiCadThreadPool()
 {
-    if( tp )
-        return *tp;
+    if( thread_pool* pool = tp.load( std::memory_order_acquire ) )
+        return *pool;
+
+    std::lock_guard lock( tp_mutex );
+
+    if( thread_pool* pool = tp.load( std::memory_order_relaxed ) )
+        return *pool;
+
+    thread_pool* pool = nullptr;
 
     // If we have a PGM_BASE, use its thread pool
     if( PGM_BASE* pgm = PgmOrNull() )
     {
-        tp = &pgm->GetThreadPool();
+        pool = &pgm->GetThreadPool();
         tp_owned = false;
-        return *tp;
+    }
+    else
+    {
+        // Otherwise, we are running in scripting or some other context where we don't have a
+        // PGM_BASE so we need to create our own thread pool
+        int num_threads = std::max( 0, ADVANCED_CFG::GetCfg().m_MaximumThreads );
+        pool = new thread_pool( num_threads );
+        tp_owned = true;
     }
 
-    // Otherwise, we are running in scripting or some other context where we don't have a PGM_BASE
-    // so we need to create our own thread pool
-    int num_threads = std::max( 0, ADVANCED_CFG::GetCfg().m_MaximumThreads );
-    tp = new thread_pool( num_threads );
-    tp_owned = true;
-
-    return *tp;
+    tp.store( pool, std::memory_order_release );
+    return *pool;
 }
 
 
 void InvalidateKiCadThreadPool()
 {
-    // If we own the thread pool (scripting context), delete it
-    if( tp && tp_owned )
-    {
-        delete tp;
-    }
+    std::lock_guard lock( tp_mutex );
+    thread_pool*    pool = tp.exchange( nullptr );
 
-    tp = nullptr;
+    // If we own the thread pool (scripting context), delete it
+    if( pool && tp_owned )
+        delete pool;
+
     tp_owned = false;
 }
