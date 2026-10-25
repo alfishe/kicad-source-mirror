@@ -55,7 +55,7 @@ KOPENAPI_REGISTER( "pcb_query",
                    "'misses' adds items failing exactly one term. Errors 400 carry the offset and close names",
                    R"json({"type":"object","properties":{
                         "from":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string","enum":["footprints","pads","tracks","vias","zones","drawings","texts","groups","items"]}}],"default":"footprints"},
-                        "where":{"type":"string","description":"KiCad DRC condition, e.g. A.side() == 'bottom' && A.mount() == 'smd'"},
+                        "where":{"type":"string","description":"KiCad DRC condition, e.g. A.side() == 'bottom' && A.mount() == 'smd'; also X in ['a', 'b'] / X not in [...] (e.g. A.NetName in ['GND', '+3V3*'])"},
                         "select":{"type":"array","items":{"type":"string"},"description":"property names (Reference, Value, Layer, Net, Width, Position_X ...), uuid / kind / owner (also in group_by / order_by), or functions (A.side(); a bare parentRef / side / mount / courtyard / length is the same); a name that is neither for the queried kinds is a 400 with close names (as group_by / order_by / aggregate)"},
                         "group_by":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"field name(s) the rows are grouped by, e.g. 'Net' or ['Net', 'Layer']"},
                         "aggregate":{"type":"object","additionalProperties":{"type":"string"},"description":"{output name: count | sum(x) | min(x) | max(x) | avg(x) | distinct(x)} per group, e.g. {n: 'count', length: 'sum(Length)'} with group_by 'Net'"},

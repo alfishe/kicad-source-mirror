@@ -708,9 +708,175 @@ std::string withItem( const std::string& aExpression )
 }
 
 
+/// @brief "X in [a, b]" / "X not in [a, b]" (or with parentheses) as "(X == a || X == b)" /
+/// "(X != a && X != b)": KiCad's grammar has no membership operator.  X is the operand just
+/// before "in" (A.NetName, A.parentRef()); the list holds literals (quoted strings, numbers).
+/// aError is set for a list that does not close
+std::string withIn( const std::string& aExpression, std::string& aError )
+{
+    auto isWord = []( char c ) { return std::isalnum( (unsigned char) c ) || c == '_' || c == '.'; };
+
+    std::string out;
+    char        quote = 0;
+
+    for( size_t i = 0; i < aExpression.size(); ++i )
+    {
+        const char ch = aExpression[i];
+
+        if( quote )
+        {
+            out += ch;
+            quote = ch == quote ? 0 : quote;
+            continue;
+        }
+
+        if( ch == '\'' || ch == '"' )
+        {
+            quote = ch;
+            out += ch;
+            continue;
+        }
+
+        const bool wordStart = ( i == 0 || std::isspace( (unsigned char) aExpression[i - 1] ) );
+
+        if( !wordStart || aExpression.compare( i, 2, "in" ) != 0 || i + 2 >= aExpression.size() || isWord( aExpression[i + 2] ) )
+        {
+            out += ch;
+            continue;
+        }
+
+        size_t open = aExpression.find_first_not_of( " \t\n", i + 2 );
+
+        if( open == std::string::npos || ( aExpression[open] != '[' && aExpression[open] != '(' ) )
+        {
+            out += ch;
+            continue;
+        }
+
+        // the operand before: trailing spaces, an optional "not", then a word with calls
+        size_t end = out.find_last_not_of( " \t\n" );
+
+        if( end == std::string::npos )
+        {
+            out += ch;
+            continue;
+        }
+
+        bool negate = false;
+
+        if( end >= 2 && out.compare( end - 2, 3, "not" ) == 0 && ( end < 3 || !isWord( out[end - 3] ) ) )
+        {
+            negate = true;
+            end = end >= 3 ? out.find_last_not_of( " \t\n", end - 3 ) : std::string::npos;
+
+            if( end == std::string::npos )
+            {
+                out += ch;
+                continue;
+            }
+        }
+
+        size_t start = end + 1;
+        int    depth = 0;
+
+        while( start > 0 )
+        {
+            const char c = out[start - 1];
+
+            if( c == ')' )
+                depth++;
+            else if( c == '(' && depth > 0 )
+                depth--;
+            else if( depth == 0 && !isWord( c ) )
+                break;
+
+            start--;
+        }
+
+        const std::string operand = out.substr( start, end + 1 - start );
+
+        if( operand.empty() || depth != 0 )
+        {
+            out += ch;
+            continue;
+        }
+
+        // the literals up to the closing bracket
+        const char               close = aExpression[open] == '[' ? ']' : ')';
+        std::vector<std::string> items;
+        std::string              item;
+        char                     q = 0;
+        size_t                   j = open + 1;
+
+        for( ; j < aExpression.size(); ++j )
+        {
+            const char c = aExpression[j];
+
+            if( q )
+            {
+                item += c;
+                q = c == q ? 0 : q;
+            }
+            else if( c == '\'' || c == '"' )
+            {
+                q = c;
+                item += c;
+            }
+            else if( c == ',' || c == close )
+            {
+                item.erase( 0, item.find_first_not_of( " \t\n" ) );
+                item.erase( item.find_last_not_of( " \t\n" ) + 1 );
+
+                if( !item.empty() )
+                    items.push_back( item );
+
+                item.clear();
+
+                if( c == close )
+                    break;
+            }
+            else
+            {
+                item += c;
+            }
+        }
+
+        if( j >= aExpression.size() )
+        {
+            aError = std::string( "'in' list opened at " ) + std::to_string( open ) + " does not close with '" + close + "'";
+            return aExpression;
+        }
+
+        std::string replaced = "(";
+
+        for( size_t k = 0; k < items.size(); ++k )
+            replaced += ( k ? ( negate ? " && " : " || " ) : "" ) + operand + ( negate ? " != " : " == " ) + items[k];
+
+        if( items.empty() )
+            replaced += negate ? "1 == 1" : "1 == 0";
+
+        replaced += ")";
+
+        out.erase( start );
+        out += replaced;
+        i = j;
+    }
+
+    return out;
+}
+
+
 PROGRAM compile( const std::string& aRawExpression, COMPILE_ERROR& aError )
 {
-    const std::string aExpression = withRectUnits( withItem( aRawExpression ) );
+    std::string       inError;
+    const std::string aExpression = withRectUnits( withItem( withIn( aRawExpression, inError ) ) );
+
+    if( !inError.empty() )
+    {
+        aError.message = inError;
+        aError.offset = 0;
+        return nullptr;
+    }
 
     static std::list<std::pair<std::string, PROGRAM>>                                           lru;
     static std::unordered_map<std::string, std::list<std::pair<std::string, PROGRAM>>::iterator> index;
