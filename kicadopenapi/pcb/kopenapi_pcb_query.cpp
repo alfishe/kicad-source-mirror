@@ -868,6 +868,16 @@ std::string withIn( const std::string& aExpression, std::string& aError )
 
 PROGRAM compile( const std::string& aRawExpression, COMPILE_ERROR& aError )
 {
+    // cached by the text as given: the rewrites run only for a new one
+    static std::list<std::pair<std::string, PROGRAM>>                                           lru;
+    static std::unordered_map<std::string, std::list<std::pair<std::string, PROGRAM>>::iterator> index;
+
+    if( auto it = index.find( aRawExpression ); it != index.end() )
+    {
+        lru.splice( lru.begin(), lru, it->second );
+        return it->second->second;
+    }
+
     std::string       inError;
     const std::string aExpression = withRectUnits( withItem( withIn( aRawExpression, inError ) ) );
 
@@ -876,15 +886,6 @@ PROGRAM compile( const std::string& aRawExpression, COMPILE_ERROR& aError )
         aError.message = inError;
         aError.offset = 0;
         return nullptr;
-    }
-
-    static std::list<std::pair<std::string, PROGRAM>>                                           lru;
-    static std::unordered_map<std::string, std::list<std::pair<std::string, PROGRAM>>::iterator> index;
-
-    if( auto it = index.find( aExpression ); it != index.end() )
-    {
-        lru.splice( lru.begin(), lru, it->second );
-        return it->second->second;
     }
 
     PCBEXPR_COMPILER compiler( new PCBEXPR_UNIT_RESOLVER() );
@@ -910,8 +911,8 @@ PROGRAM compile( const std::string& aRawExpression, COMPILE_ERROR& aError )
         return nullptr;
     }
 
-    lru.emplace_front( aExpression, program );
-    index[aExpression] = lru.begin();
+    lru.emplace_front( aRawExpression, program );
+    index[aRawExpression] = lru.begin();
 
     if( lru.size() > 64 )
     {
