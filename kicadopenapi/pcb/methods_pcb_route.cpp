@@ -2752,6 +2752,7 @@ static KOPENAPI_RESULT routeOrBranch( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 static KOPENAPI_RESULT pnsDryRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     KOPENAPI_HISTORY& history = KOPENAPI_HISTORY::Get();
+    KOPENAPI_KEEP_UNSAVED keep;   // the edits are taken back: the board stays as saved as it was
 
     if( !history.TrialBegin( aCtx, "pcb" ) )
         return KOPENAPI_RESULT::Error( 409, "dry_run: no copy of the board before the call could be made to take the routes "
@@ -7825,20 +7826,16 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     const std::vector<UNDER_PART> underAreas = underParts == "avoid" ? underPartAreas( board ) : std::vector<UNDER_PART>();
 
-    // the ring under a quad package between its pad rows and its exposed pad: where its own pads'
-    // vias go first (under_parts avoid keeps other parts' vias out of it)
+    // the ring under a quad package between its pad rows and its exposed pad: with under_parts
+    // allow, where its own pads' vias go first; avoid keeps every via out of it
     const std::vector<UNDER_PART> ringAreas = underParts == "avoid" ? underAreas : underPartAreas( board );
 
-    // the part whose body a via at aAt (with its stub from aFrom on aLayer) would sit under, or none;
-    // the ring of aOwn (the part of the pad the stub leaves) is open to it
+    // the part whose body a via at aAt (with its stub from aFrom on aLayer) would sit under, or none
     auto underWhich = [&]( const VECTOR2I& aAt, const std::optional<VECTOR2I>& aFrom, PCB_LAYER_ID aLayer,
-                           const FOOTPRINT* aOwn ) -> FOOTPRINT*
+                           const FOOTPRINT* ) -> FOOTPRINT*
     {
         for( const UNDER_PART& under : underAreas )
         {
-            if( under.fp == aOwn )
-                continue;
-
             if( under.area.Collide( aAt, viaDia / 2 ) )
                 return under.fp;
 
@@ -8290,7 +8287,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                         const BOX2I pb = basePad->GetBoundingBox();
                         const int   padHalf = dir->second.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
 
-                        for( int k = 0; quad && k < 16; ++k )
+                        for( int k = 0; quad && underParts == "allow" && k < 16; ++k )
                         {
                             const VECTOR2I at = base - dir->second * ( padHalf + viaDia / 2 + minClearance + k * pcbIUScale.mmToIU( 0.1 ) );
                             candidates.push_back( at );
@@ -8798,6 +8795,7 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         return pcbStitch( aCtx, aArgs, false );
 
     KOPENAPI_HISTORY& history = KOPENAPI_HISTORY::Get();
+    KOPENAPI_KEEP_UNSAVED keep;   // the edits are taken back: the board stays as saved as it was
 
     if( !history.TrialBegin( aCtx, "pcb" ) )
         return KOPENAPI_RESULT::Error( 409, "dry_run: no copy of the board before the call could be made to take the vias "
@@ -11623,8 +11621,8 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "net's pours beside the main one per zone and layer, as island_list shows them: kind cut_off (no via) or sliver; "
                    "vias go only where the net's plane is on another layer with zone priorities resolved, and a via left on a "
                    "piece under 2 mm2 after the refill is taken out; footprint and board keep-outs are honoured; spots_off_plane) and the "
-                   "connections still open (unrouted); a pad's via goes inward first (under its own package, between the pad row "
-                   "and the exposed pad), an island's beside a coarse-pitch pad (a cap) before a fine-pitch pin; no via or stub in the "
+                   "connections still open (unrouted); with under_parts allow a pad's via goes inward first (under its own package, "
+                   "between the pad row and the exposed pad), an island's beside a coarse-pitch pad (a cap) before a fine-pitch pin; no via or stub in the "
                    "straight escape of another net's fine-pitch, pair or clock pin (escape_keep_mm; spots_in_escapes); pads picks the ends; "
                    "dry_run stitches and takes it back; lists capped at list_limit (counts whole), full: true for all",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{"net":{"type":"string","default":"GND"},
