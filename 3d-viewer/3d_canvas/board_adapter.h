@@ -112,6 +112,12 @@ public:
      */
     std::map<int, COLOR4D> GetLayerColors() const;
 
+    /**
+     * The colours picked for the layers (the layer preset's or the colour theme's), without the
+     * board stackup colours and the overrides
+     */
+    std::map<int, COLOR4D> GetPickedLayerColors() const;
+
     std::map<int, COLOR4D> GetDefaultColors() const;
     void SetLayerColors( const std::map<int, COLOR4D>& aColors );
 
@@ -142,6 +148,9 @@ public:
      * @param aStop
      */
     void CreateLayers( std::shared_ptr<REPORTER> aStatusReporter, std::stop_token aStop = std::stop_token() );
+
+    /// The colours the renderers draw with, taken again from the layer colour settings
+    void ApplyLayerColors();
 
     /**
      * Board integer units To 3D units.

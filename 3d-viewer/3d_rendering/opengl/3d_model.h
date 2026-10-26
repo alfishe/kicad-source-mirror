@@ -86,6 +86,11 @@ public:
     bool HasTransparentMeshes() const { return m_have_transparent_meshes; }
 
     /**
+     * Draw with another material mode; the buffers hold the colours of every mode.
+     */
+    void SetMaterialMode( MATERIAL_MODE aMaterialMode );
+
+    /**
      * Draw main bounding box of the model.
      */
     void DrawBbox() const;
@@ -114,9 +119,6 @@ public:
 private:
     static const wxChar* m_logTrace;
 
-    // the material mode that was used to generate the rendering data.
-    // FIXME: this can be selected at run-time and does not require re-creation
-    //        of the whole model objects.
     MATERIAL_MODE m_materialMode;
 
     BBOX_3D   m_model_bbox;               ///< global bounding box for this model
@@ -159,6 +161,10 @@ private:
     // during rendering.
     bool m_have_opaque_meshes = false;
     bool m_have_transparent_meshes = false;
+
+    // whether some mesh has a transparent / an opaque material (the diffuse mode draws all opaque)
+    bool m_any_transparent_material = false;
+    bool m_any_opaque_material = false;
 
     // vertex buffer and index buffer for the bounding boxes.
     // the first box is always the outer box, followed by inner boxes (one for each mesh).
@@ -209,6 +215,16 @@ public:
         m_s3dModel.reset();
 
         return m_openglModel3D;
+    }
+
+    void SetMaterialMode( MATERIAL_MODE aMaterialMode )
+    {
+        std::lock_guard<std::recursive_mutex> lock( m_mutex );
+
+        m_materialNode = aMaterialMode;
+
+        if( m_openglModel3D )
+            m_openglModel3D->SetMaterialMode( aMaterialMode );
     }
 
 private:

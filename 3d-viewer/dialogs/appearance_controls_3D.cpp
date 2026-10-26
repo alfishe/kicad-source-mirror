@@ -180,11 +180,7 @@ APPEARANCE_CONTROLS_3D::APPEARANCE_CONTROLS_3D( EDA_3D_VIEWER_FRAME* aParent, wx
     m_cbUseBoardStackupColors->Bind( wxEVT_CHECKBOX,
             [this]( wxCommandEvent& aEvent )
             {
-                EDA_3D_VIEWER_SETTINGS* cfg = m_frame->GetAdapter().m_Cfg;
-                cfg->m_UseStackupColors = aEvent.IsChecked();
-
-                UpdateLayerCtls();
-                m_frame->NewDisplay( true );
+                SetUseStackupColors( aEvent.IsChecked() );
             } );
 
     m_cbUseBoardEditorCopperColors = new wxCheckBox( m_panelLayers, wxID_ANY,
@@ -196,11 +192,7 @@ APPEARANCE_CONTROLS_3D::APPEARANCE_CONTROLS_3D( EDA_3D_VIEWER_FRAME* aParent, wx
     m_cbUseBoardEditorCopperColors->Bind( wxEVT_CHECKBOX,
             [this]( wxCommandEvent& aEvent )
             {
-                EDA_3D_VIEWER_SETTINGS* cfg = m_frame->GetAdapter().m_Cfg;
-                cfg->m_Render.use_board_editor_copper_colors = aEvent.IsChecked();
-
-                UpdateLayerCtls();
-                m_frame->NewDisplay( true );
+                SetUseEditorCopperColors( aEvent.IsChecked() );
             } );
 
     m_panelLayersSizer->Add( m_cbUseBoardStackupColors, 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, 5 );
@@ -403,7 +395,7 @@ void APPEARANCE_CONTROLS_3D::ApplyViewport( const wxString& aViewportName )
 void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisible )
 {
     std::bitset<LAYER_3D_END>     visibleLayers = m_frame->GetAdapter().GetVisibleLayers();
-    const std::map<int, COLOR4D>& colors = m_frame->GetAdapter().GetLayerColors();
+    const std::map<int, COLOR4D>  colors = m_frame->GetAdapter().GetPickedLayerColors();
     bool                          killFollow = false;
     bool                          doFastRefresh = false;    // true to just refresh the display
     bool                          drawOnly = false;         // layer data unchanged: draw again
@@ -462,6 +454,13 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
         killFollow = true;
         break;
 
+    case LAYER_3D_BOUNDING_BOXES:
+    case LAYER_3D_NAVIGATOR:
+        // drawn from the setting every frame, no scene data of their own
+        drawOnly = oglRender && !oglRender->IsSceneLoading();
+        visibleLayers.set( aLayer, isVisible );
+        break;
+
     case LAYER_3D_BOARD:
     case LAYER_3D_COPPER_TOP:
     case LAYER_3D_COPPER_BOTTOM:
@@ -516,10 +515,43 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
 }
 
 
+void APPEARANCE_CONTROLS_3D::SetUseStackupColors( bool aUse )
+{
+    m_frame->GetAdapter().m_Cfg->m_UseStackupColors = aUse;
+    m_cbUseBoardStackupColors->SetValue( aUse );
+
+    UpdateLayerCtls();
+    applyColors();
+}
+
+
+void APPEARANCE_CONTROLS_3D::SetUseEditorCopperColors( bool aUse )
+{
+    m_frame->GetAdapter().m_Cfg->m_Render.use_board_editor_copper_colors = aUse;
+    m_cbUseBoardEditorCopperColors->SetValue( aUse );
+
+    UpdateLayerCtls();
+    applyColors();
+}
+
+
+bool APPEARANCE_CONTROLS_3D::SetLayerColor( int aLayer, const KIGFX::COLOR4D& aColor )
+{
+    auto it = m_layerSettingsMap.find( aLayer );
+
+    if( it == m_layerSettingsMap.end() || !it->second->m_Ctl_color || it->second->m_Ctl_color->IsReadOnly() )
+        return false;
+
+    it->second->m_Ctl_color->SetSwatchColor( aColor, false );
+    onColorSwatchChanged( it->second->m_Ctl_color );
+    return true;
+}
+
+
 void APPEARANCE_CONTROLS_3D::onColorSwatchChanged( COLOR_SWATCH* aSwatch )
 {
     std::bitset<LAYER_3D_END> visibleLayers = m_frame->GetAdapter().GetVisibleLayers();
-    std::map<int, COLOR4D>    colors = m_frame->GetAdapter().GetLayerColors();
+    std::map<int, COLOR4D>    colors = m_frame->GetAdapter().GetPickedLayerColors();
 
     m_frame->GetAdapter().SetVisibleLayers( visibleLayers );
 
@@ -567,7 +599,27 @@ void APPEARANCE_CONTROLS_3D::onColorSwatchChanged( COLOR_SWATCH* aSwatch )
     else
         syncLayerPresetSelection();
 
-    m_frame->NewDisplay( true );
+    applyColors();
+}
+
+
+void APPEARANCE_CONTROLS_3D::applyColors()
+{
+    // OpenGL takes its materials from the adapter colours every frame; raytracing bakes them in
+    EDA_3D_CANVAS* canvas = m_frame->GetCanvas();
+    auto*          oglRender = m_frame->GetAdapter().m_Cfg->m_Render.engine == RENDER_ENGINE::OPENGL
+                                       ? dynamic_cast<RENDER_3D_OPENGL*>( canvas->GetCurrentRender() )
+                                       : nullptr;
+
+    if( oglRender && !oglRender->IsSceneLoading() && !canvas->IsReloadRequestPending() )
+    {
+        m_frame->GetAdapter().ApplyLayerColors();
+        canvas->Request_refresh();
+    }
+    else
+    {
+        m_frame->NewDisplay( true );
+    }
 }
 
 

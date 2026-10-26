@@ -87,6 +87,11 @@ public:
     void Load3dModelsIfNeeded();
 
     /**
+     * Draw the loaded models with another material mode (realistic, diffuse, CAD), no reload.
+     */
+    void SetModelsMaterialMode( MATERIAL_MODE aMaterialMode );
+
+    /**
      * Rebuild the raytracing hit-test scene in the background after a visibility change.
      */
     void RebuildHitTestAsync();

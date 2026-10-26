@@ -596,7 +596,12 @@ void BOARD_ADAPTER::CreateLayers( std::shared_ptr<REPORTER> aStatusReporter, std
         aStatusReporter->Report( _( "Create layers" ) );
 
     createLayers( aStatusReporter, aStop );
+    ApplyLayerColors();
+}
 
+
+void BOARD_ADAPTER::ApplyLayerColors()
+{
     auto to_SFVEC4F =
             []( const COLOR4D& src )
             {
@@ -662,7 +667,7 @@ std::map<int, COLOR4D> BOARD_ADAPTER::GetDefaultColors() const
 }
 
 
-std::map<int, COLOR4D> BOARD_ADAPTER::GetLayerColors() const
+std::map<int, COLOR4D> BOARD_ADAPTER::GetPickedLayerColors() const
 {
     std::map<int, COLOR4D> colors;
 
@@ -677,6 +682,14 @@ std::map<int, COLOR4D> BOARD_ADAPTER::GetLayerColors() const
         for( const auto& [ layer, defaultColor /* unused */ ] : GetDefaultColors() )
             colors[ layer ] = settings->GetColor( layer );
     }
+
+    return colors;
+}
+
+
+std::map<int, COLOR4D> BOARD_ADAPTER::GetLayerColors() const
+{
+    std::map<int, COLOR4D> colors = GetPickedLayerColors();
 
     if( m_Cfg->m_UseStackupColors && m_board )
     {
@@ -782,16 +795,22 @@ std::map<int, COLOR4D> BOARD_ADAPTER::GetLayerColors() const
 void BOARD_ADAPTER::SetLayerColors( const std::map<int, COLOR4D>& aColors )
 {
     COLOR_SETTINGS* settings = ::GetColorSettings( DEFAULT_THEME );
+    bool            changed = false;
 
     for( const auto& [ layer, color ] : aColors )
     {
-        settings->SetColor( layer, color );
+        if( settings->GetColor( layer ) != color )
+        {
+            settings->SetColor( layer, color );
+            changed = true;
+        }
 
         if( layer >= LAYER_3D_USER_1 && layer <= LAYER_3D_USER_45 )
             m_UserDefinedLayerColor[ layer - LAYER_3D_USER_1 ] = GetColor( color );
     }
 
-    Pgm().GetSettingsManager().SaveColorSettings( settings, "3d_viewer" );
+    if( changed )
+        Pgm().GetSettingsManager().SaveColorSettings( settings, "3d_viewer" );
 }
 
 

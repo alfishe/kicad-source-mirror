@@ -162,10 +162,10 @@ MODEL_3D::MODEL_3D( const S3DMODEL& a3DModel, MATERIAL_MODE aMaterialMode )
         MESH_GROUP& mesh_group = mesh_groups[mesh.m_MaterialIdx];
         MATERIAL& material = m_materials[mesh.m_MaterialIdx];
 
-        if( material.IsTransparent() && m_materialMode != MATERIAL_MODE::DIFFUSE_ONLY )
-            m_have_transparent_meshes = true;
+        if( material.IsTransparent() )
+            m_any_transparent_material = true;
         else
-            m_have_opaque_meshes = true;
+            m_any_opaque_material = true;
 
         const unsigned int vtx_offset = mesh_group.m_vertices.size();
         mesh_group.m_vertices.resize( mesh_group.m_vertices.size() + mesh.m_VertexSize );
@@ -374,11 +374,30 @@ MODEL_3D::MODEL_3D( const S3DMODEL& a3DModel, MATERIAL_MODE aMaterialMode )
     glBindBuffer( GL_ARRAY_BUFFER, 0 );
     glBindBuffer( GL_ELEMENT_ARRAY_BUFFER, 0 );
 
+    SetMaterialMode( aMaterialMode );
+
     auto end_time = std::chrono::high_resolution_clock::now();
 
     wxLogTrace( m_logTrace, wxT( "  loaded in %u ms\n" ),
                (unsigned int)std::chrono::duration_cast<std::chrono::milliseconds> (
                    end_time - start_time).count() );
+}
+
+
+void MODEL_3D::SetMaterialMode( MATERIAL_MODE aMaterialMode )
+{
+    m_materialMode = aMaterialMode;
+
+    if( aMaterialMode == MATERIAL_MODE::DIFFUSE_ONLY )
+    {
+        m_have_transparent_meshes = false;
+        m_have_opaque_meshes = m_any_transparent_material || m_any_opaque_material;
+    }
+    else
+    {
+        m_have_transparent_meshes = m_any_transparent_material;
+        m_have_opaque_meshes = m_any_opaque_material;
+    }
 }
 
 

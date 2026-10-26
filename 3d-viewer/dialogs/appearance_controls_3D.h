@@ -127,6 +127,14 @@ public:
 
     void ApplyLayerPreset( const wxString& aPresetName );
 
+    /// The "Use board stackup colors" / "Use PCB editor copper colors" checkboxes, as if clicked
+    void SetUseStackupColors( bool aUse );
+    void SetUseEditorCopperColors( bool aUse );
+
+    /// A layer's colour as if picked in its swatch; false when the layer has none or it is read only
+    /// (board stackup colours in use)
+    bool SetLayerColor( int aLayer, const KIGFX::COLOR4D& aColor );
+
     const wxArrayString& GetLayerPresetsMRU() { return m_presetMRU; }
 
     /// Return a list of viewports created by the user.
@@ -156,6 +164,9 @@ private:
     void rebuildViewportsWidget();
 
     void onColorSwatchChanged( COLOR_SWATCH* aSwatch );
+
+    /// Draw with the current layer colours, rebuilding the scene only where they are baked in
+    void applyColors();
 
     void updateLayerPresetWidget( const wxString& aName );
 

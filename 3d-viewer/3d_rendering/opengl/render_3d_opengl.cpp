@@ -1917,6 +1917,17 @@ void RENDER_3D_OPENGL::generate3dGrid( GRID3D_TYPE aGridType )
 }
 
 
+void RENDER_3D_OPENGL::SetModelsMaterialMode( MATERIAL_MODE aMaterialMode )
+{
+    std::lock_guard lock( m_renderMutex );
+
+    for( auto& [file, model] : m_3dModelMap )
+        model->SetMaterialMode( aMaterialMode );
+
+    m_modelsMaterialMode = aMaterialMode;
+}
+
+
 void RENDER_3D_OPENGL::createPlaceholderModel()
 {
     // Unit cube: 1mm × 1mm × 1mm, centered at origin

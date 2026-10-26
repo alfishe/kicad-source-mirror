@@ -220,7 +220,22 @@ int EDA_3D_CONTROLLER::RotateView( const TOOL_EVENT& aEvent )
 
 int EDA_3D_CONTROLLER::SetMaterial( const TOOL_EVENT& aEvent )
 {
-    m_boardAdapter->m_Cfg->m_Render.material_mode = aEvent.Parameter<MATERIAL_MODE>();
+    const MATERIAL_MODE mode = aEvent.Parameter<MATERIAL_MODE>();
+    m_boardAdapter->m_Cfg->m_Render.material_mode = mode;
+
+    // the OpenGL models pick the mode when drawn: no scene rebuild unless one is under way
+    if( m_boardAdapter->m_Cfg->m_Render.engine == RENDER_ENGINE::OPENGL
+            && !m_canvas->IsReloadRequestPending() )
+    {
+        RENDER_3D_OPENGL* render = dynamic_cast<RENDER_3D_OPENGL*>( m_canvas->GetCurrentRender() );
+
+        if( render && !render->IsSceneLoading() )
+        {
+            render->SetModelsMaterialMode( mode );
+            m_canvas->Request_refresh();
+            return 0;
+        }
+    }
 
     EDA_BASE_FRAME* frame = dynamic_cast<EDA_BASE_FRAME*>( m_toolMgr->GetToolHolder() );
 

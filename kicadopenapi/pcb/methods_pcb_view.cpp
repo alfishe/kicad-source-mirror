@@ -35,6 +35,8 @@
 #include <project_pcb.h>
 #include <plugins/3dapi/c3dmodel.h>
 #include <dialogs/appearance_controls_3D.h>
+#include <3d_viewer/tools/eda_3d_actions.h>
+#include <tool/tool_manager.h>
 #include <layer_ids.h>
 
 #include <chrono>
@@ -624,7 +626,22 @@ static const std::map<std::string, int>& view3dLayers()
         { "fp_values", LAYER_FP_VALUES },                { "th_models", LAYER_3D_TH_MODELS },
         { "smd_models", LAYER_3D_SMD_MODELS },           { "virtual_models", LAYER_3D_VIRTUAL_MODELS },
         { "models_not_in_pos", LAYER_3D_MODELS_NOT_IN_POS }, { "models_dnp", LAYER_3D_MODELS_MARKED_DNP },
-        { "bounding_boxes", LAYER_3D_BOUNDING_BOXES },   { "off_board_silk", LAYER_3D_OFF_BOARD_SILK } };
+        { "bounding_boxes", LAYER_3D_BOUNDING_BOXES },   { "off_board_silk", LAYER_3D_OFF_BOARD_SILK },
+        { "navigator", LAYER_3D_NAVIGATOR } };
+    return layers;
+}
+
+
+/// @brief Layers with a colour swatch in the viewer: the shown layers and the two backgrounds
+static const std::map<std::string, int>& view3dColorLayers()
+{
+    static const std::map<std::string, int> layers = []()
+    {
+        std::map<std::string, int> all = view3dLayers();
+        all["background_top"] = LAYER_3D_BACKGROUND_TOP;
+        all["background_bottom"] = LAYER_3D_BACKGROUND_BOTTOM;
+        return all;
+    }();
     return layers;
 }
 
@@ -636,7 +653,17 @@ static KOPENAPI_RESULT h_view3d_layers( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( !frame || !frame->GetAppearanceManager() )
         return KOPENAPI_RESULT::Error( 409, "no 3D viewer (open: true opens it from the board editor)" );
 
-    const nlohmann::json set = aArgs.value( "set", nlohmann::json::object() );
+    static const std::map<std::string, std::pair<MATERIAL_MODE, const TOOL_ACTION*>> materials = {
+        { "realistic", { MATERIAL_MODE::NORMAL, &EDA_3D_ACTIONS::materialNormal } },
+        { "diffuse", { MATERIAL_MODE::DIFFUSE_ONLY, &EDA_3D_ACTIONS::materialDiffuse } },
+        { "cad", { MATERIAL_MODE::CAD_MODE, &EDA_3D_ACTIONS::materialCAD } } };
+
+    APPEARANCE_CONTROLS_3D* panel = frame->GetAppearanceManager();
+    EDA_3D_VIEWER_SETTINGS* cfg = frame->GetAdapter().m_Cfg;
+    const nlohmann::json    set = aArgs.value( "set", nlohmann::json::object() );
+    const std::string       material = aArgs.value( "material", std::string() );
+    const nlohmann::json    colorArgs = aArgs.value( "colors", nlohmann::json::object() );
+    std::map<int, COLOR4D>  colors;
 
     for( const auto& [name, visible] : set.items() )
     {
@@ -644,9 +671,49 @@ static KOPENAPI_RESULT h_view3d_layers( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             return KOPENAPI_RESULT::Error( 400, "set: {layer: true|false}, layers: see the answer's 'layers'" );
     }
 
-    // the same path as a click in the viewer's Layers panel (presets, follow-board, reload)
+    if( !material.empty() && !materials.count( material ) )
+        return KOPENAPI_RESULT::Error( 400, "material: realistic | diffuse | cad" );
+
+    for( const auto& [name, value] : colorArgs.items() )
+    {
+        wxColour colour( wxString::FromUTF8( value.is_string() ? value.get<std::string>() : std::string() ) );
+
+        if( !view3dColorLayers().count( name ) || !colour.IsOk() )
+            return KOPENAPI_RESULT::Error( 400, "colors: {layer: '#rrggbb' or '#rrggbbaa'}, layers as in the answer's "
+                                                "'colors'" );
+
+        colors[view3dColorLayers().at( name )] = COLOR4D( colour );
+    }
+
+    if( aArgs.contains( "preset" ) )
+    {
+        const wxString preset = wxString::FromUTF8( aArgs["preset"].get<std::string>() );
+
+        if( !cfg->FindPreset( preset ) && preset != FOLLOW_PCB && preset != FOLLOW_PLOT_SETTINGS )
+            return KOPENAPI_RESULT::Error( 400, "preset: an unknown name; the answer's 'presets' lists them" );
+
+        panel->ApplyLayerPreset( preset );
+    }
+
+    // the same paths as the viewer's Layers panel and menus (presets, follow-board, reload)
     for( const auto& [name, visible] : set.items() )
-        frame->GetAppearanceManager()->OnLayerVisibilityChanged( view3dLayers().at( name ), visible.get<bool>() );
+        panel->OnLayerVisibilityChanged( view3dLayers().at( name ), visible.get<bool>() );
+
+    if( aArgs.contains( "stackup_colors" ) )
+        panel->SetUseStackupColors( aArgs["stackup_colors"].get<bool>() );
+
+    if( aArgs.contains( "editor_copper_colors" ) )
+        panel->SetUseEditorCopperColors( aArgs["editor_copper_colors"].get<bool>() );
+
+    for( const auto& [layer, color] : colors )
+    {
+        if( !panel->SetLayerColor( layer, color ) )
+            return KOPENAPI_RESULT::Error( 409, "colors: that layer has no colour of its own here (or board stackup "
+                                                "colours are in use: stackup_colors false)" );
+    }
+
+    if( !material.empty() )
+        frame->GetToolManager()->RunAction( *materials.at( material ).second );
 
     const std::bitset<LAYER_3D_END> visibleLayers = frame->GetAdapter().GetVisibleLayers();
     nlohmann::json                  layers = nlohmann::json::object();
@@ -654,7 +721,45 @@ static KOPENAPI_RESULT h_view3d_layers( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     for( const auto& [name, id] : view3dLayers() )
         layers[name] = visibleLayers.test( id );
 
-    return KOPENAPI_RESULT::Ok( { { "layers", layers } } );
+    const std::map<int, COLOR4D> layerColors = frame->GetAdapter().GetLayerColors();
+    nlohmann::json               colorsNow = nlohmann::json::object();
+
+    for( const auto& [name, id] : view3dColorLayers() )
+    {
+        auto it = layerColors.find( id );
+
+        if( it == layerColors.end() )
+            continue;
+
+        const wxColour c = it->second.ToColour();
+        colorsNow[name] = wxString::Format( "#%02x%02x%02x%02x", c.Red(), c.Green(), c.Blue(), c.Alpha() )
+                                  .ToStdString();
+    }
+
+    std::string materialNow;
+
+    for( const auto& [name, mode] : materials )
+    {
+        if( mode.first == cfg->m_Render.material_mode )
+            materialNow = name;
+    }
+
+    nlohmann::json presets = nlohmann::json::array();
+
+    for( const LAYER_PRESET_3D& preset : cfg->m_LayerPresets )
+        presets.push_back( preset.name.ToStdString() );
+
+    const RENDER_3D_BASE* render = frame->GetCanvas()->GetCurrentRender();
+
+    return KOPENAPI_RESULT::Ok( { { "layers", layers },
+                                  { "colors", colorsNow },
+                                  { "material", materialNow },
+                                  { "stackup_colors", cfg->m_UseStackupColors },
+                                  { "editor_copper_colors", cfg->m_Render.use_board_editor_copper_colors },
+                                  { "preset", cfg->m_CurrentPreset.ToStdString() },
+                                  { "presets", presets },
+                                  { "rebuild", frame->GetCanvas()->IsReloadRequestPending()
+                                                       || ( render && render->IsSceneLoading() ) } } );
 }
 
 
@@ -1329,11 +1434,20 @@ KOPENAPI_REGISTER( "view3d_lead_clips",
                    true, h_view3d_lead_clips );
 
 KOPENAPI_REGISTER( "view3d_layers",
-                   "3D viewer layers: visibility of board, copper, silkscreen, soldermask, paste, user and fab "
-                   "layers, footprint texts and model kinds; set: {layer: true|false} applies them like clicks "
-                   "in the viewer's Layers panel; answers every layer's visibility; GUI only",
+                   "3D viewer appearance: visibility of board, copper, silkscreen, soldermask, paste, user and fab "
+                   "layers, footprint texts, model kinds, model bounding boxes and the navigator; set: {layer: "
+                   "true|false} applies them like clicks in the viewer's Layers panel; also its colour swatches "
+                   "(colors), the stackup / editor copper colour checkboxes, layer presets and the material mode "
+                   "(View menu). Answers every layer's visibility and colour (#rrggbbaa, backgrounds too), the "
+                   "material, the checkboxes, the presets and "
+                   "rebuild: whether the change rebuilds the scene (view3d_status ready when done); GUI only",
                    R"json({"type":"object","properties":{
                         "set":{"type":"object","additionalProperties":{"type":"boolean"}},
+                        "colors":{"type":"object","additionalProperties":{"type":"string"},"description":"layer: '#rrggbb' or '#rrggbbaa', as picked in its swatch; layers as in the answer's colors"},
+                        "stackup_colors":{"type":"boolean","description":"'Use board stackup colors'"},
+                        "editor_copper_colors":{"type":"boolean","description":"'Use PCB editor copper colors'"},
+                        "preset":{"type":"string","description":"a layer preset by name"},
+                        "material":{"type":"string","enum":["realistic","diffuse","cad"]},
                         "open":{"type":"boolean","default":true}}})json"_json,
                    true, h_view3d_layers );
 
