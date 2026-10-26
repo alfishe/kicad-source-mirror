@@ -1705,6 +1705,10 @@ public:
             }
         }
 
+        // stopped after a round's last net: the run ends here, not as done
+        if( stopped() )
+            return;
+
         m_byStage.push_back( m_expanded );
 
         for( size_t n = 0; n < m_nets.size(); ++n )
@@ -1869,7 +1873,8 @@ public:
         for( size_t k = m_byStage.size() - 1; k > 0; --k )
             m_byStage[k] -= m_byStage[k - 1];
 
-        at( STAGE_DONE, (int) m_v.order.size(), (int) m_v.order.size() );
+        if( !stopped() )
+            at( STAGE_DONE, (int) m_v.order.size(), (int) m_v.order.size() );
     }
 
     /// @brief Keep the steps in aLane (before Run); a branch's lane already holds its parent's
@@ -4467,7 +4472,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
             if( firstMs < 0 && !runs[k]->Halted() )
                 firstMs = finishedMs[k];
 
-            if( !complete && runs[k]->Complete() )
+            if( !complete && !runs[k]->Halted() && runs[k]->Complete() )
             {
                 complete = true;
 
