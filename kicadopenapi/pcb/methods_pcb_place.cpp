@@ -11,6 +11,7 @@
 
 #include <kicadopenapi_registry.h>
 #include <netinfo.h>
+#include <netclass.h>
 
 #include <api/pcb_context.h>
 #include <kicadopenapi_keepalive.h>
@@ -21,6 +22,7 @@
 #include <chrono>
 #include <optional>
 #include <board_design_settings.h>
+#include <convert_basic_shapes_to_polygon.h>
 #include <connectivity/connectivity_data.h>
 #include <ratsnest/ratsnest_data.h>
 #include <footprint.h>
@@ -48,6 +50,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <queue>
 #include <set>
 
 
@@ -1605,6 +1608,270 @@ nlohmann::json edgeFacing( FOOTPRINT* aFootprint, const BOX2I& aEdges )
 namespace
 {
 
+/// @brief The way of a differential pair or a clock net between two parts it joins, and the straight
+/// escape of their pins there: parts of a block keep out of it
+struct CORRIDOR
+{
+    std::set<int>  nets;
+    std::string    name;    ///< "USB_D+/USB_D-"
+    SHAPE_POLY_SET area;
+    BOX2I          box;
+};
+
+
+/// @brief Shortest way from aFrom to aTo on a 0.25 mm grid around the parts in aWalls (courtyards
+/// grown by aHalf), inside aBounds; the corner points, or the straight line when there is none
+std::vector<VECTOR2I> wayAround( const VECTOR2I& aFrom, const VECTOR2I& aTo, const std::vector<SHAPE_POLY_SET>& aWalls,
+                                 BOX2I aBounds )
+{
+    const int step = toIU( 0.25 );
+    const int cols = aBounds.GetWidth() / step + 1;
+    const int rows = aBounds.GetHeight() / step + 1;
+
+    if( cols <= 1 || rows <= 1 || (long long) cols * rows > 4000000 )
+        return { aFrom, aTo };
+
+    auto cellOf = [&]( const VECTOR2I& aAt )
+    {
+        const int c = std::clamp( ( aAt.x - aBounds.GetLeft() + step / 2 ) / step, 0, cols - 1 );
+        const int r = std::clamp( ( aAt.y - aBounds.GetTop() + step / 2 ) / step, 0, rows - 1 );
+        return r * cols + c;
+    };
+
+    auto pointOf = [&]( int aCell ) { return VECTOR2I( aBounds.GetLeft() + ( aCell % cols ) * step, aBounds.GetTop() + ( aCell / cols ) * step ); };
+
+    const int         start = cellOf( aFrom );
+    const int         goal = cellOf( aTo );
+    std::vector<char> wall( (size_t) cols * rows, 0 );
+
+    for( const SHAPE_POLY_SET& w : aWalls )
+    {
+        const BOX2I box = w.BBox();
+
+        for( int r = std::max( 0, ( box.GetTop() - aBounds.GetTop() ) / step ); r < rows && aBounds.GetTop() + r * step <= box.GetBottom(); ++r )
+        {
+            for( int c = std::max( 0, ( box.GetLeft() - aBounds.GetLeft() ) / step ); c < cols && aBounds.GetLeft() + c * step <= box.GetRight(); ++c )
+            {
+                if( !wall[r * cols + c] && w.Contains( pointOf( r * cols + c ) ) )
+                    wall[r * cols + c] = 1;
+            }
+        }
+    }
+
+    wall[start] = wall[goal] = 0;
+
+    std::vector<double> cost( wall.size(), std::numeric_limits<double>::max() );
+    std::vector<int>    from( wall.size(), -1 );
+    using ENTRY = std::pair<double, int>;
+    std::priority_queue<ENTRY, std::vector<ENTRY>, std::greater<ENTRY>> open;
+
+    cost[start] = 0;
+    open.emplace( 0, start );
+
+    while( !open.empty() )
+    {
+        const auto [c, cell] = open.top();
+        open.pop();
+
+        if( cell == goal )
+            break;
+
+        if( c > cost[cell] )
+            continue;
+
+        for( int dr = -1; dr <= 1; ++dr )
+        {
+            for( int dc = -1; dc <= 1; ++dc )
+            {
+                const int r = cell / cols + dr, col = cell % cols + dc;
+
+                if( ( !dr && !dc ) || r < 0 || r >= rows || col < 0 || col >= cols || wall[r * cols + col] )
+                    continue;
+
+                const int    next = r * cols + col;
+                const double nc = c + ( dr && dc ? M_SQRT2 : 1.0 );
+
+                if( nc < cost[next] )
+                {
+                    cost[next] = nc;
+                    from[next] = cell;
+                    open.emplace( nc, next );
+                }
+            }
+        }
+    }
+
+    if( from[goal] < 0 )
+        return { aFrom, aTo };
+
+    std::vector<int> cells;
+
+    for( int cell = goal; cell >= 0; cell = from[cell] )
+        cells.push_back( cell );
+
+    std::reverse( cells.begin(), cells.end() );
+
+    std::vector<VECTOR2I> way = { aFrom };
+
+    for( size_t i = 1; i + 1 < cells.size(); ++i )
+    {
+        const int d1 = cells[i] - cells[i - 1], d2 = cells[i + 1] - cells[i];
+
+        if( d1 != d2 )
+            way.push_back( pointOf( cells[i] ) );
+    }
+
+    way.push_back( aTo );
+    return way;
+}
+
+
+/// @brief Corridors of the board's pairs and clock nets (pcb_net_roles): between every two parts
+/// (more than two pads) that carry all nets of the group, a band as wide as the pair (or track)
+/// with its clearance along the shortest way around the parts that stay (more than two pads, not
+/// in aMoving), plus each pin's straight escape aEscapeMm long.  Groups joining more than four
+/// parts get none.
+std::vector<CORRIDOR> signalCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, double aEscapeMm,
+                                       const std::vector<FOOTPRINT*>& aMoving )
+{
+    std::vector<std::vector<std::string>> groups;
+    std::optional<KOPENAPI_METHOD>        roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" );
+
+    if( !roles )
+        return {};
+
+    const KOPENAPI_RESULT r = roles->handler( aCtx, nlohmann::json::object() );
+
+    if( r.status >= 400 )
+        return {};
+
+    for( const nlohmann::json& pr : r.body.value( "pairs", nlohmann::json::array() ) )
+    {
+        if( pr.is_object() && pr.value( "p", nlohmann::json() ).is_string() && pr.value( "n", nlohmann::json() ).is_string() )
+            groups.push_back( { pr["p"].get<std::string>(), pr["n"].get<std::string>() } );
+    }
+
+    for( const nlohmann::json& row : r.body.value( "nets", nlohmann::json::array() ) )
+    {
+        if( row.is_object() && row.value( "role", std::string() ) == "clock" && row.value( "name", nlohmann::json() ).is_string() )
+            groups.push_back( { row["name"].get<std::string>() } );
+    }
+
+    std::vector<CORRIDOR> out;
+    const int             maxError = aBoard->GetDesignSettings().m_MaxError;
+    const int             escape = toIU( aEscapeMm );
+
+    for( const std::vector<std::string>& group : groups )
+    {
+        CORRIDOR      corridor;
+        NETINFO_ITEM* first = nullptr;
+
+        for( const std::string& name : group )
+        {
+            NETINFO_ITEM* net = KopenapiFindNet( aBoard, name );
+
+            if( !net )
+                break;
+
+            first = first ? first : net;
+            corridor.nets.insert( net->GetNetCode() );
+            corridor.name += ( corridor.name.empty() ? "" : "/" ) + name;
+        }
+
+        if( !first || corridor.nets.size() != group.size() )
+            continue;
+
+        std::vector<std::vector<PAD*>> ends;
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            if( fp->Pads().size() <= 2 )
+                continue;
+
+            std::vector<PAD*> pads;
+            std::set<int>     nets;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( corridor.nets.count( pad->GetNetCode() ) )
+                {
+                    pads.push_back( pad );
+                    nets.insert( pad->GetNetCode() );
+                }
+            }
+
+            if( nets == corridor.nets )
+                ends.push_back( pads );
+        }
+
+        if( ends.size() < 2 || ends.size() > 4 )
+            continue;
+
+        NETCLASS* netclass = first->GetNetClass();
+        const int width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : toIU( 0.2 );
+        const int clearance = netclass && netclass->HasClearance() ? netclass->GetClearance() : toIU( 0.2 );
+        const int gap = netclass && netclass->HasDiffPairGap() ? netclass->GetDiffPairGap() : clearance;
+        const int band = group.size() == 2 ? 2 * width + gap + 2 * clearance : width + 2 * clearance;
+
+        std::vector<SHAPE_POLY_SET> walls;
+        BOX2I                       bounds = aBoard->GetBoardEdgesBoundingBox();
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            const bool end = std::any_of( ends.begin(), ends.end(),
+                                          [&]( const std::vector<PAD*>& e ) { return e.front()->GetParentFootprint() == fp; } );
+
+            if( end || fp->Pads().size() <= 2 || std::find( aMoving.begin(), aMoving.end(), fp ) != aMoving.end() )
+                continue;
+
+            SHAPE_POLY_SET wall = courtyard( fp );
+            wall.Inflate( band / 2, CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, maxError );
+            walls.push_back( std::move( wall ) );
+        }
+
+        auto centre = []( const std::vector<PAD*>& aPads )
+        {
+            VECTOR2L sum( 0, 0 );
+
+            for( PAD* pad : aPads )
+                sum += VECTOR2L( pad->GetPosition() );
+
+            return VECTOR2I( sum.x / (long long) aPads.size(), sum.y / (long long) aPads.size() );
+        };
+
+        for( size_t a = 0; a < ends.size(); ++a )
+        {
+            for( size_t b = a + 1; b < ends.size(); ++b )
+            {
+                const std::vector<VECTOR2I> way = wayAround( centre( ends[a] ), centre( ends[b] ), walls, bounds );
+
+                for( size_t k = 1; k < way.size(); ++k )
+                    TransformOvalToPolygon( corridor.area, way[k - 1], way[k], band, maxError, ERROR_OUTSIDE );
+            }
+
+            // each pin's escape: straight out of its part, along the axis the pin sits on
+            for( PAD* pad : ends[a] )
+            {
+                const VECTOR2I off = pad->GetPosition() - pad->GetParentFootprint()->GetPosition();
+                const VECTOR2I dir = std::abs( off.x ) >= std::abs( off.y ) ? VECTOR2I( off.x >= 0 ? 1 : -1, 0 )
+                                                                            : VECTOR2I( 0, off.y >= 0 ? 1 : -1 );
+                const BOX2I    pb = pad->GetBoundingBox();
+                const int      half = dir.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
+
+                TransformOvalToPolygon( corridor.area, pad->GetPosition(), pad->GetPosition() + dir * ( half + escape ),
+                                        width + 2 * clearance, maxError, ERROR_OUTSIDE );
+            }
+        }
+
+        corridor.area.Simplify();
+        corridor.box = corridor.area.BBox();
+        out.push_back( std::move( corridor ) );
+    }
+
+    return out;
+}
+
+
 struct NEAR_OPTIONS
 {
     double                gapMm = 0.25;     ///< between courtyards
@@ -1615,6 +1882,8 @@ struct NEAR_OPTIONS
     double                hostRingMm = 0;   ///< keep this far from the target footprint's courtyard (fan-out room)
     bool                  gapGiven = false; ///< gap_mm asked for (else a default that may be narrowed)
     std::optional<double> partHeight;       ///< of the part (3D model): it may go under raised footprints with room
+    const std::vector<CORRIDOR>* corridors = nullptr;   ///< kept free unless no other spot is found
+    double                corridorYieldMm = -1;  ///< also enter one when only that brings the pad within this
 };
 
 struct NEAR_PLACEMENT
@@ -1625,6 +1894,7 @@ struct NEAR_PLACEMENT
     double      padDistanceMm = 0;
     std::string direction;
     std::string under;   ///< the raised footprint the part went under
+    std::string corridor;   ///< the corridors the part had to enter
 };
 
 
@@ -1635,11 +1905,22 @@ class PLACE_SPACE
 public:
     /// @param aAround the middle of the search, aReach how far from it
     /// @param aHost a footprint kept aHostRing clear (fan-out room), or null
+    /// @param aCorridors kept free (those of a net the part has a pad on aside), or null
     PLACE_SPACE( BOARD* aBoard, FOOTPRINT* aPart, const VECTOR2I& aAround, int aReach, FOOTPRINT* aHost, int aHostRing,
-                 std::optional<double> aPartHeight ) :
+                 std::optional<double> aPartHeight, const std::vector<CORRIDOR>* aCorridors = nullptr ) :
             m_outline( aBoard ),
             m_part( aPart )
     {
+        for( size_t i = 0; aCorridors && i < aCorridors->size(); ++i )
+        {
+            const CORRIDOR& corridor = ( *aCorridors )[i];
+            const bool      own = std::any_of( aPart->Pads().begin(), aPart->Pads().end(),
+                                          [&]( PAD* aPad ) { return corridor.nets.count( aPad->GetNetCode() ) > 0; } );
+
+            if( !own )
+                m_corridors.push_back( &corridor );
+        }
+
         BOX2I around( aAround, VECTOR2I( 0, 0 ) );
         around.Inflate( aReach + std::max( aPart->GetBoundingBox( false ).GetWidth(), aPart->GetBoundingBox( false ).GetHeight() ) );
 
@@ -1694,6 +1975,19 @@ public:
                 return false;
         }
 
+        for( const CORRIDOR* corridor : m_corridors )
+        {
+            if( !corridor->box.Intersects( box ) )
+                continue;
+
+            SHAPE_POLY_SET moved = aArea;
+            moved.Move( aDelta );
+            moved.BooleanIntersection( corridor->area );
+
+            if( !moved.IsEmpty() )
+                return false;
+        }
+
         SHAPE_POLY_SET moved = aArea;
         moved.Move( aDelta );
         return m_outline.Contains( moved );
@@ -1716,9 +2010,28 @@ public:
         return {};
     }
 
+    /// @brief Names of the corridors the part's courtyard (where it is now) lies in, "; "-joined
+    std::string InCorridors() const
+    {
+        const SHAPE_POLY_SET body = courtyard( m_part );
+        std::string          names;
+
+        for( const CORRIDOR* corridor : m_corridors )
+        {
+            SHAPE_POLY_SET both = body;
+            both.BooleanIntersection( corridor->area );
+
+            if( !both.IsEmpty() )
+                names += ( names.empty() ? "" : "; " ) + corridor->name;
+        }
+
+        return names;
+    }
+
 private:
     OUTLINE                                              m_outline;
     FOOTPRINT*                                           m_part;
+    std::vector<const CORRIDOR*>                         m_corridors;
     std::vector<std::pair<SHAPE_POLY_SET, BOX2I>>       m_obstacles;
     std::vector<std::pair<FOOTPRINT*, SHAPE_POLY_SET>>  m_raised;
     BOX2I                                                m_edges;
@@ -1781,7 +2094,9 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
 
     const int         reach = toIU( aOptions.maxMm );
     const int         gap = toIU( aOptions.gapMm );
-    const PLACE_SPACE space( aBoard, aPart, target, reach, host, toIU( std::max( 0.0, aOptions.hostRingMm ) ), aOptions.partHeight );
+    const int         ring = toIU( std::max( 0.0, aOptions.hostRingMm ) );
+    const PLACE_SPACE space( aBoard, aPart, target, reach, host, ring, aOptions.partHeight );
+    const PLACE_SPACE kept( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, aOptions.corridors );
 
     // directions: along the target footprint's axes, the side its pad is nearest to first
     const EDA_ANGLE base = host->GetOrientation();
@@ -1824,67 +2139,106 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
     static const double laterals[] = { 0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 6.0, -6.0 };
     const int           step = toIU( 0.1 );
 
-    double    best = std::numeric_limits<double>::max();
-    EDA_ANGLE bestAngle;
-    VECTOR2I  bestPos;
-
-    for( const EDA_ANGLE& turn : turns )
+    struct SPOT
     {
-        aPart->SetOrientation( turn );
-        aPart->SetPosition( originalPos );
+        double      best = std::numeric_limits<double>::max();
+        EDA_ANGLE   angle;
+        VECTOR2I    pos;
+        wxString    padNumber;
+        std::string direction;
+    };
 
-        SHAPE_POLY_SET area = courtyard( aPart );
+    auto search = [&]( const PLACE_SPACE& aSpace )
+    {
+        SPOT       spot;
+        double&    best = spot.best;
+        EDA_ANGLE& bestAngle = spot.angle;
+        VECTOR2I&  bestPos = spot.pos;
 
-        if( gap > 0 )
-            area.Inflate( gap, CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, ARC_HIGH_DEF );
-
-        const BOX2I areaBox = area.BBox();
-
-        auto free = [&]( const VECTOR2I& aDelta ) { return space.Free( area, areaBox, aDelta ); };
-
-        for( PAD* pad : aPart->Pads() )
+        for( const EDA_ANGLE& turn : turns )
         {
-            if( std::find( padNumbers.begin(), padNumbers.end(), pad->GetNumber() ) == padNumbers.end() )
-                continue;
+            aPart->SetOrientation( turn );
+            aPart->SetPosition( originalPos );
 
-            const VECTOR2I padOffset = pad->GetPosition() - originalPos;
+            SHAPE_POLY_SET area = courtyard( aPart );
 
-            for( const auto& [name, direction] : directions )
+            if( gap > 0 )
+                area.Inflate( gap, CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, ARC_HIGH_DEF );
+
+            const BOX2I areaBox = area.BBox();
+
+            auto free = [&]( const VECTOR2I& aDelta ) { return aSpace.Free( area, areaBox, aDelta ); };
+
+            for( PAD* pad : aPart->Pads() )
             {
-                const VECTOR2D across( -direction.y, direction.x );
+                if( std::find( padNumbers.begin(), padNumbers.end(), pad->GetNumber() ) == padNumbers.end() )
+                    continue;
 
-                for( double lateral : laterals )
+                const VECTOR2I padOffset = pad->GetPosition() - originalPos;
+
+                for( const auto& [name, direction] : directions )
                 {
-                    const double lateralIU = toIU( std::abs( lateral ) ) * ( lateral < 0 ? -1.0 : 1.0 );
+                    const VECTOR2D across( -direction.y, direction.x );
 
-                    if( std::abs( lateralIU ) >= best )
-                        break;
-
-                    for( int along = 0; along <= reach; along += step )
+                    for( double lateral : laterals )
                     {
-                        const double distance = std::hypot( double( along ), lateralIU );
+                        const double lateralIU = toIU( std::abs( lateral ) ) * ( lateral < 0 ? -1.0 : 1.0 );
 
-                        if( distance >= best )
+                        if( std::abs( lateralIU ) >= best )
                             break;
 
-                        const VECTOR2I padAt = target + VECTOR2I( KiROUND( direction.x * along + across.x * lateralIU ),
-                                                                  KiROUND( direction.y * along + across.y * lateralIU ) );
-                        const VECTOR2I pos = padAt - padOffset;
-
-                        if( free( pos - originalPos ) )
+                        for( int along = 0; along <= reach; along += step )
                         {
-                            best = distance;
-                            bestAngle = turn;
-                            bestPos = pos;
-                            result.partPad = pad;
-                            result.direction = name;
-                            break;
+                            const double distance = std::hypot( double( along ), lateralIU );
+
+                            if( distance >= best )
+                                break;
+
+                            const VECTOR2I padAt = target + VECTOR2I( KiROUND( direction.x * along + across.x * lateralIU ),
+                                                                      KiROUND( direction.y * along + across.y * lateralIU ) );
+                            const VECTOR2I pos = padAt - padOffset;
+
+                            if( free( pos - originalPos ) )
+                            {
+                                best = distance;
+                                bestAngle = turn;
+                                bestPos = pos;
+                                spot.padNumber = pad->GetNumber();
+                                spot.direction = name;
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
+
+        return spot;
+    };
+
+    // corridors of pairs and clocks kept free; entered only when nothing else is found (or, with a
+    // yield distance, when only that brings the pad within it)
+    const bool corridors = aOptions.corridors && !aOptions.corridors->empty();
+    SPOT       chosen = search( corridors ? kept : space );
+    bool       entered = false;
+
+    if( corridors && ( chosen.best == std::numeric_limits<double>::max()
+                       || ( aOptions.corridorYieldMm >= 0 && toMm( chosen.best ) > aOptions.corridorYieldMm ) ) )
+    {
+        SPOT open = search( space );
+
+        if( open.best != std::numeric_limits<double>::max()
+            && ( chosen.best == std::numeric_limits<double>::max() || toMm( open.best ) <= aOptions.corridorYieldMm ) )
+        {
+            chosen = open;
+            entered = true;
+        }
     }
+
+    const double    best = chosen.best;
+    const EDA_ANGLE bestAngle = chosen.angle;
+    const VECTOR2I  bestPos = chosen.pos;
+    result.direction = chosen.direction;
 
     if( best == std::numeric_limits<double>::max() )
     {
@@ -1896,8 +2250,8 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
         return result;
     }
 
-    // the pad pointer is of the last turn tried: take it again after the final turn
-    const wxString number = result.partPad->GetNumber();
+    // the pad is taken again after the final turn
+    const wxString number = chosen.padNumber;
 
     aPart->SetOrientation( bestAngle );
     aPart->SetPosition( bestPos );
@@ -1914,6 +2268,10 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
 
     result.padDistanceMm = toMm( ( result.partPad->GetPosition() - target ).EuclideanNorm() );
     result.under = space.Under();
+
+    if( entered )
+        result.corridor = kept.InCorridors();
+
     return result;
 }
 
@@ -1928,6 +2286,9 @@ nlohmann::json nearJson( const NEAR_PLACEMENT& aPlacement, PAD* aTarget )
 
     if( !aPlacement.under.empty() )
         row["under"] = aPlacement.under;
+
+    if( !aPlacement.corridor.empty() )
+        row["in_corridor"] = aPlacement.corridor;
 
     return row;
 }
@@ -2186,6 +2547,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         NEAR_OPTIONS options = aOptions;
         options.partPad.clear();
         options.partHeight = heightOf( member.part );
+        options.corridorYieldMm = member.decoupling ? aDecapMaxMm : -1;
 
         // a fine-pitch anchor (0.65 mm or less) keeps a ring for its fan-out, unless asked otherwise
         if( options.hostRingMm < 0 )
@@ -3660,12 +4022,20 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
             continue;
         }
 
-        BOARD_COMMIT   groupCommit( context->GetToolManager() );
-        nlohmann::json row = nlohmann::json::object();
+        BOARD_COMMIT                groupCommit( context->GetToolManager() );
+        nlohmann::json              row = nlohmann::json::object();
+        const double                escapeKeep = group.value( "escape_keep_mm", 2.0 );
+        const std::vector<CORRIDOR> corridors = escapeKeep > 0 ? signalCorridors( aCtx, board, escapeKeep, parts ) : std::vector<CORRIDOR>();
+
+        options.corridors = &corridors;
 
         placeGroup( board, groupCommit, anchor, parts, options, group.value( "side", std::string( "same" ) ) == "opposite",
                     group.value( "decap_max_mm", 3.0 ), row,
                     placed );
+
+        for( const CORRIDOR& corridor : corridors )
+            row["corridors"].push_back( corridor.name );
+
         groupCommit.Push( _( "Place group (API)" ) );
         groups.push_back( row );
     }
@@ -3866,9 +4236,15 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
         }
         else
         {
-            const size_t before = moved.size();
+            const size_t                before = moved.size();
+            const double                escapeKeep = spec.value( "escape_keep_mm", 2.0 );
+            const std::vector<CORRIDOR> corridors = escapeKeep > 0 ? signalCorridors( aCtx, board, escapeKeep, parts ) : std::vector<CORRIDOR>();
 
+            options.corridors = &corridors;
             placeGroup( board, commit, anchor, parts, options, side == "opposite", decapMax, out, moved );
+
+            for( const CORRIDOR& corridor : corridors )
+                out["corridors"].push_back( corridor.name );
 
             for( size_t k = before; k < moved.size(); ++k )
             {
@@ -3935,6 +4311,7 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "depth":{"type":"integer","description":"from_schematic: how far sch_subcircuit grows (default 2)"},
     "decoupling":{"type":"string","enum":["per_pin","schematic"],"description":"add the anchor's decoupling capacitors: per_pin - each supply pin group of the anchor (adjacent pins of a rail count once) one capacitor under 1 uF of its rail plus one bulk per rail, the rail's capacitors split among the parts on it by count, each to the part drawn nearest to it (schematic if open, else board); schematic - C parts across two of its rails drawn nearest to it on its sheet, one per supply pin group (a guess). The answer's decoupling.chosen lists them"},
     "decap_max_mm":{"type":"number","default":3,"description":"a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far"},
+    "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off"},
     "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
     "side":{"type":"string","enum":["same","opposite"],"default":"same"},
     "gap_mm":{"type":"number","default":1.0,"description":"between courtyards (room for tracks between the parts; TC-13 2 layers: 0.5 mm routed 68 of 81, 1.0 mm 73); by default a part that finds no place at 1.0 mm takes 0.5"},
