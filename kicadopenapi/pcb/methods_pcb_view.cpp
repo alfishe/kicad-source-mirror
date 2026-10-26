@@ -15,6 +15,9 @@
 #include <pcb_base_frame.h>
 #include <board.h>
 #include <footprint.h>
+#include <pad.h>
+#include <board_connected_item.h>
+#include <netinfo.h>
 #include <frame_type.h>
 #include <kicadopenapi_keepalive.h>
 #include <kicadopenapi_gal_render.h>
@@ -785,7 +788,126 @@ static KOPENAPI_RESULT h_view3d_status( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                                   { "frames", progress.frames },
                                   { "last_frame_ms", progress.lastFrameMs },
                                   { "ready", progress.frames > 0 && !reloadPending && !loading
-                                                     && !progress.moreRequested } } );
+                                                     && !progress.moreRequested },
+                                  { "hit_test_ready", !raytracing && !reloadPending && canvas->IsHitTestReady() } } );
+}
+
+
+/// @brief The 3D viewer's world -> board mm (inverse of boardToWorld)
+static std::optional<SFVEC3F> worldToBoard( EDA_3D_VIEWER_FRAME* aFrame, BOARD* aBoard, const SFVEC3F& aWorld )
+{
+    const BOX2I outline = aBoard ? aBoard->GetBoardEdgesBoundingBox() : BOX2I();
+
+    if( outline.GetWidth() <= 0 || outline.GetHeight() <= 0 )
+        return std::nullopt;
+
+    const BOARD_ADAPTER& adapter = aFrame->GetAdapter();
+    const SFVEC3F        bmin = adapter.GetBBox().Min();
+    const SFVEC3F        bmax = adapter.GetBBox().Max();
+    const double         sx = ( bmax.x - bmin.x ) / ( outline.GetWidth() / pcbIUScale.IU_PER_MM );
+    const double         sy = ( bmax.y - bmin.y ) / ( outline.GetHeight() / pcbIUScale.IU_PER_MM );
+
+    return SFVEC3F( (float) ( outline.GetLeft() / pcbIUScale.IU_PER_MM + ( aWorld.x - bmin.x ) / sx ),
+                    (float) ( outline.GetTop() / pcbIUScale.IU_PER_MM + ( bmax.y - aWorld.y ) / sy ),
+                    (float) ( ( aWorld.z - bmax.z ) / sx ) );
+}
+
+
+static KOPENAPI_RESULT h_view3d_pick( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    const bool byBoardPoint = aArgs.contains( "at_mm" );
+
+    if( byBoardPoint )
+    {
+        const nlohmann::json& at = aArgs["at_mm"];
+
+        if( !at.is_array() || at.size() < 2 || !at[0].is_number() || !at[1].is_number() )
+            return KOPENAPI_RESULT::Error( 400, "at_mm must be [x_mm, y_mm] or [x_mm, y_mm, z_mm]" );
+    }
+    else if( !( aArgs.contains( "x" ) && aArgs.contains( "y" ) && aArgs["x"].is_number() && aArgs["y"].is_number() ) )
+    {
+        return KOPENAPI_RESULT::Error( 400, "give x and y (pixels of a capture, from the top left) or at_mm" );
+    }
+
+    EDA_3D_VIEWER_FRAME* frame = viewer3d( aCtx, false );
+
+    if( !frame || !frame->GetCanvas() || !frame->IsShown() || !frame->GetAdapter().GetBoard() )
+        return KOPENAPI_RESULT::Error( 409, "no 3D viewer window open (view3d_status open: true opens it)" );
+
+    EDA_3D_CANVAS* canvas = frame->GetCanvas();
+    BOARD*         board = const_cast<BOARD*>( frame->GetAdapter().GetBoard() );
+
+    if( frame->GetAdapter().m_Cfg->m_Render.engine != RENDER_ENGINE::OPENGL )
+        return KOPENAPI_RESULT::Error( 409, "picking needs the OpenGL engine (raytracing has no hit-test scene)" );
+
+    if( canvas->IsReloadRequestPending() || !canvas->IsHitTestReady() )
+        return KOPENAPI_RESULT::Error( 409, "hit-test scene being built: wait for view3d_status hit_test_ready" );
+
+    const wxSize   size = canvas->GetNativePixelSize();
+    const CAMERA&  camera = frame->GetCurrentCamera();
+    SFVEC2F        pixel;
+
+    if( byBoardPoint )
+    {
+        const nlohmann::json& at = aArgs["at_mm"];
+        std::optional<SFVEC3F> world = boardToWorld( frame, board, at[0].get<double>(), at[1].get<double>(),
+                                                     at.size() > 2 && at[2].is_number() ? at[2].get<double>() : 0.0 );
+
+        if( !world )
+            return KOPENAPI_RESULT::Error( 409, "the board has no outline" );
+
+        const glm::vec4 clip = camera.GetProjectionMatrix() * camera.GetViewMatrix() * glm::vec4( *world, 1.0f );
+
+        if( clip.w <= 0.0f )
+            return KOPENAPI_RESULT::Error( 400, "at_mm is behind the camera" );
+
+        pixel = SFVEC2F( ( clip.x / clip.w * 0.5f + 0.5f ) * size.x, ( 0.5f - clip.y / clip.w * 0.5f ) * size.y );
+    }
+    else
+    {
+        pixel = SFVEC2F( aArgs["x"].get<float>(), aArgs["y"].get<float>() );
+    }
+
+    nlohmann::json result = { { "pixel", { pixel.x, pixel.y } }, { "canvas", { size.x, size.y } } };
+
+    if( pixel.x < 0 || pixel.y < 0 || pixel.x >= size.x - 1 || pixel.y >= size.y - 1 )
+    {
+        result["hit"] = false;
+        result["outside"] = true;
+        return KOPENAPI_RESULT::Ok( result );
+    }
+
+    SFVEC3F     hitWorld;
+    BOARD_ITEM* item = canvas->PickBoardItem( pixel, &hitWorld );
+
+    result["hit"] = item != nullptr;
+
+    if( !item )
+        return KOPENAPI_RESULT::Ok( result );
+
+    if( std::optional<SFVEC3F> mm = worldToBoard( frame, board, hitWorld ) )
+        result["point_mm"] = { mm->x, mm->y, mm->z };
+
+    nlohmann::json desc = { { "type", item->GetClass().ToStdString() },
+                            { "uuid", item->m_Uuid.AsStdString() } };
+
+    if( item->GetLayer() != UNDEFINED_LAYER )
+        desc["layer"] = board->GetLayerName( item->GetLayer() ).ToStdString();
+
+    if( const FOOTPRINT* fp = item->Type() == PCB_FOOTPRINT_T ? static_cast<const FOOTPRINT*>( item )
+                                                               : item->GetParentFootprint() )
+    {
+        desc["reference"] = fp->GetReference().ToStdString();
+    }
+
+    if( item->Type() == PCB_PAD_T )
+        desc["pad"] = static_cast<PAD*>( item )->GetNumber().ToStdString();
+
+    if( BOARD_CONNECTED_ITEM* conn = dynamic_cast<BOARD_CONNECTED_ITEM*>( item ); conn && conn->GetNet() )
+        desc["net"] = conn->GetNetname().ToStdString();
+
+    result["item"] = desc;
+    return KOPENAPI_RESULT::Ok( result );
 }
 
 
@@ -1417,10 +1539,23 @@ KOPENAPI_REGISTER( "pcb_view_zoom",
 KOPENAPI_REGISTER( "view3d_status",
                    "3D viewer progress: open, engine, scene reload pending / loading (models), whether the "
                    "renderer wants more passes (raytracing), frames shown and the last frame's time; "
-                   "ready = the final picture is on screen. open: true opens the viewer; GUI only",
+                   "ready = the final picture is on screen; hit_test_ready = view3d_pick sees the current "
+                   "scene and visibility. open: true opens the viewer; GUI only",
                    R"json({"type":"object","properties":{
                         "open":{"type":"boolean","default":false}}})json"_json,
                    true, h_view3d_status );
+
+KOPENAPI_REGISTER( "view3d_pick",
+                   "What the 3D viewer shows at a point, as a mouse click picks it (OpenGL hit-test scene: "
+                   "copper with pads, tracks, vias, zones, and the models; hidden layers and models are not "
+                   "picked): x / y (pixels of a pcb_view_capture of the 3D view, from the top left) or at_mm "
+                   "(a board point, projected through the camera). Answer: hit, item (type, reference, pad, "
+                   "net, layer, uuid), point_mm (where the ray hits, z above the board's top surface), pixel, "
+                   "canvas size. 409 while the hit-test scene is rebuilt (view3d_status hit_test_ready); GUI only",
+                   R"json({"type":"object","properties":{
+                        "x":{"type":"number"},"y":{"type":"number"},
+                        "at_mm":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3}}})json"_json,
+                   true, h_view3d_pick );
 
 KOPENAPI_REGISTER( "view3d_lead_clips",
                    "Through-hole lead cut of the 3D viewer per footprint model: leads past the maximum protrusion "

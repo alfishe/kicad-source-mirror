@@ -86,6 +86,9 @@ public:
     /// @return true while a reload builds the scene in the background (not yet complete)
     virtual bool IsSceneLoading() const { return false; }
 
+    /// Called with the GL context current after a frame was shown.
+    virtual void CompileBuiltLists() {}
+
     /**
      * Request stop and join any in-progress background loading.
      */

@@ -258,6 +258,10 @@ void RENDER_3D_RAYTRACE_BASE::createItemsFromContainer( const BVH_CONTAINER_2D* 
 
     for( const OBJECT_2D* object2d_A : listObject2d )
     {
+        // what a click or hover on it picks
+        const BOARD_ITEM& owner = object2d_A->GetBoardItem();
+        BOARD_ITEM*       boardItem = owner.Type() == NOT_USED ? nullptr : const_cast<BOARD_ITEM*>( &owner );
+
         // not yet used / implemented (can be used in future to clip the objects in the
         // board borders
         OBJECT_2D* object2d_C = CSGITEM_FULL;
@@ -372,6 +376,7 @@ void RENDER_3D_RAYTRACE_BASE::createItemsFromContainer( const BVH_CONTAINER_2D* 
             LAYER_ITEM* objPtr = new LAYER_ITEM( object2d_A,
                                     m_boardAdapter.GetLayerBottomZPos( aLayer_id ) - aLayerZOffset,
                                     m_boardAdapter.GetLayerTopZPos( aLayer_id ) + aLayerZOffset );
+            objPtr->SetBoardItem( boardItem );
             objPtr->SetMaterial( aMaterialLayer );
             objPtr->SetColor( ConvertSRGBToLinear( aLayerColor ) );
             m_objectContainer.Add( objPtr );
@@ -385,6 +390,7 @@ void RENDER_3D_RAYTRACE_BASE::createItemsFromContainer( const BVH_CONTAINER_2D* 
             LAYER_ITEM* objPtr = new LAYER_ITEM( itemCSG2d,
                                     m_boardAdapter.GetLayerBottomZPos( aLayer_id ) - aLayerZOffset,
                                     m_boardAdapter.GetLayerTopZPos( aLayer_id ) + aLayerZOffset );
+            objPtr->SetBoardItem( boardItem );
 
             objPtr->SetMaterial( aMaterialLayer );
             objPtr->SetColor( ConvertSRGBToLinear( aLayerColor ) );
@@ -691,6 +697,9 @@ void RENDER_3D_RAYTRACE_BASE::Reload( bool aOnlyLoadCopperAndShapes, std::stop_t
         if( aOnlyLoadCopperAndShapes && !IsCopperLayer( layer_id ) )
             continue;
 
+        if( !m_boardAdapter.Is3dLayerEnabled( layer_id, layerFlags ) )
+            continue;
+
         // Mask layers are not processed here because they are a special case
         if( layer_id == B_Mask || layer_id == F_Mask )
             continue;
@@ -785,13 +794,19 @@ void RENDER_3D_RAYTRACE_BASE::Reload( bool aOnlyLoadCopperAndShapes, std::stop_t
     // Create plated copper
     if( m_boardAdapter.m_Cfg->m_Render.differentiate_plated_copper )
     {
-        createItemsFromContainer( m_boardAdapter.GetPlatedPadsFront(), F_Cu, &m_materials.m_Copper,
-                                  m_boardAdapter.m_CopperColor,
-                                  m_boardAdapter.GetFrontCopperThickness() * 0.1f );
+        if( m_boardAdapter.Is3dLayerEnabled( F_Cu, layerFlags ) )
+        {
+            createItemsFromContainer( m_boardAdapter.GetPlatedPadsFront(), F_Cu, &m_materials.m_Copper,
+                                      m_boardAdapter.m_CopperColor,
+                                      m_boardAdapter.GetFrontCopperThickness() * 0.1f );
+        }
 
-        createItemsFromContainer( m_boardAdapter.GetPlatedPadsBack(), B_Cu, &m_materials.m_Copper,
-                                  m_boardAdapter.m_CopperColor,
-                                  -m_boardAdapter.GetBackCopperThickness() * 0.1f );
+        if( m_boardAdapter.Is3dLayerEnabled( B_Cu, layerFlags ) )
+        {
+            createItemsFromContainer( m_boardAdapter.GetPlatedPadsBack(), B_Cu, &m_materials.m_Copper,
+                                      m_boardAdapter.m_CopperColor,
+                                      -m_boardAdapter.GetBackCopperThickness() * 0.1f );
+        }
     }
 
     if( !aOnlyLoadCopperAndShapes )

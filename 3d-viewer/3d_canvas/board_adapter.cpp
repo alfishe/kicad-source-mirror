@@ -854,6 +854,20 @@ void BOARD_ADAPTER::SetVisibleLayers( const std::bitset<LAYER_3D_END>& aLayers )
 }
 
 
+std::bitset<LAYER_3D_END> BOARD_ADAPTER::GetBuiltLayers() const
+{
+    std::bitset<LAYER_3D_END> layers = GetVisibleLayers();
+
+    if( m_Cfg && m_Cfg->m_Render.engine == RENDER_ENGINE::OPENGL )
+    {
+        layers.set( LAYER_3D_COPPER_TOP );
+        layers.set( LAYER_3D_COPPER_BOTTOM );
+    }
+
+    return layers;
+}
+
+
 std::bitset<LAYER_3D_END> BOARD_ADAPTER::GetVisibleLayers() const
 {
     if( m_visibilityOverride )

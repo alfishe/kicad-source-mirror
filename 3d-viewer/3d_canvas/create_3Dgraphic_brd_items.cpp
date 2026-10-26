@@ -198,6 +198,66 @@ void BOARD_ADAPTER::addShape( const PCB_DIMENSION_BASE* aDimension, CONTAINER_2D
 }
 
 
+int BOARD_ADAPTER::FpTextKind( const BOARD_ITEM* aItem )
+{
+    if( aItem->Type() == PCB_FIELD_T )
+    {
+        const PCB_FIELD* field = static_cast<const PCB_FIELD*>( aItem );
+
+        if( field->IsReference() )
+            return BOARD_ADAPTER::FP_TEXT_REFERENCE;
+
+        if( field->IsValue() )
+            return BOARD_ADAPTER::FP_TEXT_VALUE;
+
+        return BOARD_ADAPTER::FP_TEXT_OTHER;
+    }
+
+    const wxString& text = static_cast<const PCB_TEXT*>( aItem )->GetText();
+
+    if( text == wxT( "${REFERENCE}" ) )
+        return BOARD_ADAPTER::FP_TEXT_REFERENCE;
+
+    if( text == wxT( "${VALUE}" ) )
+        return BOARD_ADAPTER::FP_TEXT_VALUE;
+
+    return BOARD_ADAPTER::FP_TEXT_OTHER;
+}
+
+
+bool BOARD_ADAPTER::IsFpTextKindVisible( int aKind, const std::bitset<LAYER_3D_END>& aFlags )
+{
+    if( !aFlags.test( LAYER_FP_TEXT ) )
+        return false;
+
+    switch( aKind )
+    {
+    case FP_TEXT_REFERENCE: return aFlags.test( LAYER_FP_REFERENCES );
+    case FP_TEXT_VALUE:     return aFlags.test( LAYER_FP_VALUES );
+    default:                return true;
+    }
+}
+
+
+void BOARD_ADAPTER::addFootprintTexts( const FOOTPRINT* aFootprint, CONTAINER_2D_BASE* aContainer,
+                                       PCB_LAYER_ID aLayerId, int aKind )
+{
+    for( PCB_FIELD* field : aFootprint->GetFields() )
+    {
+        wxCHECK2( field, continue );
+
+        if( field->GetLayer() == aLayerId && field->IsVisible() && FpTextKind( field ) == aKind )
+            addText( field, aContainer, field );
+    }
+
+    for( BOARD_ITEM* item : aFootprint->GraphicalItems() )
+    {
+        if( item->Type() == PCB_TEXT_T && item->GetLayer() == aLayerId && FpTextKind( item ) == aKind )
+            addText( static_cast<PCB_TEXT*>( item ), aContainer, item );
+    }
+}
+
+
 void BOARD_ADAPTER::addFootprintShapes( const FOOTPRINT* aFootprint, CONTAINER_2D_BASE* aContainer,
                                         PCB_LAYER_ID aLayerId,
                                         const std::bitset<LAYER_3D_END>& aFlags )

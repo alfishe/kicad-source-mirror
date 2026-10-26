@@ -152,6 +152,18 @@ public:
     void InvalidateRaytracingHitTesting();
 
     /**
+     * The board item under a point of the canvas, as the mouse would pick it (OpenGL).
+     *
+     * @param aPixel native pixels from the top left, as in a capture of the canvas.
+     * @param aHitPoint where the ray hits, in 3D units (left unchanged when nothing is hit).
+     * @return the item, or nullptr when nothing is hit or the point is outside the canvas.
+     */
+    BOARD_ITEM* PickBoardItem( const SFVEC2F& aPixel, SFVEC3F* aHitPoint = nullptr );
+
+    /// Whether the hit-test scene matches the current scene and visibility (OpenGL)
+    bool IsHitTestReady() const;
+
+    /**
      * Query if there is a pending reload request.
      *
      * @return true if it wants to reload, false if there is no reload pending.

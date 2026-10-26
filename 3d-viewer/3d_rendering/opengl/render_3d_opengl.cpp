@@ -55,7 +55,6 @@ RENDER_3D_OPENGL::RENDER_3D_OPENGL( EDA_3D_CANVAS* aCanvas, BOARD_ADAPTER& aAdap
     m_layers.clear();
     m_outerLayerHoles.clear();
     m_innerLayerHoles.clear();
-    m_triangles.clear();
     m_board = nullptr;
     m_antiBoard = nullptr;
 
@@ -788,6 +787,30 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
 
             pLayerDispList->DrawCulled( showThickness, solder_mask, throughHolesOuter, anti_board );
 
+            for( int kind = 0; kind < BOARD_ADAPTER::FP_TEXT_KIND_COUNT; ++kind )
+            {
+                auto text = m_fpTextLayers[kind].find( layer );
+
+                if( text == m_fpTextLayers[kind].end() || !BOARD_ADAPTER::IsFpTextKindVisible( kind, layerFlags ) )
+                    continue;
+
+                std::shared_ptr<OPENGL_RENDER_LIST> textList = text->second->MakeOrGet();
+
+                if( !textList )
+                    continue;
+
+                if( throughHolesOuter )
+                    throughHolesOuter->ApplyScalePosition( textList );
+
+                if( anti_board )
+                    anti_board->ApplyScalePosition( textList );
+
+                if( solder_mask )
+                    solder_mask->ApplyScalePosition( textList );
+
+                textList->DrawCulled( showThickness, solder_mask, throughHolesOuter, anti_board );
+            }
+
             glDisable( GL_POLYGON_OFFSET_FILL );
             glPolygonOffset( 0.0f, 0.0f );
         }
@@ -1050,6 +1073,9 @@ void RENDER_3D_OPENGL::freeAllLists()
 
     DELETE_AND_FREE_MAP( m_layers )
 
+    for( MAP_OGL_DISP_LISTS& textLayers : m_fpTextLayers )
+        DELETE_AND_FREE_MAP( textLayers )
+
     DELETE_AND_FREE( m_platedPadsFront )
     DELETE_AND_FREE( m_platedPadsBack )
     DELETE_AND_FREE( m_offboardPadsFront )
@@ -1058,10 +1084,6 @@ void RENDER_3D_OPENGL::freeAllLists()
     DELETE_AND_FREE_MAP( m_outerLayerHoles )
     DELETE_AND_FREE_MAP( m_innerLayerHoles )
 
-    for( std::shared_ptr<TRIANGLE_DISPLAY_LIST>& list : m_triangles )
-        list.reset();
-
-    m_triangles.clear();
 
     if( !m_keepModelsOnReload )
         DELETE_AND_FREE_MAP( m_3dModelMap )
@@ -1197,6 +1219,46 @@ void RENDER_3D_OPENGL::releaseRetiredRenderPtrs()
     {
         std::lock_guard<std::recursive_mutex> lock( m_renderMutex );
         retired.swap( m_retiredRenderPtrs );
+    }
+}
+
+
+void RENDER_3D_OPENGL::CompileBuiltLists()
+{
+    if( m_sceneLoading || !m_compileBuiltPending.exchange( false ) )
+        return;
+
+    std::lock_guard<std::recursive_mutex> lock( m_renderMutex );
+
+    auto compile = []( const std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED>& aList )
+    {
+        if( aList )
+            aList->Compile();
+    };
+
+    auto compileAll = [&]( const auto& aMap )
+    {
+        for( const auto& [key, list] : aMap )
+            compile( list );
+    };
+
+    compileAll( m_layers );
+
+    for( const MAP_OGL_DISP_LISTS& textLayers : m_fpTextLayers )
+        compileAll( textLayers );
+
+    compileAll( m_outerLayerHoles );
+    compileAll( m_innerLayerHoles );
+    compileAll( m_extrudedBodyLists );
+    compileAll( m_extrudedPadLists );
+    compileAll( m_extrudedPegLists );
+
+    for( const std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED>& list :
+         { m_platedPadsFront, m_platedPadsBack, m_offboardPadsFront, m_offboardPadsBack, m_board,
+           m_boardWithHoles, m_postMachinePlugs, m_antiBoard, m_outerThroughHoles, m_outerViaThroughHoles,
+           m_outerThroughHoleRings, m_microviaHoles, m_padHoles, m_viaFrontCover, m_viaBackCover } )
+    {
+        compile( list );
     }
 }
 

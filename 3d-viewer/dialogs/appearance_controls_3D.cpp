@@ -399,6 +399,7 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
     bool                          killFollow = false;
     bool                          doFastRefresh = false;    // true to just refresh the display
     bool                          drawOnly = false;         // layer data unchanged: draw again
+    bool                          rebuildHitTest = false;   // with drawOnly: what can be picked changed
 
     // Layers whose geometry does not depend on the others: hiding one, or showing one the last
     // scene build had visible, only changes what is drawn (OpenGL; raytracing rebuilds its scene)
@@ -420,6 +421,7 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
         }
 
         visibleLayers.set( LAYER_FP_TEXT, isVisible );
+        drawOnly = oglRender && !oglRender->IsSceneLoading() && m_frame->GetAdapter().FpTextBuiltApart();
         killFollow = true;
         break;
 
@@ -431,6 +433,7 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
             visibleLayers.set( LAYER_FP_TEXT, true );
 
         visibleLayers.set( aLayer, isVisible );
+        drawOnly = oglRender && !oglRender->IsSceneLoading() && m_frame->GetAdapter().FpTextBuiltApart();
         killFollow = true;
         break;
 
@@ -462,8 +465,20 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
         break;
 
     case LAYER_3D_BOARD:
+        // the board body geometry does not depend on its visibility, nor does the hit-test scene
+        drawOnly = oglRender && !oglRender->IsSceneLoading();
+        visibleLayers.set( aLayer, isVisible );
+        killFollow = true;
+        break;
+
     case LAYER_3D_COPPER_TOP:
     case LAYER_3D_COPPER_BOTTOM:
+        drawOnly = oglRender && !oglRender->IsSceneLoading() && oglRender->LayerBuiltVisible( aLayer );
+        rebuildHitTest = drawOnly;
+        visibleLayers.set( aLayer, isVisible );
+        killFollow = true;
+        break;
+
     case LAYER_3D_PLATED_BARRELS:
         visibleLayers.set( aLayer, isVisible );
         killFollow = true;
@@ -499,6 +514,9 @@ void APPEARANCE_CONTROLS_3D::OnLayerVisibilityChanged( int aLayer, bool isVisibl
 
     if( drawOnly )
     {
+        if( rebuildHitTest )
+            oglRender->RebuildHitTestAsync();
+
         m_frame->GetCanvas()->Request_refresh();
     }
     else if( doFastRefresh && m_frame->GetAdapter().m_Cfg->m_Render.engine == RENDER_ENGINE::OPENGL )

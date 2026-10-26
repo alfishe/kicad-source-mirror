@@ -1767,7 +1767,15 @@ void RENDER_3D_RAYTRACE_BASE::InvalidateHitTesting()
 }
 
 
-BOARD_ITEM* RENDER_3D_RAYTRACE_BASE::IntersectBoardItem( const RAY& aRay )
+bool RENDER_3D_RAYTRACE_BASE::HasHitTestScene()
+{
+    std::lock_guard<std::mutex> lock( m_hitTestMutex );
+
+    return m_accelerator != nullptr;
+}
+
+
+BOARD_ITEM* RENDER_3D_RAYTRACE_BASE::IntersectBoardItem( const RAY& aRay, SFVEC3F* aHitPoint )
 {
     std::lock_guard<std::mutex> lock( m_hitTestMutex );
 
@@ -1778,6 +1786,9 @@ BOARD_ITEM* RENDER_3D_RAYTRACE_BASE::IntersectBoardItem( const RAY& aRay )
     {
         if( m_accelerator->Intersect( aRay, hitInfo ) )
         {
+            if( aHitPoint )
+                *aHitPoint = aRay.at( hitInfo.m_tHit );
+
             if( hitInfo.pHitObject )
                 return hitInfo.pHitObject->GetBoardItem();
         }

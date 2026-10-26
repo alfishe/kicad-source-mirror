@@ -49,7 +49,6 @@
 #include <thread>
 
 typedef std::map<PCB_LAYER_ID, std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED>> MAP_OGL_DISP_LISTS;
-typedef std::list<std::shared_ptr<TRIANGLE_DISPLAY_LIST>>                    LIST_TRIANGLES;
 
 #define SIZE_OF_CIRCLE_TEXTURE 1024
 
@@ -74,6 +73,13 @@ public:
     /// @brief Whether the last scene build saw this 3D layer visible (its geometry is complete, so
     /// showing it again needs no rebuild; hidden layers are skipped when drawing)
     bool LayerBuiltVisible( int aLayer3D ) const { return m_builtLayerFlags.test( aLayer3D ); }
+
+    /// No scene load or hit-test rebuild running or requested
+    bool IsHitTestReady() const { return !m_sceneLoading && !m_bgWorkerBusy && !m_hitTestDirty; }
+
+    /// Once per completed scene: compiles the lists not drawn yet (layers built hidden), so no
+    /// CPU triangles stay alive.
+    void CompileBuiltLists() override;
     void StopBgWorker() override;
 
     void SetCurrentRollOverItem( BOARD_ITEM* aRollOverItem )
@@ -319,6 +325,7 @@ private:
     std::atomic<bool>    m_bgWorkerBusy{ false };
     std::atomic<bool>    m_sceneLoading{ false };   ///< reload started, scene not complete yet
     std::atomic<bool>    m_hitTestDirty{ false };
+    std::atomic<bool>    m_compileBuiltPending{ false };
     std::recursive_mutex m_renderMutex;
 
 private:
@@ -347,15 +354,10 @@ private:
             m_retiredRenderPtrs.push_back( std::move( aPtr ) );
     }
 
-    void appendRenderTriangleList( std::shared_ptr<TRIANGLE_DISPLAY_LIST> aTriangles )
-    {
-        std::lock_guard lock( m_renderMutex );
-        m_triangles.push_back( std::move( aTriangles ) );
-    }
-
 private:
     // Access to the following members must be protected by m_renderMutex:
     MAP_OGL_DISP_LISTS  m_layers;
+    MAP_OGL_DISP_LISTS  m_fpTextLayers[BOARD_ADAPTER::FP_TEXT_KIND_COUNT]; ///< drawn by visibility
     std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED> m_platedPadsFront;
     std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED> m_platedPadsBack;
     std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED> m_offboardPadsFront;
@@ -371,7 +373,6 @@ private:
     std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED> m_outerThroughHoleRings;
     std::vector<std::shared_ptr<void>>           m_retiredRenderPtrs;
 
-    LIST_TRIANGLES      m_triangles;       ///< store pointers so can be deleted latter
     GLuint              m_circleTexture;
 
     GLuint              m_grid;             ///< oGL list that stores current grid

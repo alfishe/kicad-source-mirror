@@ -312,9 +312,6 @@ RENDER_3D_OPENGL::generateLayerList( const BVH_CONTAINER_2D* aContainer, const S
 
     auto layerTriangles = std::make_shared<TRIANGLE_DISPLAY_LIST>( nrTrianglesEstimation );
 
-    // store in a list so it will be latter deleted
-    appendRenderTriangleList( layerTriangles );
-
     // Load the 2D (X,Y axis) component of shapes
     for( const OBJECT_2D* object2d : listObject2d )
     {
@@ -365,9 +362,6 @@ std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED> RENDER_3D_OPENGL::generateEmptyLaye
     getLayerZPos( aLayer, layer_z_top, layer_z_bot );
 
     auto layerTriangles = std::make_shared<TRIANGLE_DISPLAY_LIST>( 1 );
-
-    // store in a list so it will be latter deleted
-    appendRenderTriangleList( layerTriangles );
 
     return std::make_shared<OPENGL_RENDER_LIST_DEFERRED>( layerTriangles, m_circleTexture, layer_z_bot, layer_z_top );
 }
@@ -666,9 +660,6 @@ void RENDER_3D_OPENGL::backfillPostMachine()
         || plugTriangles->m_layer_bot_triangles->GetVertexSize() > 0
         || plugTriangles->m_layer_middle_contours_quads->GetVertexSize() > 0 )
     {
-        // Store the triangles for later cleanup
-        appendRenderTriangleList( plugTriangles );
-
         // Create a render list for the plugs using the same Z range as the board
         // This will be scaled and drawn alongside m_boardWithHoles in renderBoardBody()
         assignRenderPtr( m_postMachinePlugs,
@@ -747,7 +738,6 @@ void RENDER_3D_OPENGL::renderExtrudedBodies()
         std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED> renderList =
                 std::make_shared<OPENGL_RENDER_LIST_DEFERRED>( layerTri, m_circleTexture, zTop, zBot );
 
-        appendRenderTriangleList( layerTri );
         assignRenderMap( m_extrudedBodyLists, fp, renderList );
 
         // Create pin extrusions for pad holes
@@ -804,7 +794,6 @@ void RENDER_3D_OPENGL::renderExtrudedBodies()
                             std::make_shared<OPENGL_RENDER_LIST_DEFERRED>( pinLayerTri, m_circleTexture, pinZTop,
                                                                            pinZBot );
 
-                    appendRenderTriangleList( pinLayerTri );
                     assignRenderMap( aDstMap, fp, pinRenderList );
                 };
 
@@ -840,7 +829,7 @@ void RENDER_3D_OPENGL::reload()
     OBJECT_2D_STATS::Instance().ResetStats();
 
     m_boardAdapter.InitSettings( m_activityReporter, m_warningReporter );
-    m_builtLayerFlags = m_boardAdapter.GetVisibleLayers();
+    m_builtLayerFlags = m_boardAdapter.GetBuiltLayers();
 
     SFVEC3F camera_pos = m_boardAdapter.GetBoardCenter();
     m_camera.SetBoardLookAtPos( camera_pos );
@@ -849,6 +838,7 @@ void RENDER_3D_OPENGL::reload()
     assignRenderPtr( m_board, createBoard( m_boardAdapter.GetBoardPoly(), nullptr ) );
 
     m_sceneLoading = true;
+    m_compileBuiltPending = false;
     startBgWorker();
 }
 
@@ -1012,9 +1002,49 @@ void RENDER_3D_OPENGL::bgWorker( std::stop_token aStop )
     if( m_activityReporter )
         m_activityReporter->Report( _( "Load OpenGL: layers" ) );
 
-    std::bitset<LAYER_3D_END> visibilityFlags = m_boardAdapter.GetVisibleLayers();
+    std::bitset<LAYER_3D_END> visibilityFlags = m_boardAdapter.GetBuiltLayers();
     const MAP_POLY&           map_poly = m_boardAdapter.GetPolyMap();
     wxString                  msg;
+
+    // vertical walls of a layer: inside the board, without holes and cutouts, silk without mask
+    auto subtractFromLayer =
+            [&]( PCB_LAYER_ID aLayer, SHAPE_POLY_SET& aPoly )
+            {
+                if( LSET::PhysicalLayersMask().test( aLayer ) )
+                {
+                    aPoly.BooleanIntersection( m_boardAdapter.GetBoardPoly() );
+                }
+
+                if( aLayer != B_Mask && aLayer != F_Mask )
+                {
+                    aPoly.BooleanSubtract( m_boardAdapter.GetTH_ODPolys() );
+                    aPoly.BooleanSubtract( m_boardAdapter.GetNPTH_ODPolys() );
+
+                    // Subtract counterbore/countersink cutouts from copper layers
+                    if( aLayer == F_Cu )
+                    {
+                        aPoly.BooleanSubtract( m_boardAdapter.GetFrontCounterborePolys() );
+                        aPoly.BooleanSubtract( m_boardAdapter.GetFrontCountersinkPolys() );
+                    }
+                    else if( aLayer == B_Cu )
+                    {
+                        aPoly.BooleanSubtract( m_boardAdapter.GetBackCounterborePolys() );
+                        aPoly.BooleanSubtract( m_boardAdapter.GetBackCountersinkPolys() );
+                    }
+                }
+
+                if( m_boardAdapter.m_Cfg->m_Render.subtract_mask_from_silk )
+                {
+                    if( aLayer == B_SilkS && map_poly.contains( B_Mask ) )
+                    {
+                        aPoly.BooleanSubtract( *map_poly.at( B_Mask ) );
+                    }
+                    else if( aLayer == F_SilkS && map_poly.contains( F_Mask ) )
+                    {
+                        aPoly.BooleanSubtract( *map_poly.at( F_Mask ) );
+                    }
+                }
+            };
 
     for( const auto& [ layer, container2d ] : m_boardAdapter.GetLayerMap() )
     {
@@ -1037,42 +1067,7 @@ void RENDER_3D_OPENGL::bgWorker( std::stop_token aStop )
             if( map_poly.contains( layer ) )
             {
                 polyListSubtracted = *map_poly.at( layer );
-
-                if( LSET::PhysicalLayersMask().test( layer ) )
-                {
-                    polyListSubtracted.BooleanIntersection( m_boardAdapter.GetBoardPoly() );
-                }
-
-                if( layer != B_Mask && layer != F_Mask )
-                {
-                    polyListSubtracted.BooleanSubtract( m_boardAdapter.GetTH_ODPolys() );
-                    polyListSubtracted.BooleanSubtract( m_boardAdapter.GetNPTH_ODPolys() );
-
-                    // Subtract counterbore/countersink cutouts from copper layers
-                    if( layer == F_Cu )
-                    {
-                        polyListSubtracted.BooleanSubtract( m_boardAdapter.GetFrontCounterborePolys() );
-                        polyListSubtracted.BooleanSubtract( m_boardAdapter.GetFrontCountersinkPolys() );
-                    }
-                    else if( layer == B_Cu )
-                    {
-                        polyListSubtracted.BooleanSubtract( m_boardAdapter.GetBackCounterborePolys() );
-                        polyListSubtracted.BooleanSubtract( m_boardAdapter.GetBackCountersinkPolys() );
-                    }
-                }
-
-                if( m_boardAdapter.m_Cfg->m_Render.subtract_mask_from_silk )
-                {
-                    if( layer == B_SilkS && map_poly.contains( B_Mask ) )
-                    {
-                        polyListSubtracted.BooleanSubtract( *map_poly.at( B_Mask ) );
-                    }
-                    else if( layer == F_SilkS && map_poly.contains( F_Mask ) )
-                    {
-                        polyListSubtracted.BooleanSubtract( *map_poly.at( F_Mask ) );
-                    }
-                }
-
+                subtractFromLayer( layer, polyListSubtracted );
                 polyList = &polyListSubtracted;
             }
         }
@@ -1085,6 +1080,37 @@ void RENDER_3D_OPENGL::bgWorker( std::stop_token aStop )
 
         if( oglList != nullptr )
             assignRenderMap( m_layers, layer, oglList );
+
+        for( int kind = 0; kind < BOARD_ADAPTER::FP_TEXT_KIND_COUNT; ++kind )
+        {
+            const MAP_CONTAINER_2D_BASE& textMap = m_boardAdapter.GetFpTextLayerMap( kind );
+
+            if( !textMap.contains( layer ) )
+                continue;
+
+            const MAP_POLY& textPolys = m_boardAdapter.GetFpTextPolyMap( kind );
+            SHAPE_POLY_SET  textPoly;
+            SHAPE_POLY_SET* textPolyList = nullptr;
+
+            if( m_boardAdapter.m_Cfg->m_Render.opengl_copper_thickness && textPolys.contains( layer ) )
+            {
+                textPoly = *textPolys.at( layer );
+                subtractFromLayer( layer, textPoly );
+                textPolyList = &textPoly;
+            }
+
+            std::shared_ptr<OPENGL_RENDER_LIST_DEFERRED> textList =
+                    generateLayerList( textMap.at( layer ), textPolyList, layer, &m_boardAdapter.GetTH_IDs() );
+
+            if( !textList )
+                continue;
+
+            assignRenderMap( m_fpTextLayers[kind], layer, textList );
+
+            // the draw loop walks m_layers
+            if( !m_layers.contains( layer ) )
+                assignRenderMap( m_layers, layer, generateEmptyLayerList( layer ) );
+        }
 
         if( aStop.stop_requested() )
             return;
@@ -1146,6 +1172,7 @@ void RENDER_3D_OPENGL::bgWorker( std::stop_token aStop )
     if( aStop.stop_requested() )
         return;
 
+    m_boardAdapter.ReleaseDrawnLayerData();
     sendRefreshView();
 
     // Load 3D models
@@ -1160,6 +1187,7 @@ void RENDER_3D_OPENGL::bgWorker( std::stop_token aStop )
         return;
 
     m_sceneLoading = false;
+    m_compileBuiltPending = true;
     sendRefreshView();
 
     // OpenGL draws the board on the GPU, but hover/picking still uses the auxiliary

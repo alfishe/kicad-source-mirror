@@ -215,6 +215,91 @@ void transformFPTextToPolySet( const FOOTPRINT* aFootprint, PCB_LAYER_ID aLayer,
 }
 
 
+void transformFPTextKindToPolySet( const FOOTPRINT* aFootprint, PCB_LAYER_ID aLayer, int aKind,
+                                   SHAPE_POLY_SET& aBuffer, int aMaxError, ERROR_LOC aErrorLoc )
+{
+    for( BOARD_ITEM* item : aFootprint->GraphicalItems() )
+    {
+        if( item->Type() == PCB_TEXT_T && item->IsOnLayer( aLayer )
+                && BOARD_ADAPTER::FpTextKind( item ) == aKind )
+        {
+            static_cast<PCB_TEXT*>( item )->TransformTextToPolySet( aBuffer, 0, aMaxError, aErrorLoc );
+        }
+    }
+
+    for( const PCB_FIELD* field : aFootprint->GetFields() )
+    {
+        wxCHECK2( field, continue );
+
+        if( field->IsOnLayer( aLayer ) && field->IsVisible() && BOARD_ADAPTER::FpTextKind( field ) == aKind )
+            field->TransformTextToPolySet( aBuffer, 0, aMaxError, aErrorLoc );
+    }
+}
+
+
+bool hasFpTextOnCopperOrMask( const BOARD* aBoard )
+{
+    const LSET layers = LSET::AllCuMask() | LSET( { F_Mask, B_Mask } );
+
+    for( const FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( const PCB_FIELD* field : fp->GetFields() )
+        {
+            if( field && field->IsVisible() && ( field->GetLayerSet() & layers ).any() )
+                return true;
+        }
+
+        for( const BOARD_ITEM* item : fp->GraphicalItems() )
+        {
+            if( item->Type() == PCB_TEXT_T && ( item->GetLayerSet() & layers ).any() )
+                return true;
+        }
+    }
+
+    return false;
+}
+
+
+void BOARD_ADAPTER::ReleaseDrawnLayerData()
+{
+    auto freeMap =
+            []( auto& aMap )
+            {
+                for( auto& [layer, ptr] : aMap )
+                    delete ptr;
+
+                aMap.clear();
+            };
+
+    freeMap( m_layers_poly );
+    freeMap( m_layerHoleOdPolys );
+    freeMap( m_layerHoleIdPolys );
+
+    for( int kind = 0; kind < FP_TEXT_KIND_COUNT; ++kind )
+    {
+        freeMap( m_fpTextLayerMap[kind] );
+        freeMap( m_fpTextPolys[kind] );
+    }
+
+    delete m_frontPlatedCopperPolys;
+    m_frontPlatedCopperPolys = nullptr;
+    delete m_backPlatedCopperPolys;
+    m_backPlatedCopperPolys = nullptr;
+
+    for( auto it = m_layerMap.begin(); it != m_layerMap.end(); )
+    {
+        if( IsCopperLayer( it->first ) )
+        {
+            ++it;
+            continue;
+        }
+
+        delete it->second;
+        it = m_layerMap.erase( it );
+    }
+}
+
+
 void BOARD_ADAPTER::destroyLayers()
 {
 #define DELETE_AND_FREE( ptr ) \
@@ -250,6 +335,14 @@ void BOARD_ADAPTER::destroyLayers()
     m_backCountersinkPolys.RemoveAllContours();
 
     DELETE_AND_FREE_MAP( m_layerMap )
+
+    for( int kind = 0; kind < FP_TEXT_KIND_COUNT; ++kind )
+    {
+        DELETE_AND_FREE_MAP( m_fpTextLayerMap[kind] )
+        DELETE_AND_FREE_MAP( m_fpTextPolys[kind] )
+    }
+
+    m_fpTextBuiltApart = false;
     DELETE_AND_FREE_MAP( m_layerHoleMap )
 
     DELETE_AND_FREE( m_platedPadsFront )
@@ -290,7 +383,7 @@ void BOARD_ADAPTER::createLayers( std::shared_ptr<REPORTER> aStatusReporter, std
 
     EDA_3D_VIEWER_SETTINGS::RENDER_SETTINGS& cfg = m_Cfg->m_Render;
 
-    std::bitset<LAYER_3D_END> visibilityFlags = GetVisibleLayers();
+    std::bitset<LAYER_3D_END> visibilityFlags = GetBuiltLayers();
 
     m_trackCount               = 0;
     m_averageTrackWidth        = 0;
@@ -1464,6 +1557,15 @@ void BOARD_ADAPTER::createLayers( std::shared_ptr<REPORTER> aStatusReporter, std
 
     std::bitset<LAYER_3D_END> enabledFlags = visibilityFlags;
 
+    // OpenGL keeps footprint texts apart per kind (visibility at draw time); mask layers keep them
+    const bool                fpTextApart = cfg.engine == RENDER_ENGINE::OPENGL;
+    std::bitset<LAYER_3D_END> noFpTextFlags = visibilityFlags;
+
+    noFpTextFlags.reset( LAYER_FP_TEXT );
+    noFpTextFlags.reset( LAYER_FP_REFERENCES );
+    noFpTextFlags.reset( LAYER_FP_VALUES );
+    m_fpTextBuiltApart = fpTextApart && !hasFpTextOnCopperOrMask( m_board );
+
     if( cfg.subtract_mask_from_silk || cfg.DifferentiatePlatedCopper() )
     {
         enabledFlags.set( LAYER_3D_SOLDERMASK_TOP );
@@ -1480,6 +1582,9 @@ void BOARD_ADAPTER::createLayers( std::shared_ptr<REPORTER> aStatusReporter, std
 
         if( !Is3dLayerEnabled( layer, enabledFlags ) )
             continue;
+
+        const bool                       textApart = fpTextApart && !IsSolderMaskLayer( layer );
+        const std::bitset<LAYER_3D_END>& layerFlags = textApart ? noFpTextFlags : visibilityFlags;
 
         BVH_CONTAINER_2D *layerContainer = new BVH_CONTAINER_2D;
         m_layerMap[layer] = layerContainer;
@@ -1576,7 +1681,7 @@ void BOARD_ADAPTER::createLayers( std::shared_ptr<REPORTER> aStatusReporter, std
                     addPads( footprint, layerContainer, layer );
                 }
 
-                addFootprintShapes( footprint, layerContainer, layer, visibilityFlags );
+                addFootprintShapes( footprint, layerContainer, layer, layerFlags );
             }
 
             // Draw non copper zones
@@ -1727,7 +1832,7 @@ void BOARD_ADAPTER::createLayers( std::shared_ptr<REPORTER> aStatusReporter, std
                     footprint->TransformPadsToPolySet( *layerPoly, layer, 0, footprint->GetMaxError(), ERROR_INSIDE );
                 }
 
-                transformFPTextToPolySet( footprint, layer, visibilityFlags, *layerPoly, footprint->GetMaxError(),
+                transformFPTextToPolySet( footprint, layer, layerFlags, *layerPoly, footprint->GetMaxError(),
                                           ERROR_INSIDE );
                 transformFPShapesToPolySet( footprint, layer, *layerPoly, footprint->GetMaxError(), ERROR_INSIDE );
             }
@@ -1749,6 +1854,42 @@ void BOARD_ADAPTER::createLayers( std::shared_ptr<REPORTER> aStatusReporter, std
 
             // This will make a union of all added contours
             layerPoly->Simplify();
+
+            if( aStop.stop_requested() )
+                return;
+        }
+
+        if( !textApart || !Is3dLayerEnabled( layer, visibilityFlags ) )
+            continue;
+
+        for( int kind = 0; kind < FP_TEXT_KIND_COUNT; ++kind )
+        {
+            BVH_CONTAINER_2D* textContainer = new BVH_CONTAINER_2D;
+
+            for( FOOTPRINT* footprint : m_board->Footprints() )
+                addFootprintTexts( footprint, textContainer, layer, kind );
+
+            if( textContainer->GetList().empty() )
+            {
+                delete textContainer;
+                continue;
+            }
+
+            m_fpTextLayerMap[kind][layer] = textContainer;
+
+            if( cfg.engine == RENDER_ENGINE::OPENGL && cfg.opengl_copper_thickness )
+            {
+                SHAPE_POLY_SET* textPoly = new SHAPE_POLY_SET;
+
+                for( FOOTPRINT* footprint : m_board->Footprints() )
+                {
+                    transformFPTextKindToPolySet( footprint, layer, kind, *textPoly, footprint->GetMaxError(),
+                                                  ERROR_INSIDE );
+                }
+
+                textPoly->Simplify();
+                m_fpTextPolys[kind][layer] = textPoly;
+            }
 
             if( aStop.stop_requested() )
                 return;

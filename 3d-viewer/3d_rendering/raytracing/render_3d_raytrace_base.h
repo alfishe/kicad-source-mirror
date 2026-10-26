@@ -76,7 +76,10 @@ public:
      */
     void InvalidateHitTesting();
 
-    BOARD_ITEM *IntersectBoardItem( const RAY& aRay );
+    /// The board item the ray hits first (aHitPoint: where, in 3D units), or nullptr
+    BOARD_ITEM *IntersectBoardItem( const RAY& aRay, SFVEC3F* aHitPoint = nullptr );
+
+    bool HasHitTestScene();
 
 protected:
     virtual void initPbo() = 0;

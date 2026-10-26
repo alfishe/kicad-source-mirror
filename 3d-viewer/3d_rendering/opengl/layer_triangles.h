@@ -279,6 +279,18 @@ public:
         m_layerTriangles.reset();
     }
 
+    /// Compile the GL list now (GL context current) and drop the CPU triangles.
+    void Compile()
+    {
+        std::lock_guard<std::recursive_mutex> lock( m_mutex );
+
+        if( m_layerTriangles )
+        {
+            MakeShared();
+            m_layerTriangles.reset();
+        }
+    }
+
     std::shared_ptr<OPENGL_RENDER_LIST> MakeOrGet()
     {
         std::lock_guard<std::recursive_mutex> lock( m_mutex );

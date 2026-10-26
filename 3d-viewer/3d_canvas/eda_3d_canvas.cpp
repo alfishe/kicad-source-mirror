@@ -373,6 +373,36 @@ void EDA_3D_CANVAS::ReloadRaytracingForHitTesting( std::stop_token aStop )
 }
 
 
+BOARD_ITEM* EDA_3D_CANVAS::PickBoardItem( const SFVEC2F& aPixel, SFVEC3F* aHitPoint )
+{
+    const wxSize size = GetNativePixelSize();
+    const SFVEC2F windowPos( aPixel.x, size.y - aPixel.y );
+
+    if( !m_3d_render_raytracing || windowPos.x < 0.0f || windowPos.y < 0.0f
+            || windowPos.x >= size.x - 1 || windowPos.y >= size.y - 1 )
+    {
+        return nullptr;
+    }
+
+    SFVEC3F rayOrigin;
+    SFVEC3F rayDir;
+
+    m_camera.MakeRay( windowPos, rayOrigin, rayDir );
+
+    RAY ray;
+    ray.Init( rayOrigin, rayDir );
+
+    return m_3d_render_raytracing->IntersectBoardItem( ray, aHitPoint );
+}
+
+
+bool EDA_3D_CANVAS::IsHitTestReady() const
+{
+    return m_3d_render_opengl && m_3d_render_opengl->IsHitTestReady() && m_3d_render_raytracing
+           && m_3d_render_raytracing->HasHitTestScene();
+}
+
+
 void EDA_3D_CANVAS::InvalidateRaytracingHitTesting()
 {
     if( m_3d_render_raytracing )
@@ -632,6 +662,9 @@ void EDA_3D_CANVAS::DoRePaint()
         m_holdFrame = false;
         m_renderProgress.frames++;
     }
+
+    if( m_3d_render )
+        m_3d_render->CompileBuiltLists();
 
     m_renderProgress.moreRequested = requested_redraw;
 

@@ -122,6 +122,12 @@ public:
     void SetLayerColors( const std::map<int, COLOR4D>& aColors );
 
     std::bitset<LAYER_3D_END> GetVisibleLayers() const;
+
+    /**
+     * The layers the scene geometry is built for: the visible ones, plus the outer copper layers
+     * with OpenGL, which hides them at draw time.
+     */
+    std::bitset<LAYER_3D_END> GetBuiltLayers() const;
     std::bitset<LAYER_3D_END> GetDefaultVisibleLayers() const;
     void SetVisibleLayers( const std::bitset<LAYER_3D_END>& aLayers );
 
@@ -285,6 +291,35 @@ public:
      * @return the map containers of this board.
      */
     const MAP_CONTAINER_2D_BASE& GetLayerMap() const noexcept { return m_layerMap; }
+
+    /// Footprint texts the OpenGL scene keeps apart from the other items of a layer, so that their
+    /// visibility is decided at draw time
+    enum FP_TEXT_KIND
+    {
+        FP_TEXT_OTHER,
+        FP_TEXT_REFERENCE,
+        FP_TEXT_VALUE,
+        FP_TEXT_KIND_COUNT
+    };
+
+    static bool IsFpTextKindVisible( int aKind, const std::bitset<LAYER_3D_END>& aFlags );
+
+    /// The kind of a footprint field or footprint PCB_TEXT
+    static int FpTextKind( const BOARD_ITEM* aItem );
+
+    /// Footprint texts of one kind per layer (OpenGL; layers other than copper and mask)
+    const MAP_CONTAINER_2D_BASE& GetFpTextLayerMap( int aKind ) const noexcept { return m_fpTextLayerMap[aKind]; }
+    const MAP_POLY& GetFpTextPolyMap( int aKind ) const noexcept { return m_fpTextPolys[aKind]; }
+
+    /// Whether the last build kept every footprint text apart (none on copper or mask layers)
+    bool FpTextBuiltApart() const noexcept { return m_fpTextBuiltApart; }
+
+    /**
+     * Free what only the OpenGL scene build reads, once its lists are made: the layer and hole
+     * polygons and the containers of the layers other than copper (the hit-test scene reads
+     * copper, holes and plated pads).
+     */
+    void ReleaseDrawnLayerData();
     const BVH_CONTAINER_2D* GetPlatedPadsFront() const noexcept { return m_platedPadsFront; }
     const BVH_CONTAINER_2D* GetPlatedPadsBack() const noexcept { return m_platedPadsBack; }
     const BVH_CONTAINER_2D* GetOffboardPadsFront() const noexcept { return m_offboardPadsFront; }
@@ -502,6 +537,9 @@ private:
 
     void addText( const EDA_TEXT* aText, CONTAINER_2D_BASE* aDstContainer, const BOARD_ITEM* aOwner );
 
+    void addFootprintTexts( const FOOTPRINT* aFootprint, CONTAINER_2D_BASE* aDstContainer, PCB_LAYER_ID aLayerId,
+                            int aKind );
+
     void addBarCode( const PCB_BARCODE* aBarCode, CONTAINER_2D_BASE* aDstContainer, const BOARD_ITEM* aOwner );
 
     void addShape( const PCB_SHAPE* aShape, CONTAINER_2D_BASE* aContainer, const BOARD_ITEM* aOwner,
@@ -609,6 +647,9 @@ private:
     SHAPE_POLY_SET          m_board_poly;           ///< Board outline polygon.
 
     MAP_CONTAINER_2D_BASE   m_layerMap;             ///< 2D elements for each layer.
+    MAP_CONTAINER_2D_BASE   m_fpTextLayerMap[FP_TEXT_KIND_COUNT];
+    MAP_POLY                m_fpTextPolys[FP_TEXT_KIND_COUNT];
+    bool                    m_fpTextBuiltApart = false;
     MAP_CONTAINER_2D_BASE   m_layerHoleMap;         ///< Holes for each layer.
 
     BVH_CONTAINER_2D*       m_platedPadsFront;
