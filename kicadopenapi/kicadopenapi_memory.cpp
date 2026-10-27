@@ -1,5 +1,6 @@
 /// @file kicadopenapi_memory.cpp
 /// @brief Memory numbers and the automatic allocator trim (see kicadopenapi_memory.h).
+#include <kicadopenapi_journal.h>
 #include <kicadopenapi_memory.h>
 #include <kicadopenapi_service.h>
 
@@ -168,6 +169,9 @@ bool idleFor( int64_t aUnused )
 void trimLoop()
 {
     kopenapi::platform::LowerCurrentThreadPriority();
+
+    // logged at once into the journal; wx's per-thread buffer is flushed at exit into a message box
+    wxLog::SetThreadActiveTarget( KOPENAPI_JOURNAL::ThreadTarget() );
 
     STATE& s = state();
     std::unique_lock<std::mutex> lock( s.mutex );

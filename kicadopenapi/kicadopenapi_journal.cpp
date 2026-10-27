@@ -168,6 +168,10 @@ void KOPENAPI_JOURNAL::Install( const std::string& aAppName )
     }
 
     delete wxLog::SetActiveTarget( new JOURNAL_LOG_TARGET() );
+
+    // once wx has deleted our target at exit it would make a wxLogOutputBest (a message box on MSW)
+    // for the records still buffered by threads
+    wxLog::DontCreateOnDemand();
 }
 
 
