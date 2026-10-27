@@ -109,6 +109,7 @@ struct STATE
     nlohmann::json          last;             ///< result of the last trim
     CLOCK::time_point       lastTrim{};
     int64_t                 unusedAfterTrim = 0;   ///< footprint - live after the last trim
+    CLOCK::time_point       nextStats{};           ///< earliest next allocator walk (rated by its cost)
 
     std::atomic<int64_t>    lastInputTicks{ 0 };   ///< CLOCK ticks of the last user input
 
@@ -186,14 +187,28 @@ void trimLoop()
         if( s.trims > 0 && CLOCK::now() - s.lastTrim < MIN_INTERVAL )
             continue;
 
+        if( CLOCK::now() < s.nextStats )
+            continue;
+
         const int64_t floor = s.unusedAfterTrim;
         const int64_t sinceTrimMs = s.trims > 0 ? msSince( s.lastTrim ) : std::numeric_limits<int64_t>::max();
         lock.unlock();
 
+        // The allocator numbers walk the heap under its lock on Windows (HeapSummary): every
+        // allocation of every thread waits meanwhile, at this thread's lowered priority. Taken only
+        // when idle and at most MAX_DUTY of the time.
+        if( !idleFor( 0 ) )
+        {
+            lock.lock();
+            continue;
+        }
+
         // Memory the OS charges but nothing uses: what a trim can give back. The allocator's own
         // "retained" (mapped - live) is no measure on macOS, where zones keep released ranges mapped.
+        const CLOCK::time_point                     statsStart = CLOCK::now();
         const kopenapi::platform::ProcessMemoryInfo process = kopenapi::platform::ProcessMemory();
         const kopenapi::platform::AllocatorInfo     allocator = kopenapi::platform::AllocatorStats();
+        const CLOCK::duration                       statsCost = CLOCK::now() - statsStart;
         const int64_t                               unused = process.footprint - allocator.live;
         bool                                        trimmed = false;
 
@@ -209,6 +224,8 @@ void trimLoop()
         }
 
         lock.lock();
+
+        s.nextStats = CLOCK::now() + std::chrono::duration_cast<CLOCK::duration>( statsCost / MAX_DUTY );
 
         if( trimmed )
             s.autoTrims++;

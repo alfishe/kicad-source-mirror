@@ -514,6 +514,10 @@ bool KopenapiOnDispatchThread()
 /// @brief How long a lease read waits for the owner's write before it queues on the strand
 static constexpr std::chrono::milliseconds LEASE_WAIT{ 200 };
 
+/// @brief status waits this long for a lease while a call holds the main thread, then answers
+/// with the documents seen last
+static constexpr std::chrono::milliseconds STATUS_LEASE_WAIT{ 500 };
+
 /// @brief A lease read past this while a write waits is journaled (revoked, then stuck)
 static constexpr std::chrono::milliseconds LEASE_BUDGET{ 2000 };
 
@@ -706,8 +710,10 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 
     std::unique_ptr<MAIN_LOOP_PROBE> mainProbe;
 
-    /// @brief A lease read on this (HTTP) thread; nullopt: not granted in time or retry on the strand
-    std::optional<KOPENAPI_RESULT> leaseRead( const std::string& aName, const nlohmann::json& aArgs ) const;
+    /// @brief A lease read on this (HTTP) thread; nullopt: not granted in time or retry on the strand.
+    /// While a call holds the main thread it waits for a lend at most aMaxWait (nullopt: the call).
+    std::optional<KOPENAPI_RESULT> leaseRead( const std::string& aName, const nlohmann::json& aArgs,
+                                              std::optional<std::chrono::milliseconds> aMaxWait = std::nullopt ) const;
 
     nlohmann::json gateJson() const;
 
@@ -953,10 +959,10 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::liveStatus() const
     std::optional<KOPENAPI_RESULT> leased;
 
     if( gate )
-        leased = leaseRead( "documents", nlohmann::json::object() );
+        leased = leaseRead( "documents", nlohmann::json::object(), STATUS_LEASE_WAIT );
 
-    // while a call holds the main thread, answer with the documents seen last
-    if( !leased && !busyJson().is_null() )
+    // while a call or job holds the main thread, answer with the documents seen last
+    if( !leased && ( !busyJson().is_null() || !KOPENAPI_JOBS::Get().Busy().empty() ) )
     {
         nlohmann::json status = statusJson();
         std::lock_guard<std::mutex> lock( traceMutex );
@@ -1537,15 +1543,18 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
 
 
 std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::leaseRead( const std::string&    aName,
-                                                                     const nlohmann::json& aArgs ) const
+                                                                     const nlohmann::json& aArgs,
+                                                                     std::optional<std::chrono::milliseconds> aMaxWait ) const
 {
+    const auto deadline = aMaxWait ? std::chrono::steady_clock::now() + *aMaxWait
+                                   : std::chrono::steady_clock::time_point::max();
     const std::string   holder = "api:" + aName;
     KOPENAPI_READ_LEASE lease = gate->Acquire( holder, std::nullopt,
                                                std::chrono::duration_cast<std::chrono::microseconds>( leaseWait ) );
 
     // GUI: while a call or job holds the main thread, it lends the documents at its next compute
     // (a queued call would wait for the whole call); an idle main thread answers at once
-    while( !lease && !ctx.headless && alive->load()
+    while( !lease && !ctx.headless && alive->load() && std::chrono::steady_clock::now() < deadline
            && ( !busyJson().is_null() || !KOPENAPI_JOBS::Get().Busy().empty() ) )
     {
         lease = gate->Acquire( holder, std::nullopt, std::chrono::milliseconds( 100 ) );
