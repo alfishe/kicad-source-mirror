@@ -29,7 +29,7 @@
 
 namespace
 {
-using INPUT = TOOL_DISPATCHER::INPUT;
+using TOOL_INPUT = TOOL_DISPATCHER::INPUT;
 
 
 struct TARGET
@@ -218,9 +218,9 @@ void injectPointer( const TARGET& aTarget, const wxPoint& aClient, int aModifier
 
 
 /// One pointer / key input into the tools
-void dispatch( const TARGET& aTarget, INPUT::KIND aKind, int aButton, int aModifiers )
+void dispatch( const TARGET& aTarget, TOOL_INPUT::KIND aKind, int aButton, int aModifiers )
 {
-    INPUT input;
+    TOOL_INPUT input;
     input.kind = aKind;
     input.button = aButton;
     input.heldButtons = g_heldButtons;
@@ -277,7 +277,7 @@ std::string pointerTo( const TARGET& aTarget, const VECTOR2D& aMm, int aModifier
         g_pointerMm = at;
         injectPointer( aTarget, client, aModifiers );
         aTarget.controls->PointerMoved();
-        dispatch( aTarget, INPUT::KIND::POINTER, 0, aModifiers );
+        dispatch( aTarget, TOOL_INPUT::KIND::POINTER, 0, aModifiers );
         KopenapiAnnotatePointer( aTarget.frame, VECTOR2D( aTarget.scale->mmToIU( at.x ), aTarget.scale->mmToIU( at.y ) ),
                                  KOPENAPI_POINTER_EVENT::MOVE );
 
@@ -298,14 +298,14 @@ std::string pointerTo( const TARGET& aTarget, const VECTOR2D& aMm, int aModifier
 
 
 /// A button change where the pointer is
-void button( const TARGET& aTarget, INPUT::KIND aKind, int aButton, int aModifiers, KOPENAPI_POINTER_EVENT aShown )
+void button( const TARGET& aTarget, TOOL_INPUT::KIND aKind, int aButton, int aModifiers, KOPENAPI_POINTER_EVENT aShown )
 {
     wxPoint client;
     toClient( aTarget, g_pointerMm, client );
 
-    if( aKind == INPUT::KIND::BUTTON_DOWN || aKind == INPUT::KIND::BUTTON_DCLICK )
+    if( aKind == TOOL_INPUT::KIND::BUTTON_DOWN || aKind == TOOL_INPUT::KIND::BUTTON_DCLICK )
         g_heldButtons |= aButton;
-    else if( aKind == INPUT::KIND::BUTTON_UP )
+    else if( aKind == TOOL_INPUT::KIND::BUTTON_UP )
         g_heldButtons &= ~aButton;
 
     injectPointer( aTarget, client, aModifiers );
@@ -366,15 +366,15 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
         // the selection is dragged from inside it (KiCad's "drag selected items"), so an item lying
         // on top of the part cannot take the drag
         const int b = parseButton( aStep, error );
-        button( aTarget, INPUT::KIND::BUTTON_DOWN, b, mods, KOPENAPI_POINTER_EVENT::DOWN );
+        button( aTarget, TOOL_INPUT::KIND::BUTTON_DOWN, b, mods, KOPENAPI_POINTER_EVENT::DOWN );
 
         if( std::string bad = pointerTo( aTarget, to, mods, std::max( ms, 1 ) ); !bad.empty() )
         {
-            button( aTarget, INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
+            button( aTarget, TOOL_INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
             return bad;
         }
 
-        button( aTarget, INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
+        button( aTarget, TOOL_INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
         return {};
     }
 
@@ -399,15 +399,15 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
             return bad;
 
         if( v == "down" || v == "click" || v == "dclick" )
-            button( aTarget, INPUT::KIND::BUTTON_DOWN, b, mods, KOPENAPI_POINTER_EVENT::DOWN );
+            button( aTarget, TOOL_INPUT::KIND::BUTTON_DOWN, b, mods, KOPENAPI_POINTER_EVENT::DOWN );
 
         if( v == "up" || v == "click" || v == "dclick" )
-            button( aTarget, INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
+            button( aTarget, TOOL_INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
 
         if( v == "dclick" )   // the toolkit's order: down, up, double click (held), up
         {
-            button( aTarget, INPUT::KIND::BUTTON_DCLICK, b, mods, KOPENAPI_POINTER_EVENT::DCLICK );
-            button( aTarget, INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
+            button( aTarget, TOOL_INPUT::KIND::BUTTON_DCLICK, b, mods, KOPENAPI_POINTER_EVENT::DCLICK );
+            button( aTarget, TOOL_INPUT::KIND::BUTTON_UP, b, mods, KOPENAPI_POINTER_EVENT::UP );
         }
 
         return {};
@@ -420,8 +420,8 @@ std::string runStep( const TARGET& aTarget, const nlohmann::json& aStep )
         if( !error.empty() || !key )
             return error.empty() ? "key is a name" : error;
 
-        INPUT input;
-        input.kind = INPUT::KIND::KEY;
+        TOOL_INPUT input;
+        input.kind = TOOL_INPUT::KIND::KEY;
         input.keyCode = key;
         input.modifiers = mods;
         input.heldButtons = g_heldButtons;
@@ -514,7 +514,7 @@ KOPENAPI_RESULT KopenapiEditorInput( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE&
             if( held & bit )
             {
                 g_heldButtons &= ~bit;
-                dispatch( target, INPUT::KIND::BUTTON_UP, bit, 0 );
+                dispatch( target, TOOL_INPUT::KIND::BUTTON_UP, bit, 0 );
             }
         }
     }

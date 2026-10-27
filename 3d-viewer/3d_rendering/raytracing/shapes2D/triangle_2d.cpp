@@ -202,7 +202,7 @@ bool triangulateTiled( const SHAPE_POLY_SET& aPolyList, std::vector<TRIANGLE_PTS
         rect.Append( (int) x0, (int) y1 );
 
         const BOX2I    tileBox( VECTOR2I( (int) x0, (int) y0 ), VECTOR2I( (int) ( x1 - x0 ), (int) ( y1 - y0 ) ) );
-        SHAPE_POLY_SET near;
+        SHAPE_POLY_SET touching;
 
         for( int i = 0; i < aPolyList.OutlineCount(); ++i )
         {
@@ -218,11 +218,11 @@ bool triangulateTiled( const SHAPE_POLY_SET& aPolyList, std::vector<TRIANGLE_PTS
                     kept.push_back( poly[h] );
             }
 
-            near.AddPolygon( kept );
+            touching.AddPolygon( kept );
         }
 
         SHAPE_POLY_SET piece;
-        piece.BooleanIntersection( near, rect );
+        piece.BooleanIntersection( touching, rect );
         ok[aIndex] = appendTriangulation( piece, parts[aIndex] );
     };
 

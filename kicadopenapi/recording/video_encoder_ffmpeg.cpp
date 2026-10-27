@@ -6,6 +6,7 @@
 #include "../platform/platform.h"
 
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 namespace kp = kopenapi::platform;

@@ -23,7 +23,7 @@ struct SUBSCRIBER
 {
     std::string                    name;
     std::string                    domain;
-    KOPENAPI_MODEL_EVENTS::CALLBACK callback;
+    KOPENAPI_MODEL_EVENTS::HANDLER callback;
     long                           delivered = 0;
     int                            failures = 0;
     int                            slow = 0;
@@ -65,7 +65,7 @@ KOPENAPI_MODEL_EVENTS::TOKEN::~TOKEN()
 
 std::unique_ptr<KOPENAPI_MODEL_EVENTS::TOKEN> KOPENAPI_MODEL_EVENTS::Subscribe( const std::string& aName,
                                                                                const std::string& aDomain,
-                                                                               CALLBACK aCallback )
+                                                                               HANDLER aCallback )
 {
     HUB&      h = hub();
     const int id = h.nextId++;
@@ -115,7 +115,7 @@ void KOPENAPI_MODEL_EVENTS::Post( const EVENT& aEvent )
         const std::string name = s.name;
 
         // a copy: the callback may destroy its own subscription (and the stored function) while it runs
-        const CALLBACK callback = s.callback;
+        const HANDLER callback = s.callback;
 
         try
         {

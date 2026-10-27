@@ -39,7 +39,7 @@ public:
         std::vector<KIID> items;
     };
 
-    using CALLBACK = std::function<void( const EVENT& )>;
+    using HANDLER = std::function<void( const EVENT& )>;
 
     /// @brief Keeps a subscription alive; destroying it unsubscribes
     class KICOMMON_API TOKEN
@@ -60,7 +60,7 @@ public:
      * @param aDomain receives only this domain's events ("" = all).
      */
     static std::unique_ptr<TOKEN> Subscribe( const std::string& aName, const std::string& aDomain,
-                                             CALLBACK aCallback );
+                                             HANDLER aCallback );
 
     /// @brief Delivers an event to the subscribers (main thread)
     static void Post( const EVENT& aEvent );
