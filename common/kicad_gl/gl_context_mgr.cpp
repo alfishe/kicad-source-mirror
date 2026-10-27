@@ -21,6 +21,7 @@
 
 #include <advanced_config.h>
 #include <kicad_gl/gl_context_mgr.h>
+#include <kiplatform/ui.h>
 #include <trace_helpers.h>
 #include <wx/debug.h>
 #include <wx/log.h>
@@ -127,12 +128,10 @@ bool GL_CONTEXT_MANAGER::LockCtx( wxGLContext* aContext, wxGLCanvas* aCanvas )
     wxGLCanvas* canvas = aCanvas ? aCanvas : m_glContexts.at( aContext );
     bool        current = false;
 
-#if defined( __WXMSW__ )
-    // Re-binding the current context makes the driver release it first, which hangs NVIDIA after a reset
-    if( wglGetCurrentContext() == aContext->GetGLRC() && wglGetCurrentDC() == canvas->GetHDC() )
+    if( KIPLATFORM::UI::GLContextBound( canvas, aContext ) )
         current = true;
     else
-#elif defined( __WXGTK__ )
+#if defined( __WXGTK__ )
     // Prevent assertion failure in wxGLContext::SetCurrent during GAL teardown
     if( canvas->GTKGetDrawingWindow() )
 #endif

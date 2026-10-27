@@ -82,6 +82,7 @@ elseif( WIN32 )
         "wintrust"
         "imm32"
         "windowsapp"
+        "opengl32"
         )
 elseif( UNIX )
     list( APPEND PLATFORM_SRCS

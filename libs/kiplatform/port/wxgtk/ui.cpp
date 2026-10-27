@@ -21,6 +21,7 @@
 #include <kiplatform/ui.h>
 
 #include <wx/frame.h>
+#include <wx/glcanvas.h>
 #include <wx/choice.h>
 #include <wx/dataview.h>
 #include <wx/dialog.h>
@@ -935,4 +936,10 @@ bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
     target.SelectObject( wxNullBitmap );
     aImage = bitmap.ConvertToImage();
     return aImage.IsOk();
+}
+
+
+bool KIPLATFORM::UI::GLContextBound( wxGLCanvas* aCanvas, wxGLContext* aContext )
+{
+    return false;
 }

@@ -25,6 +25,7 @@
 #include <kiplatform/ui.h>
 
 #include <wx/frame.h>
+#include <wx/glcanvas.h>
 #include <wx/cursor.h>
 #include <wx/dialog.h>
 #include <wx/image.h>
@@ -344,4 +345,10 @@ bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
 
     aImage.SetData( rgb, w, h, false );
     return aImage.IsOk();
+}
+
+
+bool KIPLATFORM::UI::GLContextBound( wxGLCanvas* aCanvas, wxGLContext* aContext )
+{
+    return wglGetCurrentContext() == aContext->GetGLRC() && wglGetCurrentDC() == aCanvas->GetHDC();
 }

@@ -21,10 +21,12 @@
 #include <kiplatform/ui.h>
 
 #import <Cocoa/Cocoa.h>
+#import <objc/runtime.h>
 
 #include <vector>
 
 #include <wx/frame.h>
+#include <wx/glcanvas.h>
 #include <wx/dialog.h>
 #include <wx/image.h>
 #include <wx/nonownedwnd.h>
@@ -463,4 +465,39 @@ bool KIPLATFORM::UI::CaptureWindow( wxWindow* aWindow, wxImage& aImage )
     {
         return captureWindow( aWindow, aImage );
     }
+}
+
+
+static char s_glDrawableKey;
+
+
+bool KIPLATFORM::UI::GLContextBound( wxGLCanvas* aCanvas, wxGLContext* aContext )
+{
+    NSOpenGLContext* context = aContext->GetWXGLContext();
+    NSView*          view = (NSView*) aCanvas->GetHandle();
+    NSWindow*        window = [view window];
+
+    if( !context || !view || !window )
+        return false;
+
+    NSRect   bounds = [view bounds];
+    NSArray* drawable = @[ [NSValue valueWithPointer:(__bridge void*) view],
+                           [NSValue valueWithPointer:(__bridge void*) window],
+                           [NSValue valueWithPointer:(__bridge void*) [window screen]],
+                           [NSValue valueWithRect:[view convertRect:bounds toView:nil]],
+                           [NSValue valueWithRect:[view convertRectToBacking:bounds]] ];
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    bool sameView = [context view] == view;
+#pragma clang diagnostic pop
+
+    if( sameView && [NSOpenGLContext currentContext] == context
+        && [drawable isEqualToArray:objc_getAssociatedObject( context, &s_glDrawableKey )] )
+    {
+        return true;
+    }
+
+    objc_setAssociatedObject( context, &s_glDrawableKey, drawable, OBJC_ASSOCIATION_RETAIN_NONATOMIC );
+    return false;
 }

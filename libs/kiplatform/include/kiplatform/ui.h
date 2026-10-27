@@ -27,6 +27,8 @@
 class wxChoice;
 class wxDataViewCtrl;
 class wxDialog;
+class wxGLCanvas;
+class wxGLContext;
 class wxNonOwnedWindow;
 class wxTopLevelWindow;
 class wxWindow;
@@ -371,6 +373,20 @@ namespace KIPLATFORM
          * @param aClass is the desktop application id, e.g. org.kicad.kicad
          */
         void SetWMClass( wxWindow* aWindow, const wxString& aClass );
+
+        /**
+         * Check whether a GL context is already current on a canvas with an up-to-date drawable,
+         * so making it current again can be skipped.
+         *
+         * On macOS wxGLContext::SetCurrent updates the drawable every time, a round trip to the
+         * window server; it is only needed after the canvas moves, resizes or changes screen,
+         * which this tracks.  On MSW re-binding the current context makes the driver release it
+         * first, which hangs NVIDIA after a reset.  Always false on GTK.
+         *
+         * @return true if the caller can skip wxGLCanvas::SetCurrent; when false the caller
+         *         makes the context current (the drawable state seen now is remembered).
+         */
+        bool GLContextBound( wxGLCanvas* aCanvas, wxGLContext* aContext );
     }
 }
 
