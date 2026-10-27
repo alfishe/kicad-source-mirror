@@ -34,6 +34,7 @@ set(3D-VIEWER_SRCS
     3d_canvas/eda_3d_canvas_pivot.cpp
     3d_model_viewer/eda_3d_model_viewer.cpp
     3d_rendering/opengl/3d_model.cpp
+    3d_rendering/opengl/model_instancing.cpp
     3d_rendering/opengl/opengl_utils.cpp
     3d_rendering/opengl/create_scene.cpp
     3d_rendering/opengl/render_3d_opengl.cpp

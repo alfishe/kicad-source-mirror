@@ -95,6 +95,7 @@ public:
         bool opengl_render_bbox_only_OnMove;
         bool opengl_copper_thickness;
         bool show_model_bbox;
+        bool opengl_model_instancing = true;   ///< not stored: copies of a model in one draw call
         bool clip_tht_leads;             ///< cut through-hole leads to the standard protrusion
         bool show_off_board_silk;
         bool highlight_on_rollover;

@@ -36,6 +36,7 @@
 #include "../raytracing/shapes2D/round_segment_2d.h"
 
 #include "3d_model.h"
+#include "model_instancing.h"
 
 #include "3d_cache/3d_info.h"
 
@@ -70,6 +71,12 @@ public:
 
     void JoinBgWorker() override;
     bool IsSceneLoading() const override { return m_sceneLoading; }
+
+    bool IsModelInstancing() const override { return m_modelsInstanced; }
+
+    RENDER_3D_FRAME_STATS GetFrameStats() const override { return m_frameStats; }
+
+    void SetFinishFrames( bool aFinish ) override { m_finishFrames = aFinish; }
 
     /// @brief Whether the last scene build saw this 3D layer visible (its geometry is complete, so
     /// showing it again needs no rebuild; hidden layers are skipped when drawing)
@@ -267,6 +274,10 @@ private:
     void renderModel( const glm::mat4 &aCameraViewMatrix, const MODELTORENDER &aModelToRender,
                       const SFVEC3F &aSelColor, const SFVEC3F *aCameraWorldPos );
 
+    /// The opaque pass with one draw per model and material for all its copies
+    void renderModelsInstanced( const glm::mat4& aCameraViewMatrix, const std::list<MODELTORENDER>& aRenderList,
+                                const SFVEC3F& aSelColor );
+
 
     void get3dModelsSelected( std::list<MODELTORENDER> &aDstRenderList, bool aGetTop, bool aGetBot,
                               bool aRenderTransparentOnly, bool aRenderSelectedOnly );
@@ -421,6 +432,12 @@ private:
     const S3D_CACHE*     m_modelsCache = nullptr;
     std::map<std::array<float, 9>, glm::mat4>              m_3dModelMatrixMap;
     std::vector<FRAME_MODEL> m_frameModels;   ///< see collectFrameModels(), empty between frames
+    MODEL_INSTANCING m_modelInstancing;
+    bool             m_modelsInstanced = false;
+
+    RENDER_3D_FRAME_STATS m_frameStats;
+    bool                  m_finishFrames = false;
+    std::vector<MODEL_INSTANCING::INSTANCE> m_modelInstances;   ///< reused by renderModelsInstanced()
 
     BOARD_ITEM*         m_currentRollOverItem;
 

@@ -33,6 +33,8 @@
 
 #include <wx/chartype.h>
 
+class MODEL_INSTANCING;
+
 class MODEL_3D
 {
 public:
@@ -76,6 +78,16 @@ public:
                const SFVEC3F *aCameraWorldPos ) const;
 
     /**
+     * Draw the opaque materials aCount times, one instance per copy set up in aInstancing.
+     */
+    void DrawInstanced( const MODEL_INSTANCING& aInstancing, GLsizei aCount ) const;
+
+    /**
+     * @return the draw calls of one copy in the opaque pass (its opaque materials)
+     */
+    int OpaqueDrawCalls() const;
+
+    /**
      * Return true if have opaque meshes to render.
      */
     bool HasOpaqueMeshes() const { return m_have_opaque_meshes; }
@@ -117,6 +129,16 @@ public:
     static void EndDrawMulti();
 
 private:
+    struct MATERIAL;
+
+    void bindArrays() const;
+
+    /// Whether a pass draws the material: the transparent ones in their own pass unless drawn see-through
+    bool drawnInPass( const MATERIAL& aMaterial, bool aTransparent, float aOpacity ) const;
+
+    void setMaterial( const MATERIAL& aMaterial, float aOpacity, bool aUseSelectedMaterial,
+                      const SFVEC3F& aSelectionColor ) const;
+
     static const wxChar* m_logTrace;
 
     MATERIAL_MODE m_materialMode;

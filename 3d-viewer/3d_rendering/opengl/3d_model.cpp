@@ -27,6 +27,7 @@
 #include <kicad_gl/kiglad.h>    // Must be included first
 
 #include "3d_model.h"
+#include "model_instancing.h"
 #include "../common_ogl/ogl_utils.h"
 #include "../3d_math.h"
 #include "../orphaned_gl_objects.h"
@@ -441,22 +442,7 @@ void MODEL_3D::Draw( bool aTransparent, float aOpacity, bool aUseSelectedMateria
     if( !glBindBuffer )
         throw std::runtime_error( "The OpenGL context no longer exists: unable to draw" );
 
-    glBindBuffer( GL_ARRAY_BUFFER, m_vertex_buffer );
-    glBindBuffer( GL_ELEMENT_ARRAY_BUFFER, m_index_buffer );
-
-    glVertexPointer( 3, GL_FLOAT, sizeof( VERTEX ),
-                     reinterpret_cast<const void*>( offsetof( VERTEX, m_pos ) ) );
-
-    glNormalPointer( GL_BYTE, sizeof( VERTEX ),
-                     reinterpret_cast<const void*>( offsetof( VERTEX, m_nrm ) ) );
-
-    glColorPointer( 4, GL_UNSIGNED_BYTE, sizeof( VERTEX ),
-                    reinterpret_cast<const void*>( m_materialMode == MATERIAL_MODE::CAD_MODE
-                                                         ? offsetof( VERTEX, m_cad_color )
-                                                         : offsetof( VERTEX, m_color ) ) );
-
-    glTexCoordPointer( 2, GL_FLOAT, sizeof( VERTEX ),
-                       reinterpret_cast<const void*>( offsetof( VERTEX, m_tex_uv ) ) );
+    bindArrays();
 
     const SFVEC4F param = SFVEC4F( 1.0f, 1.0f, 1.0f, aOpacity );
 
@@ -475,17 +461,8 @@ void MODEL_3D::Draw( bool aTransparent, float aOpacity, bool aUseSelectedMateria
         // Calculate the distance to the camera for each material group
         for( const MODEL_3D::MATERIAL& mat : m_materials )
         {
-            if( mat.m_render_idx_count == 0 )
-            {
+            if( !drawnInPass( mat, aTransparent, aOpacity ) )
                 continue;
-            }
-
-            if( ( mat.IsTransparent() != aTransparent )
-                && ( aOpacity >= 1.0f )
-                && m_materialMode != MATERIAL_MODE::DIFFUSE_ONLY )
-            {
-                continue;
-            }
 
             const BBOX_3D& bBox = mat.m_bbox;
             const SFVEC3F& bBoxCenter = bBox.GetCenter();
@@ -523,20 +500,8 @@ void MODEL_3D::Draw( bool aTransparent, float aOpacity, bool aUseSelectedMateria
     {
         for( const MODEL_3D::MATERIAL& mat : m_materials )
         {
-            // There is at least one default material created in case a mesh has no declared
-            // materials.  Most meshes have a material, so usually the first material will have
-            // nothing to render and is skip.  See S3D::GetModel for more details.
-            if( mat.m_render_idx_count == 0 )
-            {
+            if( !drawnInPass( mat, aTransparent, aOpacity ) )
                 continue;
-            }
-
-            if( ( mat.IsTransparent() != aTransparent )
-                && ( aOpacity >= 1.0f )
-                && m_materialMode != MATERIAL_MODE::DIFFUSE_ONLY )
-            {
-                continue;
-            }
 
             materialsToRender.push_back( &mat );
         }
@@ -544,29 +509,95 @@ void MODEL_3D::Draw( bool aTransparent, float aOpacity, bool aUseSelectedMateria
 
     for( const MODEL_3D::MATERIAL* mat : materialsToRender )
     {
-        switch( m_materialMode )
-        {
-        case MATERIAL_MODE::NORMAL:
-            OglSetMaterial( *mat, aOpacity, aUseSelectedMaterial, aSelectionColor );
-            break;
-
-        case MATERIAL_MODE::DIFFUSE_ONLY:
-            OglSetDiffuseMaterial( mat->m_Diffuse, aOpacity, aUseSelectedMaterial,
-                                   aSelectionColor );
-            break;
-
-        case MATERIAL_MODE::CAD_MODE:
-            OglSetDiffuseMaterial( MaterialDiffuseToColorCAD( mat->m_Diffuse ), aOpacity,
-                                   aUseSelectedMaterial, aSelectionColor );
-            break;
-
-        default:
-            break;
-        }
+        setMaterial( *mat, aOpacity, aUseSelectedMaterial, aSelectionColor );
 
         glDrawElements( GL_TRIANGLES, mat->m_render_idx_count, m_index_buffer_type,
                         reinterpret_cast<const void*>(
                                 static_cast<uintptr_t>( mat->m_render_idx_buffer_offset ) ) );
+    }
+}
+
+
+void MODEL_3D::DrawInstanced( const MODEL_INSTANCING& aInstancing, GLsizei aCount ) const
+{
+    if( !glBindBuffer )
+        throw std::runtime_error( "The OpenGL context no longer exists: unable to draw" );
+
+    bindArrays();
+
+    for( const MODEL_3D::MATERIAL& mat : m_materials )
+    {
+        if( !drawnInPass( mat, false, 1.0f ) )
+            continue;
+
+        setMaterial( mat, 1.0f, false, SFVEC3F( 0.0f ) );
+        aInstancing.DrawElements( mat.m_render_idx_count, m_index_buffer_type, mat.m_render_idx_buffer_offset,
+                                  aCount );
+    }
+}
+
+
+int MODEL_3D::OpaqueDrawCalls() const
+{
+    return (int) std::count_if( m_materials.begin(), m_materials.end(),
+                                [this]( const MATERIAL& aMat ) { return drawnInPass( aMat, false, 1.0f ); } );
+}
+
+
+void MODEL_3D::bindArrays() const
+{
+    glBindBuffer( GL_ARRAY_BUFFER, m_vertex_buffer );
+    glBindBuffer( GL_ELEMENT_ARRAY_BUFFER, m_index_buffer );
+
+    glVertexPointer( 3, GL_FLOAT, sizeof( VERTEX ),
+                     reinterpret_cast<const void*>( offsetof( VERTEX, m_pos ) ) );
+
+    glNormalPointer( GL_BYTE, sizeof( VERTEX ),
+                     reinterpret_cast<const void*>( offsetof( VERTEX, m_nrm ) ) );
+
+    glColorPointer( 4, GL_UNSIGNED_BYTE, sizeof( VERTEX ),
+                    reinterpret_cast<const void*>( m_materialMode == MATERIAL_MODE::CAD_MODE
+                                                         ? offsetof( VERTEX, m_cad_color )
+                                                         : offsetof( VERTEX, m_color ) ) );
+
+    glTexCoordPointer( 2, GL_FLOAT, sizeof( VERTEX ),
+                       reinterpret_cast<const void*>( offsetof( VERTEX, m_tex_uv ) ) );
+}
+
+
+bool MODEL_3D::drawnInPass( const MATERIAL& aMaterial, bool aTransparent, float aOpacity ) const
+{
+    // There is at least one default material created in case a mesh has no declared
+    // materials.  Most meshes have a material, so usually the first material will have
+    // nothing to render and is skip.  See S3D::GetModel for more details.
+    if( aMaterial.m_render_idx_count == 0 )
+        return false;
+
+    return aMaterial.IsTransparent() == aTransparent || aOpacity < 1.0f
+           || m_materialMode == MATERIAL_MODE::DIFFUSE_ONLY;
+}
+
+
+void MODEL_3D::setMaterial( const MATERIAL& aMaterial, float aOpacity, bool aUseSelectedMaterial,
+                            const SFVEC3F& aSelectionColor ) const
+{
+    switch( m_materialMode )
+    {
+    case MATERIAL_MODE::NORMAL:
+        OglSetMaterial( aMaterial, aOpacity, aUseSelectedMaterial, aSelectionColor );
+        break;
+
+    case MATERIAL_MODE::DIFFUSE_ONLY:
+        OglSetDiffuseMaterial( aMaterial.m_Diffuse, aOpacity, aUseSelectedMaterial, aSelectionColor );
+        break;
+
+    case MATERIAL_MODE::CAD_MODE:
+        OglSetDiffuseMaterial( MaterialDiffuseToColorCAD( aMaterial.m_Diffuse ), aOpacity,
+                               aUseSelectedMaterial, aSelectionColor );
+        break;
+
+    default:
+        break;
     }
 }
 

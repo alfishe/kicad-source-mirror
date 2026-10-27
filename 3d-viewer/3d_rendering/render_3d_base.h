@@ -33,6 +33,27 @@
 #include <widgets/busy_indicator.h>
 
 /**
+ * Where the last frame's time went, ms of the CPU issuing the GL commands (the GPU's own time only
+ * shows in finish, when the frames are finished on purpose: SetFinishFrames).
+ */
+struct RENDER_3D_FRAME_STATS
+{
+    double redraw = 0;               ///< the whole Redraw
+    double layers = 0;               ///< background, board layers, copper, silk, holes
+    double collect = 0;              ///< the footprint models of the frame gathered
+    double opaqueModels = 0;
+    double board = 0;                ///< extruded bodies, board body, solder masks
+    double transparentModels = 0;
+    double overlay = 0;              ///< grid, selection on top, navigator
+    double finish = 0;               ///< glFinish: the GPU catching up
+    int    modelInstances = 0;       ///< models in the opaque pass
+    int    modelGroups = 0;          ///< distinct model / lead clip pairs among them (instanced)
+    int    modelDrawCalls = 0;       ///< draw calls of the opaque pass
+    bool   instanced = false;
+};
+
+
+/**
  *  This is a base class to hold data and functions for render targets.
  */
 class RENDER_3D_BASE
@@ -85,6 +106,15 @@ public:
 
     /// @return true while a reload builds the scene in the background (not yet complete)
     virtual bool IsSceneLoading() const { return false; }
+
+    /// @return true when the last frame drew the copies of each model in one call per material
+    virtual bool IsModelInstancing() const { return false; }
+
+    /// @return the last frame's stages, empty for a renderer that does not measure them
+    virtual RENDER_3D_FRAME_STATS GetFrameStats() const { return {}; }
+
+    /// Finish every frame (glFinish) and measure it: the GPU time shows in the frame stats
+    virtual void SetFinishFrames( bool aFinish ) {}
 
     /// Called with the GL context current after a frame was shown.
     virtual void CompileBuiltLists() {}

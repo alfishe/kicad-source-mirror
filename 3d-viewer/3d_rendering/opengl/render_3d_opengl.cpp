@@ -33,12 +33,16 @@
 #include <kicad_gl/gl_context_mgr.h>
 #include <3d_math.h>
 #include <glm/geometric.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <lset.h>
 #include <pgm_base.h>
 #include <math/util.h>      // for KiROUND
 #include <base_units.h>
 
+#include <chrono>
+#include <numeric>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -95,7 +99,10 @@ RENDER_3D_OPENGL::~RENDER_3D_OPENGL()
     m_placeholderModel.reset();
 
     if( m_canvasInitialized && !ORPHANED_GL_OBJECTS::Active() )
+    {
         glDeleteTextures( 1, &m_circleTexture );
+        m_modelInstancing.Release();
+    }
 
     delete m_spheres_gizmo;
 }
@@ -531,6 +538,19 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
 
     EDA_3D_VIEWER_SETTINGS::RENDER_SETTINGS& cfg = m_boardAdapter.m_Cfg->m_Render;
 
+    using CLOCK = std::chrono::steady_clock;
+    const CLOCK::time_point frameStart = CLOCK::now();
+    CLOCK::time_point       stageStart = frameStart;
+
+    m_frameStats = RENDER_3D_FRAME_STATS();
+
+    auto stage = [&]( double& aField )
+    {
+        const CLOCK::time_point now = CLOCK::now();
+        aField += std::chrono::duration<double, std::milli>( now - stageStart ).count();
+        stageStart = now;
+    };
+
     const bool reloadRequested = m_reloadRequested;
 
     if( reloadRequested )
@@ -822,10 +842,13 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
 
     glGetFloatv( GL_MODELVIEW_MATRIX, glm::value_ptr( cameraViewMatrix ) );
 
+    stage( m_frameStats.layers );
     collectFrameModels();
+    stage( m_frameStats.collect );
 
     // Render 3D Models (Non-transparent)
     renderOpaqueModels( cameraViewMatrix );
+    stage( m_frameStats.opaqueModels );
 
     // Render extruded 3D bodies
     {
@@ -952,7 +975,9 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
     glTexEnvi( GL_TEXTURE_ENV, GL_SRC1_ALPHA, GL_CONSTANT );
     glTexEnvi( GL_TEXTURE_ENV, GL_OPERAND1_ALPHA, GL_SRC_ALPHA );
 
+    stage( m_frameStats.board );
     renderTransparentModels( cameraViewMatrix );
+    stage( m_frameStats.transparentModels );
 
     glDisable( GL_BLEND );
     OglResetTextureState();
@@ -987,7 +1012,16 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
     // Return back to the original viewport (this is important if we want
     // to take a screenshot after the render)
     glViewport( 0, 0, m_windowSize.x, m_windowSize.y );
+    stage( m_frameStats.overlay );
 
+    if( m_finishFrames )
+    {
+        glFinish();
+        stage( m_frameStats.finish );
+    }
+
+    m_frameStats.redraw = std::chrono::duration<double, std::milli>( CLOCK::now() - frameStart ).count();
+    m_frameStats.instanced = m_modelsInstanced;
     return false;
 }
 
@@ -1491,7 +1525,11 @@ void RENDER_3D_OPENGL::renderOpaqueModels( const glm::mat4 &aCameraViewMatrix )
             MODEL_3D::BeginDrawMulti( false );
 
             for( const MODELTORENDER& mtr : renderList )
+            {
                 renderModel( aCameraViewMatrix, mtr, selColor, nullptr );
+                m_frameStats.modelInstances++;
+                m_frameStats.modelDrawCalls += mtr.m_model->OpaqueDrawCalls();
+            }
 
             MODEL_3D::EndDrawMulti();
         }
@@ -1504,13 +1542,141 @@ void RENDER_3D_OPENGL::renderOpaqueModels( const glm::mat4 &aCameraViewMatrix )
     {
         MODEL_3D::BeginDrawMulti( true );
 
-        for( const MODELTORENDER& mtr : renderList )
-            renderModel( aCameraViewMatrix, mtr, selColor, nullptr );
+        m_modelsInstanced = cfg.opengl_model_instancing && !cfg.show_model_bbox && m_modelInstancing.Available();
+
+        if( m_modelsInstanced )
+        {
+            renderModelsInstanced( aCameraViewMatrix, renderList, selColor );
+        }
+        else
+        {
+            for( const MODELTORENDER& mtr : renderList )
+            {
+                renderModel( aCameraViewMatrix, mtr, selColor, nullptr );
+                m_frameStats.modelInstances++;
+                m_frameStats.modelDrawCalls += mtr.m_model->OpaqueDrawCalls();
+            }
+        }
 
         MODEL_3D::EndDrawMulti();
     }
 
     glPopMatrix();
+}
+
+
+void RENDER_3D_OPENGL::renderModelsInstanced( const glm::mat4&                aCameraViewMatrix,
+                                              const std::list<MODELTORENDER>& aRenderList, const SFVEC3F& aSelColor )
+{
+    struct GROUP
+    {
+        const MODEL_3D*          m_model;
+        std::optional<LEAD_CLIP> m_clip;
+        bool                     m_normalMatrix = false;
+        size_t                   m_first = 0;
+        size_t                   m_count = 0;
+    };
+
+    using GROUP_KEY = std::tuple<const MODEL_3D*, bool, float, bool, bool>;
+
+    std::vector<GROUP>                    groups;
+    std::map<GROUP_KEY, size_t>           byKey;
+    std::vector<std::pair<size_t, MODEL_INSTANCING::INSTANCE>> members;
+
+    members.reserve( aRenderList.size() );
+
+    for( const MODELTORENDER& mtr : aRenderList )
+    {
+        if( mtr.m_isSelected )
+            continue;
+
+        MODEL_INSTANCING::INSTANCE instance = MODEL_INSTANCING::Instance( aCameraViewMatrix * mtr.m_modelWorldMat );
+
+        const GROUP_KEY key( mtr.m_model.get(), mtr.m_leadClip.has_value(),
+                             mtr.m_leadClip ? mtr.m_leadClip->m_z : 0.0f,
+                             mtr.m_leadClip ? mtr.m_leadClip->m_keepAbove : false, !instance.m_uniform );
+
+        auto [it, added] = byKey.emplace( key, groups.size() );
+
+        if( added )
+            groups.push_back( { mtr.m_model.get(), mtr.m_leadClip, !instance.m_uniform } );
+
+        groups[it->second].m_count++;
+        members.emplace_back( it->second, instance );
+    }
+
+    // one program per kind of group (clipped or not, normal matrix or not)
+    std::vector<size_t> order( groups.size() );
+    std::iota( order.begin(), order.end(), 0 );
+    std::stable_sort( order.begin(), order.end(),
+                      [&]( size_t a, size_t b )
+                      {
+                          return std::pair( groups[a].m_clip.has_value(), groups[a].m_normalMatrix )
+                                 < std::pair( groups[b].m_clip.has_value(), groups[b].m_normalMatrix );
+                      } );
+
+    size_t first = 0;
+
+    for( size_t index : order )
+    {
+        groups[index].m_first = first;
+        first += groups[index].m_count;
+        groups[index].m_count = 0;
+    }
+
+    m_modelInstances.resize( first );
+
+    for( const auto& [index, instance] : members )
+    {
+        GROUP& group = groups[index];
+        m_modelInstances[group.m_first + group.m_count++] = instance;
+    }
+
+    if( !groups.empty() )
+    {
+        m_modelInstancing.Upload( m_modelInstances );
+        m_modelInstancing.Begin();
+
+        // clip planes are given in world coordinates: set under the view matrix alone
+        glLoadMatrixf( glm::value_ptr( aCameraViewMatrix ) );
+
+        for( size_t index : order )
+        {
+            const GROUP& group = groups[index];
+
+            if( group.m_clip )
+            {
+                const GLdouble plane[4] = { 0.0, 0.0, group.m_clip->m_keepAbove ? 1.0 : -1.0,
+                                            group.m_clip->m_keepAbove ? -group.m_clip->m_z : group.m_clip->m_z };
+
+                glClipPlane( GL_CLIP_PLANE0, plane );
+                glEnable( GL_CLIP_PLANE0 );
+            }
+
+            m_modelInstancing.Use( group.m_clip.has_value(), group.m_normalMatrix );
+            m_modelInstancing.SetInstances( group.m_first );
+            group.m_model->DrawInstanced( m_modelInstancing, static_cast<GLsizei>( group.m_count ) );
+            m_frameStats.modelDrawCalls += group.m_model->OpaqueDrawCalls();
+
+            if( group.m_clip )
+                glDisable( GL_CLIP_PLANE0 );
+        }
+
+        m_modelInstancing.End();
+    }
+
+    m_frameStats.modelInstances += (int) members.size();
+    m_frameStats.modelGroups += (int) groups.size();
+
+    for( const MODELTORENDER& mtr : aRenderList )
+    {
+        if( mtr.m_isSelected )
+        {
+            renderModel( aCameraViewMatrix, mtr, aSelColor, nullptr );
+            m_frameStats.modelInstances++;
+            m_frameStats.modelDrawCalls += mtr.m_model->OpaqueDrawCalls();
+        }
+    }
 }
 
 
