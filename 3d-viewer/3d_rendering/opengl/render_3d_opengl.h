@@ -42,6 +42,7 @@
 #include <geometry/eda_angle.h>
 #include <pad.h> // For PAD_DRILL_POST_MACHINING_MODE
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -233,8 +234,21 @@ private:
         }
     };
 
-    void renderPlaceholderForFootprint( std::list<MODELTORENDER>& aDstRenderList, const glm::mat4& aFpMatrix,
-                                        const FOOTPRINT* aFootprint, bool aRenderTransparentOnly, bool aIsSelected,
+    /// A model (or placeholder) of a shown footprint in the frame being drawn
+    struct FRAME_MODEL
+    {
+        glm::mat4 m_modelWorldMat;
+        std::shared_ptr<MODEL_3D> m_model;
+        std::optional<LEAD_CLIP> m_leadClip;
+        float m_opacity;             ///< opacity in the transparent pass
+        bool m_opaquePass;
+        bool m_transparentPass;
+        bool m_highlight;
+        bool m_isSelected;
+        bool m_flipped;
+    };
+
+    void renderPlaceholderForFootprint( const glm::mat4& aFpMatrix, const FOOTPRINT* aFootprint, bool aHighlight,
                                         float aOpacity );
 
     void renderExtrudedBodies();
@@ -257,9 +271,10 @@ private:
     void get3dModelsSelected( std::list<MODELTORENDER> &aDstRenderList, bool aGetTop, bool aGetBot,
                               bool aRenderTransparentOnly, bool aRenderSelectedOnly );
 
-    void get3dModelsFromFootprint( std::list<MODELTORENDER> &aDstRenderList,
-                                   const FOOTPRINT* aFootprint, bool aRenderTransparentOnly,
-                                   bool aIsSelected );
+    /// Gather the models of every shown footprint once per frame, for all model passes
+    void collectFrameModels();
+
+    void get3dModelsFromFootprint( const FOOTPRINT* aFootprint, bool aHighlight );
 
     void setLightFront( bool enabled );
     void setLightTop( bool enabled );
@@ -399,12 +414,13 @@ private:
     std::map<wxString, std::pair<wxString, long long>> m_modelFiles;
 
     /// Lead clip per footprint model, computed on first draw after a reload
-    std::map<std::pair<const FOOTPRINT*, wxString>, std::optional<LEAD_CLIP>> m_leadClips;
+    std::map<const FOOTPRINT*, std::map<wxString, std::optional<LEAD_CLIP>>> m_leadClips;
     std::atomic<bool>    m_sceneBoundsValid{ false };
     std::bitset<LAYER_3D_END> m_builtLayerFlags;   ///< see LayerBuiltVisible()
     MATERIAL_MODE        m_modelsMaterialMode = MATERIAL_MODE::NORMAL;
     const S3D_CACHE*     m_modelsCache = nullptr;
-    std::map<std::vector<float>, glm::mat4>                m_3dModelMatrixMap;
+    std::map<std::array<float, 9>, glm::mat4>              m_3dModelMatrixMap;
+    std::vector<FRAME_MODEL> m_frameModels;   ///< see collectFrameModels(), empty between frames
 
     BOARD_ITEM*         m_currentRollOverItem;
 

@@ -822,6 +822,8 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
 
     glGetFloatv( GL_MODELVIEW_MATRIX, glm::value_ptr( cameraViewMatrix ) );
 
+    collectFrameModels();
+
     // Render 3D Models (Non-transparent)
     renderOpaqueModels( cameraViewMatrix );
 
@@ -976,6 +978,7 @@ bool RENDER_3D_OPENGL::Redraw( bool aIsMoving )
     }
 
     renderSelectionOnTop( cameraViewMatrix );
+    m_frameModels.clear();
 
     // Render 3D arrows
     if( cfg.show_navigator )
@@ -1193,9 +1196,9 @@ std::optional<LEAD_CLIP> RENDER_3D_OPENGL::leadClip( const FOOTPRINT* aFootprint
     if( !m_boardAdapter.m_Cfg->m_Render.clip_tht_leads )
         return std::nullopt;
 
-    const std::pair<const FOOTPRINT*, wxString> key( aFootprint, aModelFile );
+    std::map<wxString, std::optional<LEAD_CLIP>>& clips = m_leadClips[aFootprint];
 
-    if( auto it = m_leadClips.find( key ); it != m_leadClips.end() )
+    if( auto it = clips.find( aModelFile ); it != clips.end() )
         return it->second;
 
     std::optional<LEAD_CLIP> clip;
@@ -1207,7 +1210,7 @@ std::optional<LEAD_CLIP> RENDER_3D_OPENGL::leadClip( const FOOTPRINT* aFootprint
             clip = ComputeLeadClip( m_boardAdapter, *aFootprint, aModelWorld, it->second.first, it->second.second ).m_clip;
     }
 
-    m_leadClips[key] = clip;
+    clips[aModelFile] = clip;
     return clip;
 }
 
@@ -1311,12 +1314,32 @@ void RENDER_3D_OPENGL::get3dModelsSelected( std::list<MODELTORENDER> &aDstRender
 {
     wxASSERT( ( aGetTop == true ) || ( aGetBot == true ) );
 
+    for( const FRAME_MODEL& fm : m_frameModels )
+    {
+        if( m_boardAdapter.m_IsBoardView && aRenderSelectedOnly != fm.m_highlight )
+            continue;
+
+        if( aGetTop != !fm.m_flipped && aGetBot != fm.m_flipped )
+            continue;
+
+        if( !( aRenderTransparentOnly ? fm.m_transparentPass : fm.m_opaquePass ) )
+            continue;
+
+        aDstRenderList.emplace_back( fm.m_modelWorldMat, fm.m_model, aRenderTransparentOnly ? fm.m_opacity : 1.0f,
+                                     aRenderTransparentOnly, fm.m_isSelected, fm.m_leadClip );
+    }
+}
+
+
+void RENDER_3D_OPENGL::collectFrameModels()
+{
+    m_frameModels.clear();
+
     if( !m_boardAdapter.GetBoard() )
         return;
 
     EDA_3D_VIEWER_SETTINGS::RENDER_SETTINGS& cfg = m_boardAdapter.m_Cfg->m_Render;
 
-    // Go for all footprints
     for( FOOTPRINT* fp : m_boardAdapter.GetBoard()->Footprints() )
     {
         bool highlight = false;
@@ -1328,120 +1351,84 @@ void RENDER_3D_OPENGL::get3dModelsSelected( std::list<MODELTORENDER> &aDstRender
 
             if( cfg.highlight_on_rollover && fp == m_currentRollOverItem )
                 highlight = true;
-
-            if( aRenderSelectedOnly != highlight )
-                continue;
         }
 
-        bool hasModels = !fp->Models().empty();
-        bool showMissing = m_boardAdapter.m_Cfg->m_Render.show_missing_models;
-
-        if( hasModels || showMissing )
-        {
-            if( m_boardAdapter.IsFootprintShown( fp ) )
-            {
-                const bool isFlipped = fp->IsFlipped();
-
-                if( aGetTop == !isFlipped || aGetBot == isFlipped )
-                    get3dModelsFromFootprint( aDstRenderList, fp, aRenderTransparentOnly,
-                                              highlight );
-            }
-        }
+        if( ( !fp->Models().empty() || cfg.show_missing_models ) && m_boardAdapter.IsFootprintShown( fp ) )
+            get3dModelsFromFootprint( fp, highlight );
     }
 }
 
 
-void RENDER_3D_OPENGL::get3dModelsFromFootprint( std::list<MODELTORENDER> &aDstRenderList,
-                                                 const FOOTPRINT* aFootprint,
-                                                 bool aRenderTransparentOnly, bool aIsSelected )
+void RENDER_3D_OPENGL::get3dModelsFromFootprint( const FOOTPRINT* aFootprint, bool aHighlight )
 {
-    if( !aFootprint->Models().empty() )
+    const glm::mat4 fpMatrix = m_boardAdapter.GetFootprintMatrix( *aFootprint );
+
+    if( aFootprint->Models().empty() )
     {
-        const glm::mat4 fpMatrix = m_boardAdapter.GetFootprintMatrix( *aFootprint );
-
-        // The placeholder stands in for the whole footprint, so several missing models share one.
-        bool placeholderAdded = false;
-
-        // Get the list of model files for this model
-        for( const FP_3DMODEL& sM : aFootprint->Models() )
-        {
-            if( !sM.m_Show || sM.m_Filename.empty() )
-                continue;
-
-            // Check if the model is present in our cache map
-            auto cache_i = m_3dModelMap.find( sM.m_Filename );
-
-            if( cache_i == m_3dModelMap.end() )
-            {
-                if( !placeholderAdded )
-                {
-                    renderPlaceholderForFootprint( aDstRenderList, fpMatrix, aFootprint, aRenderTransparentOnly,
-                                                   aIsSelected, aRenderTransparentOnly ? sM.m_Opacity : 1.0f );
-                    placeholderAdded = true;
-                }
-
-                continue;
-            }
-
-            if( const std::shared_ptr<MODEL_3D_DEFERRED>& modelPtrDef = cache_i->second )
-            {
-                std::shared_ptr<MODEL_3D> modelPtr = modelPtrDef->MakeOrGet();
-
-                if( !modelPtr )
-                    continue;
-
-                bool opaque = sM.m_Opacity >= 1.0;
-
-                if( ( !aRenderTransparentOnly && modelPtr->HasOpaqueMeshes() && opaque ) ||
-                    ( aRenderTransparentOnly && ( modelPtr->HasTransparentMeshes() || !opaque ) ) )
-                {
-                    glm::mat4 modelworldMatrix = fpMatrix;
-
-                    const SFVEC3F offset = SFVEC3F( sM.m_Offset.x, sM.m_Offset.y, sM.m_Offset.z );
-                    const SFVEC3F rotation = SFVEC3F( sM.m_Rotation.x, sM.m_Rotation.y,
-                                                      sM.m_Rotation.z );
-                    const SFVEC3F scale = SFVEC3F( sM.m_Scale.x, sM.m_Scale.y, sM.m_Scale.z );
-
-                    std::vector<float> key = { offset.x, offset.y, offset.z,
-                                               rotation.x, rotation.y, rotation.z,
-                                               scale.x, scale.y, scale.z };
-
-                    auto it = m_3dModelMatrixMap.find( key );
-
-                    if( it != m_3dModelMatrixMap.end() )
-                    {
-                        modelworldMatrix *= it->second;
-                    }
-                    else
-                    {
-                        glm::mat4 mtx = CalcModelMatrix( offset, rotation, scale );
-                        m_3dModelMatrixMap[ key ] = mtx;
-
-                        modelworldMatrix *= mtx;
-                    }
-
-                    aDstRenderList.emplace_back( modelworldMatrix, modelPtr,
-                                                 aRenderTransparentOnly ? sM.m_Opacity : 1.0f,
-                                                 aRenderTransparentOnly,
-                                                 aFootprint->IsSelected() || aIsSelected,
-                                                 leadClip( aFootprint, sM.m_Filename, modelworldMatrix ) );
-                }
-            }
-        }
+        renderPlaceholderForFootprint( fpMatrix, aFootprint, aHighlight, 1.0f );
+        return;
     }
-    else
-    {
-        const glm::mat4 fpMatrix = m_boardAdapter.GetFootprintMatrix( *aFootprint );
 
-        renderPlaceholderForFootprint( aDstRenderList, fpMatrix, aFootprint, aRenderTransparentOnly, aIsSelected,
-                                       1.0f );
+    // The placeholder stands in for the whole footprint, so several missing models share one.
+    bool placeholderAdded = false;
+
+    for( const FP_3DMODEL& sM : aFootprint->Models() )
+    {
+        if( !sM.m_Show || sM.m_Filename.empty() )
+            continue;
+
+        auto cache_i = m_3dModelMap.find( sM.m_Filename );
+
+        if( cache_i == m_3dModelMap.end() )
+        {
+            if( !placeholderAdded )
+            {
+                renderPlaceholderForFootprint( fpMatrix, aFootprint, aHighlight, sM.m_Opacity );
+                placeholderAdded = true;
+            }
+
+            continue;
+        }
+
+        if( !cache_i->second )
+            continue;
+
+        std::shared_ptr<MODEL_3D> modelPtr = cache_i->second->MakeOrGet();
+
+        if( !modelPtr )
+            continue;
+
+        const bool opaque = sM.m_Opacity >= 1.0;
+        const bool opaquePass = modelPtr->HasOpaqueMeshes() && opaque;
+        const bool transparentPass = modelPtr->HasTransparentMeshes() || !opaque;
+
+        if( !opaquePass && !transparentPass )
+            continue;
+
+        const SFVEC3F offset = SFVEC3F( sM.m_Offset.x, sM.m_Offset.y, sM.m_Offset.z );
+        const SFVEC3F rotation = SFVEC3F( sM.m_Rotation.x, sM.m_Rotation.y, sM.m_Rotation.z );
+        const SFVEC3F scale = SFVEC3F( sM.m_Scale.x, sM.m_Scale.y, sM.m_Scale.z );
+
+        const std::array<float, 9> key = { offset.x,   offset.y,   offset.z, rotation.x, rotation.y,
+                                           rotation.z, scale.x,    scale.y,  scale.z };
+
+        auto it = m_3dModelMatrixMap.find( key );
+
+        if( it == m_3dModelMatrixMap.end() )
+            it = m_3dModelMatrixMap.emplace( key, CalcModelMatrix( offset, rotation, scale ) ).first;
+
+        const glm::mat4 modelworldMatrix = fpMatrix * it->second;
+
+        m_frameModels.push_back( { modelworldMatrix, std::move( modelPtr ),
+                                   leadClip( aFootprint, sM.m_Filename, modelworldMatrix ),
+                                   static_cast<float>( sM.m_Opacity ), opaquePass, transparentPass, aHighlight,
+                                   aFootprint->IsSelected() || aHighlight, aFootprint->IsFlipped() } );
     }
 }
 
 
-void RENDER_3D_OPENGL::renderPlaceholderForFootprint( std::list<MODELTORENDER>& aDstRenderList,
-                                                      const glm::mat4& aFpMatrix, const FOOTPRINT* aFootprint,
-                                                      bool aRenderTransparentOnly, bool aIsSelected, float aOpacity )
+void RENDER_3D_OPENGL::renderPlaceholderForFootprint( const glm::mat4& aFpMatrix, const FOOTPRINT* aFootprint,
+                                                      bool aHighlight, float aOpacity )
 {
     if( !m_boardAdapter.m_Cfg->m_Render.show_missing_models || !m_placeholderModel )
         return;
@@ -1471,13 +1458,14 @@ void RENDER_3D_OPENGL::renderPlaceholderForFootprint( std::list<MODELTORENDER>& 
     mtx = glm::translate( mtx, SFVEC3F( offsetX, offsetY, offsetZ ) );
     mtx = glm::scale( mtx, SFVEC3F( scaleX, scaleY, scaleZ ) );
 
-    bool placeholderOpaque = aOpacity >= 1.0;
+    // The opaque pass draws the placeholder fully opaque, the transparent pass with aOpacity
+    const bool opaquePass = m_placeholderModel->HasOpaqueMeshes();
+    const bool transparentPass = m_placeholderModel->HasTransparentMeshes() || aOpacity < 1.0;
 
-    if( ( !aRenderTransparentOnly && m_placeholderModel->HasOpaqueMeshes() && placeholderOpaque )
-        || ( aRenderTransparentOnly && ( m_placeholderModel->HasTransparentMeshes() || !placeholderOpaque ) ) )
+    if( opaquePass || transparentPass )
     {
-        aDstRenderList.emplace_back( mtx, m_placeholderModel, aOpacity, aRenderTransparentOnly,
-                                     aFootprint->IsSelected() || aIsSelected );
+        m_frameModels.push_back( { mtx, m_placeholderModel, std::nullopt, aOpacity, opaquePass, transparentPass,
+                                   aHighlight, aFootprint->IsSelected() || aHighlight, aFootprint->IsFlipped() } );
     }
 }
 
