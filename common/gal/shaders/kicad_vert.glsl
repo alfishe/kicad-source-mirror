@@ -47,6 +47,13 @@ uniform float u_pixelSizeMultiplier;
 uniform float u_minLinePixelWidth;
 uniform vec2 u_antialiasingOffset;
 
+// colours of palette slots (a_shaderParams[0] = mode + PALETTE_SLOT_STRIDE * slot)
+uniform sampler2D u_palette;
+uniform vec2 u_paletteSize;
+const float PALETTE_SLOT_STRIDE = 16.0;
+
+vec4 vertexColor;
+
 
 float roundr( float f, float r )
 {
@@ -65,7 +72,7 @@ void computeLineCoords( bool posture, vec2 vs, vec2 vp, vec2 texcoord, vec2 dir,
     float w = ((lineWidth == 0.0) ? u_worldPixelSize : lineWidth );
     float pixelWidth = roundr( w / u_worldPixelSize, 1.0 );
     float aspect = ( lineLength + w ) / w;
-    vec4 color = gl_Color;
+    vec4 color = vertexColor;
     vec2 s = sign( vec2( gl_ModelViewProjectionMatrix[0][0], gl_ModelViewProjectionMatrix[1][1] ) );
 
 
@@ -107,7 +114,7 @@ void computeLineCoords( bool posture, vec2 vs, vec2 vp, vec2 texcoord, vec2 dir,
     v_shaderParams[1] = aspect;
 
     gl_TexCoord[0].st = vec2(aspect * texcoord.x, texcoord.y);
-    gl_FrontColor = gl_Color;
+    gl_FrontColor = vertexColor;
 }
 
 
@@ -164,7 +171,7 @@ void computeCircleCoords( float mode, float vertexIndex, float radius, float lin
     delta.y *= u_screenPixelSize.y;
 
     gl_Position = center + delta + adjust;
-    gl_FrontColor = gl_Color;
+    gl_FrontColor = vertexColor;
 }
 
 void computeHoleWallCoords( float vertexIndex, float radius, float lineWidth )
@@ -215,16 +222,30 @@ void computeHoleWallCoords( float vertexIndex, float radius, float lineWidth )
     delta.y *= u_screenPixelSize.y;
 
     gl_Position = center + delta + adjust;
-    gl_FrontColor = gl_Color;
+    gl_FrontColor = vertexColor;
 }
 
 
 void main()
 {
-    float mode = a_shaderParams[0];
+    // modes are 0..11: the half step keeps the division off the slot boundaries
+    float slot = floor( ( a_shaderParams[0] + 0.5 ) / PALETTE_SLOT_STRIDE );
+    float mode = floor( a_shaderParams[0] - PALETTE_SLOT_STRIDE * slot + 0.5 );
+
+    if( slot > 0.0 )
+    {
+        float row = floor( slot / u_paletteSize.x );
+        vec2 texel = vec2( slot - row * u_paletteSize.x, row ) + 0.5;
+        vertexColor = texture2DLod( u_palette, texel / u_paletteSize, 0.0 );
+    }
+    else
+    {
+        vertexColor = gl_Color;
+    }
 
     // Pass attributes to the fragment shader
     v_shaderParams = a_shaderParams;
+    v_shaderParams[0] = mode;
 
     float lineWidth = v_shaderParams.y;
     vec2 vs = v_shaderParams.zw;
@@ -251,7 +272,7 @@ void main()
     {
         // Pass through the coordinates like in the fixed pipeline
         gl_Position = ftransform();
-        gl_FrontColor = gl_Color;
+        gl_FrontColor = vertexColor;
 
     }
 

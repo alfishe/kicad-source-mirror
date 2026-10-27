@@ -40,6 +40,7 @@ namespace KIGFX
 class SHADER;
 class VERTEX_ITEM;
 class VERTEX_CONTAINER;
+class COLOR_PALETTE;
 class GPU_MANAGER;
 
 /**
@@ -304,6 +305,21 @@ public:
     void ChangeItemDepth( const VERTEX_ITEM& aItem, GLfloat aDepth ) const;
 
     /**
+     * The vertices put until EndPaletteStamp() carry the slot of aPalette for aKey and the colour
+     * of the first vertex (VERTEX::shader[0]), when they have that colour.
+     */
+    void BeginPaletteStamp( COLOR_PALETTE* aPalette, uint64_t aKey );
+
+    /**
+     * @return the slot when every vertex of aItem (at least one) got it, the slot then counts
+     * aItem as a user; otherwise 0 and the slot is taken out of the vertices that got it.
+     */
+    int EndPaletteStamp( const VERTEX_ITEM& aItem );
+
+    /// @brief Takes palette slot aSlot out of the vertices of aItem (they show their own colour)
+    void ClearPaletteSlot( const VERTEX_ITEM& aItem, int aSlot ) const;
+
+    /**
      * Return a pointer to the vertices owned by an item.
      *
      * @param aItem is the owner of vertices that are going to be returned.
@@ -383,6 +399,16 @@ protected:
 
     /// Currently used shader and its parameters
     GLfloat                 m_shader[SHADER_STRIDE];
+
+    /// Palette slot stamp (BeginPaletteStamp): palette, key, slot taken at the first vertex,
+    /// its shader[0] offset and colour, outcome
+    mutable COLOR_PALETTE*  m_stampPalette = nullptr;
+    uint64_t                m_stampKey = 0;
+    mutable int             m_stampSlot = 0;
+    mutable GLfloat         m_slotOffset = 0.0f;
+    mutable GLubyte         m_stampRgba[COLOR_STRIDE] = {};
+    mutable bool            m_stampMismatch = false;
+    mutable unsigned int    m_stampCount = 0;
 
     /// Currently reserved chunk to store vertices
     VERTEX*                 m_reserved;

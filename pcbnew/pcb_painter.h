@@ -224,6 +224,8 @@ public:
 
     virtual bool HasUniformColor( const VIEW_ITEM* aItem, int aLayer ) const override;
 
+    virtual uint64_t GetColorKey( const VIEW_ITEM* aItem, int aLayer ) const override;
+
 protected:
     PCB_VIEWERS_SETTINGS_BASE* viewer_settings();
 

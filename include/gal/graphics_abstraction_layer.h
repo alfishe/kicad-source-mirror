@@ -666,6 +666,29 @@ public:
     virtual void ChangeGroupColor( int aGroupNumber, const COLOR4D& aNewColor ) {};
 
     /**
+     * The group being built takes the palette slot of aKey (a painter colour key) and the colour
+     * it is drawn in, when all its vertices get that colour; its colour then follows
+     * SetPaletteColor() of that slot.
+     */
+    virtual void SetGroupPaletteKey( uint64_t aKey ) {}
+
+    /// @return the palette slot of a group, 0 when its vertices carry its colour, -1 when it has
+    /// no vertices (nothing to recolour)
+    virtual int GetGroupPaletteSlot( int aGroupNumber ) const { return 0; }
+
+    /// @brief Colour of every group of a palette slot
+    virtual void SetPaletteColor( int aSlot, const COLOR4D& aColor ) {}
+
+    /// @return true when the slot's colour is aColor as a vertex would store it
+    virtual bool PaletteColorIs( int aSlot, const COLOR4D& aColor ) const { return false; }
+
+    /// @return one past the largest palette slot in use
+    virtual int GetPaletteEnd() const { return 0; }
+
+    /// @return the number of groups that use palette slot aSlot
+    virtual int GetPaletteRefs( int aSlot ) const { return 0; }
+
+    /**
      * Change the depth (Z-axis position) of the group.
      *
      * @param aGroupNumber is the group number.

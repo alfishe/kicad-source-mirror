@@ -471,6 +471,8 @@ OPENGL_GAL::OPENGL_GAL( const KIGFX::VC_SETTINGS& aVcSettings, GAL_DISPLAY_OPTIO
     ufm_minLinePixelWidth = -1;
     ufm_fontTexture = -1;
     ufm_fontTextureWidth = -1;
+    ufm_palette = -1;
+    ufm_paletteSize = -1;
     m_swapInterval  = 0;
 }
 
@@ -499,6 +501,7 @@ OPENGL_GAL::~OPENGL_GAL()
             m_compositor->Abandon();
             m_bitmapCache->Abandon();
             m_shader->Abandon();
+            m_palette.Abandon();
 
             if( m_isInitialized )
             {
@@ -511,6 +514,7 @@ OPENGL_GAL::~OPENGL_GAL()
         else if( m_isInitialized )
         {
             glFlush();
+            m_palette.ReleaseTexture();
         }
 
         gluDeleteTess( m_tesselator );
@@ -803,6 +807,7 @@ void OPENGL_GAL::BeginDrawing()
     renderingOffset.y *= screenPixelSize.y;
     m_shader->SetParameter( ufm_antialiasingOffset, renderingOffset );
     m_shader->SetParameter( ufm_minLinePixelWidth, GetMinLineWidth() );
+    bindPalette();
     m_shader->Deactivate();
 
     // Something between BeginDrawing and EndDrawing seems to depend on
@@ -869,6 +874,15 @@ void OPENGL_GAL::EndDrawing()
     cntEndNoncached.Stop();
 
     cntEndCached.Start();
+
+    // slots taken by the groups built in this frame
+    if( m_palette.IsDirty() )
+    {
+        m_shader->Use();
+        bindPalette();
+        m_shader->Deactivate();
+    }
+
     m_cachedManager->EndDrawing();
     syncGpu();
     cntEndCached.Stop();
@@ -3029,6 +3043,8 @@ int OPENGL_GAL::BeginGroup()
     int          groupNumber = getNewGroupNumber();
     VERTEX_ITEM* newItem = new( m_groupPool.Alloc() ) VERTEX_ITEM( *m_cachedManager );
     m_liveGroups++;
+    m_buildingGroup = groupNumber;
+    m_stamping = false;
 
     if( m_groupIndex.empty() )
         m_groupIndexBase = groupNumber;
@@ -3042,7 +3058,10 @@ int OPENGL_GAL::BeginGroup()
         const size_t slot = unsigned( groupNumber ) - m_groupIndexBase;
 
         if( slot >= m_groupIndex.size() )
+        {
             m_groupIndex.resize( slot + 1, nullptr );
+            m_groupSlot.resize( slot + 1, 0 );
+        }
 
         m_groupIndex[slot] = newItem;
     }
@@ -3055,6 +3074,65 @@ void OPENGL_GAL::EndGroup()
 {
     m_cachedManager->FinishItem();
     m_isGrouping = false;
+
+    if( VERTEX_ITEM* item = findGroup( m_buildingGroup ) )
+    {
+        uint16_t& slot = m_groupSlot[unsigned( m_buildingGroup ) - m_groupIndexBase];
+
+        if( m_stamping )
+            slot = uint16_t( m_cachedManager->EndPaletteStamp( *item ) );
+
+        if( item->GetSize() == 0 )
+            slot = EMPTY_GROUP;
+    }
+
+    m_stamping = false;
+
+    m_buildingGroup = -1;
+}
+
+
+void OPENGL_GAL::bindPalette()
+{
+    if( !m_paletteSupported )
+        return;
+
+    const GLint PALETTE_TEXTURE_UNIT = 4;
+
+    m_palette.Bind( PALETTE_TEXTURE_UNIT );
+    m_shader->SetParameter( ufm_palette, (int) PALETTE_TEXTURE_UNIT );
+    m_shader->SetParameter( ufm_paletteSize, VECTOR2D( m_palette.Width(), m_palette.Height() ) );
+}
+
+
+void OPENGL_GAL::SetGroupPaletteKey( uint64_t aKey )
+{
+    if( !m_paletteSupported || !m_isGrouping || m_stamping )
+        return;
+
+    m_stamping = true;
+    m_cachedManager->BeginPaletteStamp( &m_palette, aKey );
+}
+
+
+int OPENGL_GAL::GetGroupPaletteSlot( int aGroupNumber ) const
+{
+    const unsigned int n = unsigned( aGroupNumber ) - m_groupIndexBase;
+
+    if( aGroupNumber < 0 || unsigned( aGroupNumber ) < m_groupIndexBase || n >= m_groupSlot.size() )
+        return 0;
+
+    return m_groupSlot[n] == EMPTY_GROUP ? -1 : m_groupSlot[n];
+}
+
+
+bool OPENGL_GAL::PaletteColorIs( int aSlot, const COLOR4D& aColor ) const
+{
+    const GLubyte  rgba[4] = { GLubyte( aColor.r * 255.0 ), GLubyte( aColor.g * 255.0 ),
+                               GLubyte( aColor.b * 255.0 ), GLubyte( aColor.a * 255.0 ) };
+    const GLubyte* slot = m_palette.Bytes( aSlot );
+
+    return slot[0] == rgba[0] && slot[1] == rgba[1] && slot[2] == rgba[2] && slot[3] == rgba[3];
 }
 
 
@@ -3068,7 +3146,25 @@ void OPENGL_GAL::DrawGroup( int aGroupNumber )
 void OPENGL_GAL::ChangeGroupColor( int aGroupNumber, const COLOR4D& aNewColor )
 {
     if( VERTEX_ITEM* group = findGroup( aGroupNumber ) )
+    {
+        uint16_t& slot = m_groupSlot[unsigned( aGroupNumber ) - m_groupIndexBase];
+
+        if( slot == EMPTY_GROUP )
+            return;
+
+        // the group leaves its palette slot: from now on its vertices carry its colour
+        if( slot )
+        {
+            if( PaletteColorIs( slot, aNewColor ) )
+                return;
+
+            m_cachedManager->ClearPaletteSlot( *group, slot );
+            m_palette.Release( slot );
+            slot = 0;
+        }
+
         m_cachedManager->ChangeItemColor( *group, aNewColor );
+    }
 }
 
 
@@ -3088,6 +3184,14 @@ void OPENGL_GAL::DeleteGroup( int aGroupNumber )
 
     m_groupIndex[unsigned( aGroupNumber ) - m_groupIndexBase] = nullptr;
 
+    if( uint16_t& slot = m_groupSlot[unsigned( aGroupNumber ) - m_groupIndexBase] )
+    {
+        if( slot != EMPTY_GROUP )
+            m_palette.Release( slot );
+
+        slot = 0;
+    }
+
     // Frees memory in the container as well
     item->~VERTEX_ITEM();
     KISLOT_POOL::Free( item );
@@ -3103,19 +3207,27 @@ void OPENGL_GAL::DeleteGroup( int aGroupNumber )
 
 void OPENGL_GAL::rebuildGroupIndex( unsigned int aExtraNumber, VERTEX_ITEM* aExtra )
 {
-    std::vector<std::pair<unsigned int, VERTEX_ITEM*>> live;
+    struct LIVE
+    {
+        unsigned int number;
+        VERTEX_ITEM* item;
+        uint16_t     slot;
+    };
+
+    std::vector<LIVE> live;
     live.reserve( m_liveGroups );
 
     for( size_t i = 0; i < m_groupIndex.size(); ++i )
     {
         if( m_groupIndex[i] )
-            live.emplace_back( m_groupIndexBase + unsigned( i ), m_groupIndex[i] );
+            live.push_back( { m_groupIndexBase + unsigned( i ), m_groupIndex[i], m_groupSlot[i] } );
     }
 
     if( aExtra )
-        live.emplace_back( aExtraNumber, aExtra );
+        live.push_back( { aExtraNumber, aExtra, 0 } );
 
     m_groupIndex.clear();
+    m_groupSlot.clear();
     m_groupIndexRebuildBelow = live.size() / 2;
 
     if( live.empty() )
@@ -3124,19 +3236,24 @@ void OPENGL_GAL::rebuildGroupIndex( unsigned int aExtraNumber, VERTEX_ITEM* aExt
     unsigned int lo = std::numeric_limits<unsigned int>::max();
     unsigned int hi = 0;
 
-    for( const auto& [number, item] : live )
+    for( const LIVE& g : live )
     {
-        lo = std::min( lo, number );
-        hi = std::max( hi, number );
+        lo = std::min( lo, g.number );
+        hi = std::max( hi, g.number );
     }
 
     m_groupIndexBase = lo;
     m_groupIndex.assign( size_t( hi - lo ) + 1, nullptr );
+    m_groupSlot.assign( size_t( hi - lo ) + 1, 0 );
 
-    for( const auto& [number, item] : live )
-        m_groupIndex[number - lo] = item;
+    for( const LIVE& g : live )
+    {
+        m_groupIndex[g.number - lo] = g.item;
+        m_groupSlot[g.number - lo] = g.slot;
+    }
 
     m_groupIndex.shrink_to_fit();
+    m_groupSlot.shrink_to_fit();
 }
 
 
@@ -3161,6 +3278,9 @@ void OPENGL_GAL::clearGroupIndex()
 {
     m_groupIndex.clear();
     m_groupIndex.shrink_to_fit();
+    m_groupSlot.clear();
+    m_groupSlot.shrink_to_fit();
+    m_palette.Clear();
     m_groupIndexBase = 0;
     m_groupIndexRebuildBelow = 0;
 }
@@ -3992,6 +4112,12 @@ void OPENGL_GAL::init()
     // Set up shader parameters after linking
     setupShaderParameters();
 
+    // the palette is read in the vertex shader
+    GLint vertexTextureUnits = 0;
+    glGetIntegerv( GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS, &vertexTextureUnits );
+    m_paletteSupported = vertexTextureUnits > 0 && ufm_palette != -1;
+
+
     // Check if video card supports textures big enough to fit the font atlas
     int maxTextureSize;
     glGetIntegerv( GL_MAX_TEXTURE_SIZE, &maxTextureSize );
@@ -4035,6 +4161,8 @@ void OPENGL_GAL::setupShaderParameters()
     ufm_pixelSizeMultiplier = m_shader->AddParameter( "u_pixelSizeMultiplier" );
     ufm_antialiasingOffset = m_shader->AddParameter( "u_antialiasingOffset" );
     ufm_minLinePixelWidth = m_shader->AddParameter( "u_minLinePixelWidth" );
+    ufm_palette = m_shader->AddParameter( "u_palette" );
+    ufm_paletteSize = m_shader->AddParameter( "u_paletteSize" );
 }
 
 

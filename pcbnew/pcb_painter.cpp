@@ -1229,6 +1229,24 @@ bool PCB_PAINTER::HasUniformColor( const VIEW_ITEM* aItem, int aLayer ) const
 }
 
 
+uint64_t PCB_PAINTER::GetColorKey( const VIEW_ITEM* aItem, int aLayer ) const
+{
+    if( !aItem->IsBOARD_ITEM() || !HasUniformColor( aItem, aLayer ) )
+        return 0;
+
+    const BOARD_ITEM* item = static_cast<const BOARD_ITEM*>( aItem );
+
+    if( item->Type() == PCB_MARKER_T || item->IsSelected() || item->IsBrightened() )
+        return 0;
+
+    const int netCode = item->IsConnected() ? static_cast<const BOARD_CONNECTED_ITEM*>( item )->GetNetCode()
+                                            : -1;
+
+    return ( uint64_t( 1 ) << 63 ) | ( uint64_t( aLayer & 0x7fff ) << 47 )
+           | ( uint64_t( item->Type() & 0x7fff ) << 32 ) | uint32_t( netCode );
+}
+
+
 void PCB_PAINTER::draw( const PCB_VIA* aVia, int aLayer )
 {
     const BOARD* board = aVia->GetBoard();

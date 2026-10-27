@@ -884,30 +884,110 @@ void VIEW::UpdateLayerColor( int aLayer )
 
 void VIEW::UpdateAllLayersColor()
 {
-    if( m_gal->IsVisible() )
+    if( !m_gal->IsVisible() )
+    {
+        MarkDirty();
+        return;
+    }
+
+    // Groups in a GAL palette slot are recoloured by the colour of their slot, the vertex buffer
+    // is mapped only for the others.  A slot takes the new colour when all its groups are visited
+    // and agree to it; a group that disagrees leaves the slot and takes its colour in its vertices.
+    struct SLOT_STATE
+    {
+        int     visits = 0;
+        bool    hasColor = false;
+        COLOR4D color;
+    };
+
+    struct SLOTTED
+    {
+        int     group;
+        int     slot;
+        COLOR4D color;
+    };
+
+    std::vector<SLOT_STATE>                  slots( std::max( 0, m_gal->GetPaletteEnd() ) );
+    std::vector<SLOTTED>                     slotted;
+    std::vector<std::pair<int, COLOR4D>>     recolor;
+    std::vector<std::pair<VIEW_ITEM*, int>>  repaint;
+
+    for( VIEW_ITEM* item : *m_allItems )
+    {
+        VIEW_ITEM_DATA* viewData = item ? item->viewPrivData() : nullptr;
+
+        if( !viewData )
+            continue;
+
+        for( int layer : viewData->m_layers )
+        {
+            int group = viewData->getGroup( layer );
+
+            if( group < 0 )
+                continue;
+
+            int slot = m_gal->GetGroupPaletteSlot( group );
+
+            if( slot > 0 && slot < int( slots.size() ) )
+                slots[slot].visits++;
+            else if( slot > 0 )
+                slot = 0;
+
+            if( !m_painter->HasUniformColor( item, layer ) )
+            {
+                repaint.emplace_back( item, layer );
+                continue;
+            }
+
+            if( slot < 0 )
+                continue;
+
+            const COLOR4D color = m_painter->GetSettings()->GetColor( item, layer );
+
+            if( !slot )
+            {
+                recolor.emplace_back( group, color );
+                continue;
+            }
+
+            SLOT_STATE& state = slots[slot];
+
+            if( !state.hasColor )
+            {
+                state.hasColor = true;
+                state.color = color;
+            }
+
+            slotted.push_back( { group, slot, color } );
+        }
+    }
+
+    for( size_t slot = 1; slot < slots.size(); ++slot )
+    {
+        SLOT_STATE& state = slots[slot];
+
+        if( state.hasColor && state.visits == m_gal->GetPaletteRefs( int( slot ) ) )
+            m_gal->SetPaletteColor( int( slot ), state.color );
+    }
+
+    // ChangeGroupColor keeps a group whose slot already has its colour
+    for( const SLOTTED& g : slotted )
+    {
+        if( !m_gal->PaletteColorIs( g.slot, g.color ) )
+            recolor.emplace_back( g.group, g.color );
+    }
+
+    if( !recolor.empty() || !repaint.empty() )
     {
         GAL_UPDATE_CONTEXT ctx( m_gal );
 
         if( ctx.IsUpdating() )
         {
-            for( VIEW_ITEM* item : *m_allItems )
-            {
-                if( !item )
-                    continue;
+            for( const auto& [group, color] : recolor )
+                m_gal->ChangeGroupColor( group, color );
 
-                VIEW_ITEM_DATA* viewData = item->viewPrivData();
-
-                if( !viewData )
-                    continue;
-
-                for( int layer : viewData->m_layers )
-                {
-                    int group = viewData->getGroup( layer );
-
-                    if( group >= 0 )
-                        recolorGroup( item, layer, group );
-                }
-            }
+            for( const auto& [item, layer] : repaint )
+                updateItemGeometry( item, layer );
         }
     }
 
@@ -1496,6 +1576,9 @@ void VIEW::updateItemGeometry( VIEW_ITEM* aItem, int aLayer )
 
     group = m_gal->BeginGroup();
     viewData->setGroup( aLayer, group );
+
+    if( uint64_t key = m_painter->GetColorKey( aItem, aLayer ) )
+        m_gal->SetGroupPaletteKey( key );
 
     if( !m_painter->Draw( aItem, aLayer ) )
         aItem->ViewDraw( aLayer, this ); // Alternative drawing method

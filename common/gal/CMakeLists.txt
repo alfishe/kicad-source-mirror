@@ -43,6 +43,7 @@ set( GAL_SRCS
     opengl/cached_container_ram.cpp
     opengl/noncached_container.cpp
     opengl/vertex_manager.cpp
+    opengl/color_palette.cpp
     opengl/gpu_manager.cpp
     opengl/antialiasing.cpp
     opengl/opengl_compositor.cpp

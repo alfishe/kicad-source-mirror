@@ -31,6 +31,7 @@
 #include <gal/gal_display_options.h>
 #include <gal/opengl/shader.h>
 #include <gal/opengl/vertex_manager.h>
+#include <gal/opengl/color_palette.h>
 #include <gal/opengl/vertex_item.h>
 #include <gal/opengl/cached_container.h>
 #include <gal/opengl/gl_reset_budget.h>
@@ -249,6 +250,13 @@ public:
     /// @copydoc GAL::ChangeGroupColor()
     void ChangeGroupColor( int aGroupNumber, const COLOR4D& aNewColor ) override;
 
+    void SetGroupPaletteKey( uint64_t aKey ) override;
+    int GetGroupPaletteSlot( int aGroupNumber ) const override;
+    void SetPaletteColor( int aSlot, const COLOR4D& aColor ) override { m_palette.SetColor( aSlot, aColor ); }
+    bool PaletteColorIs( int aSlot, const COLOR4D& aColor ) const override;
+    int GetPaletteEnd() const override { return m_palette.End(); }
+    int GetPaletteRefs( int aSlot ) const override { return m_palette.Refs( aSlot ); }
+
     /// @copydoc GAL::ChangeGroupDepth()
     void ChangeGroupDepth( int aGroupNumber, int aDepth ) override;
 
@@ -413,6 +421,14 @@ private:
 
     static GLuint           g_fontTexture;      ///< Bitmap font texture handle (shared)
 
+    COLOR_PALETTE           m_palette;                  ///< colours of the cached groups with a slot
+    bool                    m_paletteSupported = false; ///< vertex shader texture fetch available
+    bool                    m_stamping = false;         ///< the group being built takes a palette slot
+
+    /// m_groupSlot of a group without vertices
+    static constexpr uint16_t EMPTY_GROUP = 0xFFFF;
+    int                     m_buildingGroup = -1;       ///< number of the group being built
+
     // Vertex buffer objects related fields: one VERTEX_ITEM per group, in slots
     KISLOT_POOL             m_groupPool{ sizeof( VERTEX_ITEM ), 1 };
     size_t                  m_liveGroups = 0;
@@ -422,6 +438,7 @@ private:
     /// holds every live group. Numbers are never reused, so the window is rebuilt when it gets
     /// sparse (more than about twice the live groups)
     std::vector<VERTEX_ITEM*> m_groupIndex;
+    std::vector<uint16_t>     m_groupSlot;   ///< palette slot per m_groupIndex entry (0: none, EMPTY_GROUP: no vertices)
     unsigned int              m_groupIndexBase = 0;
     size_t                    m_groupIndexRebuildBelow = 0; ///< live groups that allow the next rebuild (0: any)
 
@@ -442,6 +459,9 @@ private:
     void destroyAllGroups();
 
     /// @brief All groups gone: empty window
+    /// @brief Uploads the palette when changed and points the shader (in use) at it
+    void bindPalette();
+
     void clearGroupIndex();
     VERTEX_MANAGER*         m_currentManager;   ///< Currently used VERTEX_MANAGER (for storing
                                                 ///< VERTEX_ITEMs).
@@ -480,6 +500,8 @@ private:
     GLint                   ufm_minLinePixelWidth;
     GLint                   ufm_fontTexture;
     GLint                   ufm_fontTextureWidth;
+    GLint                   ufm_palette;
+    GLint                   ufm_paletteSize;
 
     /// wx cursor showing the current native cursor.
     WX_CURSOR_TYPE          m_currentwxCursor;

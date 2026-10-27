@@ -98,6 +98,14 @@ public:
      */
     virtual bool HasUniformColor( const VIEW_ITEM* aItem, int aLayer ) const { return true; }
 
+    /**
+     * @return a non-zero key when the colour of the item on the given layer is likely shared by
+     * the other items of the same key, so their cached groups can share a GAL palette slot; 0 when
+     * the group keeps its colour in its vertices.  A wrong guess costs speed, not correctness: the
+     * GAL and VIEW check the colours of every group.
+     */
+    virtual uint64_t GetColorKey( const VIEW_ITEM* aItem, int aLayer ) const { return 0; }
+
 protected:
     /// Instance of graphic abstraction layer that gives an interface to call
     /// commands used to draw (eg. DrawLine, DrawCircle, etc.)

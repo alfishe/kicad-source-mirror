@@ -27,12 +27,15 @@
  */
 
 #include <gal/opengl/vertex_manager.h>
+#include <gal/opengl/color_palette.h>
 #include <gal/opengl/cached_container.h>
 #include <gal/opengl/noncached_container.h>
 #include <gal/opengl/gpu_manager.h>
 #include <gal/opengl/vertex_item.h>
 #include <confirm.h>
 #include <wx/log.h>
+
+#include <cstring>
 
 
 /**
@@ -311,6 +314,82 @@ void VERTEX_MANAGER::putVertex( VERTEX& aTarget, GLfloat aX, GLfloat aY, GLfloat
     {
         aTarget.shader[j] = m_shader[j];
     }
+
+    if( m_stampPalette )
+    {
+        if( !m_stampSlot )
+        {
+            m_stampSlot = m_stampPalette->Acquire( m_stampKey, m_color );
+
+            if( !m_stampSlot )
+            {
+                m_stampPalette = nullptr;
+                return;
+            }
+
+            m_slotOffset = PALETTE_SLOT_STRIDE * m_stampSlot;
+            std::memcpy( m_stampRgba, m_color, COLOR_STRIDE );
+        }
+
+        if( std::memcmp( m_stampRgba, m_color, COLOR_STRIDE ) == 0 )
+            aTarget.shader[0] += m_slotOffset;
+        else
+            m_stampMismatch = true;
+
+        m_stampCount++;
+    }
+}
+
+
+void VERTEX_MANAGER::BeginPaletteStamp( COLOR_PALETTE* aPalette, uint64_t aKey )
+{
+    m_stampPalette = aPalette;
+    m_stampKey = aKey;
+    m_stampSlot = 0;
+    m_slotOffset = 0.0f;
+    m_stampMismatch = false;
+    m_stampCount = 0;
+}
+
+
+int VERTEX_MANAGER::EndPaletteStamp( const VERTEX_ITEM& aItem )
+{
+    COLOR_PALETTE* palette = m_stampPalette;
+    const int      slot = m_stampSlot;
+
+    m_stampPalette = nullptr;
+    m_stampSlot = 0;
+
+    if( !palette || !slot )
+        return 0;
+
+    if( !m_stampMismatch && m_stampCount == aItem.GetSize() )
+    {
+        palette->AddRef( slot );
+        return slot;
+    }
+
+    ClearPaletteSlot( aItem, slot );
+
+    if( palette->Refs( slot ) == 0 )
+        palette->Release( slot );
+
+    return 0;
+}
+
+
+void VERTEX_MANAGER::ClearPaletteSlot( const VERTEX_ITEM& aItem, int aSlot ) const
+{
+    const GLfloat offset = PALETTE_SLOT_STRIDE * aSlot;
+    VERTEX*       vertex = m_container->GetVertices( aItem.GetOffset() );
+
+    for( unsigned int i = 0; i < aItem.GetSize(); ++i, ++vertex )
+    {
+        if( vertex->shader[0] >= offset )
+            vertex->shader[0] -= offset;
+    }
+
+    m_container->SetDirty();
 }
 
 
