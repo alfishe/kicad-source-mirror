@@ -838,7 +838,12 @@ static KOPENAPI_RESULT h_pcb_footprint_get( KOPENAPI_CONTEXT& aCtx, const nlohma
     nlohmann::json models = nlohmann::json::array();
 
     for( const FP_3DMODEL& model : fp->Models() )
-        models.push_back( { { "file", str( model.m_Filename ) }, { "show", model.m_Show } } );
+        models.push_back( { { "file", str( model.m_Filename ) },
+                            { "offset_mm", { model.m_Offset.x, model.m_Offset.y, model.m_Offset.z } },
+                            { "rotation_deg", { model.m_Rotation.x, model.m_Rotation.y, model.m_Rotation.z } },
+                            { "scale", { model.m_Scale.x, model.m_Scale.y, model.m_Scale.z } },
+                            { "opacity", model.m_Opacity },
+                            { "show", model.m_Show } } );
 
     card["panel_edge"] = KopenapiPanelEdgeJson( fp );
     card["models"] = models;
@@ -962,7 +967,8 @@ KOPENAPI_REGISTER( "pcb_footprint_get",
                    "bounding box, every pad with its net/function/size/drill and side (west / east / north / south of "
                    "the part as placed, after rotation and flip; centre for a middle pad), nets, 3D models. Answer: "
                    "the pcb_footprint_list row (pads = the pad count) plus fields, description, attributes, bbox_mm, "
-                   "pad_list (one entry per pad: number, net, at_mm, side, ...), nets, models, panel_edge",
+                   "pad_list (one entry per pad: number, net, at_mm, side, ...), nets, models (file, offset_mm, "
+                   "rotation_deg, scale, opacity, show: as pcb_footprint_model_set takes them), panel_edge",
                    R"json({"type":"object","properties":{
                         "ref":{"type":"string","description":"reference designator, e.g. U3 (must be unique)"},
                         "uuid":{"type":"string","description":"footprint uuid from pcb_footprint_list"}}})json"_json,

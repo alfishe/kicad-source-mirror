@@ -76,6 +76,7 @@ nlohmann::json modelsJson( const FOOTPRINT* aFootprint )
                             { "offset_mm", { m.m_Offset.x, m.m_Offset.y, m.m_Offset.z } },
                             { "rotation_deg", { m.m_Rotation.x, m.m_Rotation.y, m.m_Rotation.z } },
                             { "scale", { m.m_Scale.x, m.m_Scale.y, m.m_Scale.z } },
+                            { "opacity", m.m_Opacity },
                             { "show", m.m_Show } } );
     }
 
@@ -310,7 +311,7 @@ static KOPENAPI_RESULT h_pcb_footprint_model_set( KOPENAPI_CONTEXT& aCtx, const 
     BOARD* board = context->GetBoard();
 
     if( !aArgs.contains( "models" ) || !aArgs["models"].is_array() )
-        return KOPENAPI_RESULT::Error( 400, "models: [{file, offset_mm?, rotation_deg?, scale?, show?}] ([] removes them)" );
+        return KOPENAPI_RESULT::Error( 400, "models: [{file, offset_mm?, rotation_deg?, scale?, opacity?, show?}] ([] removes them)" );
 
     std::vector<FP_3DMODEL> models;
 
@@ -327,6 +328,14 @@ static KOPENAPI_RESULT h_pcb_footprint_model_set( KOPENAPI_CONTEXT& aCtx, const 
             || !vec3( m, "scale", model.m_Scale ) )
         {
             return KOPENAPI_RESULT::Error( 400, "offset_mm / rotation_deg / scale: [x, y, z]" );
+        }
+
+        if( m.contains( "opacity" ) )
+        {
+            if( !m["opacity"].is_number() || m["opacity"].get<double>() < 0.0 || m["opacity"].get<double>() > 1.0 )
+                return KOPENAPI_RESULT::Error( 400, "opacity: a number from 0 (invisible) to 1 (opaque)" );
+
+            model.m_Opacity = m["opacity"].get<double>();
         }
 
         model.m_Show = m.value( "show", true );
@@ -386,7 +395,7 @@ static KOPENAPI_RESULT h_pcb_footprint_model_set( KOPENAPI_CONTEXT& aCtx, const 
 KOPENAPI_REGISTER( "pcb_footprint_model_set",
                    "Set the 3D models of board footprints (all instances of a lib_id, or refs): file "
                    "(${KIPRJMOD}/..., ${KICAD10_3DMODEL_DIR}/..., absolute), offset_mm, rotation_deg, "
-                   "scale, show; replaces the footprint's model list; the 3D view refreshes",
+                   "scale, opacity (0..1, below 1 drawn see-through), show; replaces the footprint's model list; the 3D view refreshes",
                    R"json({"type":"object","required":["models"],"properties":{
                         "lib_id":{"type":"string","description":"every footprint of this library footprint"},
                         "ref":{"type":"string"},
@@ -396,6 +405,7 @@ KOPENAPI_REGISTER( "pcb_footprint_model_set",
                             "offset_mm":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
                             "rotation_deg":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
                             "scale":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+                            "opacity":{"type":"number","minimum":0,"maximum":1,"default":1},
                             "show":{"type":"boolean","default":true}}}}}})json"_json,
                    false, h_pcb_footprint_model_set );
 
