@@ -28,6 +28,7 @@
 #include <confirm.h>
 #include <string_utils.h>
 #include <richio.h>
+#include <ki_exception.h>
 #include <wildcards_and_files_ext.h>
 
 
@@ -42,6 +43,33 @@ PROJECT_TREE_TRAVERSER::PROJECT_TREE_TRAVERSER( KICAD_MANAGER_FRAME* aFrame,
         m_newProjectDirPath( aNewProjectDirPath ),
         m_newProjectName( aNewProjectName )
 {
+}
+
+
+void PROJECT_TREE_TRAVERSER::saveWith( int aFace, const wxString& aSrcFilePath )
+{
+    wxString error;
+
+    try
+    {
+        if( KIFACE* kiface = m_frame->Kiway().KiFACE( static_cast<KIWAY::FACE_T>( aFace ) ) )
+        {
+            kiface->SaveFileAs( m_projectDirPath, m_projectName, m_newProjectDirPath, m_newProjectName,
+                                aSrcFilePath, m_errors );
+            return;
+        }
+
+        error.Printf( _( "Cannot copy file '%s': its editor did not start." ), aSrcFilePath );
+    }
+    catch( const IO_ERROR& ioe )
+    {
+        error.Printf( _( "Cannot copy file '%s': %s" ), aSrcFilePath, ioe.What() );
+    }
+
+    if( !m_errors.IsEmpty() )
+        m_errors += "\n";
+
+    m_errors += error;
 }
 
 
@@ -104,9 +132,7 @@ wxDirTraverseResult PROJECT_TREE_TRAVERSER::OnFile( const wxString& aSrcFilePath
              || ext == FILEEXT::NetlistFileExtension
              || destFile.GetName() == FILEEXT::SymbolLibraryTableFileName ) )
     {
-        KIFACE* eeschema = m_frame->Kiway().KiFACE( KIWAY::FACE_SCH );
-        eeschema->SaveFileAs( m_projectDirPath, m_projectName, m_newProjectDirPath,
-                              m_newProjectName, aSrcFilePath, m_errors );
+        saveWith( KIWAY::FACE_SCH, aSrcFilePath );
     }
     else if( m_frame && ( ext == FILEEXT::KiCadPcbFileExtension
              || ext == FILEEXT::KiCadPcbFileExtension + FILEEXT::BackupFileSuffix
@@ -116,23 +142,17 @@ wxDirTraverseResult PROJECT_TREE_TRAVERSER::OnFile( const wxString& aSrcFilePath
              || ext == FILEEXT::FootprintAssignmentFileExtension
              || destFile.GetName() == FILEEXT::FootprintLibraryTableFileName ) )
     {
-        KIFACE* pcbnew = m_frame->Kiway().KiFACE( KIWAY::FACE_PCB );
-        pcbnew->SaveFileAs( m_projectDirPath, m_projectName, m_newProjectDirPath,
-                            m_newProjectName, aSrcFilePath, m_errors );
+        saveWith( KIWAY::FACE_PCB, aSrcFilePath );
     }
     else if( m_frame && ext == FILEEXT::DrawingSheetFileExtension )
     {
-        KIFACE* pleditor = m_frame->Kiway().KiFACE( KIWAY::FACE_PL_EDITOR );
-        pleditor->SaveFileAs( m_projectDirPath, m_projectName, m_newProjectDirPath,
-                              m_newProjectName, aSrcFilePath, m_errors );
+        saveWith( KIWAY::FACE_PL_EDITOR, aSrcFilePath );
     }
     else if( m_frame && ( ext == FILEEXT::GerberJobFileExtension
            || ext == FILEEXT::DrillFileExtension
              || FILEEXT::IsGerberFileExtension( ext ) ) )
     {
-        KIFACE* gerbview = m_frame->Kiway().KiFACE( KIWAY::FACE_GERBVIEW );
-        gerbview->SaveFileAs( m_projectDirPath, m_projectName, m_newProjectDirPath,
-                              m_newProjectName, aSrcFilePath, m_errors );
+        saveWith( KIWAY::FACE_GERBVIEW, aSrcFilePath );
     }
     else if( destFile.GetName().StartsWith( FILEEXT::LockFilePrefix )
              && ext == FILEEXT::LockFileExtension )

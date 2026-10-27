@@ -49,6 +49,10 @@ public:
     wxFileName GetNewProjectFile() const { return m_newProjectFile; }
 
 private:
+    /// Copy a file through the editor that owns its type; a failure to load that editor is an error
+    /// of this file, not of the whole copy
+    void saveWith( int aFace, const wxString& aSrcFilePath );
+
     KICAD_MANAGER_FRAME* m_frame;          // nullptr for simple copy mode (templates)
 
     wxString             m_projectDirPath;

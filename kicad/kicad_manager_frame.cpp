@@ -552,11 +552,19 @@ void KICAD_MANAGER_FRAME::PreloadAllLibraries()
     CallAfter(
             [&]()
             {
-                KIFACE *schface = Kiway().KiFACE( KIWAY::FACE_SCH );
-                schface->PreloadLibraries( &Kiway() );
-
-                KIFACE *pcbface = Kiway().KiFACE( KIWAY::FACE_PCB );
-                pcbface->PreloadLibraries( &Kiway() );
+                // an editor that does not load only loses its own preload
+                for( KIWAY::FACE_T face : { KIWAY::FACE_SCH, KIWAY::FACE_PCB } )
+                {
+                    try
+                    {
+                        if( KIFACE* kiface = Kiway().KiFACE( face ) )
+                            kiface->PreloadLibraries( &Kiway() );
+                    }
+                    catch( const IO_ERROR& ioe )
+                    {
+                        wxLogError( ioe.What() );
+                    }
+                }
 
                 Pgm().PreloadDesignBlockLibraries( &Kiway() );
             } );
@@ -792,12 +800,13 @@ bool KICAD_MANAGER_FRAME::CloseProject( bool aSave )
     if( !Kiway().PlayersClose( false ) )
         return false;
 
-    // Abort any in-progress background load, since the threads depend on the project not changing
-    KIFACE *schface = Kiway().KiFACE( KIWAY::FACE_SCH );
-    schface->CancelPreload();
-
-    KIFACE *pcbface = Kiway().KiFACE( KIWAY::FACE_PCB );
-    pcbface->CancelPreload();
+    // Abort any in-progress background load, since the threads depend on the project not changing.
+    // Only a loaded kiface can have one: closing must not load (or fail to load) a kiface.
+    for( KIWAY::FACE_T face : { KIWAY::FACE_SCH, KIWAY::FACE_PCB } )
+    {
+        if( KIFACE* kiface = Kiway().KiFACE( face, false ) )
+            kiface->CancelPreload();
+    }
 
     // Save the project file for the currently loaded project.
     if( m_active_project )

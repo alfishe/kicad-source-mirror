@@ -4,6 +4,7 @@
 #include "recording/kicadopenapi_recorder.h"
 #include "kicadopenapi_mcp.h"
 #include "kicadopenapi_journal.h"
+#include <ki_exception.h>
 #include "kicadopenapi_memory.h"
 #include "kicadopenapi_remote.h"
 #include "kicadopenapi_libraries.h"
@@ -732,7 +733,8 @@ struct KICAD_OPENAPI_SERVICE::IMPL
                  { "model_gate", gateJson() },
                  { "claim", claimJson() },
                  { "changes", KOPENAPI_CHANGE_FEED::Status() },
-                 { "job", KOPENAPI_JOBS::Get().Busy().empty() ? nlohmann::json() : nlohmann::json( KOPENAPI_JOBS::Get().Busy() ) } };
+                 { "job", KOPENAPI_JOBS::Get().Busy().empty() ? nlohmann::json() : nlohmann::json( KOPENAPI_JOBS::Get().Busy() ) },
+                 { "kiface_failures", kifaceFailuresJson() } };
     }
 
     /// @brief Who holds the documents as their only writer, or null; any thread.
@@ -796,6 +798,16 @@ struct KICAD_OPENAPI_SERVICE::IMPL
     void ensureKifaces() const;
 
     mutable std::atomic<bool> kifacesLoaded{ false };
+
+    /// @brief Editor kifaces that failed to load ({ kiface, error, system }): their methods are missing
+    mutable std::mutex     kifaceMutex;
+    mutable nlohmann::json kifaceFailures = nlohmann::json::array();
+
+    nlohmann::json kifaceFailuresJson() const
+    {
+        std::lock_guard<std::mutex> lock( kifaceMutex );
+        return kifaceFailures;
+    }
 
     /// @brief One API call through the gate, for api_trace
     struct TRACE
@@ -883,25 +895,52 @@ void KICAD_OPENAPI_SERVICE::IMPL::ensureKifaces() const
     if( kifacesLoaded.load() || !ctx.kiway )
         return;
 
-    KIWAY* kiway = ctx.kiway;
+    KIWAY*         kiway = ctx.kiway;
+    nlohmann::json failures = nlohmann::json::array();
 
     runInMain( alive, waker,
-               [kiway]()
+               [kiway, &failures]()
                {
                    for( KIWAY::FACE_T face : { KIWAY::FACE_SCH, KIWAY::FACE_PCB } )
                    {
+                       const uint64_t since = KOPENAPI_JOURNAL::Summary().value( "last_seq", uint64_t( 0 ) );
+                       std::string    error;
+
                        try
                        {
-                           kiway->KiFACE( face );
+                           if( !kiway->KiFACE( face ) )
+                               error = "the kiface did not start";
                        }
-                       catch( ... )
+                       catch( const IO_ERROR& e )
                        {
-                           // A missing kiface only means its methods are unavailable
+                           error = e.What().ToStdString();
                        }
+                       catch( const std::exception& e )
+                       {
+                           error = e.what();
+                       }
+
+                       if( error.empty() )
+                           continue;
+
+                       // the loader's own report carries the system's reason (missing library, bad image)
+                       nlohmann::json system = nlohmann::json::array();
+
+                       for( const nlohmann::json& entry : KOPENAPI_JOURNAL::Entries( since, 8, "error" ) )
+                           system.push_back( entry.value( "message", "" ) );
+
+                       failures.push_back( { { "kiface", face == KIWAY::FACE_SCH ? "eeschema" : "pcbnew" },
+                                             { "error", error },
+                                             { "system", system } } );
                    }
 
                    return KOPENAPI_RESULT::Ok( nlohmann::json::object() );
                } );
+
+    {
+        std::lock_guard<std::mutex> lock( kifaceMutex );
+        kifaceFailures = std::move( failures );
+    }
 
     kifacesLoaded.store( true );
 }
@@ -1210,6 +1249,23 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std
         for( const std::string& name : similar )
             hint += ( hint.empty() ? " (did you mean " : ", " ) + name;
 
+        const nlohmann::json failed = kifaceFailuresJson();
+
+        if( !failed.empty() )
+        {
+            std::string names;
+
+            for( const nlohmann::json& f : failed )
+                names += ( names.empty() ? "" : ", " ) + f.value( "kiface", "" ) + ": " + f.value( "error", "" );
+
+            KOPENAPI_RESULT result = KOPENAPI_RESULT::Error(
+                    503, "unknown method '" + aName + "'; kifaces failed to load, their methods are unavailable ("
+                                 + names + ")" );
+            result.body["error"]["similar"] = similar;
+            result.body["error"]["kiface_failures"] = failed;
+            return result;
+        }
+
         KOPENAPI_RESULT result = KOPENAPI_RESULT::Error( 404, "unknown method '" + aName + "'" + ( hint.empty() ? "" : hint + "?)" ) );
         result.body["error"]["similar"] = similar;
         return result;
@@ -1329,6 +1385,8 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::startJob( const nlohmann::json& aAr
 
     if( std::optional<KOPENAPI_RESULT> refused = KOPENAPI_REMOTE::Gate( aCaller, name ) )
         return *refused;
+
+    ensureKifaces();
 
     std::optional<KOPENAPI_METHOD> method;
 

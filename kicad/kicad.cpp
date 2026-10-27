@@ -58,6 +58,7 @@
 
 #include "pgm_kicad.h"
 #include <kicadopenapi_journal.h>
+#include <kicadopenapi_service.h>
 #include "kicad_manager_frame.h"
 #include "mergetool_frame.h"
 
@@ -785,6 +786,18 @@ struct APP_KICAD : public wxApp
         }
 
         return false;   // continue on. Return false to abort program
+    }
+#else
+    bool OnExceptionInMainLoop() override
+    {
+        // An agent drives the process: no Abort / Retry / Ignore box, the error goes to the journal
+        if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        {
+            Pgm().HandleException( std::current_exception(), true );
+            return true;
+        }
+
+        return wxApp::OnExceptionInMainLoop();
     }
 #endif
 

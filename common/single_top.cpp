@@ -324,6 +324,18 @@ struct APP_SINGLE_TOP : public wxApp
 
         return false;   // continue on. Return false to abort program
     }
+#else
+    bool OnExceptionInMainLoop() override
+    {
+        // An agent drives the process: no Abort / Retry / Ignore box, the error goes to the journal
+        if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        {
+            Pgm().HandleException( std::current_exception(), true );
+            return true;
+        }
+
+        return wxApp::OnExceptionInMainLoop();
+    }
 #endif
 
 #ifdef __WXMAC__
