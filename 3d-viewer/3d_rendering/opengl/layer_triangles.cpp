@@ -295,12 +295,7 @@ OPENGL_RENDER_LIST::OPENGL_RENDER_LIST( const TRIANGLE_DISPLAY_LIST& aLayerTrian
 {
     m_zBot = aZBot;
     m_zTop = aZTop;
-
-    m_layer_top_segment_ends       = 0;
-    m_layer_top_triangles          = 0;
-    m_layer_middle_contours_quads  = 0;
-    m_layer_bot_triangles          = 0;
-    m_layer_bot_segment_ends       = 0;
+    m_segEndsTexture = 0;
 
     if( aTextureIndexForSegEnds )
     {
@@ -308,11 +303,9 @@ OPENGL_RENDER_LIST::OPENGL_RENDER_LIST( const TRIANGLE_DISPLAY_LIST& aLayerTrian
 
         if( glIsTexture( aTextureIndexForSegEnds ) )
         {
-            m_layer_top_segment_ends = generate_top_or_bot_seg_ends( aLayerTriangles.m_layer_top_segment_ends,
-                                                                     true, aTextureIndexForSegEnds );
-
-            m_layer_bot_segment_ends = generate_top_or_bot_seg_ends( aLayerTriangles.m_layer_bot_segment_ends,
-                                                                     false, aTextureIndexForSegEnds );
+            m_segEndsTexture = aTextureIndexForSegEnds;
+            m_layer_top_segment_ends = generate_top_or_bot_seg_ends( aLayerTriangles.m_layer_top_segment_ends, true );
+            m_layer_bot_segment_ends = generate_top_or_bot_seg_ends( aLayerTriangles.m_layer_bot_segment_ends, false );
         }
     }
 
@@ -331,47 +324,125 @@ OPENGL_RENDER_LIST::OPENGL_RENDER_LIST( const TRIANGLE_DISPLAY_LIST& aLayerTrian
 }
 
 
-OPENGL_RENDER_LIST::~OPENGL_RENDER_LIST()
+void OPENGL_RENDER_LIST::deletePart( GL_PART& aPart )
 {
     if( !ORPHANED_GL_OBJECTS::Active() )
     {
-        if( glIsList( m_layer_top_segment_ends ) )
-            glDeleteLists( m_layer_top_segment_ends, 1 );
+        const GLuint buffers[2] = { aPart.vertices, aPart.attributes };
 
-        if( glIsList( m_layer_top_triangles ) )
-            glDeleteLists( m_layer_top_triangles, 1 );
-
-        if( glIsList( m_layer_middle_contours_quads ) )
-            glDeleteLists( m_layer_middle_contours_quads, 1 );
-
-        if( glIsList( m_layer_bot_triangles ) )
-            glDeleteLists( m_layer_bot_triangles, 1 );
-
-        if( glIsList( m_layer_bot_segment_ends ) )
-            glDeleteLists( m_layer_bot_segment_ends, 1 );
+        glDeleteBuffers( aPart.attributes ? 2 : 1, buffers );
     }
 
-    m_layer_top_segment_ends        = 0;
-    m_layer_top_triangles           = 0;
-    m_layer_middle_contours_quads  = 0;
-    m_layer_bot_triangles           = 0;
-    m_layer_bot_segment_ends        = 0;
+    aPart = GL_PART();
+}
+
+
+OPENGL_RENDER_LIST::~OPENGL_RENDER_LIST()
+{
+    for( GL_PART* part : { &m_layer_top_segment_ends, &m_layer_top_triangles, &m_layer_middle_contours_quads,
+                           &m_layer_bot_triangles, &m_layer_bot_segment_ends } )
+    {
+        if( part->vertices )
+            deletePart( *part );
+    }
+}
+
+
+void OPENGL_RENDER_LIST::drawSegEnds( const GL_PART& aPart ) const
+{
+    if( !aPart )
+        return;
+
+    glPushClientAttrib( GL_CLIENT_VERTEX_ARRAY_BIT );
+    glDisableClientState( GL_COLOR_ARRAY );
+    glDisableClientState( GL_NORMAL_ARRAY );
+    glEnableClientState( GL_VERTEX_ARRAY );
+    glEnableClientState( GL_TEXTURE_COORD_ARRAY );
+    glBindBuffer( GL_ARRAY_BUFFER, aPart.vertices );
+    glVertexPointer( 3, GL_FLOAT, 0, nullptr );
+    glBindBuffer( GL_ARRAY_BUFFER, aPart.attributes );
+    glTexCoordPointer( 2, GL_FLOAT, 0, nullptr );
+
+    glDisable( GL_COLOR_MATERIAL );
+
+    glEnable( GL_TEXTURE_2D );
+    glBindTexture( GL_TEXTURE_2D, m_segEndsTexture );
+
+    glAlphaFunc( GL_GREATER, 0.2f );
+    glEnable( GL_ALPHA_TEST );
+
+    glNormal3f( 0.0f, 0.0f, aPart.normalZ );
+
+    glDrawArrays( GL_TRIANGLES, 0, aPart.count );
+
+    glBindTexture( GL_TEXTURE_2D, 0 );
+    glDisable( GL_TEXTURE_2D );
+    glDisable( GL_ALPHA_TEST );
+    glDisable( GL_BLEND );
+
+    glBindBuffer( GL_ARRAY_BUFFER, 0 );
+    glPopClientAttrib();
+}
+
+
+void OPENGL_RENDER_LIST::drawTriangles( const GL_PART& aPart ) const
+{
+    if( !aPart )
+        return;
+
+    glPushClientAttrib( GL_CLIENT_VERTEX_ARRAY_BIT );
+    glDisableClientState( GL_TEXTURE_COORD_ARRAY );
+    glDisableClientState( GL_COLOR_ARRAY );
+    glDisableClientState( GL_NORMAL_ARRAY );
+    glEnableClientState( GL_VERTEX_ARRAY );
+    glBindBuffer( GL_ARRAY_BUFFER, aPart.vertices );
+    glVertexPointer( 3, GL_FLOAT, 0, nullptr );
+
+    setBlendfunction();
+
+    glNormal3f( 0.0f, 0.0f, aPart.normalZ );
+
+    glDrawArrays( GL_TRIANGLES, 0, aPart.count );
+
+    glDisable( GL_BLEND );
+
+    glBindBuffer( GL_ARRAY_BUFFER, 0 );
+    glPopClientAttrib();
+}
+
+
+void OPENGL_RENDER_LIST::drawMiddle( const GL_PART& aPart ) const
+{
+    if( !aPart )
+        return;
+
+    glPushClientAttrib( GL_CLIENT_VERTEX_ARRAY_BIT );
+    glDisableClientState( GL_TEXTURE_COORD_ARRAY );
+    glDisableClientState( GL_COLOR_ARRAY );
+    glEnableClientState( GL_NORMAL_ARRAY );
+    glEnableClientState( GL_VERTEX_ARRAY );
+    glBindBuffer( GL_ARRAY_BUFFER, aPart.vertices );
+    glVertexPointer( 3, GL_FLOAT, 0, nullptr );
+    glBindBuffer( GL_ARRAY_BUFFER, aPart.attributes );
+    glNormalPointer( GL_FLOAT, 0, nullptr );
+
+    setBlendfunction();
+
+    glDrawArrays( GL_TRIANGLES, 0, aPart.count );
+
+    glDisable( GL_BLEND );
+
+    glBindBuffer( GL_ARRAY_BUFFER, 0 );
+    glPopClientAttrib();
 }
 
 
 void OPENGL_RENDER_LIST::DrawTopAndMiddle() const
 {
     beginTransformation();
-
-    if( glIsList( m_layer_middle_contours_quads ) )
-        glCallList( m_layer_middle_contours_quads );
-
-    if( glIsList( m_layer_top_triangles ) )
-        glCallList( m_layer_top_triangles );
-
-    if( glIsList( m_layer_top_segment_ends ) )
-        glCallList( m_layer_top_segment_ends );
-
+    drawMiddle( m_layer_middle_contours_quads );
+    drawTriangles( m_layer_top_triangles );
+    drawSegEnds( m_layer_top_segment_ends );
     endTransformation();
 }
 
@@ -379,16 +450,9 @@ void OPENGL_RENDER_LIST::DrawTopAndMiddle() const
 void OPENGL_RENDER_LIST::DrawBotAndMiddle() const
 {
     beginTransformation();
-
-    if( glIsList( m_layer_middle_contours_quads ) )
-        glCallList( m_layer_middle_contours_quads );
-
-    if( glIsList( m_layer_bot_triangles ) )
-        glCallList( m_layer_bot_triangles );
-
-    if( glIsList( m_layer_bot_segment_ends ) )
-        glCallList( m_layer_bot_segment_ends );
-
+    drawMiddle( m_layer_middle_contours_quads );
+    drawTriangles( m_layer_bot_triangles );
+    drawSegEnds( m_layer_bot_segment_ends );
     endTransformation();
 }
 
@@ -396,13 +460,8 @@ void OPENGL_RENDER_LIST::DrawBotAndMiddle() const
 void OPENGL_RENDER_LIST::DrawTop() const
 {
     beginTransformation();
-
-    if( glIsList( m_layer_top_triangles ) )
-        glCallList( m_layer_top_triangles );
-
-    if( glIsList( m_layer_top_segment_ends ) )
-        glCallList( m_layer_top_segment_ends );
-
+    drawTriangles( m_layer_top_triangles );
+    drawSegEnds( m_layer_top_segment_ends );
     endTransformation();
 }
 
@@ -410,13 +469,8 @@ void OPENGL_RENDER_LIST::DrawTop() const
 void OPENGL_RENDER_LIST::DrawBot() const
 {
     beginTransformation();
-
-    if( glIsList( m_layer_bot_triangles ) )
-        glCallList( m_layer_bot_triangles );
-
-    if( glIsList( m_layer_bot_segment_ends ) )
-        glCallList( m_layer_bot_segment_ends );
-
+    drawTriangles( m_layer_bot_triangles );
+    drawSegEnds( m_layer_bot_segment_ends );
     endTransformation();
 }
 
@@ -424,10 +478,7 @@ void OPENGL_RENDER_LIST::DrawBot() const
 void OPENGL_RENDER_LIST::DrawMiddle() const
 {
     beginTransformation();
-
-    if( glIsList( m_layer_middle_contours_quads ) )
-        glCallList( m_layer_middle_contours_quads );
-
+    drawMiddle( m_layer_middle_contours_quads );
     endTransformation();
 }
 
@@ -437,20 +488,12 @@ void OPENGL_RENDER_LIST::DrawAll( bool aDrawMiddle ) const
     beginTransformation();
 
     if( aDrawMiddle )
-        if( glIsList( m_layer_middle_contours_quads ) )
-            glCallList( m_layer_middle_contours_quads );
+        drawMiddle( m_layer_middle_contours_quads );
 
-    if( glIsList( m_layer_top_triangles ) )
-        glCallList( m_layer_top_triangles );
-
-    if( glIsList( m_layer_bot_triangles ) )
-        glCallList( m_layer_bot_triangles );
-
-    if( glIsList( m_layer_top_segment_ends ) )
-        glCallList( m_layer_top_segment_ends );
-
-    if( glIsList( m_layer_bot_segment_ends ) )
-        glCallList( m_layer_bot_segment_ends );
+    drawTriangles( m_layer_top_triangles );
+    drawTriangles( m_layer_bot_triangles );
+    drawSegEnds( m_layer_top_segment_ends );
+    drawSegEnds( m_layer_bot_segment_ends );
 
     endTransformation();
 }
@@ -566,121 +609,81 @@ void OPENGL_RENDER_LIST::SetItIsTransparent( bool aSetTransparent )
 }
 
 
-GLuint OPENGL_RENDER_LIST::generate_top_or_bot_seg_ends(
-        const TRIANGLE_LIST* aTriangleContainer, bool aIsNormalUp, GLuint aTextureId ) const
+static GLuint makeBuffer( const void* aData, size_t aBytes )
 {
-    wxCHECK( aTriangleContainer != nullptr, 0 );
+    GLuint buffer = 0;
+
+    glGenBuffers( 1, &buffer );
+    glBindBuffer( GL_ARRAY_BUFFER, buffer );
+    glBufferData( GL_ARRAY_BUFFER, aBytes, aData, GL_STATIC_DRAW );
+    glBindBuffer( GL_ARRAY_BUFFER, 0 );
+
+    return buffer;
+}
+
+
+OPENGL_RENDER_LIST::GL_PART OPENGL_RENDER_LIST::generate_top_or_bot_seg_ends( const TRIANGLE_LIST* aTriangleContainer,
+                                                                              bool aIsNormalUp ) const
+{
+    wxCHECK( aTriangleContainer != nullptr, GL_PART() );
 
     wxASSERT( ( aTriangleContainer->GetVertexSize() % 3 ) == 0 );
 
     // Top and Bot don't have normals array stored in container
     wxASSERT( aTriangleContainer->GetNormalsSize() == 0 );
 
-    if( ( aTriangleContainer->GetVertexSize() > 0 )
-      && ( ( aTriangleContainer->GetVertexSize() % 3 ) == 0 ) )
+    GL_PART part;
+    const unsigned int count = aTriangleContainer->GetVertexSize();
+
+    if( count == 0 || count % 3 != 0 )
+        return part;
+
+    // Prepare an array of UV text coordinates
+    std::vector<SFVEC2F> uvArray( count );
+
+    for( unsigned int i = 0; i < count; i += 3 )
     {
-        GLuint listIdx = glGenLists( 1 );
-
-        if( glIsList( listIdx ) )
-        {
-            // Prepare an array of UV text coordinates
-            SFVEC2F* uvArray = new SFVEC2F[aTriangleContainer->GetVertexSize()];
-
-            for( unsigned int i = 0; i < aTriangleContainer->GetVertexSize(); i += 3 )
-            {
-                uvArray[i + 0] = SFVEC2F( 1.0f, 0.0f );
-                uvArray[i + 1] = SFVEC2F( 0.0f, 1.0f );
-                uvArray[i + 2] = SFVEC2F( 0.0f, 0.0f );
-            }
-
-            glEnableClientState( GL_TEXTURE_COORD_ARRAY );
-            glDisableClientState( GL_COLOR_ARRAY );
-            glDisableClientState( GL_NORMAL_ARRAY );
-            glEnableClientState( GL_VERTEX_ARRAY );
-            glVertexPointer( 3, GL_FLOAT, 0, aTriangleContainer->GetVertexPointer() );
-            glTexCoordPointer( 2, GL_FLOAT, 0, uvArray );
-
-            glNewList( listIdx, GL_COMPILE );
-
-            glDisable( GL_COLOR_MATERIAL );
-
-            glEnable( GL_TEXTURE_2D );
-            glBindTexture( GL_TEXTURE_2D, aTextureId );
-
-            glAlphaFunc( GL_GREATER, 0.2f );
-            glEnable( GL_ALPHA_TEST );
-
-            glNormal3f( 0.0f, 0.0f, aIsNormalUp?1.0f:-1.0f );
-
-            glDrawArrays( GL_TRIANGLES, 0, aTriangleContainer->GetVertexSize() );
-
-            glBindTexture( GL_TEXTURE_2D, 0 );
-            glDisable( GL_TEXTURE_2D );
-            glDisable( GL_ALPHA_TEST );
-            glDisable( GL_BLEND );
-
-            glEndList();
-
-            glDisableClientState( GL_VERTEX_ARRAY );
-            glDisableClientState( GL_TEXTURE_COORD_ARRAY );
-
-            delete [] uvArray;
-            return listIdx;
-        }
+        uvArray[i + 0] = SFVEC2F( 1.0f, 0.0f );
+        uvArray[i + 1] = SFVEC2F( 0.0f, 1.0f );
+        uvArray[i + 2] = SFVEC2F( 0.0f, 0.0f );
     }
 
-    return 0;
+    part.vertices = makeBuffer( aTriangleContainer->GetVertexPointer(), sizeof( SFVEC3F ) * count );
+    part.attributes = makeBuffer( uvArray.data(), sizeof( SFVEC2F ) * count );
+    part.count = (GLsizei) count;
+    part.normalZ = aIsNormalUp ? 1.0f : -1.0f;
+
+    return part;
 }
 
 
-GLuint OPENGL_RENDER_LIST::generate_top_or_bot_triangles( const TRIANGLE_LIST* aTriangleContainer,
-                                                          bool aIsNormalUp ) const
+OPENGL_RENDER_LIST::GL_PART OPENGL_RENDER_LIST::generate_top_or_bot_triangles( const TRIANGLE_LIST* aTriangleContainer,
+                                                                               bool aIsNormalUp ) const
 {
-    wxCHECK( aTriangleContainer != nullptr, 0 );
+    wxCHECK( aTriangleContainer != nullptr, GL_PART() );
 
     wxASSERT( ( aTriangleContainer->GetVertexSize() % 3 ) == 0 );
 
     // Top and Bot dint have normals array stored in container
     wxASSERT( aTriangleContainer->GetNormalsSize() == 0 );
 
-    if( ( aTriangleContainer->GetVertexSize() > 0 )
-      && ( ( aTriangleContainer->GetVertexSize() % 3 ) == 0 ) )
-    {
-        const GLuint listIdx = glGenLists( 1 );
+    GL_PART part;
+    const unsigned int count = aTriangleContainer->GetVertexSize();
 
-        if( glIsList( listIdx ) )
-        {
-            glDisableClientState( GL_TEXTURE_COORD_ARRAY );
-            glDisableClientState( GL_COLOR_ARRAY );
-            glDisableClientState( GL_NORMAL_ARRAY );
-            glEnableClientState( GL_VERTEX_ARRAY );
-            glVertexPointer( 3, GL_FLOAT, 0, aTriangleContainer->GetVertexPointer() );
+    if( count == 0 || count % 3 != 0 )
+        return part;
 
-            glNewList( listIdx, GL_COMPILE );
+    part.vertices = makeBuffer( aTriangleContainer->GetVertexPointer(), sizeof( SFVEC3F ) * count );
+    part.count = (GLsizei) count;
+    part.normalZ = aIsNormalUp ? 1.0f : -1.0f;
 
-            setBlendfunction();
-
-            glNormal3f( 0.0f, 0.0f, aIsNormalUp?1.0f:-1.0f );
-
-            glDrawArrays( GL_TRIANGLES, 0, aTriangleContainer->GetVertexSize() );
-
-            glDisable( GL_BLEND );
-            glEndList();
-
-            glDisableClientState( GL_VERTEX_ARRAY );
-
-            return listIdx;
-        }
-    }
-
-    return 0;
+    return part;
 }
 
 
-GLuint OPENGL_RENDER_LIST::generate_middle_triangles(
-        const TRIANGLE_LIST* aTriangleContainer ) const
+OPENGL_RENDER_LIST::GL_PART OPENGL_RENDER_LIST::generate_middle_triangles( const TRIANGLE_LIST* aTriangleContainer ) const
 {
-    wxCHECK( aTriangleContainer != nullptr, 0 );
+    wxCHECK( aTriangleContainer != nullptr, GL_PART() );
 
     // We expect that it is a multiple of 3 vertex
     wxASSERT( ( aTriangleContainer->GetVertexSize() % 3 ) == 0 );
@@ -691,39 +694,17 @@ GLuint OPENGL_RENDER_LIST::generate_middle_triangles(
     // We expect that there are normals with same size as vertex
     wxASSERT( aTriangleContainer->GetNormalsSize() == aTriangleContainer->GetVertexSize() );
 
-    if( ( aTriangleContainer->GetVertexSize() > 0 )
-      && ( ( aTriangleContainer->GetVertexSize() % 3 ) == 0 )
-      && ( ( aTriangleContainer->GetVertexSize() % 6 ) == 0 )
-      && ( aTriangleContainer->GetNormalsSize() == aTriangleContainer->GetVertexSize() ) )
-    {
-        const GLuint listIdx = glGenLists( 1 );
+    GL_PART part;
+    const unsigned int count = aTriangleContainer->GetVertexSize();
 
-        if( glIsList( listIdx ) )
-        {
-            glDisableClientState( GL_TEXTURE_COORD_ARRAY );
-            glDisableClientState( GL_COLOR_ARRAY );
-            glEnableClientState( GL_NORMAL_ARRAY );
-            glEnableClientState( GL_VERTEX_ARRAY );
-            glVertexPointer( 3, GL_FLOAT, 0, aTriangleContainer->GetVertexPointer() );
-            glNormalPointer( GL_FLOAT, 0, aTriangleContainer->GetNormalsPointer() );
+    if( count == 0 || count % 6 != 0 || aTriangleContainer->GetNormalsSize() != count )
+        return part;
 
-            glNewList( listIdx, GL_COMPILE );
+    part.vertices = makeBuffer( aTriangleContainer->GetVertexPointer(), sizeof( SFVEC3F ) * count );
+    part.attributes = makeBuffer( aTriangleContainer->GetNormalsPointer(), sizeof( SFVEC3F ) * count );
+    part.count = (GLsizei) count;
 
-            setBlendfunction();
-
-            glDrawArrays( GL_TRIANGLES, 0, aTriangleContainer->GetVertexSize() );
-
-            glDisable( GL_BLEND );
-            glEndList();
-
-            glDisableClientState( GL_VERTEX_ARRAY );
-            glDisableClientState( GL_NORMAL_ARRAY );
-
-            return listIdx;
-        }
-    }
-
-    return 0;
+    return part;
 }
 
 

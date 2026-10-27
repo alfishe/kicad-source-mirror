@@ -1140,8 +1140,21 @@ static void stepMove( CAMERA& aCamera, const CAMERA_MOVE& aMove, double aFrom, d
 /// @brief Plays camera moves in order, each eased in and out, repainting as it goes (on video
 /// time while a recording runs)
 /// @return frames drawn, -1 when the viewer was closed meanwhile (the UI runs between the steps)
+/// @brief Paint time per frame (ms): median, p95, max
+static nlohmann::json frameStats( std::vector<double> aMs )
+{
+    if( aMs.empty() )
+        return nullptr;
+
+    std::sort( aMs.begin(), aMs.end() );
+    const auto at = [&]( double q ) { return aMs[std::min( aMs.size() - 1, size_t( q * ( aMs.size() - 1 ) + 0.5 ) )]; };
+
+    return { { "median", at( 0.5 ) }, { "p95", at( 0.95 ) }, { "max", aMs.back() } };
+}
+
+
 static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE>& aMoves,
-                      const FRAMING* aFollow = nullptr )
+                      const FRAMING* aFollow = nullptr, std::vector<double>* aFrameMs = nullptr )
 {
     wxWeakRef<EDA_3D_VIEWER_FRAME> alive( aFrame );
     CAMERA& camera = aFrame->GetCurrentCamera();
@@ -1172,7 +1185,14 @@ static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE
                                  applied = k;
                              }
 
+                             const auto paintStart = std::chrono::steady_clock::now();
+
                              aFrame->GetCanvas()->DoRePaint();
+
+                             if( aFrameMs )
+                                 aFrameMs->push_back( std::chrono::duration<double, std::milli>(
+                                                              std::chrono::steady_clock::now() - paintStart )
+                                                              .count() );
 
                              frames++;
                          } );
@@ -1466,12 +1486,13 @@ static KOPENAPI_RESULT h_view3d_animate( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     for( const CAMERA_MOVE& m : moves )
         total += m.seconds;
 
-    const int frames = playMoves( frame, moves, follow.empty() ? nullptr : &follow );
+    std::vector<double> frameMs;
+    const int           frames = playMoves( frame, moves, follow.empty() ? nullptr : &follow, &frameMs );
 
     if( frames < 0 )
         return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
 
-    nlohmann::json result = { { "moves", moves.size() }, { "seconds", total }, { "frames", frames }, { "fit", fit } };
+    nlohmann::json result = { { "moves", moves.size() }, { "seconds", total }, { "frames", frames }, { "frame_ms", frameStats( frameMs ) }, { "fit", fit } };
 
     for( auto it = moves.rbegin(); it != moves.rend(); ++it )
     {
@@ -1514,13 +1535,14 @@ static KOPENAPI_RESULT h_view3d_orbit( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     if( !alive )
         return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
 
-    const int frames = playMoves( frame, { move }, follow.empty() ? nullptr : &follow );
+    std::vector<double> frameMs;
+    const int           frames = playMoves( frame, { move }, follow.empty() ? nullptr : &follow, &frameMs );
 
     if( frames < 0 )
         return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
 
     return KOPENAPI_RESULT::Ok( { { "degrees", aArgs.value( "degrees", 360.0 ) }, { "seconds", move.seconds },
-                                  { "frames", frames } } );
+                                  { "frames", frames }, { "frame_ms", frameStats( frameMs ) } } );
 }
 
 
@@ -1602,7 +1624,8 @@ KOPENAPI_REGISTER( "view3d_camera",
 
 KOPENAPI_REGISTER( "view3d_orbit",
                    "Orbit the 3D viewer's camera smoothly (turntable for demos / recordings): degrees "
-                   "over seconds around an axis (z = around the board normal); GUI only",
+                   "over seconds around an axis (z = around the board normal); answers frames and frame_ms (paint time "
+                   "per frame: median, p95, max); GUI only",
                    R"json({"type":"object","properties":{
                         "degrees":{"type":"number","default":360},
                         "seconds":{"type":"number","default":8},

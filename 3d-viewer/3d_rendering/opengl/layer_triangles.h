@@ -129,7 +129,7 @@ public:
 
 
 /**
- * Store the OpenGL display lists to related with a layer.
+ * Store the OpenGL vertex buffers of a layer.
  */
 class OPENGL_RENDER_LIST
 {
@@ -205,13 +205,29 @@ public:
     float GetZTop() const { return m_zTop; }
 
 private:
-    GLuint generate_top_or_bot_seg_ends( const TRIANGLE_LIST* aTriangleContainer,
-                                         bool aIsNormalUp, GLuint aTextureId ) const;
+    /// One part of a layer in GPU buffers: vertices, plus texture coordinates (segment ends) or
+    /// normals (middle contours).
+    struct GL_PART
+    {
+        GLuint  vertices = 0;
+        GLuint  attributes = 0;
+        GLsizei count = 0;
+        float   normalZ = 0.0f;    ///< face normal (top / bottom parts); 0 for the middle
 
-    GLuint generate_top_or_bot_triangles( const TRIANGLE_LIST* aTriangleContainer,
-                                          bool aIsNormalUp ) const;
+        explicit operator bool() const { return count > 0; }
+    };
 
-    GLuint generate_middle_triangles( const TRIANGLE_LIST* aTriangleContainer ) const;
+    GL_PART generate_top_or_bot_seg_ends( const TRIANGLE_LIST* aTriangleContainer, bool aIsNormalUp ) const;
+
+    GL_PART generate_top_or_bot_triangles( const TRIANGLE_LIST* aTriangleContainer, bool aIsNormalUp ) const;
+
+    GL_PART generate_middle_triangles( const TRIANGLE_LIST* aTriangleContainer ) const;
+
+    void drawSegEnds( const GL_PART& aPart ) const;
+    void drawTriangles( const GL_PART& aPart ) const;
+    void drawMiddle( const GL_PART& aPart ) const;
+
+    static void deletePart( GL_PART& aPart );
 
     void beginTransformation() const;
     void endTransformation() const;
@@ -221,11 +237,12 @@ private:
 private:
     float   m_zBot;
     float   m_zTop;
-    GLuint  m_layer_top_segment_ends;
-    GLuint  m_layer_top_triangles;
-    GLuint  m_layer_middle_contours_quads;
-    GLuint  m_layer_bot_triangles;
-    GLuint  m_layer_bot_segment_ends;
+    GL_PART m_layer_top_segment_ends;
+    GL_PART m_layer_top_triangles;
+    GL_PART m_layer_middle_contours_quads;
+    GL_PART m_layer_bot_triangles;
+    GL_PART m_layer_bot_segment_ends;
+    GLuint  m_segEndsTexture;
 
     bool    m_haveTransformation;
     float   m_zPositionTransformation;
