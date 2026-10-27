@@ -780,7 +780,33 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Status( const nlohmann::json& aArgs )
 
 KOPENAPI_RESULT KOPENAPI_JOBS::Cancel( const nlohmann::json& aArgs )
 {
-    const std::string id = aArgs.value( "job_id", std::string() );
+    std::string id = aArgs.value( "job_id", std::string() );
+
+    // no job_id: whatever runs now, the running job or a plain call
+    if( id.empty() )
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+
+        if( g_current )
+        {
+            id = g_current->Id();
+        }
+        else if( g_call )
+        {
+            if( !g_call->cancel.exchange( true ) )
+            {
+                g_call->stopReason = "job_cancel";
+                g_call->rev++;
+            }
+
+            // it stops at its next safe point and answers its own client with what it did
+            return KOPENAPI_RESULT::Ok( { { "method", g_call->method }, { "stopping", true } } );
+        }
+        else
+        {
+            return KOPENAPI_RESULT::Error( 404, "nothing runs: no job, no call" );
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lock( g_mutex );

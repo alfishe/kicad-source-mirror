@@ -324,6 +324,9 @@ public:
 
     const RENDER_PROGRESS& GetRenderProgress() const { return m_renderProgress; }
 
+    /// @brief Swap buffers in step with the display (the default) or at once (benchmarks)
+    void SetVsync( bool aOn );
+
     void OnCloseWindow( wxCloseEvent& event );
 
 private:

@@ -449,6 +449,26 @@ void EDA_3D_CANVAS::OnPaint( wxPaintEvent& aEvent )
 }
 
 
+void EDA_3D_CANVAS::SetVsync( bool aOn )
+{
+    if( !m_glRC )
+        return;
+
+    GL_CONTEXT_MANAGER* gl_mgr = Pgm().GetGLContextManager();
+
+    if( !gl_mgr->LockCtx( m_glRC, this ) )
+        return;
+
+#if wxCHECK_VERSION( 3, 3, 3 )
+    wxGLCanvas::SetSwapInterval( aOn ? -1 : 0 );
+#else
+    GL_UTILS::SetSwapInterval( this, aOn ? -1 : 0 );
+#endif
+
+    gl_mgr->UnlockCtx( m_glRC );
+}
+
+
 void EDA_3D_CANVAS::DoRePaint()
 {
     if( m_is_currently_painting.test_and_set() )

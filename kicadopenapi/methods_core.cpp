@@ -4,11 +4,13 @@
 #include "kicadopenapi_journal.h"
 #include "kicadopenapi_change_feed.h"
 #include "kicadopenapi_service.h"
+#include "kicadopenapi_jobs.h"
 #include "platform/platform.h"
 
 #include <eda_base_frame.h>
 #include <frame_type.h>
 #include <pgm_base.h>
+#include <wx/timer.h>
 #include <settings/kicad_settings.h>
 #include <settings/settings_manager.h>
 #include <kiway.h>
@@ -80,6 +82,32 @@ KOPENAPI_REGISTER( "errors",
 /// and the top window closes after this answer has gone out.  Library editors with unsaved
 /// library changes always block: KiCad can only ask about those, and a question would hang the
 /// agent.
+/// @brief Close the top window (which ends the process) after this answer is written and no job
+/// runs any more
+static void closeTopWhenIdle()
+{
+    static wxTimer* poll = nullptr;
+
+    if( !poll )
+    {
+        poll = new wxTimer();
+        poll->Bind( wxEVT_TIMER,
+                    []( wxTimerEvent& )
+                    {
+                        if( KopenapiJobRunning() )
+                            return;
+
+                        poll->Stop();
+
+                        if( wxWindow* top = wxTheApp->GetTopWindow() )
+                            top->Close( true );
+                    } );
+    }
+
+    poll->Start( 20 );
+}
+
+
 static KOPENAPI_RESULT h_app_quit( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     const bool     discard = aArgs.value( "discard", false );
@@ -128,21 +156,23 @@ static KOPENAPI_RESULT h_app_quit( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         }
     }
 
-    // After the answer has been written: closing the top window ends the process
-    wxTheApp->CallAfter(
-            []()
-            {
-                if( wxWindow* top = wxTheApp->GetTopWindow() )
-                    top->Close( true );
-            } );
+    // a running job is stopped first: its handler is still on the stack and uses the windows
+    const bool stopping = KopenapiJobRunning();
 
-    return KOPENAPI_RESULT::Ok( { { "quitting", true }, { "closed", closed }, { "discarded", discard ? unsaved : nlohmann::json::array() } } );
+    if( stopping )
+        KopenapiStopAll( "app_quit" );
+
+    closeTopWhenIdle();
+
+    return KOPENAPI_RESULT::Ok( { { "quitting", true }, { "stopping_job", stopping }, { "closed", closed },
+                                  { "discarded", discard ? unsaved : nlohmann::json::array() } } );
 }
 
 
 KOPENAPI_REGISTER( "app_quit",
                    "Quit KiCad (GUI) without any dialog: refuses while documents are unsaved unless "
-                   "discard: true, which drops the changes (journal warnings) and closes the editors; "
+                   "discard: true, which drops the changes (journal warnings) and closes the editors; a running job "
+                   "is stopped first (stopping_job: true) and the windows close when it has ended; "
                    "library editors with unsaved library changes always refuse. Headless: POST "
                    "/api/v1/shutdown (unsaved work is lost with a journal warning)",
                    R"json({"type":"object","properties":{"discard":{"type":"boolean","default":false}}})json"_json,
@@ -498,9 +528,12 @@ KOPENAPI_REGISTER( "job_cancel",
                    "copper already laid, a grid stage's before a later pns pass included, is taken back: "
                    "taken_back true). keep_timeline: true is apply: false (the copper is taken back too) that keeps "
                    "the job's state: a grid route's timeline stays with every lane stopped at its last step, to "
-                   "branch from (pcb_route {from}). Answers work_done (applied / taken back) and timeline_kept",
-                   R"json({"type":"object","required":["job_id"],"properties":{
-                        "job_id":{"type":"string"},
+                   "branch from (pcb_route {from}). Answers work_done (applied / taken back) and timeline_kept. "
+                   "Without job_id it stops whatever runs now: the running job, else the running plain call (an "
+                   "orbit, an animation, …) at its next safe point; that call answers its own client. Answers "
+                   "even while KiCad is busy",
+                   R"json({"type":"object","properties":{
+                        "job_id":{"type":"string","description":"default: the running job, else the running plain call"},
                         "apply":{"type":"boolean","default":true,"description":"false: nothing the job did is written (a pcb_route's copper so far taken back)"},
                         "keep_timeline":{"type":"boolean","default":false,"description":"take the work back (as apply: false) and keep the job's state: a grid route's timeline lanes, to branch from"},
                         "keep":{"type":"boolean","default":false,"description":"old name of keep_timeline (it keeps the timeline, not the copper)"}}})json"_json,

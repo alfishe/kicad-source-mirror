@@ -40,6 +40,10 @@
 #include <dialogs/appearance_controls_3D.h>
 #include <3d_viewer/tools/eda_3d_actions.h>
 #include <tool/tool_manager.h>
+#include <functional>
+#include <settings/settings_manager.h>
+#include <pgm_base.h>
+#include <3d_viewer/tools/eda_3d_controller.h>
 #include <layer_ids.h>
 
 #include <chrono>
@@ -766,6 +770,347 @@ static KOPENAPI_RESULT h_view3d_layers( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 }
 
 
+/// @brief How a 3D viewer option takes effect: as the viewer's menus and Preferences apply it
+enum class VIEW3D_APPLY
+{
+    REDRAW,     ///< read on every paint
+    SCENE,      ///< read while the scene is built: rebuild
+    RAYTRACE,   ///< raytracing settings: a new picture when raytracing is shown
+    CAMERA,     ///< canvas / camera settings
+    ENGINE,     ///< OpenGL or raytracing
+    REOPEN      ///< fixed when the GL canvas is made: the next time the viewer opens
+};
+
+
+/// @brief One option of view3d_options: where it sits in the answer and how it is read / set
+struct VIEW3D_OPTION
+{
+    std::string  path;     ///< json pointer, e.g. /raytracing/shadows
+    VIEW3D_APPLY apply;
+    std::function<nlohmann::json( EDA_3D_VIEWER_SETTINGS& )>                     get;
+    /// error text or ""; the value stored only when aStore
+    std::function<std::string( EDA_3D_VIEWER_SETTINGS&, const nlohmann::json&, bool aStore )> set;
+};
+
+
+static std::string colorText( const COLOR4D& aColor )
+{
+    const wxColour c = aColor.ToColour();
+    return wxString::Format( "#%02x%02x%02x%02x", c.Red(), c.Green(), c.Blue(), c.Alpha() ).ToStdString();
+}
+
+
+static const std::vector<VIEW3D_OPTION>& view3dOptions()
+{
+    using CFG = EDA_3D_VIEWER_SETTINGS;
+
+    static const std::vector<VIEW3D_OPTION> options = []()
+    {
+        std::vector<VIEW3D_OPTION> o;
+
+        auto flag = [&]( const char* aPath, VIEW3D_APPLY aApply, std::function<bool&( CFG& )> aField )
+        {
+            o.push_back( { aPath, aApply, [=]( CFG& c ) { return nlohmann::json( aField( c ) ); },
+                           [=]( CFG& c, const nlohmann::json& v, bool aStore ) -> std::string
+                           {
+                               if( !v.is_boolean() )
+                                   return "true or false";
+
+                               if( aStore )
+                                   aField( c ) = v.get<bool>();
+                               return "";
+                           } } );
+        };
+
+        auto number = [&]( const char* aPath, VIEW3D_APPLY aApply, std::function<double( CFG& )> aGet,
+                           std::function<void( CFG&, double )> aSet, double aMin, double aMax, bool aInteger )
+        {
+            o.push_back( { aPath, aApply,
+                           [=]( CFG& c )
+                           {
+                               return aInteger ? nlohmann::json( std::lround( aGet( c ) ) ) : nlohmann::json( aGet( c ) );
+                           },
+                           [=]( CFG& c, const nlohmann::json& v, bool aStore ) -> std::string
+                           {
+                               if( !v.is_number() || v.get<double>() < aMin || v.get<double>() > aMax
+                                   || ( aInteger && v.get<double>() != std::floor( v.get<double>() ) ) )
+                               {
+                                   return wxString::Format( "%s from %g to %g", aInteger ? "a whole number" : "a number",
+                                                            aMin, aMax ).ToStdString();
+                               }
+
+                               if( aStore )
+                                   aSet( c, v.get<double>() );
+                               return "";
+                           } } );
+        };
+
+        auto integer = [&]( const char* aPath, VIEW3D_APPLY aApply, std::function<int&( CFG& )> aField, int aMin,
+                            int aMax )
+        {
+            number( aPath, aApply, [=]( CFG& c ) { return double( aField( c ) ); },
+                    [=]( CFG& c, double v ) { aField( c ) = int( v ); }, aMin, aMax, true );
+        };
+
+        auto color = [&]( const std::string& aPath, VIEW3D_APPLY aApply, std::function<COLOR4D&( CFG& )> aField )
+        {
+            o.push_back( { aPath, aApply, [=]( CFG& c ) { return nlohmann::json( colorText( aField( c ) ) ); },
+                           [=]( CFG& c, const nlohmann::json& v, bool aStore ) -> std::string
+                           {
+                               wxColour colour( wxString::FromUTF8( v.is_string() ? v.get<std::string>() : "" ) );
+
+                               if( !colour.IsOk() )
+                                   return "'#rrggbb', '#rrggbbaa' or a colour name";
+
+                               if( aStore )
+                                   aField( c ) = COLOR4D( colour );
+                               return "";
+                           } } );
+        };
+
+        auto choice = [&]( const char* aPath, VIEW3D_APPLY aApply, std::function<int( CFG& )> aGet,
+                           std::function<void( CFG&, int )> aSet, std::vector<const char*> aNames )
+        {
+            o.push_back( { aPath, aApply,
+                           [=]( CFG& c )
+                           {
+                               const int i = aGet( c );
+                               return nlohmann::json( i >= 0 && i < int( aNames.size() ) ? aNames[i] : "" );
+                           },
+                           [=]( CFG& c, const nlohmann::json& v, bool aStore ) -> std::string
+                           {
+                               std::string all;
+
+                               for( size_t i = 0; i < aNames.size(); ++i )
+                               {
+                                   if( v.is_string() && v.get<std::string>() == aNames[i] )
+                                   {
+                                       if( aStore )
+                                           aSet( c, int( i ) );
+
+                                       return "";
+                                   }
+
+                                   all += ( i ? " | " : "" ) + std::string( aNames[i] );
+                               }
+
+                               return all;
+                           } } );
+        };
+
+        using A = VIEW3D_APPLY;
+
+        choice( "/engine", A::ENGINE, []( CFG& c ) { return int( c.m_Render.engine ); },
+                []( CFG& c, int v ) { c.m_Render.engine = RENDER_ENGINE( v ); }, { "opengl", "raytracing" } );
+        choice( "/grid", A::REDRAW, []( CFG& c ) { return int( c.m_Render.grid_type ); },
+                []( CFG& c, int v ) { c.m_Render.grid_type = GRID3D_TYPE( v ); },
+                { "none", "1mm", "2.5mm", "5mm", "10mm" } );
+        choice( "/antialiasing", A::REOPEN, []( CFG& c ) { return int( c.m_Render.opengl_AA_mode ); },
+                []( CFG& c, int v ) { c.m_Render.opengl_AA_mode = ANTIALIASING_MODE( v ); },
+                { "off", "2x", "4x", "8x" } );
+        flag( "/show_missing_models", A::SCENE, []( CFG& c ) -> bool& { return c.m_Render.show_missing_models; } );
+        flag( "/clip_tht_leads", A::SCENE, []( CFG& c ) -> bool& { return c.m_Render.clip_tht_leads; } );
+        flag( "/model_instancing", A::REDRAW, []( CFG& c ) -> bool& { return c.m_Render.opengl_model_instancing; } );
+        flag( "/highlight_on_rollover", A::REDRAW,
+              []( CFG& c ) -> bool& { return c.m_Render.highlight_on_rollover; } );
+        color( "/selection_color", A::REDRAW, []( CFG& c ) -> COLOR4D& { return c.m_Render.opengl_selection_color; } );
+        flag( "/copper_thickness", A::SCENE, []( CFG& c ) -> bool& { return c.m_Render.opengl_copper_thickness; } );
+        flag( "/show_zones", A::SCENE, []( CFG& c ) -> bool& { return c.m_Render.show_zones; } );
+        flag( "/subtract_mask_from_silk", A::SCENE,
+              []( CFG& c ) -> bool& { return c.m_Render.subtract_mask_from_silk; } );
+        flag( "/clip_silk_on_via_annuli", A::SCENE,
+              []( CFG& c ) -> bool& { return c.m_Render.clip_silk_on_via_annuli; } );
+        flag( "/differentiate_plated_copper", A::SCENE,
+              []( CFG& c ) -> bool& { return c.m_Render.differentiate_plated_copper; } );
+        flag( "/while_moving/no_antialiasing", A::REDRAW,
+              []( CFG& c ) -> bool& { return c.m_Render.opengl_AA_disableOnMove; } );
+        flag( "/while_moving/no_copper_thickness", A::REDRAW,
+              []( CFG& c ) -> bool& { return c.m_Render.opengl_thickness_disableOnMove; } );
+        flag( "/while_moving/no_vias", A::REDRAW,
+              []( CFG& c ) -> bool& { return c.m_Render.opengl_microvias_disableOnMove; } );
+        flag( "/while_moving/no_holes", A::REDRAW,
+              []( CFG& c ) -> bool& { return c.m_Render.opengl_holes_disableOnMove; } );
+        flag( "/while_moving/boxes_only", A::REDRAW,
+              []( CFG& c ) -> bool& { return c.m_Render.opengl_render_bbox_only_OnMove; } );
+        flag( "/camera/animation", A::CAMERA, []( CFG& c ) -> bool& { return c.m_Camera.animation_enabled; } );
+        integer( "/camera/animation_speed", A::CAMERA,
+                 []( CFG& c ) -> int& { return c.m_Camera.moving_speed_multiplier; }, 1, 5 );
+        number( "/camera/rotation_increment_deg", A::CAMERA, []( CFG& c ) { return c.m_Camera.rotation_increment; },
+                []( CFG& c, double v ) { c.m_Camera.rotation_increment = v; }, 0, 359, false );
+        choice( "/camera/projection", A::CAMERA, []( CFG& c ) { return c.m_Camera.projection_mode; },
+                []( CFG& c, int v ) { c.m_Camera.projection_mode = v; }, { "orthographic", "perspective" } );
+
+        flag( "/raytracing/shadows", A::RAYTRACE, []( CFG& c ) -> bool& { return c.m_Render.raytrace_shadows; } );
+        flag( "/raytracing/back_floor", A::RAYTRACE, []( CFG& c ) -> bool& { return c.m_Render.raytrace_backfloor; } );
+        flag( "/raytracing/refractions", A::RAYTRACE,
+              []( CFG& c ) -> bool& { return c.m_Render.raytrace_refractions; } );
+        flag( "/raytracing/reflections", A::RAYTRACE,
+              []( CFG& c ) -> bool& { return c.m_Render.raytrace_reflections; } );
+        flag( "/raytracing/post_processing", A::RAYTRACE,
+              []( CFG& c ) -> bool& { return c.m_Render.raytrace_post_processing; } );
+        flag( "/raytracing/anti_aliasing", A::RAYTRACE,
+              []( CFG& c ) -> bool& { return c.m_Render.raytrace_anti_aliasing; } );
+        flag( "/raytracing/procedural_textures", A::RAYTRACE,
+              []( CFG& c ) -> bool& { return c.m_Render.raytrace_procedural_textures; } );
+        integer( "/raytracing/samples/shadows", A::RAYTRACE,
+                 []( CFG& c ) -> int& { return c.m_Render.raytrace_nrsamples_shadows; }, 1, 64 );
+        integer( "/raytracing/samples/reflections", A::RAYTRACE,
+                 []( CFG& c ) -> int& { return c.m_Render.raytrace_nrsamples_reflections; }, 1, 32 );
+        integer( "/raytracing/samples/refractions", A::RAYTRACE,
+                 []( CFG& c ) -> int& { return c.m_Render.raytrace_nrsamples_refractions; }, 1, 5 );
+        number( "/raytracing/spread/shadows", A::RAYTRACE, []( CFG& c ) { return c.m_Render.raytrace_spread_shadows; },
+                []( CFG& c, double v ) { c.m_Render.raytrace_spread_shadows = float( v ); }, 0, 1, false );
+        number( "/raytracing/spread/reflections", A::RAYTRACE,
+                []( CFG& c ) { return c.m_Render.raytrace_spread_reflections; },
+                []( CFG& c, double v ) { c.m_Render.raytrace_spread_reflections = float( v ); }, 0, 1, false );
+        number( "/raytracing/spread/refractions", A::RAYTRACE,
+                []( CFG& c ) { return c.m_Render.raytrace_spread_refractions; },
+                []( CFG& c, double v ) { c.m_Render.raytrace_spread_refractions = float( v ); }, 0, 1, false );
+        integer( "/raytracing/recursion/reflections", A::RAYTRACE,
+                 []( CFG& c ) -> int& { return c.m_Render.raytrace_recursivelevel_reflections; }, 1, 5 );
+        integer( "/raytracing/recursion/refractions", A::RAYTRACE,
+                 []( CFG& c ) -> int& { return c.m_Render.raytrace_recursivelevel_refractions; }, 1, 7 );
+        color( "/raytracing/light_camera", A::RAYTRACE,
+               []( CFG& c ) -> COLOR4D& { return c.m_Render.raytrace_lightColorCamera; } );
+        color( "/raytracing/light_top", A::RAYTRACE, []( CFG& c ) -> COLOR4D& { return c.m_Render.raytrace_lightColorTop; } );
+        color( "/raytracing/light_bottom", A::RAYTRACE,
+               []( CFG& c ) -> COLOR4D& { return c.m_Render.raytrace_lightColorBottom; } );
+
+        for( size_t i = 0; i < 8; ++i )
+        {
+            const std::string light = "/raytracing/lights/" + std::to_string( i );
+
+            color( light + "/color", A::RAYTRACE, [i]( CFG& c ) -> COLOR4D& { return c.m_Render.raytrace_lightColor[i]; } );
+            integer( ( light + "/elevation_deg" ).c_str(), A::RAYTRACE,
+                     [i]( CFG& c ) -> int& { return c.m_Render.raytrace_lightElevation[i]; }, -90, 90 );
+            integer( ( light + "/azimuth_deg" ).c_str(), A::RAYTRACE,
+                     [i]( CFG& c ) -> int& { return c.m_Render.raytrace_lightAzimuth[i]; }, 0, 359 );
+        }
+
+        return o;
+    }();
+
+    return options;
+}
+
+
+/// @brief Sets 3D viewer options (the view3d_options shape) as the viewer's Preferences and menus do,
+/// checked first, all or nothing; aChanged gets the kinds of change made
+/// @return the error, empty when set
+static std::string setView3dOptions( EDA_3D_VIEWER_FRAME* aFrame, EDA_3D_VIEWER_SETTINGS& aCfg,
+                                     const nlohmann::json& aSet, std::set<VIEW3D_APPLY>& aChanged,
+                                     bool aApply = true )
+{
+    std::map<std::string, const VIEW3D_OPTION*> byPath;
+
+    for( const VIEW3D_OPTION& option : view3dOptions() )
+        byPath[option.path] = &option;
+
+    // checked first, all or nothing
+    const nlohmann::json flat = aSet.empty() ? nlohmann::json::object() : aSet.flatten();
+
+    for( const auto& [path, value] : flat.items() )
+    {
+        auto it = byPath.find( path );
+
+        if( it == byPath.end() )
+            return "set: no option " + path + " (the answer lists them)";
+
+        if( std::string error = it->second->set( aCfg, value, false ); !error.empty() )
+            return "set: " + path + ": " + error;
+    }
+
+    if( !aApply )
+        return "";
+
+    for( const auto& [path, value] : flat.items() )
+    {
+        const VIEW3D_OPTION* option = byPath.at( path );
+        const nlohmann::json before = option->get( aCfg );
+
+        option->set( aCfg, value, true );
+
+        if( option->get( aCfg ) != before )
+            aChanged.insert( option->apply );
+    }
+
+    if( aFrame )
+    {
+        EDA_3D_CANVAS* canvas = aFrame->GetCanvas();
+
+        if( aChanged.count( VIEW3D_APPLY::CAMERA ) )
+        {
+            canvas->SetAnimationEnabled( aCfg.m_Camera.animation_enabled );
+            canvas->SetMovingSpeedMultiplier( aCfg.m_Camera.moving_speed_multiplier );
+
+            if( canvas->GetProjectionMode() != aCfg.m_Camera.projection_mode )
+                aFrame->GetCurrentCamera().ToggleProjection();
+
+            if( EDA_3D_CONTROLLER* ctrl = aFrame->GetToolManager()->GetTool<EDA_3D_CONTROLLER>() )
+                ctrl->SetRotationIncrement( aCfg.m_Camera.rotation_increment );
+        }
+
+        // the same calls as the viewer's menu items
+        if( aChanged.count( VIEW3D_APPLY::ENGINE ) )
+            canvas->RenderEngineChanged();
+        else if( aChanged.count( VIEW3D_APPLY::SCENE )
+                 || ( aChanged.count( VIEW3D_APPLY::RAYTRACE ) && aCfg.m_Render.engine == RENDER_ENGINE::RAYTRACING ) )
+            aFrame->NewDisplay( true );
+        else if( aChanged.count( VIEW3D_APPLY::REDRAW ) || aChanged.count( VIEW3D_APPLY::CAMERA ) )
+        {
+            if( aCfg.m_Render.engine == RENDER_ENGINE::OPENGL )
+                canvas->Request_refresh();
+            else
+                canvas->RenderRaytracingRequest();
+        }
+    }
+
+    return "";
+}
+
+
+static nlohmann::json view3dOptionsJson( EDA_3D_VIEWER_SETTINGS& aCfg )
+{
+    nlohmann::json answer = nlohmann::json::object();
+
+    for( const VIEW3D_OPTION& option : view3dOptions() )
+        answer[nlohmann::json::json_pointer( option.path )] = option.get( aCfg );
+
+    return answer;
+}
+
+
+static KOPENAPI_RESULT h_view3d_options( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    EDA_3D_VIEWER_FRAME*    frame = viewer3d( aCtx, aArgs.value( "open", false ) );
+    EDA_3D_VIEWER_SETTINGS* cfg = frame ? frame->GetAdapter().m_Cfg
+                                        : Pgm().GetSettingsManager().GetAppSettings<EDA_3D_VIEWER_SETTINGS>( "3d_viewer" );
+
+    if( !cfg )
+        return KOPENAPI_RESULT::Error( 409, "no 3D viewer settings" );
+
+    const nlohmann::json set = aArgs.value( "set", nlohmann::json::object() );
+
+    if( !set.is_object() )
+        return KOPENAPI_RESULT::Error( 400, "set: options as in the answer, e.g. {highlight_on_rollover: false, "
+                                            "raytracing: {shadows: false}}" );
+
+    std::set<VIEW3D_APPLY> changed;
+
+    if( std::string error = setView3dOptions( frame, *cfg, set, changed ); !error.empty() )
+        return KOPENAPI_RESULT::Error( 400, error );
+
+    nlohmann::json answer = view3dOptionsJson( *cfg );
+
+    const RENDER_3D_BASE* render = frame ? frame->GetCanvas()->GetCurrentRender() : nullptr;
+
+    answer["viewer_open"] = frame != nullptr;
+    answer["rebuild"] = frame && ( frame->GetCanvas()->IsReloadRequestPending() || ( render && render->IsSceneLoading() ) );
+    answer["reopen_needed"] = changed.count( VIEW3D_APPLY::REOPEN ) > 0 && frame != nullptr;
+    return KOPENAPI_RESULT::Ok( answer );
+}
+
+
 static KOPENAPI_RESULT h_view3d_status( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     EDA_3D_VIEWER_FRAME* frame = viewer3d( aCtx, aArgs.value( "open", false ) );
@@ -789,7 +1134,8 @@ static KOPENAPI_RESULT h_view3d_status( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                                   { "last_frame_ms", progress.lastFrameMs },
                                   { "ready", progress.frames > 0 && !reloadPending && !loading
                                                      && !progress.moreRequested },
-                                  { "hit_test_ready", !raytracing && !reloadPending && canvas->IsHitTestReady() } } );
+                                  { "hit_test_ready", !raytracing && !reloadPending && canvas->IsHitTestReady() },
+                                  { "model_instancing", render && render->IsModelInstancing() } } );
 }
 
 
@@ -1154,7 +1500,8 @@ static nlohmann::json frameStats( std::vector<double> aMs )
 
 
 static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE>& aMoves,
-                      const FRAMING* aFollow = nullptr, std::vector<double>* aFrameMs = nullptr )
+                      const FRAMING* aFollow = nullptr, std::vector<double>* aFrameMs = nullptr,
+                      bool* aStopped = nullptr )
 {
     wxWeakRef<EDA_3D_VIEWER_FRAME> alive( aFrame );
     CAMERA& camera = aFrame->GetCurrentCamera();
@@ -1169,33 +1516,43 @@ static int playMoves( EDA_3D_VIEWER_FRAME* aFrame, const std::vector<CAMERA_MOVE
         if( !alive )
             return -1;
 
-        KopenapiAnimate( move.seconds,
-                         [&]( double e )
-                         {
-                             if( !alive )
-                                 return;
+        const bool finished = KopenapiAnimate( move.seconds,
+                                               [&]( double e )
+                                               {
+                                                   if( !alive )
+                                                       return;
 
-                             stepMove( camera, move, done, e );
-                             done = e;
+                                                   stepMove( camera, move, done, e );
+                                                   done = e;
 
-                             if( aFollow )
-                             {
-                                 const double k = framingAt( *aFollow, start + e * move.seconds );
-                                 camera.Zoom( (float) ( applied / k ) );
-                                 applied = k;
-                             }
+                                                   if( aFollow )
+                                                   {
+                                                       const double k = framingAt( *aFollow, start + e * move.seconds );
+                                                       camera.Zoom( (float) ( applied / k ) );
+                                                       applied = k;
+                                                   }
 
-                             const auto paintStart = std::chrono::steady_clock::now();
+                                                   const auto paintStart = std::chrono::steady_clock::now();
 
-                             aFrame->GetCanvas()->DoRePaint();
+                                                   aFrame->GetCanvas()->DoRePaint();
 
-                             if( aFrameMs )
-                                 aFrameMs->push_back( std::chrono::duration<double, std::milli>(
-                                                              std::chrono::steady_clock::now() - paintStart )
-                                                              .count() );
+                                                   if( aFrameMs )
+                                                   {
+                                                       const std::chrono::duration<double, std::milli> paint =
+                                                               std::chrono::steady_clock::now() - paintStart;
+                                                       aFrameMs->push_back( paint.count() );
+                                                   }
 
-                             frames++;
-                         } );
+                                                   frames++;
+                                               } );
+
+        if( !finished )
+        {
+            if( aStopped )
+                *aStopped = true;
+
+            break;
+        }
 
         start += move.seconds;
     }
@@ -1487,12 +1844,14 @@ static KOPENAPI_RESULT h_view3d_animate( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         total += m.seconds;
 
     std::vector<double> frameMs;
-    const int           frames = playMoves( frame, moves, follow.empty() ? nullptr : &follow, &frameMs );
+    bool                stopped = false;
+    const int           frames = playMoves( frame, moves, follow.empty() ? nullptr : &follow, &frameMs, &stopped );
 
     if( frames < 0 )
         return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
 
-    nlohmann::json result = { { "moves", moves.size() }, { "seconds", total }, { "frames", frames }, { "frame_ms", frameStats( frameMs ) }, { "fit", fit } };
+    nlohmann::json result = { { "moves", moves.size() }, { "seconds", total }, { "frames", frames }, { "frame_ms", frameStats( frameMs ) }, { "fit", fit },
+                              { "stopped", stopped } };
 
     for( auto it = moves.rbegin(); it != moves.rend(); ++it )
     {
@@ -1536,13 +1895,281 @@ static KOPENAPI_RESULT h_view3d_orbit( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
         return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
 
     std::vector<double> frameMs;
-    const int           frames = playMoves( frame, { move }, follow.empty() ? nullptr : &follow, &frameMs );
+    bool                stopped = false;
+    const int           frames = playMoves( frame, { move }, follow.empty() ? nullptr : &follow, &frameMs, &stopped );
 
     if( frames < 0 )
         return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the animation" );
 
     return KOPENAPI_RESULT::Ok( { { "degrees", aArgs.value( "degrees", 360.0 ) }, { "seconds", move.seconds },
-                                  { "frames", frames }, { "frame_ms", frameStats( frameMs ) } } );
+                                  { "frames", frames }, { "frame_ms", frameStats( frameMs ) },
+                                  { "stopped", stopped } } );
+}
+
+
+/// @brief Draws the 3D viewer until its scene is built and the final picture is shown
+/// @return false when the viewer was closed or the call was stopped meanwhile
+static bool settle3d( EDA_3D_VIEWER_FRAME* aFrame, double aLimitS = 300 )
+{
+    wxWeakRef<EDA_3D_VIEWER_FRAME> alive( aFrame );
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>( aLimitS );
+
+    while( alive && std::chrono::steady_clock::now() < deadline )
+    {
+        EDA_3D_CANVAS*        canvas = aFrame->GetCanvas();
+        const RENDER_3D_BASE* render = canvas->GetCurrentRender();
+
+        if( !canvas->IsReloadRequestPending() && !( render && render->IsSceneLoading() )
+            && !canvas->GetRenderProgress().moreRequested && canvas->GetRenderProgress().frames > 0 )
+        {
+            return true;
+        }
+
+        canvas->DoRePaint();
+        KopenapiKeepUiAlive();
+
+        if( !KopenapiJobStep( "scene", 0, 0 ) )
+            return false;
+
+        std::this_thread::sleep_for( std::chrono::milliseconds( 8 ) );
+    }
+
+    return (bool) alive;
+}
+
+
+/// @brief median, p95, min, mean of ms values
+static nlohmann::json benchStats( std::vector<double> aMs )
+{
+    if( aMs.empty() )
+        return nullptr;
+
+    std::sort( aMs.begin(), aMs.end() );
+
+    double sum = 0;
+
+    for( double v : aMs )
+        sum += v;
+
+    auto at = [&]( double aQ ) { return aMs[std::min( aMs.size() - 1, (size_t) std::lround( aQ * ( aMs.size() - 1 ) ) )]; };
+    auto r3 = []( double v ) { return std::round( v * 1000 ) / 1000; };
+
+    return { { "median", r3( at( 0.5 ) ) }, { "p95", r3( at( 0.95 ) ) }, { "min", r3( aMs.front() ) },
+             { "mean", r3( sum / aMs.size() ) } };
+}
+
+
+static KOPENAPI_RESULT h_view3d_benchmark( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    EDA_3D_VIEWER_FRAME* frame = viewer3d( aCtx, aArgs.value( "open", true ) );
+
+    if( !frame )
+        return KOPENAPI_RESULT::Error( 409, "no 3D viewer (open: true opens it from the board editor)" );
+
+    EDA_3D_VIEWER_SETTINGS* cfg = frame->GetAdapter().m_Cfg;
+
+    if( !cfg || cfg->m_Render.engine != RENDER_ENGINE::OPENGL )
+        return KOPENAPI_RESULT::Error( 409, "the OpenGL engine draws the benchmark (view3d_options {engine: opengl})" );
+
+    const int    frames = std::clamp( aArgs.value( "frames", 120 ), 10, 5000 );
+    const int    warmup = std::clamp( aArgs.value( "warmup", 10 ), 0, 1000 );
+    const int    rounds = std::clamp( aArgs.value( "rounds", 3 ), 1, 50 );
+    const double degrees = aArgs.value( "degrees", 90.0 );
+    const bool   finish = aArgs.value( "finish", false );
+    const bool   vsync = aArgs.value( "vsync", false );
+    const std::string axis = aArgs.value( "axis", std::string( "z" ) );
+
+    nlohmann::json variants = aArgs.value( "variants", nlohmann::json::array( { nlohmann::json::object() } ) );
+
+    if( !variants.is_array() || variants.empty() )
+        return KOPENAPI_RESULT::Error( 400, "variants: a list of view3d_options sets, e.g. [{model_instancing: false}, "
+                                            "{model_instancing: true}]" );
+
+    // every variant checked first; the options they touch are put back afterwards
+    nlohmann::json       restore = nlohmann::json::object();
+    const nlohmann::json before = view3dOptionsJson( *cfg ).flatten();
+
+    for( const nlohmann::json& set : variants )
+    {
+        std::set<VIEW3D_APPLY> unused;
+
+        if( !set.is_object() )
+            return KOPENAPI_RESULT::Error( 400, "variants: each one a view3d_options set (an object)" );
+
+        if( std::string error = setView3dOptions( frame, *cfg, set, unused, false ); !error.empty() )
+            return KOPENAPI_RESULT::Error( 400, "variants: " + error );
+
+        const nlohmann::json flat = set.empty() ? nlohmann::json::object() : set.flatten();
+
+        for( const auto& [path, value] : flat.items() )
+            restore[path] = before.at( path );
+    }
+
+    KOPENAPI_REMOTE_GUARD          remote( frame );   // manual camera off, title says so, for this call
+    wxWeakRef<EDA_3D_VIEWER_FRAME> alive( frame );
+    CAMERA&                        camera = frame->GetCurrentCamera();
+
+    CAMERA_MOVE sweep;
+    sweep.rotate[axis == "x" ? 0 : axis == "y" ? 1 : 2] = degrees;
+
+    struct SAMPLES
+    {
+        std::vector<double> paint, redraw, layers, collect, opaque, board, transparent, overlay, finish, rest;
+        std::vector<double> roundPaint;
+        RENDER_3D_FRAME_STATS last;
+    };
+
+    std::vector<SAMPLES> samples( variants.size() );
+    bool                 stopped = false;
+    int                  done = 0;
+    const int            total = rounds * (int) variants.size() * frames;
+
+    for( int round = 0; round < rounds && !stopped; ++round )
+    {
+        for( size_t v = 0; v < variants.size() && !stopped; ++v )
+        {
+            std::set<VIEW3D_APPLY> changed;
+            setView3dOptions( frame, *cfg, variants[v], changed );
+
+            if( !settle3d( frame ) )
+            {
+                if( !alive )
+                    return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the benchmark" );
+
+                stopped = true;
+                break;
+            }
+
+            RENDER_3D_BASE* render = frame->GetCanvas()->GetCurrentRender();
+            render->SetFinishFrames( finish );
+            frame->GetCanvas()->SetVsync( vsync );
+
+            for( int w = 0; w < warmup; ++w )
+                frame->GetCanvas()->DoRePaint();
+
+            std::vector<double> paints;
+            double              swept = 0;
+
+            for( int k = 1; k <= frames; ++k )
+            {
+                const double e = double( k ) / frames;
+                stepMove( camera, sweep, swept, e );
+                swept = e;
+
+                const auto start = std::chrono::steady_clock::now();
+                frame->GetCanvas()->DoRePaint();
+                const std::chrono::duration<double, std::milli> paint = std::chrono::steady_clock::now() - start;
+
+                if( !alive )
+                    return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the benchmark" );
+
+                const RENDER_3D_FRAME_STATS st = frame->GetCanvas()->GetCurrentRender()->GetFrameStats();
+                SAMPLES&                    out = samples[v];
+
+                out.paint.push_back( paint.count() );
+                out.redraw.push_back( st.redraw );
+                out.layers.push_back( st.layers );
+                out.collect.push_back( st.collect );
+                out.opaque.push_back( st.opaqueModels );
+                out.board.push_back( st.board );
+                out.transparent.push_back( st.transparentModels );
+                out.overlay.push_back( st.overlay );
+                out.finish.push_back( st.finish );
+                out.rest.push_back( std::max( 0.0, paint.count() - st.redraw ) );
+                out.last = st;
+                paints.push_back( paint.count() );
+
+                const bool go = KopenapiJobStep( "benchmark", ++done, total );
+
+                if( !alive )
+                    return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the benchmark" );
+
+                if( !go )
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+
+            stepMove( camera, sweep, swept, 0.0 );   // back to the start pose
+            frame->GetCanvas()->GetCurrentRender()->SetFinishFrames( false );
+            frame->GetCanvas()->SetVsync( true );
+            samples[v].roundPaint.push_back( benchStats( paints )["median"].get<double>() );
+        }
+    }
+
+    if( alive )
+    {
+        std::set<VIEW3D_APPLY> changed;
+        setView3dOptions( frame, *cfg, restore.empty() ? restore : restore.unflatten(), changed );
+        frame->GetCanvas()->GetCurrentRender()->SetFinishFrames( false );
+        settle3d( frame );
+        paint3d( frame );
+    }
+
+    if( !alive )
+        return KOPENAPI_RESULT::Error( 409, "the 3D viewer was closed during the benchmark" );
+
+    const wxSize   size = frame->GetCanvas()->GetClientSize() * frame->GetCanvas()->GetContentScaleFactor();
+    nlohmann::json out = nlohmann::json::array();
+
+    for( size_t v = 0; v < variants.size(); ++v )
+    {
+        const SAMPLES& sm = samples[v];
+
+        if( sm.paint.empty() )
+            continue;
+
+        out.push_back( { { "set", variants[v] },
+                         { "frames", sm.paint.size() },
+                         { "paint_ms", benchStats( sm.paint ) },
+                         { "round_paint_median_ms", sm.roundPaint },
+                         { "stages_ms", { { "redraw", benchStats( sm.redraw ) },
+                                          { "layers", benchStats( sm.layers ) },
+                                          { "collect", benchStats( sm.collect ) },
+                                          { "opaque_models", benchStats( sm.opaque ) },
+                                          { "board", benchStats( sm.board ) },
+                                          { "transparent_models", benchStats( sm.transparent ) },
+                                          { "overlay", benchStats( sm.overlay ) },
+                                          { "finish", benchStats( sm.finish ) },
+                                          { "swap_and_rest", benchStats( sm.rest ) } } },
+                         { "models", { { "instances", sm.last.modelInstances },
+                                       { "groups", sm.last.modelGroups },
+                                       { "draw_calls", sm.last.modelDrawCalls },
+                                       { "instanced", sm.last.instanced } } } } );
+    }
+
+    nlohmann::json answer = { { "variants", out }, { "rounds", rounds }, { "frames_per_round", frames },
+                              { "degrees", degrees }, { "axis", axis }, { "finish", finish }, { "vsync", vsync },
+                              { "canvas", { size.x, size.y } }, { "stopped", stopped } };
+
+    // each variant against the first: how many times faster (median)
+    if( out.size() > 1 )
+    {
+        auto median = [&]( size_t aV, const char* aStage ) -> double
+        {
+            const nlohmann::json& st = aStage ? out[aV]["stages_ms"][aStage] : out[aV]["paint_ms"];
+            return st.is_null() ? 0.0 : st["median"].get<double>();
+        };
+
+        nlohmann::json speedup = nlohmann::json::array();
+
+        for( size_t v = 1; v < out.size(); ++v )
+        {
+            auto ratio = [&]( const char* aStage )
+            {
+                const double b = median( v, aStage );
+                return b > 0 ? std::round( median( 0, aStage ) / b * 100 ) / 100 : 0.0;
+            };
+
+            speedup.push_back( { { "paint", ratio( nullptr ) }, { "redraw", ratio( "redraw" ) },
+                                 { "opaque_models", ratio( "opaque_models" ) } } );
+        }
+
+        answer["speedup_vs_first"] = speedup;
+    }
+
+    return KOPENAPI_RESULT::Ok( answer );
 }
 
 
@@ -1608,6 +2235,22 @@ KOPENAPI_REGISTER( "view3d_layers",
                         "open":{"type":"boolean","default":true}}})json"_json,
                    true, h_view3d_layers );
 
+KOPENAPI_REGISTER( "view3d_options",
+                   "3D viewer preferences and menu options: engine (opengl / raytracing), grid, antialiasing "
+                   "(takes effect when the viewer opens next: reopen_needed), placeholders for missing models, "
+                   "through-hole lead clipping, rollover highlight, selection colour, copper thickness, zones, "
+                   "silkscreen clipping, plated copper, what is left out while moving, camera (animation, speed, "
+                   "rotation increment, projection) and the raytracing settings (lights included); set: the "
+                   "same shape, only what changes (e.g. {highlight_on_rollover: false, raytracing: {shadows: "
+                   "false}}), checked first, all or nothing, applied as the viewer's Preferences / menus do. "
+                   "Without an open viewer the stored settings are read and set (used when it opens). Answer: "
+                   "every option, rebuild (the change rebuilds the scene: view3d_status ready when done), "
+                   "viewer_open, reopen_needed; GUI only",
+                   R"json({"type":"object","properties":{
+                        "set":{"type":"object","description":"options as in the answer (nested), e.g. {grid: '5mm', camera: {projection: 'orthographic'}}"},
+                        "open":{"type":"boolean","default":false,"description":"open the viewer from the board editor first"}}})json"_json,
+                   true, h_view3d_options );
+
 KOPENAPI_REGISTER( "view3d_camera",
                    "3D viewer camera: preset view (top, bottom, left, right, front, back, fit; animated), "
                    "then rotate_deg [x, y, z], look_at (turn about and look at parts or a point of the "
@@ -1622,10 +2265,34 @@ KOPENAPI_REGISTER( "view3d_camera",
                         "open":{"type":"boolean","default":true}}})json"_json,
                    true, h_view3d_camera, 300 );   // animations record on video time: slow while recording
 
+KOPENAPI_REGISTER( "view3d_benchmark",
+                   "Render benchmark of the 3D viewer (OpenGL): from the current camera, rounds of frames swept "
+                   "over degrees about an axis by a fixed step per frame (no clock: the same poses each time), "
+                   "for each variant (a view3d_options set, e.g. [{model_instancing: false}, {model_instancing: "
+                   "true}]) in turn per round so a load change hits all alike; per variant paint ms (median, p95, "
+                   "min, mean), the median of each round, the renderer's stages (redraw, layers, collect, "
+                   "opaque_models, board, transparent_models, overlay, finish = glFinish when finish: true, the "
+                   "GPU catching up; swap_and_rest = paint - redraw; vsync false by default: frames are not held to "
+                   "the display rate), the models' instances, groups, draw calls "
+                   "and whether they were instanced; speedup_vs_first. Options and camera put back afterwards. "
+                   "Reading calls answer between frames, job_cancel stops it (stopped: true); GUI only",
+                   R"json({"type":"object","properties":{
+                        "variants":{"type":"array","items":{"type":"object"},"description":"view3d_options sets; default: [{}] (as it is)"},
+                        "frames":{"type":"integer","default":120,"minimum":10,"maximum":5000},
+                        "warmup":{"type":"integer","default":10,"minimum":0,"maximum":1000,"description":"unmeasured frames after a variant is set"},
+                        "rounds":{"type":"integer","default":3,"minimum":1,"maximum":50},
+                        "degrees":{"type":"number","default":90},
+                        "axis":{"type":"string","enum":["x","y","z"],"default":"z"},
+                        "vsync":{"type":"boolean","default":false,"description":"swap in step with the display, as the viewer does"},
+                        "finish":{"type":"boolean","default":false,"description":"glFinish each frame: the GPU time shows (stages finish)"},
+                        "open":{"type":"boolean","default":true}}})json"_json,
+                   true, h_view3d_benchmark, 1800 );
+
 KOPENAPI_REGISTER( "view3d_orbit",
                    "Orbit the 3D viewer's camera smoothly (turntable for demos / recordings): degrees "
-                   "over seconds around an axis (z = around the board normal); answers frames and frame_ms (paint time "
-                   "per frame: median, p95, max); GUI only",
+                   "over seconds around an axis (z = around the board normal); answers frames, frame_ms (paint time "
+                   "per frame: median, p95, max) and stopped (job_cancel ended it early; the camera stays where it "
+                   "got to). Reading calls (view3d_status, …) answer between the frames; GUI only",
                    R"json({"type":"object","properties":{
                         "degrees":{"type":"number","default":360},
                         "seconds":{"type":"number","default":8},

@@ -6,6 +6,7 @@
 #define KICADOPENAPI_VIEW_MOTION_H
 
 #include <class_draw_panel_gal.h>
+#include <kicadopenapi_jobs.h>
 #include <kicadopenapi_keepalive.h>
 #include <recording/kicadopenapi_recorder.h>
 #include <view/view.h>
@@ -22,8 +23,11 @@
 /// @brief Runs an animation: aStep( e ) shows the state at eased progress e (0..1, smoothstep) and
 /// repaints. While a recording runs it steps on video time (every video frame recorded, never
 /// dropped), with extra on-screen steps in between at the display's rate; otherwise on the wall
-/// clock with the UI alive.
-inline void KopenapiAnimate( double aSeconds, const std::function<void( double )>& aStep )
+/// clock with the UI alive.  Every step is a safe point: reading API calls queued meanwhile
+/// (view3d_status, job_get, …) run between the frames, and a stop (job_cancel) ends the motion
+/// where it is.
+/// @return false when it was stopped before the end
+inline bool KopenapiAnimate( double aSeconds, const std::function<void( double )>& aStep )
 {
     auto ease = []( double t ) { return t * t * ( 3 - 2 * t ); };
     int  fps = 0;
@@ -32,7 +36,7 @@ inline void KopenapiAnimate( double aSeconds, const std::function<void( double )
     {
         aStep( 1.0 );
         KopenapiKeepUiAlive();
-        return;
+        return true;
     }
 
     // the motion is smooth already: a recording's steadycam follows it exactly
@@ -62,9 +66,12 @@ inline void KopenapiAnimate( double aSeconds, const std::function<void( double )
             }
 
             KopenapiRecordFrame();
+
+            if( !KopenapiJobStep( "animate", i, frames ) )
+                return false;
         }
 
-        return;
+        return true;
     }
 
     const auto start = std::chrono::steady_clock::now();
@@ -77,7 +84,10 @@ inline void KopenapiAnimate( double aSeconds, const std::function<void( double )
         KopenapiKeepUiAlive();
 
         if( t >= 1.0 )
-            break;
+            return true;
+
+        if( !KopenapiJobStep( "animate", int( t * 1000 ), 1000 ) )
+            return false;
 
         std::this_thread::sleep_for( std::chrono::milliseconds( 8 ) );
     }
