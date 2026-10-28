@@ -470,9 +470,6 @@ void PCB_BASE_EDIT_FRAME::PutDataInPreviousState( PICKED_ITEMS_LIST* aList, bool
         switch( eda_item->Type() )
         {
         case PCB_FOOTPRINT_T:
-            deep_reBuild_ratsnest = true;   // Pointers on pads can be invalid
-            KI_FALLTHROUGH;
-
         case PCB_ZONE_T:
         case PCB_TRACE_T:
         case PCB_ARC_T:
@@ -538,6 +535,11 @@ void PCB_BASE_EDIT_FRAME::PutDataInPreviousState( PICKED_ITEMS_LIST* aList, bool
                 view->Remove( item );
                 parent->Remove( item, REMOVE_MODE::BULK );
 
+                // BOARD::Remove / Add keep the connectivity of the items they own; a footprint's
+                // children are taken out and put back here
+                if( parent != GetBoard() )
+                    connectivity->Remove( item );
+
                 if( item->Type() != PCB_MARKER_T )
                     item->SwapItemData( image );
 
@@ -548,6 +550,9 @@ void PCB_BASE_EDIT_FRAME::PutDataInPreviousState( PICKED_ITEMS_LIST* aList, bool
                 view->Add( item );
                 view->Hide( item, false );
                 parent->Add( item, ADD_MODE::BULK_INSERT );
+
+                if( parent != GetBoard() )
+                    connectivity->Add( item );
 
                 if( item->Type() == PCB_ZONE_T && static_cast<ZONE*>( item )->GetIsRuleArea() )
                 {
@@ -568,9 +573,14 @@ void PCB_BASE_EDIT_FRAME::PutDataInPreviousState( PICKED_ITEMS_LIST* aList, bool
                 aList->SetPickedItemStatus( UNDO_REDO::DELETED, ii );
 
                 if( FOOTPRINT* parentFP = boardItem->GetParentFootprint() )
+                {
                     parentFP->Remove( boardItem );
+                    connectivity->Remove( boardItem );
+                }
                 else
+                {
                     GetModel()->Remove( boardItem, REMOVE_MODE::BULK );
+                }
 
                 update_item_change_state( eda_item, ITEM_CHANGE_TYPE::DELETED );
 
@@ -596,9 +606,14 @@ void PCB_BASE_EDIT_FRAME::PutDataInPreviousState( PICKED_ITEMS_LIST* aList, bool
                 eda_item->ClearFlags( UR_TRANSIENT );
 
                 if( FOOTPRINT* parentFP = boardItem->GetParentFootprint() )
+                {
                     parentFP->Add( boardItem );
+                    connectivity->Add( boardItem );
+                }
                 else
+                {
                     GetModel()->Add( boardItem, ADD_MODE::BULK_APPEND );
+                }
 
                 update_item_change_state( eda_item, ITEM_CHANGE_TYPE::ADDED );
 
@@ -701,10 +716,15 @@ void PCB_BASE_EDIT_FRAME::PutDataInPreviousState( PICKED_ITEMS_LIST* aList, bool
             view->UpdateCollidingItems( dirty_rule_areas, { PCB_TRACE_T, PCB_ARC_T, PCB_VIA_T, PCB_PAD_T } );
         }
 
-        if( reBuild_ratsnest || deep_reBuild_ratsnest )
+        // Every item went through the connectivity as it was taken out and put back, so only the
+        // dirty nets are propagated again; a changed net list needs the whole graph
+        if( deep_reBuild_ratsnest )
         {
-            // Connectivity may have changed; rebuild internal caches to remove stale items
             GetBoard()->BuildConnectivity();
+            GetBoard()->CompileRatsnest();
+        }
+        else if( reBuild_ratsnest )
+        {
             GetBoard()->CompileRatsnest();
         }
 
