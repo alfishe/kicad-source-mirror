@@ -20,8 +20,12 @@
 #ifndef RENDER_SETTINGS_H
 #define RENDER_SETTINGS_H
 
+#include <algorithm>
 #include <map>
 #include <set>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 
 #include <gal/color4d.h>
 #include <layer_ids.h>
@@ -35,6 +39,77 @@ class COLOR_SETTINGS;
 namespace KIGFX
 {
 class VIEW_ITEM;
+
+/**
+ * Colours by layer id, with the lookups of a std::map.  A flat table: every colour of a redraw
+ * and of a recolour is looked up here, and the layers in use run densely from 0.
+ */
+class LAYER_COLOR_MAP
+{
+public:
+    using value_type = std::pair<int, COLOR4D>;
+    using iterator = value_type*;
+    using const_iterator = const value_type*;
+
+    iterator       find( int aLayer ) { return has( aLayer ) ? &m_entries[aLayer] : nullptr; }
+    const_iterator find( int aLayer ) const { return has( aLayer ) ? &m_entries[aLayer] : nullptr; }
+
+    iterator       end() { return nullptr; }
+    const_iterator end() const { return nullptr; }
+
+    size_t count( int aLayer ) const { return has( aLayer ) ? 1 : 0; }
+
+    COLOR4D& at( int aLayer )
+    {
+        if( !has( aLayer ) )
+            throw std::out_of_range( "LAYER_COLOR_MAP::at" );
+
+        return m_entries[aLayer].second;
+    }
+
+    const COLOR4D& at( int aLayer ) const
+    {
+        if( !has( aLayer ) )
+            throw std::out_of_range( "LAYER_COLOR_MAP::at" );
+
+        return m_entries[aLayer].second;
+    }
+
+    COLOR4D& operator[]( int aLayer )
+    {
+        if( aLayer < 0 )
+        {
+            wxFAIL_MSG( wxT( "LAYER_COLOR_MAP: negative layer" ) );
+            return m_negative;
+        }
+
+        if( aLayer >= (int) m_entries.size() )
+        {
+            const size_t size = std::max<size_t>( aLayer + 1, LAYER_ID_COUNT );
+
+            m_entries.resize( size );
+            m_present.resize( size, false );
+        }
+
+        if( !m_present[aLayer] )
+        {
+            m_present[aLayer] = true;
+            m_entries[aLayer] = { aLayer, COLOR4D() };
+        }
+
+        return m_entries[aLayer].second;
+    }
+
+private:
+    bool has( int aLayer ) const
+    {
+        return aLayer >= 0 && aLayer < (int) m_present.size() && m_present[aLayer];
+    }
+
+    std::vector<value_type> m_entries;
+    std::vector<bool>       m_present;
+    COLOR4D                 m_negative;
+};
 
 /**
  * Container for all the knowledge about how graphical objects are drawn on any output
@@ -316,11 +391,11 @@ protected:
     wxString               m_layerName;
     std::set<int>          m_highContrastLayers; // High-contrast layers (both board layers and
                                                  //   synthetic GAL layers)
-    std::map<int, COLOR4D> m_layerColors;        // Layer colors
-    std::map<int, COLOR4D> m_layerColorsHi;      // Layer colors for highlighted objects
-    std::map<int, COLOR4D> m_layerColorsSel;     // Layer colors for selected objects
-    std::map<int, COLOR4D> m_hiContrastColor;    // High-contrast mode layer colors
-    std::map<int, COLOR4D> m_layerColorsDark;    // Darkened layer colors (for high-contrast mode)
+    LAYER_COLOR_MAP        m_layerColors;        // Layer colors
+    LAYER_COLOR_MAP        m_layerColorsHi;      // Layer colors for highlighted objects
+    LAYER_COLOR_MAP        m_layerColorsSel;     // Layer colors for selected objects
+    LAYER_COLOR_MAP        m_hiContrastColor;    // High-contrast mode layer colors
+    LAYER_COLOR_MAP        m_layerColorsDark;    // Darkened layer colors (for high-contrast mode)
 
     COLOR4D m_backgroundColor;                   // The background color
 
