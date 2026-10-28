@@ -264,7 +264,12 @@ public:
     bool Remove( BOARD_ITEM* aItem );
     bool Add( BOARD_ITEM* aItem );
 
-    const CLUSTERS SearchClusters( CLUSTER_SEARCH_MODE aMode, bool aExcludeZones, int aSingleNet );
+    /**
+     * @param aNets when given, only items of the nets set in it seed or join clusters (net-bound
+     *              modes only: clusters never cross nets there, so theirs come out as without it).
+     */
+    const CLUSTERS SearchClusters( CLUSTER_SEARCH_MODE aMode, bool aExcludeZones, int aSingleNet,
+                                   const std::vector<bool>* aNets = nullptr );
     const CLUSTERS SearchClusters( CLUSTER_SEARCH_MODE aMode );
 
     /**

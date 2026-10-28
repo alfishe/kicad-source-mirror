@@ -397,9 +397,18 @@ const CN_CONNECTIVITY_ALGO::CLUSTERS CN_CONNECTIVITY_ALGO::SearchClusters( CLUST
 
 
 const CN_CONNECTIVITY_ALGO::CLUSTERS
-CN_CONNECTIVITY_ALGO::SearchClusters( CLUSTER_SEARCH_MODE aMode, bool aExcludeZones, int aSingleNet )
+CN_CONNECTIVITY_ALGO::SearchClusters( CLUSTER_SEARCH_MODE aMode, bool aExcludeZones, int aSingleNet,
+                                      const std::vector<bool>* aNets )
 {
     bool withinAnyNet = ( aMode != CSM_PROPAGATE );
+
+    wxCHECK_MSG( withinAnyNet || !aNets, CLUSTERS(), wxT( "a net filter needs a net-bound mode" ) );
+
+    auto inNets =
+            [aNets]( int aNet )
+            {
+                return !aNets || ( aNet >= 0 && aNet < (int) aNets->size() && ( *aNets )[aNet] );
+            };
 
     CLUSTERS clusters;
 
@@ -423,6 +432,7 @@ CN_CONNECTIVITY_ALGO::SearchClusters( CLUSTER_SEARCH_MODE aMode, bool aExcludeZo
         bool participates = item->Valid()
                             && !( withinAnyNet && item->Net() <= 0 )
                             && !( withinAnyNet && aSingleNet >= 0 && item->Net() != aSingleNet )
+                            && inNets( item->Net() )
                             && !( aExcludeZones && item->Parent()->Type() == PCB_ZONE_T );
 
         if( participates )
@@ -505,11 +515,12 @@ CN_CONNECTIVITY_ALGO::SearchClusters( CLUSTER_SEARCH_MODE aMode, bool aExcludeZo
         clusters = std::move( keep );
     }
 
-    std::sort( clusters.begin(), clusters.end(),
-               []( const std::shared_ptr<CN_CLUSTER>& a, const std::shared_ptr<CN_CLUSTER>& b )
-               {
-                   return a->OriginNet() < b->OriginNet();
-               } );
+    // Stable: a net's clusters keep the item order, with or without a net filter
+    std::stable_sort( clusters.begin(), clusters.end(),
+                      []( const std::shared_ptr<CN_CLUSTER>& a, const std::shared_ptr<CN_CLUSTER>& b )
+                      {
+                          return a->OriginNet() < b->OriginNet();
+                      } );
 
     return clusters;
 }
@@ -840,7 +851,8 @@ void CN_CONNECTIVITY_ALGO::FillIsolatedIslandsMap( std::map<ZONE*, std::map<PCB_
 
 const CN_CONNECTIVITY_ALGO::CLUSTERS& CN_CONNECTIVITY_ALGO::GetClusters()
 {
-    m_ratsnestClusters = SearchClusters( CSM_RATSNEST );
+    // Only the clusters of dirty nets are read (the ratsnest update, GetDirtyClusters)
+    m_ratsnestClusters = SearchClusters( CSM_RATSNEST, false, -1, &m_dirtyNets );
     return m_ratsnestClusters;
 }
 
