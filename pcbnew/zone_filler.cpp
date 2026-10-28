@@ -589,6 +589,89 @@ bool ZONE_FILLER::zoneKnockoutMayInteract( const ZONE* aZone, const ZONE* aKnock
  */
 bool ZONE_FILLER::Fill( const std::vector<ZONE*>& aZones, bool aCheck, wxWindow* aParent )
 {
+    if( !m_commit )
+        return fillZones( aZones, aCheck, aParent );
+
+    // The fill recomputes the zone layer overrides of every via and pad; the ones it changes are
+    // staged so that reverting or undoing the fill restores them together with the zones.
+    std::vector<BOARD_CONNECTED_ITEM*> items;
+    std::vector<ZONE_LAYER_OVERRIDE>   before;
+
+    auto getOverride =
+            []( BOARD_CONNECTED_ITEM* aItem, PCB_LAYER_ID aLayer )
+            {
+                if( aItem->Type() == PCB_VIA_T )
+                    return static_cast<PCB_VIA*>( aItem )->GetZoneLayerOverride( aLayer );
+
+                return static_cast<PAD*>( aItem )->GetZoneLayerOverride( aLayer );
+            };
+
+    auto setOverride =
+            []( BOARD_CONNECTED_ITEM* aItem, PCB_LAYER_ID aLayer, ZONE_LAYER_OVERRIDE aOverride )
+            {
+                if( aItem->Type() == PCB_VIA_T )
+                    static_cast<PCB_VIA*>( aItem )->SetZoneLayerOverride( aLayer, aOverride );
+                else
+                    static_cast<PAD*>( aItem )->SetZoneLayerOverride( aLayer, aOverride );
+            };
+
+    for( PCB_TRACK* track : m_board->Tracks() )
+    {
+        if( track->Type() == PCB_VIA_T )
+            items.push_back( track );
+    }
+
+    for( FOOTPRINT* footprint : m_board->Footprints() )
+    {
+        for( PAD* pad : footprint->Pads() )
+            items.push_back( pad );
+    }
+
+    const std::vector<PCB_LAYER_ID> layers = LSET::AllCuMask( m_board->GetCopperLayerCount() ).Seq();
+    before.reserve( items.size() * layers.size() );
+
+    for( BOARD_CONNECTED_ITEM* item : items )
+    {
+        for( PCB_LAYER_ID layer : layers )
+            before.push_back( getOverride( item, layer ) );
+    }
+
+    const bool filled = fillZones( aZones, aCheck, aParent );
+
+    std::vector<std::pair<BOARD_CONNECTED_ITEM*, std::vector<ZONE_LAYER_OVERRIDE>>> changed;
+    std::vector<ZONE_LAYER_OVERRIDE> current( layers.size() );
+
+    for( size_t ii = 0; ii < items.size(); ++ii )
+    {
+        const ZONE_LAYER_OVERRIDE* old = &before[ii * layers.size()];
+
+        for( size_t jj = 0; jj < layers.size(); ++jj )
+            current[jj] = getOverride( items[ii], layers[jj] );
+
+        if( std::equal( current.begin(), current.end(), old ) )
+            continue;
+
+        for( size_t jj = 0; jj < layers.size(); ++jj )
+            setOverride( items[ii], layers[jj], old[jj] );
+
+        changed.emplace_back( items[ii], current );
+    }
+
+    for( const auto& [item, after] : changed )
+        m_commit->Modify( item );
+
+    for( const auto& [item, after] : changed )
+    {
+        for( size_t jj = 0; jj < layers.size(); ++jj )
+            setOverride( item, layers[jj], after[jj] );
+    }
+
+    return filled;
+}
+
+
+bool ZONE_FILLER::fillZones( const std::vector<ZONE*>& aZones, bool aCheck, wxWindow* aParent )
+{
     std::lock_guard<KISPINLOCK> lock( m_board->GetConnectivity()->GetLock() );
 
     // Keyed on knockout geometry only; valid for this fill's passes (pre-knockout fill is rebuilt

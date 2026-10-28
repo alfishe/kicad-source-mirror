@@ -133,12 +133,6 @@ PCB_VIA::PCB_VIA( const PCB_VIA& aOther ) :
     PCB_VIA::operator=( aOther );
 
     SetUuidDirect( aOther.m_Uuid );
-
-    for( size_t ii = 0; ii < m_zoneLayerOverrides.size(); ++ii )
-    {
-        m_zoneLayerOverrides[ii].store( aOther.m_zoneLayerOverrides[ii].load( std::memory_order_relaxed ),
-                                        std::memory_order_relaxed );
-    }
 }
 
 
@@ -152,6 +146,12 @@ PCB_VIA& PCB_VIA::operator=( const PCB_VIA &aOther )
     m_viaType = aOther.m_viaType;
     m_padStack = aOther.m_padStack;
     m_isFree = aOther.m_isFree;
+
+    for( size_t ii = 0; ii < m_zoneLayerOverrides.size(); ++ii )
+    {
+        m_zoneLayerOverrides[ii].store( aOther.m_zoneLayerOverrides[ii].load( std::memory_order_relaxed ),
+                                        std::memory_order_relaxed );
+    }
 
     return *this;
 }

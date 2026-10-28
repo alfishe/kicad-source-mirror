@@ -62,6 +62,8 @@ public:
 
 private:
 
+    bool fillZones( const std::vector<ZONE*>& aZones, bool aCheck, wxWindow* aParent );
+
     void addKnockout( BOARD_ITEM* aItem, PCB_LAYER_ID aLayer, int aGap, SHAPE_POLY_SET& aHoles );
 
     void addKnockout( BOARD_ITEM* aItem, PCB_LAYER_ID aLayer, int aGap, bool aIgnoreLineWidth,

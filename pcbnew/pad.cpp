@@ -360,6 +360,12 @@ PAD& PAD::operator=( const PAD &aOther )
     SetSubRatsnest( aOther.GetSubRatsnest() );
     m_effectiveBoundingRadius = aOther.m_effectiveBoundingRadius;
 
+    if( this != &aOther )
+    {
+        std::scoped_lock lock( m_dataMutex, aOther.m_dataMutex );
+        m_zoneLayerOverrides = aOther.m_zoneLayerOverrides;
+    }
+
     return *this;
 }
 
