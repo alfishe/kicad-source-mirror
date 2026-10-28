@@ -209,9 +209,11 @@ void VERTEX_MANAGER::FreeItem( VERTEX_ITEM& aItem ) const
 void VERTEX_MANAGER::ChangeItemColor( const VERTEX_ITEM& aItem, const COLOR4D& aColor ) const
 {
     unsigned int size = aItem.GetSize();
-    unsigned int offset = aItem.GetOffset();
 
-    VERTEX* vertex = m_container->GetVertices( offset );
+    if( size == 0 )
+        return;
+
+    VERTEX* vertex = m_container->GetItemVertices( aItem );
 
     for( unsigned int i = 0; i < size; ++i )
     {
@@ -229,9 +231,11 @@ void VERTEX_MANAGER::ChangeItemColor( const VERTEX_ITEM& aItem, const COLOR4D& a
 void VERTEX_MANAGER::ChangeItemDepth( const VERTEX_ITEM& aItem, GLfloat aDepth ) const
 {
     unsigned int size = aItem.GetSize();
-    unsigned int offset = aItem.GetOffset();
 
-    VERTEX* vertex = m_container->GetVertices( offset );
+    if( size == 0 )
+        return;
+
+    VERTEX* vertex = m_container->GetItemVertices( aItem );
 
     for( unsigned int i = 0; i < size; ++i )
     {
@@ -248,7 +252,7 @@ VERTEX* VERTEX_MANAGER::GetVertices( const VERTEX_ITEM& aItem ) const
     if( aItem.GetSize() == 0 )
         return nullptr; // The item is not stored in the container
 
-    return m_container->GetVertices( aItem.GetOffset() );
+    return m_container->GetItemVertices( aItem );
 }
 
 
@@ -380,13 +384,25 @@ int VERTEX_MANAGER::EndPaletteStamp( const VERTEX_ITEM& aItem )
 
 void VERTEX_MANAGER::ClearPaletteSlot( const VERTEX_ITEM& aItem, int aSlot ) const
 {
-    const GLfloat offset = PALETTE_SLOT_STRIDE * aSlot;
-    VERTEX*       vertex = m_container->GetVertices( aItem.GetOffset() );
+    if( aItem.GetSize() == 0 )
+        return;
 
-    for( unsigned int i = 0; i < aItem.GetSize(); ++i, ++vertex )
+    VERTEX* vertex = m_container->GetItemVertices( aItem );
+
+    if( const uint8_t* modes = m_container->GetItemModes( aItem ) )
     {
-        if( vertex->shader[0] >= offset )
-            vertex->shader[0] -= offset;
+        for( unsigned int i = 0; i < aItem.GetSize(); ++i, ++vertex )
+            vertex->shader[0] = modes[i];
+    }
+    else
+    {
+        const GLfloat offset = PALETTE_SLOT_STRIDE * aSlot;
+
+        for( unsigned int i = 0; i < aItem.GetSize(); ++i, ++vertex )
+        {
+            if( vertex->shader[0] >= offset )
+                vertex->shader[0] -= offset;
+        }
     }
 
     m_container->SetDirty();

@@ -27,6 +27,7 @@
 
 #include <gal/gal.h>
 
+#include <cmath>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +42,13 @@ static constexpr float PALETTE_SLOT_STRIDE = 16.0f;
 
 /// slots in a palette texture row
 static constexpr int PALETTE_ROW = 256;
+
+/// @return the shader mode of a vertex from its shader[0] (as kicad_vert.glsl decodes it)
+inline uint8_t PaletteVertexMode( GLfloat aShader0 )
+{
+    const float slot = std::floor( ( aShader0 + 0.5f ) / PALETTE_SLOT_STRIDE );
+    return static_cast<uint8_t>( std::floor( aShader0 - PALETTE_SLOT_STRIDE * slot + 0.5f ) );
+}
 
 
 class GAL_API COLOR_PALETTE

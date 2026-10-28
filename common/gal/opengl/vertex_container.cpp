@@ -64,6 +64,12 @@ VERTEX_CONTAINER::VERTEX_CONTAINER( unsigned int aSize ) :
 }
 
 
+VERTEX* VERTEX_CONTAINER::GetItemVertices( const VERTEX_ITEM& aItem ) const
+{
+    return &m_vertices[aItem.GetOffset()];
+}
+
+
 VERTEX_CONTAINER::~VERTEX_CONTAINER()
 {
 }

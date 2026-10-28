@@ -32,6 +32,7 @@
 #include <cstring>
 #include <list>
 #include <memory>
+#include <vector>
 
 #include <core/profile.h>
 #include <trace_helpers.h>
@@ -65,6 +66,9 @@ CACHED_CONTAINER_GPU::CACHED_CONTAINER_GPU( unsigned int aSize ) :
     {
         m_useCopyBuffer = false;
     }
+
+    // items then move by GPU copies, so nothing has to read the mapping
+    m_writeOnly = m_useCopyBuffer;
 
 #ifdef KICAD_GAL_PROFILE
     wxLogTrace( traceGalProfile, "VBO initial size: %u", m_currentSize );
@@ -105,7 +109,18 @@ void CACHED_CONTAINER_GPU::Map()
         throw std::runtime_error( "OpenGL no longer available!" );
 
     glBindBuffer( GL_ARRAY_BUFFER, m_glBufferHandle );
-    m_vertices = static_cast<VERTEX*>( glMapBuffer( GL_ARRAY_BUFFER, GL_READ_WRITE ) );
+
+    if( !m_writeOnly )
+        m_vertices = static_cast<VERTEX*>( glMapBuffer( GL_ARRAY_BUFFER, GL_READ_WRITE ) );
+    else if( GLAD_GL_VERSION_3_0 || GLAD_GL_ARB_map_buffer_range )
+    {
+        // the whole buffer: during a resize it is mapped before m_currentSize changes
+        GLint bytes = 0;
+        glGetBufferParameteriv( GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bytes );
+        m_vertices = static_cast<VERTEX*>( glMapBufferRange( GL_ARRAY_BUFFER, 0, bytes, GL_MAP_WRITE_BIT ) );
+    }
+    else
+        m_vertices = static_cast<VERTEX*>( glMapBuffer( GL_ARRAY_BUFFER, GL_WRITE_ONLY ) );
 
     if( checkGlError( "mapping vertices buffer", __FILE__, __LINE__ ) == GL_NO_ERROR
         && m_vertices != nullptr )
@@ -153,7 +168,10 @@ bool CACHED_CONTAINER_GPU::defragmentResize( unsigned int aNewSize )
     const size_t oldBytes = static_cast<size_t>( m_currentSize ) * VERTEX_SIZE;
     const size_t newBytes = static_cast<size_t>( aNewSize ) * VERTEX_SIZE;
 
-    switch( KIGFX::chooseResizeStrategy( KIGFX::queryFreeVideoMemoryBytes(), oldBytes, newBytes, 0.15 ) )
+    KIGFX::VRAM_RESIZE_STRATEGY strategy =
+            KIGFX::chooseResizeStrategy( KIGFX::queryFreeVideoMemoryBytes(), oldBytes, newBytes, 0.15 );
+
+    switch( strategy )
     {
     case KIGFX::VRAM_RESIZE_STRATEGY::REFUSE:
         throw KIGFX::GPU_OOM_ERROR( "Insufficient GPU memory to render this board; switching to software rendering." );
@@ -201,7 +219,8 @@ bool CACHED_CONTAINER_GPU::defragmentResize( unsigned int aNewSize )
     glBufferData( GL_ELEMENT_ARRAY_BUFFER, aNewSize * VERTEX_SIZE, nullptr, GL_DYNAMIC_DRAW );
     checkGlError( "creating buffer during defragmentation", __FILE__, __LINE__ );
 
-    int newOffset = 0;
+    int                  newOffset = 0;
+    std::vector<uint8_t> newModes( m_writeOnly ? aNewSize : 0 );
 
     // Defragmentation
     forEachStored(
@@ -213,6 +232,7 @@ bool CACHED_CONTAINER_GPU::defragmentResize( unsigned int aNewSize )
                 // Move an item to the new container
                 glCopyBufferSubData( GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, itemOffset * VERTEX_SIZE,
                                      newOffset * VERTEX_SIZE, itemSize * VERTEX_SIZE );
+                moveModes( newModes, itemOffset, newOffset, itemSize );
 
                 // Update new offset
                 item->setOffset( newOffset );
@@ -221,8 +241,11 @@ bool CACHED_CONTAINER_GPU::defragmentResize( unsigned int aNewSize )
                 newOffset += itemSize;
             } );
 
-    // Move the current item and place it at the end
-    if( m_item->GetSize() > 0 )
+    if( m_writeOnly )
+        m_modes.swap( newModes );
+
+    // Move the current item and place it at the end (write-only: it is still in the stage)
+    if( !m_writeOnly && m_item && m_item->GetSize() > 0 )
     {
         glCopyBufferSubData( GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER,
                              m_item->GetOffset() * VERTEX_SIZE, newOffset * VERTEX_SIZE,
@@ -391,10 +414,37 @@ bool CACHED_CONTAINER_GPU::defragmentResizeStaged( unsigned int aNewSize )
                              "switching to software rendering." );
     }
 
-    // Reads from the mapped old buffer, so it must run before that buffer is released.
-    defragment( staging.get() );
+    if( m_writeOnly )
+    {
+        // the old buffer is read back unmapped (the current item is still in the stage)
+        Unmap();
+        glBindBuffer( GL_ARRAY_BUFFER, m_glBufferHandle );
 
-    Unmap();
+        std::vector<uint8_t> newModes( aNewSize );
+        unsigned int         newOffset = 0;
+
+        forEachStored(
+                [&]( VERTEX_ITEM* item )
+                {
+                    glGetBufferSubData( GL_ARRAY_BUFFER, item->GetOffset() * VERTEX_SIZE,
+                                        item->GetSize() * VERTEX_SIZE, &staging[newOffset] );
+                    moveModes( newModes, item->GetOffset(), newOffset, item->GetSize() );
+                    item->setOffset( newOffset );
+                    newOffset += item->GetSize();
+                } );
+
+        m_modes.swap( newModes );
+        m_maxIndex = newOffset;
+        glBindBuffer( GL_ARRAY_BUFFER, 0 );
+        checkGlError( "reading back the buffer during staged defragmentation", __FILE__, __LINE__ );
+    }
+    else
+    {
+        // Reads from the mapped old buffer, so it must run before that buffer is released.
+        defragment( staging.get() );
+        Unmap();
+    }
+
     glDeleteBuffers( 1, &m_glBufferHandle );
 
     GLuint newBuffer;

@@ -26,6 +26,7 @@
 #include <gal/opengl/vertex_container.h>
 #include <gal/opengl/vertex_item.h>
 #include <map>
+#include <vector>
 
 namespace KIGFX
 {
@@ -92,6 +93,12 @@ public:
 
     virtual unsigned int AllItemsSize() const { return 0; }
 
+    /// @copydoc VERTEX_CONTAINER::GetItemVertices()
+    VERTEX* GetItemVertices( const VERTEX_ITEM& aItem ) const override;
+
+    /// @copydoc VERTEX_CONTAINER::GetItemModes()
+    const uint8_t* GetItemModes( const VERTEX_ITEM& aItem ) const override;
+
 protected:
     /// Maps size of free memory chunks to their offsets
     typedef std::pair<unsigned int, unsigned int> CHUNK;
@@ -125,6 +132,21 @@ protected:
      * @param aTarget is the destination for the defragmented data.
      */
     void defragment( VERTEX* aTarget );
+
+    /**
+     * Write-only mode: place the item built in m_stage into a free chunk (growing the container
+     * when none fits) and keep the shader modes of its vertices.
+     *
+     * @return false in case of failure (e.g. memory shortage).
+     */
+    bool placeStaged();
+
+    /**
+     * Write-only mode: the modes of a stored item move with it in a defragmentation into aTarget
+     * (sized to the new container).
+     */
+    void moveModes( std::vector<uint8_t>& aTarget, unsigned int aFrom, unsigned int aTo,
+                    unsigned int aSize ) const;
 
     /**
      * Look for consecutive free memory chunks and merges them, decreasing fragmentation of
@@ -231,6 +253,13 @@ protected:
 
     /// Maximal vertex index number stored in the container
     unsigned int           m_maxIndex;
+
+    /// Vertices are only written through the mapping, never read (reading a mapped video buffer
+    /// makes the driver copy it back): the current item is built in m_stage and copied when it
+    /// is finished, the shader modes are kept in m_modes, items move by GPU copies
+    bool                   m_writeOnly = false;
+    std::vector<VERTEX>    m_stage;
+    std::vector<uint8_t>   m_modes;         ///< shader mode of each vertex (write-only mode)
 
 private:
     /// Debug & test functions

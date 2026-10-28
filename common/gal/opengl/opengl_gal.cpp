@@ -3072,19 +3072,17 @@ int OPENGL_GAL::BeginGroup()
 
 void OPENGL_GAL::EndGroup()
 {
+    VERTEX_ITEM* item = findGroup( m_buildingGroup );
+
+    // before the item is finished: its vertices may still be in the container's stage
+    if( item && m_stamping )
+        m_groupSlot[unsigned( m_buildingGroup ) - m_groupIndexBase] = uint16_t( m_cachedManager->EndPaletteStamp( *item ) );
+
     m_cachedManager->FinishItem();
     m_isGrouping = false;
 
-    if( VERTEX_ITEM* item = findGroup( m_buildingGroup ) )
-    {
-        uint16_t& slot = m_groupSlot[unsigned( m_buildingGroup ) - m_groupIndexBase];
-
-        if( m_stamping )
-            slot = uint16_t( m_cachedManager->EndPaletteStamp( *item ) );
-
-        if( item->GetSize() == 0 )
-            slot = EMPTY_GROUP;
-    }
+    if( item && item->GetSize() == 0 )
+        m_groupSlot[unsigned( m_buildingGroup ) - m_groupIndexBase] = EMPTY_GROUP;
 
     m_stamping = false;
 

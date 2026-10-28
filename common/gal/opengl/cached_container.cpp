@@ -28,6 +28,7 @@
  */
 
 #include <gal/opengl/cached_container.h>
+#include <gal/opengl/color_palette.h>
 #include <gal/opengl/vertex_manager.h>
 #include <gal/opengl/vertex_item.h>
 #include <gal/opengl/utils.h>
@@ -78,8 +79,17 @@ void CACHED_CONTAINER::FinishItem()
 
     unsigned int itemSize = m_item->GetSize();
 
+    if( m_writeOnly )
+    {
+        if( itemSize > 0 && ( m_failed || !placeStaged() ) )
+        {
+            m_failed = true;
+            m_item->setSize( 0 );
+            itemSize = 0;
+        }
+    }
     // Finishing the previously edited item
-    if( itemSize < m_chunkSize )
+    else if( itemSize < m_chunkSize )
     {
         // There is some not used but reserved memory left, so we should return it to the pool
         int itemOffset = m_item->GetOffset();
@@ -115,6 +125,16 @@ VERTEX* CACHED_CONTAINER::Allocate( unsigned int aSize )
 
     unsigned int itemSize = m_item->GetSize();
     unsigned int newSize = itemSize + aSize;
+
+    if( m_writeOnly )
+    {
+        if( newSize > m_stage.size() )
+            m_stage.resize( std::max<size_t>( newSize, 2 * m_stage.size() ) );
+
+        m_item->setSize( newSize );
+        m_dirty = true;
+        return &m_stage[itemSize];
+    }
 
     if( newSize > m_chunkSize )
     {
@@ -209,6 +229,77 @@ void CACHED_CONTAINER::Clear()
     // Now there is only free space left
     m_freeChunks.clear();
     m_freeChunks.insert( std::make_pair( m_freeSpace, 0 ) );
+}
+
+
+VERTEX* CACHED_CONTAINER::GetItemVertices( const VERTEX_ITEM& aItem ) const
+{
+    if( m_writeOnly && &aItem == m_item )
+        return const_cast<VERTEX*>( m_stage.data() );
+
+    return &m_vertices[aItem.GetOffset()];
+}
+
+
+const uint8_t* CACHED_CONTAINER::GetItemModes( const VERTEX_ITEM& aItem ) const
+{
+    if( !m_writeOnly || &aItem == m_item || aItem.GetSize() == 0 )
+        return nullptr;
+
+    return &m_modes[aItem.GetOffset()];
+}
+
+
+bool CACHED_CONTAINER::placeStaged()
+{
+    const unsigned int itemSize = m_item->GetSize();
+
+    FREE_CHUNK_MAP::iterator chunk = m_freeChunks.lower_bound( itemSize );
+
+    if( chunk == m_freeChunks.end() )
+    {
+        const unsigned int newSize = itemSize < m_freeSpace + m_currentSize
+                                             ? m_currentSize * 2
+                                             : pow( 2, ceil( log2( m_currentSize * 2 + itemSize ) ) );
+
+        if( !defragmentResize( newSize ) )
+            return false;
+
+        chunk = m_freeChunks.lower_bound( itemSize );
+        assert( chunk != m_freeChunks.end() );
+    }
+
+    if( !m_vertices )
+        return false;
+
+    const unsigned int chunkSize = getChunkSize( *chunk );
+    const unsigned int offset = getChunkOffset( *chunk );
+
+    m_freeChunks.erase( chunk );
+    m_freeSpace -= chunkSize;
+
+    if( chunkSize > itemSize )
+        addFreeChunk( offset + itemSize, chunkSize - itemSize );
+
+    memcpy( &m_vertices[offset], m_stage.data(), itemSize * VERTEX_SIZE );
+
+    if( m_modes.size() < m_currentSize )
+        m_modes.resize( m_currentSize );
+
+    for( unsigned int i = 0; i < itemSize; ++i )
+        m_modes[offset + i] = PaletteVertexMode( m_stage[i].shader[0] );
+
+    m_item->setOffset( offset );
+    m_maxIndex = std::max( offset + itemSize, m_maxIndex );
+    return true;
+}
+
+
+void CACHED_CONTAINER::moveModes( std::vector<uint8_t>& aTarget, unsigned int aFrom, unsigned int aTo,
+                                  unsigned int aSize ) const
+{
+    if( m_writeOnly && aSize > 0 )
+        memcpy( &aTarget[aTo], &m_modes[aFrom], aSize );
 }
 
 

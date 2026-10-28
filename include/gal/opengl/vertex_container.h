@@ -30,6 +30,8 @@
 
 #include <gal/opengl/vertex_common.h>
 
+#include <cstdint>
+
 namespace KIGFX
 {
 class VERTEX_ITEM;
@@ -122,6 +124,20 @@ public:
     virtual VERTEX* GetVertices( unsigned int aOffset ) const
     {
         return &m_vertices[aOffset];
+    }
+
+    /**
+     * Return the vertices of an item, the one being built included.
+     */
+    virtual VERTEX* GetItemVertices( const VERTEX_ITEM& aItem ) const;
+
+    /**
+     * Return the shader mode of every vertex of a stored item, without its palette slot, when
+     * the container keeps them (its vertices must not be read through the mapping); else nullptr.
+     */
+    virtual const uint8_t* GetItemModes( const VERTEX_ITEM& aItem ) const
+    {
+        return nullptr;
     }
 
     /**
