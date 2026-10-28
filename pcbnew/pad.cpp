@@ -615,7 +615,7 @@ bool PAD::IsNoConnectPad() const
 
 bool PAD::IsFreePad() const
 {
-    return GetShortNetname().StartsWith( wxT( "unconnected-(" ) ) && m_pinType == wxT( "free" );
+    return m_pinType == wxT( "free" ) && GetShortNetname().StartsWith( wxT( "unconnected-(" ) );
 }
 
 

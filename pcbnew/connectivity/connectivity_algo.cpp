@@ -1119,6 +1119,9 @@ void CN_CONNECTIVITY_ALGO::updateJumperPads()
 
         FOOTPRINT* fp = pad->GetParentFootprint();
 
+        if( !fp->GetDuplicatePadNumbersAreJumpers() && fp->JumperPadGroups().IsEmpty() )
+            continue;
+
         padsByFootprint[fp][ pad->GetNumber() ].emplace_back( item );
     }
 
