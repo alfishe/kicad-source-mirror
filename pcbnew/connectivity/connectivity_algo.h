@@ -267,9 +267,12 @@ public:
     /**
      * @param aNets when given, only items of the nets set in it seed or join clusters (net-bound
      *              modes only: clusters never cross nets there, so theirs come out as without it).
+     * @param aItems when given, only items whose list index is set in it take part.  It must
+     *               hold whole clusters, which then come out as without it.
      */
     const CLUSTERS SearchClusters( CLUSTER_SEARCH_MODE aMode, bool aExcludeZones, int aSingleNet,
-                                   const std::vector<bool>* aNets = nullptr );
+                                   const std::vector<bool>* aNets = nullptr,
+                                   const std::vector<bool>* aItems = nullptr );
     const CLUSTERS SearchClusters( CLUSTER_SEARCH_MODE aMode );
 
     /**
@@ -317,6 +320,10 @@ private:
     void searchConnections();
 
     void propagateConnections( BOARD_COMMIT* aCommit = nullptr );
+
+    /// @return the list indices of the propagation clusters holding an item that needs
+    ///         propagation; the other clusters are already propagated.
+    std::vector<bool> propagationItems() const;
 
     template <class Container, class BItem>
     void add( Container& c, BItem brditem )

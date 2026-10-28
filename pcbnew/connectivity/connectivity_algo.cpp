@@ -398,7 +398,7 @@ const CN_CONNECTIVITY_ALGO::CLUSTERS CN_CONNECTIVITY_ALGO::SearchClusters( CLUST
 
 const CN_CONNECTIVITY_ALGO::CLUSTERS
 CN_CONNECTIVITY_ALGO::SearchClusters( CLUSTER_SEARCH_MODE aMode, bool aExcludeZones, int aSingleNet,
-                                      const std::vector<bool>* aNets )
+                                      const std::vector<bool>* aNets, const std::vector<bool>* aItems )
 {
     bool withinAnyNet = ( aMode != CSM_PROPAGATE );
 
@@ -433,6 +433,7 @@ CN_CONNECTIVITY_ALGO::SearchClusters( CLUSTER_SEARCH_MODE aMode, bool aExcludeZo
                             && !( withinAnyNet && item->Net() <= 0 )
                             && !( withinAnyNet && aSingleNet >= 0 && item->Net() != aSingleNet )
                             && inNets( item->Net() )
+                            && ( !aItems || ( *aItems )[item->ListIndex()] )
                             && !( aExcludeZones && item->Parent()->Type() == PCB_ZONE_T );
 
         if( participates )
@@ -748,11 +749,71 @@ void CN_CONNECTIVITY_ALGO::propagateConnections( BOARD_COMMIT* aCommit )
 }
 
 
+std::vector<bool> CN_CONNECTIVITY_ALGO::propagationItems() const
+{
+    // The members of SearchClusters( CSM_PROPAGATE ): valid items other than zones, joined
+    // whatever their nets
+    auto takesPart =
+            []( const CN_ITEM* aItem )
+            {
+                return aItem->Valid() && aItem->Parent()->Type() != PCB_ZONE_T;
+            };
+
+    std::vector<bool>     items( m_itemList.Size(), false );
+    std::vector<CN_ITEM*> stack;
+
+    for( CN_ITEM* seed : m_itemList )
+    {
+        if( items[seed->ListIndex()] || !takesPart( seed ) || !seed->NeedsPropagation() )
+            continue;
+
+        items[seed->ListIndex()] = true;
+        stack.push_back( seed );
+
+        while( !stack.empty() )
+        {
+            CN_ITEM* item = stack.back();
+            stack.pop_back();
+
+            for( CN_ITEM* neighbour : item->ConnectedItems() )
+            {
+                int listIndex = neighbour->ListIndex();
+
+                if( listIndex < 0 || listIndex >= (int) items.size() || items[listIndex]
+                        || !takesPart( neighbour ) )
+                {
+                    continue;
+                }
+
+                items[listIndex] = true;
+                stack.push_back( neighbour );
+            }
+        }
+    }
+
+    return items;
+}
+
+
 void CN_CONNECTIVITY_ALGO::PropagateNets( BOARD_COMMIT* aCommit )
 {
     updateJumperPads();
-    m_connClusters = SearchClusters( CSM_PROPAGATE );
+
+    if( m_itemList.IsDirty() )
+        searchConnections();
+
+    // A cluster none of whose items changed gives the result it gave last time, which is
+    // already applied
+    std::vector<bool> items = propagationItems();
+
+    m_connClusters = SearchClusters( CSM_PROPAGATE, true, -1, nullptr, &items );
     propagateConnections( aCommit );
+
+    for( const std::shared_ptr<CN_CLUSTER>& cluster : m_connClusters )
+    {
+        for( CN_ITEM* item : *cluster )
+            item->SetPropagated();
+    }
 }
 
 

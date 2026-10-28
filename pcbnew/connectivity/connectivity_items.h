@@ -158,6 +158,12 @@ public:
     void SetDirty( bool aDirty ) { m_dirty.store( aDirty, std::memory_order_release ); }
     bool Dirty() const { return m_dirty.load( std::memory_order_acquire ); }
 
+    /// @return true if the item's net or connections changed since the net propagation last
+    ///         went over it (a new item always).
+    bool NeedsPropagation() const { return m_propagatedNet != Net(); }
+
+    void SetPropagated() { m_propagatedNet = Net(); }
+
     /**
      * Set the layers spanned by the item to aStartLayer and aEndLayer.
      */
@@ -239,6 +245,7 @@ public:
           return;
 
         m_connected.insert( i, b );
+        m_propagatedNet = NOT_PROPAGATED;
     }
 
     void RemoveInvalidRefs();
@@ -277,6 +284,11 @@ private:
     bool            m_valid;         ///< used to identify garbage items (we use lazy removal)
 
     int             m_listIndex = -1;    ///< position in the owning CN_LIST, see SetListIndex()
+
+    static constexpr int NOT_PROPAGATED = std::numeric_limits<int>::min();
+
+    int             m_propagatedNet = NOT_PROPAGATED; ///< net when last propagated, see
+                                                      ///< NeedsPropagation()
 
     std::mutex      m_listLock;      ///< mutex protecting this item's connected_items set to
 };
