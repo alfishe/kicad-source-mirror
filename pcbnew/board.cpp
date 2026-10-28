@@ -2841,11 +2841,28 @@ BOX2I BOARD::ComputeBoundingBox( bool aBoardEdgesOnly, bool aPhysicalLayersOnly 
 
 void BOARD::GetMsgPanelInfo( EDA_DRAW_FRAME* aFrame, std::vector<MSG_PANEL_ITEM>& aList )
 {
-    int           padCount = 0;
-    int           viaCount = 0;
-    int           trackSegmentCount = 0;
-    std::set<int> netCodes;
-    int           unconnected = GetConnectivity()->GetUnconnectedCount( true );
+    int               padCount = 0;
+    int               viaCount = 0;
+    int               trackSegmentCount = 0;
+    int               netCount = 0;
+    std::vector<bool> netSeen( GetNetCount() + 1, false );
+    int               unconnected = GetConnectivity()->GetUnconnectedCount( true );
+
+    auto countNet =
+            [&]( int aNetCode )
+            {
+                if( aNetCode <= 0 )
+                    return;
+
+                if( aNetCode >= (int) netSeen.size() )
+                    netSeen.resize( aNetCode + 1, false );
+
+                if( !netSeen[aNetCode] )
+                {
+                    netSeen[aNetCode] = true;
+                    netCount++;
+                }
+            };
 
     for( PCB_TRACK* item : m_tracks )
     {
@@ -2854,8 +2871,7 @@ void BOARD::GetMsgPanelInfo( EDA_DRAW_FRAME* aFrame, std::vector<MSG_PANEL_ITEM>
         else
             trackSegmentCount++;
 
-        if( item->GetNetCode() > 0 )
-            netCodes.insert( item->GetNetCode() );
+        countNet( item->GetNetCode() );
     }
 
     for( FOOTPRINT* footprint : Footprints() )
@@ -2863,16 +2879,14 @@ void BOARD::GetMsgPanelInfo( EDA_DRAW_FRAME* aFrame, std::vector<MSG_PANEL_ITEM>
         for( PAD* pad : footprint->Pads() )
         {
             padCount++;
-
-            if( pad->GetNetCode() > 0 )
-                netCodes.insert( pad->GetNetCode() );
+            countNet( pad->GetNetCode() );
         }
     }
 
     aList.emplace_back( _( "Pads" ), wxString::Format( wxT( "%d" ), padCount ) );
     aList.emplace_back( _( "Vias" ), wxString::Format( wxT( "%d" ), viaCount ) );
     aList.emplace_back( _( "Track Segments" ), wxString::Format( wxT( "%d" ), trackSegmentCount ) );
-    aList.emplace_back( _( "Nets" ), wxString::Format( wxT( "%d" ), (int) netCodes.size() ) );
+    aList.emplace_back( _( "Nets" ), wxString::Format( wxT( "%d" ), netCount ) );
     aList.emplace_back( _( "Unrouted" ), wxString::Format( wxT( "%d" ), unconnected ) );
 }
 
