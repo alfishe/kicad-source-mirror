@@ -394,24 +394,22 @@ FOOTPRINT::~FOOTPRINT()
 }
 
 
+PROPERTY_BASE* FOOTPRINT::fieldProperty( const wxString& aName ) const
+{
+    auto it = m_dynamicPropertyCache.find( aName );
+
+    if( it == m_dynamicPropertyCache.end() )
+        it = m_dynamicPropertyCache.emplace( aName, std::make_unique<PCB_FOOTPRINT_FIELD_PROPERTY>( aName ) ).first;
+
+    return it->second.get();
+}
+
+
 std::vector<PROPERTY_BASE*> FOOTPRINT::GetDynamicProperties() const
 {
     std::vector<PROPERTY_BASE*> props;
     const BOARD* board = GetBoard();
     bool isFPedit = board && board->IsFootprintHolder();
-
-    auto getOrCreate = [&]( const wxString& aName )
-    {
-        auto it = m_dynamicPropertyCache.find( aName );
-
-        if( it == m_dynamicPropertyCache.end() )
-        {
-            auto prop = std::make_unique<PCB_FOOTPRINT_FIELD_PROPERTY>( aName );
-            it = m_dynamicPropertyCache.emplace( aName, std::move( prop ) ).first;
-        }
-
-        return it->second.get();
-    };
 
     for( PCB_FIELD* field : GetFields() )
     {
@@ -426,7 +424,7 @@ std::vector<PROPERTY_BASE*> FOOTPRINT::GetDynamicProperties() const
         if( PROPERTY_MANAGER::Instance().GetProperty( TYPE_HASH( FOOTPRINT ), name ) )
             continue;
 
-        props.push_back( getOrCreate( name ) );
+        props.push_back( fieldProperty( name ) );
     }
 
     // user fields by name, case-insensitive; each name built once, not per comparison
@@ -448,12 +446,61 @@ std::vector<PROPERTY_BASE*> FOOTPRINT::GetDynamicProperties() const
                               } );
 
     for( const auto& [key, name] : userFields )
-        props.push_back( getOrCreate( name ) );
+        props.push_back( fieldProperty( name ) );
 
     for( PROPERTY_BASE* prop : GetCustomPropertiesAsInspectables() )
         props.push_back( prop );
 
     return props;
+}
+
+
+bool FOOTPRINT::FindDynamicProperty( const wxString& aName, PROPERTY_BASE*& aProperty ) const
+{
+    // Same answer as the first match in GetDynamicProperties(): mandatory fields, then user
+    // fields (equal sort keys keep field order), then custom properties
+    const BOARD* board = GetBoard();
+    bool         isFPedit = board && board->IsFootprintHolder();
+
+    for( PCB_FIELD* field : GetFields() )
+    {
+        if( !field->IsMandatory() || ( !isFPedit && field->IsPrivate() ) )
+            continue;
+
+        const wxString& name = field->GetUntranslatedName();
+
+        if( !aName.CmpNoCase( name ) && !PROPERTY_MANAGER::Instance().GetProperty( TYPE_HASH( FOOTPRINT ), name ) )
+        {
+            aProperty = fieldProperty( name );
+            return true;
+        }
+    }
+
+    for( PCB_FIELD* field : GetFields() )
+    {
+        if( field->IsMandatory() || ( !isFPedit && field->IsPrivate() ) )
+            continue;
+
+        const wxString& name = field->GetUntranslatedName();
+
+        if( !aName.CmpNoCase( name ) )
+        {
+            aProperty = fieldProperty( name );
+            return true;
+        }
+    }
+
+    for( PROPERTY_BASE* prop : GetCustomPropertiesAsInspectables() )
+    {
+        if( !aName.CmpNoCase( prop->Name() ) )
+        {
+            aProperty = prop;
+            return true;
+        }
+    }
+
+    aProperty = nullptr;
+    return true;
 }
 
 

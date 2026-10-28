@@ -55,6 +55,18 @@ public:
         return {};
     }
 
+    /**
+     * Find the first of GetDynamicProperties() named \a aName (case-insensitive) without
+     * building the list.
+     *
+     * @return false when the object has no such lookup (the caller scans the list); otherwise
+     *         true, with \a aProperty set to the property or nullptr.
+     */
+    virtual bool FindDynamicProperty( const wxString& aName, PROPERTY_BASE*& aProperty ) const
+    {
+        return false;
+    }
+
     bool Set( PROPERTY_BASE* aProperty, wxAny& aValue, bool aNotify = true );
 
     template <typename T>

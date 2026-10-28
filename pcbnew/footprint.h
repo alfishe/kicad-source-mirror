@@ -1184,6 +1184,7 @@ public:
     int GetFileFormatVersionAtLoad() const { return m_fileFormatVersionAtLoad; }
 
     std::vector<PROPERTY_BASE*> GetDynamicProperties() const override;
+    bool FindDynamicProperty( const wxString& aName, PROPERTY_BASE*& aProperty ) const override;
 
     /**
      * Return a #PAD with a matching number.
@@ -1529,6 +1530,8 @@ private:
     // fragile.
     mutable std::mutex                                     m_geometry_cache_mutex;
     mutable std::unique_ptr<FOOTPRINT_GEOMETRY_CACHE_DATA> m_geometry_cache;
+
+    PROPERTY_BASE* fieldProperty( const wxString& aName ) const;
 
     mutable std::map<wxString, std::unique_ptr<PCB_FOOTPRINT_FIELD_PROPERTY>> m_dynamicPropertyCache;
 

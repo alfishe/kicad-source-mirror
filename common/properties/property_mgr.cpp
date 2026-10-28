@@ -72,6 +72,9 @@ PROPERTY_BASE* PROPERTY_MANAGER::GetProperty( const INSPECTABLE* aObject, const 
     if( PROPERTY_BASE* prop = GetProperty( TYPE_HASH( *aObject ), aProperty ) )
         return prop;
 
+    if( PROPERTY_BASE* found = nullptr; aObject->FindDynamicProperty( aProperty, found ) )
+        return found;
+
     for( PROPERTY_BASE* dynamicProp : aObject->GetDynamicProperties() )
     {
         if( !aProperty.CmpNoCase( dynamicProp->Name() ) )
