@@ -28,6 +28,7 @@
 #include <zone_filler.h>
 #include <board_commit.h>
 
+#include <connectivity/connectivity_algo.h>
 #include <connectivity/connectivity_data.h>
 #include <drc/drc_rtree.h>
 #include <geometry/shape_line_chain.h>
@@ -463,9 +464,37 @@ void TEARDROP_MANAGER::UpdateTeardrops( BOARD_COMMIT& aCommit,
     if( dirtyPadsAndVias )
         dirtyPadViaSet.insert( dirtyPadsAndVias->begin(), dirtyPadsAndVias->end() );
 
+    // Without a full update only a dirty track or a track connected to a dirty pad or via can
+    // get a pad or via teardrop; connections are recorded on both items
+    std::unordered_set<const BOARD_CONNECTED_ITEM*> candidateTracks;
+
+    if( !aForceFullUpdate )
+    {
+        std::shared_ptr<CN_CONNECTIVITY_ALGO> connAlgo = connectivity->GetConnectivityAlgo();
+
+        candidateTracks.insert( dirtyTracks->begin(), dirtyTracks->end() );
+
+        for( BOARD_ITEM* item : dirtyPadViaSet )
+        {
+            BOARD_CONNECTED_ITEM* padOrVia = static_cast<BOARD_CONNECTED_ITEM*>( item );
+
+            if( !connAlgo->ItemExists( padOrVia ) )
+                continue;
+
+            for( CN_ITEM* citem : connAlgo->ItemEntry( padOrVia ).GetItems() )
+            {
+                for( CN_ITEM* connected : citem->ConnectedItems() )
+                    candidateTracks.insert( connected->Parent() );
+            }
+        }
+    }
+
     for( PCB_TRACK* track : m_board->Tracks() )
     {
         if( ! ( track->Type() == PCB_TRACE_T || track->Type() == PCB_ARC_T ) )
+            continue;
+
+        if( !aForceFullUpdate && !candidateTracks.contains( track ) )
             continue;
 
         std::vector<PAD*>     connectedPads;
