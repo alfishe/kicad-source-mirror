@@ -1946,7 +1946,7 @@ bool PAD::IsOnCopperLayer() const
             return false;
     }
 
-    return ( m_padStack.LayerSet() & LSET::AllCuMask() ).any();
+    return m_padStack.LayerSet().Intersects( LSET::AllCuMask() );
 }
 
 
