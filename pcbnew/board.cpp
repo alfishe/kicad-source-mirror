@@ -4029,9 +4029,26 @@ void BOARD::MapNets( BOARD* aDestBoard )
 
 void BOARD::SanitizeNetcodes()
 {
+    const NETCODES_MAP& netCodes = m_NetInfo.NetsByNetcode();
+    std::vector<bool>   known( netCodes.empty() ? 1 : std::max( netCodes.rbegin()->first, 0 ) + 1,
+                               false );
+
+    for( const auto& [code, net] : netCodes )
+    {
+        if( code >= 0 )
+            known[code] = true;
+    }
+
+    if( m_NetInfo.GetNetCount() == 0 )
+        known[NETINFO_LIST::UNCONNECTED] = true;
+
     for( BOARD_CONNECTED_ITEM* item : AllConnectedItems() )
     {
-        if( FindNet( item->GetNetCode() ) == nullptr )
+        int  code = item->GetNetCode();
+        bool exists = code >= 0 && code < (int) known.size() ? known[code]
+                                                             : FindNet( code ) != nullptr;
+
+        if( !exists )
             item->SetNetCode( NETINFO_LIST::ORPHANED );
     }
 }
