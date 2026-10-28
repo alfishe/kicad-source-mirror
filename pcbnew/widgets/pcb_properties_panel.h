@@ -114,7 +114,8 @@ protected:
     PG_FPID_EDITOR*      m_fpEditorInstance;
     PG_URL_EDITOR*       m_urlEditorInstance;
 
-    wxPGChoices m_nets;
+    wxPGChoices                           m_nets;
+    std::vector<std::pair<int, wxString>> m_netListKey;   ///< (code, netname) m_nets was built from
 
     bool m_scaleConfirmPending;
 };

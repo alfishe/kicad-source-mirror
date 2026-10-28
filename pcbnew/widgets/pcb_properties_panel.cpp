@@ -1337,7 +1337,6 @@ void PCB_PROPERTIES_PANEL::updateLists( const BOARD* aBoard )
 {
     wxPGChoices layersAll;
     wxPGChoices layersCu;
-    wxPGChoices nets;
     wxPGChoices fonts;
 
     // Regenerate all layers
@@ -1360,34 +1359,64 @@ void PCB_PROPERTIES_PANEL::updateLists( const BOARD* aBoard )
     m_propMgr.GetProperty( TYPE_HASH( PCB_VIA ), _HKI( "Top Backdrill Must-Cut" ) )->SetChoices( layersCu );
     m_propMgr.GetProperty( TYPE_HASH( PCB_TUNING_PATTERN ), _HKI( "Layer" ) )->SetChoices( layersCu );
 
-    // Regenerate nets
+    // Regenerate nets only when the net list differs from the one the choices were built from
+    const NETCODES_MAP& netCodes = aBoard->GetNetInfo().NetsByNetcode();
+    bool netsChanged = netCodes.size() != m_netListKey.size()
+                       || m_nets.GetCount() != m_netListKey.size();
 
-    std::vector<std::pair<wxString, int>> netNames;
-    netNames.reserve( aBoard->GetNetInfo().NetsByNetcode().size() );
+    if( !netsChanged )
+    {
+        auto key = m_netListKey.begin();
 
-    for( const auto& [ netCode, netInfo ] : aBoard->GetNetInfo().NetsByNetcode() )
-        netNames.emplace_back( UnescapeString( netInfo->GetNetname() ), netCode );
+        for( const auto& [ netCode, netInfo ] : netCodes )
+        {
+            if( key->first != netCode || key->second != netInfo->GetNetname() )
+            {
+                netsChanged = true;
+                break;
+            }
 
-    std::sort( netNames.begin(), netNames.end(),
-               []( const auto& a, const auto& b )
-               {
-                   return a.first.CmpNoCase( b.first ) < 0;
-               } );
+            ++key;
+        }
+    }
 
-    for( const auto& [ netName, netCode ] : netNames )
-        nets.Add( netName, netCode );
+    if( netsChanged )
+    {
+        m_netListKey.clear();
+        m_netListKey.reserve( netCodes.size() );
+
+        std::vector<std::pair<wxString, int>> netNames;
+        netNames.reserve( netCodes.size() );
+
+        for( const auto& [ netCode, netInfo ] : netCodes )
+        {
+            m_netListKey.emplace_back( netCode, netInfo->GetNetname() );
+            netNames.emplace_back( UnescapeString( netInfo->GetNetname() ), netCode );
+        }
+
+        std::sort( netNames.begin(), netNames.end(),
+                   []( const auto& a, const auto& b )
+                   {
+                       return a.first.CmpNoCase( b.first ) < 0;
+                   } );
+
+        m_nets = wxPGChoices();
+
+        for( const auto& [ netName, netCode ] : netNames )
+            m_nets.Add( netName, netCode );
+    }
 
     auto netProperty = m_propMgr.GetProperty( TYPE_HASH( BOARD_CONNECTED_ITEM ), _HKI( "Net" ) );
-    netProperty->SetChoices( nets );
+    netProperty->SetChoices( m_nets );
 
     auto tuningNet = m_propMgr.GetProperty( TYPE_HASH( PCB_TUNING_PATTERN ), _HKI( "Net" ) );
-    tuningNet->SetChoices( nets );
+    tuningNet->SetChoices( m_nets );
 
     auto stitchNet = m_propMgr.GetProperty( TYPE_HASH( PCB_VIA_STITCH ), _HKI( "Net" ) );
-    stitchNet->SetChoices( nets );
+    stitchNet->SetChoices( m_nets );
 
     auto stitchGuardedNet = m_propMgr.GetProperty( TYPE_HASH( PCB_VIA_STITCH ), _HKI( "Guarded Net" ) );
-    stitchGuardedNet->SetChoices( nets );
+    stitchGuardedNet->SetChoices( m_nets );
 
     // Drill spans come from the stackup rather than from an enum, and enumerating them costs a
     // walk of the board, so only a board that actually has a map pays for it
