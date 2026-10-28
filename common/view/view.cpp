@@ -275,6 +275,7 @@ VIEW::VIEW() :
         l.items          = std::make_shared<VIEW_RTREE>();
         l.id             = ii;
         l.renderingOrder = ii;
+        l.groupsOrder    = ii;
         l.visible        = true;
         l.displayOnly    = false;
         l.diffLayer      = false;
@@ -796,6 +797,7 @@ void VIEW::ReorderLayerData( std::unordered_map<int, int> aReorderMap )
 
         destination->second = layer;
         destination->second.id = destination->first;
+        destination->second.groupsOrder = GROUPS_MIXED;
     }
 
     // A source nothing moves onto keeps its settings but must own an empty tree rather than the
@@ -1105,23 +1107,18 @@ void VIEW::UpdateAllLayersOrder()
 
         if( ctx.IsUpdating() )
         {
-            for( VIEW_ITEM* item : *m_allItems )
+            BOX2I r;
+            r.SetMaximum();
+
+            // Only the layers whose order moved are walked, through their own trees
+            for( auto& [id, l] : m_layers )
             {
-                if( !item )
+                if( l.groupsOrder == l.renderingOrder )
                     continue;
 
-                VIEW_ITEM_DATA* viewData = item->viewPrivData();
-
-                if( !viewData )
-                    continue;
-
-                for( int layer : viewData->m_layers )
-                {
-                    int group = viewData->getGroup( layer );
-
-                    if( group >= 0 )
-                        m_gal->ChangeGroupDepth( group, m_layers[layer].renderingOrder );
-                }
+                UPDATE_DEPTH_VISITOR visitor( id, l.renderingOrder, m_gal );
+                l.items->Query( r, visitor );
+                l.groupsOrder = l.renderingOrder;
             }
         }
     }
@@ -1567,6 +1564,9 @@ void VIEW::updateItemGeometry( VIEW_ITEM* aItem, int aLayer )
 
     m_gal->SetTarget( l.target );
     m_gal->SetLayerDepth( l.renderingOrder );
+
+    if( l.groupsOrder != l.renderingOrder )
+        l.groupsOrder = GROUPS_MIXED;
 
     // Redraw the item from scratch
     int group = viewData->getGroup( aLayer );

@@ -23,6 +23,7 @@
 #pragma once
 
 #include <gal/gal.h>
+#include <limits>
 #include <map>
 #include <vector>
 #include <set>
@@ -777,6 +778,9 @@ public:
     /// Rendering order modifier for layers that are marked as top layers.
     static constexpr int TOP_LAYER_MODIFIER = -MAX_LAYERS_FOR_VIEW;
 
+    /// VIEW_LAYER::groupsOrder of a layer whose groups may have different depths.
+    static constexpr int GROUPS_MIXED = std::numeric_limits<int>::min();
+
 protected:
     struct VIEW_LAYER
     {
@@ -790,6 +794,9 @@ protected:
         bool                    hasNegatives;
         std::shared_ptr<VIEW_RTREE> items;       ///< R-tree indexing all items on this layer.
         int                     renderingOrder;  ///< Rendering order of this layer.
+
+        /// Depth all cached groups of this layer carry, GROUPS_MIXED when they may differ.
+        int                     groupsOrder;
         int                     id;              ///< Layer ID.
         RENDER_TARGET           target;          ///< Where the layer should be rendered.
 
