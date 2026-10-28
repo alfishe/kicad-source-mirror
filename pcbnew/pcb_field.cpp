@@ -133,6 +133,35 @@ wxString PCB_FIELD::GetUntranslatedName() const
 }
 
 
+bool PCB_FIELD::NameIs( const wxString& aName, bool aNoCase ) const
+{
+    static const wxString s_reference = GetDefaultFieldName( FIELD_T::REFERENCE, UNTRANSLATED );
+    static const wxString s_value = GetDefaultFieldName( FIELD_T::VALUE, UNTRANSLATED );
+    static const wxString s_datasheet = GetDefaultFieldName( FIELD_T::DATASHEET, UNTRANSLATED );
+    static const wxString s_description = GetDefaultFieldName( FIELD_T::DESCRIPTION, UNTRANSLATED );
+
+    auto same =
+            [&]( const wxString& aFieldName )
+            {
+                return aNoCase ? aFieldName.CmpNoCase( aName ) == 0 : aFieldName == aName;
+            };
+
+    switch( m_id )
+    {
+    case FIELD_T::REFERENCE:   return same( s_reference );
+    case FIELD_T::VALUE:       return same( s_value );
+    case FIELD_T::DATASHEET:   return same( s_datasheet );
+    case FIELD_T::DESCRIPTION: return same( s_description );
+    default:                   break;
+    }
+
+    if( m_name.IsEmpty() )
+        return same( GetUserFieldName( m_ordinal, UNTRANSLATED ) );
+
+    return same( m_name );
+}
+
+
 wxString PCB_FIELD::GetShownText( RESOLUTION_CONTEXT aContext, int aDepth ) const
 {
     const BOARD* board = GetBoard();

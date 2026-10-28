@@ -114,6 +114,12 @@ public:
      */
     wxString GetUntranslatedName() const;
 
+    /**
+     * @return true when GetName() is \a aName (case-insensitive with \a aNoCase), without
+     *         building a copy of the name.
+     */
+    bool NameIs( const wxString& aName, bool aNoCase = false ) const;
+
     wxString GetShownText( RESOLUTION_CONTEXT aContext, int aDepth = 0 ) const override;
     wxString GetShownText( const wxString& aVariantName, RESOLUTION_CONTEXT aContext,
                            int aDepth = 0 ) const;

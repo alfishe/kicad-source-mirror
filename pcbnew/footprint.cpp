@@ -467,9 +467,12 @@ bool FOOTPRINT::FindDynamicProperty( const wxString& aName, PROPERTY_BASE*& aPro
         if( !field->IsMandatory() || ( !isFPedit && field->IsPrivate() ) )
             continue;
 
-        const wxString& name = field->GetUntranslatedName();
+        if( !field->NameIs( aName, true ) )
+            continue;
 
-        if( !aName.CmpNoCase( name ) && !PROPERTY_MANAGER::Instance().GetProperty( TYPE_HASH( FOOTPRINT ), name ) )
+        const wxString name = field->GetUntranslatedName();
+
+        if( !PROPERTY_MANAGER::Instance().GetProperty( TYPE_HASH( FOOTPRINT ), name ) )
         {
             aProperty = fieldProperty( name );
             return true;
@@ -481,11 +484,9 @@ bool FOOTPRINT::FindDynamicProperty( const wxString& aName, PROPERTY_BASE*& aPro
         if( field->IsMandatory() || ( !isFPedit && field->IsPrivate() ) )
             continue;
 
-        const wxString& name = field->GetUntranslatedName();
-
-        if( !aName.CmpNoCase( name ) )
+        if( field->NameIs( aName, true ) )
         {
-            aProperty = fieldProperty( name );
+            aProperty = fieldProperty( field->GetUntranslatedName() );
             return true;
         }
     }
@@ -965,7 +966,7 @@ PCB_FIELD* FOOTPRINT::GetField( const wxString& aFieldName ) const
 {
     for( PCB_FIELD* field : m_fields )
     {
-        if( field->GetName() == aFieldName )
+        if( field->NameIs( aFieldName ) )
             return field;
     }
 
