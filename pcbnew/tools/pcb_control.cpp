@@ -3190,8 +3190,12 @@ int PCB_CONTROL::RehatchShapes( const TOOL_EVENT& aEvent )
 {
     KIGFX::VIEW* view = this->view();
 
+    // Only a footprint's drawings can be shapes; its pads and fields need no visit
     for( FOOTPRINT* footprint : board()->Footprints() )
-        footprint->RunOnChildren( std::bind( &PCB_CONTROL::rehatchBoardItem, view, _1 ), NO_RECURSE );
+    {
+        for( BOARD_ITEM* item : footprint->GraphicalItems() )
+            rehatchBoardItem( view, item );
+    }
 
     for( BOARD_ITEM* item : board()->Drawings() )
         rehatchBoardItem( view, item );
