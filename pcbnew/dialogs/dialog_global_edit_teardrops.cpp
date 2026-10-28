@@ -407,7 +407,6 @@ bool DIALOG_GLOBAL_EDIT_TEARDROPS::TransferDataFromWindow()
         else if( m_addTeardrops->GetValue() )
         {
             targetParams->m_Enabled = true;
-            teardropManager.BuildTrackCaches();
             teardropManager.AddTeardropsOnTracks( commit, nullptr, true );
         }
     }

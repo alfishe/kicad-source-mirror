@@ -49,6 +49,7 @@
 TEARDROP_MANAGER::TEARDROP_MANAGER( BOARD* aBoard, TOOL_MANAGER* aToolManager ) :
         m_board( aBoard ),
         m_toolManager( aToolManager ),
+        m_tracksCached( false ),
         m_copperIndexed( false )
 {
     m_prmsList = m_board->GetDesignSettings().GetTeadropParamsList();
@@ -456,8 +457,6 @@ void TEARDROP_MANAGER::UpdateTeardrops( BOARD_COMMIT& aCommit,
         m_board->BulkRemoveStaleTeardrops( aCommit );
     }
 
-    BuildTrackCaches();
-
     std::shared_ptr<CONNECTIVITY_DATA> connectivity = m_board->GetConnectivity();
     std::unordered_set<BOARD_ITEM*>    dirtyPadViaSet;
 
@@ -726,6 +725,8 @@ void TEARDROP_MANAGER::AddTeardropsOnTracks( BOARD_COMMIT& aCommit,
 {
     std::shared_ptr<CONNECTIVITY_DATA> connectivity = m_board->GetConnectivity();
     TEARDROP_PARAMETERS                params = *m_prmsList->GetParameters( TARGET_TRACK );
+
+    ensureTrackCaches();
 
     // Explore groups (a group is a set of tracks on the same layer and the same net):
     for( auto& grp : m_trackLookupList.GetBuffer() )

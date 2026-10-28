@@ -125,8 +125,6 @@ public:
     static bool IsRound( BOARD_ITEM* aItem, PCB_LAYER_ID aLayer );
     static bool IsUniformlyRound( BOARD_ITEM* aItem );
 
-    void BuildTrackCaches();
-
 private:
     /**
      * @return true if the given aViaPad + aTrack is located inside a zone of the same netname
@@ -152,6 +150,10 @@ private:
     /// Build the copper collision index, deferred so a commit with no teardrop candidate
     /// never pays for it.
     void ensureCopperIndex() const;
+
+    /// Build the track index and the per net and layer track groups, deferred like the copper
+    /// index.
+    void ensureTrackCaches() const;
 
     /**
      * @return true if a teardrop with the given outline would touch copper of another net.
@@ -334,8 +336,9 @@ private:
     TOOL_MANAGER*             m_toolManager;
     TEARDROP_PARAMETERS_LIST* m_prmsList;       // the teardrop parameters list, from the board design settings
 
-    DRC_RTREE                 m_tracksRTree;
-    TRACK_BUFFER              m_trackLookupList;
+    mutable DRC_RTREE         m_tracksRTree;
+    mutable TRACK_BUFFER      m_trackLookupList;
+    mutable bool              m_tracksCached;
     std::vector<ZONE*>        m_createdTdList;  // list of new created teardrops
 
     /// Every copper item plus the teardrops built so far, to keep teardrops off other nets.

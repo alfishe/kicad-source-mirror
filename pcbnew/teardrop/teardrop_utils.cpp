@@ -116,8 +116,13 @@ bool TEARDROP_MANAGER::IsUniformlyRound(BOARD_ITEM* aItem)
 }
 
 
-void TEARDROP_MANAGER::BuildTrackCaches()
+void TEARDROP_MANAGER::ensureTrackCaches() const
 {
+    if( m_tracksCached )
+        return;
+
+    m_tracksCached = true;
+
     for( PCB_TRACK* track : m_board->Tracks() )
     {
         if( track->Type() == PCB_TRACE_T || track->Type() == PCB_ARC_T )
@@ -512,6 +517,8 @@ PCB_TRACK* TEARDROP_MANAGER::findTouchingTrack( EDA_ITEM_FLAGS& aMatchType, PCB_
                                                 PCB_TRACK* aSourceTrack,
                                                 const VECTOR2I& aEndPoint ) const
 {
+    ensureTrackCaches();
+
     int matches = 0;                    // Count of candidates: only 1 is acceptable
     PCB_TRACK* candidate = nullptr;     // a reference to the track connected
 
