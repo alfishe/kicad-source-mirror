@@ -891,6 +891,9 @@ protected:
      */
     void invalidateItem( VIEW_ITEM* aItem, int aUpdateFlags );
 
+    /// Add \a aUpdateFlags to the deferred update flags of \a aItem and keep it for UpdateItems().
+    void requireUpdate( const VIEW_ITEM* aItem, VIEW_ITEM_DATA* aData, int aUpdateFlags ) const;
+
     /// Update colors that are used for an item to be drawn.
     void updateItemColor( VIEW_ITEM* aItem, int aLayer );
 
@@ -982,5 +985,12 @@ protected:
 
     /// True when at least one item has deferred update flags that still need processing.
     mutable bool m_hasPendingItemUpdates;
+
+    /// m_allItems indices of the items that got update flags since the last UpdateItems(); an
+    /// entry can be stale (removed item, flags already processed) and is then skipped.
+    mutable std::vector<int> m_pendingItems;
+
+    /// m_pendingItems is incomplete or its indices moved: UpdateItems() scans all items.
+    mutable bool m_pendingScanAll;
 };
 } // namespace KIGFX

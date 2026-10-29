@@ -265,7 +265,8 @@ VIEW::VIEW() :
     m_useDrawPriority( false ),
     m_nextDrawPriority( 0 ),
     m_reverseDrawOrder( false ),
-    m_hasPendingItemUpdates( false )
+    m_hasPendingItemUpdates( false ),
+    m_pendingScanAll( false )
 {
 
     // Set m_boundary to define the max area size. The default area size
@@ -483,6 +484,9 @@ void VIEW::unlinkItem( VIEW_ITEM* aItem )
                 // Update cached indices
                 for( size_t idx = 0; idx < m_allItems->size(); idx++ )
                     ( *m_allItems )[idx]->m_viewPrivData->m_cachedIndex = idx;
+
+                m_pendingItems.clear();
+                m_pendingScanAll = true;
 
                 s_gcCounter = 0;
             }
@@ -846,8 +850,7 @@ void VIEW::ReorderLayerData( std::unordered_map<int, int> aReorderMap )
 
         viewData->reorderGroups( aReorderMap );
 
-        viewData->m_requiredUpdate |= COLOR;
-        m_hasPendingItemUpdates = true;
+        requireUpdate( item, viewData, COLOR );
     }
 
     m_lodEpoch = 0;
@@ -1401,6 +1404,8 @@ void VIEW::Clear()
     }
 
     m_allItems->clear();
+    m_pendingItems.clear();
+    m_pendingScanAll = false;
     m_lodEpoch = 0;
     clearLODContext();
 
@@ -1767,6 +1772,10 @@ void VIEW::RecacheAllItems()
 }
 
 
+// Marks an item UpdateItems() has collected, so a repeated m_pendingItems entry is skipped
+static constexpr int PENDING_COLLECTED = 0x100;
+
+
 void VIEW::UpdateItems()
 {
     if( !m_gal->IsVisible() || !m_gal->IsInitialized() )
@@ -1783,24 +1792,52 @@ void VIEW::UpdateItems()
     unsigned int cntAnyUpdate = 0;
     bool         anyUpdated = false;
 
-    for( VIEW_ITEM* item : *m_allItems )
+    // The items to update: all of them, or the pending entries that still have flags
+    const bool              scanAll = m_pendingScanAll;
+    std::vector<VIEW_ITEM*> updated;
+
+    auto collect =
+            [&]( VIEW_ITEM* item )
+            {
+                VIEW_ITEM_DATA* vpd = item ? item->viewPrivData() : nullptr;
+
+                if( !vpd || vpd->m_requiredUpdate == NONE )
+                    return;
+
+                // A stale duplicate entry was already collected
+                if( !scanAll && ( vpd->m_requiredUpdate & PENDING_COLLECTED ) )
+                    return;
+
+                anyUpdated = true;
+                cntAnyUpdate++;
+
+                if( vpd->m_requiredUpdate & ( GEOMETRY | LAYERS ) )
+                    cntGeomUpdate++;
+
+                if( !scanAll )
+                {
+                    vpd->m_requiredUpdate |= PENDING_COLLECTED;
+                    updated.push_back( item );
+                }
+            };
+
+    if( scanAll )
     {
-        if( !item )
-            continue;
+        for( VIEW_ITEM* item : *m_allItems )
+            collect( item );
+    }
+    else
+    {
+        updated.reserve( m_pendingItems.size() );
 
-        auto vpd = item->viewPrivData();
-
-        if( !vpd )
-            continue;
-
-        if( vpd->m_requiredUpdate != NONE )
+        for( int idx : m_pendingItems )
         {
-            anyUpdated = true;
-            cntAnyUpdate++;
-
-            if( vpd->m_requiredUpdate & ( GEOMETRY | LAYERS ) )
-                cntGeomUpdate++;
+            if( idx < (int) m_allItems->size() )
+                collect( ( *m_allItems )[idx] );
         }
+
+        for( VIEW_ITEM* item : updated )
+            item->viewPrivData()->m_requiredUpdate &= ~PENDING_COLLECTED;
     }
 
     unsigned int cntTotal = m_allItems->size();
@@ -1882,12 +1919,33 @@ void VIEW::UpdateItems()
 
         if( ctx.IsUpdating() )
         {
-            for( VIEW_ITEM* item : *m_allItems.get() )
+            auto process =
+                    [this]( VIEW_ITEM* item )
+                    {
+                        if( item && item->viewPrivData() && item->viewPrivData()->m_requiredUpdate != NONE )
+                        {
+                            invalidateItem( item, item->viewPrivData()->m_requiredUpdate );
+                            item->viewPrivData()->m_requiredUpdate = NONE;
+                        }
+                    };
+
+            if( scanAll )
             {
-                if( item && item->viewPrivData() && item->viewPrivData()->m_requiredUpdate != NONE )
+                for( VIEW_ITEM* item : *m_allItems.get() )
+                    process( item );
+            }
+            else
+            {
+                const size_t collected = m_pendingItems.size();
+
+                for( VIEW_ITEM* item : updated )
+                    process( item );
+
+                // Items flagged meanwhile, as the full scan would reach them too
+                for( size_t ii = collected; ii < m_pendingItems.size() && !m_pendingScanAll; ++ii )
                 {
-                    invalidateItem( item, item->viewPrivData()->m_requiredUpdate );
-                    item->viewPrivData()->m_requiredUpdate = NONE;
+                    if( m_pendingItems[ii] < (int) m_allItems->size() )
+                        process( ( *m_allItems )[m_pendingItems[ii]] );
                 }
             }
         }
@@ -1902,8 +1960,41 @@ void VIEW::UpdateItems()
               cntTotal, cntGeomUpdate, (unsigned) anyUpdated );
 #endif
 
-    if( updatesProcessed )
+    // A scan-all request made while processing the pending entries waits for the next call
+    if( updatesProcessed && ( scanAll || !m_pendingScanAll ) )
+    {
         m_hasPendingItemUpdates = false;
+        m_pendingItems.clear();
+        m_pendingScanAll = false;
+    }
+}
+
+
+void VIEW::requireUpdate( const VIEW_ITEM* aItem, VIEW_ITEM_DATA* aData, int aUpdateFlags ) const
+{
+    if( aUpdateFlags == NONE )
+        return;
+
+    // An added item can carry flags from before a Clear(), which no entry stands for
+    if( ( aData->m_requiredUpdate == NONE || ( aUpdateFlags & INITIAL_ADD ) ) && !m_pendingScanAll )
+    {
+        const int idx = aData->m_cachedIndex;
+
+        if( aData->m_view != this )
+        {
+            // A data reference shares m_allItems with the owning view
+            m_pendingItems.clear();
+            m_pendingScanAll = true;
+        }
+        else if( idx >= 0 && idx < (int) m_allItems->size() && ( *m_allItems )[idx] == aItem )
+        {
+            m_pendingItems.push_back( idx );
+        }
+        // else the item has no layers and is not in m_allItems, so no update would reach it
+    }
+
+    aData->m_requiredUpdate |= aUpdateFlags;
+    m_hasPendingItemUpdates = true;
 }
 
 
@@ -1915,10 +2006,7 @@ void VIEW::UpdateAllItems( int aUpdateFlags )
     for( VIEW_ITEM* item : *m_allItems )
     {
         if( item && item->viewPrivData() )
-        {
-            item->viewPrivData()->m_requiredUpdate |= aUpdateFlags;
-            m_hasPendingItemUpdates = true;
-        }
+            requireUpdate( item, item->viewPrivData(), aUpdateFlags );
     }
 }
 
@@ -1937,10 +2025,7 @@ void VIEW::UpdateAllItemsConditionally( int aUpdateFlags,
         if( aCondition( item ) )
         {
             if( item->viewPrivData() )
-            {
-                item->viewPrivData()->m_requiredUpdate |= aUpdateFlags;
-                m_hasPendingItemUpdates = true;
-            }
+                requireUpdate( item, item->viewPrivData(), aUpdateFlags );
         }
     }
 }
@@ -1954,13 +2039,7 @@ void VIEW::UpdateAllItemsConditionally( std::function<int( VIEW_ITEM* )> aItemFl
             continue;
 
         if( item->viewPrivData() )
-        {
-            int flags = aItemFlagsProvider( item );
-            item->viewPrivData()->m_requiredUpdate |= flags;
-
-            if( flags != NONE )
-                m_hasPendingItemUpdates = true;
-        }
+            requireUpdate( item, item->viewPrivData(), aItemFlagsProvider( item ) );
     }
 }
 
@@ -1972,6 +2051,7 @@ std::unique_ptr<VIEW> VIEW::DataReference() const
     ret->m_allItems = m_allItems;
     ret->m_layers = m_layers;
     ret->m_hasPendingItemUpdates = m_hasPendingItemUpdates;
+    ret->m_pendingScanAll = m_hasPendingItemUpdates;
     ret->SortOrderedLayers();
     return ret;
 }
@@ -2065,8 +2145,7 @@ void VIEW::Update( const VIEW_ITEM* aItem, int aUpdateFlags ) const
 
     assert( aUpdateFlags != NONE );
 
-    viewData->m_requiredUpdate |= aUpdateFlags;
-    m_hasPendingItemUpdates = true;
+    requireUpdate( aItem, viewData, aUpdateFlags );
 }
 
 
