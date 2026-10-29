@@ -27,6 +27,7 @@ using namespace std::placeholders;
 #include <pcb_display_options.h>
 #include <pcb_painter.h>
 #include <footprint.h>
+#include <board.h>
 
 namespace KIGFX {
 PCB_VIEW::PCB_VIEW() :
@@ -47,6 +48,28 @@ PCB_VIEW::PCB_VIEW() :
 
 PCB_VIEW::~PCB_VIEW()
 {
+}
+
+
+bool PCB_VIEW::lodContextChanged()
+{
+    const PCB_RENDER_SETTINGS* settings = static_cast<PCB_PAINTER*>( GetPainter() )->GetSettings();
+    LOD_CONTEXT                context;
+
+    context.settings = settings;
+    context.highContrast = settings->GetHighContrast();
+    context.highContrastLayers = settings->GetHighContrastLayers();
+    context.contrastModeDisplay = static_cast<int>( settings->m_ContrastModeDisplay );
+    context.printing = settings->IsPrinting();
+    context.forceShowFields = settings->m_ForceShowFieldsWhenFPSelected;
+    context.visibleLayers = m_board->GetVisibleLayers();
+    context.enabledLayers = m_board->GetEnabledLayers();
+
+    if( context == m_lodContext )
+        return false;
+
+    m_lodContext = std::move( context );
+    return true;
 }
 
 

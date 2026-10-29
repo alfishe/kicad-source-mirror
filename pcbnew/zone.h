@@ -233,6 +233,8 @@ public:
 
     double ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const override;
 
+    bool ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const override;
+
     void SetFillMode( ZONE_FILL_MODE aFillMode );
 
     ZONE_FILL_MODE GetFillMode() const { return m_fillMode; }

@@ -1615,6 +1615,13 @@ double PCB_SHAPE::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 }
 
 
+bool PCB_SHAPE::ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const
+{
+    // The constraint shadow follows the live constrained-item set
+    return aLayer != LAYER_CONSTRAINT_SHADOW;
+}
+
+
 std::vector<int> PCB_SHAPE::ViewGetLayers() const
 {
     std::vector<int> layers;

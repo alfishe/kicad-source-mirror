@@ -154,6 +154,17 @@ public:
         return LOD_SHOW;
     }
 
+    /**
+     * Return true if ViewGetLOD() for \a aLayer depends only on this item, on the layer
+     * visibility of \a aView and on the view's LOD context (see VIEW::lodContextChanged()).
+     *
+     * The VIEW then keeps the value until the item is updated or that state changes.
+     */
+    virtual bool ViewLODCacheable( int aLayer, const VIEW* aView ) const
+    {
+        return false;
+    }
+
     VIEW_ITEM_DATA* viewPrivData() const
     {
         return m_viewPrivData;

@@ -1019,6 +1019,13 @@ double PCB_DIMENSION_BASE::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) co
 }
 
 
+bool PCB_DIMENSION_BASE::ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const
+{
+    // The constraint shadow follows the live constrained-item set
+    return aLayer != LAYER_CONSTRAINT_SHADOW;
+}
+
+
 double PCB_DIMENSION_BASE::GetCoverageArea( int aTextMargin ) const
 {
     // A dimension covers its whole drawing, not only the value text it inherits from

@@ -335,6 +335,8 @@ public:
 
     double ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const override;
 
+    bool ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const override;
+
     double Similarity( const BOARD_ITEM& aBoardItem ) const override;
 
     bool operator==( const PCB_SHAPE& aShape ) const;

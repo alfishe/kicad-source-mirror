@@ -303,6 +303,12 @@ double PCB_TEXT::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 }
 
 
+bool PCB_TEXT::ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const
+{
+    return true;
+}
+
+
 void PCB_TEXT::GetMsgPanelInfo( EDA_DRAW_FRAME* aFrame, std::vector<MSG_PANEL_ITEM>& aList )
 {
     FOOTPRINT* parentFP = GetParentFootprint();

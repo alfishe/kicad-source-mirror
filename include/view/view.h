@@ -823,6 +823,25 @@ protected:
     /// Redraw contents within rectangle \a aRect.
     void redrawRect( const BOX2I& aRect );
 
+    /// Return true if a subclass supplies a LOD context, which enables the LOD cache.
+    virtual bool lodCacheable() const { return false; }
+
+    /**
+     * Compare the non-visibility state ViewGetLOD() reads (render settings, the document's
+     * layers) with the value stored by the previous call, store the new value and return true
+     * if it changed.
+     */
+    virtual bool lodContextChanged() { return false; }
+
+    /// Forget the stored LOD context (the view's items are being removed).
+    virtual void clearLODContext() {}
+
+    /// Start a new LOD cache epoch if the layer visibility or the LOD context changed.
+    void refreshLODEpoch();
+
+    /// ViewGetLOD() of \a aItem on \a aLayer, cached for items that allow it (only while m_lodStore).
+    double itemLOD( VIEW_ITEM* aItem, int aLayer );
+
     inline void markTargetClean( int aTarget )
     {
         wxCHECK( aTarget < TARGETS_NUMBER, /* void */ );
@@ -932,6 +951,16 @@ protected:
     bool                               m_mirrorY;
     BASE_SET                           m_layerVisibilityCache;
     BASE_SET                           m_layerCachedFlagCache;
+
+    /// Layer visibility the current LOD cache epoch was started with.
+    BASE_SET                           m_lodVisibility;
+
+    /// LOD cache epoch, unique across views since items can be shared; 0 when the cache is off.
+    uint32_t                           m_lodEpoch;
+
+    /// False in a frame that started a new epoch: a context that changes every frame (a toggle
+    /// held down, a bench) is not worth storing.
+    bool                               m_lodStore;
 
     /// PAINTER contains information how do draw items.
     PAINTER* m_painter;

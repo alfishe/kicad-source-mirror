@@ -37,6 +37,7 @@
 #include <gal/graphics_abstraction_layer.h>
 #include <gal/painter.h>
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -61,11 +62,14 @@ public:
         m_drawPriority( 0 ),
         m_cachedIndex( -1 ),
         m_groups( nullptr ),
-        m_groupsSize( 0 ) {}
+        m_groupsSize( 0 ),
+        m_lodEpoch( 0 ),
+        m_lods( nullptr ) {}
 
     ~VIEW_ITEM_DATA()
     {
         deleteGroups();
+        delete[] m_lods;
     }
 
     int GetFlags() const
@@ -171,6 +175,7 @@ private:
     void saveLayers( const std::vector<int>& aLayers )
     {
         m_layers.clear();
+        m_lodEpoch = 0;
 
         for( int layer : aLayers )
         {
@@ -213,10 +218,22 @@ private:
     std::pair<int, int>* m_groups;           ///< layer_number:group_id pairs for each layer the
                                              ///< item occupies.
     int                  m_groupsSize;
+    uint32_t             m_lodEpoch;         ///< VIEW epoch m_lods belong to, 0 = none.
 
     std::vector<int>     m_layers;           /// Stores layer numbers used by the item.
 
-    BOX2I                m_bbox;             /// Cached inserted Bbox for faster removals.
+    struct LOD_SLOT
+    {
+        int    layer;
+        double lod;
+    };
+
+    /// The number of entries in [0].layer, then a layer of m_layers with its ViewGetLOD()
+    /// (LOD_UNKNOWN or LOD_UNCACHEABLE when not stored).  The layers are kept here too so the
+    /// draw walk reads one buffer, and a single pointer keeps the item data in its size class.
+    LOD_SLOT*            m_lods;
+
+    VIEW_RTREE::KEY      m_bbox;             /// The box the item was inserted with, for removals.
 };
 
 
@@ -240,6 +257,9 @@ VIEW::VIEW() :
     m_mirrorX( false ), m_mirrorY( false ),
     m_layerVisibilityCache( VIEW_MAX_LAYERS ),
     m_layerCachedFlagCache( VIEW_MAX_LAYERS ),
+    m_lodVisibility( VIEW_MAX_LAYERS ),
+    m_lodEpoch( 0 ),
+    m_lodStore( false ),
     m_painter( nullptr ),
     m_gal( nullptr ),
     m_useDrawPriority( false ),
@@ -247,6 +267,7 @@ VIEW::VIEW() :
     m_reverseDrawOrder( false ),
     m_hasPendingItemUpdates( false )
 {
+
     // Set m_boundary to define the max area size. The default area size
     // is defined here as the max value of a int.
     // this is a default value acceptable for Pcbnew and Gerbview, but too large for Eeschema.
@@ -312,7 +333,7 @@ void VIEW::Add( VIEW_ITEM* aItem, int aDrawPriority )
     aItem->m_viewPrivData->m_view = this;
     aItem->m_viewPrivData->m_drawPriority = aDrawPriority;
     const BOX2I bbox = aItem->ViewBBox();
-    aItem->m_viewPrivData->m_bbox = bbox;
+    aItem->m_viewPrivData->m_bbox = VIEW_RTREE::Key( bbox );
     aItem->m_viewPrivData->m_cachedIndex = m_allItems->size();
 
     std::vector<int> layers = aItem->ViewGetLayers();
@@ -370,7 +391,7 @@ void VIEW::AddBatch( const std::vector<VIEW_ITEM*>& aItems )
         item->m_viewPrivData->m_view = this;
         item->m_viewPrivData->m_drawPriority = drawPriority;
         const BOX2I bbox = item->ViewBBox();
-        item->m_viewPrivData->m_bbox = bbox;
+        item->m_viewPrivData->m_bbox = VIEW_RTREE::Key( bbox );
         item->m_viewPrivData->m_cachedIndex = m_allItems->size();
 
         std::vector<int> layers = item->ViewGetLayers();
@@ -467,7 +488,7 @@ void VIEW::unlinkItem( VIEW_ITEM* aItem )
             }
         }
 
-        const BOX2I* bbox = &aItem->m_viewPrivData->m_bbox;
+        const VIEW_RTREE::KEY& bbox = aItem->m_viewPrivData->m_bbox;
 
         for( int layer : aItem->m_viewPrivData->m_layers )
         {
@@ -829,6 +850,7 @@ void VIEW::ReorderLayerData( std::unordered_map<int, int> aReorderMap )
         m_hasPendingItemUpdates = true;
     }
 
+    m_lodEpoch = 0;
     UpdateItems();
 }
 
@@ -1149,7 +1171,8 @@ struct VIEW::DRAW_ITEM_VISITOR
             return true;
         }
 
-        const double itemLOD = aItem->ViewGetLOD( layer, view );
+        const double itemLOD = view->m_lodStore ? view->itemLOD( aItem, layer )
+                                                : aItem->ViewGetLOD( layer, view );
 
         // Conditions that have to be fulfilled for an item to be drawn
         bool drawCondition = aItem->viewPrivData()->isRenderable() && itemLOD < view->m_scale;
@@ -1202,6 +1225,7 @@ struct VIEW::DRAW_ITEM_VISITOR
 void VIEW::redrawRect( const BOX2I& aRect )
 {
     SyncLayerVisibilityCache();
+    refreshLODEpoch();
 
     RENDER_STATS* stats = RENDER_STATS::Active();
 
@@ -1377,6 +1401,8 @@ void VIEW::Clear()
     }
 
     m_allItems->clear();
+    m_lodEpoch = 0;
+    clearLODContext();
 
     for( auto& [_, layer] : m_layers )
         layer.items->RemoveAll();
@@ -1473,6 +1499,8 @@ void VIEW::clearGroupCache()
 
 void VIEW::invalidateItem( VIEW_ITEM* aItem, int aUpdateFlags )
 {
+    aItem->viewPrivData()->m_lodEpoch = 0;
+
     // updateLayers updates geometry too, so we do not have to update both of them at the
     // same time
     if( aUpdateFlags & LAYERS )
@@ -1602,12 +1630,13 @@ void VIEW::updateBbox( VIEW_ITEM* aItem )
     // copied before the m_bbox overwrite that follows rather than aliased to it. Otherwise
     // a moved item is removed with the wrong box and the R-tree falls back to a full-tree
     // search instead of the targeted removal.
-    const BOX2I  old_bbox = aItem->m_viewPrivData->m_bbox;
+    const VIEW_RTREE::KEY old_bbox = aItem->m_viewPrivData->m_bbox;
+    const VIEW_RTREE::KEY new_key = VIEW_RTREE::Key( new_bbox );
 
-    if( new_bbox == old_bbox )
+    if( new_key == old_bbox )
         return;
 
-    aItem->m_viewPrivData->m_bbox = new_bbox;
+    aItem->m_viewPrivData->m_bbox = new_key;
 
     for( int layer : layers )
     {
@@ -1617,8 +1646,8 @@ void VIEW::updateBbox( VIEW_ITEM* aItem )
             continue;
 
         VIEW_LAYER& l = it->second;
-        l.items->Remove( aItem, &old_bbox );
-        l.items->Insert( aItem, new_bbox );
+        l.items->Remove( aItem, old_bbox );
+        l.items->Insert( aItem, new_key );
         MarkTargetDirty( l.target );
     }
 }
@@ -1635,11 +1664,11 @@ void VIEW::updateLayers( VIEW_ITEM* aItem )
     std::vector<int> newLayers = aItem->ViewGetLayers();
 
     // If neither the layers nor the bbox have changed, skip the expensive R-tree operations
-    if( newLayers == viewData->m_layers && new_bbox == viewData->m_bbox )
+    if( newLayers == viewData->m_layers && VIEW_RTREE::Key( new_bbox ) == viewData->m_bbox )
         return;
 
     // Remove the item from previous layer set
-    const BOX2I& old_bbox = aItem->m_viewPrivData->m_bbox;
+    const VIEW_RTREE::KEY old_bbox = aItem->m_viewPrivData->m_bbox;
 
     for( int layer : aItem->m_viewPrivData->m_layers )
     {
@@ -1649,7 +1678,7 @@ void VIEW::updateLayers( VIEW_ITEM* aItem )
             continue;
 
         VIEW_LAYER& l = it->second;
-        l.items->Remove( aItem, &old_bbox );
+        l.items->Remove( aItem, old_bbox );
         MarkTargetDirty( l.target );
 
         if( IsCached( l.id ) )
@@ -1665,7 +1694,7 @@ void VIEW::updateLayers( VIEW_ITEM* aItem )
         }
     }
 
-    aItem->m_viewPrivData->m_bbox = new_bbox;
+    aItem->m_viewPrivData->m_bbox = VIEW_RTREE::Key( new_bbox );
     viewData->saveLayers( newLayers );
 
     for( int layer : newLayers )
@@ -1804,7 +1833,7 @@ void VIEW::UpdateItems()
                 continue;
 
             const BOX2I bbox = item->ViewBBox();
-            item->m_viewPrivData->m_bbox = bbox;
+            item->m_viewPrivData->m_bbox = VIEW_RTREE::Key( bbox );
 
             std::vector<int> layers = item->ViewGetLayers();
             item->viewPrivData()->saveLayers( layers );
@@ -2099,6 +2128,91 @@ void VIEW::SyncLayerVisibilityCache()
         m_layerVisibilityCache[ layer.first ] = layer.second.visible;
         m_layerCachedFlagCache[ layer.first ] = (layer.second.target == TARGET_CACHED);
     }
+}
+
+
+// Every frame walks the item data of the whole view: past 96 bytes a size class costs ~3% a frame
+static_assert( sizeof( VIEW_ITEM_DATA ) <= 96, "VIEW_ITEM_DATA outgrew its allocation size class" );
+
+
+static constexpr double LOD_UNKNOWN = -1.0;
+static constexpr double LOD_UNCACHEABLE = -2.0;
+
+
+void VIEW::refreshLODEpoch()
+{
+    static std::atomic<uint32_t> s_epochs( 0 );
+
+    if( !lodCacheable() )
+    {
+        m_lodEpoch = 0;
+        m_lodStore = false;
+        return;
+    }
+
+    bool changed = lodContextChanged();
+
+    m_lodStore = !changed && m_lodEpoch != 0 && m_lodVisibility == m_layerVisibilityCache;
+
+    if( !m_lodStore )
+    {
+        m_lodVisibility = m_layerVisibilityCache;
+
+        do
+        {
+            m_lodEpoch = ++s_epochs;
+        } while( m_lodEpoch == 0 );
+    }
+}
+
+
+double VIEW::itemLOD( VIEW_ITEM* aItem, int aLayer )
+{
+    VIEW_ITEM_DATA* data = aItem->viewPrivData();
+
+    if( data->m_requiredUpdate != NONE )
+        return aItem->ViewGetLOD( aLayer, this );
+
+    if( data->m_lodEpoch != m_lodEpoch )
+    {
+        const int count = (int) data->m_layers.size();
+
+        if( !data->m_lods || data->m_lods[0].layer != count )
+        {
+            delete[] data->m_lods;
+            data->m_lods = new VIEW_ITEM_DATA::LOD_SLOT[count + 1];
+            data->m_lods[0].layer = count;
+        }
+
+        for( int i = 0; i < count; ++i )
+            data->m_lods[i + 1] = { data->m_layers[i], LOD_UNKNOWN };
+
+        data->m_lodEpoch = m_lodEpoch;
+    }
+
+    VIEW_ITEM_DATA::LOD_SLOT* slot = data->m_lods + 1;
+    VIEW_ITEM_DATA::LOD_SLOT* end = slot + data->m_lods[0].layer;
+
+    while( slot != end && slot->layer != aLayer )
+        ++slot;
+
+    if( slot == end )
+        return aItem->ViewGetLOD( aLayer, this );
+
+    double& cached = slot->lod;
+
+    if( cached == LOD_UNCACHEABLE )
+        return aItem->ViewGetLOD( aLayer, this );
+
+    if( cached == LOD_UNKNOWN )
+    {
+        const double lod = aItem->ViewGetLOD( aLayer, this );
+
+        cached = aItem->ViewLODCacheable( aLayer, this ) ? lod : LOD_UNCACHEABLE;
+        return lod;
+    }
+
+    return cached;
 }
 
 } // namespace KIGFX

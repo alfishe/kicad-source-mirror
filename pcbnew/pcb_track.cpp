@@ -2481,6 +2481,13 @@ double PCB_TRACK::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 }
 
 
+bool PCB_TRACK::ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const
+{
+    // The netname test clips the track to the viewport
+    return !IsNetnameLayer( aLayer );
+}
+
+
 const BOX2I PCB_TRACK::ViewBBox() const
 {
     BOX2I bbox = GetBoundingBox();
@@ -2664,6 +2671,20 @@ double PCB_VIA::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
     }
 
     return LOD_SHOW;
+}
+
+
+bool PCB_VIA::ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const
+{
+    // Netnames follow FlashLayer(), which asks the connectivity when unconnected layers are removed
+    if( IsNetnameLayer( aLayer ) )
+    {
+        const UNCONNECTED_LAYER_MODE mode = Padstack().UnconnectedLayerMode();
+
+        return mode == UNCONNECTED_LAYER_MODE::KEEP_ALL || mode == UNCONNECTED_LAYER_MODE::START_END_ONLY;
+    }
+
+    return true;
 }
 
 

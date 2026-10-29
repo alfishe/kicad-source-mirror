@@ -2902,6 +2902,20 @@ double PAD::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 }
 
 
+bool PAD::ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const
+{
+    // Netnames follow FlashLayer(), which asks the connectivity when unconnected layers are removed
+    if( IsNetnameLayer( aLayer ) )
+    {
+        const UNCONNECTED_LAYER_MODE mode = m_padStack.UnconnectedLayerMode();
+
+        return mode == UNCONNECTED_LAYER_MODE::KEEP_ALL || mode == UNCONNECTED_LAYER_MODE::START_END_ONLY;
+    }
+
+    return true;
+}
+
+
 const BOX2I PAD::ViewBBox() const
 {
     // Bounding box includes soldermask too. Remember mask and/or paste margins can be < 0

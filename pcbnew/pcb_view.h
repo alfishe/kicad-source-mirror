@@ -52,6 +52,33 @@ public:
                                std::initializer_list<KICAD_T> aTypes );
 
     void UpdateDisplayOptions( const PCB_DISPLAY_OPTIONS& aOptions );
+
+    /// Set the board whose items are shown, which enables the LOD cache.
+    void SetBoard( const BOARD* aBoard ) { m_board = aBoard; }
+
+protected:
+    bool lodCacheable() const override { return m_board != nullptr; }
+    bool lodContextChanged() override;
+    void clearLODContext() override { m_board = nullptr; }
+
+private:
+    /// The render settings and board state the items' ViewGetLOD() reads.
+    struct LOD_CONTEXT
+    {
+        const void*   settings = nullptr;
+        bool          highContrast = false;
+        std::set<int> highContrastLayers;
+        int           contrastModeDisplay = 0;
+        bool          printing = false;
+        bool          forceShowFields = false;
+        LSET          visibleLayers;
+        LSET          enabledLayers;
+
+        bool operator==( const LOD_CONTEXT& aOther ) const = default;
+    };
+
+    const BOARD* m_board = nullptr;
+    LOD_CONTEXT  m_lodContext;
 };
 
 }

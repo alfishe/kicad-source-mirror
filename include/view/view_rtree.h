@@ -41,6 +41,21 @@ class VIEW_ITEM;
 class VIEW_RTREE
 {
 public:
+    /// The integer box an item is indexed with.
+    struct KEY
+    {
+        int min[2];
+        int max[2];
+
+        bool operator==( const KEY& aOther ) const = default;
+    };
+
+    static KEY Key( const BOX2I& aBox )
+    {
+        return { { std::min( aBox.GetX(), aBox.GetRight() ), std::min( aBox.GetY(), aBox.GetBottom() ) },
+                 { std::max( aBox.GetX(), aBox.GetRight() ), std::max( aBox.GetY(), aBox.GetBottom() ) } };
+    }
+
     /**
      * Insert an item into the tree.
      *
@@ -48,12 +63,12 @@ public:
      */
     void Insert( VIEW_ITEM* aItem, const BOX2I& bbox )
     {
-        const int mmin[2] = { std::min( bbox.GetX(), bbox.GetRight() ),
-                              std::min( bbox.GetY(), bbox.GetBottom() ) };
-        const int mmax[2] = { std::max( bbox.GetX(), bbox.GetRight() ),
-                              std::max( bbox.GetY(), bbox.GetBottom() ) };
+        Insert( aItem, Key( bbox ) );
+    }
 
-        m_tree.Insert( mmin, mmax, aItem );
+    void Insert( VIEW_ITEM* aItem, const KEY& aKey )
+    {
+        m_tree.Insert( aKey.min, aKey.max, aItem );
     }
 
     /**
@@ -65,11 +80,7 @@ public:
     {
         if( aBbox )
         {
-            const int mmin[2] = { std::min( aBbox->GetX(), aBbox->GetRight() ),
-                                  std::min( aBbox->GetY(), aBbox->GetBottom() ) };
-            const int mmax[2] = { std::max( aBbox->GetX(), aBbox->GetRight() ),
-                                  std::max( aBbox->GetY(), aBbox->GetBottom() ) };
-            m_tree.Remove( mmin, mmax, aItem );
+            Remove( aItem, Key( *aBbox ) );
             return;
         }
 
@@ -78,6 +89,12 @@ public:
         const int mmin[2] = { INT_MIN, INT_MIN };
         const int mmax[2] = { INT_MAX, INT_MAX };
         m_tree.Remove( mmin, mmax, aItem );
+    }
+
+    /// Remove an item inserted with \a aKey.
+    void Remove( VIEW_ITEM* aItem, const KEY& aKey )
+    {
+        m_tree.Remove( aKey.min, aKey.max, aItem );
     }
 
     /**

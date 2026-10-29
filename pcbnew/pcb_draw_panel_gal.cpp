@@ -309,6 +309,7 @@ void PCB_DRAW_PANEL_GAL::DisplayBoard( BOARD* aBoard, PROGRESS_REPORTER* aReport
     }
 
     m_view->AddBatch( viewItems );
+    static_cast<KIGFX::PCB_VIEW*>( m_view )->SetBoard( aBoard );
 
     aBoard->UpdateBoardOutline();
     m_view->Add( aBoard->BoardOutline() );

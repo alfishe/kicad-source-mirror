@@ -317,6 +317,13 @@ double PCB_FIELD::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 }
 
 
+bool PCB_FIELD::ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const
+{
+    // A selection change of the parent footprint updates its fields in the view
+    return aView != nullptr;
+}
+
+
 EDA_ITEM* PCB_FIELD::Clone() const
 {
     return new PCB_FIELD( *this );

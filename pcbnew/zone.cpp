@@ -768,6 +768,12 @@ double ZONE::ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const
 }
 
 
+bool ZONE::ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const
+{
+    return true;
+}
+
+
 bool ZONE::IsOnLayer( PCB_LAYER_ID aLayer ) const
 {
     std::lock_guard<std::mutex> lock( m_layerSetMutex );

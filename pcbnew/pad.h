@@ -1048,6 +1048,8 @@ public:
 
     double ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const override;
 
+    bool ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const override;
+
     virtual const BOX2I ViewBBox() const override;
 
     void ClearZoneLayerOverrides();

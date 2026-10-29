@@ -217,6 +217,8 @@ public:
 
     double ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const override;
 
+    bool ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const override;
+
     const BOX2I ViewBBox() const override;
 
     /**
@@ -620,6 +622,8 @@ public:
     std::vector<int> ViewGetLayers() const override;
 
     double ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const override;
+
+    bool ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const override;
 
     void Flip( const VECTOR2I& aCentre, FLIP_DIRECTION aFlipDirection ) override;
 

@@ -341,6 +341,8 @@ public:
 
     double ViewGetLOD( int aLayer, const KIGFX::VIEW* aView ) const override;
 
+    bool ViewLODCacheable( int aLayer, const KIGFX::VIEW* aView ) const override;
+
     void ClearRenderCache() override;
 
     double GetCoverageArea( int aTextMargin ) const override;
