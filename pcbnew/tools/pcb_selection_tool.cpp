@@ -4022,8 +4022,8 @@ void PCB_SELECTION_TOOL::RebuildSelection()
 
     bool enteredGroupFound = false;
 
-    INSPECTOR_FUNC inspector =
-            [&]( EDA_ITEM* item, void* testData )
+    auto inspect =
+            [&]( EDA_ITEM* item )
             {
                 if( item->IsSelected() )
                 {
@@ -4031,7 +4031,7 @@ void PCB_SELECTION_TOOL::RebuildSelection()
 
                     // Let selected parents handle their children.
                     if( parent && parent->IsSelected() )
-                        return INSPECT_RESULT::CONTINUE;
+                        return;
 
                     highlight( item, SELECTED, &m_selection );
                 }
@@ -4048,12 +4048,81 @@ void PCB_SELECTION_TOOL::RebuildSelection()
                         item->ClearFlags( ENTERED );
                     }
                 }
-
-                return INSPECT_RESULT::CONTINUE;
             };
 
-    board()->Visit( inspector, nullptr, m_isFootprintEditor ? GENERAL_COLLECTOR::FootprintItems
-                                                            : GENERAL_COLLECTOR::AllBoardItems );
+    if( m_isFootprintEditor )
+    {
+        INSPECTOR_FUNC inspector =
+                [&]( EDA_ITEM* item, void* )
+                {
+                    inspect( item );
+                    return INSPECT_RESULT::CONTINUE;
+                };
+
+        board()->Visit( inspector, nullptr, GENERAL_COLLECTOR::FootprintItems );
+    }
+    else
+    {
+        // The items and the order of BOARD::Visit() with GENERAL_COLLECTOR::AllBoardItems,
+        // without matching every item against the type list
+        auto inspectDrawing =
+                [&]( BOARD_ITEM* item )
+                {
+                    inspect( item );
+
+                    if( item->Type() == PCB_TABLE_T || IsGeneratedTableType( item->Type() ) )
+                    {
+                        for( PCB_TABLECELL* cell : static_cast<PCB_TABLE*>( item )->GetCells() )
+                            inspect( cell );
+                    }
+                };
+
+        BOARD* brd = board();
+
+        for( PCB_MARKER* marker : brd->Markers() )
+            inspect( marker );
+
+        for( FOOTPRINT* fp : brd->Footprints() )
+        {
+            for( BOARD_ITEM* item : fp->GraphicalItems() )
+                inspectDrawing( item );
+
+            for( PAD* pad : fp->Pads() )
+                inspect( pad );
+
+            for( PCB_FIELD* field : fp->GetFields() )
+                inspect( field );
+
+            inspect( fp );
+
+            for( PCB_GROUP* group : fp->Groups() )
+                inspect( group );
+
+            for( ZONE* zone : fp->Zones() )
+                inspect( zone );
+
+            for( PCB_POINT* point : fp->Points() )
+                inspect( point );
+        }
+
+        for( BOARD_ITEM* item : brd->Drawings() )
+            inspectDrawing( item );
+
+        for( PCB_TRACK* track : brd->Tracks() )
+            inspect( track );
+
+        for( PCB_GROUP* group : brd->Groups() )
+            inspect( group );
+
+        for( ZONE* zone : brd->Zones() )
+            inspect( zone );
+
+        for( PCB_POINT* point : brd->Points() )
+            inspect( point );
+
+        for( PCB_GENERATOR* generator : brd->Generators() )
+            inspect( generator );
+    }
 
     if( !enteredGroupFound )
     {
