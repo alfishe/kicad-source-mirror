@@ -3711,11 +3711,156 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return false;
     };
 
-    // Via spots to leave an end: out of the package first (away from its body, past the pad's end,
-    // a little to either side), then around the end; nearest the other end first within each kind
+    // inward_escapes: parts whose row pads may also leave inward, through a via in the ring between
+    // the row and the exposed pad (the largest pad, inside the row) where the ring is wide enough
+    std::map<const FOOTPRINT*, PAD*> inwardParts;
+
+    if( aArgs.contains( "inward_escapes" ) )
+    {
+        if( !aArgs["inward_escapes"].is_array() )
+            return KOPENAPI_RESULT::Error( 400, "inward_escapes: [footprint references]" );
+
+        for( const nlohmann::json& r : aArgs["inward_escapes"] )
+        {
+            FOOTPRINT* fp = r.is_string() ? board->FindFootprintByReference( wxString::FromUTF8( r.get<std::string>() ) ) : nullptr;
+
+            if( !fp )
+                return KOPENAPI_RESULT::Error( 404, "inward_escapes: no footprint " + ( r.is_string() ? r.get<std::string>() : r.dump() ) );
+
+            PAD*   ep = nullptr;
+            double epArea = 0, rowArea = 0;
+
+            for( PAD* q : fp->Pads() )
+            {
+                const double area = (double) q->GetBoundingBox().GetWidth() * q->GetBoundingBox().GetHeight();
+
+                if( area > epArea )
+                {
+                    rowArea = std::max( rowArea, epArea );
+                    epArea = area;
+                    ep = q;
+                }
+                else
+                {
+                    rowArea = std::max( rowArea, area );
+                }
+            }
+
+            BOX2I ring;
+
+            for( PAD* q : fp->Pads() )
+            {
+                if( q != ep )
+                    ring.Merge( q->GetBoundingBox() );
+            }
+
+            if( !ep || fp->Pads().size() < 5 || epArea < 4 * rowArea || !ring.Contains( ep->GetBoundingBox() ) )
+            {
+                return KOPENAPI_RESULT::Error( 400, "inward_escapes: " + str( fp->GetReference() )
+                                                            + " has no exposed pad inside its pad row" );
+            }
+
+            inwardParts[fp] = ep;
+        }
+    }
+
+    std::set<std::pair<int, int>> inwardSpots;   // via spots in a ring, to name them in the rows
+
+    // spots in the ring between aPad's inner end and the exposed pad aEp (aDir: aPad's way out of the
+    // package), nearest the pad first, in front of the pad and between it and each neighbour; none in
+    // the straight way from a pad of the exposed pad's net to it (its ground connection)
+    auto ringSpots = [&]( PAD* aPad, PAD* aEp, const VECTOR2D& aDir )
+    {
+        std::vector<VECTOR2I> out;
+
+        if( aEp->GetNetCode() > 0 && aPad->GetNetCode() == aEp->GetNetCode() )
+            return out;
+
+        const int grid = pcbIUScale.mmToIU( 0.05 );
+        const int clear = std::max( ds.m_MinClearance, 0 );
+        int       dia = ds.GetCurrentViaSize();
+        NETCLASS* netclass = aPad->GetEffectiveNetClass();
+
+        if( netclass && netclass->HasViaDiameter() )
+            dia = std::min( dia, netclass->GetViaDiameter() );
+
+        const BOX2I epBox = aEp->GetBoundingBox();
+
+        // a pad's inner end, the way into the package and the gap from there to the exposed pad
+        auto innerOf = [&]( PAD* aQ, VECTOR2D& aIn, double& aGap )
+        {
+            const BOX2I    box = aQ->GetBoundingBox();
+            const VECTOR2D d = VECTOR2D( box.Centre() ) - VECTOR2D( epBox.Centre() );
+            const bool     x = std::abs( d.x ) * epBox.GetHeight() >= std::abs( d.y ) * epBox.GetWidth();
+
+            aIn = x ? VECTOR2D( d.x >= 0 ? -1 : 1, 0 ) : VECTOR2D( 0, d.y >= 0 ? -1 : 1 );
+
+            const VECTOR2D end = VECTOR2D( box.Centre() ) + aIn * ( x ? box.GetWidth() / 2.0 : box.GetHeight() / 2.0 );
+            aGap = x ? ( aIn.x > 0 ? epBox.GetLeft() - end.x : end.x - epBox.GetRight() )
+                     : ( aIn.y > 0 ? epBox.GetTop() - end.y : end.y - epBox.GetBottom() );
+            return end;
+        };
+
+        std::vector<std::pair<SEG, int>> ground;   // a ground pad's way to the exposed pad, its half width
+
+        for( PAD* q : aPad->GetParentFootprint()->Pads() )
+        {
+            if( q == aEp || aEp->GetNetCode() <= 0 || q->GetNetCode() != aEp->GetNetCode() )
+                continue;
+
+            VECTOR2D     in;
+            double       gap = 0;
+            const VECTOR2D end = innerOf( q, in, gap );
+            const BOX2I  qb = q->GetBoundingBox();
+            const int    across = in.x != 0 ? qb.GetHeight() : qb.GetWidth();
+
+            if( gap > 0 )
+                ground.emplace_back( SEG( VECTOR2I( end ), VECTOR2I( end + in * gap ) ), across / 2 );
+        }
+
+        VECTOR2D       in;
+        double         gap = 0;
+        const VECTOR2D end = innerOf( aPad, in, gap );
+        const VECTOR2D across( -in.y, in.x );
+        const double   pitch = pitchOf( aPad );
+
+        // the opposite of the outward way the caller found means the same side
+        if( in.x != -aDir.x || in.y != -aDir.y )
+            return out;
+
+        for( double d = dia / 2.0 + clear; d <= gap - dia / 2.0 - clear; d += grid )
+        {
+            for( double side : { 0.0, pitch / 2, -pitch / 2 } )
+            {
+                const VECTOR2D p = end + in * d + across * side;
+                const VECTOR2I at( KiROUND( p.x / grid ) * grid, KiROUND( p.y / grid ) * grid );
+                const bool     cuts = std::any_of( ground.begin(), ground.end(), [&]( const std::pair<SEG, int>& g )
+                                                   { return g.first.Distance( at ) < g.second + clear + dia / 2; } );
+
+                if( !cuts )
+                    out.push_back( at );
+            }
+        }
+
+        return out;
+    };
+
+    // a routed connection through a ring spot names it
+    auto noteInward = [&]( const ROUTE_REQUEST& aReq, nlohmann::json& aAttempt )
+    {
+        for( const auto& [at, layer] : aReq.vias )
+        {
+            if( inwardSpots.count( { at.x, at.y } ) )
+                aAttempt["inward_via_mm"] = { pcbIUScale.IUTomm( at.x ), pcbIUScale.IUTomm( at.y ) };
+        }
+    };
+
+    // Via spots to leave an end: inward into the ring of an inward_escapes part first, out of the
+    // package next (away from its body, past the pad's end, a little to either side), then around the
+    // end; nearest the other end first within each kind
     auto spots = [&]( BOARD_CONNECTED_ITEM* aEnd, const VECTOR2I& aPos, const VECTOR2I& aToward )
     {
-        std::vector<VECTOR2I> outward, around;
+        std::vector<VECTOR2I> inward, outward, around;
         const int             grid = pcbIUScale.mmToIU( 0.05 );
         auto                  snap = [&]( const VECTOR2D& p )
         {
@@ -3747,6 +3892,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                              + across * pcbIUScale.mmToIU( side ) ) );
                 }
             }
+
+            if( auto it = inwardParts.find( fp ); it != inwardParts.end() && pad != it->second )
+                inward = ringSpots( pad, it->second, dir );
         }
 
         const BOX2I box = aEnd->GetBoundingBox();
@@ -3781,11 +3929,19 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             return false;
         };
 
+        inward.erase( std::remove_if( inward.begin(), inward.end(), unusable ), inward.end() );
         outward.erase( std::remove_if( outward.begin(), outward.end(), unusable ), outward.end() );
         around.erase( std::remove_if( around.begin(), around.end(), unusable ), around.end() );
         std::stable_sort( around.begin(), around.end(), byTarget );
 
         std::vector<VECTOR2I> out;
+
+        // the ring spots nearest the pad, at most 3
+        for( size_t i = 0; i < inward.size() && i < 3; ++i )
+        {
+            out.push_back( inward[i] );
+            inwardSpots.insert( { inward[i].x, inward[i].y } );
+        }
 
         // the outward spots in their order (the closest escape first), at most 6, then 3 around
         for( size_t i = 0; i < outward.size() && out.size() < 6; ++i )
@@ -4208,6 +4364,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         aTries++;
                         ok = routeOne( *context, req, aAttempt, added );
 
+                        if( ok )
+                            noteInward( req, aAttempt );
+
                         if( !ok && stoppedBefore( v ) )
                             deadFirstVia.insert( { v.x, v.y } );
                         else if( !ok && stoppedAfter() )
@@ -4254,6 +4413,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         aAttempt = nlohmann::json::object();
                         aTries++;
                         ok = routeOne( *context, req, aAttempt, added );
+
+                        if( ok )
+                            noteInward( req, aAttempt );
 
                         if( !ok && stoppedBefore( va ) )
                             deadFirstVia.insert( { va.x, va.y } );
@@ -5246,6 +5408,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             row["length_mm"] = attempt["metrics"]["length_mm"];
             row["vias"] = attempt["metrics"].value( "vias", 0 );
             row["detour"] = attempt["metrics"]["detour"];
+
+            if( attempt.contains( "inward_via_mm" ) )
+                row["inward_via_mm"] = attempt["inward_via_mm"];
 
             if( attempt.contains( "necked_from_mm" ) )
                 row["necked_from_mm"] = attempt["necked_from_mm"];
@@ -6631,6 +6796,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     row["length_mm"] = attempt["metrics"]["length_mm"];
                     row["vias"] = attempt["metrics"].value( "vias", 0 );
                     row["detour"] = attempt["metrics"]["detour"];
+
+                    if( attempt.contains( "inward_via_mm" ) )
+                        row["inward_via_mm"] = attempt["inward_via_mm"];
                     continue;
                 }
             }
@@ -6996,6 +7164,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     row["length_mm"] = attempt["metrics"]["length_mm"];
                     row["vias"] = attempt["metrics"].value( "vias", 0 );
                     row["detour"] = attempt["metrics"]["detour"];
+
+                    if( attempt.contains( "inward_via_mm" ) )
+                        row["inward_via_mm"] = attempt["inward_via_mm"];
 
                     // copper of an earlier call laid again: listed, and its net is one this call moved
                     auto earlier = [&]( size_t aJob, const nlohmann::json* aAttempt )
@@ -7396,6 +7567,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 row["length_mm"] = attempt["metrics"]["length_mm"];
                 row["vias"] = vias;
                 row["detour"] = attempt["metrics"]["detour"];
+
+                if( attempt.contains( "inward_via_mm" ) )
+                    row["inward_via_mm"] = attempt["inward_via_mm"];
                 continue;
             }
 
@@ -11598,7 +11772,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (0.65 mm or closer) is routed no wider than that pad's narrow side (not below the Default class width or the board minimum) when its class is wider; the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
-                        "escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (0.65 mm or closer) on the edge of its package is kept open while its connection waits: room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},
+                        "inward_escapes":{"type":"array","items":{"type":"string"},"description":"footprint references of packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). 404 an unknown reference, 400 a part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (0.65 mm or closer) on the edge of its package is kept open while its connection waits: room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},
                         "plan":{"type":"boolean","default":true,"description":"a connection the router does not find on a layer is planned over the free space (grid search with vias, the board's clearances), the router follows the plan; no plan found: no escape-spot tries either (row plan tells)"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
                         "style":{"type":"string","enum":["direct","rail"],"default":"direct","description":"rail (power nets): every connection leaves its pads through a via next to them and runs on the second layer"},
