@@ -606,7 +606,7 @@ bool OPTIMIZER::mergeFull( LINE* aLine )
         if( step > max_step )
             step = max_step;
 
-        if( step < 1 )
+        if( step < 1 || ROUTER::GetInstance()->Settings().StopRequested() )
             break;
 
         bool found_anything = mergeStep( aLine, current_path, step );
@@ -862,8 +862,13 @@ bool OPTIMIZER::mergeStep( LINE* aLine, SHAPE_LINE_CHAIN& aCurrentPath, int step
     DIRECTION_45 orig_end( aLine->CSegment( -1 ), is90mode );
 
 
+    const ROUTING_SETTINGS& settings = ROUTER::GetInstance()->Settings();
+
     for( int n = 0; n < n_segs - step; n++ )
     {
+        if( settings.StopRequested() )
+            return false;
+
         // Do not attempt to merge false segments that are part of an arc
         if( aCurrentPath.IsArcSegment( n )
             || aCurrentPath.IsArcSegment( static_cast<std::size_t>( n ) + step ) )
