@@ -516,7 +516,8 @@ KOPENAPI_REGISTER( "job_get",
                    R"json({"type":"object","required":["job_id"],"properties":{
                         "job_id":{"type":"string"},
                         "wait_s":{"type":"integer","minimum":0,"maximum":600,"default":0},
-                        "since":{"type":"integer","minimum":0,"description":"answer once the job's rev is past this (with wait_s)"}}})json"_json,
+                        "since":{"type":"integer","minimum":0,"description":"answer once the job's rev is past this (with wait_s)"},
+                        "summary":{"type":"boolean","default":false,"description":"the result cut to what to act on: of rows with routed (pcb_route results) only the failed ones, without their fields over 1.5 kB but strings; other arrays their first 20 entries; each cut counted in <key>_omitted"}}})json"_json,
                    false, h_job_served );
 
 KOPENAPI_REGISTER( "job_cancel",

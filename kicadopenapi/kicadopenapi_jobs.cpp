@@ -557,6 +557,25 @@ bool KopenapiJobCancelled()
 }
 
 
+void KopenapiJobStopSelf( const std::string& aWhy )
+{
+    {
+        std::lock_guard<std::mutex> lock( g_mutex );
+        std::shared_ptr<JOB>        self = g_current ? g_current : g_call;
+
+        if( !self || self->cancel.exchange( true ) )
+            return;
+
+        self->stopReason = aWhy;
+        self->rev++;
+        wxLogMessage( "api call %s: stopping: %s", self->method, aWhy );
+    }
+
+    g_changed.notify_all();
+    KopenapiEventNotify( "job" );
+}
+
+
 void KopenapiStopAll( const std::string& aWhy )
 {
     {
@@ -756,6 +775,63 @@ bool KOPENAPI_JOBS::Wait( const std::string& aId, std::chrono::milliseconds aFor
 }
 
 
+/// @brief A result cut to what a reader acts on: rows that carry "routed" keep the failed ones
+/// (fields over 1.5 kB but strings dropped), other arrays their first 20 entries; each cut is counted
+/// in <key>_omitted
+static nlohmann::json summarized( const nlohmann::json& aResult )
+{
+    if( !aResult.is_object() )
+        return aResult;
+
+    nlohmann::json out = nlohmann::json::object();
+
+    for( const auto& [key, value] : aResult.items() )
+    {
+        if( !value.is_array() )
+        {
+            out[key] = value;
+            continue;
+        }
+
+        const bool rows = !value.empty() && value.front().is_object() && value.front().contains( "routed" );
+        nlohmann::json kept = nlohmann::json::array();
+        size_t         omitted = 0;
+
+        for( const nlohmann::json& item : value )
+        {
+            if( rows ? item.value( "routed", false ) : kept.size() >= 20 )
+            {
+                omitted++;
+                continue;
+            }
+
+            if( !rows || !item.is_object() )
+            {
+                kept.push_back( item );
+                continue;
+            }
+
+            nlohmann::json row = nlohmann::json::object();
+
+            for( const auto& [field, v] : item.items() )
+            {
+                if( v.is_string() || v.dump().size() <= 1500 )
+                    row[field] = v;
+            }
+
+            kept.push_back( row );
+        }
+
+        out[key] = kept;
+
+        if( omitted )
+            out[key + "_omitted"] = omitted;
+    }
+
+    return out;
+}
+
+
 KOPENAPI_RESULT KOPENAPI_JOBS::Status( const nlohmann::json& aArgs )
 {
     const std::string id = aArgs.value( "job_id", std::string() );
@@ -774,7 +850,12 @@ KOPENAPI_RESULT KOPENAPI_JOBS::Status( const nlohmann::json& aArgs )
     g_changed.wait_for( lock, std::chrono::seconds( waitS ),
                         [&] { return job->Finished() || ( bySince && (int64_t) job->rev > since ); } );
 
-    return KOPENAPI_RESULT::Ok( describe( *job, true ) );
+    nlohmann::json out = describe( *job, true );
+
+    if( aArgs.value( "summary", false ) && out.contains( "result" ) )
+        out["result"] = summarized( out["result"] );
+
+    return KOPENAPI_RESULT::Ok( out );
 }
 
 

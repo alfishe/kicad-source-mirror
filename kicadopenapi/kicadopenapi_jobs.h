@@ -50,6 +50,10 @@ KICOMMON_API nlohmann::json KopenapiRunningProgress();
 /// @brief The running job was asked to stop (job_cancel, Esc, a window close)
 KICOMMON_API bool KopenapiJobCancelled();
 
+/// @brief The running job or plain call stops itself, as job_cancel with apply (what it did is kept);
+/// aWhy becomes its stop_reason.  Any thread
+KICOMMON_API void KopenapiJobStopSelf( const std::string& aWhy );
+
 /// @brief The service stops: every queued or running job is cancelled (as job_cancel) and the
 /// running plain call is asked to stop at its next safe point (KopenapiJobStep / KopenapiJobProgress
 /// / KopenapiJobCancelled answer stop).  Any thread

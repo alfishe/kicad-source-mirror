@@ -3206,9 +3206,27 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     std::optional<std::chrono::steady_clock::time_point> tryDeadline;
     std::string budgetName = "first_pass_budget_s";
 
+    // stop_on_plateau_s: no connection more routed for that long stops the call as job_cancel does
+    // (what is routed is kept)
+    const double plateauS = std::clamp( aArgs.value( "stop_on_plateau_s", 0.0 ), 0.0, 86400.0 );
+    int          plateauBest = -1;
+    auto         plateauSince = std::chrono::steady_clock::now();
+    bool         plateauStopped = false;
+
+    auto plateauCheck = [&]( const std::chrono::steady_clock::time_point& aNow )
+    {
+        if( plateauS > 0 && !plateauStopped && std::chrono::duration<double>( aNow - plateauSince ).count() > plateauS )
+        {
+            plateauStopped = true;
+            KopenapiJobStopSelf( "stop_on_plateau_s: no connection routed for " + mmText( plateauS ) + " s" );
+        }
+    };
+
     auto overTime = [&]()
     {
-        return KopenapiJobCancelled() || ( tryDeadline && std::chrono::steady_clock::now() > *tryDeadline );
+        const auto now = std::chrono::steady_clock::now();
+        plateauCheck( now );
+        return KopenapiJobCancelled() || ( tryDeadline && now > *tryDeadline );
     };
 
     profile.stop = overTime;
@@ -4227,8 +4245,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( ok || !planning || rail || ways.empty() || aTries >= maxTries )
                 return;
 
-            const WAY&       way = ways.front();
-            const ROUTE_PLAN plan = makePlan( planRequest( way.from, way.to, way.toPos ) );
+            const WAY&               way = ways.front();
+            const ROUTE_PLAN_REQUEST asked = planRequest( way.from, way.to, way.toPos );
+            const ROUTE_PLAN         plan = makePlan( asked );
 
             planned = plan.found ? 1 : 0;
 
@@ -4256,6 +4275,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         if( !own || t->GetNetCode() == way.from->GetNetCode() || !t->IsOnLayer( layer )
                             || !area.Intersects( t->GetBoundingBox() )
                             || !t->GetEffectiveShape( layer )->Collide( own.get(), pcbIUScale.mmToIU( 1.0 ), &actual ) )
+                        {
+                            continue;
+                        }
+
+                        // copper a track of the plan's width passes beside at its clearance does not shut the end in
+                        if( actual >= asked.trackWidth + std::max( netClearance( way.from, ds.m_MinClearance ),
+                                                             netClearance( t, ds.m_MinClearance ) ) )
                         {
                             continue;
                         }
@@ -4289,12 +4315,71 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     list += ( list.empty() ? "" : ", " ) + what;
                 }
 
+                // the cause, when one can be named: the clearance to its own row neighbours, else the ways
+                // out kept open for other nets' fine-pitch pads (the plan finds a way without them)
+                std::string cause;
+                std::string causeKind;
+
+                if( end->Type() == PCB_PAD_T && pitchOf( static_cast<PAD*>( end ) ) <= pcbIUScale.mmToIU( 0.65 ) )
+                {
+                    if( const int fit = padEntryFit( board, static_cast<PAD*>( end ), way.from->GetNetCode() );
+                        fit < ds.m_TrackMinWidth )
+                    {
+                        causeKind = "pad_clearance";
+                        cause = "the clearance to its neighbour pads leaves " + ( fit == INT_MAX ? std::string( "no" ) : mmText( toMm( std::max( fit, 0 ) ) ) + " mm" )
+                                + " for a track, under the board minimum " + mmText( toMm( ds.m_TrackMinWidth ) ) + " mm";
+                    }
+                }
+
+                if( cause.empty() )
+                {
+                    ROUTE_PLAN_REQUEST open = asked;
+
+                    if( !open.keepOut.empty() )
+                    {
+                        open.keepOut.clear();
+                        const ROUTE_PLAN freed = makePlan( open );
+
+                        if( freed.found || freed.boxedEnd != plan.boxedEnd )
+                        {
+                            std::string pads;
+                            int         shown = 0, count = 0;
+                            BOX2I       near = end->GetBoundingBox();
+                            near.Inflate( pcbIUScale.mmToIU( 1.5 ) );
+
+                            for( const ESCAPE_FRONT& front : fronts )
+                            {
+                                if( !front.open || front.pad->GetNetCode() == way.from->GetNetCode()
+                                    || !near.Intersects( front.shape.BBox() ) )
+                                {
+                                    continue;
+                                }
+
+                                count++;
+
+                                if( shown++ < 6 )
+                                    pads += ( pads.empty() ? "" : ", " ) + endName( front.pad );
+                            }
+
+                            causeKind = "escapes_kept";
+                            cause = "the ways out kept open for other nets' fine-pitch pads shut it in"
+                                    + ( pads.empty() ? std::string() : " (" + pads + ( count > shown ? ", ..." : "" ) + ")" )
+                                    + "; escapes: false or routing those pads first frees it";
+                        }
+                    }
+                }
+
                 aAttempt["boxed_in"] = { { "end", endName( end ) },
                                          { "which", plan.boxedEnd == 1 ? "start" : "target" },
                                          { "room_cells", plan.boxedRoom },
                                          { "by", by } };
+
+                if( !causeKind.empty() )
+                    aAttempt["boxed_in"]["cause"] = causeKind;
+
                 aAttempt["boxed_reason"] = std::string( plan.boxedEnd == 1 ? "start " : "target " ) + endName( end )
                                            + " is boxed in: no way out of it at this width and clearance"
+                                           + ( cause.empty() ? std::string() : ": " + cause )
                                            + ( list.empty() ? std::string() : ", by " + list );
             }
 
@@ -4606,7 +4691,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 aAttempt["budget"] = budgetName;
             }
 
-            aAttempt["reason"] = std::string( KopenapiJobCancelled() ? "stopped (job_cancel)" : "the connection's " + budgetName + " ran out" )
+            aAttempt["reason"] = std::string( KopenapiJobCancelled() ? ( plateauStopped ? "stopped (stop_on_plateau_s)" : "stopped (job_cancel)" ) : "the connection's " + budgetName + " ran out" )
                                  + " after " + std::to_string( aTries ) + " tries; last: " + aAttempt.value( "reason", std::string( "-" ) );
         }
         else if( !ok && aTries >= maxTries )
@@ -5316,6 +5401,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( !row.value( "trunk", false ) )
                 ( ok ? routed : failed )++;
         }
+
+        if( routed > plateauBest )
+        {
+            plateauBest = routed;
+            plateauSince = now;
+        }
+
+        plateauCheck( now );
 
         const int connections = (int) ( jobs.size() - trunks.size() + gaps.size()
                                         - std::count_if( jobs.begin(), jobs.end(), []( const JOB& j ) { return j.foreign; } ) );
@@ -8167,6 +8260,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "diff_pairs_skipped", pairsSkipped },
                               { "dry_run", dryRun },
                               { "stopped", KopenapiJobCancelled() },
+                              { "stopped_on_plateau", plateauStopped },
                               { "unrouted_left", openAtEnd->connections },
                               { "unrouted_connections", openAtEnd->connections },
                               { "unrouted_nets", openAtEnd->nets },
@@ -11984,6 +12078,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "rip_ups_planned: rip-ups whose routes a plan chose; rip_ups_second: routes taken out that had no way back "
                    "and moved others in turn; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at); "
+                   "a row whose end is shut in has boxed_in (end, which, by: other nets' copper nearer than a track of its width needs, and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
                    "pairs_stuck: pair tries ended when nothing was placed after 3 steps; pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way); sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
@@ -12001,7 +12096,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
                         "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it); a detour over 1.6 x follows a plan through vias instead when that is a quarter shorter, a via counted as 2 mm (kept when a fifth shorter); clean_up: tried / skipped / kept / vias_removed / via_ways / vias_added / shortened_mm; rows cleaned"},
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
-                        "first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
+                        "stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does: what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
                         "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},

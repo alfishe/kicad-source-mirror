@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <condition_variable>
 #include <ctime>
@@ -485,11 +486,17 @@ const json kBridgeMethods = json::parse(R"json([
    "summary": "Route all following calls to another running KiCad instance, by pid or port.",
    "inputSchema": {"type": "object", "properties": {
        "pid": {"type": "integer"}, "port": {"type": "integer"}}}},
+  {"name": "instance_stop", "gui_only": false,
+   "summary": "Stop a headless KiCad instance (by pid or port), started by this bridge or not: it is asked to shut down, killed after 5 s. Refused while it has unsaved changes unless discard: true. A GUI instance is closed through its own menu (app_quit), never here.",
+   "inputSchema": {"type": "object", "properties": {
+       "pid": {"type": "integer"}, "port": {"type": "integer"},
+       "discard": {"type": "boolean", "default": false, "description": "stop it even with unsaved changes (they are lost)"}}}},
   {"name": "instance_start", "gui_only": false,
    "summary": "Start a new KiCad instance and route following calls to it. mode=headless (no windows, fast; stopped after the idle timeout unless it has unsaved changes) or gui (visible editor windows, never stopped by the bridge).",
    "inputSchema": {"type": "object", "required": ["mode"], "properties": {
        "mode": {"type": "string", "enum": ["headless", "gui"]},
        "path": {"type": "string", "description": "Optional .kicad_pro/.kicad_sch/.kicad_pcb to open"},
+       "build": {"type": "string", "description": "Optional build to run instead of the bridge's own: a build directory (its kicad/KiCad.app on macOS, kicad/ elsewhere), an .app bundle or the directory of the executables. The answer gives the executable started and its build time"},
        "select": {"type": "boolean", "default": true}}}}
 ])json");
 
@@ -545,7 +552,8 @@ private:
     /// @brief After app_restart: wait for the new process on the same port and bind to it
     bool FollowRestart();
     bool EnsureBound(std::string& error);
-    std::optional<bridge::Instance> Start(const std::string& mode, const std::string& path, std::string& error);
+    std::optional<bridge::Instance> Start(const std::string& mode, const std::string& path, std::string& error,
+                                          const std::string& build = {}, json* started = nullptr);
 
     /// @brief Forward one request line; std::nullopt on transport failure (error already emitted)
     /// aProgressToken (string or number): the instance's progress meanwhile as notifications/progress
@@ -601,17 +609,63 @@ fs::path Bridge::NewLogFile(const std::string& mode)
                        + std::to_string(++m_logCounter) + ".log");
 }
 
-std::optional<bridge::Instance> Bridge::Start(const std::string& mode, const std::string& path, std::string& error)
+/// @brief The executable aName of the build aBuild (see instance_start "build"); empty if none is there
+fs::path BuildExecutable(const fs::path& aBuild, const std::string& aName)
 {
+    const std::string exe = platform::ExecutableName(aName);
+    const fs::path    tries[] = {aBuild / "kicad" / "KiCad.app" / "Contents" / "MacOS" / exe,
+                                 aBuild / "Contents" / "MacOS" / exe, aBuild / "kicad" / exe, aBuild / exe};
+    std::error_code   ec;
+
+    for (const fs::path& p : tries)
+    {
+        if (fs::is_regular_file(p, ec))
+        {
+            return p;
+        }
+    }
+    return {};
+}
+
+std::optional<bridge::Instance> Bridge::Start(const std::string& mode, const std::string& path, std::string& error,
+                                              const std::string& build, json* started)
+{
+    fs::path exe = mode == "headless" ? m_cfg.kicadCli : m_cfg.kicad;
+    if (!build.empty())
+    {
+        exe = BuildExecutable(build, mode == "headless" ? "kicad-cli" : "kicad");
+        if (exe.empty())
+        {
+            error = "no " + std::string(mode == "headless" ? "kicad-cli" : "kicad") + " executable in build " + build;
+            return std::nullopt;
+        }
+    }
+
     std::vector<std::string> argv;
     if (mode == "headless")
     {
         // --parent-pid: the server exits when the bridge dies without cleaning up (hard kill)
-        argv = {m_cfg.kicadCli.string(), "openapi-server", "--parent-pid", std::to_string(platform::CurrentPid())};
+        argv = {exe.string(), "openapi-server", "--parent-pid", std::to_string(platform::CurrentPid())};
     }
     else
     {
-        argv = {m_cfg.kicad.string()};
+        argv = {exe.string()};
+    }
+
+    if (started)
+    {
+        std::error_code ec;
+        const auto      when = fs::last_write_time(exe, ec);
+        (*started)["executable"] = exe.string();
+        if (!ec)
+        {
+            const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                    when - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+            const std::time_t t = std::chrono::system_clock::to_time_t(sys);
+            char              text[32] = {};
+            std::strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+            (*started)["built"] = text;
+        }
     }
     if (!path.empty())
     {
@@ -954,6 +1008,58 @@ json Bridge::CallBridgeMethod(const std::string& name, const json& args)
         return ToolResult({{"selected", InstanceJson(*inst)}});
     }
 
+    if (name == "instance_stop")
+    {
+        const std::string policy = args.contains("pid")    ? "pid:" + std::to_string(args.value("pid", 0L))
+                                   : args.contains("port") ? "port:" + std::to_string(args.value("port", 0))
+                                                           : "";
+        if (policy.empty())
+        {
+            return ToolResult({{"error", "give pid or port"}}, true);
+        }
+        std::optional<bridge::Instance> inst = bridge::Select(bridge::Discover(m_cfg.discoveryDir), policy);
+        if (!inst)
+        {
+            return ToolResult({{"error", "no running instance with " + policy}}, true);
+        }
+        if (!inst->headless)
+        {
+            return ToolResult({{"error", "pid " + std::to_string(inst->pid) + " is a GUI instance: close it through its "
+                                         "menu (app_quit)"}}, true);
+        }
+
+        std::string host;
+        int         port = 0;
+        std::string path;
+        json        status;
+        if (bridge::ParseUrl(inst->url + "/api/v1/status", host, port, path))
+        {
+            bridge::HttpResult got = bridge::Get(host, port, path, 2);
+            status = got.ok ? json::parse(got.body, nullptr, false) : json();
+        }
+        const bool unsaved = status.is_object() && status.value("unsaved", false);
+        if (unsaved && !args.value("discard", false))
+        {
+            return ToolResult({{"error", "pid " + std::to_string(inst->pid) + " has unsaved changes: save them, or "
+                                         "instance_stop {discard: true}"},
+                               {"documents", status.value("documents", json::array())}}, true);
+        }
+
+        // the caller holds m_mutex
+        if (inst->pid == m_pid)
+        {
+            Unbind();
+        }
+        if (m_children.erase(inst->pid))
+        {
+            UntrackHeadless(inst->pid);
+        }
+        m_dying.push_back(inst->pid);
+        bridge::Stop(*inst, std::chrono::seconds(5));
+        return ToolResult({{"stopped", InstanceJson(*inst)}, {"discarded", unsaved},
+                           {"exited", !platform::ProcessAlive(inst->pid)}});
+    }
+
     // instance_start
     const std::string mode = args.value("mode", std::string());
     if (mode != "headless" && mode != "gui")
@@ -961,7 +1067,9 @@ json Bridge::CallBridgeMethod(const std::string& name, const json& args)
         return ToolResult({{"error", "mode must be 'headless' or 'gui'"}}, true);
     }
     std::string error;
-    std::optional<bridge::Instance> inst = Start(mode, args.value("path", std::string()), error);
+    json                            build = json::object();
+    std::optional<bridge::Instance> inst =
+            Start(mode, args.value("path", std::string()), error, args.value("build", std::string()), &build);
     if (!inst)
     {
         return ToolResult({{"error", error}}, true);
@@ -970,7 +1078,7 @@ json Bridge::CallBridgeMethod(const std::string& name, const json& args)
     {
         BindTo(*inst, "instance_start");
     }
-    return ToolResult({{"started", InstanceJson(*inst)}, {"selected", args.value("select", true)}});
+    return ToolResult({{"started", InstanceJson(*inst)}, {"build", build}, {"selected", args.value("select", true)}});
 }
 
 json Bridge::Search(const std::string& line, const json& args)
