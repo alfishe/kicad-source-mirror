@@ -7537,9 +7537,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     // Clean-up: a routed connection with vias or a detour is routed again alone on a layer both
     // ends are on (walkaround: it moves nothing else); kept when it has fewer vias, or as many and
-    // is 5 % shorter, and no connection of its net is left cut; else put back as it was
-    int cleanTried = 0, cleanSkipped = 0, cleanKept = 0, viasRemoved = 0;
+    // is 5 % shorter, and no connection of its net is left cut; else put back as it was.  A long
+    // detour (over 1.6 x the straight line) follows a plan through vias instead when that plan is a
+    // quarter shorter (a via counted as 2 mm of track); kept when it is a fifth shorter so counted
+    int cleanTried = 0, cleanSkipped = 0, cleanKept = 0, viasRemoved = 0, viasAdded = 0, viaWays = 0;
     double shortenedIU = 0;
+    const double viaCost = pcbIUScale.mmToIU( 2.0 );
 
     if( !dryRun && !rail && !grid && aArgs.value( "clean_up", true ) )
     {
@@ -7627,12 +7630,29 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             const std::vector<PCB_TRACK*> chain = chainOf( job );
 
-            if( shared.empty() || chain.empty() )
+            if( chain.empty() )
+                continue;
+
+            const double direct = ( job.toPos - job.from->GetPosition() ).EuclideanNorm();
+            ROUTE_PLAN   viaPlan;
+
+            if( planning && viasAllowed && c.length > 1.6 * direct )
+            {
+                ROUTE_PLAN plan = makePlan( planRequest( job.from, job.to, job.toPos ) );
+
+                if( plan.found && plan.vias > 0
+                    && plan.length + viaCost * plan.vias < 0.75 * ( c.length + viaCost * c.vias ) )
+                {
+                    viaPlan = std::move( plan );
+                }
+            }
+
+            if( !viaPlan.found && shared.empty() )
                 continue;
 
             // the free space must hold a way on those layers that could win (the net's own copper
             // is no obstacle to the plan, so the chain stays until then)
-            if( planning )
+            if( planning && !viaPlan.found )
             {
                 ROUTE_PLAN_REQUEST req = planRequest( job.from, job.to, job.toPos );
                 req.layers = shared;
@@ -7670,7 +7690,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             nlohmann::json attempt;
             bool           ok = false;
 
-            for( PCB_LAYER_ID layer : shared )
+            if( viaPlan.found )
+            {
+                ROUTE_REQUEST req{ job.from, job.to, job.toPos, viaPlan.startLayer, PNS::RM_Walkaround, false, {} };
+                req.fronts = &fronts;
+                req.neckWidth = neckFor( job.from, job.to );
+                req.vias = viaPlan.points;
+                req.planned = true;
+                ok = routeOne( *context, req, attempt, added );
+            }
+
+            for( PCB_LAYER_ID layer : viaPlan.found ? std::vector<PCB_LAYER_ID>() : shared )
             {
                 for( bool reverse : { false, true } )
                 {
@@ -7709,7 +7739,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         length += t->GetLength();
                 }
 
-                ok = vias < c.vias || ( vias == c.vias && length < 0.95 * c.length );
+                ok = viaPlan.found ? length + viaCost * vias < 0.8 * ( c.length + viaCost * c.vias )
+                                   : vias < c.vias || ( vias == c.vias && length < 0.95 * c.length );
             }
 
             // every routed connection of the net still joined
@@ -7734,7 +7765,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( ok )
             {
                 cleanKept++;
-                viasRemoved += c.vias - vias;
+                viasRemoved += std::max( c.vias - vias, 0 );
+                viasAdded += std::max( vias - c.vias, 0 );
+                viaWays += viaPlan.found;
                 shortenedIU += c.length - length;
 
                 nlohmann::json& row = results[rowOf[c.index]];
@@ -8072,7 +8105,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "rip_up", { { "tried", rippedTried }, { "won", rippedOk }, { "scope", ripScope },
                                             { "earlier_routes_movable", foreignJobs },
                                             { "earlier_routes_rerouted", foreignMoved } } },
-                              { "clean_up", { { "tried", cleanTried }, { "skipped", cleanSkipped }, { "kept", cleanKept }, { "vias_removed", viasRemoved },
+                              { "clean_up", { { "tried", cleanTried }, { "skipped", cleanSkipped }, { "kept", cleanKept }, { "vias_removed", viasRemoved }, { "via_ways", viaWays }, { "vias_added", viasAdded },
                                               { "shortened_mm", std::round( pcbIUScale.IUTomm( shortenedIU ) * 1000.0 ) / 1000.0 } } },
                               { "stubs_removed", stubs },
                               { "doubled_removed", twins },
@@ -11914,7 +11947,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "layers":{"type":"array","items":{"type":"string"},"default":["F.Cu","B.Cu"]},
                         "order":{"type":"string","enum":["short_first","power_first","dense_first"],"default":"short_first","description":"dense_first: connections at fine-pitch pads (<= 0.65 mm) first"},
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
-                        "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it; clean_up: tried / skipped / kept / vias_removed / shortened_mm; rows cleaned)"},
+                        "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it); a detour over 1.6 x follows a plan through vias instead when that is a quarter shorter, a via counted as 2 mm (kept when a fifth shorter); clean_up: tried / skipped / kept / vias_removed / via_ways / vias_added / shortened_mm; rows cleaned"},
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
                         "first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
