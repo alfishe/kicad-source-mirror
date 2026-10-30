@@ -7428,6 +7428,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         int            tries = 0;
         bool           ok = false;
 
+        if( ripBudgetS > 0 )
+            tryDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( (long) ( ripBudgetS * 1000 ) );
+
         for( PNS::PNS_MODE mode : { PNS::RM_Walkaround, PNS::RM_Shove } )
         {
             for( PCB_LAYER_ID layer : layers )
@@ -7467,6 +7470,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         results.push_back( row );
     }
+
+    tryDeadline.reset();
 
     // Clean-up: a routed connection with vias or a detour is routed again alone on a layer both
     // ends are on (walkaround: it moves nothing else); kept when it has fewer vias, or as many and
@@ -11848,7 +11853,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "order":{"type":"string","enum":["short_first","power_first","dense_first"],"default":"short_first","description":"dense_first: connections at fine-pitch pads (<= 0.65 mm) first"},
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
                         "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it; clean_up: tried / skipped / kept / vias_removed / shortened_mm; rows cleaned)"},
-                        "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back); spent: the rip-up fails and what it took out goes back; 0 no limit"},
+                        "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
                         "first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
                         "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
