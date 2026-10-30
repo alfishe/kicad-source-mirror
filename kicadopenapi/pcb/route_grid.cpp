@@ -999,6 +999,20 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
             }
         }
 
+        for( const GRID_PARAMS::KEEP_OPEN& open : aParams.keepOpen )
+        {
+            auto shape = std::make_shared<SHAPE_SEGMENT>( open.shape );
+
+            for( int l = 0; l < L; ++l )
+            {
+                if( aParams.layers[l] == open.layer )
+                    mark( shape, sz.clearance + sz.halfWidth + slack, l, open.netCode );
+            }
+
+            if( vias )
+                mark( shape, sz.clearance + sz.viaRadius + slack, L, open.netCode );
+        }
+
         for( PCB_TRACK* t : aBoard->Tracks() )
         {
             copperItem( t, ownerOf( t ), false,
@@ -2095,6 +2109,9 @@ public:
     };
 
     const std::vector<NET_STATE>& Nets() const { return m_nets; }
+
+    /// @brief The net's states shared with another net: 0 legal
+    int Conflicts( int aNet ) const { return conflicts( aNet ); }
     int                           Round() const { return m_round; }
     int                           Conflicting() const { return m_conflicting; }
     int                           Dropped() const { return m_dropped; }
@@ -4505,7 +4522,8 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         }
     }
 
-    // the best: most ends joined, then fewest vias, then shortest; ties to the earlier variant
+    // the best: most ends joined by legal nets (a variant stopped in its rounds still has crowded
+    // ones), then fewest vias, then shortest; ties to the earlier variant
     int    best = -1;
     long   bestReached = -1, bestVias = 0;
     double bestLength = 0;
@@ -4515,8 +4533,13 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
         long   reached = 0, vias = 0;
         double length = 0;
 
-        for( const auto& net : runs[k]->Nets() )
+        for( size_t n = 0; n < runs[k]->Nets().size(); ++n )
         {
+            const auto& net = runs[k]->Nets()[n];
+
+            if( runs[k]->Halted() && runs[k]->Conflicts( (int) n ) > 0 )
+                continue;
+
             reached += std::count( net.reached.begin(), net.reached.end(), true );
             vias += (long) net.vias.size();
 
@@ -4596,7 +4619,18 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
     for( size_t n = 0; n < win.Nets().size(); ++n )
     {
-        result.nets.push_back( toGeometry( world, aParams, win.Nets()[n], n ) );
+        // stopped in its rounds: a crowded net is left out, the rest is legal
+        if( win.Halted() && win.Conflicts( (int) n ) > 0 )
+        {
+            GRID_NET_RESULT out;
+            out.reached.assign( win.Nets()[n].reached.size(), false );
+            result.nets.push_back( std::move( out ) );
+            result.crowdedLeftOut++;
+        }
+        else
+        {
+            result.nets.push_back( toGeometry( world, aParams, win.Nets()[n], n ) );
+        }
 
         if( n < world.nets.size() )
             result.nets.back().walls = world.nets[n].walls;

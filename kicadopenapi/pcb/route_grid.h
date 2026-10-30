@@ -1,5 +1,6 @@
 #pragma once
 
+#include <geometry/shape_segment.h>
 #include <layer_ids.h>
 #include <math/vector2d.h>
 
@@ -61,6 +62,16 @@ struct GRID_PARAMS
     int64_t                   memoryBudget = 0; ///< bytes the lanes may take; 0: half the memory available now
     int                       maxRounds = 40;
     int                       viaKeepOut = 0;  ///< only the chip's own nets' vias this far around it while routing; 0 none
+
+    /// @brief Ways out of pads of nets outside the call kept open: copper of the pad's net to the others
+    struct KEEP_OPEN
+    {
+        PCB_LAYER_ID  layer;
+        SHAPE_SEGMENT shape;
+        int           netCode;
+    };
+
+    std::vector<KEEP_OPEN>    keepOpen;
     int                       viaAway = 0;     ///< a via nearer a chip's pads than this costs more, the nearer the more; 0 none
     int                       viaAwayCost = 0; ///< at the pads: as much as this length of track
     int                       viaNearHole = 0; ///< a via nearer a through hole of its own net than this costs more; 0 none
@@ -163,6 +174,7 @@ struct GRID_RESULT
     std::string                  variant;
     int                          rounds = 0;
     int                          conflictsLeft = 0;   ///< nets dropped to make the rest legal
+    int                          crowdedLeftOut = 0;  ///< stopped in its rounds: crowded nets not given
     int                          cell = 0;
     int64_t                      expanded = 0;
     double                       buildMs = 0;
