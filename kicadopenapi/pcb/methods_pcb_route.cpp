@@ -3371,6 +3371,112 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             return nullptr;
         };
 
+        std::vector<PAD*> netPads;
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            for( PAD* pad : fp->Pads() )
+            {
+                if( pad->GetNetCode() == code )
+                    netPads.push_back( pad );
+            }
+        }
+
+        // a track leaving a pad (an escape stub, one segment or a chain of them) is reached at its
+        // free end: the ratsnest may anchor it next to the pad, where the pad's neighbours wall it in
+        auto stubEnd = [&]( BOARD_CONNECTED_ITEM*& aItem, VECTOR2I& aPos )
+        {
+            if( aItem->Type() != PCB_TRACE_T && aItem->Type() != PCB_ARC_T )
+                return;
+
+            const int eps = pcbIUScale.mmToIU( 0.01 );
+
+            // what else of the net touches point aAt of track aTrack: pads and vias, other tracks
+            auto touching = [&]( const PCB_TRACK* aTrack, const VECTOR2I& aAt, int& aPadsVias,
+                                 std::vector<PCB_TRACK*>& aTracks )
+            {
+                aPadsVias = 0;
+                aTracks.clear();
+
+                for( PAD* pad : netPads )
+                {
+                    if( pad->IsOnLayer( aTrack->GetLayer() ) && pad->HitTest( aAt, eps ) )
+                        aPadsVias++;
+                }
+
+                for( PCB_TRACK* t : board->Tracks() )
+                {
+                    if( t == aTrack || t->GetNetCode() != code )
+                        continue;
+
+                    if( t->Type() == PCB_VIA_T )
+                    {
+                        const PCB_VIA* via = static_cast<const PCB_VIA*>( t );
+
+                        if( ( via->GetPosition() - aAt ).EuclideanNorm() <= via->GetWidth( aTrack->GetLayer() ) / 2 )
+                            aPadsVias++;
+                    }
+                    else if( t->GetLayer() == aTrack->GetLayer()
+                             && ( ( t->GetStart() - aAt ).EuclideanNorm() <= eps
+                                  || ( t->GetEnd() - aAt ).EuclideanNorm() <= eps ) )
+                    {
+                        aTracks.push_back( t );
+                    }
+                }
+            };
+
+            PCB_TRACK*              cur = static_cast<PCB_TRACK*>( aItem );
+            int                     padsVias[2];
+            std::vector<PCB_TRACK*> tracks[2];
+
+            touching( cur, cur->GetStart(), padsVias[0], tracks[0] );
+            touching( cur, cur->GetEnd(), padsVias[1], tracks[1] );
+
+            const bool free0 = !padsVias[0] && tracks[0].empty();
+            const bool free1 = !padsVias[1] && tracks[1].empty();
+
+            if( free0 != free1 )
+            {
+                aPos = free0 ? cur->GetStart() : cur->GetEnd();
+                return;
+            }
+
+            // a chain: from the end on a pad along single joins to an end nothing else touches
+            if( free0 || ( !padsVias[0] && !padsVias[1] ) )
+                return;
+
+            VECTOR2I at = padsVias[0] ? cur->GetEnd() : cur->GetStart();
+            int      side = padsVias[0] ? 1 : 0;
+
+            if( padsVias[side] )
+                return;
+
+            std::vector<PCB_TRACK*> next = tracks[side];
+
+            for( int step = 0; step < 64; ++step )
+            {
+                if( next.empty() )
+                {
+                    aItem = cur;
+                    aPos = at;
+                    return;
+                }
+
+                if( next.size() > 1 )
+                    return;
+
+                PCB_TRACK* t = next.front();
+                at = ( t->GetStart() - at ).EuclideanNorm() <= eps ? t->GetEnd() : t->GetStart();
+                cur = t;
+
+                int pv = 0;
+                touching( cur, at, pv, next );
+
+                if( pv )
+                    return;
+            }
+        };
+
         for( const CN_EDGE& edge : rn->GetEdges() )
         {
             std::shared_ptr<const CN_ANCHOR> a = edge.GetSourceNode(), b = edge.GetTargetNode();
@@ -3384,9 +3490,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( PCB_VIA* v = fannedVia( pa, posA ) )
                 pa = v, posA = v->GetPosition();
+            else
+                stubEnd( pa, posA );
 
             if( PCB_VIA* v = fannedVia( pb, posB ) )
                 pb = v, posB = v->GetPosition();
+            else
+                stubEnd( pb, posB );
 
             if( pa->Type() != PCB_PAD_T )
                 std::swap( pa, pb ), std::swap( posA, posB );
