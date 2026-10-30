@@ -54,6 +54,7 @@
 #include <geometry/shape_line_chain.h>
 #include <geometry/shape_arc.h>
 #include <geometry/shape_simple.h>
+#include <geometry/shape_rect.h>
 #include <geometry/shape_line_chain.h>
 #include <geometry/shape_ellipse.h>
 
@@ -129,7 +130,8 @@ namespace std
 
 // Identifies a pair of items for the temporary clearance cache by their properties (net, layers,
 // kind) instead of their memory address. Items with the same properties get the same clearance
-// from the rules, so they share one cache entry.
+// from the rules, so they share one cache entry. With geometry-dependent rules (intersectsCourtyard
+// and the like) the geometry that decides the rule is part of them (see geometryNear).
 struct TEMP_CLEARANCE_CACHE_KEY
 {
     struct SIDE
@@ -140,11 +142,12 @@ struct TEMP_CLEARANCE_CACHE_KEY
         int         layerEnd;
         int         kind;
         bool        freePad;
+        size_t      geometry;
 
         bool operator==( const SIDE& o ) const
         {
             return boardItem == o.boardItem && net == o.net && layerStart == o.layerStart && layerEnd == o.layerEnd
-                   && kind == o.kind && freePad == o.freePad;
+                   && kind == o.kind && freePad == o.freePad && geometry == o.geometry;
         }
 
         bool operator<( const SIDE& o ) const
@@ -159,7 +162,9 @@ struct TEMP_CLEARANCE_CACHE_KEY
                 return layerEnd < o.layerEnd;
             if( kind != o.kind )
                 return kind < o.kind;
-            return freePad < o.freePad;
+            if( freePad != o.freePad )
+                return freePad < o.freePad;
+            return geometry < o.geometry;
         }
     };
 
@@ -167,21 +172,23 @@ struct TEMP_CLEARANCE_CACHE_KEY
     SIDE B;
     bool Flag;
 
-    static SIDE makeSide( const PNS::ITEM* aItem )
+    static SIDE makeSide( const PNS::ITEM* aItem, size_t aGeometry )
     {
         return SIDE{ (const void*) aItem->BoardItem(),
                      (const void*) aItem->Net(),
                      aItem->Layers().Start(),
                      aItem->Layers().End(),
                      (int) aItem->Kind(),
-                     aItem->IsFreePad() };
+                     aItem->IsFreePad(),
+                     aGeometry };
     }
 
-    TEMP_CLEARANCE_CACHE_KEY( const PNS::ITEM* aA, const PNS::ITEM* aB, bool aFlag ) :
+    TEMP_CLEARANCE_CACHE_KEY( const PNS::ITEM* aA, const PNS::ITEM* aB, bool aFlag, size_t aGeometryA = 0,
+                              size_t aGeometryB = 0 ) :
             Flag( aFlag )
     {
-        SIDE sa = makeSide( aA );
-        SIDE sb = makeSide( aB );
+        SIDE sa = makeSide( aA, aGeometryA );
+        SIDE sb = makeSide( aB, aGeometryB );
 
         // Canonical order so the key is symmetric in (A, B)
         if( sb < sa )
@@ -212,7 +219,7 @@ struct hash<TEMP_CLEARANCE_CACHE_KEY>
         {
             hash_combine( retval, hash<const void*>()( s->boardItem ), hash<const void*>()( s->net ),
                           hash<int>()( s->layerStart ), hash<int>()( s->layerEnd ), hash<int>()( s->kind ),
-                          hash<bool>()( s->freePad ) );
+                          hash<bool>()( s->freePad ), hash<size_t>()( s->geometry ) );
         }
 
         hash_combine( retval, hash<bool>()( k.Flag ) );
@@ -237,6 +244,45 @@ struct HULL_CACHE_KEY
             && layer == other.layer;
     }
 };
+
+// A segment of a temporary line against a board item: the rules seen by that segment alone
+struct SEGMENT_RULE_CACHE_KEY
+{
+    const void* opposing;
+    const void* net;
+    VECTOR2I    start;
+    VECTOR2I    end;
+    size_t      region;     ///< regionState of the segment; then start and end are not part of it
+    int         width;
+    int         layer;
+    int         type;
+    bool        lineFirst;
+
+    bool operator==( const SEGMENT_RULE_CACHE_KEY& o ) const
+    {
+        return opposing == o.opposing && net == o.net && start == o.start && end == o.end && region == o.region
+               && width == o.width
+               && layer == o.layer && type == o.type && lineFirst == o.lineFirst;
+    }
+};
+
+namespace std
+{
+    template <>
+    struct hash<SEGMENT_RULE_CACHE_KEY>
+    {
+        std::size_t operator()( const SEGMENT_RULE_CACHE_KEY& k ) const
+        {
+            size_t retval = 0x5E6C0FFEE0DDF00D;
+            hash_combine( retval, hash<const void*>()( k.opposing ), hash<const void*>()( k.net ),
+                          hash<int>()( k.start.x ), hash<int>()( k.start.y ), hash<int>()( k.end.x ),
+                          hash<int>()( k.end.y ), hash<size_t>()( k.region ), hash<int>()( k.width ),
+                          hash<int>()( k.layer ),
+                          hash<int>()( k.type ), hash<bool>()( k.lineFirst ) );
+            return retval;
+        }
+    };
+}
 
 namespace std
 {
@@ -309,6 +355,15 @@ public:
 private:
     BOARD_ITEM* getBoardItem( const PNS::ITEM* aItem, PCB_LAYER_ID aBoardLayer, int aIdx = 0 );
 
+    /// @brief Hash of the geometry of temporary item aItem that a geometry-dependent rule can see
+    /// against aOther: where its whole shape lies (regionState) or its anchors, and a line's segments
+    /// within reach of aOther (the ones QueryConstraint evaluates); 0 for a board item
+    size_t geometryNear( const PNS::ITEM* aItem, const PNS::ITEM* aOther );
+
+    /// @brief Hash of the courtyards and zones a track (aSeg, aWidth) lies inside or crosses (courtyards
+    /// only), 0 when outside all of them; nullopt when that does not tell (it touches an outline)
+    std::optional<size_t> regionState( const SEG& aSeg, int aWidth );
+
     /// @brief An explicit pair's other net and the polarity of aNet in it (1 P, -1 N); 0 when none
     int explicitPair( PNS::NET_HANDLE aNet, NETINFO_ITEM** aOther ) const;
 
@@ -330,12 +385,27 @@ private:
     // Cached for the routing session: the board's biggest clearance, how far a rule can reach
     std::optional<int> m_biggestClearance;
 
+    // Cached for the routing session: rules whose condition depends on where an item is
+    std::optional<bool> m_geometryRules;
+
+    struct RULE_REGION
+    {
+        BOX2I          box;
+        SHAPE_POLY_SET outline;
+        int            margin;
+        bool           courtyard;
+    };
+
+    // Cached for the routing session: the courtyards and zones geometry-dependent rules test
+    std::optional<std::vector<RULE_REGION>> m_ruleRegions;
+
     int64_t m_clearanceLookups = 0;
     int64_t m_ruleEvaluations = 0;
 
     std::unordered_map<CLEARANCE_CACHE_KEY, int> m_clearanceCache;
     std::unordered_map<TEMP_CLEARANCE_CACHE_KEY, int>    m_tempClearanceCache;
     std::unordered_map<HULL_CACHE_KEY, SHAPE_LINE_CHAIN> m_hullCache;
+    std::unordered_map<SEGMENT_RULE_CACHE_KEY, DRC_CONSTRAINT> m_segmentRuleCache;
 };
 
 
@@ -559,6 +629,9 @@ BOARD_ITEM* PNS_PCBNEW_RULE_RESOLVER::getBoardItem( const PNS::ITEM* aItem, PCB_
         m_dummyTracks[aIdx].SetNet( static_cast<NETINFO_ITEM*>( aItem->Net() ) );
         m_dummyTracks[aIdx].SetStart( aItem->Anchor( 0 ) );
         m_dummyTracks[aIdx].SetEnd( aItem->Anchor( 1 ) );
+        m_dummyTracks[aIdx].SetWidth( aItem->Kind() == PNS::ITEM::LINE_T
+                                              ? static_cast<const PNS::LINE*>( aItem )->Width()
+                                              : static_cast<const PNS::SEGMENT*>( aItem )->Width() );
         return &m_dummyTracks[aIdx];
 
     default:
@@ -671,8 +744,29 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
             useReach = true;
         }
 
+        // A real board item stays the same for the session (the router's dummies do not)
+        const PNS::ITEM* opposingItem = aLineIsFirst ? aItemB : aItemA;
+        const bool       memo = aOpposingItem && opposingItem && opposingItem->BoardItem() == aOpposingItem;
+
         auto evaluate = [&]( const VECTOR2I& aStart, const VECTOR2I& aEnd ) -> bool
         {
+            SEGMENT_RULE_CACHE_KEY key{ aOpposingItem, aLineItem->Net(), aStart,      aEnd, 0,
+                                        line->Width(), board_layer,      hostType,    aLineIsFirst };
+
+            if( memo )
+            {
+                if( std::optional<size_t> state = regionState( SEG( aStart, aEnd ), line->Width() ) )
+                {
+                    key.start = key.end = VECTOR2I();
+                    key.region = *state + 1;
+                }
+
+                auto it = m_segmentRuleCache.find( key );
+
+                if( it != m_segmentRuleCache.end() )
+                    return pickSmallerConstraint( bestConstraint, it->second );
+            }
+
             dummyTrack.SetStart( aStart );
             dummyTrack.SetEnd( aEnd );
 
@@ -681,6 +775,14 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
             DRC_CONSTRAINT segConstraint = aLineIsFirst
                 ? drcEngine->EvalRules( hostType, &dummyTrack, aOpposingItem, board_layer )
                 : drcEngine->EvalRules( hostType, aOpposingItem, &dummyTrack, board_layer );
+
+            if( memo )
+            {
+                if( m_segmentRuleCache.size() > 1000000 )
+                    m_segmentRuleCache.clear();
+
+                m_segmentRuleCache.emplace( key, segConstraint );
+            }
 
             return pickSmallerConstraint( bestConstraint, segConstraint );
         };
@@ -895,11 +997,15 @@ void PNS_PCBNEW_RULE_RESOLVER::ClearCacheForItems( std::vector<const PNS::ITEM*>
 
 void PNS_PCBNEW_RULE_RESOLVER::ClearCaches()
 {
+
     m_clearanceCache.clear();
     m_tempClearanceCache.clear();
     m_hullCache.clear();
+    m_segmentRuleCache.clear();
     m_hasUserPhysicalConstraint.reset();
     m_biggestClearance.reset();
+    m_geometryRules.reset();
+    m_ruleRegions.reset();
 }
 
 
@@ -942,10 +1048,230 @@ bool PNS_PCBNEW_RULE_RESOLVER::HasUserDefinedPhysicalConstraint()
 }
 
 
+size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS::ITEM* aOther )
+{
+    if( aItem->Owner() || aItem->BoardItem() )
+        return 0;
+
+    size_t h = 0x9E3779B97F4A7C15;
+
+    auto add = [&h]( const VECTOR2I& aPt )
+    {
+        hash_combine( h, std::hash<int>()( aPt.x ), std::hash<int>()( aPt.y ) );
+    };
+
+    // Where a track lies against the courtyards and zones when that alone decides the rules,
+    // otherwise its exact geometry
+    auto trackKey = [&]( const VECTOR2I& aA, const VECTOR2I& aB, int aWidth ) -> size_t
+    {
+        if( std::optional<size_t> state = regionState( SEG( aA, aB ), aWidth ) )
+            return *state * 2 + 1;
+
+        size_t k = 0;
+        hash_combine( k, std::hash<int>()( aA.x ), std::hash<int>()( aA.y ), std::hash<int>()( aB.x ),
+                      std::hash<int>()( aB.y ), std::hash<int>()( aWidth ) );
+        return k * 2;
+    };
+
+    auto isMultiSegmentLine = []( const PNS::ITEM* aLine )
+    {
+        return aLine->Kind() == PNS::ITEM::LINE_T && !aLine->BoardItem()
+               && static_cast<const PNS::LINE*>( aLine )->CLine().SegmentCount() > 1;
+    };
+
+    if( aItem->Kind() != PNS::ITEM::SEGMENT_T && aItem->Kind() != PNS::ITEM::LINE_T )
+    {
+        for( int i = 0; i < aItem->AnchorCount(); ++i )
+            add( aItem->Anchor( i ) );
+
+        return h;
+    }
+
+    int width = aItem->Kind() == PNS::ITEM::LINE_T ? static_cast<const PNS::LINE*>( aItem )->Width()
+                                                    : static_cast<const PNS::SEGMENT*>( aItem )->Width();
+
+    // QueryConstraint takes a segment, a one-segment line and a line far from another line whole,
+    // as a track from its first to its last point (getBoardItem)
+    bool whole = !isMultiSegmentLine( aItem );
+
+    if( !whole && isMultiSegmentLine( aOther ) )
+    {
+        const PNS::LINE* other = static_cast<const PNS::LINE*>( aOther );
+        BOX2I            box = static_cast<const PNS::LINE*>( aItem )->CLine().BBox();
+        box.Inflate( std::max( width, other->Width() ) * 2 );
+        whole = !box.Intersects( other->CLine().BBox() );
+    }
+
+    if( whole )
+    {
+        hash_combine( h, std::hash<size_t>()( trackKey( aItem->Anchor( 0 ), aItem->Anchor( 1 ), width ) ) );
+        return h;
+    }
+
+    const PNS::LINE*        line = static_cast<const PNS::LINE*>( aItem );
+    const SHAPE_LINE_CHAIN& chain = line->CLine();
+
+    if( !m_biggestClearance )
+        m_biggestClearance = std::max( m_board->GetDesignSettings().GetBiggestClearanceValue(), 0 );
+
+    if( BOARD_ITEM* other = aOther->BoardItem() )
+    {
+        // the segments evaluateLineSegments evaluates, in its order: the first of equal ones decides
+        BOX2I reach = other->GetBoundingBox();
+        reach.Inflate( width / 2 + *m_biggestClearance );
+
+        std::vector<size_t> seen;
+
+        for( int i = 0; i < chain.SegmentCount(); ++i )
+        {
+            BOX2I segBox( chain.CPoint( i ), VECTOR2I( 0, 0 ) );
+            segBox.Merge( chain.CPoint( i + 1 ) );
+
+            if( !segBox.Intersects( reach ) )
+                continue;
+
+            size_t k = trackKey( chain.CPoint( i ), chain.CPoint( i + 1 ), width );
+
+            if( std::find( seen.begin(), seen.end(), k ) == seen.end() )
+            {
+                seen.push_back( k );
+                hash_combine( h, std::hash<size_t>()( k ) );
+            }
+        }
+
+        hash_combine( h, std::hash<size_t>()( seen.size() ) );
+        return h;
+    }
+
+    BOX2I reach;
+
+    if( aOther->Kind() == PNS::ITEM::LINE_T )
+    {
+        reach = static_cast<const PNS::LINE*>( aOther )->CLine().BBox();
+    }
+    else
+    {
+        for( int i = 0; i < aOther->AnchorCount(); ++i )
+            reach.Merge( aOther->Anchor( i ) );
+    }
+
+    // wider than QueryConstraint's reach: the hash covers every segment it can evaluate, with the
+    // exact points, as which of them it evaluates depends on them
+    reach.Inflate( width + *m_biggestClearance + pcbIUScale.mmToIU( 1.0 ) );
+
+    for( int i = 0; i < chain.SegmentCount(); ++i )
+    {
+        BOX2I segBox( chain.CPoint( i ), VECTOR2I( 0, 0 ) );
+        segBox.Merge( chain.CPoint( i + 1 ) );
+
+        if( segBox.Intersects( reach ) )
+        {
+            add( chain.CPoint( i ) );
+            add( chain.CPoint( i + 1 ) );
+        }
+    }
+
+    return h;
+}
+
+
+std::optional<size_t> PNS_PCBNEW_RULE_RESOLVER::regionState( const SEG& aSeg, int aWidth )
+{
+    if( !m_ruleRegions )
+    {
+        m_ruleRegions.emplace();
+
+        // the rule functions test zones against their outline deflated by the DRC epsilon, with
+        // arcs approximated
+        int zoneMargin = m_board->GetDesignSettings().GetDRCEpsilon() + ARC_LOW_DEF + 1;
+
+        auto addRegion = [&]( SHAPE_POLY_SET aOutline, int aMargin, bool aCourtyard )
+        {
+            aOutline.ClearArcs();
+            BOX2I box = aOutline.BBox();
+            box.Inflate( aMargin );
+            m_ruleRegions->push_back( { box, std::move( aOutline ), aMargin, aCourtyard } );
+        };
+
+        for( FOOTPRINT* fp : m_board->Footprints() )
+        {
+            for( PCB_LAYER_ID side : { F_CrtYd, B_CrtYd } )
+            {
+                const SHAPE_POLY_SET& courtyard = fp->GetCourtyard( side );
+
+                if( courtyard.OutlineCount() > 0 )
+                    addRegion( courtyard, 1, true );
+            }
+
+            for( ZONE* zone : fp->Zones() )
+                addRegion( zone->GetBoardOutline(), zoneMargin, false );
+        }
+
+        for( ZONE* zone : m_board->Zones() )
+            addRegion( zone->GetBoardOutline(), zoneMargin, false );
+    }
+
+    BOX2I track( aSeg.A, VECTOR2I( 0, 0 ) );
+    track.Merge( aSeg.B );
+    track.Inflate( aWidth / 2 + 1 );
+
+    size_t state = 0;
+
+    for( size_t i = 0; i < m_ruleRegions->size(); ++i )
+    {
+        const RULE_REGION& region = ( *m_ruleRegions )[i];
+
+        if( !region.box.Intersects( track ) )
+            continue;
+
+        BOX2I box = track;
+        box.Inflate( region.margin );
+        SHAPE_RECT rect( box );
+        bool       touches = false;
+        bool       crosses = false;
+
+        for( auto edge = region.outline.CIterateSegmentsWithHoles(); edge; edge++ )
+        {
+            if( rect.Collide( *edge ) )
+            {
+                touches = true;
+
+                if( !region.courtyard )
+                    break;
+
+                // the centre line through a courtyard's outline: the track intersects it, whatever the rest
+                if( ( *edge ).Intersects( aSeg ) )
+                {
+                    crosses = true;
+                    break;
+                }
+            }
+        }
+
+        if( crosses )
+            hash_combine( state, std::hash<size_t>()( i + 1 ), std::hash<int>()( 2 ) );
+        else if( touches )
+            return std::nullopt;
+        else if( region.outline.Contains( box.GetOrigin() ) )
+            hash_combine( state, std::hash<size_t>()( i + 1 ), std::hash<int>()( 1 ) );
+    }
+
+    return state;
+}
+
+
 int PNS_PCBNEW_RULE_RESOLVER::Clearance( const PNS::ITEM* aA, const PNS::ITEM* aB,
                                          bool aUseClearanceEpsilon )
 {
     const bool bothOwned = aA && aB && aA->Owner() && aB->Owner();
+
+    if( !m_geometryRules )
+    {
+        std::shared_ptr<DRC_ENGINE> drc = m_board->GetDesignSettings().m_DRCEngine;
+        m_geometryRules = drc && drc->HasGeometryDependentRules();
+    }
+
+    std::optional<TEMP_CLEARANCE_CACHE_KEY> tempKey;
 
     if( bothOwned )
     {
@@ -958,7 +1284,9 @@ int PNS_PCBNEW_RULE_RESOLVER::Clearance( const PNS::ITEM* aA, const PNS::ITEM* a
     else if( aA && aB )
     {
         // Search cache (used for temporary items within an algorithm)
-        auto it = m_tempClearanceCache.find( TEMP_CLEARANCE_CACHE_KEY( aA, aB, aUseClearanceEpsilon ) );
+        tempKey.emplace( aA, aB, aUseClearanceEpsilon, *m_geometryRules ? geometryNear( aA, aB ) : 0,
+                         *m_geometryRules ? geometryNear( aB, aA ) : 0 );
+        auto it = m_tempClearanceCache.find( *tempKey );
 
         if( it != m_tempClearanceCache.end() )
             return it->second;
@@ -1059,7 +1387,7 @@ int PNS_PCBNEW_RULE_RESOLVER::Clearance( const PNS::ITEM* aA, const PNS::ITEM* a
     if( bothOwned )
         m_clearanceCache[CLEARANCE_CACHE_KEY( aA, aB, aUseClearanceEpsilon )] = rv;
     else if( aA && aB )
-        m_tempClearanceCache[TEMP_CLEARANCE_CACHE_KEY( aA, aB, aUseClearanceEpsilon )] = rv;
+        m_tempClearanceCache[*tempKey] = rv;
 
     return rv;
 }
