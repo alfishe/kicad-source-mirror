@@ -448,6 +448,10 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             if( nearAnEnd( shape.BBox() ) )
                 nearEnds.push_back( { std::make_shared<SHAPE_SEGMENT>( shape ), 0, l, -1 } );
         }
+
+        // a through via stands in the way out on every layer
+        if( vias && shape.BBox().Intersects( region ) )
+            grid.Mark( shape, netFloor( aReq.from ) + viaRadius + slack, via );
     }
 
     // no via on the end pads themselves: the route leaves a pad on a track

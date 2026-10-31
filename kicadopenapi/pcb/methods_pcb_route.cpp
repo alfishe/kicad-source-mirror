@@ -4712,6 +4712,27 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                        && std::abs( pcbIUScale.mmToIU( t[1].get<double>() ) - aVia.y ) <= 1;
             };
 
+            auto stopOf = [&]()
+            {
+                const nlohmann::json& t = aAttempt["stopped_at_mm"];
+                return VECTOR2I( pcbIUScale.mmToIU( t[0].get<double>() ), pcbIUScale.mmToIU( t[1].get<double>() ) );
+            };
+
+            auto stoppedAt = [&]( const VECTOR2I& aVia )
+            {
+                if( !aAttempt.contains( "stopped_at_mm" ) || aAttempt.value( "routed", false ) )
+                    return false;
+
+                const VECTOR2I d = stopOf() - aVia;
+                return std::abs( d.x ) <= pcbIUScale.mmToIU( 0.05 ) && std::abs( d.y ) <= pcbIUScale.mmToIU( 0.05 );
+            };
+
+            auto stoppedShort = [&]( const VECTOR2I& aVia )
+            {
+                return aAttempt.contains( "stopped_at_mm" ) && !aAttempt.value( "routed", false )
+                       && ( stopOf() - aVia ).EuclideanNorm() > pcbIUScale.mmToIU( 3.0 );
+            };
+
             auto stoppedAfter = [&]()
             {
                 return !aAttempt.value( "routed", false ) && aAttempt.contains( "target_mm" )
@@ -4767,17 +4788,24 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 int budget = 24;   // via pairs per crossing layer
 
+                // a crossing leg that stopped at its first via or well short of the second (the second
+                // vias all lie near the far end): that first via fails there whatever the second via
+                // is; two first vias stopped at the same spot: the layer is shut there for every one
+                std::set<std::pair<int, int>> deadCrossing;
+                std::vector<VECTOR2I>         crossStops;
+                bool                          crossShut = false;
+
                 for( const VECTOR2I& va : starts )
                 {
                     for( const VECTOR2I& vb : ends )
                     {
-                        if( deadFirstVia.count( { va.x, va.y } ) )
+                        if( deadFirstVia.count( { va.x, va.y } ) || deadCrossing.count( { va.x, va.y } ) )
                         {
                             profile.deadLegsSkipped++;
                             break;
                         }
 
-                        if( ok || aTries >= maxTries || budget <= 0 || overTime() )
+                        if( ok || crossShut || aTries >= maxTries || budget <= 0 || overTime() )
                             break;
 
                         if( deadLastVia.count( { vb.x, vb.y } ) )
@@ -4802,6 +4830,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                         if( !ok && stoppedBefore( va ) )
                             deadFirstVia.insert( { va.x, va.y } );
+                        else if( !ok && stoppedBefore( vb ) && ( stoppedAt( va ) || stoppedShort( vb ) ) )
+                        {
+                            const VECTOR2I at = stopOf();
+                            crossShut = std::any_of( crossStops.begin(), crossStops.end(), [&]( const VECTOR2I& p )
+                                                     { return ( p - at ).EuclideanNorm() <= pcbIUScale.mmToIU( 0.5 ); } );
+                            crossStops.push_back( at );
+                            deadCrossing.insert( { va.x, va.y } );
+                        }
                         else if( !ok && stoppedAfter() )
                             deadLastVia.insert( { vb.x, vb.y } );
                     }
