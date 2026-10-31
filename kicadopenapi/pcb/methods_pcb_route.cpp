@@ -764,6 +764,9 @@ struct ROUTE_REQUEST
 
     /// @brief Ways out of pads kept open: a route putting copper of another net across one is refused
     const std::vector<ESCAPE_FRONT>* fronts = nullptr;
+
+    /// @brief Each try appended here (pcb_route attempts: true)
+    nlohmann::json* tried = nullptr;
 };
 
 
@@ -788,6 +791,7 @@ struct ROUTE_PROFILE
     int    deadLegsSkipped = 0;   ///< tries not made: their first leg had failed to reach that via
     int    viaSpotsBlocked = 0;   ///< via spots left out: a via there would touch another net
     int    viaSpotsOffBoard = 0;  ///< via spots left out: on or past the board's edge
+    int    viaSpotsInEscapes = 0; ///< via spots left out: in the way out kept open for another net's pad
     int    ripUpsSkipped = 0;     ///< rip-ups not repeated: nothing changed since the same one failed
     int    ripUpsWalled = 0;      ///< rip-ups not made: no plan even through the routes of this call
     int    ripUpsPlanned = 0;     ///< rip-ups whose routes to take out a plan chose (the rest: the nearest in the corridor)
@@ -905,7 +909,8 @@ static double msSince( std::chrono::steady_clock::time_point aFrom,
 /// split where they cross a courtyard, a piece under a custom track_width rule at its opt (else its
 /// min, not below the board minimum), else at aBase, or at the neck width inside the courtyards of
 /// the route's ends.  A piece made wider than routed stays as routed when that would break a
-/// clearance (guard).  Answers widths_mm when more than one, narrow_kept_mm
+/// clearance (guard) or run over a way out kept open for another net's pad (split where it comes
+/// near one).  Answers widths_mm when more than one, narrow_kept_mm
 static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const ROUTE_REQUEST& aReq, int aBase,
                                 nlohmann::json& aOut )
 {
@@ -931,8 +936,45 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
     if( mine.empty() )
         return;
 
-    std::vector<SHAPE_POLY_SET> courtyards;
-    std::vector<SHAPE_POLY_SET> neckAreas;
+    std::vector<SHAPE_POLY_SET>      courtyards;
+    std::vector<SHAPE_POLY_SET>      neckAreas;
+    std::vector<const ESCAPE_FRONT*> fronts;
+    std::vector<std::pair<PCB_LAYER_ID, SHAPE_POLY_SET>> frontZones;
+    const int                        clearance = mine.front()->GetOwnClearance( mine.front()->GetLayer() );
+
+    if( aReq.fronts )
+    {
+        for( const ESCAPE_FRONT& front : *aReq.fronts )
+        {
+            BOX2I near = front.shape.BBox();
+            near.Inflate( aBase + clearance );
+
+            if( !front.open || front.pad->GetNetCode() == netCode || !near.Intersects( box ) )
+                continue;
+
+            fronts.push_back( &front );
+
+            // past this outline a track aBase wide keeps its clearance from the way out
+            SHAPE_POLY_SET zone;
+            SHAPE_SEGMENT( front.shape.GetSeg(), front.shape.GetWidth() + aBase + 2 * clearance )
+                    .TransformToPolygon( zone, aBoard->GetDesignSettings().m_MaxError, ERROR_OUTSIDE );
+            frontZones.emplace_back( front.layer, std::move( zone ) );
+        }
+    }
+
+    auto overFront = [&]( PCB_TRACK* aPiece )
+    {
+        for( const ESCAPE_FRONT* front : fronts )
+        {
+            if( aPiece->IsOnLayer( front->layer )
+                && aPiece->GetEffectiveShape( front->layer )->Collide( &front->shape, std::max( aPiece->GetOwnClearance( front->layer ) - 1, 0 ) ) )
+            {
+                return true;
+            }
+        }
+
+        return false;
+    };
 
     for( FOOTPRINT* fp : aBoard->Footprints() )
     {
@@ -960,7 +1002,7 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
         const SEG             whole( track->GetStart(), track->GetEnd() );
         std::vector<VECTOR2I> cuts = { whole.A, whole.B };
 
-        for( const SHAPE_POLY_SET& c : courtyards )
+        auto cutAt = [&]( const SHAPE_POLY_SET& c )
         {
             for( int o = 0; o < c.OutlineCount(); ++o )
             {
@@ -970,6 +1012,15 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
                 for( const SHAPE_LINE_CHAIN::INTERSECTION& hit : hits )
                     cuts.push_back( hit.p );
             }
+        };
+
+        for( const SHAPE_POLY_SET& c : courtyards )
+            cutAt( c );
+
+        for( const auto& [layer, zone] : frontZones )
+        {
+            if( layer == track->GetLayer() )
+                cutAt( zone );
         }
 
         std::sort( cuts.begin(), cuts.end(),
@@ -1040,7 +1091,7 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
         {
             piece->SetWidth( want );
 
-            if( want > routed && !guard( aBoard, { piece }, aIface.m_removed, false, &staged ).empty() )
+            if( want > routed && ( overFront( piece ) || !guard( aBoard, { piece }, aIface.m_removed, false, &staged ).empty() ) )
             {
                 piece->SetWidth( routed );
                 narrowKept += piece->GetLength();
@@ -1641,10 +1692,19 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
                     continue;
                 }
 
-                iface->Staged().Revert();
+                const std::string key = copperKey( item );
+                const VECTOR2I    at = item->GetEffectiveShape( front.layer )->Centre();
+
                 aOut["routed"] = false;
                 aOut["reason"] = "refused: the route would wall in the way out of "
                                  + str( front.pad->GetParentFootprint()->GetReference() ) + "." + str( front.pad->GetNumber() );
+                aOut["walls_in"] = { { "pad", str( front.pad->GetParentFootprint()->GetReference() ) + "." + str( front.pad->GetNumber() ) },
+                                     { "layer", str( board->GetLayerName( front.layer ) ) },
+                                     { "by", key },
+                                     { "way_out_mm", { { toMm( front.shape.GetSeg().A.x ), toMm( front.shape.GetSeg().A.y ) },
+                                                       { toMm( front.shape.GetSeg().B.x ), toMm( front.shape.GetSeg().B.y ) } } },
+                                     { "at_mm", { toMm( at.x ), toMm( at.y ) } } };
+                iface->Staged().Revert();
                 return false;
             }
         }
@@ -2116,6 +2176,43 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
                          + pcbIUScale.mmToIU( aOut.value( "clearance_mm", 0.2 ) );
 
         aOut["blocked_by"] = blockersAt( aContext.GetBoard(), at, aim, aReq.layer, aReq.from->GetNetCode(), half );
+    }
+
+    if( aReq.tried && aReq.tried->size() < 40 )
+    {
+        BOARD*         board = aContext.GetBoard();
+        nlohmann::json vias = nlohmann::json::array();
+
+        for( const auto& [pos, layer] : aReq.vias )
+        {
+            vias.push_back( { { "at_mm", { toMm( pos.x ), toMm( pos.y ) } },
+                              { "layer", layer ? nlohmann::json( str( board->GetLayerName( *layer ) ) ) : nlohmann::json() } } );
+        }
+
+        const PAD*     pad = dynamic_cast<const PAD*>( aReq.from );
+        nlohmann::json t = { { "kind", kind }, { "pass", profile.pass }, { "layer", str( board->GetLayerName( aReq.layer ) ) },
+                             { "from", pad && pad->GetParentFootprint() ? str( pad->GetParentFootprint()->GetReference() ) + "." + str( pad->GetNumber() )
+                                                                        : std::string( "copper" ) },
+                             { "routed", ok }, { "ms", std::round( ms ) } };
+
+        if( !vias.empty() )
+            t["points"] = vias;
+
+        if( !ok )
+        {
+            t["reason"] = aOut.value( "reason", std::string() );
+
+            for( const char* key : { "stopped_at_mm", "toward_mm", "walls_in" } )
+            {
+                if( aOut.contains( key ) )
+                    t[key] = aOut[key];
+            }
+
+            if( aOut.contains( "blocked_by" ) && !aOut["blocked_by"].empty() )
+                t["blocked_by"] = aOut["blocked_by"][0];
+        }
+
+        aReq.tried->push_back( std::move( t ) );
     }
 
     return ok;
@@ -3358,6 +3455,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         int                   busIndex = -1;
         std::optional<VECTOR2I> busVia = std::nullopt;   ///< its spot in the bus's via fan (bus_layer)
         double                ms = 0;          ///< time of every try for it, rip-up re-routes too
+        nlohmann::json        tried = nlohmann::json::array();   ///< its tries (attempts: true)
     };
 
     std::vector<JOB> jobs;
@@ -3855,6 +3953,33 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return !guard( board, { &via }, {}, true ).empty();
     };
 
+    // ways out of fine-pitch pads kept open while their connections wait (filled once the jobs are
+    // final, below); open while a connection at the pad is not routed
+    std::vector<ESCAPE_FRONT> fronts;
+    const std::vector<bool>*  doneOf = nullptr;
+
+    // a via of the end's net there would stand in the way out kept open for another net's pad: the
+    // router walks around that, a try through it is wasted
+    auto frontBlocked = [&]( BOARD_CONNECTED_ITEM* aEnd, const VECTOR2I& aAt )
+    {
+        int       dia = ds.GetCurrentViaSize();
+        NETCLASS* netclass = aEnd->GetEffectiveNetClass();
+
+        if( netclass && netclass->HasViaDiameter() )
+            dia = std::min( dia, netclass->GetViaDiameter() );
+
+        const int        clearance = std::max( std::max( ds.m_MinClearance, 0 ), netclass && netclass->HasClearance() ? netclass->GetClearance() : 0 );
+        const SHAPE_CIRCLE via( aAt, dia / 2 );
+
+        for( const ESCAPE_FRONT& front : fronts )
+        {
+            if( front.open && front.pad->GetNetCode() != aEnd->GetNetCode() && front.shape.Collide( &via, clearance - 1 ) )
+                return true;
+        }
+
+        return false;
+    };
+
     // a via there would stand on or past the board's edge (escape spots of an edge connector's
     // fingers point out of the board)
     SHAPE_POLY_SET boardArea;
@@ -4107,6 +4232,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 return true;
             }
 
+            if( frontBlocked( aEnd, aAt ) )
+            {
+                profile.viaSpotsInEscapes++;
+                return true;
+            }
+
             return false;
         };
 
@@ -4138,11 +4269,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     const bool rail = style == "rail";
     const bool viasAllowed = aArgs.value( "vias", true ) && layers.size() >= 2;
     const bool planning = aArgs.value( "plan", true );
-
-    // ways out of fine-pitch pads kept open while their connections wait (filled once the jobs are
-    // final, below); open while a connection at the pad is not routed
-    std::vector<ESCAPE_FRONT> fronts;
-    const std::vector<bool>*  doneOf = nullptr;
+    const bool keepTries = aArgs.value( "attempts", false );
 
     auto refreshFronts = [&]()
     {
@@ -4387,6 +4514,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 ROUTE_REQUEST req{ way.from, way.to, way.toPos, plan.startLayer, PNS::RM_Walkaround, dryRun, {} };
                 req.fronts = &fronts;
+                req.tried = keepTries ? &aJob.tried : nullptr;
                 req.neckWidth = neckFor( way.from, way.to );
                 req.vias = plan.points;
                 req.planned = true;
@@ -4408,6 +4536,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                     ROUTE_REQUEST req{ way.from, way.to, way.toPos, layer, aMode, dryRun, {} };
                     req.fronts = &fronts;
+                    req.tried = keepTries ? &aJob.tried : nullptr;
                     req.neckWidth = neckFor( way.from, way.to );
                     aAttempt = nlohmann::json::object();
                     aTries++;
@@ -4496,6 +4625,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 ROUTE_REQUEST req{ way.from, way.to, way.toPos, layer, PNS::RM_Walkaround, dryRun, {} };
                 req.fronts = &fronts;
+                req.tried = keepTries ? &aJob.tried : nullptr;
                 req.neckWidth = neckFor( way.from, way.to );
                 req.vias = { { corner, std::nullopt } };
                 req.noDoubleBack = true;
@@ -4609,6 +4739,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                         ROUTE_REQUEST req{ way.from, way.to, way.toPos, start, PNS::RM_Walkaround, dryRun, {} };
                         req.fronts = &fronts;
+                        req.tried = keepTries ? &aJob.tried : nullptr;
                         req.neckWidth = neckFor( way.from, way.to );
                         req.vias = { { v, arrive } };
                         aAttempt = nlohmann::json::object();
@@ -4659,6 +4790,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                         ROUTE_REQUEST req{ way.from, way.to, way.toPos, start, PNS::RM_Walkaround, dryRun, {} };
                         req.fronts = &fronts;
+                        req.tried = keepTries ? &aJob.tried : nullptr;
                         req.neckWidth = neckFor( way.from, way.to );
                         req.vias = { { va, cross }, { vb, arrive } };
                         aAttempt = nlohmann::json::object();
@@ -8276,6 +8408,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                              { "rule_evaluations", profile.ruleEvaluations },
                                              { "via_spots_blocked", profile.viaSpotsBlocked },
                                              { "via_spots_off_board", profile.viaSpotsOffBoard },
+                                             { "via_spots_in_escapes", profile.viaSpotsInEscapes },
                                              { "rip_ups_skipped", profile.ripUpsSkipped },
                                              { "rip_ups_planned", profile.ripUpsPlanned },
                                              { "rip_ups_walled", profile.ripUpsWalled },
@@ -8298,6 +8431,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     if( !doubled.empty() )
         cap.Put( answer, "doubled", std::move( doubled ) );
+    for( size_t k = 0; keepTries && k < jobs.size(); ++k )
+    {
+        if( rowOf[k] >= 0 && !jobs[k].tried.empty() )
+            results[rowOf[k]]["attempts"] = std::move( jobs[k].tried );
+    }
+
     cap.PutPreferring( answer, "results", std::move( results ),
                        []( const nlohmann::json& aRow )
                        {
@@ -12074,7 +12213,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "joined by copper; per connection "
                    "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
                    "profile (attempts; clearance_lookups / rule_evaluations: the router's clearances past its caches and the design "
-                   "rule evaluations they took; dead_legs_skipped / via_spots_blocked / rip_ups_skipped / rip_ups_walled: tries not made; "
+                   "rule evaluations they took; dead_legs_skipped / via_spots_blocked / via_spots_in_escapes / rip_ups_skipped / rip_ups_walled: tries not made; "
                    "rip_ups_planned: rip-ups whose routes a plan chose; rip_ups_second: routes taken out that had no way back "
                    "and moved others in turn; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at); "
@@ -12096,7 +12235,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
                         "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it); a detour over 1.6 x follows a plan through vias instead when that is a quarter shorter, a via counted as 2 mm (kept when a fifth shorter); clean_up: tried / skipped / kept / vias_removed / via_ways / vias_added / shortened_mm; rows cleaned"},
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
-                        "stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does: what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
+                        "attempts":{"type":"boolean","default":false,"description":"pns: each row lists its tries (at most 40): kind, pass, layer, from, points (vias / corners), routed, ms; a failed one its reason, stopped_at_mm, toward_mm, walls_in, the nearest blocker"},"stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does: what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
                         "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},
