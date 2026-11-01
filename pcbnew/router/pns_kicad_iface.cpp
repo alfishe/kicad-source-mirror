@@ -815,12 +815,12 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
 
             if( useReach )
             {
-                std::optional<SEG> near = segmentInReach( seg.A, seg.B, reach );
+                std::optional<SEG> inReach = segmentInReach( seg.A, seg.B, reach );
 
-                if( !near )
+                if( !inReach )
                     continue;
 
-                seg = *near;
+                seg = *inReach;
             }
 
             evaluated = true;
@@ -1147,12 +1147,12 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
 
         for( int i = 0; i < chain.SegmentCount(); ++i )
         {
-            std::optional<SEG> near = segmentInReach( chain.CPoint( i ), chain.CPoint( i + 1 ), reach );
+            std::optional<SEG> inReach = segmentInReach( chain.CPoint( i ), chain.CPoint( i + 1 ), reach );
 
-            if( !near )
+            if( !inReach )
                 continue;
 
-            size_t k = trackKey( near->A, near->B, width );
+            size_t k = trackKey( inReach->A, inReach->B, width );
 
             if( std::find( seen.begin(), seen.end(), k ) == seen.end() )
             {
