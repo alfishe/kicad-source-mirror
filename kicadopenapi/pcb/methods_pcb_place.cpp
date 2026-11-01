@@ -2533,6 +2533,20 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         member.decoupling = member.ownNets == 0;
         member.farads = faradsOf( part ).value_or( 1.0 );
+
+        // a decoupling capacitor belongs at its supply pin, its ground the nearest to that
+        if( member.decoupling )
+        {
+            auto isGround = [&]( int aNet )
+            {
+                NETINFO_ITEM* info = aBoard->FindNet( aNet );
+                return info && KopenapiNetRoleFromName( str( UnescapeString( info->GetNetname() ) ) ).value( "role", "" )
+                                       == "ground";
+            };
+
+            std::stable_partition( member.nets.begin(), member.nets.end(), [&]( int n ) { return !isGround( n ); } );
+        }
+
         members.push_back( member );
     }
 
