@@ -803,6 +803,7 @@ struct ROUTE_PROFILE
     int    plans = 0;             ///< global plans made (PlanRoute)
     int    plansFound = 0;        ///< ... that found a way
     int    plansWholeBoard = 0;   ///< ... searched again over the whole board (the box round the ends cut the way)
+    int    plansStopped = 0;      ///< ... ended by job_cancel, a budget or the plateau
     double planMs = 0;
     double syncMs = 0;    ///< the router's world built from the board
     double moveMs = 0;    ///< the router's path search (every Move of the head)
@@ -1583,7 +1584,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         if( stopped )
             profile.triesStopped++;
 
-        aOut["reason"] = stopped       ? "stopped inside the router try (job_cancel or the connection's time budget: first_pass_budget_s / rip_up_budget_s)"
+        aOut["reason"] = stopped       ? "stopped inside the router try (job_cancel, the connection's time budget: first_pass_budget_s / rip_up_budget_s, or stop_on_plateau_s ending its turn)"
                          : aReq.diffPair ? "the pair did not reach the target pads"
                          : reached     ? "the router could not fix the route"
                          : wrongLayer  ? "at the target but on another layer than its pad: a via is needed in front of it"
@@ -3309,21 +3310,39 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     int          plateauBest = -1;
     auto         plateauSince = std::chrono::steady_clock::now();
     bool         plateauStopped = false;
+    size_t       plateauHeld = 0;   ///< connections still to have their turn (first pass, retry pass)
+    bool         plateauTurnCut = false;
 
+    // while connections still wait for their turn, a plateau ends the turn of the one routing, not the call
     auto plateauCheck = [&]( const std::chrono::steady_clock::time_point& aNow )
     {
         if( plateauS > 0 && !plateauStopped && std::chrono::duration<double>( aNow - plateauSince ).count() > plateauS )
         {
+            if( plateauHeld > 0 )
+            {
+                plateauTurnCut = true;
+                return;
+            }
+
             plateauStopped = true;
             KopenapiJobStopSelf( "stop_on_plateau_s: no connection routed for " + mmText( plateauS ) + " s" );
         }
+    };
+
+    // a held turn has the whole plateau for itself
+    auto plateauTurn = [&]()
+    {
+        if( plateauHeld > 0 )
+            plateauSince = std::max( plateauSince, std::chrono::steady_clock::now() );
+
+        plateauTurnCut = false;
     };
 
     auto overTime = [&]()
     {
         const auto now = std::chrono::steady_clock::now();
         plateauCheck( now );
-        return KopenapiJobCancelled() || ( tryDeadline && now > *tryDeadline );
+        return KopenapiJobCancelled() || plateauTurnCut || ( tryDeadline && now > *tryDeadline );
     };
 
     profile.stop = overTime;
@@ -4297,6 +4316,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             width = neck;
 
         ROUTE_PLAN_REQUEST req{ board, aFrom, aTo, aToPos, layers, width, viasAllowed ? dia : 0, drill, {}, {} };
+        req.stop = overTime;
 
         for( const ESCAPE_FRONT& front : fronts )
         {
@@ -4316,6 +4336,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         profile.plans++;
         profile.plansFound += plan.found;
         profile.plansWholeBoard += plan.wholeBoard;
+        profile.plansStopped += plan.stopped;
         profile.planMs += plan.ms;
         return plan;
     };
@@ -4853,13 +4874,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         if( !ok && overTime() )
         {
+            const std::string budget = plateauTurnCut ? std::string( "stop_on_plateau_s" ) : budgetName;
+
             if( !KopenapiJobCancelled() )
             {
                 profile.budgetSpent[profile.pass]++;
-                aAttempt["budget"] = budgetName;
+                aAttempt["budget"] = budget;
             }
 
-            aAttempt["reason"] = std::string( KopenapiJobCancelled() ? ( plateauStopped ? "stopped (stop_on_plateau_s)" : "stopped (job_cancel)" ) : "the connection's " + budgetName + " ran out" )
+            aAttempt["reason"] = std::string( KopenapiJobCancelled() ? ( plateauStopped ? "stopped (stop_on_plateau_s)" : "stopped (job_cancel)" ) : "the connection's " + budget + " ran out" )
                                  + " after " + std::to_string( aTries ) + " tries; last: " + aAttempt.value( "reason", std::string( "-" ) );
         }
         else if( !ok && aTries >= maxTries )
@@ -5618,6 +5641,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return counts;
     };
 
+    // a first pass bounded per connection: the plateau waits until each connection has had its try
+    plateauHeld = firstBudgetS > 0 ? 1 : 0;
+
     for( size_t index = 0; index < jobs.size(); ++index )
     {
         JOB& job = jobs[index];
@@ -5795,6 +5821,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         nlohmann::json attempt;
         int            tries = 0;
 
+        plateauTurn();
+
         if( firstBudgetS > 0 )
             tryDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( (long) ( firstBudgetS * 1000 ) );
 
@@ -5911,6 +5939,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         rowOf[index] = (int) results.size();
         results.push_back( row );
     }
+
+    plateauHeld = 0;
+    plateauTurnCut = false;
 
     // The grid engine: the connections left, every net at once
     nlohmann::json gridOut;
@@ -6299,21 +6330,19 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         if( params.strategies.size() > 32 )
             return KOPENAPI_RESULT::Error( 400, "strategies: at most 32" );
-        params.progress = [&]( const std::vector<GRID_VARIANT_PROGRESS>& aVariants )
+        auto gridCounts = [&]( const std::vector<GRID_VARIANT_PROGRESS>& aVariants, int& aFinished )
         {
-            if( params.record )
-                GridReplayAdvance();
-
             nlohmann::json variants = nlohmann::json::array();
-            int            finished = 0, crowded = INT_MAX;
+            int            crowded = INT_MAX;
+            aFinished = 0;
 
             for( const GRID_VARIANT_PROGRESS& v : aVariants )
             {
-                finished += v.stage == "done" || v.stage == "abandoned";
+                aFinished += v.stage == "done" || v.stage == "abandoned";
                 crowded = std::min( crowded, v.crowded );
                 variants.push_back( { { "variant", v.name }, { "stage", v.stage }, { "round", v.round },
                                       { "crowded", v.crowded }, { "net", v.net }, { "of", v.nets },
-                                      { "expanded", v.expanded } } );
+                                      { "expanded", v.expanded }, { "held", v.held }, { "step", v.step } } );
             }
 
             // done / total: variants finished; each variant's own stage below
@@ -6321,8 +6350,32 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             counts["nets"] = gridNets.size();
             counts["crowded"] = crowded;
             counts["variants"] = variants;
+            return counts;
+        };
 
+        params.progress = [&]( const std::vector<GRID_VARIANT_PROGRESS>& aVariants )
+        {
+            if( params.record )
+                GridReplayAdvance();
+
+            int                  finished = 0;
+            const nlohmann::json counts = gridCounts( aVariants, finished );
             return KopenapiJobStep( "grid", finished, (int) aVariants.size(), std::string(), counts );
+        };
+
+        params.live = [&]( std::function<std::vector<GRID_VARIANT_PROGRESS>()> aNow )
+        {
+            if( !aNow )
+            {
+                KopenapiJobRefresh( nullptr );
+                return;
+            }
+
+            KopenapiJobRefresh( [&gridCounts, aNow]()
+                                {
+                                    int finished = 0;
+                                    return gridCounts( aNow(), finished );
+                                } );
         };
 
         // a cancelled job stops every variant at its next net, not only at the next progress report
@@ -7230,9 +7283,39 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     {
         bool progress = false;
 
+        // the connections with fewest tries first: one that failed fast is not left without a turn
+        // behind the slow ones; in the first round the plateau waits until each has had its turn
+        std::vector<size_t> order;
+
         for( size_t index = 0; index < jobs.size(); ++index )
         {
-            if( done[index] || rowOf[index] < 0 || jobs[index].trunk )
+            if( !done[index] && rowOf[index] >= 0 && !jobs[index].trunk )
+                order.push_back( index );
+        }
+
+        std::stable_sort( order.begin(), order.end(),
+                          [&]( size_t a, size_t b )
+                          { return results[rowOf[a]].value( "tries", 0 ) < results[rowOf[b]].value( "tries", 0 ); } );
+
+        if( round == 0 )
+            plateauHeld = order.size();
+
+        struct TURN
+        {
+            size_t& held;
+            bool    first;
+            ~TURN()
+            {
+                if( first && held > 0 )
+                    held--;
+            }
+        };
+
+        for( size_t index : order )
+        {
+            TURN turn{ plateauHeld, round == 0 };
+
+            if( done[index] )
                 continue;
 
             JOB& job = jobs[index];
@@ -7247,6 +7330,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 break;
             }
+
+            plateauTurn();
 
             if( ripBudgetS > 0 )
                 tryDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( (long) ( ripBudgetS * 1000 ) );
@@ -7741,6 +7826,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 results[rowOf[index]]["rip_ups_failed"].push_back( { { "taken_out", takenOut }, { "failed_at", failedAt } } );
             }
         }
+
+        plateauHeld = 0;
+        plateauTurnCut = false;
 
         if( !progress )
             break;
@@ -8454,7 +8542,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                              { "pad_exits", { { "tried", profile.padExitsTried }, { "won", profile.padExitsWon } } },
                                              { "plans", profile.plans },
                                              { "plans_found", profile.plansFound },
-                                             { "plans_whole_board", profile.plansWholeBoard },
+                                             { "plans_whole_board", profile.plansWholeBoard }, { "plans_stopped", profile.plansStopped },
                                              { "plan_ms", std::round( profile.planMs ) },
                                              { "sync_ms", std::round( profile.syncMs ) },
                                              { "move_ms", std::round( profile.moveMs ) },
@@ -12254,7 +12342,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "and moved others in turn; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at); "
                    "a row whose end is shut in has boxed_in (end, which, by: other nets' copper nearer than a track of its width needs, and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
-                   "pairs_stuck: pair tries ended when nothing was placed after 3 steps; pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way); sync_ms: building the router's world for each; move_ms: the path search; "
+                   "pairs_stuck: pair tries ended when nothing was placed after 3 steps; pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way; plans_stopped: ended by job_cancel, a budget or stop_on_plateau_s); sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
                    "rip_up, gaps); "
@@ -12271,7 +12359,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
                         "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it); a detour over 1.6 x follows a plan through vias instead when that is a quarter shorter, a via counted as 2 mm (kept when a fifth shorter); clean_up: tried / skipped / kept / vias_removed / via_ways / vias_added / shortened_mm; rows cleaned"},
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
-                        "attempts":{"type":"boolean","default":false,"description":"pns: each row lists its tries (at most 40): kind, pass, layer, from, points (vias / corners), routed, ms; a failed one its reason, stopped_at_mm, toward_mm, walls_in, the nearest blocker"},"stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does: what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
+                        "attempts":{"type":"boolean","default":false,"description":"pns: each row lists its tries (at most 40): kind, pass, layer, from, points (vias / corners), routed, ms; a failed one its reason, stopped_at_mm, toward_mm, walls_in, the nearest blocker"},"stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does; while connections still wait for their first-pass try (first_pass_budget_s bounding it) or, failed there, for their turn in the retry pass (fewest tries first), it ends the turn of the one routing instead (budget stop_on_plateau_s): what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
                         "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},

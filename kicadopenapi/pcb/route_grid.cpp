@@ -2095,6 +2095,8 @@ public:
         p.net = m_taken;
         p.nets = m_takenOf;
         p.expanded = m_expandedShown;
+        p.held = m_held;
+        p.step = m_stepSeen;
         return p;
     }
 
@@ -2174,7 +2176,10 @@ private:
             int         n = 0;
 
             if( stopped() || !m_params.held( serial, by, n ) )
+            {
+                m_held = false;
                 return;
+            }
 
             if( serial != m_stepSeen )
             {
@@ -2187,12 +2192,17 @@ private:
             if( m_stepLeft > 0 )
             {
                 --m_stepLeft;
+                m_held = false;
                 return;
             }
 
             if( m_stepRound >= 0 && m_stage == m_stepStage && ( m_stage != STAGE_ROUNDS || m_round < m_stepRound ) )
+            {
+                m_held = false;
                 return;
+            }
 
+            m_held = true;
             std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
         }
     }
@@ -3823,7 +3833,8 @@ private:
     std::atomic<int>       m_round{ 0 };
     std::atomic<int>       m_conflicting{ 0 };
     std::atomic<int>       m_stage{ STAGE_ROUNDS };
-    uint64_t               m_stepSeen = 0;    ///< the job_step this variant went on for
+    std::atomic<uint64_t>  m_stepSeen = 0;    ///< the job_step this variant went on for
+    std::atomic<bool>      m_held = false;    ///< waiting in gate() for the next job_step
     int                    m_stepLeft = 0;
     int                    m_stepRound = -1;
     int                    m_stepStage = -1;
@@ -4443,6 +4454,29 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     }
 
     std::vector<std::future<void>> done;
+
+    struct LIVE
+    {
+        const GRID_PARAMS& params;
+        ~LIVE()
+        {
+            if( params.live )
+                params.live( nullptr );
+        }
+    } live{ aParams };
+
+    if( aParams.live )
+    {
+        aParams.live( [&runs]()
+                      {
+                          std::vector<GRID_VARIANT_PROGRESS> states;
+
+                          for( auto& run : runs )
+                              states.push_back( run->Progress() );
+
+                          return states;
+                      } );
+    }
 
     for( auto& run : runs )
         done.push_back( std::async( std::launch::async, [r = run.get()]() { r->Run(); } ) );

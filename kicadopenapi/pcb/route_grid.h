@@ -37,6 +37,8 @@ struct GRID_VARIANT_PROGRESS
     int         net = 0;    ///< nets taken in this stage (of nets)
     int         nets = 0;
     int64_t     expanded = 0;
+    bool        held = false;   ///< waiting in a paused job for the next job_step
+    uint64_t    step = 0;       ///< the last job_step this variant went on for
 };
 
 /// @brief How one variant searches: net order, layer directions, negotiation schedule, A* weight
@@ -108,6 +110,10 @@ struct GRID_PARAMS
 
     /// @brief Called on the calling thread while the variants run, about every 50 ms; false stops them
     std::function<bool( const std::vector<GRID_VARIANT_PROGRESS>& )> progress;
+
+    /// @brief Given the variants' progress as it is now while they run (null once they are done):
+    /// for a status read while the job is paused, when progress is not called
+    std::function<void( std::function<std::vector<GRID_VARIANT_PROGRESS>()> )> live;
 };
 
 /// @brief A run of track on one layer: its corners from end to end

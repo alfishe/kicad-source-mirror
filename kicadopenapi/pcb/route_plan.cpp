@@ -653,6 +653,12 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
 
     while( !open.empty() && plan.expanded < limit )
     {
+        if( aReq.stop && ( plan.expanded & 4095 ) == 0 && aReq.stop() )
+        {
+            plan.stopped = true;
+            break;
+        }
+
         const auto [f, s] = open.top();
         open.pop();
 

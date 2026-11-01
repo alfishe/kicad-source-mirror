@@ -557,8 +557,9 @@ KOPENAPI_REGISTER( "job_resume", "Resume a paused job",
 
 KOPENAPI_REGISTER( "job_step",
                    "A paused job goes on and pauses again: to its next safe point; a grid route by n nets per "
-                   "variant (by: net) or to the next n rounds (by: round; after the rounds: the next stage). "
-                   "409 when the job is not paused",
+                   "variant (by: net) or to the next n rounds (by: round; after the rounds: the next stage); "
+                   "the step is done for a grid variant when job_get's progress.variants row has step equal to "
+                   "this call's step.serial and held true (or the variant is done). 409 when the job is not paused",
                    R"json({"type":"object","required":["job_id"],"properties":{
                         "job_id":{"type":"string"},
                         "by":{"type":"string","enum":["net","round"],"default":"net"},

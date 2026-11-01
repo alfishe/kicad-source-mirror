@@ -3,6 +3,7 @@
 #include <geometry/shape_segment.h>
 #include <layer_ids.h>
 #include <math/vector2d.h>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -37,6 +38,9 @@ struct ROUTE_PLAN_REQUEST
     /// @brief Search the whole board, not a box round the ends (the box's search reached its cut
     /// sides and found nothing)
     bool wholeBoard = false;
+
+    /// @brief Asked between steps of the search: true ends it, not found (`stopped`)
+    std::function<bool()> stop;
 };
 
 /// @brief A route through free space: corners on a layer, and through vias where it changes layer
@@ -61,6 +65,7 @@ struct ROUTE_PLAN
     /// its own (0 neither or not known, 1 the start, 2 the target) and how many states that room has
     int    boxedEnd = 0;
     size_t boxedRoom = 0;
+    bool   stopped = false;   ///< the request's stop ended the search
 };
 
 /**

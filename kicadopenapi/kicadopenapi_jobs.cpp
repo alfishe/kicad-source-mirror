@@ -267,6 +267,9 @@ private:
 };
 
 JOB_TITLES* g_titles = nullptr;
+
+/// @brief Under g_mutex: the running job's progress counts while it is paused (KopenapiJobRefresh)
+std::function<nlohmann::json()> g_refresh;
 CLOCK::time_point g_titleShown;
 
 } // namespace
@@ -380,6 +383,8 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
     KopenapiYieldAll();
 
     // paused: the UI and reading calls run until job_resume, a job_step or a stop
+    auto refreshed = CLOCK::now();
+
     for( bool shown = false;; )
     {
         {
@@ -411,6 +416,33 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
 
         KopenapiYieldAll();
         std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+
+        if( CLOCK::now() - refreshed >= std::chrono::milliseconds( 50 ) )
+        {
+            refreshed = CLOCK::now();
+            std::function<nlohmann::json()> refresh;
+
+            {
+                std::lock_guard<std::mutex> lock( g_mutex );
+                refresh = g_refresh;
+            }
+
+            if( refresh )
+            {
+                const nlohmann::json counts = refresh();
+                std::lock_guard<std::mutex> lock( g_mutex );
+
+                if( g_current && !counts.is_null() && counts != g_current->counts )
+                {
+                    g_current->counts = counts;
+                    g_current->rev++;
+                    KopenapiEventNotify( "job" );
+                    KopenapiEventNotify( "progress" );
+                }
+            }
+
+            g_changed.notify_all();
+        }
     }
 
     std::lock_guard<std::mutex> lock( g_mutex );
@@ -423,6 +455,13 @@ bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const st
     }
 
     return !g_current->cancel;
+}
+
+
+void KopenapiJobRefresh( std::function<nlohmann::json()> aRefresh )
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    g_refresh = std::move( aRefresh );
 }
 
 
@@ -722,6 +761,7 @@ void KOPENAPI_JOBS::Run( const std::string& aId, const std::function<KOPENAPI_RE
         job->result = std::move( result );
         job->rev++;
         g_current.reset();
+        g_refresh = nullptr;
     }
 
     g_changed.notify_all();

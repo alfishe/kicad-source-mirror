@@ -32,6 +32,12 @@ KICOMMON_API bool KopenapiJobProgress( const std::string& aPhase, int aDone, int
                                        const std::string& aItem = std::string(),
                                        const nlohmann::json& aCounts = nlohmann::json() );
 
+/// @brief While the running job waits paused in KopenapiJobStep, aRefresh gives the counts of its
+/// progress about every 50 ms: work its worker threads still do while it is held (a grid route's
+/// variants going on to their step points) shows in job_get as it is.  Empty: none.  Cleared when
+/// the job ends
+KICOMMON_API void KopenapiJobRefresh( std::function<nlohmann::json()> aRefresh );
+
 /// @brief The gate: an outermost API call starts / ends on the main thread.  KopenapiJobStep outside
 /// a job records that call's progress and runs the API calls queued meanwhile (edits get 409); no
 /// user input, no stop
