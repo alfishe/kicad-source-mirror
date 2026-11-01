@@ -1116,9 +1116,132 @@ struct LINK_END
 };
 
 
+/// @brief The pads of a part on the given nets: the side of the part each is on (west / east / north /
+/// south / centre, board frame), the side most are on and the nets clockwise round the part
+struct PART_ORDER
+{
+    std::map<std::string, int>   sides;
+    std::string                  side;
+    std::vector<std::string>     order;    ///< nets clockwise round the part (board view, y down)
+    std::map<std::string, std::string> padSide;   ///< net -> side of its first pad
+    int                          pads = 0;
+};
+
+
+const char* padSideOf( const BOX2I& aExtent, const VECTOR2I& aAt )
+{
+    const VECTOR2I d = aAt - aExtent.Centre();
+    const double   rx = aExtent.GetWidth() > 0 ? double( d.x ) / aExtent.GetWidth() : 0;
+    const double   ry = aExtent.GetHeight() > 0 ? double( d.y ) / aExtent.GetHeight() : 0;
+
+    return std::abs( rx ) < 0.2 && std::abs( ry ) < 0.2 ? "centre"
+           : std::abs( rx ) >= std::abs( ry )          ? ( rx < 0 ? "west" : "east" )
+                                                        : ( ry < 0 ? "north" : "south" );
+}
+
+
+BOX2I padExtent( FOOTPRINT* aFp )
+{
+    BOX2I extent;
+    bool  first = true;
+
+    for( PAD* pad : aFp->Pads() )
+    {
+        if( pad->GetNumber().IsEmpty() )
+            continue;
+
+        if( first )
+            extent = BOX2I( pad->GetPosition(), VECTOR2I( 0, 0 ) );
+        else
+            extent.Merge( pad->GetPosition() );
+
+        first = false;
+    }
+
+    return extent;
+}
+
+
+PART_ORDER partOrder( FOOTPRINT* aFp, const std::set<int>& aNets )
+{
+    PART_ORDER        po;
+    std::vector<PAD*> pads;
+
+    for( PAD* pad : aFp->Pads() )
+    {
+        if( !pad->GetNumber().IsEmpty() && aNets.count( pad->GetNetCode() ) )
+            pads.push_back( pad );
+    }
+
+    if( pads.empty() )
+        return po;
+
+    const BOX2I    extent = padExtent( aFp );
+    const VECTOR2I c = extent.Centre();
+    double         sx = 0, sy = 0;
+
+    for( PAD* pad : pads )
+    {
+        const std::string side = padSideOf( extent, pad->GetPosition() );
+        const std::string net = str( UnescapeString( pad->GetNetname() ) );
+        po.sides[side]++;
+        po.padSide.emplace( net, side );
+
+        const VECTOR2I d = pad->GetPosition() - c;
+        const double   len = std::hypot( double( d.x ), double( d.y ) );
+
+        if( len > 0 )
+        {
+            sx += d.x / len;
+            sy += d.y / len;
+        }
+    }
+
+    // clockwise from the side opposite the pads' mean direction, so a row reads end to end
+    const double mean = std::atan2( sy, sx );
+    std::vector<std::pair<double, std::string>> around;
+
+    for( PAD* pad : pads )
+    {
+        const VECTOR2I d = pad->GetPosition() - c;
+        double         a = std::atan2( double( d.y ), double( d.x ) ) - mean;
+
+        while( a <= -M_PI )
+            a += 2 * M_PI;
+
+        while( a > M_PI )
+            a -= 2 * M_PI;
+
+        around.emplace_back( a, str( UnescapeString( pad->GetNetname() ) ) );
+    }
+
+    std::stable_sort( around.begin(), around.end(), []( const auto& x, const auto& y ) { return x.first < y.first; } );
+
+    for( const auto& [a, net] : around )
+    {
+        if( std::find( po.order.begin(), po.order.end(), net ) == po.order.end() )
+            po.order.push_back( net );
+    }
+
+    po.pads = (int) pads.size();
+    int most = 0;
+
+    for( const auto& [side, n] : po.sides )
+    {
+        if( n > most )
+        {
+            most = n;
+            po.side = side;
+        }
+    }
+
+    return po;
+}
+
+
 LINK_END linkEnd( const BOARD_BLOCKS& aB, int aBlock, const std::set<int>& aNets )
 {
-    LINK_END   end;
+    LINK_END     end;
     const BLOCK& blk = aB.blocks[aBlock];
     end.block = aBlock;
 
@@ -1132,89 +1255,16 @@ LINK_END linkEnd( const BOARD_BLOCKS& aB, int aBlock, const std::set<int>& aNets
 
     for( int m : order )
     {
-        FOOTPRINT*        fp = aB.parts[m].fp;
-        std::vector<PAD*> pads, all;
+        PART_ORDER po = partOrder( aB.parts[m].fp, aNets );
 
-        for( PAD* pad : fp->Pads() )
-        {
-            if( pad->GetNumber().IsEmpty() )
-                continue;
-
-            all.push_back( pad );
-
-            if( aNets.count( pad->GetNetCode() ) )
-                pads.push_back( pad );
-        }
-
-        if( pads.empty() )
+        if( po.pads == 0 )
             continue;
 
-        BOX2I extent;
-        extent.SetOrigin( all.front()->GetPosition() );
-
-        for( PAD* pad : all )
-            extent.Merge( pad->GetPosition() );
-
-        const VECTOR2I c = extent.Centre();
-        double         sx = 0, sy = 0;
-        std::vector<std::pair<double, std::string>> around;
-
-        for( PAD* pad : pads )
-        {
-            const VECTOR2I d = pad->GetPosition() - c;
-            const double   rx = extent.GetWidth() > 0 ? double( d.x ) / extent.GetWidth() : 0;
-            const double   ry = extent.GetHeight() > 0 ? double( d.y ) / extent.GetHeight() : 0;
-            const char*    side = std::abs( rx ) < 0.2 && std::abs( ry ) < 0.2 ? "centre"
-                                  : std::abs( rx ) >= std::abs( ry )          ? ( rx < 0 ? "west" : "east" )
-                                                                               : ( ry < 0 ? "north" : "south" );
-            end.sides[side]++;
-            const double len = std::hypot( double( d.x ), double( d.y ) );
-
-            if( len > 0 )
-            {
-                sx += d.x / len;
-                sy += d.y / len;
-            }
-        }
-
-        const double mean = std::atan2( sy, sx );
-
-        for( PAD* pad : pads )
-        {
-            const VECTOR2I d = pad->GetPosition() - c;
-            double         a = std::atan2( double( d.y ), double( d.x ) ) - mean;
-
-            while( a <= -M_PI )
-                a += 2 * M_PI;
-
-            while( a > M_PI )
-                a -= 2 * M_PI;
-
-            around.emplace_back( a, str( UnescapeString( pad->GetNetname() ) ) );
-        }
-
-        std::stable_sort( around.begin(), around.end(),
-                          []( const auto& x, const auto& y ) { return x.first < y.first; } );
-
-        for( const auto& [a, net] : around )
-        {
-            if( std::find( end.order.begin(), end.order.end(), net ) == end.order.end() )
-                end.order.push_back( net );
-        }
-
         end.part = aB.parts[m].ref;
-        end.pads = (int) pads.size();
-        int most = 0;
-
-        for( const auto& [side, n] : end.sides )
-        {
-            if( n > most )
-            {
-                most = n;
-                end.side = side;
-            }
-        }
-
+        end.sides = po.sides;
+        end.side = po.side;
+        end.order = po.order;
+        end.pads = po.pads;
         break;
     }
 
@@ -1601,6 +1651,402 @@ static KOPENAPI_RESULT h_pcb_layout_graph( KOPENAPI_CONTEXT& aCtx, const nlohman
     return KOPENAPI_RESULT::Ok( { { "blocks", blocks }, { "clusters", clusters }, { "buses", busList },
                                   { "edges", edges }, { "unassigned", refList( b, b.unassigned ) },
                                   { "ms", std::round( ms ) } } );
+}
+
+
+/// @brief Positions in a sequence that form its longest increasing run (kept in order), the rest out
+std::vector<bool> longestIncreasing( const std::vector<int>& aSeq )
+{
+    const size_t     n = aSeq.size();
+    std::vector<int> len( n, 1 ), prev( n, -1 );
+
+    for( size_t i = 0; i < n; ++i )
+    {
+        for( size_t j = 0; j < i; ++j )
+        {
+            if( aSeq[j] < aSeq[i] && len[j] + 1 > len[i] )
+            {
+                len[i] = len[j] + 1;
+                prev[i] = (int) j;
+            }
+        }
+    }
+
+    std::vector<bool> in( n, false );
+    int               at = -1;
+
+    for( size_t i = 0; i < n; ++i )
+    {
+        if( at < 0 || len[i] > len[at] )
+            at = (int) i;
+    }
+
+    for( ; at >= 0; at = prev[at] )
+        in[at] = true;
+
+    return in;
+}
+
+
+int inversions( const std::vector<int>& aSeq )
+{
+    int n = 0;
+
+    for( size_t i = 0; i < aSeq.size(); ++i )
+    {
+        for( size_t j = i + 1; j < aSeq.size(); ++j )
+            n += aSeq[i] > aSeq[j];
+    }
+
+    return n;
+}
+
+
+static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    const auto    started = std::chrono::steady_clock::now();
+    BOARD*        board = context->GetBoard();
+    GROUP_OPTIONS opt;
+
+    if( std::optional<std::string> bad = groupOptions( aArgs, opt ) )
+        return KOPENAPI_RESULT::Error( 400, *bad );
+
+    const std::string ref = aArgs.value( "ref", std::string() );
+
+    if( ref.empty() )
+        return KOPENAPI_RESULT::Error( 400, "ref: the package to fan out (an IC with its pads on its sides)" );
+
+    std::string  error;
+    BOARD_BLOCKS b = buildBlocks( aCtx, board, opt, nlohmann::json(), error );
+
+    if( !error.empty() )
+        return KOPENAPI_RESULT::Error( 404, error );
+
+    int anchor = -1;
+
+    for( size_t i = 0; i < b.parts.size(); ++i )
+    {
+        if( b.parts[i].ref == ref )
+            anchor = (int) i;
+    }
+
+    if( anchor < 0 )
+        return KOPENAPI_RESULT::Error( 404, "no footprint " + ref );
+
+    const PART&    a = b.parts[anchor];
+    const BOX2I    extent = padExtent( a.fp );
+    const VECTOR2I centre = extent.Centre();
+    const int      ownBlock = b.partBlock[anchor];
+
+    // the sides clockwise in the board view (y down); a quarter turn clockwise moves a pad one on
+    static const std::vector<std::string> sides = { "west", "north", "east", "south" };
+
+    auto sideIndex = []( const std::string& aSide ) -> int
+    {
+        auto it = std::find( sides.begin(), sides.end(), aSide );
+        return it == sides.end() ? -1 : (int) ( it - sides.begin() );
+    };
+
+    auto towards = [&]( const VECTOR2I& aTo ) -> std::string
+    {
+        const VECTOR2I d = aTo - centre;
+        return std::abs( d.x ) >= std::abs( d.y ) ? ( d.x < 0 ? "west" : "east" ) : ( d.y < 0 ? "north" : "south" );
+    };
+
+    // the part each signal net goes to: the nearest in another block, else the nearest in its own
+    struct PORT
+    {
+        PAD*        pad = nullptr;
+        std::string net;
+        int         code = 0;
+        std::string side;
+        int         to = -1;
+        std::string toSide;
+        std::string kind;   ///< signal, local, rail
+        bool        via = false;
+        std::string why;
+    };
+
+    // the layer a pad is on: F / B for SMD, THT where every layer reaches it (a layer change is free there)
+    auto padLayer = []( PAD* aPad ) -> std::string
+    {
+        if( aPad->GetAttribute() == PAD_ATTRIB::PTH || aPad->GetAttribute() == PAD_ATTRIB::NPTH )
+            return "THT";
+
+        return aPad->IsOnLayer( F_Cu ) ? "F" : "B";
+    };
+
+    // a group: nets from one side of the package to one part, arriving on one side and layer of it
+    struct GROUP_KEY
+    {
+        int         far;
+        std::string side, farSide, farLayer;
+
+        bool operator<( const GROUP_KEY& o ) const
+        {
+            return std::tie( far, side, farSide, farLayer ) < std::tie( o.far, o.side, o.farSide, o.farLayer );
+        }
+    };
+
+    std::vector<PORT>                  ports;
+    std::map<GROUP_KEY, std::set<int>> toNets;
+    std::map<GROUP_KEY, bool>          thtEnd;
+    std::set<int>                      seen;
+
+    for( PAD* pad : a.fp->Pads() )
+    {
+        const int code = pad->GetNetCode();
+
+        if( pad->GetNumber().IsEmpty() || code <= 0 )
+            continue;
+
+        PORT port;
+        port.pad = pad;
+        port.code = code;
+        port.net = str( UnescapeString( pad->GetNetname() ) );
+        port.side = padSideOf( extent, pad->GetPosition() );
+
+        if( b.rails.count( code ) )
+        {
+            port.kind = "rail";
+            port.why = "to its plane: a via in or by the pad";
+            ports.push_back( port );
+            continue;
+        }
+
+        double best = std::numeric_limits<double>::max();
+        bool   bestOther = false;
+
+        for( size_t j = 0; j < b.parts.size(); ++j )
+        {
+            if( (int) j == anchor || std::find( b.parts[j].nets.begin(), b.parts[j].nets.end(), code ) == b.parts[j].nets.end() )
+                continue;
+
+            const bool   other = b.partBlock[j] != ownBlock;
+            const double d = ( b.parts[j].centre - centre ).EuclideanNorm();
+
+            if( ( other && !bestOther ) || ( other == bestOther && d < best ) )
+            {
+                best = d;
+                bestOther = other;
+                port.to = (int) j;
+            }
+        }
+
+        if( port.to < 0 )
+            continue;
+
+        port.kind = bestOther ? "signal" : "local";
+        port.toSide = towards( b.parts[port.to].centre );
+
+        if( seen.insert( code ).second )
+        {
+            PAD* farPad = nullptr;
+
+            for( PAD* fp : b.parts[port.to].fp->Pads() )
+            {
+                if( fp->GetNetCode() == code && !fp->GetNumber().IsEmpty() )
+                {
+                    farPad = fp;
+                    break;
+                }
+            }
+
+            if( farPad )
+            {
+                const GROUP_KEY key{ port.to, port.side, padSideOf( padExtent( b.parts[port.to].fp ), farPad->GetPosition() ),
+                                     padLayer( farPad ) };
+                toNets[key].insert( code );
+                thtEnd[key] = thtEnd[key] || key.farLayer == "THT" || padLayer( pad ) == "THT";
+            }
+        }
+
+        ports.push_back( port );
+    }
+
+    // per far part with two nets or more: the order at the anchor against the far end's, mirrored as two
+    // parts facing each other are; the longest run in order stays on the pads' layer, the rest change layer
+    // by a via; what still crosses among those is left for L2 / L3 (another side, the part mirrored)
+    nlohmann::json groups = nlohmann::json::array();
+    std::set<int>  viaNets;
+    int            crossingsLeft = 0;
+
+    for( const auto& [key, nets] : toNets )
+    {
+        const int far = key.far;
+
+        if( nets.size() < 2 )
+            continue;
+
+        const PART_ORDER here = partOrder( a.fp, nets );
+        const PART_ORDER there = partOrder( b.parts[far].fp, nets );
+        std::map<std::string, int> at;
+
+        for( size_t k = 0; k < there.order.size(); ++k )
+            at[there.order[k]] = (int) ( there.order.size() - 1 - k );
+
+        std::vector<int>         seq;
+        std::vector<std::string> names;
+
+        for( const std::string& n : here.order )
+        {
+            if( auto it = at.find( n ); it != at.end() )
+            {
+                seq.push_back( it->second );
+                names.push_back( n );
+            }
+        }
+
+        const std::vector<bool> keep = longestIncreasing( seq );
+        std::vector<int>         rest;
+        nlohmann::json           kept = nlohmann::json::array(), changed = nlohmann::json::array();
+
+        for( size_t k = 0; k < seq.size(); ++k )
+        {
+            if( keep[k] )
+            {
+                kept.push_back( names[k] );
+            }
+            else
+            {
+                rest.push_back( seq[k] );
+                changed.push_back( names[k] );
+
+                if( NETINFO_ITEM* net = KopenapiFindNet( board, names[k] ); net && !thtEnd[key] )
+                    viaNets.insert( net->GetNetCode() );
+            }
+        }
+
+        const int left = inversions( rest );
+        crossingsLeft += left;
+
+        groups.push_back( { { "to", b.parts[far].ref }, { "side", key.side }, { "to_pads_side", key.farSide },
+                            { "to_layer", key.farLayer }, { "layer_change_at_pin", thtEnd[key] },
+                            { "to_block", b.partBlock[far] >= 0 ? b.blocks[b.partBlock[far]].name : std::string() },
+                            { "to_side", towards( b.parts[far].centre ) }, { "width", seq.size() },
+                            { "order_here", names }, { "order_there", there.order },
+                            { "crossings", inversions( seq ) }, { "kept_on_layer", kept }, { "via_to_other_layer", changed },
+                            { "crossings_left", left } } );
+    }
+
+    // the turn each signal takes from the side its pad is on to the side its far part lies: straight out,
+    // round one corner, or round the part; and the quarter turns of the part that make them cheapest
+    auto turnOf = [&]( int aOwn, int aTo )
+    {
+        const int d = ( ( aTo - aOwn ) % 4 + 4 ) % 4;
+        return d == 0 ? 0 : d == 2 ? 2 : 1;
+    };
+
+    nlohmann::json byTurn = nlohmann::json::array();
+    int            bestTurns = 0;
+    int            bestCost = std::numeric_limits<int>::max();
+
+    for( int q = 0; q < 4; ++q )
+    {
+        int cost = 0, straight = 0, corner = 0, round = 0;
+
+        for( const PORT& p : ports )
+        {
+            const int own = sideIndex( p.side ), to = sideIndex( p.toSide );
+
+            if( p.kind != "signal" || own < 0 || to < 0 )
+                continue;
+
+            const int t = turnOf( ( own + q ) % 4, to );
+            cost += t == 0 ? 0 : t == 1 ? 1 : 3;
+            ( t == 0 ? straight : t == 1 ? corner : round )++;
+        }
+
+        byTurn.push_back( { { "quarter_turns_cw", q }, { "straight", straight }, { "corner", corner },
+                            { "round_the_part", round }, { "cost", cost } } );
+
+        if( cost < bestCost )
+        {
+            bestCost = cost;
+            bestTurns = q;
+        }
+    }
+
+    static const char* turnName[3] = { "straight", "corner", "round_the_part" };
+    std::map<std::string, nlohmann::json> bySide;
+    std::map<std::string, int>            counts;
+
+    for( PORT& p : ports )
+    {
+        if( viaNets.count( p.code ) )
+        {
+            p.via = true;
+            p.why = "out of order with its far end: a via to the other layer";
+        }
+
+        nlohmann::json j = { { "pad", str( p.pad->GetNumber() ) }, { "net", p.net }, { "kind", p.kind },
+                             { "layer", p.via ? "other" : "pad" } };
+
+        if( p.to >= 0 )
+        {
+            const int own = sideIndex( p.side ), to = sideIndex( p.toSide );
+            j["to"] = b.parts[p.to].ref;
+            j["to_side"] = p.toSide;
+
+            if( own >= 0 && to >= 0 )
+            {
+                j["turn"] = turnName[turnOf( own, to )];
+                counts[turnName[turnOf( own, to )]] += p.kind == "signal";
+            }
+        }
+
+        if( !p.why.empty() )
+            j["why"] = p.why;
+
+        if( !bySide.count( p.side ) )
+            bySide[p.side] = nlohmann::json::array();
+
+        bySide[p.side].push_back( j );
+    }
+
+    // ports along each side in the order a track leaving it meets them (clockwise)
+    nlohmann::json sideList = nlohmann::json::object();
+    std::set<int>  all;
+
+    for( const PORT& p : ports )
+        all.insert( p.code );
+
+    const PART_ORDER cw = partOrder( a.fp, all );
+
+    for( auto& [side, list] : bySide )
+    {
+        std::vector<nlohmann::json> rows( list.begin(), list.end() );
+        std::stable_sort( rows.begin(), rows.end(),
+                          [&]( const nlohmann::json& x, const nlohmann::json& y )
+                          {
+                              auto ix = std::find( cw.order.begin(), cw.order.end(), x["net"].get<std::string>() );
+                              auto iy = std::find( cw.order.begin(), cw.order.end(), y["net"].get<std::string>() );
+                              return ix < iy;
+                          } );
+        sideList[side] = rows;
+    }
+
+    // the sides the signals leave by, to be kept open for them by the support parts
+    std::set<std::string> open;
+
+    for( const PORT& p : ports )
+    {
+        if( p.kind == "signal" )
+            open.insert( p.toSide );
+    }
+
+    const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
+
+    return KOPENAPI_RESULT::Ok( { { "ref", ref }, { "block", ownBlock >= 0 ? b.blocks[ownBlock].name : std::string() },
+                                  { "ports", sideList }, { "groups", groups }, { "vias_for_order", viaNets.size() },
+                                  { "crossings_left", crossingsLeft }, { "turns", counts },
+                                  { "rotation", { { "best_quarter_turns_cw", bestTurns }, { "by_turn", byTurn } } },
+                                  { "keep_open", open }, { "ms", std::round( ms ) } } );
 }
 
 
@@ -2093,6 +2539,28 @@ KOPENAPI_REGISTER( "pcb_layout_graph",
                         "min_bus":{"type":"integer","default":3,"minimum":2,"description":"lines a bundle needs (pcb_net_roles min_bundle)"},
                         "list_limit":{"type":"integer","default":16,"description":"single nets listed per edge"}}})json"_json,
                    false, h_pcb_layout_graph, 120 );
+
+KOPENAPI_REGISTER( "pcb_fanout_ports",
+                   "The second level of laying a board out: where each pin of a large package must leave it, "
+                   "before anything is placed round it. Per pad a port: the side it is on, the part its net goes "
+                   "to (the nearest in another block, else in its own: local) and the side that part lies, the "
+                   "turn between them (straight, corner, round_the_part), and the layer: pins whose order "
+                   "matches their far end's stay on the pad's layer, the rest of a group (two or more nets to "
+                   "one part; the longest run in order kept) change layer by a via; rails go to their plane. "
+                   "groups: per far part, side of the package and side and layer the nets arrive on (F, B, THT), the order "
+                   "at both ends, crossings, the nets kept and moved (at a THT end the pin itself changes layer: "
+                   "no via), "
+                   "crossings_left (pairs that still cross after the vias: another side or the part mirrored, "
+                   "L2 / L3). rotation: the quarter turns of the package that make the turns cheapest "
+                   "(straight 0, corner 1, round the part 3); a turn keeps the order round the part, so it "
+                   "never changes crossings. keep_open: the sides signals leave by. Read only",
+                   R"json({"type":"object","required":["ref"],"properties":{
+                        "ref":{"type":"string","description":"the package"},
+                        "by":{"type":"string","enum":["auto","sheet"],"default":"auto"},
+                        "max_part_pins":{"type":"integer","default":3},
+                        "depth":{"type":"integer","default":2,"minimum":1,"maximum":6},
+                        "max_fanout":{"type":"integer","default":30}}})json"_json,
+                   false, h_pcb_fanout_ports, 120 );
 
 KOPENAPI_REGISTER( "pcb_space",
                    "Room on the board, and trying another outline (smaller / lower card, trim, resize): usable "
