@@ -953,10 +953,10 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
     {
         for( const ESCAPE_FRONT& front : *aReq.fronts )
         {
-            BOX2I near = front.shape.BBox();
-            near.Inflate( aBase + clearance );
+            BOX2I nearBox = front.shape.BBox();
+            nearBox.Inflate( aBase + clearance );
 
-            if( !front.open || front.pad->GetNetCode() == netCode || !near.Intersects( box ) )
+            if( !front.open || front.pad->GetNetCode() == netCode || !nearBox.Intersects( box ) )
                 continue;
 
             fronts.push_back( &front );
@@ -4498,13 +4498,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         {
                             std::string pads;
                             int         shown = 0, count = 0;
-                            BOX2I       near = end->GetBoundingBox();
-                            near.Inflate( pcbIUScale.mmToIU( 1.5 ) );
+                            BOX2I       nearBox = end->GetBoundingBox();
+                            nearBox.Inflate( pcbIUScale.mmToIU( 1.5 ) );
 
                             for( const ESCAPE_FRONT& front : fronts )
                             {
                                 if( !front.open || front.pad->GetNetCode() == way.from->GetNetCode()
-                                    || !near.Intersects( front.shape.BBox() ) )
+                                    || !nearBox.Intersects( front.shape.BBox() ) )
                                 {
                                     continue;
                                 }

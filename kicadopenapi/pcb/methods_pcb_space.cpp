@@ -1784,12 +1784,12 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
     // a group: nets from one side of the package to one part, arriving on one side and layer of it
     struct GROUP_KEY
     {
-        int         far;
+        int         farPart;
         std::string side, farSide, farLayer;
 
         bool operator<( const GROUP_KEY& o ) const
         {
-            return std::tie( far, side, farSide, farLayer ) < std::tie( o.far, o.side, o.farSide, o.farLayer );
+            return std::tie( farPart, side, farSide, farLayer ) < std::tie( o.farPart, o.side, o.farSide, o.farLayer );
         }
     };
 
@@ -1878,13 +1878,13 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
     for( const auto& [key, nets] : toNets )
     {
-        const int far = key.far;
+        const int farPart = key.farPart;
 
         if( nets.size() < 2 )
             continue;
 
         const PART_ORDER here = partOrder( a.fp, nets );
-        const PART_ORDER there = partOrder( b.parts[far].fp, nets );
+        const PART_ORDER there = partOrder( b.parts[farPart].fp, nets );
         std::map<std::string, int> at;
 
         for( size_t k = 0; k < there.order.size(); ++k )
@@ -1925,10 +1925,10 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         const int left = inversions( rest );
         crossingsLeft += left;
 
-        groups.push_back( { { "to", b.parts[far].ref }, { "side", key.side }, { "to_pads_side", key.farSide },
+        groups.push_back( { { "to", b.parts[farPart].ref }, { "side", key.side }, { "to_pads_side", key.farSide },
                             { "to_layer", key.farLayer }, { "layer_change_at_pin", thtEnd[key] },
-                            { "to_block", b.partBlock[far] >= 0 ? b.blocks[b.partBlock[far]].name : std::string() },
-                            { "to_side", towards( b.parts[far].centre ) }, { "width", seq.size() },
+                            { "to_block", b.partBlock[farPart] >= 0 ? b.blocks[b.partBlock[farPart]].name : std::string() },
+                            { "to_side", towards( b.parts[farPart].centre ) }, { "width", seq.size() },
                             { "order_here", names }, { "order_there", there.order },
                             { "crossings", inversions( seq ) }, { "kept_on_layer", kept }, { "via_to_other_layer", changed },
                             { "crossings_left", left } } );
