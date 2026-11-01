@@ -631,6 +631,23 @@ static KOPENAPI_RESULT h_pcb_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         if( target.GetExt() != FILEEXT::KiCadPcbFileExtension )
             return KOPENAPI_RESULT::Error( 400, "expected a .kicad_pcb path" );
 
+        if( !target.DirExists() && !wxFileName::Mkdir( target.GetPath(), wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL ) )
+            return KOPENAPI_RESULT::Error( 500, "cannot create " + std::string( target.GetPath().ToUTF8() ) );
+
+        // the custom rules go with the board: the new project reads them from beside it
+        if( BOARD* board = context->GetBoard() )
+        {
+            wxFileName rules( board->GetDesignRulesPath() );
+            wxFileName targetRules( target );
+            targetRules.SetExt( FILEEXT::DesignRulesFileExtension );
+
+            if( rules.FileExists() && rules.GetFullPath() != targetRules.GetFullPath()
+                && !wxCopyFile( rules.GetFullPath(), targetRules.GetFullPath(), true ) )
+            {
+                return KOPENAPI_RESULT::Error( 500, "cannot write " + std::string( targetRules.GetFullPath().ToUTF8() ) );
+            }
+        }
+
         // Save As switches the document (headless); GUI hosts write a copy and keep editing
         ok = aCtx.headless ? context->SaveBoardAs( target.GetFullPath() )
                            : context->SavePcbCopy( target.GetFullPath(), false, false );
