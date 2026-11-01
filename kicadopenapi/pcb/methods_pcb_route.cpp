@@ -5038,7 +5038,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     {
                         const double gap = ( pad->GetPosition() - aFrom->GetPosition() ).EuclideanNorm();
 
-                        if( pad->GetParentFootprint() != aFrom->GetParentFootprint() && gap < bestGap
+                        if( pad->GetParentFootprint() != aFrom->GetParentFootprint()
+                            && ( gap < bestGap
+                                 || ( gap == bestGap && best
+                                      && std::make_tuple( pad->GetPosition().x, pad->GetPosition().y )
+                                                 < std::make_tuple( best->GetPosition().x, best->GetPosition().y ) ) )
                             && ( pad->GetLayerSet() & aFrom->GetLayerSet() & LSET::AllCuMask() ).any() )
                         {
                             bestGap = gap;
@@ -5069,20 +5073,32 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 continue;
             }
 
-            // a chain: from the end farthest from the middle, each time to the nearest left
+            // a chain: from the end farthest from the middle, each time to the nearest left; ties (two
+            // ends are always as far from their middle) go to the package with more pads, then by place
             VECTOR2I middle( 0, 0 );
 
             for( const auto& [p, n] : ends )
                 middle += p->GetPosition() / (int) ends.size();
 
+            auto chainKey = [&]( const std::pair<PAD*, PAD*>& aEnd, const VECTOR2I& aFrom, bool aFar )
+            {
+                const VECTOR2I at = aEnd.first->GetPosition();
+                const int64_t  um = KiROUND( ( at - aFrom ).EuclideanNorm() / pcbIUScale.mmToIU( 0.001 ) );
+                const FOOTPRINT* fp = aEnd.first->GetParentFootprint();
+                const int64_t  pads = fp ? (int64_t) fp->Pads().size() : 0;
+
+                return std::make_tuple( aFar ? -um : um, -pads, at.x, at.y );
+            };
+
             std::sort( ends.begin(), ends.end(), [&]( const auto& x, const auto& y )
-                       { return ( x.first->GetPosition() - middle ).EuclideanNorm() > ( y.first->GetPosition() - middle ).EuclideanNorm(); } );
+                       { return chainKey( x, middle, true ) < chainKey( y, middle, true ); } );
 
             for( size_t k = 1; k < ends.size(); ++k )
             {
+                const VECTOR2I last = ends[k - 1].first->GetPosition();
+
                 std::sort( ends.begin() + k, ends.end(), [&]( const auto& x, const auto& y )
-                           { return ( x.first->GetPosition() - ends[k - 1].first->GetPosition() ).EuclideanNorm()
-                                    < ( y.first->GetPosition() - ends[k - 1].first->GetPosition() ).EuclideanNorm(); } );
+                           { return chainKey( x, last, false ) < chainKey( y, last, false ); } );
             }
 
             for( size_t k = 1; k < ends.size(); ++k )
