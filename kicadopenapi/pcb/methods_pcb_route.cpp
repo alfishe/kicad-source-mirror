@@ -583,15 +583,21 @@ STUB_NECK padNeck( BOARD* aBoard, PAD* aPad, int aWidth, PCB_LAYER_ID aLayer )
     if( const int rule = ruleTrackWidthAt( aBoard, aPad, aPad->GetNetCode(), aLayer ).first; rule > 0 )
         cap = std::max( bds.m_TrackMinWidth, std::min( cap, rule ) );
 
+    bool byFit = false;
+
     if( const int fit = padEntryFit( aBoard, aPad, aPad->GetNetCode() ); fit < cap )
+    {
         cap = std::max( bds.m_TrackMinWidth, fit );
+        byFit = true;
+    }
 
     if( cap < aWidth )
     {
-        char text[160];
-        std::snprintf( text, sizeof( text ), "fine-pitch pad %s.%s (pitch %.3g mm, pad %.3g mm wide)",
+        char text[200];
+        std::snprintf( text, sizeof( text ), "fine-pitch pad %s.%s (pitch %.3g mm, pad %.3g mm wide)%s",
                        str( aPad->GetParentFootprint()->GetReference() ).c_str(), str( aPad->GetNumber() ).c_str(),
-                       toMm( pitch ), toMm( std::min( size.x, size.y ) ) );
+                       toMm( pitch ), toMm( std::min( size.x, size.y ) ),
+                       byFit ? ": the width that leaves its neighbours their clearance" : "" );
         out = { cap, text };
     }
 
