@@ -21,6 +21,7 @@
 #include <string_utils.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <deque>
@@ -1102,6 +1103,507 @@ static KOPENAPI_RESULT h_pcb_blocks( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 }
 
 
+/// @brief Where the nets of a bus or link leave one block: the pads on its anchor (else on any member
+/// holding them), the side of the part each is on (board frame) and the nets clockwise round the part
+struct LINK_END
+{
+    int                      block = -1;
+    std::string              part;
+    std::map<std::string, int> sides;
+    std::string              side;     ///< the side most of them are on
+    std::vector<std::string> order;    ///< nets clockwise round the part (board view, y down)
+    int                      pads = 0;
+};
+
+
+LINK_END linkEnd( const BOARD_BLOCKS& aB, int aBlock, const std::set<int>& aNets )
+{
+    LINK_END   end;
+    const BLOCK& blk = aB.blocks[aBlock];
+    end.block = aBlock;
+
+    std::vector<int> order = blk.members;
+
+    if( blk.anchor >= 0 )
+    {
+        order.erase( std::remove( order.begin(), order.end(), blk.anchor ), order.end() );
+        order.insert( order.begin(), blk.anchor );
+    }
+
+    for( int m : order )
+    {
+        FOOTPRINT*        fp = aB.parts[m].fp;
+        std::vector<PAD*> pads, all;
+
+        for( PAD* pad : fp->Pads() )
+        {
+            if( pad->GetNumber().IsEmpty() )
+                continue;
+
+            all.push_back( pad );
+
+            if( aNets.count( pad->GetNetCode() ) )
+                pads.push_back( pad );
+        }
+
+        if( pads.empty() )
+            continue;
+
+        BOX2I extent;
+        extent.SetOrigin( all.front()->GetPosition() );
+
+        for( PAD* pad : all )
+            extent.Merge( pad->GetPosition() );
+
+        const VECTOR2I c = extent.Centre();
+        double         sx = 0, sy = 0;
+        std::vector<std::pair<double, std::string>> around;
+
+        for( PAD* pad : pads )
+        {
+            const VECTOR2I d = pad->GetPosition() - c;
+            const double   rx = extent.GetWidth() > 0 ? double( d.x ) / extent.GetWidth() : 0;
+            const double   ry = extent.GetHeight() > 0 ? double( d.y ) / extent.GetHeight() : 0;
+            const char*    side = std::abs( rx ) < 0.2 && std::abs( ry ) < 0.2 ? "centre"
+                                  : std::abs( rx ) >= std::abs( ry )          ? ( rx < 0 ? "west" : "east" )
+                                                                               : ( ry < 0 ? "north" : "south" );
+            end.sides[side]++;
+            const double len = std::hypot( double( d.x ), double( d.y ) );
+
+            if( len > 0 )
+            {
+                sx += d.x / len;
+                sy += d.y / len;
+            }
+        }
+
+        const double mean = std::atan2( sy, sx );
+
+        for( PAD* pad : pads )
+        {
+            const VECTOR2I d = pad->GetPosition() - c;
+            double         a = std::atan2( double( d.y ), double( d.x ) ) - mean;
+
+            while( a <= -M_PI )
+                a += 2 * M_PI;
+
+            while( a > M_PI )
+                a -= 2 * M_PI;
+
+            around.emplace_back( a, str( UnescapeString( pad->GetNetname() ) ) );
+        }
+
+        std::stable_sort( around.begin(), around.end(),
+                          []( const auto& x, const auto& y ) { return x.first < y.first; } );
+
+        for( const auto& [a, net] : around )
+        {
+            if( std::find( end.order.begin(), end.order.end(), net ) == end.order.end() )
+                end.order.push_back( net );
+        }
+
+        end.part = aB.parts[m].ref;
+        end.pads = (int) pads.size();
+        int most = 0;
+
+        for( const auto& [side, n] : end.sides )
+        {
+            if( n > most )
+            {
+                most = n;
+                end.side = side;
+            }
+        }
+
+        break;
+    }
+
+    return end;
+}
+
+
+/// @brief Pairs of nets whose order at one end is not the mirror of the other's: tracks that cross
+/// between two parts facing each other (clockwise at one end is counter-clockwise at the other)
+int crossingsBetween( const std::vector<std::string>& aA, const std::vector<std::string>& aB )
+{
+    std::map<std::string, int> at;
+
+    for( size_t k = 0; k < aB.size(); ++k )
+        at[aB[k]] = (int) ( aB.size() - 1 - k );
+
+    std::vector<int> seq;
+
+    for( const std::string& n : aA )
+    {
+        if( auto it = at.find( n ); it != at.end() )
+            seq.push_back( it->second );
+    }
+
+    int inversions = 0;
+
+    for( size_t i = 0; i < seq.size(); ++i )
+    {
+        for( size_t j = i + 1; j < seq.size(); ++j )
+            inversions += seq[i] > seq[j];
+    }
+
+    return inversions;
+}
+
+
+nlohmann::json endJson( const BOARD_BLOCKS& aB, const LINK_END& aEnd )
+{
+    return { { "block", aB.blocks[aEnd.block].name }, { "part", aEnd.part }, { "side", aEnd.side },
+             { "sides", aEnd.sides }, { "order", aEnd.order }, { "pads", aEnd.pads } };
+}
+
+
+static KOPENAPI_RESULT h_pcb_layout_graph( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    const auto    started = std::chrono::steady_clock::now();
+    BOARD*        board = context->GetBoard();
+    GROUP_OPTIONS opt;
+
+    if( std::optional<std::string> bad = groupOptions( aArgs, opt ) )
+        return KOPENAPI_RESULT::Error( 400, *bad );
+
+    std::string  error;
+    BOARD_BLOCKS b = buildBlocks( aCtx, board, opt, aArgs.value( "blocks", nlohmann::json() ), error );
+
+    if( !error.empty() )
+        return KOPENAPI_RESULT::Error( 404, error );
+
+    std::map<std::string, int> partOf;
+
+    for( size_t i = 0; i < b.parts.size(); ++i )
+        partOf[b.parts[i].ref] = (int) i;
+
+    auto blockOfRef = [&]( const std::string& aRef )
+    {
+        auto it = partOf.find( aRef );
+        return it == partOf.end() ? -1 : b.partBlock[it->second];
+    };
+
+    auto netName = [&]( int aCode )
+    {
+        NETINFO_ITEM* net = board->FindNet( aCode );
+        return net ? str( UnescapeString( net->GetNetname() ) ) : std::string();
+    };
+
+    // the blocks each signal net reaches
+    std::map<int, std::set<int>> netBlocks;
+
+    for( size_t i = 0; i < b.parts.size(); ++i )
+    {
+        if( b.partBlock[i] < 0 )
+            continue;
+
+        for( int n : b.parts[i].nets )
+        {
+            if( !b.rails.count( n ) )
+                netBlocks[n].insert( b.partBlock[i] );
+        }
+    }
+
+    // buses: pcb_net_roles bundles of one name that share an end part, as one
+    struct BUS
+    {
+        std::string           key;
+        std::set<std::string> ends;      ///< parts
+        std::set<int>         nets;
+        std::set<std::string> sources;
+        std::vector<std::string> bundles;
+        std::map<std::string, int> endUse;   ///< part -> bundles it ends
+    };
+
+    std::vector<BUS> buses;
+    nlohmann::json   rolesBody;
+
+    if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+    {
+        KOPENAPI_RESULT r = roles->handler( aCtx, { { "min_bundle", aArgs.value( "min_bus", 3 ) } } );
+
+        if( r.status == 200 )
+            rolesBody = r.body;
+    }
+
+    for( const nlohmann::json& bundle : rolesBody.value( "bundles", nlohmann::json::array() ) )
+    {
+        const std::string name = bundle.value( "name", std::string() );
+        const std::string key = name.substr( 0, name.find( '@' ) );
+        std::set<std::string> ends;
+        std::set<int>         nets;
+
+        for( const nlohmann::json& e : bundle.value( "ends", nlohmann::json::array() ) )
+            ends.insert( e.get<std::string>() );
+
+        for( const nlohmann::json& m : bundle.value( "members", nlohmann::json::array() ) )
+        {
+            for( const nlohmann::json& n : m.value( "nets", nlohmann::json::array() ) )
+            {
+                if( NETINFO_ITEM* net = KopenapiFindNet( board, n.get<std::string>() ) )
+                    nets.insert( net->GetNetCode() );
+            }
+        }
+
+        BUS* into = nullptr;
+
+        for( BUS& bus : buses )
+        {
+            if( bus.key != key )
+                continue;
+
+            for( const std::string& e : ends )
+            {
+                if( bus.ends.count( e ) )
+                    into = &bus;
+            }
+        }
+
+        if( !into )
+        {
+            buses.push_back( BUS{ key } );
+            into = &buses.back();
+        }
+
+        into->ends.insert( ends.begin(), ends.end() );
+        into->nets.insert( nets.begin(), nets.end() );
+        into->sources.insert( bundle.value( "source", std::string( "topology" ) ) );
+        into->bundles.push_back( name );
+
+        for( const std::string& e : ends )
+            into->endUse[e]++;
+    }
+
+    // two buses of one name joined later by a bundle that shares an end with both
+    for( bool merged = true; merged; )
+    {
+        merged = false;
+
+        for( size_t i = 0; i < buses.size() && !merged; ++i )
+        {
+            for( size_t j = i + 1; j < buses.size() && !merged; ++j )
+            {
+                if( buses[i].key != buses[j].key )
+                    continue;
+
+                for( const std::string& e : buses[j].ends )
+                {
+                    if( buses[i].ends.count( e ) )
+                    {
+                        merged = true;
+                        break;
+                    }
+                }
+
+                if( merged )
+                {
+                    BUS& to = buses[i];
+                    BUS& from = buses[j];
+                    to.ends.insert( from.ends.begin(), from.ends.end() );
+                    to.nets.insert( from.nets.begin(), from.nets.end() );
+                    to.sources.insert( from.sources.begin(), from.sources.end() );
+                    to.bundles.insert( to.bundles.end(), from.bundles.begin(), from.bundles.end() );
+
+                    for( const auto& [e, n] : from.endUse )
+                        to.endUse[e] += n;
+
+                    buses.erase( buses.begin() + (long) j );
+                }
+            }
+        }
+    }
+
+    std::map<int, int> busOf;   // net -> bus
+    nlohmann::json     busList = nlohmann::json::array();
+
+    for( size_t k = 0; k < buses.size(); ++k )
+    {
+        BUS& bus = buses[k];
+
+        // the trunk: the end part in most of its bundles, then the one with most of its nets
+        std::string trunk;
+        int         best = -1;
+
+        for( const auto& [e, n] : bus.endUse )
+        {
+            if( n > best )
+            {
+                best = n;
+                trunk = e;
+            }
+        }
+
+        std::vector<std::string> names;
+
+        for( int n : bus.nets )
+        {
+            busOf[n] = (int) k;
+            names.push_back( netName( n ) );
+        }
+
+        std::sort( names.begin(), names.end(), []( const std::string& x, const std::string& y ) { return KopenapiNaturalLess( x, y ); } );
+
+        std::set<int> blocks;
+
+        for( const std::string& e : bus.ends )
+        {
+            if( int blk = blockOfRef( e ); blk >= 0 )
+                blocks.insert( blk );
+        }
+
+        const int      trunkBlock = blockOfRef( trunk );
+        nlohmann::json ends = nlohmann::json::array();
+        LINK_END       trunkEnd;
+
+        if( trunkBlock >= 0 )
+            trunkEnd = linkEnd( b, trunkBlock, bus.nets );
+
+        for( int blk : blocks )
+        {
+            const LINK_END end = blk == trunkBlock ? trunkEnd : linkEnd( b, blk, bus.nets );
+            nlohmann::json j = endJson( b, end );
+
+            if( blk != trunkBlock && trunkBlock >= 0 )
+                j["crossings_to_trunk"] = crossingsBetween( trunkEnd.order, end.order );
+
+            ends.push_back( j );
+        }
+
+        nlohmann::json sources = nlohmann::json::array();
+
+        for( const std::string& src : bus.sources )
+            sources.push_back( src );
+
+        busList.push_back( { { "name", bus.key + "@" + trunk }, { "width", bus.nets.size() }, { "nets", names },
+                             { "trunk", trunkBlock >= 0 ? b.blocks[trunkBlock].name : trunk }, { "ends", ends },
+                             { "bundles", bus.bundles }, { "source", sources } } );
+    }
+
+    // edges between blocks: every signal net two blocks share, by bus or alone
+    std::map<std::pair<int, int>, std::set<int>> pairNets;
+
+    for( const auto& [net, blocks] : netBlocks )
+    {
+        if( blocks.size() < 2 )
+            continue;
+
+        for( int x : blocks )
+        {
+            for( int y : blocks )
+            {
+                if( x < y )
+                    pairNets[{ x, y }].insert( net );
+            }
+        }
+    }
+
+    const int      listLimit = std::max( 1, aArgs.value( "list_limit", 16 ) );
+    nlohmann::json edges = nlohmann::json::array();
+    std::vector<std::pair<std::pair<int, int>, std::set<int>>> sortedPairs( pairNets.begin(), pairNets.end() );
+    std::stable_sort( sortedPairs.begin(), sortedPairs.end(),
+                      []( const auto& x, const auto& y ) { return x.second.size() > y.second.size(); } );
+
+    for( const auto& [pair, nets] : sortedPairs )
+    {
+        nlohmann::json singles = nlohmann::json::array();
+        int            alone = 0;
+        std::set<int>  through;
+
+        for( int n : nets )
+        {
+            if( auto it = busOf.find( n ); it != busOf.end() )
+            {
+                through.insert( it->second );
+                continue;
+            }
+
+            if( alone++ < listLimit )
+                singles.push_back( netName( n ) );
+        }
+
+        nlohmann::json via = nlohmann::json::array();
+
+        for( int k : through )
+            via.push_back( busList[k]["name"] );
+
+        nlohmann::json e = { { "a", b.blocks[pair.first].name }, { "b", b.blocks[pair.second].name },
+                             { "width", nets.size() }, { "buses", via }, { "singles", alone } };
+
+        if( alone > 0 )
+            e["single_nets"] = singles;
+
+        edges.push_back( e );
+    }
+
+    // clusters: the schematic sheet of each block's anchor
+    std::map<std::string, std::vector<int>> sheets;
+
+    for( size_t i = 0; i < b.blocks.size(); ++i )
+    {
+        const BLOCK& blk = b.blocks[i];
+        sheets[blk.anchor >= 0 ? b.parts[blk.anchor].sheet : "/"].push_back( (int) i );
+    }
+
+    nlohmann::json clusters = nlohmann::json::array();
+
+    for( const auto& [sheet, members] : sheets )
+    {
+        nlohmann::json names = nlohmann::json::array();
+
+        for( int i : members )
+            names.push_back( b.blocks[i].name );
+
+        clusters.push_back( { { "sheet", sheet }, { "blocks", names } } );
+    }
+
+    nlohmann::json blocks = nlohmann::json::array();
+
+    for( size_t i = 0; i < b.blocks.size(); ++i )
+    {
+        const BLOCK& blk = b.blocks[i];
+        BOX2I        box;
+        bool         first = true;
+
+        for( int m : blk.members )
+        {
+            const BOX2I cb = b.parts[m].courtyard.BBox();
+
+            if( first )
+                box = cb;
+            else
+                box.Merge( cb );
+
+            first = false;
+        }
+
+        nlohmann::json j = { { "name", blk.name }, { "kind", blk.kind }, { "parts", blk.members.size() } };
+
+        if( blk.anchor >= 0 )
+        {
+            j["anchor"] = b.parts[blk.anchor].ref;
+            j["sheet"] = b.parts[blk.anchor].sheet;
+        }
+
+        if( !first )
+            j["bbox_mm"] = boxJson( box );
+
+        blocks.push_back( j );
+    }
+
+    const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
+
+    return KOPENAPI_RESULT::Ok( { { "blocks", blocks }, { "clusters", clusters }, { "buses", busList },
+                                  { "edges", edges }, { "unassigned", refList( b, b.unassigned ) },
+                                  { "ms", std::round( ms ) } } );
+}
+
+
 static KOPENAPI_RESULT h_pcb_space( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -1571,6 +2073,26 @@ KOPENAPI_REGISTER( "pcb_blocks",
                         "show":{"type":"boolean","default":false,"description":"GUI: overlay group 'blocks'"},
                         "show_fill":{"type":"number","default":0.22,"minimum":0,"maximum":1,"description":"GUI: fill opacity of the shown regions"}}})json"_json,
                    false, h_pcb_blocks, 120 );
+
+KOPENAPI_REGISTER( "pcb_layout_graph",
+                   "The board as blocks and the links between them, the first level of laying it out: blocks (an "
+                   "IC or connector with its small parts, as pcb_blocks finds them), clusters (blocks by schematic "
+                   "sheet), buses (pcb_net_roles bundles of one name that share an end part, joined: the MB bus of "
+                   "three bundles from one MCU to four buffers is one bus of 12 nets) with their trunk (the end in "
+                   "most bundles) and per end block the part the nets leave from, its side (west / east / north / "
+                   "south, board frame), the nets clockwise round the part and crossings_to_trunk (pairs of nets "
+                   "whose order is not the mirror of the trunk's: tracks that cross between them as placed); edges: "
+                   "every pair of blocks sharing signal nets, widest first, with the buses between them and the "
+                   "nets that go alone (single_nets cut to list_limit). Read only",
+                   R"json({"type":"object","properties":{
+                        "by":{"type":"string","enum":["auto","sheet"],"default":"auto","description":"blocks as pcb_blocks: auto around ICs and connectors, sheet one per schematic sheet"},
+                        "blocks":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"parts":{"type":"array","items":{"type":"string"}}}},"description":"these blocks instead"},
+                        "max_part_pins":{"type":"integer","default":3},
+                        "depth":{"type":"integer","default":2,"minimum":1,"maximum":6},
+                        "max_fanout":{"type":"integer","default":30},
+                        "min_bus":{"type":"integer","default":3,"minimum":2,"description":"lines a bundle needs (pcb_net_roles min_bundle)"},
+                        "list_limit":{"type":"integer","default":16,"description":"single nets listed per edge"}}})json"_json,
+                   false, h_pcb_layout_graph, 120 );
 
 KOPENAPI_REGISTER( "pcb_space",
                    "Room on the board, and trying another outline (smaller / lower card, trim, resize): usable "
