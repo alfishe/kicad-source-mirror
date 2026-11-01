@@ -50,6 +50,7 @@
 #include <gal/graphics_abstraction_layer.h>
 #include <pcb_painter.h>
 
+#include <geometry/geometry_utils.h>
 #include <geometry/shape.h>
 #include <geometry/shape_line_chain.h>
 #include <geometry/shape_arc.h>
@@ -640,6 +641,25 @@ BOARD_ITEM* PNS_PCBNEW_RULE_RESOLVER::getBoardItem( const PNS::ITEM* aItem, PCB_
 }
 
 
+// The part of a line's segment within reach of an opposing item: the copper a clearance to that
+// item is about (the route is split at rule areas when it is committed, as DRC then sees it)
+static std::optional<SEG> segmentInReach( const VECTOR2I& aA, const VECTOR2I& aB, const BOX2I& aReach )
+{
+    BOX2I segBox( aA, VECTOR2I( 0, 0 ) );
+    segBox.Merge( aB );
+
+    if( !segBox.Intersects( aReach ) )
+        return std::nullopt;
+
+    int x1 = aA.x, y1 = aA.y, x2 = aB.x, y2 = aB.y;
+
+    if( ClipLine( &aReach, x1, y1, x2, y2 ) )
+        return std::nullopt;
+
+    return SEG( VECTOR2I( x1, y1 ), VECTOR2I( x2, y2 ) );
+}
+
+
 bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
                                                 const PNS::ITEM* aItemA, const PNS::ITEM* aItemB,
                                                 int aPNSLayer, PNS::CONSTRAINT* aConstraint )
@@ -791,18 +811,21 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
 
         for( int i = 0; i < chain.SegmentCount(); i++ )
         {
+            SEG seg( chain.CPoint( i ), chain.CPoint( i + 1 ) );
+
             if( useReach )
             {
-                BOX2I segBox( chain.CPoint( i ), VECTOR2I( 0, 0 ) );
-                segBox.Merge( chain.CPoint( i + 1 ) );
+                std::optional<SEG> near = segmentInReach( seg.A, seg.B, reach );
 
-                if( !segBox.Intersects( reach ) )
+                if( !near )
                     continue;
+
+                seg = *near;
             }
 
             evaluated = true;
 
-            if( evaluate( chain.CPoint( i ), chain.CPoint( i + 1 ) ) )
+            if( evaluate( seg.A, seg.B ) )
                 break;
         }
 
@@ -1124,13 +1147,12 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
 
         for( int i = 0; i < chain.SegmentCount(); ++i )
         {
-            BOX2I segBox( chain.CPoint( i ), VECTOR2I( 0, 0 ) );
-            segBox.Merge( chain.CPoint( i + 1 ) );
+            std::optional<SEG> near = segmentInReach( chain.CPoint( i ), chain.CPoint( i + 1 ), reach );
 
-            if( !segBox.Intersects( reach ) )
+            if( !near )
                 continue;
 
-            size_t k = trackKey( chain.CPoint( i ), chain.CPoint( i + 1 ), width );
+            size_t k = trackKey( near->A, near->B, width );
 
             if( std::find( seen.begin(), seen.end(), k ) == seen.end() )
             {
@@ -1154,6 +1176,10 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
         for( int i = 0; i < aOther->AnchorCount(); ++i )
             reach.Merge( aOther->Anchor( i ) );
     }
+
+    // QueryConstraint evaluates the parts of the segments within reach of the other item's box
+    add( reach.GetOrigin() );
+    add( reach.GetEnd() );
 
     // wider than QueryConstraint's reach: the hash covers every segment it can evaluate, with the
     // exact points, as which of them it evaluates depends on them
