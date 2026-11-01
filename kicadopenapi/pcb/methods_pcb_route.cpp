@@ -11112,6 +11112,38 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         onlyNets.insert( net->GetNetCode() );
     }
 
+    // ports: the layout's plan for each pin (pcb_fanout_ports): a via only for rails and for pins the
+    // order at their far end moves to the other layer; the rest leave on the pad's layer
+    struct PORT_PLAN
+    {
+        std::string kind, layer, to;
+    };
+
+    const bool                 withPorts = aArgs.value( "ports", false );
+    std::map<std::string, PORT_PLAN> plan;
+
+    if( withPorts )
+    {
+        std::optional<KOPENAPI_METHOD> ports = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" );
+
+        if( !ports )
+            return KOPENAPI_RESULT::Error( 500, "pcb_fanout_ports is not registered" );
+
+        KOPENAPI_RESULT r = ports->handler( aCtx, { { "ref", str( aFp->GetReference() ) } } );
+
+        if( r.status != 200 )
+            return r;
+
+        for( const auto& [side, list] : r.body["ports"].items() )
+        {
+            for( const nlohmann::json& port : list )
+            {
+                plan[port.value( "pad", std::string() )] = { port.value( "kind", std::string() ), port.value( "layer", std::string() ),
+                                                              port.value( "to", std::string() ) };
+            }
+        }
+    }
+
     std::vector<PAD*> pads;
 
     for( PAD* pad : aFp->Pads() )
@@ -11343,6 +11375,9 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
             std::string        last = "every row's spot touches other copper";
             bool               done = false;
 
+            const auto     portOf = plan.find( str( pad->GetNumber() ) );
+            const bool     padVia = !withPorts ? withVias
+                                    : portOf != plan.end() && ( portOf->second.kind == "rail" || portOf->second.layer == "other" );
             const VECTOR2I knee = point( along( at ), tipLine );
             const VECTOR2I ray = point( fanned, rayEnd );
 
@@ -11354,12 +11389,12 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
 
             for( int r : tries )
             {
-                const int64_t  reach = withVias ? rayEnd + r * ( viaDia + clearance ) : toCourtyard;
+                const int64_t  reach = padVia ? rayEnd + r * ( viaDia + clearance ) : toCourtyard;
                 const VECTOR2I spot = point( fanned, reach );
 
                 std::unique_ptr<PCB_VIA> via;
 
-                if( withVias )
+                if( padVia )
                 {
                     via = std::make_unique<PCB_VIA>( aBoard );
                     via->SetViaType( VIATYPE::THROUGH );
@@ -11400,7 +11435,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
                 {
                     last = "the spots out from it touch other copper (" + violations[0]["other"].dump() + ")";
 
-                    if( !withVias )
+                    if( !padVia )
                         break;
 
                     continue;
@@ -11412,8 +11447,16 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
                                        { "end_mm", { toMm( spot.x ), toMm( spot.y ) } },
                                        { "far_end_mm", { toMm( fars[pad]->x ), toMm( fars[pad]->y ) } } };
 
-                if( withVias )
+                if( padVia )
                     row["row"] = r;
+
+                if( withPorts && portOf != plan.end() )
+                {
+                    row["port"] = { { "kind", portOf->second.kind }, { "layer", portOf->second.layer } };
+
+                    if( !portOf->second.to.empty() )
+                        row["port"]["to"] = portOf->second.to;
+                }
 
                 placed.push_back( row );
 
@@ -11486,6 +11529,16 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
                               { "skipped_by_reason", reasons },
                               { "dry_run", dryRun },
                               { "applied", !dryRun && !added.empty() } };
+
+    if( withPorts )
+    {
+        int planVias = 0;
+
+        for( const nlohmann::json& row : placed )
+            planVias += row.contains( "row" );
+
+        answer["ports"] = { { "planned", plan.size() }, { "vias", planVias } };
+    }
 
     if( withVias )
         answer["via"] = { { "diameter_mm", toMm( viaDia ) }, { "drill_mm", toMm( viaDrill ) } };
@@ -12561,6 +12614,7 @@ KOPENAPI_REGISTER( "pcb_fanout",
                         "width_mm":{"type":"number"},
                         "stagger":{"type":"integer","minimum":1,"maximum":4,"description":"ring packages: via lines the neighbours alternate over (default 2 when a via plus clearance is wider than the pitch, else 1)"},
                         "vias":{"type":"boolean","default":true,"description":"ring packages: false gives the stubs only, ending just outside the courtyard"},
+                        "ports":{"type":"boolean","default":false,"description":"ring packages: follow the layout plan (pcb_fanout_ports): a via only for rails and for pins whose far end's order moves them to the other layer; the rest stubs out past the courtyard on the pad's layer; each pin answers its port (kind, layer, to)"},
                         "direction":{"type":"string","enum":["inward","up","down","left","right"],"description":"stubs straight this way (edge mode); inward: away from the board edge the pads sit on (found by itself for card-edge fingers)"},
                         "stub_mm":{"type":"number","description":"edge mode: stub length from the pad centre"},
                         "via":{"type":"string","enum":["none","always","stagger"],"default":"none","description":"edge mode: a via at each stub end, stagger: on two alternating lines"},
