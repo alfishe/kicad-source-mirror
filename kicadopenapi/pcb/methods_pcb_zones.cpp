@@ -1508,7 +1508,6 @@ KOPENAPI_REGISTER( "pcb_zone_delete",
                    "with its library footprint); one undo step; answers the connections still open",
                    R"json({"type":"object","properties":{
                         "uuid":{"type":"string"},"net":{"type":"string","description":"every zone of this net (instead of uuid)"},
-                        "set_net":{"type":"string","description":"new net of the zones"},
                         "override_locks":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_zone_delete );
 
