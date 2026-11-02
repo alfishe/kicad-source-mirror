@@ -31,13 +31,21 @@ class FOOTPRINT_LIBRARY_ADAPTER;
 class PROJECT;
 
 
+/// The plugin type Add Library gives the library at @a aLibPath (KiCad when it cannot tell)
+wxString FootprintLibraryType( const wxString& aLibPath );
+
+/// The nickname Add Library gives the library at @a aLibPath
+wxString FootprintLibraryNickname( const wxString& aLibPath );
+
+
 /**
  * Add Library without the file dialog: the library at @a aLibPath goes into the global or project
  * footprint library table (nickname from its file name, path normalised to an environment
- * variable or the project), the table is saved and reloaded and the library loaded.
+ * variable, or the project for the project table) through EditLibraryTable, and the library
+ * loaded.
  *
- * @return false when there is no library name or table, with @a aError when the table could not
- *         be saved
+ * @return false when there is no library name (@a aError empty), or with @a aError from
+ *         EditLibraryTable
  */
 bool AddFootprintLibraryToTable( PROJECT& aProject, const wxString& aLibPath, LIBRARY_TABLE_SCOPE aScope,
                                  wxString& aNickname, wxString& aError );

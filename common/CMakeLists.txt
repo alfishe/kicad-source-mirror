@@ -210,6 +210,7 @@ set( KICOMMON_SRCS
     libraries/library_manager.cpp
     libraries/library_table.cpp
     libraries/library_table_parser.cpp
+    libraries/library_table_edit.cpp
 
     model_preview_manager.cpp
     model_preview_manager_windows_classifier.cpp

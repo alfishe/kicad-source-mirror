@@ -25,6 +25,7 @@
 #include <footprint_library_adapter.h>
 #include <ki_exception.h>
 #include <libraries/library_manager.h>
+#include <libraries/library_table_edit.h>
 #include <pcb_io/pcb_io_mgr.h>
 #include <pgm_base.h>
 #include <project.h>
@@ -37,66 +38,65 @@
 #include <memory>
 
 
-bool AddFootprintLibraryToTable( PROJECT& aProject, const wxString& aLibPath, LIBRARY_TABLE_SCOPE aScope,
-                                 wxString& aNickname, wxString& aError )
+wxString FootprintLibraryType( const wxString& aLibPath )
 {
-    FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( &aProject );
-    LIBRARY_MANAGER&           manager = Pgm().GetLibraryManager();
-    wxFileName                 fn( aLibPath );
-    wxString                   libPath = fn.GetFullPath();
-    wxString                   libName = fn.GetName();
-
-    if( libName.IsEmpty() )
-        return false;
-
-    PCB_IO_MGR::PCB_FILE_T lib_type = PCB_IO_MGR::GuessPluginTypeFromLibPath( libPath );
+    PCB_IO_MGR::PCB_FILE_T lib_type = PCB_IO_MGR::GuessPluginTypeFromLibPath( aLibPath );
 
     if( lib_type == PCB_IO_MGR::FILE_TYPE_NONE )
         lib_type = PCB_IO_MGR::KICAD_SEXP;
 
-    wxString type = PCB_IO_MGR::ShowType( lib_type );
+    return PCB_IO_MGR::ShowType( lib_type );
+}
+
+
+wxString FootprintLibraryNickname( const wxString& aLibPath )
+{
+    wxFileName fn( aLibPath );
 
     // KiCad lib is our default guess.  So it might not have the .pretty extension
     // In this case, the extension is part of the library name
-    if( lib_type == PCB_IO_MGR::KICAD_SEXP && fn.GetExt() != FILEEXT::KiCadFootprintLibPathExtension )
-        libName = fn.GetFullName();
-
-    // try to use path normalized to an environmental variable or project path
-    wxString normalizedPath = NormalizePath( libPath, &Pgm().GetLocalEnvVariables(), &aProject );
-    bool     success = true;
-
-    try
+    if( FootprintLibraryType( aLibPath ) == PCB_IO_MGR::ShowType( PCB_IO_MGR::KICAD_SEXP )
+        && fn.GetExt() != FILEEXT::KiCadFootprintLibPathExtension )
     {
-        std::optional<LIBRARY_TABLE*> optTable = manager.Table( LIBRARY_TABLE_TYPE::FOOTPRINT, aScope );
-
-        if( !optTable )
-            return false;
-
-        LIBRARY_TABLE* table = optTable.value();
-
-        LIBRARY_TABLE_ROW& row = table->InsertRow();
-
-        row.SetNickname( libName );
-        row.SetURI( normalizedPath );
-        row.SetType( type );
-
-        table->Save().map_error(
-                [&]( const LIBRARY_ERROR& aLibError )
-                {
-                    aError = _( "Error saving library table:\n\n" ) + aLibError.message;
-                    success = false;
-                } );
+        return fn.GetFullName();
     }
-    catch( const IO_ERROR& ioe )
+
+    return fn.GetName();
+}
+
+
+bool AddFootprintLibraryToTable( PROJECT& aProject, const wxString& aLibPath, LIBRARY_TABLE_SCOPE aScope,
+                                 wxString& aNickname, wxString& aError )
+{
+    FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( &aProject );
+    wxFileName                 fn( aLibPath );
+    wxString                   libPath = fn.GetFullPath();
+
+    if( fn.GetName().IsEmpty() )
+        return false;
+
+    wxString type = FootprintLibraryType( libPath );
+    wxString libName = FootprintLibraryNickname( libPath );
+
+    // try to use path normalized to an environmental variable, or the project path for the project table
+    wxString normalizedPath = NormalizePath( libPath, &Pgm().GetLocalEnvVariables(),
+                                             aScope == LIBRARY_TABLE_SCOPE::PROJECT ? &aProject : nullptr );
+
+    if( !EditLibraryTable( LIBRARY_TABLE_TYPE::FOOTPRINT, aScope,
+                           [&]( LIBRARY_TABLE& aTable ) -> wxString
+                           {
+                               LIBRARY_TABLE_ROW& row = aTable.InsertRow();
+
+                               row.SetNickname( libName );
+                               row.SetURI( normalizedPath );
+                               row.SetType( type );
+                               return wxEmptyString;
+                           },
+                           aError ) )
     {
-        aError = ioe.What();
         return false;
     }
 
-    if( !success )
-        return false;
-
-    manager.ReloadTables( aScope, { LIBRARY_TABLE_TYPE::FOOTPRINT } );
     adapter->LoadOne( libName );
     aNickname = libName;
     return true;

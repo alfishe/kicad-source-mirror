@@ -93,6 +93,7 @@
 #include <wildcards_and_files_ext.h>
 #include <panel_sym_lib_table.h>
 #include <string_utils.h>
+#include <libraries/library_table_edit.h>
 #include <libraries/symbol_library_adapter.h>
 #include <wx/dir.h>
 #include <wx/msgdlg.h>
@@ -2352,7 +2353,6 @@ bool SYMBOL_EDIT_FRAME::addLibTableEntry( const wxString& aLibFile, LIBRARY_TABL
     wxFileName libTableFileName( Prj().GetProjectPath(), FILEEXT::SymbolLibraryTableFileName );
     wxString libNickname = fn.GetName();
     SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( &Prj() );
-    LIBRARY_MANAGER&        manager = Pgm().GetLibraryManager();
     const ENV_VAR_MAP&      envVars = Pgm().GetLocalEnvVariables();
 
     if( adapter->HasLibrary( libNickname ) )
@@ -2368,42 +2368,34 @@ bool SYMBOL_EDIT_FRAME::addLibTableEntry( const wxString& aLibFile, LIBRARY_TABL
         }
     }
 
-    std::optional<LIBRARY_TABLE*> optTable = manager.Table( LIBRARY_TABLE_TYPE::SYMBOL, aScope );
-    wxCHECK( optTable.has_value(), false );
-    LIBRARY_TABLE* table = optTable.value();
-
-    LIBRARY_TABLE_ROW* row = &table->InsertRow();
-
-    row->SetNickname( libNickname );
-
     // We cannot normalize against the current project path when saving to global table.
     wxString normalizedPath = NormalizePath( aLibFile, &envVars,
                                              aScope == LIBRARY_TABLE_SCOPE::PROJECT ? Prj().GetProjectPath()
                                                                                     : wxString( wxEmptyString ) );
+    wxString error;
 
-    row->SetURI( normalizedPath );
-    row->SetType( SCH_IO_MGR::ShowType( SCH_IO_MGR::GuessPluginTypeFromLibPath( normalizedPath ) ) );
+    if( !EditLibraryTable( LIBRARY_TABLE_TYPE::SYMBOL, aScope,
+                           [&]( LIBRARY_TABLE& aTable ) -> wxString
+                           {
+                               LIBRARY_TABLE_ROW& row = aTable.InsertRow();
 
-    bool success = true;
-
-    table->Save().map_error(
-            [&]( const LIBRARY_ERROR& aError )
-            {
-                KICAD_MESSAGE_DIALOG dlg( this, _( "Error saving library table." ), _( "File Save Error" ),
-                                          wxOK | wxICON_ERROR );
-                dlg.SetExtendedMessage( aError.message );
-                dlg.ShowModal();
-
-                success = false;
-            } );
-
-    if( success )
+                               row.SetNickname( libNickname );
+                               row.SetURI( normalizedPath );
+                               row.SetType( SCH_IO_MGR::ShowType(
+                                       SCH_IO_MGR::GuessPluginTypeFromLibPath( normalizedPath ) ) );
+                               return wxEmptyString;
+                           },
+                           error ) )
     {
-        manager.ReloadTables( aScope, { LIBRARY_TABLE_TYPE::SYMBOL } );
-        adapter->LoadOne( libNickname );
+        KICAD_MESSAGE_DIALOG dlg( this, _( "Error saving library table." ), _( "File Save Error" ),
+                                  wxOK | wxICON_ERROR );
+        dlg.SetExtendedMessage( error );
+        dlg.ShowModal();
+        return false;
     }
 
-    return success;
+    adapter->LoadOne( libNickname );
+    return true;
 }
 
 
