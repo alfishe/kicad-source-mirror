@@ -813,6 +813,31 @@ bool KopenapiPadFinePitch( BOARD* aBoard, PAD* aPad )
 }
 
 
+int KopenapiPadEscapeDepth( BOARD* aBoard, PAD* aPad )
+{
+    if( !aPad || !aPad->GetParentFootprint() )
+        return 0;
+
+    const PCB_LAYER_ID layer = aPad->GetPrincipalLayer();
+    KOPENAPI_RULE_VIA  rule = KopenapiRuleVia( aBoard, aPad->GetNetCode(), aPad->GetPosition(), layer, nullptr );
+    double             pitch = std::numeric_limits<double>::max();
+
+    for( PAD* q : aPad->GetParentFootprint()->Pads() )
+    {
+        if( q == aPad || !KopenapiPadNeighbours( q, aPad ) )
+            continue;
+
+        pitch = std::min( pitch, double( ( q->GetPosition() - aPad->GetPosition() ).EuclideanNorm() ) );
+
+        if( q->GetNetCode() != aPad->GetNetCode() )
+            rule.clearance = std::max( rule.clearance, KopenapiRuleVia( aBoard, aPad->GetNetCode(), aPad->GetPosition(), layer, q ).clearance );
+    }
+
+    const double apart = rule.dia + rule.clearance;
+    return 2 * rule.clearance + rule.dia + ( pitch < apart ? KiROUND( std::sqrt( apart * apart - pitch * pitch ) ) : 0 );
+}
+
+
 namespace
 {
 
@@ -8743,25 +8768,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( !finePad( aPad ) )
                 return;
 
-            const double pitch = pitchOf( aPad );
-
-            // a via of the pad's net with the clearance the rules ask to its row neighbours on both
-            // sides; where two vias do not fit side by side at the pitch, room for the neighbours' vias on
-            // a second, staggered line
-            FOOTPRINT*   owner = aPad->GetParentFootprint();
+            const double       pitch = pitchOf( aPad );
             const PCB_LAYER_ID padLayer = aPad->GetPrincipalLayer();
-            KOPENAPI_RULE_VIA rule = KopenapiRuleVia( board, aPad->GetNetCode(), aPad->GetPosition(), padLayer, nullptr );
-
-            for( PAD* q : owner->Pads() )
-            {
-                if( q != aPad && q->GetNetCode() != aPad->GetNetCode() && KopenapiPadNeighbours( q, aPad ) )
-                    rule.clearance = std::max( rule.clearance, KopenapiRuleVia( board, aPad->GetNetCode(), aPad->GetPosition(), padLayer, q ).clearance );
-            }
-
-            const int    clearance = rule.clearance;
-            const int    via = rule.dia;
-            const double apart = via + clearance;
-            const int    depth = 2 * clearance + via + ( pitch < apart ? KiROUND( std::sqrt( apart * apart - pitch * pitch ) ) : 0 );
+            const int          depth = KopenapiPadEscapeDepth( board, aPad );
 
             FOOTPRINT* fp = aPad->GetParentFootprint();
             BOX2I      ring = fp->Pads().front()->GetBoundingBox();

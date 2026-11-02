@@ -246,6 +246,11 @@ KOPENAPI_RULE_VIA KopenapiRuleVia( BOARD* aBoard, int aNetCode, const VECTOR2I& 
 /// its vias do not fit side by side at the pitch (via + clearance to that neighbour); false without one
 bool KopenapiPadFinePitch( BOARD* aBoard, PAD* aPad );
 
+/// @brief How far past its outer end a pad's way out reaches as the rules size it: a via of its net with
+/// the clearance to its row neighbours of other nets on both sides (KopenapiRuleVia), plus the offset
+/// of a second, staggered via line where two vias do not fit side by side at the row's pitch
+int KopenapiPadEscapeDepth( BOARD* aBoard, PAD* aPad );
+
 /// @brief The letters a reference starts with, upper case ("C" for c12): the part's kind by convention
 std::string KopenapiRefPrefix( const std::string& aRef );
 

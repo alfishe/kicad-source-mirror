@@ -2566,8 +2566,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         }
 
         // how far past the courtyard the ways out of each side's pins reach, as pcb_route's escape fronts have
-        // them: from the pad's end a via of its net with a clearance on both sides, staggered where two vias do
-        // not fit side by side at the pins' pitch
+        // them (KopenapiPadEscapeDepth past the pad's end)
         int64_t wayOut[4] = { 0, 0, 0, 0 };
 
         for( const PORT& q : ports )
@@ -2577,19 +2576,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             if( qSide < 0 )
                 continue;
 
-            double pinPitch = std::numeric_limits<double>::max();
-
-            for( PAD* o : a.fp->Pads() )
-            {
-                if( o != q.pad )
-                    pinPitch = std::min<double>( pinPitch, ( o->GetPosition() - q.pad->GetPosition() ).EuclideanNorm() );
-            }
-
-            NETCLASS*    netclass = q.pad->GetEffectiveNetClass();
-            const int    clearance = std::max( ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0 );
-            const int    dia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
-            const double apart = dia + clearance;
-            const int64_t depth = 2 * clearance + dia + ( pinPitch < apart ? KiROUND( std::sqrt( apart * apart - pinPitch * pinPitch ) ) : 0 );
+            const int64_t depth = KopenapiPadEscapeDepth( board, q.pad );
             const BOX2I   box = q.pad->GetBoundingBox();
             const int64_t end = qSide == 0 ? court.GetLeft() - (int64_t) box.GetLeft() : qSide == 1 ? court.GetTop() - (int64_t) box.GetTop()
                                 : qSide == 2 ? box.GetRight() - (int64_t) court.GetRight() : box.GetBottom() - (int64_t) court.GetBottom();
