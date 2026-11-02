@@ -17,6 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <exporters/export_footprint_associations.h>
 #include <confirm.h>
 #include <string_utils.h>
 #include <macros.h>
