@@ -6872,6 +6872,35 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             aOut.layer = aOut.viaTo;
         }
 
+        auto boxOf = []( const nlohmann::json& aBox ) -> std::optional<BOX2I>
+        {
+            if( !aBox.is_array() || aBox.size() != 4
+                || !std::all_of( aBox.begin(), aBox.end(), []( const nlohmann::json& v ) { return v.is_number(); } ) )
+            {
+                return std::nullopt;
+            }
+
+            const VECTOR2I p0( pcbIUScale.mmToIU( aBox[0].get<double>() ), pcbIUScale.mmToIU( aBox[1].get<double>() ) );
+            const VECTOR2I p1( pcbIUScale.mmToIU( aBox[2].get<double>() ), pcbIUScale.mmToIU( aBox[3].get<double>() ) );
+            return BOX2I( p0, p1 - p0 );
+        };
+
+        // the rooms to the next gate: any gate's (a portal's, a via gate's, a free point's)
+        const nlohmann::json roomsArg = aPoint.is_object() ? aPoint.value( "rooms_mm", nlohmann::json() ) : nlohmann::json();
+
+        if( roomsArg.is_array() )
+        {
+            for( const nlohmann::json& box : roomsArg )
+            {
+                std::optional<BOX2I> room = boxOf( box );
+
+                if( !room )
+                    return false;
+
+                aOut.rooms.push_back( *room );
+            }
+        }
+
         if( aPoint.is_object() && aPoint.contains( "along" ) )
         {
             const std::string along = aPoint["along"].is_string() ? aPoint["along"].get<std::string>() : std::string();
@@ -6883,34 +6912,6 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             aOut.lo = aPoint.contains( "lo_mm" ) ? pcbIUScale.mmToIU( aPoint.value( "lo_mm", 0.0 ) ) : -bigIU;
             aOut.hi = aPoint.contains( "hi_mm" ) ? pcbIUScale.mmToIU( aPoint.value( "hi_mm", 0.0 ) ) : bigIU;
             const nlohmann::json r = aPoint.value( "into_mm", nlohmann::json() );
-
-            auto boxOf = []( const nlohmann::json& aBox ) -> std::optional<BOX2I>
-            {
-                if( !aBox.is_array() || aBox.size() != 4
-                    || !std::all_of( aBox.begin(), aBox.end(), []( const nlohmann::json& v ) { return v.is_number(); } ) )
-                {
-                    return std::nullopt;
-                }
-
-                const VECTOR2I p0( pcbIUScale.mmToIU( aBox[0].get<double>() ), pcbIUScale.mmToIU( aBox[1].get<double>() ) );
-                const VECTOR2I p1( pcbIUScale.mmToIU( aBox[2].get<double>() ), pcbIUScale.mmToIU( aBox[3].get<double>() ) );
-                return BOX2I( p0, p1 - p0 );
-            };
-
-            const nlohmann::json roomsArg = aPoint.value( "rooms_mm", nlohmann::json() );
-
-            if( roomsArg.is_array() )
-            {
-                for( const nlohmann::json& box : roomsArg )
-                {
-                    std::optional<BOX2I> room = boxOf( box );
-
-                    if( !room )
-                        return false;
-
-                    aOut.rooms.push_back( *room );
-                }
-            }
 
             if( std::optional<BOX2I> room = boxOf( r ) )
                 aOut.into = room;
@@ -7066,37 +7067,58 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         // the centre line: the crossings, joined inside each region by axis-parallel runs (a turn's
         // corner where the two crossings' lines meet; a jog half way; a way back out through the same
         // side as deep as the ribbon needs), the ribbon a pitch off the region's sides where it fits
-        std::vector<VECTOR2I> line;
-        int                   runsMoved = 0;
+        std::vector<VECTOR2I>     line;
+        std::vector<PCB_LAYER_ID> lineLayer;   ///< per vertex: the layer of the run from it on
+        int                       runsMoved = 0;
 
-        // copper of other nets on the members' layer, for the runs inside the regions (and the pulls)
-        std::vector<std::pair<BOX2I, std::shared_ptr<SHAPE>>> copper;
+        // per gate the layer of the run from it to the next (its own, else the one before's)
+        std::vector<PCB_LAYER_ID> gateLayer( pts.size(), startLayer );
 
-        auto addCopper = [&]( BOARD_CONNECTED_ITEM* aItem )
+        for( size_t k = 0; k < pts.size(); ++k )
+            gateLayer[k] = pts[k].layer ? *pts[k].layer : k > 0 ? gateLayer[k - 1] : startLayer;
+
+        PCB_LAYER_ID onLayer = startLayer;   ///< the layer the run looked at is on
+
+        // copper of other nets per layer (read when first asked), for the runs inside the regions
+        // (and the pulls); and the rule areas tracks may not cross there
+        std::map<PCB_LAYER_ID, std::vector<std::pair<BOX2I, std::shared_ptr<SHAPE>>>> copperOf;
+
+        auto copperOn = [&]( PCB_LAYER_ID aLayer ) -> const std::vector<std::pair<BOX2I, std::shared_ptr<SHAPE>>>&
         {
-            if( aNear && !aNear->Intersects( aItem->GetBoundingBox() ) )
-                return;
+            auto it = copperOf.find( aLayer );
 
-            if( aItem->IsOnLayer( startLayer ) && !codes.count( aItem->GetNetCode() ) )
-                copper.emplace_back( aItem->GetBoundingBox(), aItem->GetEffectiveShape( startLayer ) );
+            if( it != copperOf.end() )
+                return it->second;
+
+            std::vector<std::pair<BOX2I, std::shared_ptr<SHAPE>>>& copper = copperOf[aLayer];
+
+            auto addCopper = [&]( BOARD_CONNECTED_ITEM* aItem )
+            {
+                if( aNear && !aNear->Intersects( aItem->GetBoundingBox() ) )
+                    return;
+
+                if( aItem->IsOnLayer( aLayer ) && !codes.count( aItem->GetNetCode() ) )
+                    copper.emplace_back( aItem->GetBoundingBox(), aItem->GetEffectiveShape( aLayer ) );
+            };
+
+            for( PCB_TRACK* track : board->Tracks() )
+                addCopper( track );
+
+            for( FOOTPRINT* fp : board->Footprints() )
+            {
+                for( PAD* pad : fp->Pads() )
+                    addCopper( pad );
+            }
+
+            for( ZONE* zone : board->Zones() )
+            {
+                if( zone->GetIsRuleArea() && zone->GetDoNotAllowTracks() && zone->IsOnLayer( aLayer )
+                    && ( !aNear || aNear->Intersects( zone->Outline()->BBox() ) ) )
+                    copper.emplace_back( zone->Outline()->BBox(), std::make_shared<SHAPE_POLY_SET>( *zone->Outline() ) );
+            }
+
+            return copper;
         };
-
-        for( PCB_TRACK* track : board->Tracks() )
-            addCopper( track );
-
-        for( FOOTPRINT* fp : board->Footprints() )
-        {
-            for( PAD* pad : fp->Pads() )
-                addCopper( pad );
-        }
-
-        // and the rule areas tracks may not cross there
-        for( ZONE* zone : board->Zones() )
-        {
-            if( zone->GetIsRuleArea() && zone->GetDoNotAllowTracks() && zone->IsOnLayer( startLayer )
-                && ( !aNear || aNear->Intersects( zone->Outline()->BBox() ) ) )
-                copper.emplace_back( zone->Outline()->BBox(), std::make_shared<SHAPE_POLY_SET>( *zone->Outline() ) );
-        }
 
         auto ribbonClear = [&]( const VECTOR2I& aFrom, const VECTOR2I& aTo )
         {
@@ -7104,7 +7126,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             BOX2I     span = BOX2I::ByCorners( aFrom, aTo );
             span.Inflate( clearance );
 
-            for( const auto& [box, shape] : copper )
+            for( const auto& [box, shape] : copperOn( onLayer ) )
             {
                 if( box.Intersects( span ) && shape->Collide( SEG( aFrom, aTo ), clearance ) )
                     return false;
@@ -7128,7 +7150,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         auto keep = [&]( const VECTOR2I& aAt )
         {
             if( line.empty() || line.back() != aAt )
+            {
                 line.push_back( aAt );
+                lineLayer.push_back( onLayer );
+            }
         };
 
         // a crossing moved along its stretch (inside it at the ribbon's room), the shifts to try: none
@@ -7162,6 +7187,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         for( size_t k = 0; k < pts.size(); ++k )
         {
             CROSSING& x = pts[k];
+            onLayer = gateLayer[k];
             keep( x.at );
 
             if( k + 1 == pts.size() || x.axis < 0 || pts[k + 1].axis < 0 || !x.into || x.rooms.size() > 1 )
@@ -7195,7 +7221,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 // the turn and its two legs clear of the copper: both crossings moved along their
                 // stretches, the least moved pair that clears
-                if( !copper.empty() && !legsClear( x.at, y.at ) )
+                if( !copperOn( onLayer ).empty() && !legsClear( x.at, y.at ) )
                 {
                     const std::vector<int> dx = shiftsOf( x ), dy = shiftsOf( y );
                     std::optional<std::pair<VECTOR2I, VECTOR2I>> best;
@@ -7241,7 +7267,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             int        b1 = inX ? y.at.y : y.at.x;
 
             // in line: straight on where that is clear of the copper, else a jog round it
-            if( b0 == b1 && ( copper.empty() || ribbonClear( x.at, y.at ) ) )
+            if( b0 == b1 && ( copperOn( onLayer ).empty() || ribbonClear( x.at, y.at ) ) )
                 continue;
 
             // through the region with the crossings less than a pitch apart along the way: one straight
@@ -7274,7 +7300,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             // the nearest clear depth, the second crossing where it is or else moved along its
             // stretch (the least moved that clears)
-            if( rlo <= rhi && !copper.empty() && !runClear( mid ) )
+            if( rlo <= rhi && !copperOn( onLayer ).empty() && !runClear( mid ) )
             {
                 const int step = std::max( 1, pitch / 4 );
                 const int b1From = b1;
@@ -7348,8 +7374,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     const VECTOR2I q( KiROUND( p.x ), KiROUND( p.y ) );
                     bool           inside = false;
 
-                    for( const CROSSING& x : pts )
+                    for( size_t g = 0; g < pts.size() && !inside; ++g )
                     {
+                        const CROSSING& x = pts[g];
+
+                        if( gateLayer[g] != onLayer )
+                            continue;
+
                         for( const BOX2I& room : x.rooms )
                             inside = inside || BOX2I( room ).Inflate( 10 ).Contains( q );
 
@@ -7386,10 +7417,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     bool overVia = false;
 
                     for( size_t v = i + 1; v < j && !overVia; ++v )
-                        overVia = viaGateAt( line[v] ) != nullptr;
+                        overVia = viaGateAt( line[v] ) != nullptr || lineLayer[v] != lineLayer[i];
 
                     if( overVia )
                         continue;
+
+                    onLayer = lineLayer[i];
 
                     const VECTOR2I a = line[i], b = line[j];
                     const VECTOR2I c0( b.x, a.y ), c1( a.x, b.y );
