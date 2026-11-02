@@ -4481,7 +4481,8 @@ std::optional<KOPENAPI_RESULT> groupParts( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard
 }
 
 /// @brief orientation of a block's anchor: keep (nothing), auto (chosen by routability, the turns set
-/// later) or a count of quarter turns clockwise; a locked anchor turns only with override_locks
+/// later) or a count of quarter turns clockwise; a locked anchor turns only with override_locks (auto
+/// keeps it)
 std::optional<KOPENAPI_RESULT> anchorTurns( const nlohmann::json& aSpec, FOOTPRINT* aAnchor, bool aOverrideLocks,
                                             std::optional<int>& aTurns )
 {
@@ -4497,7 +4498,7 @@ std::optional<KOPENAPI_RESULT> anchorTurns( const nlohmann::json& aSpec, FOOTPRI
     if( o.is_number_integer() )
         aTurns = o.get<int>();
 
-    if( aAnchor->IsLocked() && !aOverrideLocks && o != 0 )
+    if( aAnchor->IsLocked() && !aOverrideLocks && o.is_number_integer() && o != 0 )
         return KOPENAPI_RESULT::Error( 409, str( aAnchor->GetReference() ) + " is locked: orientation turns it only with "
                                                                               "override_locks: true" );
 
@@ -5608,7 +5609,19 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
             if( std::optional<KOPENAPI_RESULT> error = anchorTurns( spec, anchor, overrideLocks, turns ) )
                 return fail( *error );
 
-            if( spec.value( "orientation", nlohmann::json( "keep" ) ) == "auto" )
+            if( spec.value( "orientation", nlohmann::json( "keep" ) ) == "auto" && anchor->IsLocked() && !overrideLocks )
+            {
+                nlohmann::json byTurn = nlohmann::json::array();
+
+                for( int q = 1; q < 4; ++q )
+                    byTurn.push_back( { { "quarter_turns_cw", q }, { "blocked_by", "locked (override_locks: true)" } } );
+
+                turns = 0;
+                orientation["why"] = "kept: " + str( anchor->GetReference() ) + " is locked";
+                orientation["by"] = "lock";
+                orientation["by_turn"] = byTurn;
+            }
+            else if( spec.value( "orientation", nlohmann::json( "keep" ) ) == "auto" )
             {
                 // each quarter turn tried: the block placed in a step taken back, the way out of the
                 // anchor's neighbourhood estimated, the cheapest kept
@@ -5820,7 +5833,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
 static const char* PLACE_GROUP_BLOCK = R"json({
     "anchor":{"type":"string","description":"reference of the main part; it does not move (orientation may turn it in place)"},
-    "orientation":{"description":"the anchor's quarter turn: keep (default); auto - each of the four tried (the block placed, then a quick route of every non-rail connection with an end within orientation_margin_mm of the anchor's courtyard, the far ends reached straight from the box's edge, on a grid of the anchor's pad pitch (or one track pitch) over the routing layers, the rails' stitching vias as pcb_stitch lays them as walls and each via taking its room on every layer, shortest first without rip-up, then negotiated), the turn with the fewest connections left without a way (boxed in, failed in the first pass, still sharing cells, parts unplaced), of those the one with the fewest vias + mm / 10; the anchor stays as it is unless a turn gets more connections out or saves a tenth (why says which); a turn whose courtyard runs into another part of its side (not the block's) or over the board's edge is not tried (by_turn blocked_by); or 0..3 quarter turns clockwise. The anchor turns about its courtyard's centre; a locked one needs override_locks. Answer orientation: quarter_turns_cw, rotation_deg, why, by_turn (auto: per turn failed, its parts, vias, length_mm, rail_vias, cost = 10 x failed + vias + mm / 10)","oneOf":[{"type":"string","enum":["keep","auto"]},{"type":"integer","minimum":0,"maximum":3}]},
+    "orientation":{"description":"the anchor's quarter turn: keep (default); auto - each of the four tried (the block placed, then a quick route of every non-rail connection with an end within orientation_margin_mm of the anchor's courtyard, the far ends reached straight from the box's edge, on a grid of the anchor's pad pitch (or one track pitch) over the routing layers, the rails' stitching vias as pcb_stitch lays them as walls and each via taking its room on every layer, shortest first without rip-up, then negotiated), the turn with the fewest connections left without a way (boxed in, failed in the first pass, still sharing cells, parts unplaced), of those the one with the fewest vias + mm / 10; the anchor stays as it is unless a turn gets more connections out or saves a tenth (why says which); a turn whose courtyard runs into another part of its side (not the block's) or over the board's edge is not tried (by_turn blocked_by); or 0..3 quarter turns clockwise. The anchor turns about its courtyard's centre; a locked one needs override_locks (auto keeps it: why kept, by lock, turns 1..3 blocked_by locked). Answer orientation: quarter_turns_cw, rotation_deg, why, by_turn (auto: per turn failed, its parts, vias, length_mm, rail_vias, cost = 10 x failed + vias + mm / 10)","oneOf":[{"type":"string","enum":["keep","auto"]},{"type":"integer","minimum":0,"maximum":3}]},
     "orientation_margin_mm":{"type":"number","default":6,"description":"orientation auto: how far round the anchor's courtyard the estimate routes"},
     "parts":{"type":"array","items":{"type":"string"}},
     "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
