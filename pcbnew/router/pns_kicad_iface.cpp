@@ -391,11 +391,15 @@ private:
 
     struct RULE_REGION
     {
-        BOX2I          box;
-        SHAPE_POLY_SET outline;
-        int            margin;
-        bool           courtyard;
+        BOX2I              box;
+        SHAPE_POLY_SET     outline;
+        int                margin;
+        bool               courtyard;
+        std::vector<SEG>   edges;    ///< the outline's edges, holes too
+        std::vector<BOX2I> spans;    ///< the box of each EDGE_SPAN edges in a row
     };
+
+    static constexpr size_t EDGE_SPAN = 16;
 
     // Cached for the routing session: the courtyards and zones geometry-dependent rules test
     std::optional<std::vector<RULE_REGION>> m_ruleRegions;
@@ -1335,7 +1339,22 @@ std::optional<size_t> PNS_PCBNEW_RULE_RESOLVER::regionState( const SEG& aSeg, in
             aOutline.ClearArcs();
             BOX2I box = aOutline.BBox();
             box.Inflate( aMargin );
-            m_ruleRegions->push_back( { box, std::move( aOutline ), aMargin, aCourtyard } );
+
+            std::vector<SEG>   edges;
+            std::vector<BOX2I> spans;
+
+            for( auto edge = aOutline.CIterateSegmentsWithHoles(); edge; edge++ )
+            {
+                if( edges.size() % EDGE_SPAN == 0 )
+                    spans.emplace_back( ( *edge ).A, VECTOR2I( 0, 0 ) );
+
+                spans.back().Merge( ( *edge ).A );
+                spans.back().Merge( ( *edge ).B );
+                edges.push_back( *edge );
+            }
+
+            m_ruleRegions->push_back( { box, std::move( aOutline ), aMargin, aCourtyard, std::move( edges ),
+                                        std::move( spans ) } );
         };
 
         for( FOOTPRINT* fp : m_board->Footprints() )
@@ -1374,21 +1393,40 @@ std::optional<size_t> PNS_PCBNEW_RULE_RESOLVER::regionState( const SEG& aSeg, in
         SHAPE_RECT rect( box );
         bool       touches = false;
         bool       crosses = false;
+        bool       done = false;
 
-        for( auto edge = region.outline.CIterateSegmentsWithHoles(); edge; edge++ )
+        // an edge the box touches lies in a span whose box it touches, and its own box does
+        BOX2I around = box;
+        around.Inflate( 1 );
+
+        for( size_t span = 0; span < region.spans.size() && !done; ++span )
         {
-            if( rect.Collide( *edge ) )
+            if( !region.spans[span].Intersects( around ) )
+                continue;
+
+            const size_t last = std::min( region.edges.size(), ( span + 1 ) * EDGE_SPAN );
+
+            for( size_t e = span * EDGE_SPAN; e < last; ++e )
             {
-                touches = true;
+                const SEG& edge = region.edges[e];
 
-                if( !region.courtyard )
-                    break;
-
-                // the centre line through a courtyard's outline: the track intersects it, whatever the rest
-                if( ( *edge ).Intersects( aSeg ) )
+                if( std::max( edge.A.x, edge.B.x ) < around.GetLeft() || std::min( edge.A.x, edge.B.x ) > around.GetRight()
+                    || std::max( edge.A.y, edge.B.y ) < around.GetTop() || std::min( edge.A.y, edge.B.y ) > around.GetBottom() )
                 {
-                    crosses = true;
-                    break;
+                    continue;
+                }
+
+                if( rect.Collide( edge ) )
+                {
+                    touches = true;
+
+                    // the centre line through a courtyard's outline: the track intersects it, whatever the rest
+                    if( !region.courtyard || edge.Intersects( aSeg ) )
+                    {
+                        crosses = region.courtyard;
+                        done = true;
+                        break;
+                    }
                 }
             }
         }
