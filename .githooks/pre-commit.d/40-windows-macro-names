@@ -1,0 +1,117 @@
+#!/bin/sh
+#
+# Rejects C++ that uses a Windows SDK macro name as an identifier. windows.h defines near and far
+# (empty), MSVC's rpcndr.h small (char), combaseapi.h interface (struct): such a variable compiles
+# on macOS and Linux and breaks only the Windows build.
+#
+#   (pre-commit)                    the added lines of the staged .cpp / .cxx / .h / .hpp / .mm files
+#   40-windows-macro-names FILE...  whole files
+#   40-windows-macro-names --self-test
+#
+# String and character literals, comments and #include lines are not code and are not checked.
+
+NAMES='near|far|small|interface'
+
+# awk: check(where, line) prints where and the line when its code uses one of the names
+CHECK='
+function strip( text,    code, start, end, rest )
+{
+    gsub( /\\./, "", text )
+    code = ""
+
+    while( match( text, /["'"'"']|\/[\/*]/ ) )
+    {
+        start = substr( text, RSTART, RLENGTH )
+        code = code substr( text, 1, RSTART - 1 ) " "
+        rest = substr( text, RSTART + RLENGTH )
+
+        if( start == "//" )
+            return code
+
+        end = ( start == "/*" ) ? "*/" : start
+        if( !( RSTART = index( rest, end ) ) )
+            return code
+
+        text = substr( rest, RSTART + length( end ) )
+    }
+
+    return code text
+}
+
+function check( where, line,    code )
+{
+    code = strip( line )
+
+    if( code ~ /^[ \t]*\*/ || code ~ /^[ \t]*#[ \t]*include/ )
+        return 0
+
+    if( code ~ /(^|[^A-Za-z0-9_])('"$NAMES"')([^A-Za-z0-9_]|$)/ )
+    {
+        print where ": " line
+        return 1
+    }
+
+    return 0
+}
+'
+
+check_files()
+{
+    awk "$CHECK"'{ found += check( FILENAME ":" FNR, $0 ) } END { exit found > 0 }' "$@"
+}
+
+check_staged()
+{
+    git diff --cached -U0 --no-color --diff-filter=ACMR -- \
+            '*.cpp' '*.cxx' '*.h' '*.hpp' '*.mm' |
+        awk "$CHECK"'
+            /^\+\+\+ / { file = substr( $0, 7 ); next }
+            /^@@ /     { split( $3, at, "," ); line = substr( at[1], 2 ) + 0; next }
+            /^\+/      { found += check( file ":" line, substr( $0, 2 ) ); line++ }
+            END        { exit found > 0 }'
+}
+
+self_test()
+{
+    bad=$(check_files - <<'EOF' | wc -l | tr -d ' '
+    VECTOR2I far = a;
+int small;
+x.near = 1;
+struct interface {};
+farPad = far;
+EOF
+)
+    good=$(check_files - <<'EOF'
+int farPad, nearest, smallest, interfaces;
+// as far as the near side
+/* far */ int a; /* small */
+s = "so far, chip's near";
+"description":"this far around the chip's pads"
+#include "interface.h"
+ * far in a doc comment
+char c = 'f'; char q = '"'; t = "\" far";
+EOF
+)
+
+    if [ "$bad" != 5 ] || [ -n "$good" ]; then
+        echo "40-windows-macro-names self-test FAILED: bad lines found $bad of 5; good lines flagged:"
+        echo "$good"
+        exit 1
+    fi
+
+    echo "40-windows-macro-names self-test passed"
+}
+
+case "$1" in
+--self-test) self_test ;;
+"")
+    if ! out=$(check_staged); then
+        echo "Windows SDK macro names ($NAMES) used as identifiers; rename them:"
+        echo "$out"
+        exit 1
+    fi
+    ;;
+*)
+    check_files "$@" || { echo "Windows SDK macro names ($NAMES) used as identifiers"; exit 1; }
+    ;;
+esac
