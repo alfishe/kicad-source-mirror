@@ -4790,6 +4790,49 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     // the planned ports of signal pins (ports), filled once the jobs are final
     std::map<const PAD*, PORT_GOAL> portGoals;
+
+    // of two parts joined by planned lanes, the one whose lanes set the order of the connections between them:
+    // summed over those connections, the lanes that turn more round their part (their ranks nest in the ring),
+    // then the longer; a straight lane follows any order. One end per pair of parts, so a bus keeps one order
+    std::map<std::pair<const FOOTPRINT*, const FOOTPRINT*>, bool> setsOrderCache;
+
+    auto setsOrder = [&]( const FOOTPRINT* aPart, const FOOTPRINT* aOther ) -> bool
+    {
+        if( auto it = setsOrderCache.find( { aPart, aOther } ); it != setsOrderCache.end() )
+            return it->second;
+
+        auto tally = [&]( const FOOTPRINT* aFp, const FOOTPRINT* aFar )
+        {
+            std::pair<size_t, double> sum( 0, 0.0 );
+
+            for( const auto& [pad, goal] : portGoals )
+            {
+                if( pad->GetParentFootprint() != aFp || goal.lane.empty() )
+                    continue;
+
+                bool joined = false;
+
+                for( const PAD* q : aFar->Pads() )
+                    joined = joined || ( q->GetNetCode() > 0 && q->GetNetCode() == pad->GetNetCode() );
+
+                if( !joined )
+                    continue;
+
+                sum.first += goal.lane.size();
+
+                for( size_t i = 1; i < goal.lane.size(); ++i )
+                    sum.second += ( goal.lane[i] - goal.lane[i - 1] ).EuclideanNorm();
+            }
+
+            return sum;
+        };
+
+        const std::pair<size_t, double> mine = tally( aPart, aOther ), theirs = tally( aOther, aPart );
+        const bool sets = mine.first != theirs.first ? mine.first > theirs.first : mine.second > theirs.second;
+        setsOrderCache[{ aPart, aOther }] = sets;
+        setsOrderCache[{ aOther, aPart }] = !sets && ( mine != theirs );
+        return sets;
+    };
     bool                            lanesOn = false;   ///< lanes: ports follow their planned lanes
     int                             lanesLaid = 0, lanesRefused = 0, lanesTakenOut = 0;
     int                             portTries = 0, portWon = 0;
@@ -5262,9 +5305,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 std::swap( ga, gb );
             }
 
-            // lanes at both ends: from the larger package's, whose lanes set the order
+            // lanes at both ends: from the end whose lanes set the order
             if( lanesOn && gb && !ga->lane.empty() && !gb->lane.empty() && b->Type() == PCB_PAD_T
-                && static_cast<PAD*>( b )->GetParentFootprint()->Pads().size() > a->GetParentFootprint()->Pads().size() )
+                && setsOrder( static_cast<PAD*>( b )->GetParentFootprint(), a->GetParentFootprint() ) )
             {
                 PAD* other = static_cast<PAD*>( b );
                 b = a;
@@ -6798,8 +6841,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( it == portGoals.end() || it->second.via )
                     continue;
 
-                if( !portEnd[k] || pad->GetParentFootprint()->Pads().size() > portEnd[k]->GetParentFootprint()->Pads().size() )
+                if( !portEnd[k]
+                    || ( lanesOn ? !it->second.lane.empty()
+                                           && ( portGoals[portEnd[k]].lane.empty()
+                                                || setsOrder( pad->GetParentFootprint(), portEnd[k]->GetParentFootprint() ) )
+                                 : pad->GetParentFootprint()->Pads().size()
+                                           > portEnd[k]->GetParentFootprint()->Pads().size() ) )
+                {
                     portEnd[k] = pad;
+                }
             }
 
             // lanes turning out of the ring: by the corner they leave and the way they leave it
@@ -6981,14 +7031,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( !a || !b || !a->GetParentFootprint() || !b->GetParentFootprint() )
                 continue;
 
-            if( b->GetParentFootprint()->Pads().size() > a->GetParentFootprint()->Pads().size() )
-                std::swap( a, b );
-
             auto ia = portGoals.find( a );
             auto ib = portGoals.find( b );
 
             if( ia == portGoals.end() || ib == portGoals.end() )
                 continue;
+
+            if( setsOrder( b->GetParentFootprint(), a->GetParentFootprint() ) )
+            {
+                std::swap( a, b );
+                std::swap( ia, ib );
+            }
 
             PORT_GOAL& ga = ia->second;
             PORT_GOAL& gb = ib->second;
