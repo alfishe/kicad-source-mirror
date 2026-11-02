@@ -10784,6 +10784,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     {
         std::set<int> special;
+        std::set<int> pairNets;
 
         if( escapeKeepMm > 0 )
         {
@@ -10801,7 +10802,12 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                             continue;
 
                         if( NETINFO_ITEM* info = KopenapiFindNet( board, row.value( "net", std::string() ) ) )
+                        {
                             special.insert( info->GetNetCode() );
+
+                            if( role == "pair" )
+                                pairNets.insert( info->GetNetCode() );
+                        }
                     }
                 }
             }
@@ -10853,6 +10859,41 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
                 for( PCB_LAYER_ID l : pad->GetLayerSet().CuStack() )
                     escapes.push_back( { pad, l, SHAPE_SEGMENT( tip, end, across + 2 * minClearance ) } );
+
+                // a pair's pin: on to the pad of its net where the pair goes (the nearest on another
+                // part), a line of the pair's width wide: the pair leaves coupled between the two
+                if( !pairNets.count( pad->GetNetCode() ) )
+                    continue;
+
+                const PAD* partner = nullptr;
+
+                for( FOOTPRINT* other : board->Footprints() )
+                {
+                    if( other == fp )
+                        continue;
+
+                    for( PAD* p : other->Pads() )
+                    {
+                        if( p->GetNetCode() == pad->GetNetCode() && ( p->GetLayerSet() & pad->GetLayerSet() & LSET::AllCuMask() ).any()
+                            && ( !partner
+                                 || ( p->GetPosition() - end ).SquaredEuclideanNorm() < ( partner->GetPosition() - end ).SquaredEuclideanNorm() ) )
+                        {
+                            partner = p;
+                        }
+                    }
+                }
+
+                if( !partner || ( partner->GetPosition() - end ).EuclideanNorm() > pcbIUScale.mmToIU( 25.0 ) )
+                    continue;
+
+                NETCLASS* nc = pad->GetNet() ? pad->GetNet()->GetNetClass() : nullptr;
+                const int line = nc && nc->HasDiffPairWidth() ? nc->GetDiffPairWidth()
+                                 : nc && nc->HasTrackWidth()  ? nc->GetTrackWidth()
+                                                              : board->GetDesignSettings().GetCurrentTrackWidth();
+                const int clear = std::max( minClearance, nc && nc->HasClearance() ? nc->GetClearance() : 0 );
+
+                for( PCB_LAYER_ID l : pad->GetLayerSet().CuStack() )
+                    escapes.push_back( { pad, l, SHAPE_SEGMENT( end, partner->GetPosition(), line + 2 * clear ) } );
             }
         }
     }

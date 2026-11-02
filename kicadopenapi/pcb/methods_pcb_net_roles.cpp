@@ -463,6 +463,13 @@ static KOPENAPI_RESULT h_pcb_net_roles( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                     break;
                 }
             }
+
+            // USB's DP / DM with a suffix after it (USB_DP_MCU / USB_DM_MCU), as pcb_route pairs them
+            static const std::regex dpSuffixed( R"(^(.*D)P(_[^/]*)$)" );
+            std::smatch             m;
+
+            if( other.empty() && std::regex_match( f.name, m, dpSuffixed ) )
+                other = m[1].str() + "M" + m[2].str();
         }
 
         if( other.empty() || !byName.count( other ) )
