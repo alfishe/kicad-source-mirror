@@ -859,20 +859,90 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
-    // a bus is a ribbon only where its pins lie close at both ends: within bus_spread_k times the ribbon's
-    // width (its lines at their pitch) across each end; a bus spread wider is cut, in the order its pins
-    // lie at a, into clusters that fit, each its own link; a pin alone goes with the single nets
-    const double      spreadK = std::max( 0.0, aArgs.value( "bus_spread_k", 4.0 ) );
+    // a bus is one ribbon only where its pins lie closer, at each end, than the free width beside them
+    // there: outward of the side its tracks leave by (the side nearest the pins, or the bus end's exit
+    // where not one track fits out of that) to the next box, an all-layer keep-out or the board's
+    // edge, in the line of the pin where that is widest. A wider gap between two pins next to each other cuts it, each part its own link;
+    // a pin alone goes with the single nets
+    auto freeBeside = [&]( const std::set<int>& aBoxes, const std::vector<VECTOR2I>& aPins, const VECTOR2I& aFar,
+                           int aExit )
+    {
+        BOX2I part;
+
+        for( int k : aBoxes )
+            part.Merge( boxes[k].box );
+
+        BOX2I span( aPins.front(), VECTOR2I( 0, 0 ) );
+
+        for( const VECTOR2I& p : aPins )
+            span.Merge( p );
+
+        const VECTOR2I mid = span.Centre();
+        const std::array<int64_t, 4> toSide = { mid.x - part.GetLeft(), part.GetRight() - mid.x, mid.y - part.GetTop(),
+                                                part.GetBottom() - mid.y };
+        const std::array<int64_t, 4> toFar = { mid.x - aFar.x, aFar.x - mid.x, mid.y - aFar.y, aFar.y - mid.y };
+        int          side = aExit < 0 ? 0 : aExit;
+
+        // the side nearest the pins; of two as near, the one facing the far end
+        for( int k = 1; k < 4 && aExit < 0; ++k )
+        {
+            if( toSide[k] < toSide[side] || ( toSide[k] == toSide[side] && toFar[k] > toFar[side] ) )
+                side = k;
+        }
+
+        // per pin, outward of the side to the nearest obstacle in its line; the widest of them
+        const BOX2I   board = usable.BBox();
+        const bool    across = side < 2;
+        const int64_t edge = side == 0 ? part.GetLeft() - board.GetLeft() : side == 1 ? board.GetRight() - part.GetRight()
+                             : side == 2 ? part.GetTop() - board.GetTop() : board.GetBottom() - part.GetBottom();
+        std::vector<BOX2I> obstacles;
+
+        for( size_t k = 0; k < boxes.size(); ++k )
+        {
+            if( !aBoxes.count( (int) k ) )
+                obstacles.push_back( boxes[k].box );
+        }
+
+        for( const FP_KEEPOUT& k : keepouts )
+        {
+            if( ( k.layers & allBits ) == allBits )
+                obstacles.push_back( k.box );
+        }
+
+        int64_t free = 0;
+
+        for( const VECTOR2I& p : aPins )
+        {
+            const int u = across ? p.y : p.x;
+            int64_t   here = edge;
+
+            for( const BOX2I& o : obstacles )
+            {
+                if( u < ( across ? o.GetTop() : o.GetLeft() ) || u > ( across ? o.GetBottom() : o.GetRight() ) )
+                    continue;
+
+                const int64_t gap = side == 0 ? part.GetLeft() - o.GetRight() : side == 1 ? o.GetLeft() - part.GetRight()
+                                    : side == 2 ? part.GetTop() - o.GetBottom() : o.GetTop() - part.GetBottom();
+
+                if( gap >= 0 )
+                    here = std::min( here, gap );
+            }
+
+            free = std::max( free, here );
+        }
+
+        return toMm( (double) std::max<int64_t>( 0, free ) );
+    };
+
     std::vector<LINK> clusters;
     std::vector<std::tuple<int, int, std::string>> splitKeys;
 
     for( auto& [key, l] : linkMap )
     {
-        if( l.bus.empty() || l.nets.size() < 2 || spreadK <= 0 )
+        if( l.bus.empty() || l.nets.size() < 2 || l.aBoxes.empty() || l.bBoxes.empty() )
             continue;
 
-        const int reach = iu( spreadK * l.demand );
-        BOX2I     spanA( l.pins.front().first, VECTOR2I( 0, 0 ) );
+        BOX2I spanA( l.pins.front().first, VECTOR2I( 0, 0 ) );
 
         for( const auto& [atA, atB] : l.pins )
             spanA.Merge( atA );
@@ -883,26 +953,59 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         std::stable_sort( order.begin(), order.end(), [&]( size_t x, size_t y )
                           { return alongX ? l.pins[x].first.x < l.pins[y].first.x : l.pins[x].first.y < l.pins[y].first.y; } );
 
-        std::vector<std::vector<size_t>> groups;
-        BOX2I                            boxA, boxB;
+        // the free width beside the pins at each end (their side facing the other end's pins)
+        std::vector<VECTOR2I> atA, atB;
+        VECTOR2D              midA( 0, 0 ), midB( 0, 0 );
 
-        for( size_t k : order )
+        for( const auto& [pa, pb] : l.pins )
         {
-            BOX2I a = boxA, b = boxB;
-            a.Merge( l.pins[k].first );
-            b.Merge( l.pins[k].second );
+            atA.push_back( pa );
+            atB.push_back( pb );
+            midA += VECTOR2D( pa ) / (double) l.pins.size();
+            midB += VECTOR2D( pb ) / (double) l.pins.size();
+        }
 
-            if( groups.empty() || std::max( a.GetWidth(), a.GetHeight() ) > reach || std::max( b.GetWidth(), b.GetHeight() ) > reach )
-            {
-                groups.push_back( { k } );
-                boxA = BOX2I( l.pins[k].first, VECTOR2I( 0, 0 ) );
-                boxB = BOX2I( l.pins[k].second, VECTOR2I( 0, 0 ) );
-                continue;
-            }
+        auto exitOf = [&]( int aBlock, const std::set<int>& aBoxes )
+        {
+            auto be = aArgs.value( "port_sides", true ) ? busEnds.find( l.bus ) : busEnds.end();
 
-            groups.back().push_back( k );
-            boxA = a;
-            boxB = b;
+            if( be == busEnds.end() )
+                return -1;
+
+            auto at = be->second.find( blocks[aBlock].name );
+
+            if( at == be->second.end() )
+                return -1;
+
+            auto bx = boxOfRef.find( at->second.first );
+            return bx != boxOfRef.end() && aBoxes.count( bx->second ) ? at->second.second : -1;
+        };
+
+        // by the pins' side; where not one track fits out there, by the bus end's exit
+        const double pitch = l.demand / (double) l.nets.size();
+        auto         wide = [&]( int aBlock, const std::set<int>& aBoxes, const std::vector<VECTOR2I>& aPins,
+                                 const VECTOR2D& aFar )
+        {
+            const VECTOR2I toward( KiROUND( aFar.x ), KiROUND( aFar.y ) );
+            const double   free = freeBeside( aBoxes, aPins, toward, -1 );
+            const int      exit = free < pitch ? exitOf( aBlock, aBoxes ) : -1;
+            return exit < 0 ? free : freeBeside( aBoxes, aPins, toward, exit );
+        };
+
+        const double wideA = wide( l.a, l.aBoxes, atA, midB );
+        const double wideB = wide( l.b, l.bBoxes, atB, midA );
+        std::vector<std::vector<size_t>> groups;
+
+        for( size_t i = 0; i < order.size(); ++i )
+        {
+            const bool cut = i == 0
+                             || toMm( ( l.pins[order[i]].first - l.pins[order[i - 1]].first ).EuclideanNorm() ) > wideA + 1e-6
+                             || toMm( ( l.pins[order[i]].second - l.pins[order[i - 1]].second ).EuclideanNorm() ) > wideB + 1e-6;
+
+            if( cut )
+                groups.emplace_back();
+
+            groups.back().push_back( order[i] );
         }
 
         if( groups.size() == 1 )
@@ -1635,8 +1738,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         using ENTRY = std::pair<double, int>;
         std::priority_queue<ENTRY, std::vector<ENTRY>, std::greater<ENTRY>> open;
 
-        // at an end whose boxes reach farther than a ribbon's spread (bus_spread_k ribbons, an edge
-        // connector's long row): the way starts by its pins' middle there, and its cost runs on to it at b
+        // a cluster (a part of a bus cut at its pins' gaps): the way starts by its pins' middle, and its
+        // cost runs on to their middle at b
         double pinAX = 0, pinAY = 0, pinBX = 0, pinBY = 0;
 
         for( const auto& [atA, atB] : aLink.pins )
@@ -1652,9 +1755,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         for( int k : fromBoxes )
             source.Merge( boxes[k].box );
 
-        const int  spread = iu( spreadK * aLink.demand );
-        const bool anchorA = !aLink.pins.empty() && spreadK > 0 && std::max( source.GetWidth(), source.GetHeight() ) > spread;
-        const bool anchorB = !aLink.pins.empty() && spreadK > 0 && std::max( target.GetWidth(), target.GetHeight() ) > spread;
+        const bool anchorA = !aLink.pins.empty() && aLink.cluster >= 0;
+        const bool anchorB = anchorA;
 
         auto relax = [&]( int aNode, double aCost, int aPrev, std::pair<double, double> aAt )
         {
@@ -2688,7 +2790,10 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                    "by their end parts only). A bus's nets are one ribbon only where the rules bundle them (pcb_net_roles: a "
                    "differential pair, a length or skew rule, a netclass other than Default): a link per bundle (bundle), and "
                    "a corridor only for a bundle whose every gate's free stretch, and every room run through from one portal to a parallel one across that way, holds its ribbon (else corridor [], "
-                   "corridor_dropped why; summary corridors_dropped). show: channels in "
+                   "corridor_dropped why; summary corridors_dropped). A bus is cut where two of its pins next to each other "
+                   "lie farther apart, at either end, than the free width outward of the pins' side there (to the next box, an "
+                   "all-layer keep-out or the board's edge, in the line of the pin where it is widest; by the bus end's exit where not one track fits out of the pins' side), each part its own link (cluster; summary buses_split), a pin "
+                   "alone with the single nets. A cluster's way starts by its pins' middle. show: channels in "
                    "the GUI coloured by use. "
                    "Read only",
                    R"json({"type":"object","properties":{
@@ -2711,7 +2816,6 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "snap_mm":{"type":"number","minimum":0,"description":"obstacle edges closer than this share one grid line (default one Default track pitch; 0: exact). Gaps narrower close, obstacles thinner keep both edges"},
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
-                        "bus_spread_k":{"type":"number","default":4,"minimum":0,"description":"a bus link is a ribbon only where its pins lie within this many times its ribbon's width (its lines at their pitch) across each end; a bus spread wider is cut, in the order of its pins at a, into clusters that fit, each its own link (link cluster: its index; summary buses_split), a pin alone goes with the single nets; at an end whose boxes reach farther than that (an edge connector's row) a link's way starts by its pins' middle there; 0: never cut nor anchored"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
                         "corridor_merge":{"type":"boolean","default":true,"description":"a corridor's gates (portals crossed) that a straight run from an earlier gate to a later one passes, inside each portal less the ribbon's half width and a pitch, are dropped; the earlier gate's rooms_mm lists the regions the run goes through (corridor.md); summary gates_merged"},
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
