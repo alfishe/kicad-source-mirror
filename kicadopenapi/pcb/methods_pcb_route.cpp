@@ -12927,6 +12927,8 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     std::vector<ESCAPE>              escapes;
     std::set<const PAD*>             finePads;
     std::map<const PAD*, VECTOR2I>   outward;
+    nlohmann::json                   pairLanes = nlohmann::json::array();       ///< pin, to
+    nlohmann::json                   pairLanesNone = nlohmann::json::array();   ///< pin, why
 
     {
         std::set<int> special;
@@ -12958,6 +12960,34 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                 }
             }
         }
+
+        // a pair's lane runs to its partner pad in the pin's own block (pcb_blocks: the part and its
+        // members); beyond it the way is the router's
+        std::map<std::string, int> blockOfRef;
+
+        if( !pairNets.empty() )
+        {
+            if( std::optional<KOPENAPI_METHOD> blocksMethod = KOPENAPI_REGISTRY::Get().Find( "pcb_blocks" ) )
+            {
+                const KOPENAPI_RESULT r = blocksMethod->handler( aCtx, nlohmann::json{ { "heights", false } } );
+                const nlohmann::json  list = r.status == 200 ? r.body.value( "blocks", nlohmann::json::array() ) : nlohmann::json::array();
+
+                for( size_t b = 0; b < list.size(); ++b )
+                {
+                    for( const nlohmann::json& ref : list[b].value( "parts", nlohmann::json::array() ) )
+                    {
+                        if( ref.is_string() )
+                            blockOfRef.emplace( ref.get<std::string>(), (int) b );
+                    }
+                }
+            }
+        }
+
+        auto blockOf = [&]( const FOOTPRINT* aFp )
+        {
+            auto it = blockOfRef.find( str( aFp->GetReference() ) );
+            return it == blockOfRef.end() ? -1 : it->second;
+        };
 
         for( FOOTPRINT* fp : board->Footprints() )
         {
@@ -13012,10 +13042,12 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                     continue;
 
                 const PAD* partner = nullptr;
+                const int  block = blockOf( fp );
+                const std::string pin = str( fp->GetReference() ) + "." + str( pad->GetNumber() );
 
                 for( FOOTPRINT* other : board->Footprints() )
                 {
-                    if( other == fp )
+                    if( other == fp || block < 0 || blockOf( other ) != block )
                         continue;
 
                     for( PAD* p : other->Pads() )
@@ -13029,8 +13061,15 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                     }
                 }
 
-                if( !partner || ( partner->GetPosition() - end ).EuclideanNorm() > pcbIUScale.mmToIU( 25.0 ) )
+                if( !partner )
+                {
+                    pairLanesNone.push_back( { { "pin", pin },
+                                               { "why", block < 0 ? "its part is in no block (pcb_blocks)"
+                                                                  : "no pad of its net on another part of its block (pcb_blocks): the way on is the router's" } } );
                     continue;
+                }
+
+                pairLanes.push_back( { { "pin", pin }, { "to", str( partner->GetParentFootprint()->GetReference() ) + "." + str( partner->GetNumber() ) } } );
 
                 NETCLASS* nc = pad->GetNet() ? pad->GetNet()->GetNetClass() : nullptr;
                 const int line = nc && nc->HasDiffPairWidth() ? nc->GetDiffPairWidth()
@@ -14341,6 +14380,8 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     KopenapiKeepUiAlive();
 
     nlohmann::json answer = { { "net", str( netName ) },
+                                  { "pair_lanes", pairLanes },
+                                  { "pair_lanes_none", pairLanesNone },
                                   { "vias", placed },
                                   { "joined", joined },
                                   { "reused", reused },
@@ -14417,7 +14458,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     if( !only.empty() )
         out["pads"] = aArgs["pads"];
 
-    for( const char* key : { "vias", "joined", "reused", "not_reached", "islands_left" } )
+    for( const char* key : { "vias", "joined", "reused", "not_reached", "islands_left", "pair_lanes", "pair_lanes_none" } )
         cap.Put( out, key, answer[key] );
 
     KopenapiKeepUiAlive();
@@ -17845,7 +17886,8 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "beside a coarse-pitch pad (a cap) before a fine-pitch pin; a net without a plane gets vias only at the fine-pitch pins of "
                    "quad packages, inward, kept as their way to the other layers for the router (port: true; the other ends are left "
                    "to the router, not_reached says so); no via or stub in the "
-                   "straight escape of another net's fine-pitch, pair or clock pin (escape_keep_mm; spots_in_escapes); pads picks the ends; "
+                   "straight escape of another net's fine-pitch, pair or clock pin (escape_keep_mm; spots_in_escapes), nor in a pair pin's lane on to "
+                   "the nearest pad of its net on another part of its block (pcb_blocks; pair_lanes: pin, to; pair_lanes_none: pin, why); pads picks the ends; "
                    "dry_run stitches and takes it back; lists capped at list_limit (counts whole), full: true for all",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{"net":{"type":"string","description":"default: the one net pcb_net_roles calls ground (400 when none or several)"},
                         "pads":{"type":"array","items":{"type":"string"},"description":"only these ends: REF.PAD of the net (and the islands of tracks they are on); 400 for a pad not found or on another net"},
