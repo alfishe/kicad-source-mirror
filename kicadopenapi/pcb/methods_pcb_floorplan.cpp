@@ -1478,8 +1478,9 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     // there. Allowed only where the band meets the pour of one net only (never across a split), that net
     // not ground (pcb_net_roles), no copper of another net is in the band or at the via rows, and no pad
     // of that net is cut off the pour by the band (the pieces cut off are reported as islands). The
-    // band: the via rows and the ribbon (via + 2 clearances + the ribbon's width deep); the vias at the
-    // via pitch (via + clearance).
+    // band: the via rows and the ribbon; the vias at the via pitch (via + clearance), the row at the pins'
+    // side as far out as the pins' 45 degree fan to it needs (KopenapiFan), the other rows a clearance off the
+    // courtyard; sizes as the rules ask of the bus's nets.
     using AT = std::array<double, 2>;
     const bool   innerRing = aArgs.value( "inner_ring", true );
     const double viaCost = std::max( 0.0, aArgs.value( "via_cost_mm", 2.0 ) );
@@ -1547,7 +1548,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     {
         FOOTPRINT*                part = nullptr;
         BOX2I                     court;
-        int                       down = -1, n = 0, via = 0, viaPitch = 0, depth = 0;
+        int                       down = -1, n = 0, via = 0, viaPitch = 0, depth = 0, rowDepth = 0;
+        int                       downOff = 0, upOff = 0;   ///< the rows' centre lines off the courtyard
         AT                        mid{}, atDown{};
         BOX2I                     rowDown;
         std::string               why;   ///< empty: some variant may be allowed
@@ -1574,9 +1576,9 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return net ? str( UnescapeString( net->GetNetname() ) ) : std::string();
     };
 
-    // the via row of n at a side: centred at a point along it as near as it fits, a via's half and a clearance outside
-    // the courtyard; false where it does not fit along the side
-    auto rowAt = []( const BOX2I& aC, int aSide, int aN, int aVia, int aPitch, int aClear, int aToward, BOX2I& aRow )
+    // the via row of n at a side: centred at a point along it as near as it fits, its centre line aOff outside the
+    // courtyard; false where it does not fit along the side
+    auto rowAt = []( const BOX2I& aC, int aSide, int aN, int aVia, int aPitch, int aOff, int aToward, BOX2I& aRow )
     {
         const bool alongY = aSide < 2;
         const int  lo = alongY ? aC.GetTop() : aC.GetLeft(), hi = alongY ? aC.GetBottom() : aC.GetRight();
@@ -1586,7 +1588,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             return false;
 
         const int from = std::clamp( aToward - len / 2, lo, hi - len );
-        const int off = aClear + aVia / 2;
+        const int off = aOff;
         const int line = aSide == 0 ? aC.GetLeft() - off : aSide == 1 ? aC.GetRight() + off
                          : aSide == 2 ? aC.GetTop() - off : aC.GetBottom() + off;
         aRow = alongY ? BOX2I( VECTOR2I( line - aVia / 2, from ), VECTOR2I( aVia, len ) )
@@ -1645,13 +1647,44 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( !o.part )
             return -1;
 
+        std::vector<PAD*> pinPads;
+
+        for( const VECTOR2I& at : pins )
+        {
+            for( PAD* pad : o.part->Pads() )
+            {
+                if( pad->GetPosition() == at )
+                {
+                    pinPads.push_back( pad );
+                    break;
+                }
+            }
+        }
+
         const BOX2I c = courtyardBox( o.part );
+        const PCB_LAYER_ID padLayer = o.part->GetLayer();
+        int width = 0, clear = 0, dia = 0;
+
+        for( PAD* pad : pinPads )
+        {
+            std::vector<PCB_LAYER_ID> layers = powerLayers;
+            layers.push_back( padLayer );
+
+            for( PCB_LAYER_ID l : layers )
+            {
+                const KOPENAPI_RULE_VIA vr = KopenapiRuleVia( board, pad->GetNetCode(), pad->GetPosition(), l );
+                clear = std::max( clear, vr.clearance );
+                dia = std::max( dia, vr.dia );
+                width = std::max( width, KopenapiRuleTrack( board, pad->GetNetCode(), pad->GetPosition(), l ).opt );
+            }
+        }
+
         o.court = c;
         o.down = side;
         o.n = (int) aLink.nets.size();
-        o.via = std::max( defaults.via, 1 );
-        o.viaPitch = o.via + defaults.clearance;
-        o.depth = o.via + 2 * defaults.clearance + iu( aLink.demand );
+        o.via = std::max( dia, 1 );
+        o.viaPitch = o.via + clear;
+        o.upOff = o.downOff = clear + o.via / 2;
         o.mid = { toMm( mid.x ), toMm( mid.y ) };
         const std::set<int> own( aLink.nets.begin(), aLink.nets.end() );
 
@@ -1665,8 +1698,44 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( powerLayers.empty() )
             return refuseAll( "no layer the stack-up types power" );
 
-        if( !rowAt( c, side, o.n, o.via, o.viaPitch, defaults.clearance, side < 2 ? KiROUND( mid.y ) : KiROUND( mid.x ), o.rowDown ) )
+        const int toward = side < 2 ? KiROUND( mid.y ) : KiROUND( mid.x );
+
+        if( !rowAt( c, side, o.n, o.via, o.viaPitch, o.downOff, toward, o.rowDown ) )
             return refuseAll( "a row of " + std::to_string( o.n ) + " vias at the via pitch does not fit along the pins' side" );
+
+        // the row as far out as the pins' fan to it needs: pin k to via k in their order along the side
+        {
+            const bool alongY = side < 2;
+            auto       outOf = [&]( const BOX2I& aB ) -> int64_t
+            {
+                return side == 0 ? -(int64_t) aB.GetLeft() : side == 1 ? (int64_t) aB.GetRight()
+                       : side == 2 ? -(int64_t) aB.GetTop() : (int64_t) aB.GetBottom();
+            };
+
+            std::sort( pinPads.begin(), pinPads.end(),
+                       [&]( PAD* a, PAD* b ) { return alongY ? a->GetPosition().y < b->GetPosition().y : a->GetPosition().x < b->GetPosition().x; } );
+
+            const int64_t        rowMid = alongY ? o.rowDown.Centre().y : o.rowDown.Centre().x;
+            std::vector<int64_t> pinsAlong, spotsAlong;
+            int64_t              tip = std::numeric_limits<int64_t>::min();
+
+            for( size_t k = 0; k < pinPads.size(); ++k )
+            {
+                pinsAlong.push_back( alongY ? pinPads[k]->GetPosition().y : pinPads[k]->GetPosition().x );
+                spotsAlong.push_back( rowMid + KiROUND( ( k - ( pinPads.size() - 1 ) / 2.0 ) * o.viaPitch ) );
+                tip = std::max( tip, outOf( pinPads[k]->GetBoundingBox() ) );
+            }
+
+            if( !pinPads.empty() )
+            {
+                const KOPENAPI_FAN fan = KopenapiFan( pinsAlong, spotsAlong, width, clear, o.via );
+                o.downOff = std::max<int64_t>( o.downOff, tip + fan.depth - outOf( c ) );
+                rowAt( c, side, o.n, o.via, o.viaPitch, o.downOff, toward, o.rowDown );
+            }
+        }
+
+        o.rowDepth = o.downOff + o.via / 2 + clear;
+        o.depth = o.rowDepth + std::max( iu( aLink.demand ), o.n * ( width + clear ) );
 
         o.atDown = { toMm( o.rowDown.Centre().x ), toMm( o.rowDown.Centre().y ) };
 
@@ -1730,7 +1799,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 // the up row may come up anywhere along its side: the whole side clear on every layer
                 BOX2I upRow;
 
-                if( !rowAt( c, up, o.n, o.via, o.viaPitch, defaults.clearance, 0, upRow ) )
+                if( !rowAt( c, up, o.n, o.via, o.viaPitch, o.upOff, 0, upRow ) )
                 {
                     v.why = "a row of " + std::to_string( o.n ) + " vias does not fit along the " + SIDES[up] + " side";
                     o.variants.push_back( v );
@@ -1898,7 +1967,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                         cut.to = c.GetBottom();
                         cut.free.assign( nl, 0 );
                         cut.ring = v.layer;
-                        cut.total = std::max( 0, room - o.via - 2 * defaults.clearance );
+                        cut.total = std::max( 0, room - o.rowDepth );
                         cut.detour = -1;
                         cut.low = cut.high = "ring round " + str( o.part->GetReference() ) + " on "
                                              + str( board->GetLayerName( v.layer ) );
@@ -1930,7 +1999,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         const int up = aV.sides.back();
         BOX2I     row;
         const int toward = up < 2 ? iu( aTo[1] ) : iu( aTo[0] );
-        rowAt( aO.court, up, aO.n, aO.via, aO.viaPitch, defaults.clearance, toward, row );
+        rowAt( aO.court, up, aO.n, aO.via, aO.viaPitch, aO.upOff, toward, row );
         const AT atUp{ toMm( row.Centre().x ), toMm( row.Centre().y ) };
         aUpAlong = up < 2 ? atUp[1] : atUp[0];
         std::vector<AT> way = { aO.mid, aO.atDown };
@@ -3346,7 +3415,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 double              upAlong = 0;
                 const double        length = ringWay( o, v, AT{ on[0].get<double>(), on[1].get<double>() }, upAlong );
                 BOX2I               rowUp;
-                rowAt( o.court, up, o.n, o.via, o.viaPitch, defaults.clearance, iu( upAlong ), rowUp );
+                rowAt( o.court, up, o.n, o.via, o.viaPitch, o.upOff, iu( upAlong ), rowUp );
                 const AT            atUp{ toMm( rowUp.Centre().x ), toMm( rowUp.Centre().y ) };
 
                 nlohmann::json head = nlohmann::json::array();
@@ -3704,7 +3773,7 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
-                        "inner_ring":{"type":"boolean","default":true,"description":"allow inner rings: a bus may leave (enter) its end part by another side than its pins' by a via row at the pins' side down to a layer the stack-up types power, round the part in a band outside its courtyard, up by a row at that side. A candidate way in the negotiation (cost: its length + 2 x via_cost_mm + its channel's overflow), taken where cheaper or where the surface way overflows (link rings: layer, net, rows, band, channel, cost, islands; rings_refused: why, where the way overflows). Only inside one pour of a net not ground (pcb_net_roles), no copper of another net in the band or at the rows, no pad of the net cut off the pour"},
+                        "inner_ring":{"type":"boolean","default":true,"description":"allow inner rings: a bus may leave (enter) its end part by another side than its pins' by a via row at the pins' side (as far out as their 45 degree fan to it needs, sizes by the rules) down to a layer the stack-up types power, round the part in a band outside its courtyard, up by a row at that side. A candidate way in the negotiation (cost: its length + 2 x via_cost_mm + its channel's overflow), taken where cheaper or where the surface way overflows (link rings: layer, net, rows, band, channel, cost, islands; rings_refused: why, where the way overflows). Only inside one pour of a net not ground (pcb_net_roles), no copper of another net in the band or at the rows, no pad of the net cut off the pour"},
                         "via_cost_mm":{"type":"number","default":2.0,"description":"mm of track a via costs (inner rings: two per track)"},
                         "corridor_merge":{"type":"boolean","default":true,"description":"a corridor's gates (portals crossed) that a straight run from an earlier gate to a later one passes, inside each portal less the ribbon's half width and a pitch, are dropped; the earlier gate's rooms_mm lists the regions the run goes through (corridor.md); summary gates_merged"},
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},

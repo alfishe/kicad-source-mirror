@@ -937,6 +937,44 @@ bool KopenapiPadWayBetween( BOARD* aBoard, PAD* aPad )
     return inner ? before && after : before || after;
 }
 
+KOPENAPI_FAN KopenapiFan( const std::vector<int64_t>& aPinsAlong, const std::vector<int64_t>& aSpotsAlong, int aWidth,
+                          int aClearance, int aViaDia )
+{
+    const int n = (int) std::min( aPinsAlong.size(), aSpotsAlong.size() );
+    int64_t   pinPitch = std::numeric_limits<int64_t>::max();
+
+    for( int k = 1; k < n; ++k )
+        pinPitch = std::min( pinPitch, aPinsAlong[k] - aPinsAlong[k - 1] );
+
+    const int    kneeStep = std::max<int>( 0, KiROUND( ( aWidth + aClearance ) * M_SQRT2 ) - ( n > 1 ? (int) pinPitch : 0 ) )
+                         + pcbIUScale.mmToIU( 0.005 );
+    KOPENAPI_FAN fan{ std::vector<int>( n, aClearance + aWidth / 2 ), std::vector<int>( n, 0 ), 0 };
+
+    for( int k = 0; k < n; ++k )
+        fan.shift[k] = (int) ( aSpotsAlong[k] - aPinsAlong[k] );
+
+    for( int k = 1; k < n; ++k )
+    {
+        if( fan.shift[k] < 0 && fan.shift[k - 1] < 0 )
+            fan.knee[k] = fan.knee[k - 1] + kneeStep;
+    }
+
+    for( int k = n - 2; k >= 0; --k )
+    {
+        if( fan.shift[k] > 0 && fan.shift[k + 1] > 0 )
+            fan.knee[k] = fan.knee[k + 1] + kneeStep;
+    }
+
+    int64_t reach = 0;
+
+    for( int k = 0; k < n; ++k )
+        reach = std::max<int64_t>( reach, fan.knee[k] + std::abs( fan.shift[k] ) );
+
+    fan.depth = reach + aViaDia / 2 + aClearance + aWidth / 2;
+    return fan;
+}
+
+
 namespace
 {
 
@@ -4553,41 +4591,20 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 // line, out to the spot. The pins going the same way turn the farther out the nearer they are to the
                 // middle, by what keeps two legs a track and a clearance apart; the spots go out (past the row if need
                 // be) till the farthest diagonal ends a via, a clearance and half a track short of them
-                int64_t tip = std::numeric_limits<int64_t>::min();
-                int     pinPitch = std::numeric_limits<int>::max();
+                int64_t              tip = std::numeric_limits<int64_t>::min();
+                std::vector<int64_t> pinsAlong, spotsAlong;
 
                 for( int k = 0; k < n; ++k )
                 {
                     tip = std::max( tip, edgeOf( pins[k]->GetBoundingBox(), outDown ) );
-
-                    if( k )
-                        pinPitch = std::min<int>( pinPitch, dot( pins[k]->GetPosition() - pins[k - 1]->GetPosition(), alongDown ) );
+                    pinsAlong.push_back( dot( pins[k]->GetPosition(), alongDown ) );
+                    spotsAlong.push_back( dot( downSpots[k], alongDown ) );
                 }
 
-                const int        kneeStep = std::max( 0, KiROUND( ( width + clearance ) * M_SQRT2 ) - ( n > 1 ? pinPitch : 0 ) ) + pcbIUScale.mmToIU( 0.005 );
-                std::vector<int> knee( n, clearance + width / 2 ), shift( n, 0 );
-
-                for( int k = 0; k < n; ++k )
-                    shift[k] = (int) ( dot( downSpots[k], alongDown ) - dot( pins[k]->GetPosition(), alongDown ) );
-
-                for( int k = 1; k < n; ++k )
-                {
-                    if( shift[k] < 0 && shift[k - 1] < 0 )
-                        knee[k] = knee[k - 1] + kneeStep;
-                }
-
-                for( int k = n - 2; k >= 0; --k )
-                {
-                    if( shift[k] > 0 && shift[k + 1] > 0 )
-                        knee[k] = knee[k + 1] + kneeStep;
-                }
-
-                int64_t reach = 0;
-
-                for( int k = 0; k < n; ++k )
-                    reach = std::max<int64_t>( reach, knee[k] + std::abs( shift[k] ) );
-
-                const int64_t spotOut = std::max<int64_t>( dot( rowD.Centre(), outDown ), tip + reach + viaDia / 2 + clearance + width / 2 );
+                const KOPENAPI_FAN      fan = KopenapiFan( pinsAlong, spotsAlong, width, clearance, viaDia );
+                const std::vector<int>& knee = fan.knee;
+                const std::vector<int>& shift = fan.shift;
+                const int64_t           spotOut = std::max<int64_t>( dot( rowD.Centre(), outDown ), tip + fan.depth );
 
                 for( VECTOR2I& spot : downSpots )
                     spot += outDown * (int) ( spotOut - dot( spot, outDown ) );

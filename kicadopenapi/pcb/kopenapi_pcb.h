@@ -257,6 +257,22 @@ int KopenapiPadEscapeDepth( BOARD* aBoard, PAD* aPad );
 /// sides along the axis to its nearest neighbour. False for either pad of a two-pad part
 bool KopenapiPadWayBetween( BOARD* aBoard, PAD* aPad );
 
+/// @brief A row of pins' 45 degree fan to a row of spots, pin k to spot k, both in order along the row: out of
+/// the pad to a knee, 45 degrees to the spot's line, straight on to the spot. Pins going the same way turn
+/// the farther out the nearer they are to the middle, by what keeps two legs a track and a clearance apart;
+/// the spots lie a via's radius, a clearance and half a track past the farthest diagonal's end
+struct KOPENAPI_FAN
+{
+    std::vector<int> knee;    ///< per pin: its knee past the pins' tips
+    std::vector<int> shift;   ///< per pin: its spot less its own position along the row
+    int64_t          depth;   ///< the spots past the pins' tips
+};
+
+/// @brief The fan of pins at aPinsAlong to spots at aSpotsAlong (positions along the row, in order) with a
+/// track aWidth wide, aClearance and vias aViaDia across
+KOPENAPI_FAN KopenapiFan( const std::vector<int64_t>& aPinsAlong, const std::vector<int64_t>& aSpotsAlong, int aWidth,
+                          int aClearance, int aViaDia );
+
 /// @brief The letters a reference starts with, upper case ("C" for c12): the part's kind by convention
 std::string KopenapiRefPrefix( const std::string& aRef );
 
