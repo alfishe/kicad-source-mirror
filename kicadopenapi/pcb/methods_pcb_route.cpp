@@ -12761,6 +12761,53 @@ static std::string stitchedFor( BOARD_CONNECTED_ITEM* aItem )
 }
 
 
+/// @brief The net a stitch or rail plan is for: the one given, else the one net pcb_net_roles calls
+/// ground; aError set (400 / 404) where there is none or more than one
+static NETINFO_ITEM* stitchNetOf( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, const nlohmann::json& aArgs, KOPENAPI_RESULT& aError )
+{
+    if( aArgs.contains( "net" ) )
+    {
+        const std::string text = aArgs.value( "net", std::string() );
+        NETINFO_ITEM*     net = KopenapiFindNet( aBoard, text );
+
+        if( !net )
+            aError = KopenapiNoSuchNet( aBoard, text );
+
+        return net;
+    }
+
+    std::vector<NETINFO_ITEM*> grounds;
+
+    if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+    {
+        KOPENAPI_RESULT res = roles->handler( aCtx, nlohmann::json::object() );
+        const nlohmann::json rows = res.status == 200 ? res.body.value( "nets", nlohmann::json::array() ) : nlohmann::json::array();
+
+        for( const nlohmann::json& row : rows )
+        {
+            if( row.value( "role", std::string() ) != "ground" )
+                continue;
+
+            if( NETINFO_ITEM* net = KopenapiFindNet( aBoard, row.value( "net", std::string() ) ) )
+                grounds.push_back( net );
+        }
+    }
+
+    if( grounds.size() == 1 )
+        return grounds.front();
+
+    nlohmann::json names = nlohmann::json::array();
+
+    for( NETINFO_ITEM* net : grounds )
+        names.push_back( str( UnescapeString( net->GetNetname() ) ) );
+
+    aError = KOPENAPI_RESULT::Error( 400, grounds.empty() ? std::string( "net: none given and pcb_net_roles calls no net ground: give net" )
+                                                          : "net: none given and pcb_net_roles calls " + std::to_string( grounds.size() )
+                                                                    + " nets ground " + names.dump() + ": give net" );
+    return nullptr;
+}
+
+
 static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, bool aQuiet )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -12773,11 +12820,13 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
         return KOPENAPI_RESULT::Error( 422, rulesError );
 
-    const wxString netName = wxString::FromUTF8( aArgs.value( "net", std::string( "GND" ) ) );
-    NETINFO_ITEM* net = KopenapiFindNet( board, aArgs.value( "net", std::string( "GND" ) ) );
+    KOPENAPI_RESULT netError;
+    NETINFO_ITEM*   net = stitchNetOf( aCtx, board, aArgs, netError );
 
     if( !net )
-        return KopenapiNoSuchNet( board, str( netName ) );
+        return netError;
+
+    const wxString netName = net->GetNetname();
 
     NETCLASS*  netclass = net->GetNetClass();
     const int  classViaDia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
@@ -14429,11 +14478,11 @@ static KOPENAPI_RESULT h_pcb_rail_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
         return KOPENAPI_RESULT::Error( 422, rulesError );
 
-    const std::string netText = aArgs.value( "net", std::string( "GND" ) );
-    NETINFO_ITEM*     net = KopenapiFindNet( board, netText );
+    KOPENAPI_RESULT netError;
+    NETINFO_ITEM*   net = stitchNetOf( aCtx, board, aArgs, netError );
 
     if( !net )
-        return KopenapiNoSuchNet( board, netText );
+        return netError;
 
     NETCLASS*         netclass = net->GetNetClass();
     RAIL_PLAN_OPTIONS options;
@@ -14468,7 +14517,7 @@ static KOPENAPI_RESULT h_pcb_rail_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         pins.push_back( std::move( row ) );
     }
 
-    nlohmann::json body = { { "ref", ref }, { "pins", std::move( pins ) }, { "planned_count", planned },
+    nlohmann::json body = { { "ref", ref }, { "net", str( UnescapeString( net->GetNetname() ) ) }, { "pins", std::move( pins ) }, { "planned_count", planned },
                             { "skipped_count", skipped }, { "fixed_count", fixed },
                             { "class_via_mm", toMm( options.classViaDia ) }, { "class_drill_mm", toMm( options.classViaDrill ) } };
 
@@ -17776,7 +17825,7 @@ KOPENAPI_REGISTER( "pcb_route",
 
 
 KOPENAPI_REGISTER( "pcb_stitch",
-                   "Stitch a net (default GND) to its pours and planes: every open end on one side only (SMD "
+                   "Stitch a net (default: the one net pcb_net_roles calls ground; 400 when none or several) to its pours and planes: every open end on one side only (SMD "
                    "pad, zone island, the track end of pads joined by tracks) gets a through via at a free spot "
                    "next to it (with a short track from a pad or track end), guarded against touching other nets (other nets' fills give way: they are refilled), "
                    "the stub necked as the router does at a fine-pitch pad (no wider than the pad's narrow side) and further "
@@ -17798,7 +17847,7 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "to the router, not_reached says so); no via or stub in the "
                    "straight escape of another net's fine-pitch, pair or clock pin (escape_keep_mm; spots_in_escapes); pads picks the ends; "
                    "dry_run stitches and takes it back; lists capped at list_limit (counts whole), full: true for all",
-                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{"net":{"type":"string","default":"GND"},
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{"net":{"type":"string","description":"default: the one net pcb_net_roles calls ground (400 when none or several)"},
                         "pads":{"type":"array","items":{"type":"string"},"description":"only these ends: REF.PAD of the net (and the islands of tracks they are on); 400 for a pad not found or on another net"},
                         "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"no via or stub this far out in front of a fine-pitch (0.65 mm or closer), pair or clock pin of another net on a package's row; 0 off"},
                         "dry_run":{"type":"boolean","default":false,"description":"the whole call (vias, stubs, refills) runs on the board and is taken back: the answer is what it places (409 when no copy of the board could be made)"},
@@ -17815,7 +17864,7 @@ KOPENAPI_REGISTER( "pcb_rail_plan",
                    "them: the net class's via first, the board's smallest within its rules where it does not fit. Read only",
                    R"json({"type":"object","required":["ref"],"properties":{
                         "ref":{"type":"string","description":"the package"},
-                        "net":{"type":"string","default":"GND","description":"the net whose class gives the via sizes (as pcb_stitch net)"}}})json"_json,
+                        "net":{"type":"string","description":"the net whose class gives the via sizes (as pcb_stitch net; default the one net pcb_net_roles calls ground)"}}})json"_json,
                    false, h_pcb_rail_plan, 60 );
 
 KOPENAPI_REGISTER( "pcb_track_list",
