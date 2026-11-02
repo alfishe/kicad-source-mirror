@@ -114,27 +114,11 @@ std::string fmt( double aValue, int aDigits = 2 )
 }
 
 
-std::string refPrefix( const std::string& aRef )
-{
-    size_t n = 0;
-
-    while( n < aRef.size() && std::isalpha( static_cast<unsigned char>( aRef[n] ) ) )
-        ++n;
-
-    std::string out = aRef.substr( 0, n );
-
-    for( char& c : out )
-        c = static_cast<char>( std::toupper( static_cast<unsigned char>( c ) ) );
-
-    return out;
-}
-
-
 bool isPassive( const std::string& aRef )
 {
     static const std::set<std::string> passive = { "R", "RN", "RA", "C", "CN", "L", "FB", "F", "JP", "TP", "H", "MH",
                                                    "FID", "NT" };
-    return passive.count( refPrefix( aRef ) ) > 0;
+    return passive.count( KopenapiRefPrefix( aRef ) ) > 0;
 }
 
 
@@ -1242,7 +1226,7 @@ void detectTermination( CHECKER& aC, NET_INFO& aNet )
         FOOTPRINT*        fp = pad->GetParentFootprint();
         const std::string ref = fp ? str( fp->GetReference() ) : std::string();
 
-        if( !fp || refPrefix( ref ) != "R" || fp->Pads().size() != 2 )
+        if( !fp || KopenapiRefPrefix( ref ) != "R" || fp->Pads().size() != 2 )
             continue;
 
         const PAD*   other = fp->Pads()[0] == pad ? fp->Pads()[1] : fp->Pads()[0];
@@ -1271,7 +1255,7 @@ void detectTermination( CHECKER& aC, NET_INFO& aNet )
                 if( !qf || qf == fp )
                     continue;
 
-                if( refPrefix( str( qf->GetReference() ) ) == "C" && qf->Pads().size() == 2 )
+                if( KopenapiRefPrefix( str( qf->GetReference() ) ) == "C" && qf->Pads().size() == 2 )
                 {
                     const PAD* qo = qf->Pads()[0] == q ? qf->Pads()[1] : qf->Pads()[0];
                     auto       g = aC.nets.find( qo->GetNetCode() );
@@ -1370,7 +1354,7 @@ void checkSeriesStub( CHECKER& aC, std::set<std::string>& aDone )
         {
             FOOTPRINT* fp = pad->GetParentFootprint();
 
-            if( !fp || refPrefix( str( fp->GetReference() ) ) != "R" || fp->Pads().size() != 2
+            if( !fp || KopenapiRefPrefix( str( fp->GetReference() ) ) != "R" || fp->Pads().size() != 2
                 || aDone.count( str( fp->GetReference() ) ) )
             {
                 continue;
@@ -1743,7 +1727,7 @@ void checkReferenceChange( CHECKER& aC, double aReturnMaxMm )
             {
                 for( FOOTPRINT* fp : aC.board->Footprints() )
                 {
-                    if( refPrefix( str( fp->GetReference() ) ) != "C" || fp->Pads().size() != 2 )
+                    if( KopenapiRefPrefix( str( fp->GetReference() ) ) != "C" || fp->Pads().size() != 2 )
                         continue;
 
                     const int a = fp->Pads()[0]->GetNetCode(), b = fp->Pads()[1]->GetNetCode();
@@ -1839,7 +1823,7 @@ void checkDecoupling( CHECKER& aC )
 
             for( FOOTPRINT* c : aC.board->Footprints() )
             {
-                if( refPrefix( str( c->GetReference() ) ) != "C" || c->Pads().size() != 2 )
+                if( KopenapiRefPrefix( str( c->GetReference() ) ) != "C" || c->Pads().size() != 2 )
                     continue;
 
                 PAD* p0 = c->Pads()[0];

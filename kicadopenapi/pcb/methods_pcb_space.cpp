@@ -125,17 +125,6 @@ SHAPE_POLY_SET courtyardOf( FOOTPRINT* aFp )
 }
 
 
-std::string refPrefix( const std::string& aRef )
-{
-    size_t n = 0;
-
-    while( n < aRef.size() && std::isalpha( (unsigned char) aRef[n] ) )
-        ++n;
-
-    return aRef.substr( 0, n );
-}
-
-
 struct PART
 {
     FOOTPRINT*       fp = nullptr;
@@ -284,7 +273,7 @@ BOARD_BLOCKS buildBlocks( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, const GROUP_OPT
         p.nets.assign( nets.begin(), nets.end() );
 
         const std::string lib = str( fp->GetFPID().GetLibItemName() ) + " " + str( fp->GetFPID().GetLibNickname() );
-        const std::string prefix = refPrefix( p.ref );
+        const std::string prefix = KopenapiRefPrefix( p.ref );
         p.connector = KopenapiIsConnectorRef( p.ref ) || lib.find( "Connector" ) != std::string::npos;
         p.mechanical = nets.empty() || prefix == "H" || prefix == "MH" || prefix == "FID"
                        || lib.find( "MountingHole" ) != std::string::npos || lib.find( "Fiducial" ) != std::string::npos;

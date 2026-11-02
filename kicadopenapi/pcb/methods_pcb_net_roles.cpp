@@ -73,7 +73,7 @@ static std::string bareName( const std::string& aName )
 }
 
 
-static std::string refPrefix( const std::string& aRef )
+std::string KopenapiRefPrefix( const std::string& aRef )
 {
     size_t n = 0;
 
@@ -132,7 +132,7 @@ struct UNION_FIND
 /// resistor array (pad i to pad n + 1 - i)
 static bool isSeriesPart( const FOOTPRINT* aFp )
 {
-    const std::string p = refPrefix( str( aFp->GetReference() ) );
+    const std::string p = KopenapiRefPrefix( str( aFp->GetReference() ) );
     const size_t      pads = aFp->Pads().size();
 
     if( pads == 2 && ( p == "R" || p == "FB" ) )
@@ -146,7 +146,7 @@ static bool isSeriesPart( const FOOTPRINT* aFp )
 static bool isPassive( const FOOTPRINT* aFp )
 {
     static const std::set<std::string> passive = { "R", "RN", "RA", "RP", "C", "CN", "L", "FB", "TP" };
-    return passive.count( refPrefix( str( aFp->GetReference() ) ) ) > 0;
+    return passive.count( KopenapiRefPrefix( str( aFp->GetReference() ) ) ) > 0;
 }
 
 
@@ -278,7 +278,7 @@ static KOPENAPI_RESULT h_pcb_net_roles( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     for( FOOTPRINT* fp : board->Footprints() )
     {
         const std::string ref = str( fp->GetReference() );
-        const std::string prefix = refPrefix( ref );
+        const std::string prefix = KopenapiRefPrefix( ref );
 
         for( PAD* pad : fp->Pads() )
         {
@@ -366,7 +366,7 @@ static KOPENAPI_RESULT h_pcb_net_roles( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             sw = sw || t.rfind( "sw_pin:", 0 ) == 0;
 
         for( const std::string& r : f.refs )
-            inductor = inductor || refPrefix( r ) == "L";
+            inductor = inductor || KopenapiRefPrefix( r ) == "L";
 
         if( sw && inductor && !isPowerRole( f.role ) )
             f.Set( "switching", "pins", "switch pin and an inductor on the net" );

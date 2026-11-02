@@ -196,6 +196,9 @@ KOPENAPI_RESULT KopenapiNoSuchNet( BOARD* aBoard, const std::string& aName, cons
 /// sides of an edge connector's finger, or a pad stacked on another, are not neighbours)
 bool KopenapiPadNeighbours( const PAD* aA, const PAD* aB );
 
+/// @brief The letters a reference starts with, upper case ("C" for c12): the part's kind by convention
+std::string KopenapiRefPrefix( const std::string& aRef );
+
 /**
  * @brief Validate a net's stored driver edge block ({family, tr_ps, tr_def, rout_ohm, swing_v, nm_v, driver})
  * @return empty when valid, else what is wrong
