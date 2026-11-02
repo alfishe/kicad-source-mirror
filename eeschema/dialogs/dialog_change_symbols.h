@@ -26,6 +26,7 @@
 
 #include <lib_id.h>
 #include <sch_sheet_path.h>
+#include <symbol_changer.h>
 #include <template_fieldnames.h>
 
 
@@ -33,13 +34,6 @@ class SCH_SYMBOL;
 class SCH_EDIT_FRAME;
 class SCH_SCREEN;
 class SCH_COMMIT;
-
-
-struct SYMBOL_CHANGE_INFO
-{
-    std::vector<SCH_SHEET_PATH> m_Instances;
-    LIB_ID                      m_LibId;
-};
 
 
 /**

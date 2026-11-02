@@ -582,279 +582,49 @@ int DIALOG_CHANGE_SYMBOLS::processSymbols( SCH_COMMIT* aCommit, const std::map<S
 
     wxCHECK( frame, 0 );
 
-    std::map<SCH_SYMBOL*, SYMBOL_CHANGE_INFO>           symbols = aSymbols;
-    std::map<SCH_SYMBOL*, SYMBOL_CHANGE_INFO>::iterator it = symbols.begin();
+    SYMBOL_CHANGE_OPTIONS options;
+    options.m_UpdateFields = m_updateFields;
+    options.m_RemoveExtraFields = m_removeExtraBox->GetValue();
+    options.m_ResetEmptyFields = m_resetEmptyFields->GetValue();
+    options.m_ResetFieldText = m_resetFieldText->GetValue();
+    options.m_ResetFieldVisibilities = m_resetFieldVisibilities->GetValue();
+    options.m_ResetFieldEffects = m_resetFieldEffects->GetValue();
+    options.m_ResetFieldPositions = m_resetFieldPositions->GetValue();
+    options.m_ResetAttributes = m_resetAttributes->GetValue();
+    options.m_ResetPinTextVisibility = m_resetPinTextVisibility->GetValue();
+    options.m_ResetAlternatePins = m_resetAlternatePin->IsChecked();
+    options.m_ResetCustomPower = m_resetCustomPower->IsChecked();
+    options.m_ResetPinMapOverrides = m_resetPinMapOverrides->IsChecked();
+    options.m_AutoplaceNewFields = frame->eeconfig()->m_AutoplaceFields.enable;
 
-    // Remove all symbols that don't have a valid library symbol link or enough units to
-    // satisfy the library symbol update.
-    while( it != symbols.end() )
+    SYMBOL_CHANGER changer(
+            [frame]( const LIB_ID& aId )
+            {
+                return frame->GetLibSymbol( aId );
+            },
+            options );
+
+    std::map<SCH_SYMBOL*, wxString> oldLinks;
+
+    for( const auto& [symbol, info] : aSymbols )
+        oldLinks[symbol] = UnescapeString( symbol->GetLibId().Format() );
+
+    for( const SYMBOL_CHANGE_RESULT& result : changer.Apply( aCommit, aSymbols ) )
     {
-        SCH_SYMBOL* symbol = it->first;
-
-        wxCHECK2( symbol, ++it; continue );
-
-        if( !it->second.m_LibId.IsValid() )
+        if( !result.m_Error.IsEmpty() )
         {
-            msg = getSymbolReferences( *symbol, it->second.m_LibId );
-            msg << wxT( ": " ) << _( "*** symbol lib id not valid ***" );
+            msg = getSymbolReferences( *result.m_Symbol, result.m_NewLibId );
+            msg << wxT( ": *** " ) << result.m_Error << wxT( " ***" );
             m_messagePanel->Report( msg, RPT_SEVERITY_ERROR );
-            it = symbols.erase( it );
             continue;
         }
 
-        LIB_SYMBOL* libSymbol = frame->GetLibSymbol( it->second.m_LibId );
+        frame->GetCanvas()->GetView()->Update( result.m_Symbol );
 
-        if( !libSymbol )
-        {
-            msg = getSymbolReferences( *symbol, it->second.m_LibId );
-            msg << wxT( ": " ) << _( "*** symbol not found ***" );
-            m_messagePanel->Report( msg, RPT_SEVERITY_ERROR );
-            it = symbols.erase( it );
-            continue;
-        }
-
-        std::unique_ptr<LIB_SYMBOL> flattenedSymbol = libSymbol->Flatten();
-
-        if( flattenedSymbol->GetUnitCount() < symbol->GetUnit() )
-        {
-            msg = getSymbolReferences( *symbol, it->second.m_LibId );
-            msg << wxT( ": " ) << _( "*** new symbol has too few units ***" );
-            m_messagePanel->Report( msg, RPT_SEVERITY_ERROR );
-            it = symbols.erase( it );
-        }
-        else
-        {
-            ++it;
-        }
-    }
-
-    // Removing the symbol needs to be done before the LIB_SYMBOL is changed to prevent stale
-    // library symbols in the schematic file.
-    for( const auto& [ symbol, symbol_change_info ] : symbols )
-    {
-        wxCHECK( symbol && !symbol_change_info.m_Instances.empty(), 0 );
-
-        SCH_SCREEN* screen = symbol_change_info.m_Instances[0].LastScreen();
-
-        wxCHECK( screen, 0 );
-
-        screen->Remove( symbol );
-        SCH_SYMBOL* symbol_copy = static_cast<SCH_SYMBOL*>( symbol->Clone() );
-        aCommit->Modified( symbol, symbol_copy, screen );
-    }
-
-    for( const auto& [ symbol, symbol_change_info ] : symbols )
-    {
-        // Remember initial link before changing for diags purpose
-        wxString initialLibLinkName = UnescapeString( symbol->GetLibId().Format() );
-
-        LIB_SYMBOL* libSymbol = frame->GetLibSymbol( symbol_change_info.m_LibId );
-
-        wxCHECK2( libSymbol, continue );
-
-        if( symbol_change_info.m_LibId != symbol->GetLibId() )
-            symbol->SetLibId( symbol_change_info.m_LibId );
-
-        std::unique_ptr<LIB_SYMBOL> flattenedSymbol = libSymbol->Flatten();
-        SCH_SCREEN*                 screen = symbol_change_info.m_Instances[0].LastScreen();
-
-        const bool keepPinMaps = !m_resetPinMapOverrides->IsChecked();
-
-        PIN_MAP_SET                       savedPinMaps;
-        std::vector<ASSOCIATED_FOOTPRINT> savedAssociations;
-
-        if( keepPinMaps && symbol->GetLibSymbolRef() )
-        {
-            savedPinMaps = symbol->GetLibSymbolRef()->GetPinMaps();
-            savedAssociations = symbol->GetLibSymbolRef()->GetAssociatedFootprints();
-        }
-
-        symbol->SetLibSymbol( flattenedSymbol.release() );
-
-        if( keepPinMaps && symbol->GetLibSymbolRef() )
-        {
-            symbol->GetLibSymbolRef()->SetPinMaps( savedPinMaps );
-            symbol->GetLibSymbolRef()->SetAssociatedFootprints( savedAssociations );
-        }
-
-        if( m_resetAttributes->GetValue() )
-        {
-            // Fetch the attributes from the *flattened* library symbol.  They are not supported
-            // in derived symbols.
-            symbol->SetExcludedFromSim( symbol->GetLibSymbolRef()->GetExcludedFromSim() );
-            symbol->SetExcludedFromBOM( symbol->GetLibSymbolRef()->GetExcludedFromBOM() );
-            symbol->SetExcludedFromBoard( symbol->GetLibSymbolRef()->GetExcludedFromBoard() );
-            symbol->SetExcludedFromPosFiles( symbol->GetLibSymbolRef()->GetExcludedFromPosFiles() );
-        }
-
-        if( m_resetPinTextVisibility->GetValue() )
-        {
-            symbol->SetShowPinNames( symbol->GetLibSymbolRef()->GetShowPinNames() );
-            symbol->SetShowPinNumbers( symbol->GetLibSymbolRef()->GetShowPinNumbers() );
-        }
-
-        bool removeExtras = m_removeExtraBox->GetValue();
-        bool resetVis = m_resetFieldVisibilities->GetValue();
-        bool resetEffects = m_resetFieldEffects->GetValue();
-        bool resetPositions = m_resetFieldPositions->GetValue();
-
-        for( int ii = (int) symbol->GetFields().size() - 1; ii >= 0; ii-- )
-        {
-            SCH_FIELD& field = symbol->GetFields()[ii];
-            SCH_FIELD* libField = nullptr;
-            bool       doUpdate = field.IsPrivate();
-
-            // Mandatory fields always exist in m_updateFields, but these names can be translated,
-            // so use GetUntranslatedName().
-            doUpdate |= alg::contains( m_updateFields, field.GetUntranslatedName() );
-
-            if( !doUpdate )
-                continue;
-
-            if( field.IsMandatory() )
-                libField = symbol->GetLibSymbolRef()->GetField( field.GetId() );
-            else
-                libField = symbol->GetLibSymbolRef()->GetField( field.GetName() );
-
-            if( libField )
-            {
-                field.SetPrivate( libField->IsPrivate() );
-
-                bool resetText = libField->GetText().IsEmpty() ? m_resetEmptyFields->GetValue()
-                                                               : m_resetFieldText->GetValue();
-
-                if( resetText )
-                {
-                    if( field.GetId() == FIELD_T::REFERENCE )
-                    {
-                        wxString prefix = UTIL::GetRefDesPrefix( libField->GetText() );
-
-                        for( const SCH_SHEET_PATH& instance : symbol_change_info.m_Instances )
-                        {
-                            wxString ref = symbol->GetRef( &instance );
-                            int      number = UTIL::GetRefDesNumber( ref );
-
-                            if( number >= 0 )
-                                ref.Printf( wxS( "%s%d" ), prefix, number );
-                            else
-                                ref = UTIL::GetRefDesUnannotated( prefix );
-
-                            symbol->SetRef( &instance, ref );
-                        }
-                    }
-                    else if( field.GetId() == FIELD_T::VALUE )
-                    {
-                        if( !symbol->IsPower() || m_resetCustomPower->IsChecked() )
-                            symbol->SetValueFieldText( UnescapeString( libField->GetText() ) );
-                    }
-                    else
-                    {
-                        field.SetText( libField->GetText() );
-                    }
-                }
-
-                if( resetVis )
-                    field.SetVisible( libField->IsVisible() );
-
-                if( resetEffects )
-                {
-                    // Careful: the visible bit and position are also set by SetAttributes()
-                    bool     visible = field.IsVisible();
-                    VECTOR2I pos = field.GetPosition();
-
-                    field.SetAttributes( *libField );
-
-                    field.SetVisible( visible );
-                    field.SetPosition( pos );
-                    field.SetNameShown( libField->IsNameShown() );
-                    field.SetCanAutoplace( libField->CanAutoplace() );
-                }
-
-                if( resetPositions )
-                    field.SetTextPos( symbol->GetPosition() + libField->GetTextPos() );
-            }
-            else if( !field.IsMandatory() && removeExtras )
-            {
-                symbol->RemoveField( field.GetName() );
-            }
-        }
-
-        std::vector<SCH_FIELD*> libFields;
-        symbol->GetLibSymbolRef()->GetFields( libFields );
-
-        for( SCH_FIELD* libField : libFields )
-        {
-            if( libField->IsMandatory() )
-                continue;
-
-            if( !alg::contains( m_updateFields, libField->GetUntranslatedName() ) )
-                continue;
-
-            if( !symbol->GetField( libField->GetName() ) )
-            {
-                SCH_FIELD* schField = symbol->AddField( SCH_FIELD( symbol, FIELD_T::USER, libField->GetName() ) );
-
-                // SetAttributes() also covers text angle, size, italic and bold
-                schField->SetAttributes( *libField );
-                schField->SetVisible( libField->IsVisible() );
-                schField->SetText( libField->GetText() );
-                schField->SetTextPos( symbol->GetPosition() + libField->GetTextPos() );
-                schField->SetPrivate( libField->IsPrivate() );
-            }
-
-            if( resetPositions && frame->eeconfig()->m_AutoplaceFields.enable )
-            {
-                AUTOPLACE_ALGO fieldsAutoplaced = symbol->GetFieldsAutoplaced();
-
-                if( fieldsAutoplaced == AUTOPLACE_AUTO || fieldsAutoplaced == AUTOPLACE_MANUAL )
-                    symbol->AutoplaceFields( screen, fieldsAutoplaced );
-            }
-        }
-
-        symbol->SetSchSymbolLibraryName( wxEmptyString );
-        screen->Append( symbol );
-
-        if( resetPositions )
-        {
-            AUTOPLACE_ALGO fieldsAutoplaced = symbol->GetFieldsAutoplaced();
-
-            if( fieldsAutoplaced == AUTOPLACE_AUTO || fieldsAutoplaced == AUTOPLACE_MANUAL )
-                symbol->AutoplaceFields( screen, fieldsAutoplaced );
-        }
-
-        // Clear alternate pins as required.
-        for( const SCH_SHEET_PATH& instance : symbol_change_info.m_Instances )
-        {
-            for( SCH_PIN* pin : symbol->GetPins( &instance ) )
-            {
-                if( !pin->GetAlt().IsEmpty() )
-                {
-                    // There is a bug that allows the alternate pin name to be set to the default pin
-                    // name which causes library symbol comparison errors.  Clear the alternate pin
-                    // name in this case even if the reset option is not checked.  Also clear the
-                    // alternate pin name if it no longer exists in the alternate pin map.
-                    if( m_resetAlternatePin->IsChecked()
-                        || ( pin->GetAlt() == pin->GetBaseName() )
-                        || ( pin->GetAlternates().count( pin->GetAlt() ) == 0 ) )
-                    {
-                        pin->SetAlt( wxEmptyString );
-                    }
-                }
-            }
-        }
-
-        if( m_resetPinMapOverrides->IsChecked() )
-        {
-            for( const SCH_SHEET_PATH& instance : symbol_change_info.m_Instances )
-                symbol->SetPinMapOverride( PIN_MAP_INSTANCE_OVERRIDE(), &instance );
-        }
-
-        frame->GetCanvas()->GetView()->Update( symbol );
-
-        msg = getSymbolReferences( *symbol, symbol_change_info.m_LibId, &initialLibLinkName );
+        msg = getSymbolReferences( *result.m_Symbol, result.m_NewLibId, &oldLinks[result.m_Symbol] );
         msg += wxS( ": OK" );
         m_messagePanel->Report( msg, RPT_SEVERITY_ACTION );
-        matchesProcessed +=1;
+        matchesProcessed += 1;
     }
 
     return matchesProcessed;

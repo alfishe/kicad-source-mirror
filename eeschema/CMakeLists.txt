@@ -521,6 +521,7 @@ set( EESCHEMA_SRCS
     schematic_undo_redo.cpp
     sheet.cpp
     symbol.cpp
+    symbol_changer.cpp
     symbol_checker.cpp
     symbol_chooser_frame.cpp
     variant_proxy_undo_item.cpp
