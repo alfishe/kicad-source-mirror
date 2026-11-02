@@ -46,6 +46,8 @@
 #include <pcb_track.h>
 #include <router/pns_kicad_iface.h>
 #include <regex>
+#include <router/pns_debug_decorator.h>
+#include <router/pns_line.h>
 #include <router/pns_placement_algo.h>
 #include <router/pns_router.h>
 #include <router/pns_routing_settings.h>
@@ -60,6 +62,8 @@
 #include <cleanup_item.h>
 #include <tracks_cleaner.h>
 
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <wx/thread.h>
 #include <limits>
@@ -165,6 +169,124 @@ public:
     std::vector<BOARD_ITEM*> m_added;
     std::set<BOARD_ITEM*>    m_modified;
     std::set<BOARD_ITEM*>    m_removed;
+};
+
+
+/// @brief The router's steps of one try as text, no addresses: where (file:line), what, and the
+/// items and shapes by kind, net, layers, box and points (trace_attempt)
+class TRACE_DECORATOR : public PNS::DEBUG_DECORATOR
+{
+public:
+    TRACE_DECORATOR( const PNS::ROUTER_IFACE& aIface, size_t aCap ) : m_iface( aIface ), m_cap( aCap ) { SetDebugEnabled( true ); }
+
+    void Message( const wxString& aMsg, const SRC_LOCATION_INFO& aSrc ) override { add( aSrc, "msg " + str( aMsg ) ); }
+    void NewStage( const wxString& aName, int aIter, const SRC_LOCATION_INFO& aSrc ) override
+    {
+        add( aSrc, "stage " + str( aName ) + " " + std::to_string( aIter ) );
+    }
+    void BeginGroup( const wxString& aName, int aLevel, const SRC_LOCATION_INFO& aSrc ) override { add( aSrc, "begin " + str( aName ) ); }
+    void EndGroup( const SRC_LOCATION_INFO& aSrc ) override { add( aSrc, "end" ); }
+    void AddPoint( const VECTOR2I& aP, const KIGFX::COLOR4D&, int, const wxString& aName, const SRC_LOCATION_INFO& aSrc ) override
+    {
+        add( aSrc, "point " + str( aName ) + " " + pt( aP ) );
+    }
+    void AddItem( const PNS::ITEM* aItem, const KIGFX::COLOR4D&, int, const wxString& aName, const SRC_LOCATION_INFO& aSrc ) override
+    {
+        add( aSrc, "item " + str( aName ) + " " + itemKey( aItem ) );
+    }
+    void AddShape( const SHAPE* aShape, const KIGFX::COLOR4D&, int, const wxString& aName, const SRC_LOCATION_INFO& aSrc ) override
+    {
+        add( aSrc, "shape " + str( aName ) + " " + shapeKey( aShape ) );
+    }
+
+    std::string itemKey( const PNS::ITEM* aItem ) const
+    {
+        if( !aItem )
+            return "-";
+
+        std::string key = aItem->KindStr() + " net " + std::to_string( m_iface.GetNetCode( aItem->Net() ) ) + " L" + std::to_string( aItem->Layers().Start() )
+                          + "-" + std::to_string( aItem->Layers().End() );
+
+        if( const PNS::LINKED_ITEM* linked = dynamic_cast<const PNS::LINKED_ITEM*>( aItem ) )
+            key += " uid " + std::to_string( linked->Uid() );
+
+        if( aItem->Kind() == PNS::ITEM::LINE_T )
+            return key + " " + chain( static_cast<const PNS::LINE*>( aItem )->CLine() );
+
+        return key + " " + shapeKey( aItem->Shape( aItem->Layers().Start() ) );
+    }
+
+    nlohmann::json Json() const
+    {
+        return { { "events", m_events }, { "total", m_total }, { "capped", m_total > m_events.size() }, { "other_threads", m_otherThreads.load() } };
+    }
+
+private:
+    static std::string pt( const VECTOR2I& aP ) { return std::to_string( aP.x ) + "," + std::to_string( aP.y ); }
+
+    // a message or a name may print a pointer (%p): it differs from run to run
+    static std::string noAddresses( std::string aText )
+    {
+        for( size_t at = aText.find( "0x" ); at != std::string::npos; at = aText.find( "0x", at + 2 ) )
+        {
+            size_t end = at + 2;
+
+            while( end < aText.size() && std::isxdigit( (unsigned char) aText[end] ) )
+                end++;
+
+            aText.replace( at + 2, end - at - 2, "_" );
+        }
+
+        return aText;
+    }
+
+    static std::string chain( const SHAPE_LINE_CHAIN& aChain )
+    {
+        std::string out = "chain " + std::to_string( aChain.PointCount() ) + ":";
+
+        for( int i = 0; i < aChain.PointCount(); ++i )
+            out += " " + pt( aChain.CPoint( i ) );
+
+        return out;
+    }
+
+    static std::string shapeKey( const SHAPE* aShape )
+    {
+        if( !aShape )
+            return "-";
+
+        if( aShape->Type() == SH_LINE_CHAIN )
+            return chain( *static_cast<const SHAPE_LINE_CHAIN*>( aShape ) );
+
+        const BOX2I box = aShape->BBox();
+        return "type " + std::to_string( (int) aShape->Type() ) + " box " + pt( box.GetOrigin() ) + " " + pt( box.GetEnd() );
+    }
+
+    // the router's pool threads (nearest obstacle) report too: in no fixed order, only counted
+    void add( const SRC_LOCATION_INFO& aSrc, std::string aText )
+    {
+        if( std::this_thread::get_id() != m_thread )
+        {
+            m_otherThreads++;
+            return;
+        }
+
+        if( m_events.size() < m_cap )
+        {
+            const size_t slash = aSrc.fileName.find_last_of( "/\\" );
+            m_events.push_back( ( slash == std::string::npos ? aSrc.fileName : aSrc.fileName.substr( slash + 1 ) ) + ":" + std::to_string( aSrc.line ) + " "
+                                + noAddresses( std::move( aText ) ) );
+        }
+
+        m_total++;
+    }
+
+    const PNS::ROUTER_IFACE& m_iface;
+    const std::thread::id    m_thread = std::this_thread::get_id();
+    std::atomic<size_t>      m_otherThreads{ 0 };
+    size_t                   m_cap;
+    std::vector<std::string> m_events;
+    size_t                   m_total = 0;
 };
 
 
@@ -882,6 +1004,11 @@ struct ROUTE_PROFILE
 
     std::map<KIID, LAID> laid;
     long                 job = -1;   ///< the job or gap the routes are laid for now
+
+    int            traceAttempt = 0;   ///< trace_attempt: the first try (1 = the first) traced
+    int            traceLast = 0;      ///< trace_last: the last one
+    int            tracedAttempt = 0;  ///< the try being traced (a try inside a try is not)
+    nlohmann::json traces = nlohmann::json::array();
 };
 
 /// @brief The profile of the pcb_route call running on a board; a scratch one outside such a call
@@ -1320,8 +1447,70 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     ROUTE_PROFILE& profile = ROUTE_PROFILES::Of( board, scratch );
     const auto started = std::chrono::steady_clock::now();
 
+    // trace_attempt: outlives the router and its interface, which report to it
+    struct TRACED
+    {
+        ROUTE_PROFILE&                   profile;
+        nlohmann::json&                  out;
+        std::unique_ptr<TRACE_DECORATOR> tracer;
+        nlohmann::json                   trace;
+        ~TRACED()
+        {
+            if( !tracer )
+                return;
+
+            nlohmann::json pns = tracer->Json();
+            // uids are counted by the process: kept apart from the steps
+            std::string steps;
+
+            for( const nlohmann::json& event : pns["events"] )
+            {
+                const std::string& text = event.get_ref<const std::string&>();
+                size_t             from = 0;
+
+                for( size_t at = text.find( " uid " ); at != std::string::npos; at = text.find( " uid ", from ) )
+                {
+                    steps.append( text, from, at - from );
+                    from = at + 5;
+
+                    while( from < text.size() && std::isdigit( (unsigned char) text[from] ) )
+                        from++;
+                }
+
+                steps.append( text, from, std::string::npos );
+                steps += '\n';
+            }
+
+            trace["pns_hash"] = std::to_string( std::hash<std::string>()( steps ) );
+            trace["pns_uid_hash"] = std::to_string( std::hash<std::string>()( pns["events"].dump() ) );
+            trace["routed"] = out.value( "routed", false );
+
+            // one try: all of it; a range: what tells two runs' tries apart
+            if( profile.traceLast == profile.traceAttempt )
+            {
+                trace["pns"] = std::move( pns );
+                trace["out"] = out;
+            }
+            else
+            {
+                trace.erase( "board_tracks" );
+                trace["pns_total"] = pns["total"];
+            }
+
+            profile.traces.push_back( std::move( trace ) );
+            profile.tracedAttempt = 0;
+        }
+    } traced{ profile, aOut, nullptr, nullptr };
+
     auto iface = std::make_unique<KOPENAPI_PNS_IFACE>();
     iface->SetBoard( board );
+
+    // the interface deletes its decorator: the tracer is taken back before
+    struct DETACH
+    {
+        KOPENAPI_PNS_IFACE& iface;
+        ~DETACH() { iface.SetDebugDecorator( nullptr ); }
+    } detach{ *iface };
 
     if( aReq.pairs )
         iface->SetExplicitDiffPairs( *aReq.pairs );
@@ -1373,6 +1562,52 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         router = std::make_unique<PNS::ROUTER>();
         router->SetInterface( iface.get() );
         router->LoadSettings( &settings );
+
+        if( profile.traceAttempt > 0 && profile.attempts + 1 >= profile.traceAttempt && profile.attempts + 1 <= profile.traceLast
+            && !profile.tracedAttempt )
+        {
+            nlohmann::json tracks = nlohmann::json::array();
+
+            for( PCB_TRACK* track : board->Tracks() )
+                tracks.push_back( copperKey( track ) );
+
+            nlohmann::json fronts = nlohmann::json::array();
+
+            for( size_t k = 0; aReq.fronts && k < aReq.fronts->size(); ++k )
+            {
+                const ESCAPE_FRONT& front = ( *aReq.fronts )[k];
+
+                if( front.walls( aReq.from->GetNetCode() ) )
+                    fronts.push_back( str( front.pad->GetParentFootprint()->GetReference() ) + "." + str( front.pad->GetNumber() ) + " "
+                                      + std::to_string( front.shape.GetSeg().A.x ) + "," + std::to_string( front.shape.GetSeg().A.y ) );
+            }
+
+            nlohmann::json vias = nlohmann::json::array();
+
+            for( const auto& [at, layer] : aReq.vias )
+                vias.push_back( { at.x, at.y, layer ? (int) *layer : -1 } );
+
+            std::string trackKeys;
+
+            for( const nlohmann::json& key : tracks )
+                trackKeys += key.get<std::string>() + "\n";
+
+            traced.trace = { { "attempt", profile.attempts + 1 },
+                              { "from", copperKey( aReq.from ) },
+                              { "to", aReq.to ? copperKey( aReq.to ) : std::string() },
+                              { "to_pos", { aReq.toPos.x, aReq.toPos.y } },
+                              { "layer", (int) aReq.layer },
+                              { "mode", (int) aReq.mode },
+                              { "neck", aReq.neckWidth },
+                              { "vias", vias },
+                              { "fronts", fronts },
+                              { "board_tracks", tracks },
+                              { "board_tracks_hash", std::to_string( std::hash<std::string>()( trackKeys ) ) } };
+            profile.tracedAttempt = profile.attempts + 1;
+            traced.tracer = std::make_unique<TRACE_DECORATOR>( *iface, 400000 );
+            iface->SetDebugDecorator( traced.tracer.get() );
+        }
+
         router->SyncWorld();
 
         // a way out of another net's pad kept open is that net's copper to the router when asked: it walks around
@@ -3344,6 +3579,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     if( budgetMode != "time" && budgetMode != "work" )
         return KOPENAPI_RESULT::Error( 400, "budgets: time (seconds on the wall clock) or work (the router's work, the same under any load)" );
+
+    profile.traceAttempt = std::max( 0, aArgs.value( "trace_attempt", 0 ) );
+    profile.traceLast = std::max( profile.traceAttempt, aArgs.value( "trace_last", profile.traceAttempt ) );
 
     const bool   workBudgets = budgetMode == "work";
     const double workPerS = std::clamp( aArgs.value( "work_per_s", 5000.0 ), 1.0, 1e9 );
@@ -9262,6 +9500,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                             { "ms", std::round( portMs ) } };
     }
 
+    if( profile.traceAttempt > 0 && profile.traceLast == profile.traceAttempt )
+        answer["trace"] = profile.traces.empty() ? nlohmann::json::object() : std::move( profile.traces[0] );
+    else if( profile.traceAttempt > 0 )
+        answer["traces"] = std::move( profile.traces );
+
     cap.Put( answer, "other_nets_moved", std::move( moved ) );
 
     if( !doubled.empty() )
@@ -13928,6 +14171,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
                         "attempts":{"type":"boolean","default":false,"description":"pns: each row lists its tries (at most 40): kind, pass, layer, from, points (vias / corners), routed, ms; a failed one its reason, stopped_at_mm, toward_mm, walls_in, the nearest blocker"},"stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does; while connections still wait for their first-pass try (first_pass_budget_s bounding it) or, failed there, for their turn in the retry pass (fewest tries first), it ends the turn of the one routing instead (budget stop_on_plateau_s): what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
                         "budgets":{"type":"string","enum":["time","work"],"default":"time","description":"time: first_pass_budget_s, rip_up_budget_s and stop_on_plateau_s on the wall clock; work: counted in the router's work (its stop checks: each walkaround / shove step and try) at work_per_s a second, so the same board routes the same under any load (A/B comparisons), the wall clock only a hard cap at wall_cap_x times a budget (profile budget: mode, work, work_per_s, wall_caps)"},
+                        "trace_attempt":{"type":"integer","minimum":0,"default":0,"description":"debug: trace the router's try of this number (1 = the first; the segments' attempt): trace {attempt, from, to, layer, mode, vias, fronts, board_tracks (the board's track order), board_tracks_hash, pns {events: the router's steps as text without addresses, file:line first, total, capped, other_threads}, pns_hash, routed, out}; two runs' traces show where they part"},
+                        "trace_last":{"type":"integer","minimum":0,"description":"debug: with trace_attempt, trace every try up to this one: traces [{attempt, from, to, ..., board_tracks_hash, pns_hash, pns_total, routed}] (no steps, no track list): the first try whose hashes differ between two runs is the one to trace alone"},
                         "work_per_s":{"type":"number","default":5000,"minimum":1,"description":"budgets work: the work counted as one second (5000: about what U18 routes a second on the Mac Studio under load 15..20)"},
                         "wall_cap_x":{"type":"number","default":10,"minimum":1,"description":"budgets work: a budget also ends after this many times its seconds on the wall clock (wall_caps counts them; a capped run is no longer load-independent)"},
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
