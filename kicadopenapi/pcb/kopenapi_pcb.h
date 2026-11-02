@@ -251,6 +251,11 @@ bool KopenapiPadFinePitch( BOARD* aBoard, PAD* aPad );
 /// of a second, staggered via line where two vias do not fit side by side at the row's pitch
 int KopenapiPadEscapeDepth( BOARD* aBoard, PAD* aPad );
 
+/// @brief A pad whose way out runs between other-net neighbours of its footprint: the nearest pad sets
+/// the row axis, and a pad of another net (or none) lies on that axis on both sides, each within one and
+/// a half pitches. False for a pad at the end of a row and for either pad of a two-pad part
+bool KopenapiPadWayBetween( PAD* aPad );
+
 /// @brief The letters a reference starts with, upper case ("C" for c12): the part's kind by convention
 std::string KopenapiRefPrefix( const std::string& aRef );
 
