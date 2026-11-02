@@ -25,6 +25,8 @@
 #include <netclass.h>
 #include <netinfo.h>
 #include <pad.h>
+#include <pcb_track.h>
+#include <geometry/shape.h>
 #include <project/net_settings.h>
 #include <string_utils.h>
 #include <zone.h>
@@ -682,9 +684,11 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
-    // links: per signal net its blocks joined by a shortest tree; the nets of one bus between two
-    // blocks, and the single nets between them, are one bundle each
+    // links: per signal net the hops of a shortest tree over its pads (as its connections run) between
+    // two blocks; the nets of one bus between two blocks, and the single nets between them, are one
+    // bundle each
     std::map<int, std::set<int>>                netBlocks;
+    std::map<int, std::vector<std::pair<int, VECTOR2I>>> netPads;   ///< net -> (block, position) per pad
     std::map<int, std::map<int, std::set<int>>> netBoxes;   ///< net -> block -> boxes of its pads
 
     for( FOOTPRINT* fp : board->Footprints() )
@@ -702,6 +706,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             if( pad->GetNetCode() > 0 && !rails.count( pad->GetNetCode() ) )
             {
                 netBlocks[pad->GetNetCode()].insert( it->second );
+                netPads[pad->GetNetCode()].emplace_back( it->second, pad->GetPosition() );
 
                 if( bx != boxOfRef.end() )
                     netBoxes[pad->GetNetCode()][it->second].insert( bx->second );
@@ -716,9 +721,15 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( set.size() < 2 )
             continue;
 
-        std::vector<int>  members( set.begin(), set.end() );
-        std::vector<bool> in( members.size(), false );
+        const std::vector<std::pair<int, VECTOR2I>>& pads = netPads[net];
+        std::vector<bool>   in( pads.size(), false );
+        std::vector<double> dist( pads.size(), std::numeric_limits<double>::max() );
+        std::vector<int>    via( pads.size(), 0 );
+        std::set<std::pair<int, int>> hops;
         in[0] = true;
+
+        for( size_t j = 1; j < pads.size(); ++j )
+            dist[j] = ( pads[j].second - pads[0].second ).EuclideanNorm();
 
         NETINFO_ITEM*   info = board->FindNet( net );
         const NETCLASS* nc = info ? info->GetNetClass() : nullptr;
@@ -731,36 +742,35 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         const double    width = toMm( rule.width + rule.clearance );
         auto            bus = busOfNet.find( net );
 
-        for( size_t added = 1; added < members.size(); ++added )
+        for( size_t added = 1; added < pads.size(); ++added )
         {
-            double best = std::numeric_limits<double>::max();
-            int    bi = -1, bj = -1;
+            int bj = -1;
 
-            for( size_t i = 0; i < members.size(); ++i )
+            for( size_t j = 0; j < pads.size(); ++j )
             {
-                if( !in[i] )
-                    continue;
-
-                for( size_t j = 0; j < members.size(); ++j )
-                {
-                    if( in[j] )
-                        continue;
-
-                    const VECTOR2I d = blocks[members[i]].box.Centre() - blocks[members[j]].box.Centre();
-                    const double   len = std::abs( double( d.x ) ) + std::abs( double( d.y ) );
-
-                    if( len < best )
-                    {
-                        best = len;
-                        bi = (int) i;
-                        bj = (int) j;
-                    }
-                }
+                if( !in[j] && ( bj < 0 || dist[j] < dist[bj] ) )
+                    bj = (int) j;
             }
 
             in[bj] = true;
-            const int a = std::min( members[bi], members[bj] );
-            const int b = std::max( members[bi], members[bj] );
+
+            for( size_t j = 0; j < pads.size(); ++j )
+            {
+                const double d = ( pads[j].second - pads[bj].second ).EuclideanNorm();
+
+                if( !in[j] && d < dist[j] )
+                {
+                    dist[j] = d;
+                    via[j] = bj;
+                }
+            }
+
+            const int a = std::min( pads[bj].first, pads[via[bj]].first );
+            const int b = std::max( pads[bj].first, pads[via[bj]].first );
+
+            if( a == b || !hops.insert( { a, b } ).second )
+                continue;
+
             LINK&     l = linkMap[{ a, b, bus == busOfNet.end() ? std::string() : bus->second }];
             l.a = a;
             l.b = b;
@@ -1980,6 +1990,81 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return std::make_pair( lo, hi );
     };
 
+    // copper_stretches: per routing layer the parts of a free stretch no copper on that layer (tracks,
+    // vias, pads, at the board's clearance) is in, sampled every 0.05 mm
+    const bool copperStretches = aArgs.value( "copper_stretches", false );
+    const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+    const int  copperClearance = std::max( bds.m_MinClearance, bds.m_NetSettings->GetDefaultNetclass()->GetClearance() );
+
+    auto copperFree = [&]( bool aVertical, double aAt, double aLo, double aHi )
+    {
+        const double step = 0.05;
+        const int    count = std::max( 1, (int) std::floor( ( aHi - aLo ) / step ) + 1 );
+        auto         pointAt = [&]( int aIndex )
+        {
+            const int u = pcbIUScale.mmToIU( aLo + aIndex * step ), at = pcbIUScale.mmToIU( aAt );
+            return aVertical ? VECTOR2I( at, u ) : VECTOR2I( u, at );
+        };
+
+        BOX2I span = BOX2I::ByCorners( pointAt( 0 ), pointAt( count - 1 ) );
+        span.Inflate( copperClearance );
+        nlohmann::json out = nlohmann::json::object();
+
+        for( PCB_LAYER_ID layer : routing )
+        {
+            std::vector<char> taken( (size_t) count, 0 );
+
+            auto mark = [&]( BOARD_ITEM* aItem )
+            {
+                if( !aItem->IsOnLayer( layer ) || !aItem->GetBoundingBox().Intersects( span ) )
+                    return;
+
+                const std::shared_ptr<SHAPE> shape = aItem->GetEffectiveShape( layer );
+
+                for( int i = 0; i < count; ++i )
+                {
+                    if( !taken[i] && shape->Collide( pointAt( i ), copperClearance ) )
+                        taken[i] = 1;
+                }
+            };
+
+            for( PCB_TRACK* track : board->Tracks() )
+                mark( track );
+
+            for( FOOTPRINT* fp : board->Footprints() )
+            {
+                if( !fp->GetBoundingBox().Intersects( span ) )
+                    continue;
+
+                for( PAD* pad : fp->Pads() )
+                    mark( pad );
+            }
+
+            nlohmann::json runs = nlohmann::json::array();
+
+            for( int i = 0; i < count; )
+            {
+                if( taken[i] )
+                {
+                    ++i;
+                    continue;
+                }
+
+                int k = i;
+
+                while( k + 1 < count && !taken[k + 1] )
+                    ++k;
+
+                runs.push_back( { r2( aLo + i * step ), r2( std::min( aHi, aLo + k * step ) ) } );
+                i = k + 1;
+            }
+
+            out[str( board->GetLayerName( layer ) )] = runs;
+        }
+
+        return out;
+    };
+
     auto corridorJson = [&]( const LINK& aLink )
     {
         nlohmann::json list = nlohmann::json::array();
@@ -1992,6 +2077,9 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             list.push_back( { { "at_mm", { r2( c[0] ), r2( c[1] ) } }, { "along", p.vertical ? "y" : "x" },
                               { "lo_mm", r2( lo ) }, { "hi_mm", r2( hi ) },
                               { "into_mm", { r2( toMm( xs[r.i0] ) ), r2( toMm( ys[r.j0] ) ), r2( toMm( xs[r.i1] ) ), r2( toMm( ys[r.j1] ) ) } } } );
+
+            if( copperStretches )
+                list.back()["free_mm"] = copperFree( p.vertical, p.at, lo, hi );
         }
 
         return list;
@@ -2247,6 +2335,7 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
+                        "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
                         "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
                         "overflow_cost_mm":{"type":"number","default":5,"description":"detour worth one track over a channel's capacity, first round (doubles each round)"},

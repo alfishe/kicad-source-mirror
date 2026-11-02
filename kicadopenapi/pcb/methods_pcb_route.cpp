@@ -6199,6 +6199,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             int      axis = -1;   ///< the portal along x (0) or y (1); -1 a free point
             int      lo = 0, hi = 0;
             std::optional<BOX2I> into;   ///< the region the path enters there
+            std::map<std::string, std::vector<std::pair<int, int>>> free;   ///< layer -> runs no copper is in
         };
 
         struct CORRIDOR
@@ -6244,6 +6245,27 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     const VECTOR2I p1( pcbIUScale.mmToIU( r[2].get<double>() ), pcbIUScale.mmToIU( r[3].get<double>() ) );
                     aOut.into = BOX2I( p0, p1 - p0 );
                 }
+
+                const nlohmann::json freeArg = aPoint.value( "free_mm", nlohmann::json() );
+
+                if( freeArg.is_object() )
+                {
+                    for( auto it = freeArg.begin(); it != freeArg.end(); ++it )
+                    {
+                        if( !it.value().is_array() )
+                            return false;
+
+                        std::vector<std::pair<int, int>>& runs = aOut.free[it.key()];
+
+                        for( const nlohmann::json& run : it.value() )
+                        {
+                            if( !run.is_array() || run.size() != 2 || !run[0].is_number() || !run[1].is_number() )
+                                return false;
+
+                            runs.emplace_back( pcbIUScale.mmToIU( run[0].get<double>() ), pcbIUScale.mmToIU( run[1].get<double>() ) );
+                        }
+                    }
+                }
             }
 
             return true;
@@ -6263,6 +6285,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 return KOPENAPI_RESULT::Error( 400, "bus_paths: {floorplan: {pcb_floorplan arguments}}" );
 
             fpArgs["list_limit"] = 100000;
+
+            if( !fpArgs.contains( "copper_stretches" ) )
+                fpArgs["copper_stretches"] = true;
+
             const KOPENAPI_RESULT r = fp->handler( aCtx, fpArgs );
 
             if( r.status >= 400 )
@@ -6393,6 +6419,43 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             std::vector<MEMBER> members;
             const VECTOR2I      front = c.points.front().at, back = c.points.back().at;
+            int                 partEnds = 0;   ///< members ending on copper of their net already there
+
+            // the block an end is in: its part's; a track or via end (a net partly routed), the block
+            // whose parts' pads are nearer
+            std::vector<VECTOR2I> padsOf[2];
+
+            for( FOOTPRINT* fp : board->Footprints() )
+            {
+                const std::string ref = str( fp->GetReference() );
+
+                for( int side = 0; side < 2; ++side )
+                {
+                    if( ( side == 0 ? c.aParts : c.bParts ).count( ref ) )
+                    {
+                        for( PAD* pad : fp->Pads() )
+                            padsOf[side].push_back( pad->GetPosition() );
+                    }
+                }
+            }
+
+            auto sideOf = [&]( BOARD_CONNECTED_ITEM* aItem, const VECTOR2I& aPos )
+            {
+                const std::string ref = refOf( aItem );
+
+                if( !ref.empty() )
+                    return c.aParts.count( ref ) ? 0 : c.bParts.count( ref ) ? 1 : -1;
+
+                double nearest[2] = { std::numeric_limits<double>::max(), std::numeric_limits<double>::max() };
+
+                for( int side = 0; side < 2; ++side )
+                {
+                    for( const VECTOR2I& at : padsOf[side] )
+                        nearest[side] = std::min( nearest[side], double( ( at - aPos ).EuclideanNorm() ) );
+                }
+
+                return nearest[0] <= nearest[1] ? 0 : 1;
+            };
 
             for( size_t k = 0; k < jobs.size(); ++k )
             {
@@ -6405,14 +6468,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 if( !c.aParts.empty() || !c.bParts.empty() )
                 {
-                    const std::string from = refOf( j.from ), to = refOf( j.to );
+                    const int from = sideOf( j.from, j.from->GetPosition() ), to = sideOf( j.to, j.toPos );
 
-                    if( c.aParts.count( from ) && c.bParts.count( to ) )
-                        forward = true;
-                    else if( c.bParts.count( from ) && c.aParts.count( to ) )
-                        forward = false;
-                    else
+                    if( from < 0 || to < 0 || from == to )
                         continue;
+
+                    forward = from == 0;
+                    partEnds += !refOf( j.to ).empty() ? 0 : 1;
                 }
                 else
                 {
@@ -6453,8 +6515,46 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             const int n = (int) members.size();
             const int half = KiROUND( ( n - 1 ) / 2.0 * pitch );
             const int margin = pitch;
-            int       squeezed = 0;
+            int       squeezed = 0, copperNarrowed = 0;
             std::vector<CROSSING> pts = c.points;
+            BOARD_CONNECTED_ITEM* first = jobs[members.front().job].from;
+            const PCB_LAYER_ID    startLayer = first->IsOnLayer( F_Cu ) ? F_Cu : first->IsOnLayer( B_Cu ) ? B_Cu
+                                                                                                   : first->GetLayerSet().CuStack().front();
+            const std::string     startLayerName = str( board->GetLayerName( startLayer ) );
+
+            // copper on the members' layer: each crossing in the run of its stretch no copper is in that
+            // is wide enough and nearest to where it was (the widest when none is)
+            for( CROSSING& x : pts )
+            {
+                auto runs = x.free.find( startLayerName );
+
+                if( x.axis < 0 || runs == x.free.end() )
+                    continue;
+
+                const int u = x.axis == 0 ? x.at.x : x.at.y;
+                const std::pair<int, int>* pick = nullptr;
+                int64_t pickCost = std::numeric_limits<int64_t>::max();
+
+                for( const std::pair<int, int>& run : runs->second )
+                {
+                    const int lo = run.first + margin + half, hi = run.second - margin - half;
+                    const int64_t cost = lo <= hi ? int64_t( u < lo ? lo - u : u > hi ? u - hi : 0 )
+                                                  : int64_t( bigIU ) * 4 - ( run.second - run.first );
+
+                    if( cost < pickCost )
+                    {
+                        pickCost = cost;
+                        pick = &run;
+                    }
+                }
+
+                if( pick && ( pick->first != x.lo || pick->second != x.hi ) )
+                {
+                    x.lo = pick->first;
+                    x.hi = pick->second;
+                    copperNarrowed++;
+                }
+            }
 
             // the ribbon inside each portal's free stretch, a pitch off its ends, straight on from the
             // portal before where that is in line
@@ -6502,6 +6602,40 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             // corner where the two crossings' lines meet; a jog half way; a way back out through the same
             // side as deep as the ribbon needs), the ribbon a pitch off the region's sides where it fits
             std::vector<VECTOR2I> line;
+            int                   runsMoved = 0;
+
+            // copper of other nets on the members' layer, for the runs inside the regions
+            std::vector<std::pair<BOX2I, std::shared_ptr<SHAPE>>> copper;
+
+            auto addCopper = [&]( BOARD_CONNECTED_ITEM* aItem )
+            {
+                if( aItem->IsOnLayer( startLayer ) && !codes.count( aItem->GetNetCode() ) )
+                    copper.emplace_back( aItem->GetBoundingBox(), aItem->GetEffectiveShape( startLayer ) );
+            };
+
+            for( PCB_TRACK* track : board->Tracks() )
+                addCopper( track );
+
+            for( FOOTPRINT* fp : board->Footprints() )
+            {
+                for( PAD* pad : fp->Pads() )
+                    addCopper( pad );
+            }
+
+            auto ribbonClear = [&]( const VECTOR2I& aFrom, const VECTOR2I& aTo )
+            {
+                const int clearance = half + margin;
+                BOX2I     span = BOX2I::ByCorners( aFrom, aTo );
+                span.Inflate( clearance );
+
+                for( const auto& [box, shape] : copper )
+                {
+                    if( box.Intersects( span ) && shape->Collide( SEG( aFrom, aTo ), clearance ) )
+                        return false;
+                }
+
+                return true;
+            };
 
             auto keep = [&]( const VECTOR2I& aAt )
             {
@@ -6540,6 +6674,39 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 if( rlo <= rhi )
                     mid = std::clamp( mid, rlo, rhi );
+
+                // the run (and its two legs from the crossings) clear of the copper there: the nearest
+                // depth in the region where it is
+                auto runClear = [&]( int aMid )
+                {
+                    const VECTOR2I p0 = inX ? VECTOR2I( a0, b0 ) : VECTOR2I( b0, a0 );
+                    const VECTOR2I p1 = inX ? VECTOR2I( aMid, b0 ) : VECTOR2I( b0, aMid );
+                    const VECTOR2I p2 = inX ? VECTOR2I( aMid, b1 ) : VECTOR2I( b1, aMid );
+                    const VECTOR2I p3 = inX ? VECTOR2I( a1, b1 ) : VECTOR2I( b1, a1 );
+                    return ribbonClear( p0, p1 ) && ribbonClear( p1, p2 ) && ribbonClear( p2, p3 );
+                };
+
+                if( rlo <= rhi && !copper.empty() && !runClear( mid ) )
+                {
+                    const int step = std::max( 1, pitch / 4 );
+
+                    for( int d = step; d <= rhi - rlo; d += step )
+                    {
+                        if( mid + d <= rhi && runClear( mid + d ) )
+                        {
+                            mid += d;
+                            runsMoved++;
+                            break;
+                        }
+
+                        if( mid - d >= rlo && runClear( mid - d ) )
+                        {
+                            mid -= d;
+                            runsMoved++;
+                            break;
+                        }
+                    }
+                }
 
                 keep( inX ? VECTOR2I( mid, b0 ) : VECTOR2I( b0, mid ) );
                 keep( inX ? VECTOR2I( mid, b1 ) : VECTOR2I( b1, mid ) );
@@ -6675,6 +6842,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( squeezed )
                 out["portals_narrower"] = squeezed;
+
+            if( copperNarrowed )
+                out["copper_narrowed"] = copperNarrowed;
+
+            if( runsMoved )
+                out["runs_moved"] = runsMoved;
+
+            if( partEnds )
+                out["ends_on_copper"] = partEnds;
 
             corridorOut.push_back( out );
         }
