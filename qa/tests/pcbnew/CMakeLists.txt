@@ -63,6 +63,7 @@ set( QA_PCBNEW_SRCS
     test_group_mirror.cpp
     test_group_save_perf.cpp
     test_headless_pcb_context.cpp
+    test_generator_tool_listener.cpp
     test_history_autosave.cpp
     test_fields_table_presence.cpp
     test_footprint.cpp

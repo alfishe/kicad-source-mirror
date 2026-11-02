@@ -44,7 +44,11 @@ GENERATOR_TOOL::GENERATOR_TOOL() :
 
                 BOARD_ITEM* item = dynamic_cast<BOARD_ITEM*>( aItem );
 
-                if( item && aProperty->Name() == _HKI( "Locked" ) )
+                // Every generator tool hears every board's changes: only this tool's board is ours
+                if( !item || !aCommit || !m_toolMgr || item->GetBoard() != board() )
+                    return;
+
+                if( aProperty->Name() == _HKI( "Locked" ) )
                 {
                     if( PCB_GENERATOR* generator = dynamic_cast<PCB_GENERATOR*>( item->GetParentGroup() ) )
                     {
@@ -65,7 +69,9 @@ GENERATOR_TOOL::GENERATOR_TOOL() :
             {
                 // Special case: regenerate generators when their properties change
 
-                if( PCB_GENERATOR* generator = dynamic_cast<PCB_GENERATOR*>( aItem ) )
+                PCB_GENERATOR* generator = dynamic_cast<PCB_GENERATOR*>( aItem );
+
+                if( generator && aCommit && m_toolMgr && generator->GetBoard() == board() )
                 {
                     BOARD_COMMIT* commit = static_cast<BOARD_COMMIT*>( aCommit );
 
