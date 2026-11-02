@@ -40,6 +40,7 @@
 #include <tools/global_edit_tool.h>
 #include <tools/footprint_editor_control.h>
 #include <dialog_global_edit_text_and_graphics_base.h>
+#include <global_edit_text_and_graphics.h>
 
 // Columns of layer classes grid
 enum
@@ -98,8 +99,6 @@ protected:
     bool TransferDataToWindow() override;
     bool TransferDataFromWindow() override;
 
-    void visitItem( BOARD_COMMIT& aCommit, BOARD_ITEM* aItem );
-    void processItem( BOARD_COMMIT& aCommit, BOARD_ITEM* aItem );
 
 private:
     PCB_BASE_EDIT_FRAME*   m_parent;
@@ -355,157 +354,6 @@ void DIALOG_GLOBAL_EDIT_TEXT_AND_GRAPHICS::onTextSize( wxCommandEvent& aEvent )
 }
 
 
-void DIALOG_GLOBAL_EDIT_TEXT_AND_GRAPHICS::processItem( BOARD_COMMIT& aCommit, BOARD_ITEM* aItem )
-{
-    aCommit.Modify( aItem );
-
-    PCB_FIELD*          field = dynamic_cast<PCB_FIELD*>( aItem );
-    EDA_TEXT*           text = dynamic_cast<EDA_TEXT*>( aItem );
-    PCB_SHAPE*          shape = dynamic_cast<PCB_SHAPE*>( aItem );
-    PCB_DIMENSION_BASE* dimension = dynamic_cast<PCB_DIMENSION_BASE*>( aItem );
-    PCB_BARCODE*        barcode = dynamic_cast<PCB_BARCODE*>( aItem );
-    FOOTPRINT*          parentFP = aItem->GetParentFootprint();
-
-    if( m_setToSpecifiedValues->GetValue() )
-    {
-        if( m_LayerCtrl->GetLayerSelection() != UNDEFINED_LAYER )
-            aItem->SetLayer( ToLAYER_ID( m_LayerCtrl->GetLayerSelection() ) );
-
-        if( text )
-        {
-            if( !m_textWidth.IsIndeterminate() )
-                text->SetTextSize( VECTOR2I( m_textWidth.GetIntValue(), text->GetTextSize().y ) );
-
-            if( !m_textHeight.IsIndeterminate() )
-                text->SetTextSize( VECTOR2I( text->GetTextSize().x, m_textHeight.GetIntValue() ) );
-
-            if( m_autoTextThickness->IsChecked() )
-                text->SetAutoThickness( true );
-            else if( !m_thickness.IsIndeterminate() )
-                text->SetTextThickness( m_thickness.GetIntValue() );
-
-            // Must be after SetTextSize()
-            if( m_bold->Get3StateValue() != wxCHK_UNDETERMINED )
-                text->SetBold( m_bold->GetValue() );
-
-            if( m_italic->Get3StateValue() != wxCHK_UNDETERMINED )
-                text->SetItalic( m_italic->GetValue() );
-
-            // Must come after setting bold & italic
-            if( m_fontCtrl->GetStringSelection() != INDETERMINATE_ACTION )
-            {
-                text->SetFont( m_fontCtrl->GetFontSelection( text->IsBold(), text->IsItalic() ) );
-            }
-            else if(( m_italic->Get3StateValue() != wxCHK_UNDETERMINED
-                    || m_bold->Get3StateValue() != wxCHK_UNDETERMINED ) )
-            {
-                if( !text->GetFontName().IsEmpty() )
-                {
-                    text->SetFont( KIFONT::FONT::GetFont( text->GetFontName(), text->IsBold(),
-                                                          text->IsItalic(),
-                                                          m_parent->GetBoard()->GetEmbeddedFiles()->GetFontFiles() ) );
-                }
-            }
-
-            if( parentFP )
-            {
-                if( m_keepUpright->Get3StateValue() != wxCHK_UNDETERMINED )
-                    text->SetKeepUpright( m_keepUpright->GetValue() );
-
-                if( m_centerOnFP->GetValue() == wxCHK_CHECKED )
-                    text->SetTextPos( aItem->GetParent()->GetCenter() );
-            }
-        }
-
-        if( barcode )
-        {
-            if( !m_textHeight.IsIndeterminate() )
-                barcode->SetTextSize( m_textHeight.GetIntValue() );
-            else if( !m_textWidth.IsIndeterminate() )
-                barcode->SetTextSize( m_textWidth.GetIntValue() );
-        }
-
-        if( field )
-        {
-            if( m_visible->Get3StateValue() != wxCHK_UNDETERMINED )
-                field->SetVisible( m_visible->GetValue() );
-        }
-
-        if( !m_lineWidth.IsIndeterminate() )
-        {
-            if( shape )
-            {
-                STROKE_PARAMS stroke = shape->GetStroke();
-                stroke.SetWidth( m_lineWidth.GetIntValue() );
-                shape->SetStroke( stroke );
-            }
-
-            if( dimension )
-                dimension->SetLineThickness( m_lineWidth.GetIntValue() );
-        }
-    }
-    else
-    {
-        aItem->StyleFromSettings( *m_brdSettings, false );
-    }
-}
-
-
-void DIALOG_GLOBAL_EDIT_TEXT_AND_GRAPHICS::visitItem( BOARD_COMMIT& aCommit, BOARD_ITEM* aItem )
-{
-    if( m_selectedItemsFilter->GetValue() )
-    {
-        EDA_ITEM* candidate = aItem;
-
-        if( !candidate->IsSelected() )
-        {
-            if( candidate->GetParent() && candidate->GetParent()->Type() == PCB_FOOTPRINT_T )
-                candidate = candidate->GetParent();
-        }
-
-        if( !candidate->IsSelected() )
-        {
-            candidate = ( candidate->GetParentGroup() ? candidate->GetParentGroup()->AsEdaItem() : nullptr );
-
-            while( candidate && !candidate->IsSelected() && candidate->GetParentGroup() )
-                candidate = candidate->GetParentGroup()->AsEdaItem();
-
-            if( !candidate || !candidate->IsSelected() )
-                return;
-        }
-    }
-
-    if( m_layerFilterOpt->GetValue() && m_layerFilter->GetLayerSelection() != UNDEFINED_LAYER )
-    {
-        if( aItem->GetLayer() != m_layerFilter->GetLayerSelection() )
-            return;
-    }
-
-    if( m_isBoardEditor )
-    {
-        if( m_referenceFilterOpt->GetValue() && !m_referenceFilter->GetValue().IsEmpty() )
-        {
-            if( FOOTPRINT* fp = aItem->GetParentFootprint() )
-            {
-                if( !WildCompareString( m_referenceFilter->GetValue(), fp->GetReference(), false ) )
-                    return;
-            }
-        }
-
-        if( m_footprintFilterOpt->GetValue() && !m_footprintFilter->GetValue().IsEmpty() )
-        {
-            if( FOOTPRINT* fp = aItem->GetParentFootprint() )
-            {
-                if( !WildCompareString( m_footprintFilter->GetValue(), fp->GetFPID().Format(), false ) )
-                    return;
-            }
-        }
-    }
-
-    processItem( aCommit, aItem );
-}
-
-
 bool DIALOG_GLOBAL_EDIT_TEXT_AND_GRAPHICS::TransferDataFromWindow()
 {
     int minTextSize = pcbIUScale.mmToIU( TEXT_MIN_SIZE_MM );
@@ -517,108 +365,73 @@ bool DIALOG_GLOBAL_EDIT_TEXT_AND_GRAPHICS::TransferDataFromWindow()
         return false;
     }
 
+    GLOBAL_EDIT_TEXT_AND_GRAPHICS_OPTIONS opt;
+
+    opt.references = m_references->GetValue();
+    opt.values = m_values->GetValue();
+    opt.otherFootprintFields = m_otherFootprintFields->GetValue();
+    opt.footprintTexts = m_footprintTexts->GetValue();
+    opt.footprintGraphics = m_footprintGraphics->GetValue();
+    opt.footprintDimensions = m_footprintDimensions->GetValue();
+    opt.boardTexts = m_boardText->GetValue();
+    opt.boardGraphics = m_boardGraphics->GetValue();
+    opt.boardDimensions = m_boardDimensions->GetValue();
+
+    opt.selectedOnly = m_selectedItemsFilter->GetValue();
+
+    if( m_layerFilterOpt->GetValue() && m_layerFilter->GetLayerSelection() != UNDEFINED_LAYER )
+        opt.layerFilter = ToLAYER_ID( m_layerFilter->GetLayerSelection() );
+
+    if( m_isBoardEditor && m_referenceFilterOpt->GetValue() )
+        opt.referenceFilter = m_referenceFilter->GetValue();
+
+    if( m_isBoardEditor && m_footprintFilterOpt->GetValue() )
+        opt.footprintFilter = m_footprintFilter->GetValue();
+
+    opt.setToLayerDefaults = !m_setToSpecifiedValues->GetValue();
+
+    if( m_LayerCtrl->GetLayerSelection() != UNDEFINED_LAYER )
+        opt.layer = ToLAYER_ID( m_LayerCtrl->GetLayerSelection() );
+
+    if( !m_lineWidth.IsIndeterminate() )
+        opt.lineWidth = m_lineWidth.GetIntValue();
+
+    if( !m_textWidth.IsIndeterminate() )
+        opt.textWidth = m_textWidth.GetIntValue();
+
+    if( !m_textHeight.IsIndeterminate() )
+        opt.textHeight = m_textHeight.GetIntValue();
+
+    opt.autoTextThickness = m_autoTextThickness->IsChecked();
+
+    if( !m_thickness.IsIndeterminate() )
+        opt.textThickness = m_thickness.GetIntValue();
+
+    if( m_bold->Get3StateValue() != wxCHK_UNDETERMINED )
+        opt.bold = m_bold->GetValue();
+
+    if( m_italic->Get3StateValue() != wxCHK_UNDETERMINED )
+        opt.italic = m_italic->GetValue();
+
+    if( m_keepUpright->Get3StateValue() != wxCHK_UNDETERMINED )
+        opt.keepUpright = m_keepUpright->GetValue();
+
+    if( m_visible->Get3StateValue() != wxCHK_UNDETERMINED )
+        opt.visible = m_visible->GetValue();
+
+    opt.centerOnFootprint = m_centerOnFP->GetValue() == wxCHK_CHECKED;
+
+    if( m_fontCtrl->GetStringSelection() != INDETERMINATE_ACTION )
+    {
+        opt.font = [this]( bool aBold, bool aItalic )
+        {
+            return m_fontCtrl->GetFontSelection( aBold, aItalic );
+        };
+    }
+
     BOARD_COMMIT commit( m_parent );
 
-    // Go through the footprints
-    for( FOOTPRINT* fp : m_parent->GetBoard()->Footprints() )
-    {
-        if( m_references->GetValue() )
-            visitItem( commit, &fp->Reference() );
-
-        if( m_values->GetValue() )
-            visitItem( commit, &fp->Value() );
-
-        for( PCB_FIELD* field : fp->GetFields() )
-        {
-            wxCHECK2( field, continue );
-
-            if( field->IsReference() )
-                continue;
-
-            if( field->IsValue() )
-                continue;
-
-            if( m_otherFootprintFields->GetValue() )
-                visitItem( commit, field );
-            else if( m_references->GetValue() && field->GetText() == wxT( "${REFERENCE}" ) )
-                visitItem( commit, field );
-            else if( m_values->GetValue() && field->GetText() == wxT( "${VALUE}" ) )
-                visitItem( commit, field );
-        }
-
-        // Go through all other footprint items
-        for( BOARD_ITEM* boardItem : fp->GraphicalItems() )
-        {
-            KICAD_T itemType = boardItem->Type();
-
-            if( itemType == PCB_TEXT_T || itemType == PCB_TEXTBOX_T )
-            {
-                EDA_TEXT* textItem = dynamic_cast<EDA_TEXT*>( boardItem );
-
-                if( m_footprintTexts->GetValue() )
-                    visitItem( commit, boardItem );
-                else if( m_references->GetValue() && textItem->GetText() == wxT( "${REFERENCE}" ) )
-                    visitItem( commit, boardItem );
-                else if( m_values->GetValue() && textItem->GetText() == wxT( "${VALUE}" ) )
-                    visitItem( commit, boardItem );
-            }
-            else if( itemType == PCB_TABLE_T )
-            {
-                boardItem->RunOnChildren(
-                        [&]( BOARD_ITEM* child )
-                        {
-                            if( child->Type() == PCB_TABLECELL_T && m_footprintTexts->GetValue() )
-                                visitItem( commit, child );
-                        },
-                        RECURSE_MODE::NO_RECURSE );
-            }
-            else if( BaseType( itemType ) == PCB_DIMENSION_T )
-            {
-                if( m_footprintDimensions->GetValue() )
-                    visitItem( commit, boardItem );
-            }
-            else if( itemType == PCB_SHAPE_T || itemType == PCB_BARCODE_T )
-            {
-                if( m_footprintGraphics->GetValue() )
-                    visitItem( commit, boardItem );
-            }
-        }
-    }
-
-    if( m_isBoardEditor )
-    {
-        // Go through the PCB text & graphic items
-        for( BOARD_ITEM* boardItem : m_parent->GetBoard()->Drawings() )
-        {
-            KICAD_T itemType = boardItem->Type();
-
-            if( itemType == PCB_TEXT_T || itemType == PCB_TEXTBOX_T )
-            {
-                if( m_boardText->GetValue() )
-                    visitItem( commit, boardItem );
-            }
-            else if( itemType == PCB_TABLE_T )
-            {
-                boardItem->RunOnChildren(
-                        [&]( BOARD_ITEM* child )
-                        {
-                            if( child->Type() == PCB_TABLECELL_T && m_boardText->GetValue() )
-                                visitItem( commit, child );
-                        },
-                        RECURSE_MODE::NO_RECURSE );
-            }
-            else if( BaseType( itemType ) == PCB_DIMENSION_T )
-            {
-                if( m_boardDimensions->GetValue() )
-                    visitItem( commit, boardItem );
-            }
-            else if( itemType == PCB_SHAPE_T || itemType == PCB_BARCODE_T )
-            {
-                if( m_boardGraphics->GetValue() )
-                    visitItem( commit, boardItem );
-            }
-        }
-    }
+    GlobalEditTextAndGraphics( *m_parent->GetBoard(), commit, *m_brdSettings, opt, m_isBoardEditor );
 
     commit.Push( _( "Edit Text and Graphics" ) );
     m_parent->GetCanvas()->Refresh();

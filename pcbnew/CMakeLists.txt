@@ -459,6 +459,7 @@ set( PCBNEW_CLASS_SRCS
     fp_tree_model_adapter.cpp
     footprint_fields_data_model.cpp
     generate_footprint_info.cpp
+    global_edit_text_and_graphics.cpp
     graphics_cleaner.cpp
     grid_layer_box_helpers.cpp
     grid_layer_box_helpers.h
