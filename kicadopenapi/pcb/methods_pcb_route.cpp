@@ -12964,9 +12964,13 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         }
     }
 
-    // escape_keep_mm: the straight way out of a fine-pitch pin (pitch up to 0.65 mm) and of a
-    // pair's or clock's pin stays clear of stitching vias and stubs for that length
-    const double escapeKeepMm = std::clamp( aArgs.value( "escape_keep_mm", 2.0 ), 0.0, 20.0 );
+    // escape_keep_mm: the straight way out of a fine-pitch pin (KopenapiPadFinePitch) and of a
+    // pair's or clock's pin stays clear of stitching vias and stubs for that length; by default past its
+    // part's courtyard by one via pitch (the rules' via and clearance), where its first via can go
+    const std::optional<double> escapeKeepGiven = aArgs.contains( "escape_keep_mm" ) ? std::optional<double>( std::clamp(
+                                                          aArgs.value( "escape_keep_mm", 0.0 ), 0.0, 20.0 ) )
+                                                                                     : std::nullopt;
+    const bool                  escapeKeepOn = !escapeKeepGiven || *escapeKeepGiven > 0;
     const int    minClearance = board->GetDesignSettings().m_MinClearance;
 
     struct ESCAPE
@@ -12986,7 +12990,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         std::set<int> special;
         std::set<int> pairNets;
 
-        if( escapeKeepMm > 0 )
+        if( escapeKeepOn )
         {
             if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
             {
@@ -13065,7 +13069,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
                 outward[pad] = *dir;
 
-                if( escapeKeepMm <= 0 || pad->GetNetCode() == net->GetNetCode() || pad->GetNetCode() <= 0
+                if( !escapeKeepOn || pad->GetNetCode() == net->GetNetCode() || pad->GetNetCode() <= 0
                     || ( !fine && !special.count( pad->GetNetCode() ) ) )
                 {
                     continue;
@@ -13075,7 +13079,22 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                 const int      half = dir->x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
                 const int      across = dir->x ? pb.GetHeight() : pb.GetWidth();
                 const VECTOR2I tip = pad->GetPosition() + *dir * half;
-                const VECTOR2I end = tip + *dir * pcbIUScale.mmToIU( escapeKeepMm );
+                int            keep = 0;
+
+                if( escapeKeepGiven )
+                {
+                    keep = pcbIUScale.mmToIU( *escapeKeepGiven );
+                }
+                else
+                {
+                    const SHAPE_POLY_SET& cy = fp->GetCourtyard( fp->GetLayer() == B_Cu ? B_Cu : F_Cu );
+                    const BOX2I           body = cy.OutlineCount() ? cy.BBox() : fp->GetBoundingBox( false );
+                    const int             toEdge = dir->x > 0 ? body.GetRight() - tip.x : dir->x < 0 ? tip.x - body.GetLeft()
+                                                   : dir->y > 0 ? body.GetBottom() - tip.y : tip.y - body.GetTop();
+                    keep = std::max( toEdge, 0 ) + classViaDia + ruleVia.clearance;
+                }
+
+                const VECTOR2I end = tip + *dir * keep;
 
                 for( PCB_LAYER_ID l : pad->GetLayerSet().CuStack() )
                     escapes.push_back( { pad, l, SHAPE_SEGMENT( tip, end, across + 2 * minClearance ) } );
@@ -14532,7 +14551,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                     { "not_reached_count", answer["not_reached"].size() },
                                     { "islands_left_count", answer["islands_left"].size() },
                                     { "spots_off_plane", offPlaneSkipped },
-                                    { "escape_keep_mm", escapeKeepMm },
+                                    { "escape_keep", escapeKeepGiven ? nlohmann::json( *escapeKeepGiven ) : nlohmann::json( "courtyard_via_pitch" ) },
                                     { "spots_in_escapes", escapeSkipped } };
 
     if( !only.empty() )
@@ -17989,7 +18008,7 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "dry_run stitches and takes it back; lists capped at list_limit (counts whole), full: true for all",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{"net":{"type":"string","description":"default: the one net pcb_net_roles calls ground (400 when none or several)"},
                         "pads":{"type":"array","items":{"type":"string"},"description":"only these ends: REF.PAD of the net (and the islands of tracks they are on); 400 for a pad not found or on another net"},
-                        "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"no via or stub this far out in front of a fine-pitch (0.65 mm or closer), pair or clock pin of another net on a package's row; 0 off"},
+                        "escape_keep_mm":{"type":"number","minimum":0,"description":"no via or stub this far out in front of a fine-pitch (no track of the rules' width passes beside it at their clearance, or two of its vias do not fit side by side at the pitch), pair or clock pin of another net on a package's row; default past its part's courtyard by one via pitch (the rules' via and clearance), where its first via can go; 0 off; the answer's escape_keep is the value given or courtyard_via_pitch"},
                         "dry_run":{"type":"boolean","default":false,"description":"the whole call (vias, stubs, refills) runs on the board and is taken back: the answer is what it places (409 when no copy of the board could be made)"},
                         "under_parts":{"type":"string","enum":["avoid","allow"],"default":"avoid","description":"avoid: no via or stub of another part inside the ring of pads of a quad package (QFP / QFN / LGA) on its side - the ring is the package's own pins' (their vias go inward) and the exposed pad and its clearance stay open for its own vias; BGAs are not affected; not_reached says when only such spots were near. allow: other parts' vias may go there too"}}})json"_json ),
                    false, h_pcb_stitch, 300 );
