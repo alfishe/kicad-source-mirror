@@ -1474,6 +1474,16 @@ static KOPENAPI_RESULT h_pcb_layout_graph( KOPENAPI_CONTEXT& aCtx, const nlohman
             }
         }
 
+        // a net alone in its name series: by its own name when that is the bus's (PM_SD_CS, or a
+        // number on it: SPI_RX0)
+        auto namedBy = []( const std::string& aNet, const std::string& aKey )
+        {
+            const std::string leaf = aNet.substr( aNet.rfind( '/' ) == std::string::npos ? 0 : aNet.rfind( '/' ) + 1 );
+
+            return !aKey.empty() && leaf.compare( 0, aKey.size(), aKey ) == 0
+                   && std::all_of( leaf.begin() + (long) aKey.size(), leaf.end(), []( char ch ) { return ch >= '0' && ch <= '9'; } );
+        };
+
         for( const nlohmann::json& m : bundle.value( "members", nlohmann::json::array() ) )
         {
             const std::string how = source != "topology" ? source
@@ -1484,7 +1494,7 @@ static KOPENAPI_RESULT h_pcb_layout_graph( KOPENAPI_CONTEXT& aCtx, const nlohman
                 if( NETINFO_ITEM* net = KopenapiFindNet( board, n.get<std::string>() ) )
                 {
                     nets.insert( net->GetNetCode() );
-                    netSource[net->GetNetCode()] = how;
+                    netSource[net->GetNetCode()] = how == "topology" && namedBy( n.get<std::string>(), key ) ? "name" : how;
                 }
             }
         }
