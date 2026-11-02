@@ -173,6 +173,7 @@ struct CUT
     std::vector<int>    links;
     bool                through = false;   ///< across a box of a block, under its parts
     double              detour = -1;       ///< mm, the way round the obstacle at its nearer end instead; -1: none
+    PCB_LAYER_ID        ring = UNDEFINED_LAYER;   ///< an inner ring's channel: on this layer only (free: total)
 };
 
 
@@ -194,6 +195,8 @@ struct LINK
     std::vector<int> topologyOnly;   ///< nets in the bus by their ends only, not by their name
     std::vector<std::pair<VECTOR2I, VECTOR2I>> pins;   ///< per net its hop's pads at a and at b
     int              cluster = -1;     ///< a bus split by its pins' spread: the cluster's index
+    int              ringOptA = -1, ringOptB = -1;   ///< its inner ring options at a and at b
+    int              ringVarA = -1, ringVarB = -1;   ///< the ring variant its way takes there (-1: none)
     std::string      bundle;           ///< what the rules bundle its nets by ("" none: no corridor)
     std::vector<std::array<double, 4>> corridor;   ///< portal crossings in path order: x, y (mm), portal, region entered
     double           length = 0;
@@ -457,6 +460,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     // keep-outs that bar tracks: rule areas of the board and of footprints, and given ones
     std::vector<FP_KEEPOUT> keepouts;
+    std::vector<std::tuple<std::string, BOX2I, LSET>> trackBars;   ///< every keep-out barring tracks, on any copper layer
 
     auto ruleArea = [&]( ZONE* aZone, const std::string& aSource )
     {
@@ -464,11 +468,13 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             return;
 
         const uint64_t bits = layerBits( aZone->GetLayerSet() );
+        std::string    name = str( aZone->GetZoneName() );
+
+        trackBars.emplace_back( name.empty() ? "keep-out (" + aSource + ")" : name, aZone->GetBoardOutline().BBox(),
+                                aZone->GetLayerSet() );
 
         if( !bits )
             return;
-
-        std::string name = str( aZone->GetZoneName() );
 
         if( name.empty() )
             name = "keep-out " + std::to_string( keepouts.size() + 1 );
@@ -493,9 +499,12 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             return KOPENAPI_RESULT::Error( 400, "keepouts: [{name, rect: [x0, y0, x1, y1] mm, layers}]" );
 
         uint64_t bits = allBits;
+        LSET     on = LSET::AllCuMask();
 
         if( k.contains( "layers" ) )
         {
+            on = LSET();
+
             if( !k["layers"].is_array() )
                 return KOPENAPI_RESULT::Error( 400, "keepouts: layers is a list of copper layer names" );
 
@@ -508,6 +517,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 if( std::find( copper.begin(), copper.end(), l ) == copper.end() )
                     return KOPENAPI_RESULT::Error( 400, "keepouts: " + n.dump() + " is not a copper layer of the board" );
 
+                on.set( l );
+
                 for( int i = 0; i < nl; ++i )
                 {
                     if( routing[i] == l )
@@ -517,6 +528,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
 
         keepouts.push_back( { k.value( "name", "keep-out " + std::to_string( keepouts.size() + 1 ) ), *box, bits, "argument" } );
+        trackBars.emplace_back( keepouts.back().name, *box, on );
     }
 
     // net classes
@@ -1458,6 +1470,481 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
+    // inner ring: a bus may leave (enter) its end part by another side than the one its pins face by
+    // diving through a row of vias at the pins' side to a layer the stack-up types power, going round the
+    // part there in a band just outside its courtyard and coming up by a row at that other side. A
+    // candidate way in the negotiation: its cost is its length plus via_cost_mm per via a track takes
+    // (two), and the ring round one part on one layer is a channel of the room outside the courtyard
+    // there. Allowed only where the band meets the pour of one net only (never across a split), that net
+    // not ground (pcb_net_roles), no copper of another net is in the band or at the via rows, and no pad
+    // of that net is cut off the pour by the band (the pieces cut off are reported as islands). The
+    // band: the via rows and the ribbon (via + 2 clearances + the ribbon's width deep); the vias at the
+    // via pitch (via + clearance).
+    using AT = std::array<double, 2>;
+    const bool   innerRing = aArgs.value( "inner_ring", true );
+    const double viaCost = std::max( 0.0, aArgs.value( "via_cost_mm", 2.0 ) );
+    int          ringsLaid = 0;
+    std::vector<PCB_LAYER_ID> powerLayers;
+
+    for( PCB_LAYER_ID l : copper )
+    {
+        if( board->GetLayerType( l ) == LT_POWER )
+            powerLayers.push_back( l );
+    }
+
+    auto copperIn = [&]( PCB_LAYER_ID aLayer, const BOX2I& aBox, const std::set<int>& aOwn ) -> std::string
+    {
+        BOX2I span = aBox;
+        span.Inflate( defaults.clearance );
+        SHAPE_RECT rect( span );
+
+        auto hits = [&]( BOARD_CONNECTED_ITEM* aItem )
+        {
+            return !aOwn.count( aItem->GetNetCode() ) && aItem->IsOnLayer( aLayer ) && aItem->GetBoundingBox().Intersects( span )
+                   && aItem->GetEffectiveShape( aLayer )->Collide( &rect, 0 );
+        };
+
+        for( PCB_TRACK* track : board->Tracks() )
+        {
+            if( hits( track ) )
+                return std::string( track->Type() == PCB_VIA_T ? "a via of " : "a track of " ) + str( UnescapeString( track->GetNetname() ) );
+        }
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            if( !fp->GetBoundingBox().Intersects( span ) )
+                continue;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( hits( pad ) )
+                    return "pad " + str( fp->GetReference() ) + "." + str( pad->GetNumber() );
+            }
+        }
+
+        for( const auto& [name, box, on] : trackBars )
+        {
+            if( on.Contains( aLayer ) && box.Intersects( span ) )
+                return "keep-out " + name;
+        }
+
+        return std::string();
+    };
+
+    struct RING_VARIANT
+    {
+        std::vector<int>   sides;     ///< from the down side round to the up side
+        std::vector<BOX2I> band;      ///< strips and corner squares in order
+        std::vector<AT>    corners;
+        PCB_LAYER_ID       layer = UNDEFINED_LAYER;
+        int                net = 0;
+        int                cut = -1;
+        nlohmann::json     islands = nlohmann::json::array();
+        std::string        why;       ///< empty: allowed
+    };
+
+    struct RING_OPTION
+    {
+        FOOTPRINT*                part = nullptr;
+        BOX2I                     court;
+        int                       down = -1, n = 0, via = 0, viaPitch = 0, depth = 0;
+        AT                        mid{}, atDown{};
+        BOX2I                     rowDown;
+        std::string               why;   ///< empty: some variant may be allowed
+        std::vector<RING_VARIANT> variants;
+    };
+
+    std::vector<RING_OPTION>                      ringOptions;
+    std::map<std::pair<FOOTPRINT*, int>, int>     ringCutOf;   ///< (part, layer) -> its ring channel
+
+    auto boxPoly = []( const BOX2I& aB )
+    {
+        SHAPE_POLY_SET one;
+        one.NewOutline();
+        one.Append( aB.GetLeft(), aB.GetTop() );
+        one.Append( aB.GetRight(), aB.GetTop() );
+        one.Append( aB.GetRight(), aB.GetBottom() );
+        one.Append( aB.GetLeft(), aB.GetBottom() );
+        return one;
+    };
+
+    auto netOf = [&]( int aCode )
+    {
+        NETINFO_ITEM* net = board->FindNet( aCode );
+        return net ? str( UnescapeString( net->GetNetname() ) ) : std::string();
+    };
+
+    // the via row of n at a side: centred at a point along it as near as it fits, a via's half and a clearance outside
+    // the courtyard; false where it does not fit along the side
+    auto rowAt = []( const BOX2I& aC, int aSide, int aN, int aVia, int aPitch, int aClear, int aToward, BOX2I& aRow )
+    {
+        const bool alongY = aSide < 2;
+        const int  lo = alongY ? aC.GetTop() : aC.GetLeft(), hi = alongY ? aC.GetBottom() : aC.GetRight();
+        const int  len = aN * aPitch;
+
+        if( len > hi - lo )
+            return false;
+
+        const int from = std::clamp( aToward - len / 2, lo, hi - len );
+        const int off = aClear + aVia / 2;
+        const int line = aSide == 0 ? aC.GetLeft() - off : aSide == 1 ? aC.GetRight() + off
+                         : aSide == 2 ? aC.GetTop() - off : aC.GetBottom() + off;
+        aRow = alongY ? BOX2I( VECTOR2I( line - aVia / 2, from ), VECTOR2I( aVia, len ) )
+                      : BOX2I( VECTOR2I( from, line - aVia / 2 ), VECTOR2I( len, aVia ) );
+        return true;
+    };
+
+    auto ringOption = [&]( const LINK& aLink, bool aAtA ) -> int
+    {
+        const int side = aAtA ? aLink.aSide : aLink.bSide;
+
+        if( !innerRing || aLink.bus.empty() || aLink.bundle.empty() || aLink.nets.size() < 2 || side < 0
+            || ( aAtA ? aLink.aPort : aLink.bPort ) < 0 )
+        {
+            return -1;
+        }
+
+        RING_OPTION o;
+        VECTOR2D    mid( 0, 0 );
+        std::vector<VECTOR2I> pins;
+
+        for( const auto& [atA, atB] : aLink.pins )
+        {
+            pins.push_back( aAtA ? atA : atB );
+            mid += VECTOR2D( pins.back() ) / (double) aLink.pins.size();
+        }
+
+        for( const std::string& ref : blocks[aAtA ? aLink.a : aLink.b].parts )
+        {
+            auto it = fpOfRef.find( ref );
+
+            if( it == fpOfRef.end() )
+                continue;
+
+            size_t hits = 0;
+
+            for( const VECTOR2I& at : pins )
+            {
+                for( PAD* pad : it->second->Pads() )
+                {
+                    if( pad->GetPosition() == at )
+                    {
+                        hits++;
+                        break;
+                    }
+                }
+            }
+
+            if( hits == pins.size() )
+            {
+                o.part = it->second;
+                break;
+            }
+        }
+
+        if( !o.part )
+            return -1;
+
+        const BOX2I c = courtyardBox( o.part );
+        o.court = c;
+        o.down = side;
+        o.n = (int) aLink.nets.size();
+        o.via = std::max( defaults.via, 1 );
+        o.viaPitch = o.via + defaults.clearance;
+        o.depth = o.via + 2 * defaults.clearance + iu( aLink.demand );
+        o.mid = { toMm( mid.x ), toMm( mid.y ) };
+        const std::set<int> own( aLink.nets.begin(), aLink.nets.end() );
+
+        auto refuseAll = [&]( const std::string& aWhy )
+        {
+            o.why = aWhy;
+            ringOptions.push_back( std::move( o ) );
+            return (int) ringOptions.size() - 1;
+        };
+
+        if( powerLayers.empty() )
+            return refuseAll( "no layer the stack-up types power" );
+
+        if( !rowAt( c, side, o.n, o.via, o.viaPitch, defaults.clearance, side < 2 ? KiROUND( mid.y ) : KiROUND( mid.x ), o.rowDown ) )
+            return refuseAll( "a row of " + std::to_string( o.n ) + " vias at the via pitch does not fit along the pins' side" );
+
+        o.atDown = { toMm( o.rowDown.Centre().x ), toMm( o.rowDown.Centre().y ) };
+
+        for( PCB_LAYER_ID l : copper )
+        {
+            if( const std::string hit = copperIn( l, o.rowDown, own ); !hit.empty() )
+                return refuseAll( "the via row at the pins' side meets " + hit + " on " + str( board->GetLayerName( l ) ) );
+        }
+
+        auto strip = [&]( int aSide )
+        {
+            const int d = o.depth;
+
+            switch( aSide )
+            {
+            case 0: return BOX2I( VECTOR2I( c.GetLeft() - d, c.GetTop() ), VECTOR2I( d, c.GetHeight() ) );
+            case 1: return BOX2I( VECTOR2I( c.GetRight(), c.GetTop() ), VECTOR2I( d, c.GetHeight() ) );
+            case 2: return BOX2I( VECTOR2I( c.GetLeft(), c.GetTop() - d ), VECTOR2I( c.GetWidth(), d ) );
+            default: return BOX2I( VECTOR2I( c.GetLeft(), c.GetBottom() ), VECTOR2I( c.GetWidth(), d ) );
+            }
+        };
+
+        auto cornerBox = [&]( int aOne, int aOther )
+        {
+            const int x = aOne == 0 || aOther == 0 ? c.GetLeft() - o.depth : c.GetRight();
+            const int y = aOne == 2 || aOther == 2 ? c.GetTop() - o.depth : c.GetBottom();
+            return BOX2I( VECTOR2I( x, y ), VECTOR2I( o.depth, o.depth ) );
+        };
+
+        for( int up = 0; up < 4; ++up )
+        {
+            if( up == side )
+                continue;
+
+            std::vector<std::vector<int>> ways;
+
+            if( ( side < 2 ) != ( up < 2 ) )
+                ways.push_back( { side, up } );
+            else if( side < 2 )
+                ways = { { side, 2, up }, { side, 3, up } };
+            else
+                ways = { { side, 0, up }, { side, 1, up } };
+
+            for( const std::vector<int>& way : ways )
+            {
+                RING_VARIANT v;
+                v.sides = way;
+
+                for( size_t k = 0; k < way.size(); ++k )
+                {
+                    v.band.push_back( strip( way[k] ) );
+
+                    if( k + 1 < way.size() )
+                    {
+                        const BOX2I q = cornerBox( way[k], way[k + 1] );
+                        v.band.push_back( q );
+                        v.corners.push_back( { toMm( q.Centre().x ), toMm( q.Centre().y ) } );
+                    }
+                }
+
+                // the up row may come up anywhere along its side: the whole side clear on every layer
+                BOX2I upRow;
+
+                if( !rowAt( c, up, o.n, o.via, o.viaPitch, defaults.clearance, 0, upRow ) )
+                {
+                    v.why = "a row of " + std::to_string( o.n ) + " vias does not fit along the " + SIDES[up] + " side";
+                    o.variants.push_back( v );
+                    continue;
+                }
+
+                BOX2I line = upRow;
+
+                if( up < 2 )
+                    line = BOX2I( VECTOR2I( upRow.GetLeft(), c.GetTop() ), VECTOR2I( upRow.GetWidth(), c.GetHeight() ) );
+                else
+                    line = BOX2I( VECTOR2I( c.GetLeft(), upRow.GetTop() ), VECTOR2I( c.GetWidth(), upRow.GetHeight() ) );
+
+                for( PCB_LAYER_ID l : copper )
+                {
+                    if( const std::string hit = copperIn( l, line, own ); !hit.empty() )
+                    {
+                        v.why = "the " + std::string( SIDES[up] ) + " side's via row meets " + hit + " on " + str( board->GetLayerName( l ) );
+                        break;
+                    }
+                }
+
+                if( !v.why.empty() )
+                {
+                    o.variants.push_back( v );
+                    continue;
+                }
+
+                SHAPE_POLY_SET bandPoly;
+
+                for( const BOX2I& b : v.band )
+                    bandPoly.BooleanAdd( boxPoly( b ) );
+
+                nlohmann::json whyNot = nlohmann::json::array();
+
+                for( PCB_LAYER_ID layer : powerLayers )
+                {
+                    std::set<int>  nets;
+                    SHAPE_POLY_SET pour;
+
+                    for( ZONE* zone : board->Zones() )
+                    {
+                        if( zone->GetIsRuleArea() || !zone->IsOnLayer( layer ) )
+                            continue;
+
+                        SHAPE_POLY_SET meet = *zone->Outline();
+                        meet.BooleanIntersection( bandPoly );
+
+                        if( meet.Area() <= 0 )
+                            continue;
+
+                        nets.insert( zone->GetNetCode() );
+                        pour.BooleanAdd( *zone->Outline() );
+                    }
+
+                    std::string why;
+
+                    if( nets.empty() )
+                        why = "no pour under the band";
+                    else if( nets.size() > 1 )
+                        why = "the band crosses a split between " + netOf( *nets.begin() ) + " and " + netOf( *nets.rbegin() );
+                    else if( groundNets.count( *nets.begin() ) )
+                        why = netOf( *nets.begin() ) + " is ground (pcb_net_roles)";
+
+                    const int net = nets.empty() ? 0 : *nets.begin();
+
+                    if( why.empty() )
+                    {
+                        for( const BOX2I& b : v.band )
+                        {
+                            if( std::string hit = copperIn( layer, b, own ); !hit.empty() )
+                            {
+                                why = "the band meets " + hit;
+                                break;
+                            }
+                        }
+                    }
+
+                    nlohmann::json islands = nlohmann::json::array();
+
+                    if( why.empty() )
+                    {
+                        SHAPE_POLY_SET pieces = pour;
+                        pieces.BooleanSubtract( bandPoly );
+                        int    main = -1;
+                        double mainArea = -1;
+
+                        for( int k = 0; k < pieces.OutlineCount(); ++k )
+                        {
+                            if( const double a = pieces.COutline( k ).Area(); a > mainArea )
+                            {
+                                mainArea = a;
+                                main = k;
+                            }
+                        }
+
+                        for( int k = 0; k < pieces.OutlineCount() && why.empty(); ++k )
+                        {
+                            if( k == main )
+                                continue;
+
+                            nlohmann::json cut = nlohmann::json::array();
+                            auto inPiece = [&]( const VECTOR2I& aAt ) { return pieces.COutline( k ).PointInside( aAt ); };
+
+                            for( FOOTPRINT* fp : board->Footprints() )
+                            {
+                                for( PAD* pad : fp->Pads() )
+                                {
+                                    if( pad->GetNetCode() == net && pad->IsOnLayer( layer ) && inPiece( pad->GetPosition() ) )
+                                        cut.push_back( str( fp->GetReference() ) + "." + str( pad->GetNumber() ) );
+                                }
+                            }
+
+                            for( PCB_TRACK* track : board->Tracks() )
+                            {
+                                if( track->Type() == PCB_VIA_T && track->GetNetCode() == net && track->IsOnLayer( layer )
+                                    && inPiece( track->GetPosition() ) )
+                                {
+                                    cut.push_back( "via at " + nlohmann::json( { r2( toMm( track->GetPosition().x ) ),
+                                                                                 r2( toMm( track->GetPosition().y ) ) } ).dump() );
+                                }
+                            }
+
+                            if( !cut.empty() )
+                                why = "the band cuts " + cut.dump() + " off the " + netOf( net ) + " pour";
+
+                            islands.push_back( { { "box_mm", boxMm( pieces.COutline( k ).BBox() ) },
+                                                 { "area_mm2", r2( toMm( toMm( pieces.COutline( k ).Area() ) ) ) },
+                                                 { "pads", cut } } );
+                        }
+                    }
+
+                    if( !why.empty() )
+                    {
+                        whyNot.push_back( { { "layer", str( board->GetLayerName( layer ) ) }, { "why", why } } );
+                        continue;
+                    }
+
+                    v.layer = layer;
+                    v.net = net;
+                    v.islands = islands;
+                    break;
+                }
+
+                if( v.layer == UNDEFINED_LAYER )
+                {
+                    v.why = "no power layer allows it: " + whyNot.dump();
+                }
+                else
+                {
+                    // the ring round this part on this layer: a channel as deep as the room outside the
+                    // courtyard to the board's usable edge, less the via rows
+                    auto key = std::make_pair( o.part, (int) v.layer );
+                    auto at = ringCutOf.find( key );
+
+                    if( at == ringCutOf.end() )
+                    {
+                        const BOX2I ub = usable.BBox();
+                        const int   room = std::min( { c.GetLeft() - ub.GetLeft(), ub.GetRight() - c.GetRight(),
+                                                       c.GetTop() - ub.GetTop(), ub.GetBottom() - c.GetBottom() } );
+                        CUT cut;
+                        cut.vertical = true;
+                        cut.at = c.Centre().x;
+                        cut.from = c.GetTop();
+                        cut.to = c.GetBottom();
+                        cut.free.assign( nl, 0 );
+                        cut.ring = v.layer;
+                        cut.total = std::max( 0, room - o.via - 2 * defaults.clearance );
+                        cut.detour = -1;
+                        cut.low = cut.high = "ring round " + str( o.part->GetReference() ) + " on "
+                                             + str( board->GetLayerName( v.layer ) );
+                        at = ringCutOf.emplace( key, (int) cuts.size() ).first;
+                        cuts.push_back( std::move( cut ) );
+                    }
+
+                    v.cut = at->second;
+                }
+
+                o.variants.push_back( v );
+            }
+        }
+
+        ringOptions.push_back( std::move( o ) );
+        return (int) ringOptions.size() - 1;
+    };
+
+    for( LINK& l : links )
+    {
+        l.ringOptA = ringOption( l, true );
+        l.ringOptB = ringOption( l, false );
+    }
+
+    // a ring way's length from the pins' middle down, round, up and on to a point by the up side; the
+    // up row comes up where that point projects on the side (within it)
+    auto ringWay = [&]( const RING_OPTION& aO, const RING_VARIANT& aV, const AT& aTo, double& aUpAlong )
+    {
+        const int up = aV.sides.back();
+        BOX2I     row;
+        const int toward = up < 2 ? iu( aTo[1] ) : iu( aTo[0] );
+        rowAt( aO.court, up, aO.n, aO.via, aO.viaPitch, defaults.clearance, toward, row );
+        const AT atUp{ toMm( row.Centre().x ), toMm( row.Centre().y ) };
+        aUpAlong = up < 2 ? atUp[1] : atUp[0];
+        std::vector<AT> way = { aO.mid, aO.atDown };
+        way.insert( way.end(), aV.corners.begin(), aV.corners.end() );
+        way.push_back( atUp );
+        way.push_back( aTo );
+        double length = 0;
+
+        for( size_t k = 0; k + 1 < way.size(); ++k )
+            length += std::abs( way[k + 1][0] - way[k][0] ) + std::abs( way[k + 1][1] - way[k][1] );
+
+        return length;
+    };
+
     auto capacity = [&]( const CUT& aCut ) { return toMm( double( aCut.total ) ); };
 
     const auto gridDone = clock::now();
@@ -1642,8 +2129,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     // (at the start: nearest the target)
     const size_t          nodes = portals.size() * 2;
     std::vector<double>   cost( nodes ), cutCostAt( cuts.size() ), pointX( nodes ), pointY( nodes );
-    std::vector<int>      prev( nodes );
-    std::vector<unsigned> seenAt( nodes, 0 ), doneAt( nodes, 0 ), targetAt( regions.size(), 0 ),
+    std::vector<int>      prev( nodes ), ringVarAt( nodes, -1 ), ringVarBAt( nodes, -1 );
+    std::vector<unsigned> seenAt( nodes, 0 ), doneAt( nodes, 0 ), targetAt( regions.size(), 0 ), startAt( regions.size(), 0 ),
             preAt( regions.size(), 0 ), cutAt( cuts.size(), 0 ), factorAt( regions.size(), 0 );
     std::vector<double>   regionFactor( regions.size(), 1.0 );
     std::vector<char>     regionFree( regions.size() );
@@ -1772,6 +2259,14 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             return c.kind == CELL_BLOCK && !has( c, aLink.a ) && !has( c, aLink.b );
         };
 
+        // a box passed under its parts by its channels: another block's, or one of its own ends' it has left
+        // (not the target's, not the source's it starts in)
+        auto passedUnder = [&]( int aRegion, bool aFromStart )
+        {
+            return cells[regions[aRegion].cell].kind == CELL_BLOCK && targetAt[aRegion] != epoch
+                   && ( foreign( aRegion ) || !( aFromStart && startAt[aRegion] == epoch ) );
+        };
+
         // 0: no way in; else the cost factor per mm inside
         auto factorOf = [&]( int aRegion )
         {
@@ -1794,11 +2289,67 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         aLink.found = false;
         aLink.aExit = aLink.bExit = aLink.aExitSide = aLink.bExitSide = -1;
 
-        // a node into the target by its side only
+        // the inner ring at an end: the cheapest allowed variant coming up at a side, its cost from the
+        // pins' middle to a point by that side (length, a via down and one up, its channel); where an end
+        // may take one, the surface way's cost runs from the pins' middle too
+        const RING_OPTION* ringA = aOn && aLink.ringOptA >= 0 && ringOptions[aLink.ringOptA].why.empty()
+                                           ? &ringOptions[aLink.ringOptA] : nullptr;
+        const RING_OPTION* ringB = bOn && aLink.ringOptB >= 0 && ringOptions[aLink.ringOptB].why.empty()
+                                           ? &ringOptions[aLink.ringOptB] : nullptr;
+
+        auto ringCost = [&]( const RING_OPTION* aO, int aUp, std::pair<double, double> aAt, int& aVar, double& aUpAlong )
+        {
+            double best = -1;
+            aVar = -1;
+
+            for( size_t k = 0; aO && k < aO->variants.size(); ++k )
+            {
+                const RING_VARIANT& v = aO->variants[k];
+
+                if( !v.why.empty() || v.sides.back() != aUp )
+                    continue;
+
+                double     along = 0;
+                const double c = ringWay( *aO, v, AT{ aAt.first, aAt.second }, along ) + 2 * viaCost + cutCost( v.cut );
+
+                if( best < 0 || c < best )
+                {
+                    best = c;
+                    aVar = (int) k;
+                    aUpAlong = along;
+                }
+            }
+
+            return best;
+        };
+
+        auto fromMid = [&]( const RING_OPTION* aO, std::pair<double, double> aAt )
+        {
+            return aO ? std::abs( aAt.first - aO->mid[0] ) + std::abs( aAt.second - aO->mid[1] ) : 0.0;
+        };
+
+        // a node into the target by its side only, or by a side its inner ring comes up at
+        auto ringUpSide = [&]( const RING_OPTION* aO, int aSide )
+        {
+            for( size_t k = 0; aO && k < aO->variants.size(); ++k )
+            {
+                if( aO->variants[k].why.empty() && aO->variants[k].sides.back() == aSide )
+                    return true;
+            }
+
+            return false;
+        };
+
         auto intoTarget = [&]( int aNode )
         {
-            return targetAt[entered( aNode )] == epoch
-                   && ( !bOn || portalSide( portals[aNode >> 1], aLink.bPort ) == aLink.bSide );
+            if( targetAt[entered( aNode )] != epoch )
+                return false;
+
+            if( !bOn )
+                return true;
+
+            const int side = portalSide( portals[aNode >> 1], aLink.bPort );
+            return side == aLink.bSide || ringUpSide( ringB, side );
         };
 
         auto barred = [&]( int aNode )
@@ -1825,6 +2376,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 }
 
                 starts.push_back( r );
+                startAt[r] = epoch;
             }
         }
 
@@ -1851,16 +2403,31 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         const bool anchorA = !aLink.pins.empty() && aLink.cluster >= 0;
         const bool anchorB = anchorA;
 
-        auto relax = [&]( int aNode, double aCost, int aPrev, std::pair<double, double> aAt )
+
+        auto relax = [&]( int aNode, double aCost, int aPrev, std::pair<double, double> aAt, int aVar = -1 )
         {
-            if( anchorB && intoTarget( aNode ) )
-                aCost += std::abs( aAt.first - pinBX ) + std::abs( aAt.second - pinBY );
+            int    varB = -1;
+            double upB = 0;
+
+            if( intoTarget( aNode ) )
+            {
+                const int side = bOn ? portalSide( portals[aNode >> 1], aLink.bPort ) : -1;
+
+                if( ringB && side != aLink.bSide )
+                    aCost += ringCost( ringB, side, aAt, varB, upB );
+                else if( anchorB )
+                    aCost += std::abs( aAt.first - pinBX ) + std::abs( aAt.second - pinBY );
+                else
+                    aCost += fromMid( ringB, aAt );
+            }
 
             if( seenAt[aNode] != epoch || aCost < cost[aNode] )
             {
                 seenAt[aNode] = epoch;
                 cost[aNode] = aCost;
                 prev[aNode] = aPrev;
+                ringVarAt[aNode] = aVar;
+                ringVarBAt[aNode] = varB;
                 pointX[aNode] = aAt.first;
                 pointY[aNode] = aAt.second;
                 open.emplace( aCost + h( aAt.first, aAt.second ) * ( 1 + 1e-6 ), aNode );   // ties: nearer the target first
@@ -1875,15 +2442,26 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             {
                 const int node = 2 * p + ( portals[p].r0 == r ? 1 : 0 );
 
-                if( aOn && portalSide( portals[p], aLink.aPort ) != aLink.aSide )
-                    continue;
-
                 if( barred( node ) )
                     continue;
 
+                if( aOn && portalSide( portals[p], aLink.aPort ) != aLink.aSide )
+                {
+                    const auto at = nearest( portals[p], cx, cy );
+                    int        var = -1;
+                    double     up = 0;
+                    const double c = ringCost( ringA, portalSide( portals[p], aLink.aPort ), at, var, up );
+
+                    if( var >= 0 )
+                        relax( node, cutCost( portals[p].cut ) + c, -1, at, var );
+
+                    continue;
+                }
+
                 if( !anchorA )
                 {
-                    relax( node, cutCost( portals[p].cut ), -1, nearest( portals[p], cx, cy ) );
+                    const auto at = nearest( portals[p], cx, cy );
+                    relax( node, cutCost( portals[p].cut ) + fromMid( ringA, at ), -1, at );
                     continue;
                 }
 
@@ -1929,7 +2507,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 const auto at = nearest( to, x, y );
                 double     under = 0;
 
-                if( foreign( r ) )
+                if( passedUnder( r, prev[node] < 0 ) )
                 {
                     const int dir = std::abs( at.first - x ) >= std::abs( at.second - y ) ? 0 : 1;
                     bool      room = true;
@@ -1979,6 +2557,11 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         aLink.bExit = boxOf( toBoxes, entered( path.back() ) );
         aLink.aExitSide = aLink.aExit >= 0 ? portalSide( first, aLink.aExit ) : -1;
         aLink.bExitSide = aLink.bExit >= 0 ? portalSide( last, aLink.bExit ) : -1;
+        aLink.ringVarA = ringA ? ringVarAt[path.front()] : -1;
+        aLink.ringVarB = ringB ? ringVarBAt[path.back()] : -1;
+
+        if( aLink.ringVarA >= 0 )
+            aLink.cuts.push_back( ringOptions[aLink.ringOptA].variants[aLink.ringVarA].cut );
 
         for( size_t k = 0; k < path.size(); ++k )
         {
@@ -1993,9 +2576,11 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 const CELL&  c = cells[regions[r].cell];
                 aLink.length += std::abs( x1 - x0 ) + std::abs( y1 - y0 );
 
-                if( c.kind == CELL_BLOCK && !has( c, aLink.a ) && !has( c, aLink.b ) )
+                if( passedUnder( r, k == 1 ) )
                 {
-                    aLink.crosses.insert( c.blocks[0] );
+                    if( foreign( r ) )
+                        aLink.crosses.insert( c.blocks[0] );
+
                     const int dir = std::abs( x1 - x0 ) >= std::abs( y1 - y0 ) ? 0 : 1;
 
                     for( int b : c.boxes )
@@ -2047,6 +2632,9 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             if( to.cut >= 0 )
                 aLink.cuts.push_back( to.cut );
         }
+
+        if( aLink.ringVarB >= 0 )
+            aLink.cuts.push_back( ringOptions[aLink.ringOptB].variants[aLink.ringVarB].cut );
     };
 
     auto apply = [&]( const LINK& aLink, double aSign )
@@ -2080,6 +2668,15 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
         return count;
     };
+
+    // the most a way's inner rings add to it beyond its length: two vias at each end
+    double ringExtra = 0;
+
+    for( const LINK& l : links )
+    {
+        if( ( l.ringOptA >= 0 && ringOptions[l.ringOptA].why.empty() ) || ( l.ringOptB >= 0 && ringOptions[l.ringOptB].why.empty() ) )
+            ringExtra = 4 * viaCost;
+    }
 
     std::vector<LINK> best;
     int               bestCount = std::numeric_limits<int>::max();
@@ -2160,7 +2757,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 cheapest = std::min( cheapest, over / defaultPitch * ( c.detour >= 0 ? c.detour : longestWay ) );
         }
 
-        if( present * cheapest >= longestWay )
+        if( present * cheapest >= longestWay + ringExtra )
         {
             stopped = "no way round the channels over";
             break;
@@ -2287,9 +2884,16 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     {
         const CUT&     c = cuts[aCut];
         nlohmann::json perLayer = nlohmann::json::object();
+        std::vector<std::pair<std::string, long long>> free;
 
-        for( int k = 0; k < nl; ++k )
-            perLayer[str( board->GetLayerName( routing[k] ) )] = r2( toMm( c.free[k] ) );
+        if( c.ring != UNDEFINED_LAYER )
+            free.emplace_back( str( board->GetLayerName( c.ring ) ), c.total );
+
+        for( int k = 0; k < nl && c.ring == UNDEFINED_LAYER; ++k )
+            free.emplace_back( str( board->GetLayerName( routing[k] ) ), c.free[k] );
+
+        for( const auto& [name, len] : free )
+            perLayer[name] = r2( toMm( double( len ) ) );
 
         nlohmann::json tracks = nlohmann::json::object();
 
@@ -2300,10 +2904,10 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             int             sum = 0;
             nlohmann::json  layers = nlohmann::json::object();
 
-            for( int k = 0; k < nl; ++k )
+            for( const auto& [layer, len] : free )
             {
-                const int t = c.free[k] / pitch;
-                layers[str( board->GetLayerName( routing[k] ) )] = t;
+                const int t = int( len / pitch );
+                layers[layer] = t;
                 sum += t;
             }
 
@@ -2331,6 +2935,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                                { "length_mm", r2( toMm( c.to - c.from ) ) },
                                { "between", { c.low, c.high } },
                                { "through", c.through },
+                               { "ring", c.ring != UNDEFINED_LAYER },
                                { "detour_mm", c.detour >= 0 ? nlohmann::json( r2( c.detour ) ) : nlohmann::json() },
                                { "free_mm", perLayer },
                                { "capacity_mm", r2( cap ) },
@@ -2342,454 +2947,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                                { "links", linkList } };
     };
 
-
-    // inner ring: where a bus's corridor goes round its end part (it leaves by the side the pins face and
-    // the way on lies beyond another side), the bus may dive by a row of vias at the pins' side to a layer
-    // the stack-up types power, go round the part there in a band just outside its courtyard, and come
-    // up by a second row at the side facing the way on. Allowed only where the band meets the pour of one
-    // net only (never across a split), that net not ground (pcb_net_roles), no copper of another net is in the band or at the
-    // via rows, and no pad of that net is cut off from the pour by the band (the pieces it cuts off are
-    // reported as islands). The band: the via rows and the ribbon (via + 2 clearances + the ribbon's
-    // width deep); the vias at the via pitch (via + clearance).
-    using AT = std::array<double, 2>;
-    const bool innerRing = aArgs.value( "inner_ring", true );
-    int        ringsLaid = 0;
-    std::vector<PCB_LAYER_ID> powerLayers;
-
-    for( PCB_LAYER_ID l : copper )
-    {
-        if( board->GetLayerType( l ) == LT_POWER )
-            powerLayers.push_back( l );
-    }
-
-    auto copperIn = [&]( PCB_LAYER_ID aLayer, const BOX2I& aBox, const std::set<int>& aOwn ) -> std::string
-    {
-        BOX2I span = aBox;
-        span.Inflate( defaults.clearance );
-        SHAPE_RECT rect( span );
-
-        auto hits = [&]( BOARD_CONNECTED_ITEM* aItem )
-        {
-            return !aOwn.count( aItem->GetNetCode() ) && aItem->IsOnLayer( aLayer ) && aItem->GetBoundingBox().Intersects( span )
-                   && aItem->GetEffectiveShape( aLayer )->Collide( &rect, 0 );
-        };
-
-        for( PCB_TRACK* track : board->Tracks() )
-        {
-            if( hits( track ) )
-                return std::string( track->Type() == PCB_VIA_T ? "a via of " : "a track of " ) + str( UnescapeString( track->GetNetname() ) );
-        }
-
-        for( FOOTPRINT* fp : board->Footprints() )
-        {
-            if( !fp->GetBoundingBox().Intersects( span ) )
-                continue;
-
-            for( PAD* pad : fp->Pads() )
-            {
-                if( hits( pad ) )
-                    return "pad " + str( fp->GetReference() ) + "." + str( pad->GetNumber() );
-            }
-        }
-
-        for( const FP_KEEPOUT& k : keepouts )
-        {
-            for( int b = 0; b < nl; ++b )
-            {
-                if( routing[b] == aLayer && ( k.layers & ( uint64_t( 1 ) << b ) ) && k.box.Intersects( span ) )
-                    return "keep-out " + k.name;
-            }
-        }
-
-        return std::string();
-    };
-
-    auto ringAt = [&]( const LINK& aLink, nlohmann::json& aGates, bool aAtA, nlohmann::json& aRefused ) -> nlohmann::json
-    {
-        const size_t n = aLink.nets.size();
-        std::vector<VECTOR2I> pins;
-        VECTOR2D              mid( 0, 0 );
-
-        for( const auto& [atA, atB] : aLink.pins )
-        {
-            pins.push_back( aAtA ? atA : atB );
-            mid += VECTOR2D( pins.back() ) / (double) aLink.pins.size();
-        }
-
-        if( pins.empty() || aGates.empty() )
-            return nlohmann::json();
-
-        FOOTPRINT* part = nullptr;
-
-        for( const std::string& ref : blocks[aAtA ? aLink.a : aLink.b].parts )
-        {
-            auto it = fpOfRef.find( ref );
-
-            if( it == fpOfRef.end() )
-                continue;
-
-            size_t hits = 0;
-
-            for( const VECTOR2I& at : pins )
-            {
-                for( PAD* pad : it->second->Pads() )
-                {
-                    if( pad->GetPosition() == at )
-                    {
-                        hits++;
-                        break;
-                    }
-                }
-            }
-
-            if( hits == pins.size() )
-            {
-                part = it->second;
-                break;
-            }
-        }
-
-        if( !part )
-            return nlohmann::json();
-
-        const BOX2I c = courtyardBox( part );
-        const int   via = std::max( defaults.via, 1 ), clear = defaults.clearance;
-        const int   viaPitch = via + clear;
-        const int   depth = via + 2 * clear + iu( aLink.demand );
-        const AT    centre{ toMm( c.Centre().x ), toMm( c.Centre().y ) };
-
-        // the side of the courtyard nearest a point (outside it: the one it lies farthest beyond)
-        auto sideOf = [&]( double aX, double aY, bool aOutside )
-        {
-            const std::array<double, 4> beyond = { toMm( c.GetLeft() ) - aX, aX - toMm( c.GetRight() ),
-                                                   toMm( c.GetTop() ) - aY, aY - toMm( c.GetBottom() ) };
-            int best = 0;
-
-            for( int k = 1; k < 4; ++k )
-            {
-                if( aOutside ? beyond[k] > beyond[best] : -beyond[k] < -beyond[best] )
-                    best = k;
-            }
-
-            return best;
-        };
-
-        const int down = sideOf( toMm( mid.x ), toMm( mid.y ), true );
-        BOX2I     around = c;
-        around.Inflate( depth );
-        const size_t count = aGates.size();
-
-        auto gateAt = [&]( size_t aK ) -> nlohmann::json& { return aGates[aAtA ? aK : count - 1 - aK]; };
-        auto atOf = [&]( size_t aK ) { return AT{ gateAt( aK )["at_mm"][0].get<double>(), gateAt( aK )["at_mm"][1].get<double>() }; };
-
-        size_t m = 0;
-
-        while( m < count && around.Contains( VECTOR2I( iu( atOf( m )[0] ), iu( atOf( m )[1] ) ) ) )
-            ++m;
-
-        if( m == count )
-            return nlohmann::json();
-
-        const AT  on = atOf( m );
-        const int up = sideOf( on[0], on[1], true );
-
-        if( up == down )
-            return nlohmann::json();
-
-        const std::string ref = str( part->GetReference() );
-
-        auto refuse = [&]( const std::string& aWhy )
-        {
-            aRefused.push_back( { { "end", aAtA ? "a" : "b" }, { "part", ref }, { "why", aWhy } } );
-            return nlohmann::json();
-        };
-
-        // the sides passed: one corner to a side next to it, two round to the opposite one (by the side
-        // the way on lies towards)
-        std::vector<int> sides = { down };
-
-        if( ( down < 2 ) == ( up < 2 ) )
-        {
-            const bool horizontal = down < 2;
-            sides.push_back( horizontal ? ( on[1] < centre[1] ? 2 : 3 ) : ( on[0] < centre[0] ? 0 : 1 ) );
-        }
-
-        sides.push_back( up );
-
-        auto strip = [&]( int aSide )
-        {
-            switch( aSide )
-            {
-            case 0: return BOX2I( VECTOR2I( c.GetLeft() - depth, c.GetTop() ), VECTOR2I( depth, c.GetHeight() ) );
-            case 1: return BOX2I( VECTOR2I( c.GetRight(), c.GetTop() ), VECTOR2I( depth, c.GetHeight() ) );
-            case 2: return BOX2I( VECTOR2I( c.GetLeft(), c.GetTop() - depth ), VECTOR2I( c.GetWidth(), depth ) );
-            default: return BOX2I( VECTOR2I( c.GetLeft(), c.GetBottom() ), VECTOR2I( c.GetWidth(), depth ) );
-            }
-        };
-
-        auto cornerBox = [&]( int aOne, int aOther )
-        {
-            const int x = aOne == 0 || aOther == 0 ? c.GetLeft() - depth : c.GetRight();
-            const int y = aOne == 2 || aOther == 2 ? c.GetTop() - depth : c.GetBottom();
-            return BOX2I( VECTOR2I( x, y ), VECTOR2I( depth, depth ) );
-        };
-
-        std::vector<BOX2I> band;
-        std::vector<AT>    corners;
-
-        for( size_t k = 0; k < sides.size(); ++k )
-        {
-            band.push_back( strip( sides[k] ) );
-
-            if( k + 1 < sides.size() )
-            {
-                const BOX2I q = cornerBox( sides[k], sides[k + 1] );
-                band.push_back( q );
-                corners.push_back( { toMm( q.Centre().x ), toMm( q.Centre().y ) } );
-            }
-        }
-
-        // the via rows: n vias at the via pitch along the side, by the pins at the down side and towards
-        // the way on at the up side, a via's half and a clearance outside the courtyard
-        auto row = [&]( int aSide, double aToward, BOX2I& aRow, AT& aAt ) -> bool
-        {
-            const bool alongY = aSide < 2;
-            const int  lo = alongY ? c.GetTop() : c.GetLeft(), hi = alongY ? c.GetBottom() : c.GetRight();
-            const int  len = int( n ) * viaPitch;
-
-            if( len > hi - lo )
-                return false;
-
-            const int from = std::clamp( iu( aToward ) - len / 2, lo, hi - len );
-            const int off = clear + via / 2;
-            const int line = aSide == 0 ? c.GetLeft() - off : aSide == 1 ? c.GetRight() + off
-                             : aSide == 2 ? c.GetTop() - off : c.GetBottom() + off;
-            aRow = alongY ? BOX2I( VECTOR2I( line - via / 2, from ), VECTOR2I( via, len ) )
-                          : BOX2I( VECTOR2I( from, line - via / 2 ), VECTOR2I( len, via ) );
-            aAt = { toMm( aRow.Centre().x ), toMm( aRow.Centre().y ) };
-            return true;
-        };
-
-        BOX2I rowDown, rowUp;
-        AT    atDown{}, atUp{};
-
-        if( !row( down, down < 2 ? toMm( mid.y ) : toMm( mid.x ), rowDown, atDown )
-            || !row( up, up < 2 ? on[1] : on[0], rowUp, atUp ) )
-        {
-            return refuse( "a row of " + std::to_string( n ) + " vias at the via pitch does not fit along the courtyard's side" );
-        }
-
-        const std::set<int> own( aLink.nets.begin(), aLink.nets.end() );
-
-        for( const BOX2I& r : { rowDown, rowUp } )
-        {
-            for( PCB_LAYER_ID l : copper )
-            {
-                if( const std::string hit = copperIn( l, r, own ); !hit.empty() )
-                    return refuse( "the via row at " + boxMm( r ).dump() + " meets " + hit + " on " + str( board->GetLayerName( l ) ) );
-            }
-        }
-
-        SHAPE_POLY_SET bandPoly;
-
-        for( const BOX2I& b : band )
-        {
-            SHAPE_POLY_SET one;
-            one.NewOutline();
-            one.Append( b.GetLeft(), b.GetTop() );
-            one.Append( b.GetRight(), b.GetTop() );
-            one.Append( b.GetRight(), b.GetBottom() );
-            one.Append( b.GetLeft(), b.GetBottom() );
-            bandPoly.BooleanAdd( one );
-        }
-
-        if( powerLayers.empty() )
-            return refuse( "no layer the stack-up types power" );
-
-        nlohmann::json whyNot = nlohmann::json::array();
-
-        for( PCB_LAYER_ID layer : powerLayers )
-        {
-            const std::string layerName = str( board->GetLayerName( layer ) );
-            std::set<int>     nets;
-            SHAPE_POLY_SET    pour;
-
-            for( ZONE* zone : board->Zones() )
-            {
-                if( zone->GetIsRuleArea() || !zone->IsOnLayer( layer ) )
-                    continue;
-
-                SHAPE_POLY_SET meet = *zone->Outline();
-                meet.BooleanIntersection( bandPoly );
-
-                if( meet.Area() <= 0 )
-                    continue;
-
-                nets.insert( zone->GetNetCode() );
-                pour.BooleanAdd( *zone->Outline() );
-            }
-
-            auto netOf = [&]( int aCode ) { return str( UnescapeString( board->FindNet( aCode )->GetNetname() ) ); };
-            std::string why;
-
-            if( nets.empty() )
-                why = "no pour under the band";
-            else if( nets.size() > 1 )
-                why = "the band crosses a split between " + netOf( *nets.begin() ) + " and " + netOf( *nets.rbegin() );
-            else if( groundNets.count( *nets.begin() ) )
-                why = netOf( *nets.begin() ) + " is ground (pcb_net_roles)";
-
-            const int net = nets.empty() ? 0 : *nets.begin();
-
-            if( why.empty() )
-            {
-                for( const BOX2I& b : band )
-                {
-                    if( std::string hit = copperIn( layer, b, own ); !hit.empty() )
-                    {
-                        why = "the band meets " + hit;
-                        break;
-                    }
-                }
-            }
-
-            nlohmann::json islands = nlohmann::json::array();
-
-            if( why.empty() )
-            {
-                SHAPE_POLY_SET pieces = pour;
-                pieces.BooleanSubtract( bandPoly );
-                int    main = -1;
-                double mainArea = -1;
-
-                for( int k = 0; k < pieces.OutlineCount(); ++k )
-                {
-                    if( const double a = pieces.COutline( k ).Area(); a > mainArea )
-                    {
-                        mainArea = a;
-                        main = k;
-                    }
-                }
-
-                for( int k = 0; k < pieces.OutlineCount() && why.empty(); ++k )
-                {
-                    if( k == main )
-                        continue;
-
-                    nlohmann::json cut = nlohmann::json::array();
-
-                    auto inPiece = [&]( const VECTOR2I& aAt ) { return pieces.COutline( k ).PointInside( aAt ); };
-
-                    for( FOOTPRINT* fp : board->Footprints() )
-                    {
-                        for( PAD* pad : fp->Pads() )
-                        {
-                            if( pad->GetNetCode() == net && pad->IsOnLayer( layer ) && inPiece( pad->GetPosition() ) )
-                                cut.push_back( str( fp->GetReference() ) + "." + str( pad->GetNumber() ) );
-                        }
-                    }
-
-                    for( PCB_TRACK* track : board->Tracks() )
-                    {
-                        if( track->Type() == PCB_VIA_T && track->GetNetCode() == net && track->IsOnLayer( layer )
-                            && inPiece( track->GetPosition() ) )
-                        {
-                            cut.push_back( "via at " + nlohmann::json( { r2( toMm( track->GetPosition().x ) ), r2( toMm( track->GetPosition().y ) ) } ).dump() );
-                        }
-                    }
-
-                    if( !cut.empty() )
-                        why = "the band cuts " + cut.dump() + " off the " + netOf( net ) + " pour";
-
-                    islands.push_back( { { "box_mm", boxMm( pieces.COutline( k ).BBox() ) },
-                                         { "area_mm2", r2( toMm( toMm( pieces.COutline( k ).Area() ) ) ) },
-                                         { "pads", cut } } );
-                }
-            }
-
-            if( !why.empty() )
-            {
-                whyNot.push_back( { { "layer", layerName }, { "why", why } } );
-                continue;
-            }
-
-            // the corridor at this end: down by the via row, round by the corners on the layer, up by the
-            // second row, then on from the first gate past the band
-            const std::string padLayer = str( board->GetLayerName( part->GetLayer() ) );
-            auto room = [&]( const BOX2I& aB ) { return boxMm( aB ); };
-            nlohmann::json head = nlohmann::json::array();
-            head.push_back( { { "at_mm", { r2( atDown[0] ), r2( atDown[1] ) } },
-                              { "via", { { "from_layer", padLayer }, { "to_layer", layerName } } },
-                              { "layer", layerName }, { "rooms_mm", { room( band.front() ) } }, { "into_mm", room( band.front() ) } } );
-
-            for( size_t k = 0; k < corners.size(); ++k )
-            {
-                head.push_back( { { "at_mm", { r2( corners[k][0] ), r2( corners[k][1] ) } }, { "layer", layerName },
-                                  { "rooms_mm", { room( band[2 * k + 2] ) } }, { "into_mm", room( band[2 * k + 2] ) } } );
-            }
-
-            head.push_back( { { "at_mm", { r2( atUp[0] ), r2( atUp[1] ) } },
-                              { "via", { { "from_layer", layerName }, { "to_layer", padLayer } } },
-                              { "layer", padLayer } } );
-
-            double surface = std::hypot( atOf( 0 )[0] - toMm( mid.x ), atOf( 0 )[1] - toMm( mid.y ) );
-
-            for( size_t k = 0; k < m; ++k )
-                surface += std::hypot( atOf( k + 1 )[0] - atOf( k )[0], atOf( k + 1 )[1] - atOf( k )[1] );
-
-            std::vector<AT> way = { { toMm( mid.x ), toMm( mid.y ) }, atDown };
-            way.insert( way.end(), corners.begin(), corners.end() );
-            way.push_back( atUp );
-            way.push_back( on );
-            double length = 0;
-
-            for( size_t k = 0; k + 1 < way.size(); ++k )
-                length += std::abs( way[k + 1][0] - way[k][0] ) + std::abs( way[k + 1][1] - way[k][1] );
-
-            nlohmann::json rest = nlohmann::json::array();
-
-            for( size_t k = m; k < count; ++k )
-                rest.push_back( gateAt( k ) );
-
-            nlohmann::json list = nlohmann::json::array();
-
-            if( aAtA )
-            {
-                list = head;
-                list.insert( list.end(), rest.begin(), rest.end() );
-            }
-            else
-            {
-                std::reverse( rest.begin(), rest.end() );
-                list = rest;
-
-                for( size_t k = head.size(); k-- > 0; )
-                {
-                    nlohmann::json g = head[k];
-
-                    if( g.contains( "via" ) )
-                        g["via"] = { { "from_layer", g["via"]["to_layer"] }, { "to_layer", g["via"]["from_layer"] } };
-
-                    g["layer"] = g.contains( "via" ) ? g["via"]["to_layer"] : nlohmann::json( layerName );
-                    list.push_back( g );
-                }
-            }
-
-            aGates = list;
-            nlohmann::json bandJson = nlohmann::json::array();
-
-            for( const BOX2I& b : band )
-                bandJson.push_back( boxMm( b ) );
-
-            return { { "end", aAtA ? "a" : "b" }, { "part", ref }, { "layer", layerName }, { "net", netOf( net ) },
-                     { "down", { { "side", SIDES[down] }, { "at_mm", { r2( atDown[0] ), r2( atDown[1] ) } }, { "row_mm", boxMm( rowDown ) } } },
-                     { "up", { { "side", SIDES[up] }, { "at_mm", { r2( atUp[0] ), r2( atUp[1] ) } }, { "row_mm", boxMm( rowUp ) } } },
-                     { "vias", n }, { "via_pitch_mm", r3( toMm( viaPitch ) ) }, { "band_mm", bandJson },
-                     { "length_mm", r2( length ) }, { "surface_mm", r2( surface ) }, { "islands", islands } };
-        }
-
-        return refuse( "no power layer allows it: " + whyNot.dump() );
-    };
 
     std::vector<int> listed;
 
@@ -3129,16 +3286,129 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( !l.bundle.empty() )
             j["bundle"] = l.bundle;
 
-        if( innerRing && !l.bus.empty() && !l.bundle.empty() && l.nets.size() >= 2 && !j["corridor"].empty() )
+        // the inner rings its way takes: their gates head (at b: tail) the corridor; where an end may not
+        // take one and the way overflows, why not
         {
             nlohmann::json rings = nlohmann::json::array(), refused = nlohmann::json::array();
 
             for( bool atA : { true, false } )
             {
-                nlohmann::json r = ringAt( l, j["corridor"], atA, refused );
+                const int opt = atA ? l.ringOptA : l.ringOptB;
+                const int var = atA ? l.ringVarA : l.ringVarB;
 
-                if( !r.is_null() )
-                    rings.push_back( r );
+                if( opt < 0 )
+                    continue;
+
+                const RING_OPTION& o = ringOptions[opt];
+                const std::string  ref = str( o.part->GetReference() );
+
+                if( var < 0 )
+                {
+                    if( !over )
+                        continue;
+
+                    std::string why = o.why;
+
+                    if( why.empty() )
+                    {
+                        nlohmann::json each = nlohmann::json::array();
+
+                        for( const RING_VARIANT& v : o.variants )
+                        {
+                            if( v.why.empty() )
+                                continue;
+
+                            nlohmann::json sides = nlohmann::json::array();
+
+                            for( int t : v.sides )
+                                sides.push_back( SIDES[t] );
+
+                            each.push_back( { { "sides", sides }, { "why", v.why } } );
+                        }
+
+                        why = each.empty() ? "dearer than the way it took" : "no way round allowed: " + each.dump();
+                    }
+
+                    refused.push_back( { { "end", atA ? "a" : "b" }, { "part", ref }, { "why", why } } );
+                    continue;
+                }
+
+                if( j["corridor"].empty() )
+                    continue;
+
+                const RING_VARIANT& v = o.variants[var];
+                const int           up = v.sides.back();
+                const std::string   layerName = str( board->GetLayerName( v.layer ) );
+                const std::string   padLayer = str( board->GetLayerName( o.part->GetLayer() ) );
+                nlohmann::json&     gates = j["corridor"];
+                const size_t        count = gates.size();
+                const nlohmann::json& on = gates[atA ? 0 : count - 1]["at_mm"];
+                double              upAlong = 0;
+                const double        length = ringWay( o, v, AT{ on[0].get<double>(), on[1].get<double>() }, upAlong );
+                BOX2I               rowUp;
+                rowAt( o.court, up, o.n, o.via, o.viaPitch, defaults.clearance, iu( upAlong ), rowUp );
+                const AT            atUp{ toMm( rowUp.Centre().x ), toMm( rowUp.Centre().y ) };
+
+                nlohmann::json head = nlohmann::json::array();
+                head.push_back( { { "at_mm", { r2( o.atDown[0] ), r2( o.atDown[1] ) } },
+                                  { "via", { { "from_layer", padLayer }, { "to_layer", layerName } } },
+                                  { "layer", layerName }, { "rooms_mm", { boxMm( v.band.front() ) } }, { "into_mm", boxMm( v.band.front() ) } } );
+
+                for( size_t c = 0; c < v.corners.size(); ++c )
+                {
+                    head.push_back( { { "at_mm", { r2( v.corners[c][0] ), r2( v.corners[c][1] ) } }, { "layer", layerName },
+                                      { "rooms_mm", { boxMm( v.band[2 * c + 2] ) } }, { "into_mm", boxMm( v.band[2 * c + 2] ) } } );
+                }
+
+                head.push_back( { { "at_mm", { r2( atUp[0] ), r2( atUp[1] ) } },
+                                  { "via", { { "from_layer", layerName }, { "to_layer", padLayer } } },
+                                  { "layer", padLayer } } );
+
+                nlohmann::json list = nlohmann::json::array();
+
+                if( atA )
+                {
+                    list = head;
+
+                    for( size_t g = 0; g < count; ++g )
+                        list.push_back( gates[g] );
+                }
+                else
+                {
+                    for( size_t g = 0; g < count; ++g )
+                        list.push_back( gates[g] );
+
+                    for( size_t g = head.size(); g-- > 0; )
+                    {
+                        nlohmann::json one = head[g];
+
+                        if( one.contains( "via" ) )
+                        {
+                            one["via"] = { { "from_layer", one["via"]["to_layer"] }, { "to_layer", one["via"]["from_layer"] } };
+                            one["layer"] = one["via"]["to_layer"];
+                        }
+
+                        list.push_back( one );
+                    }
+                }
+
+                gates = list;
+                nlohmann::json bandJson = nlohmann::json::array();
+                nlohmann::json sidesJson = nlohmann::json::array();
+
+                for( const BOX2I& b : v.band )
+                    bandJson.push_back( boxMm( b ) );
+
+                for( int t : v.sides )
+                    sidesJson.push_back( SIDES[t] );
+
+                rings.push_back( { { "end", atA ? "a" : "b" }, { "part", ref }, { "layer", layerName }, { "net", netName( v.net ) },
+                                   { "down", { { "side", SIDES[o.down] }, { "at_mm", { r2( o.atDown[0] ), r2( o.atDown[1] ) } }, { "row_mm", boxMm( o.rowDown ) } } },
+                                   { "up", { { "side", SIDES[up] }, { "at_mm", { r2( atUp[0] ), r2( atUp[1] ) } }, { "row_mm", boxMm( rowUp ) } } },
+                                   { "sides", sidesJson }, { "vias", o.n }, { "via_pitch_mm", r3( toMm( o.viaPitch ) ) },
+                                   { "band_mm", bandJson }, { "channel", cutId( v.cut ) }, { "length_mm", r2( length ) },
+                                   { "via_cost_mm", r2( viaCost ) }, { "cost_mm", r2( length + 2 * viaCost ) },
+                                   { "islands", v.islands } } );
             }
 
             if( !rings.empty() )
@@ -3434,7 +3704,8 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
-                        "inner_ring":{"type":"boolean","default":true,"description":"where a bus's corridor goes round its end part, dive by a via row at the pins' side to a layer the stack-up types power, round the part in a band outside its courtyard, up by a row at the side facing the way on (link rings: layer, net, rows, band, islands; rings_refused: why). Only inside one pour of a net not ground (pcb_net_roles), no copper of another net in the band or at the rows, no pad of the net cut off the pour"},
+                        "inner_ring":{"type":"boolean","default":true,"description":"allow inner rings: a bus may leave (enter) its end part by another side than its pins' by a via row at the pins' side down to a layer the stack-up types power, round the part in a band outside its courtyard, up by a row at that side. A candidate way in the negotiation (cost: its length + 2 x via_cost_mm + its channel's overflow), taken where cheaper or where the surface way overflows (link rings: layer, net, rows, band, channel, cost, islands; rings_refused: why, where the way overflows). Only inside one pour of a net not ground (pcb_net_roles), no copper of another net in the band or at the rows, no pad of the net cut off the pour"},
+                        "via_cost_mm":{"type":"number","default":2.0,"description":"mm of track a via costs (inner rings: two per track)"},
                         "corridor_merge":{"type":"boolean","default":true,"description":"a corridor's gates (portals crossed) that a straight run from an earlier gate to a later one passes, inside each portal less the ribbon's half width and a pitch, are dropped; the earlier gate's rooms_mm lists the regions the run goes through (corridor.md); summary gates_merged"},
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
