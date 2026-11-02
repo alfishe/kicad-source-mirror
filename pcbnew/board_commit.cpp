@@ -94,6 +94,13 @@ BOARD_COMMIT::BOARD_COMMIT( TOOL_MANAGER* aMgr ) :
         m_isBoardEditor = true;
     else if( frame && frame->IsType( FRAME_FOOTPRINT_EDITOR ) )
         m_isFootprintEditor = true;
+    else if( !aMgr->GetToolHolder() )
+    {
+        // Headless (API, jobs) on a board: commits as the board editor's, so ratsnest and
+        // teardrops follow an edit as they do there.  GUI-only steps check the frame.
+        if( BOARD* board = dynamic_cast<BOARD*>( aMgr->GetModel() ) )
+            m_isBoardEditor = board->GetBoardUse() == BOARD_USE::NORMAL;
+    }
 }
 
 

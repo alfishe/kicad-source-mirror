@@ -8,7 +8,6 @@
 #include <board.h>
 #include <board_commit.h>
 #include <board_design_settings.h>
-#include <connectivity/connectivity_data.h>
 #include <footprint.h>
 #include <kicadopenapi_keepalive.h>
 #include <kicadopenapi_util.h>
@@ -366,16 +365,6 @@ KOPENAPI_RESULT h_pcb_teardrops( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     board->SetLegacyTeardrops( false );
 
-    auto freshConnectivity = [&]()
-    {
-        std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
-
-        if( conn && !KopenapiConnectivityCurrent( *conn ) )
-            conn->RecalculateRatsnest();
-    };
-
-    freshConnectivity();
-
     const bool   removeAll = action == "remove_all";
     const bool   remove = action == "remove" || removeAll;
     BOARD_COMMIT commit( context->GetToolManager() );
@@ -473,15 +462,23 @@ KOPENAPI_RESULT h_pcb_teardrops( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             manager.AddTeardropsOnTracks( commit, nullptr, true );
     }
 
-    // a headless commit is no board editor's and leaves teardrops alone: rebuilt here in both
-    commit.Push( _( "Edit Teardrops (API)" ), SKIP_TEARDROPS );
-    freshConnectivity();
+    // as the dialog: without filters a full rebuild, else the commit updates what it touched
+    const bool filtered = !nets.empty() || !netclass.IsEmpty() || layer != UNDEFINED_LAYER
+                          || list->m_UseRoundShapesOnly || existingOnly || byItems;
 
-    BOARD_COMMIT     update( context->GetToolManager() );
-    TEARDROP_MANAGER updater( board, context->GetToolManager() );
-    updater.UpdateTeardrops( update, nullptr, nullptr, true );
-    update.Push( _( "Edit Teardrops (API)" ), SKIP_TEARDROPS | APPEND_UNDO );
-    freshConnectivity();
+    if( !filtered )
+    {
+        commit.Push( _( "Edit Teardrops (API)" ), SKIP_TEARDROPS );
+
+        BOARD_COMMIT     update( context->GetToolManager() );
+        TEARDROP_MANAGER updater( board, context->GetToolManager() );
+        updater.UpdateTeardrops( update, nullptr, nullptr, true );
+        update.Push( _( "Edit Teardrops (API)" ), SKIP_TEARDROPS | APPEND_UNDO );
+    }
+    else
+    {
+        commit.Push( _( "Edit Teardrops (API)" ) );
+    }
 
     // teardrops are zones: fill them, and the pours they now stand beside
     bool filled = false;
