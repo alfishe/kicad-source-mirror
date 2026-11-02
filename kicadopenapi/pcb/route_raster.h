@@ -49,38 +49,63 @@ struct PLAN_GRID
         const int   x1 = std::min( nx - 1, (int) std::ceil( (double) ( bb.GetRight() - origin.x ) / cell ) );
         const int   y1 = std::min( ny - 1, (int) std::ceil( (double) ( bb.GetBottom() - origin.y ) / cell ) );
 
-        PIECE      pieces[MAX_PIECES];
-        const int  count = Pieces( aShape, aInflate, pieces );
+        std::vector<PIECE> pieces;
+        const bool         closed = Pieces( aShape, aInflate, pieces );
+
+        if( closed && pieces.size() == 1 )
+        {
+            // one piece: the cells between its may and sure spans are tested, the sure ones taken
+            const PIECE& piece = pieces[0];
+
+            for( int y = y0; y <= y1; ++y )
+            {
+                int mayLo, mayHi, sureLo, sureHi;
+                RowSpan( piece, y, piece.radius + SURE, x0, x1, mayLo, mayHi );
+                RowSpan( piece, y, piece.radius - SURE, x0, x1, sureLo, sureHi );
+
+                for( int x = mayLo; x <= mayHi; ++x )
+                {
+                    const size_t i = aOffset + Index( x, y );
+
+                    if( !aSkip( i ) && ( ( x >= sureLo && x <= sureHi ) || aShape.Collide( Centre( x, y ), aInflate ) ) )
+                        aVisit( i );
+                }
+            }
+
+            return;
+        }
+
+        std::vector<uint8_t> row( (size_t) std::max( x1 - x0 + 1, 0 ) );
 
         for( int y = y0; y <= y1; ++y )
         {
-            // per piece the row's cells it surely covers and those it may cover; the shape's own
-            // test decides only between the two
-            int sureLo[MAX_PIECES], sureHi[MAX_PIECES], mayLo[MAX_PIECES], mayHi[MAX_PIECES];
+            // per cell of the row: 2 the shape surely covers it, 1 it may (its own test decides), 0 not
+            std::fill( row.begin(), row.end(), closed ? 0 : 1 );
 
-            for( int k = 0; k < count; ++k )
+            for( const PIECE& piece : pieces )
             {
-                RowSpan( pieces[k], y, pieces[k].radius - SURE, x0, x1, sureLo[k], sureHi[k] );
-                RowSpan( pieces[k], y, pieces[k].radius + SURE, x0, x1, mayLo[k], mayHi[k] );
+                int lo, hi;
+                RowSpan( piece, y, piece.radius + SURE, x0, x1, lo, hi );
+
+                for( int x = lo; x <= hi; ++x )
+                    row[x - x0] = std::max<uint8_t>( row[x - x0], 1 );
+
+                RowSpan( piece, y, piece.radius - SURE, x0, x1, lo, hi );
+
+                for( int x = lo; x <= hi; ++x )
+                    row[x - x0] = 2;
             }
 
             for( int x = x0; x <= x1; ++x )
             {
-                const size_t i = aOffset + Index( x, y );
+                const uint8_t cover = row[x - x0];
 
-                if( aSkip( i ) )
+                if( cover == 0 )
                     continue;
 
-                bool sure = false;
-                bool may = count < 0;
+                const size_t i = aOffset + Index( x, y );
 
-                for( int k = 0; k < count && !sure; ++k )
-                {
-                    sure = x >= sureLo[k] && x <= sureHi[k];
-                    may = may || ( x >= mayLo[k] && x <= mayHi[k] );
-                }
-
-                if( sure || ( may && aShape.Collide( Centre( x, y ), aInflate ) ) )
+                if( !aSkip( i ) && ( cover == 2 || aShape.Collide( Centre( x, y ), aInflate ) ) )
                     aVisit( i );
             }
         }
@@ -95,20 +120,15 @@ struct PLAN_GRID
         double radius = 0;                       ///< a point nearer than this collides (the shapes square a negative one)
     };
 
-    static constexpr int    MAX_PIECES = 8;
     static constexpr double SURE = 2.0;   ///< far above the rounding of the shapes' integer distances
 
-    /// @return the pieces of the shape, or -1 when a part has no closed form (every cell is tested)
-    int Pieces( const SHAPE& aShape, int aInflate, PIECE* aPieces ) const
+    /// @return false when a part of the shape has no closed form (every cell is tested), else the
+    /// pieces of the shape in aPieces
+    bool Pieces( const SHAPE& aShape, int aInflate, std::vector<PIECE>& aPieces ) const
     {
-        int count = 0;
-
         auto add = [&]( const SHAPE* aPart ) -> bool
         {
-            if( count == MAX_PIECES )
-                return false;
-
-            PIECE& p = aPieces[count];
+            PIECE p;
 
             switch( aPart->Type() )
             {
@@ -149,7 +169,7 @@ struct PLAN_GRID
                 return false;
             }
 
-            ++count;
+            aPieces.push_back( p );
             return true;
         };
 
@@ -158,20 +178,23 @@ struct PLAN_GRID
             for( const SHAPE* part : static_cast<const SHAPE_COMPOUND&>( aShape ).Shapes() )
             {
                 if( !add( part ) )
-                    return -1;
+                {
+                    aPieces.clear();
+                    return false;
+                }
             }
 
-            return count;
+            return true;
         }
 
-        return add( &aShape ) ? count : -1;
+        return add( &aShape );
     }
 
     /// @brief The cells [aLo, aHi] of row aY within aX0..aX1 whose centres are within aRadius of the
     /// piece (a box takes its inside too); aLo > aHi when there are none
     void RowSpan( const PIECE& aPiece, int aY, double aRadius, int aX0, int aX1, int& aLo, int& aHi ) const
     {
-        aLo = aX1 + 1;
+        aLo = aX0;
         aHi = aX0 - 1;
 
         const double py = (double) aY * cell;
