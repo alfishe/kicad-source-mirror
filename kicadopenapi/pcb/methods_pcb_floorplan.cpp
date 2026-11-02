@@ -170,6 +170,7 @@ struct CUT
     double              use = 0;           ///< mm
     double              hist = 0;
     std::vector<int>    links;
+    bool                through = false;   ///< across a box of a block, under its parts
 };
 
 
@@ -276,7 +277,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const int maxIterations = std::clamp( aArgs.value( "iterations", 8 ), 1, 64 );
     const bool negotiate = aArgs.value( "negotiate", true );
     const double overflowCost = std::max( 0.0, aArgs.value( "overflow_cost_mm", 5.0 ) );
-    const double foreignPenalty = std::max( 1.0, aArgs.value( "through_block_factor", 10.0 ) );
     const int listLimit = KopenapiListLimit( aArgs, 40, 1 );
     const bool allChannels = aArgs.value( "all_channels", false );
     const std::string reroute = aArgs.value( "reroute", std::string( "overflowed" ) );
@@ -1378,6 +1378,82 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
+    // a box of another block is passed under its parts where their pads and the keep-outs over it leave
+    // room: two channels through it, across its height (crossed moving in x) and across its width
+    // (moving in y), per layer the stretches clear of them along that span that a track fits in
+    std::vector<std::array<int, 2>> boxCut( boxes.size(), { -1, -1 } );
+
+    for( size_t k = 0; k < boxes.size(); ++k )
+    {
+        const BOX2I&                            bb = boxes[k].box;
+        std::vector<std::pair<BOX2I, uint64_t>> taken;
+
+        for( const std::string& ref : boxes[k].parts )
+        {
+            auto it = fpOfRef.find( ref );
+
+            if( it == fpOfRef.end() )
+                continue;
+
+            for( PAD* pad : it->second->Pads() )
+                taken.emplace_back( pad->GetBoundingBox(), layerBits( pad->GetLayerSet() ) );
+        }
+
+        for( const FP_KEEPOUT& ko : keepouts )
+            taken.emplace_back( ko.box, ko.layers );
+
+        if( boxes[k].parts.empty() )
+            taken.emplace_back( bb, allBits );
+
+        for( int dir = 0; dir < 2; ++dir )
+        {
+            CUT cut;
+            cut.vertical = dir == 0;
+            cut.through = true;
+            cut.at = dir == 0 ? bb.Centre().x : bb.Centre().y;
+            cut.from = dir == 0 ? bb.GetTop() : bb.GetLeft();
+            cut.to = dir == 0 ? bb.GetBottom() : bb.GetRight();
+            cut.free.assign( nl, 0 );
+            cut.low = cut.high = blocks[boxes[k].block].name;
+
+            for( int l = 0; l < nl; ++l )
+            {
+                std::vector<std::pair<int, int>> spans;
+
+                for( const auto& [b, bits] : taken )
+                {
+                    if( !( bits & ( uint64_t( 1 ) << l ) ) || !b.Intersects( bb ) )
+                        continue;
+
+                    spans.emplace_back( std::max( cut.from, dir == 0 ? b.GetTop() : b.GetLeft() ),
+                                        std::min( cut.to, dir == 0 ? b.GetBottom() : b.GetRight() ) );
+                }
+
+                std::sort( spans.begin(), spans.end() );
+                int at = cut.from;
+
+                for( const auto& [lo, hi] : spans )
+                {
+                    if( lo - at >= defaults.width + defaults.clearance )
+                        cut.free[l] += lo - at;
+
+                    at = std::max( at, hi );
+                }
+
+                if( cut.to - at >= defaults.width + defaults.clearance )
+                    cut.free[l] += cut.to - at;
+
+                cut.total += cut.free[l];
+            }
+
+            if( cut.total > 0 )
+            {
+                boxCut[k][dir] = (int) cuts.size();
+                cuts.push_back( std::move( cut ) );
+            }
+        }
+    }
+
     auto capacity = [&]( const CUT& aCut ) { return toMm( double( aCut.total ) ); };
 
     const auto gridDone = clock::now();
@@ -1678,6 +1754,13 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             return linePre[v1] - linePre[v0] + linePre[h1] - linePre[h0];
         };
 
+        // a box of another block, passed under its parts (the box's channels through it)
+        auto foreign = [&]( int aRegion )
+        {
+            const CELL& c = cells[regions[aRegion].cell];
+            return c.kind == CELL_BLOCK && !has( c, aLink.a ) && !has( c, aLink.b );
+        };
+
         // 0: no way in; else the cost factor per mm inside
         auto factorOf = [&]( int aRegion )
         {
@@ -1686,7 +1769,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 const CELL& c = cells[regions[aRegion].cell];
                 factorAt[aRegion] = epoch;
                 regionFactor[aRegion] = c.kind != CELL_BLOCK || has( c, aLink.a ) || has( c, aLink.b ) ? 1.0
-                                        : c.inside                                                  ? foreignPenalty
+                                        : c.inside                                                  ? 1.0
                                                                                                     : 0.0;
             }
 
@@ -1832,9 +1915,26 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 if( doneAt[next] == epoch || barred( next ) )
                     continue;
 
-                const auto   at = nearest( to, x, y );
+                const auto at = nearest( to, x, y );
+                double     under = 0;
+
+                if( foreign( r ) )
+                {
+                    const int dir = std::abs( at.first - x ) >= std::abs( at.second - y ) ? 0 : 1;
+                    bool      room = true;
+
+                    for( int b : cells[regions[r].cell].boxes )
+                    {
+                        room &= boxCut[b][dir] >= 0;
+                        under += room ? cutCost( boxCut[b][dir] ) : 0.0;
+                    }
+
+                    if( !room )
+                        continue;
+                }
+
                 const double step = ( std::abs( at.first - x ) + std::abs( at.second - y ) ) * factor
-                                    + ( inFree ? innerCost( r, x, y, at.first, at.second ) : 0.0 ) + cutCost( to.cut );
+                                    + ( inFree ? innerCost( r, x, y, at.first, at.second ) : 0.0 ) + cutCost( to.cut ) + under;
                 relax( next, cost[node] + step, node, at );
             }
         }
@@ -1883,7 +1983,18 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 aLink.length += std::abs( x1 - x0 ) + std::abs( y1 - y0 );
 
                 if( c.kind == CELL_BLOCK && !has( c, aLink.a ) && !has( c, aLink.b ) )
+                {
                     aLink.crosses.insert( c.blocks[0] );
+                    const int dir = std::abs( x1 - x0 ) >= std::abs( y1 - y0 ) ? 0 : 1;
+
+                    for( int b : c.boxes )
+                    {
+                        const int under = boxCut[b][dir];
+
+                        if( under >= 0 && std::find( aLink.cuts.begin(), aLink.cuts.end(), under ) == aLink.cuts.end() )
+                            aLink.cuts.push_back( under );
+                    }
+                }
 
                 if( c.kind == CELL_FREE )
                 {
@@ -2186,6 +2297,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                                { "line_mm", boxMm( area ) },
                                { "length_mm", r2( toMm( c.to - c.from ) ) },
                                { "between", { c.low, c.high } },
+                               { "through", c.through },
                                { "free_mm", perLayer },
                                { "capacity_mm", r2( cap ) },
                                { "tracks", tracks },
@@ -2674,7 +2786,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     for( const CUT& c : cuts )
     {
-        if( c.to - c.from < pitchIU )
+        if( !c.through && c.to - c.from < pitchIU )
         {
             ++slivers;
             sliversUsed += c.use > 0;
@@ -2792,7 +2904,9 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                    "corridor_dropped why; summary corridors_dropped). A bus is cut where two of its pins next to each other "
                    "lie farther apart, at either end, than the free width outward of the pins' side there (to the next box, an "
                    "all-layer keep-out or the board's edge, in the line of the pin where it is widest; by the bus end's exit where not one track fits out of the pins' side), each part its own link (cluster; summary buses_split), a pin "
-                   "alone with the single nets. A cluster's way starts by its pins' middle. show: channels in "
+                   "alone with the single nets. A cluster's way starts by its pins' middle. A way through another block's box passes "
+                   "under its parts: two channels per box (through true), across its height and its width, per layer the stretches "
+                   "clear of its pads and the keep-outs over it that a track fits in. show: channels in "
                    "the GUI coloured by use. "
                    "Read only",
                    R"json({"type":"object","properties":{
@@ -2820,7 +2934,6 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
                         "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
                         "overflow_cost_mm":{"type":"number","default":5,"description":"detour worth one track over a channel's capacity, first round (doubles each round)"},
-                        "through_block_factor":{"type":"number","default":10,"minimum":1,"description":"cost of a path through another block's box per mm, against free space"},
                         "all_channels":{"type":"boolean","default":false,"description":"list every channel, not only the used ones"},
                         "list_limit":{"type":"integer","default":40,"description":"channels listed, net names and links per entry"},"full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"},
                         "show":{"type":"boolean","default":false,"description":"GUI: overlay group 'floorplan'"}}})json"_json,
