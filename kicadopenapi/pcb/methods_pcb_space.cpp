@@ -2653,80 +2653,98 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                               return rx != ry ? rx < ry : lanes[x].lo < lanes[y].lo;
                           } );
 
-        // a pin a lane runs in front of (a rail pin, a pin going to another layer, a straight one, a pair's):
-        // walled in on its layer, it leaves by a via by its pad; the lane keeps outside that via
-        std::vector<std::tuple<int64_t, int, PCB_LAYER_ID>> viaReach;
-        std::set<const PORT*>                               turning;
-
-        for( const LANE& l : lanes )
+        // the vias the package's fan-out lays by its pads (pcb_fanout, dry run): the rails' and the moved pins' as
+        // the plan has them, and for every other pin not turning, where its via would go were it walled in. The
+        // lanes keep clear of them, past their pads
+        struct SPOT
         {
-            if( l.turn > 0 )
-                turning.insert( l.port );
-        }
+            VECTOR2I at;
+            int      dia = 0;
+            int      net = 0;
+        };
 
-        for( const PORT& p : ports )
+        std::vector<SPOT> spots;
+        nlohmann::json    spotsOut = nlohmann::json::array();
+
+        if( std::optional<KOPENAPI_METHOD> fanout = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout" ) )
         {
-            if( turning.count( &p ) || p.pad->GetAttribute() != PAD_ATTRIB::SMD )
-                continue;
+            std::set<const PORT*> turning;
+            nlohmann::json        stayNets = nlohmann::json::array();
 
-            // by its pad's side, by the side it leaves by when that is another, and for a pin leaving by a via
-            // at the end of its row by the side round that corner (the via may go there)
-            std::set<int> by;
-            const int     own = sideIndex( p.padSide );
-
-            for( int s : { own, sideIndex( p.side ) } )
+            for( const LANE& l : lanes )
             {
-                if( s >= 0 )
-                    by.insert( s );
+                if( l.turn > 0 )
+                    turning.insert( l.port );
             }
 
-            if( own >= 0 && ( p.kind == "rail" || p.via ) )
+            for( const PORT& p : ports )
             {
-                const bool alongY = own % 2 == 0;
-                const int  here = alongY ? p.pad->GetPosition().y : p.pad->GetPosition().x;
-                bool       first = true, last = true;
+                if( !turning.count( &p ) && p.kind != "rail" && !p.via && p.pad->GetAttribute() == PAD_ATTRIB::SMD )
+                    stayNets.push_back( p.net );
+            }
 
-                for( PAD* q : a.fp->Pads() )
+            std::set<std::string> spotted;
+            const nlohmann::json  common = { { "ref", str( a.fp->GetReference() ) }, { "dry_run", true }, { "full", true }, { "zones", "keep" } };
+
+            for( nlohmann::json args : { nlohmann::json( { { "ports", true } } ), nlohmann::json( { { "nets", stayNets } } ) } )
+            {
+                if( args.contains( "nets" ) && stayNets.empty() )
+                    continue;
+
+                args.update( common );
+                const KOPENAPI_RESULT fan = fanout->handler( aCtx, args );
+
+                if( fan.status != 200 || !fan.body.contains( "pins" ) || !fan.body["pins"].is_array() )
+                    continue;
+
+                for( const nlohmann::json& row : fan.body["pins"] )
                 {
-                    if( q == p.pad || padSideOf( extent, q->GetPosition() ) != p.padSide )
+                    const std::string name = row.value( "pad", std::string() );
+
+                    if( !row.contains( "row" ) || !row.contains( "end_mm" ) || !spotted.insert( name ).second )
                         continue;
 
-                    const int there = alongY ? q->GetPosition().y : q->GetPosition().x;
-                    first = first && there > here;
-                    last = last && there < here;
+                    PAD* pad = nullptr;
+
+                    for( PAD* q : a.fp->Pads() )
+                    {
+                        if( str( a.fp->GetReference() ) + "." + str( q->GetNumber() ) == name )
+                            pad = q;
+                    }
+
+                    if( !pad )
+                        continue;
+
+                    NETCLASS* netclass = pad->GetEffectiveNetClass();
+                    SPOT      spot;
+                    spot.at = VECTOR2I( pcbIUScale.mmToIU( row["end_mm"][0].get<double>() ), pcbIUScale.mmToIU( row["end_mm"][1].get<double>() ) );
+                    spot.dia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
+                    spot.net = pad->GetNetCode();
+                    spots.push_back( spot );
+                    spotsOut.push_back( { { "pad", name }, { "at_mm", row["end_mm"] } } );
                 }
-
-                if( first )
-                    by.insert( alongY ? 1 : 0 );
-
-                if( last )
-                    by.insert( alongY ? 3 : 2 );
-            }
-
-            for( int side : by )
-            {
-
-                NETCLASS*      netclass = p.pad->GetEffectiveNetClass();
-                const int      clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
-                const int      via = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
-                const BOX2I    box = p.pad->GetBoundingBox();
-                const VECTOR2I end = box.Centre() + outward[side] * ( side % 2 == 0 ? box.GetWidth() / 2 : box.GetHeight() / 2 );
-                const int      past = (int) ( (int64_t) ( end - onSide( side, 0, end ) ).x * outward[side].x
-                                              + (int64_t) ( end - onSide( side, 0, end ) ).y * outward[side].y );
-                double         padPitch = std::numeric_limits<double>::max();
-
-                for( PAD* q : a.fp->Pads() )
-                {
-                    if( q != p.pad && padSideOf( extent, q->GetPosition() ) == p.padSide )
-                        padPitch = std::min( padPitch, (double) ( q->GetPosition() - p.pad->GetPosition() ).EuclideanNorm() );
-                }
-
-                const double apart = via + clearance;
-                const int    depth = 2 * clearance + via + ( padPitch < apart ? KiROUND( std::sqrt( apart * apart - padPitch * padPitch ) ) : 0 );
-                viaReach.emplace_back( perimeter( side, p.pad->GetPosition() ), past + depth + clearance,
-                                        p.pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu );
             }
         }
+
+        // a lane's runs past its pad keep a via's half, a clearance and their half width from each spot
+        auto clearsSpots = [&]( const LANE& l )
+        {
+            for( const SPOT& spot : spots )
+            {
+                if( spot.net == l.port->code )
+                    continue;
+
+                const int apart = spot.dia / 2 + l.clearance + l.width / 2;
+
+                for( size_t i = 1; i + 1 < l.pts.size(); ++i )
+                {
+                    if( SEG( l.pts[i], l.pts[i + 1] ).Distance( spot.at ) < apart )
+                        return false;
+                }
+            }
+
+            return true;
+        };
 
         const int steps = 16;
 
@@ -2734,16 +2752,6 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         {
             LANE& l = lanes[order[m]];
             int   off = base;
-
-            for( const auto& [at, reach, layer] : viaReach )
-            {
-                for( int64_t k : { -loop, (int64_t) 0, loop } )
-                {
-                    // the polyline is given to the micrometre: rounded outward, half of one to spare
-                    if( layer == l.layer && l.lo <= at + k && at + k <= l.hi )
-                        off = std::max( off, ( reach + l.width / 2 + 500 + 999 ) / 1000 * 1000 );
-                }
-            }
 
             l.nominal = off;   // where it lies with nothing in the way
 
@@ -2757,6 +2765,18 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                     off = std::max( off, inner.off + pitch );
                     l.nominal = std::max( l.nominal, inner.nominal + pitch );
                 }
+            }
+
+            // out past the fan-out's vias: where it lies with nothing else in the way
+            for( int step = 0; step < steps; ++step )
+            {
+                build( l, off );
+
+                if( clearsSpots( l ) )
+                    break;
+
+                off += pitch;
+                l.nominal += pitch;
             }
 
             for( int step = 0;; ++step )
@@ -2985,7 +3005,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
         lanesOut = { { "pitch_mm", mm( pitch ) }, { "base_mm", mm( base ) }, { "count", lanes.size() - crossDropped.size() },
                      { "shifted", shifted }, { "blocked", blocked }, { "off_board", offBoard },
-                     { "crossings", crossings }, { "dropped", dropped }, { "lanes", list } };
+                     { "crossings", crossings }, { "dropped", dropped }, { "via_spots", spotsOut }, { "lanes", list } };
     }
 
     // ports along each side in the order a track leaving it meets them (clockwise)
@@ -3564,8 +3584,9 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "offset_mm past the courtyard, polyline_mm (pad end, out to the offset, the corners, out past the "
                    "last to one front for the lanes leaving there, two pitches past the outermost), shift_mm and moved_by (other parts' pads, other nets' tracks or vias in its way: "
                    "moved out a pitch at a time, the lanes outside it with it), blocked_by (still in the way after "
-                   "16 pitches), outside the vias its package's other connected SMD pins on its layer take by their pads when it runs past them (a "
-                   "rail pin at the end of a row: also round that corner), off_board, crossings with other lanes on its layer; straight ones run out past the "
+                   "16 pitches), clear of the vias the package's fan-out lays by its pads (pcb_fanout dry run: the rails' and moved pins' as "
+                   "planned, every other pin not turning where its via would go; via_spots: pad, at_mm) by a via's half, a clearance and its "
+                   "half width along its runs past its pad, off_board, crossings with other lanes on its layer; straight ones run out past the "
                    "lanes going by their pin. The pins of one side going round the part to one far part all go one way round: the way whose "
                    "modelled paths (out to their offsets, round both corners, straight on to their far pins) cross fewer of each other and of "
                    "the package's straight ways out on their layer, then the shorter in total (round_ways: per side and far part both ways' "
