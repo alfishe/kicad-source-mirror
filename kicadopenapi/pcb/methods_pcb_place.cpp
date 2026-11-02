@@ -2963,7 +2963,9 @@ std::string pinSide( FOOTPRINT* aPart, PAD* aPad )
 /// capacitor) takes a free supply pad (adjacent pads of one rail count as one) whose ground pad is
 /// nearest, the smallest value first.  Rails are told by role (railNets), not by pad count.  Order:
 /// parts on two nets of their own (a crystal), decoupling, the rest.  Parts are staged in aCommit;
-/// aOut gets placed / unplaced (and decoupling_far: capacitors over aDecapMaxMm from their pin).
+/// aOut gets placed / unplaced (and decoupling_far: capacitors over aDecapMaxMm from their pin).  Only
+/// filter parts (a capacitor, inductor, ferrite or resistor) across two rails decouple: a battery or a
+/// diode there is placed like the rest.
 void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::vector<FOOTPRINT*> aParts,
                  const NEAR_OPTIONS& aOptions, bool aOpposite, double aDecapMaxMm, std::optional<bool> aDecapOtherSide,
                  nlohmann::json& aOut, std::vector<KIID>& aMoved, bool aDecapVias = true )
@@ -3032,10 +3034,13 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             continue;
         }
 
-        member.decoupling = member.ownNets == 0;
-        member.capacitor = faradsOf( part ).has_value() || KopenapiRefPrefix( str( part->GetReference() ) ) == "C";
+        const std::string prefix = KopenapiRefPrefix( str( part->GetReference() ) );
+
+        member.capacitor = faradsOf( part ).has_value() || prefix == "C";
         member.farads = faradsOf( part ).value_or( 1.0 );
-        member.inductor = !member.capacitor && ( henryValue( part ) || KopenapiRefPrefix( str( part->GetReference() ) ) == "L" );
+        member.inductor = !member.capacitor && ( henryValue( part ) || prefix == "L" );
+        member.decoupling = member.ownNets == 0
+                            && ( member.capacitor || member.inductor || prefix == "R" || prefix == "FB" );
 
         // a decoupling capacitor belongs at its supply pin, its ground the nearest to that
         if( member.decoupling )
