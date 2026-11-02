@@ -31,6 +31,7 @@
 #include <string_utils.h>
 #include <tool/tool_manager.h>
 #include <zone.h>
+#include <zone_merge.h>
 #include <zone_cutout.h>
 #include <zone_filler.h>
 
@@ -1515,112 +1516,47 @@ static KOPENAPI_RESULT h_pcb_zone_merge( KOPENAPI_CONTEXT& aCtx, const nlohmann:
             return KOPENAPI_RESULT::Error( 409, "zone " + str( zone->m_Uuid.AsString() ) + " is locked (pcb_unlock, or override_locks)" );
     }
 
-    ZONE*              first = named.front();
-    std::vector<ZONE*> toMerge = { first };
-    std::vector<ZONE*> pending;
-    nlohmann::json     skipped = nlohmann::json::array();
+    ZONE_MERGE_PLAN plan = PlanZoneMerge( board, named );
+    ZONE*           first = named.front();
+    nlohmann::json  skipped = nlohmann::json::array();
 
-    auto skip = [&]( ZONE* aZone, const std::string& aWhy )
+    for( const auto& [zone, why] : plan.skipped )
     {
-        skipped.push_back( { { "uuid", str( aZone->m_Uuid.AsString() ) }, { "reason", aWhy } } );
-    };
-
-    for( size_t i = 1; i < named.size(); i++ )
-    {
-        ZONE* zone = named[i];
-
-        if( zone->GetIsRuleArea() != first->GetIsRuleArea() )
-            skip( zone, "a keep-out and a copper zone" );
-        else if( zone->GetNetCode() != first->GetNetCode() )
-            skip( zone, "another net" );
-        else if( zone->GetLayerSet() != first->GetLayerSet() )
-            skip( zone, "other layers" );
-        else
-            pending.push_back( zone );
+        const char* reason = why == ZONE_MERGE_SKIP::OTHER_KIND     ? "a keep-out and a copper zone"
+                             : why == ZONE_MERGE_SKIP::OTHER_NET    ? "another net"
+                             : why == ZONE_MERGE_SKIP::OTHER_LAYERS ? "other layers"
+                                                                    : "does not overlap the others";
+        skipped.push_back( { { "uuid", str( zone->m_Uuid.AsString() ) }, { "reason", reason } } );
     }
 
-    // overlapping any zone already taken, in any order
-    for( bool grew = true; grew && !pending.empty(); )
+    if( !plan.error.IsEmpty() )
     {
-        grew = false;
-
-        for( auto it = pending.begin(); it != pending.end(); )
-        {
-            const bool touches = std::any_of( toMerge.begin(), toMerge.end(),
-                                              [&]( ZONE* aTaken ) { return board->TestZoneIntersection( *it, aTaken ); } );
-
-            if( touches )
-            {
-                toMerge.push_back( *it );
-                it = pending.erase( it );
-                grew = true;
-            }
-            else
-            {
-                ++it;
-            }
-        }
-    }
-
-    for( ZONE* zone : pending )
-        skip( zone, "does not overlap the others" );
-
-    if( toMerge.size() < 2 )
-    {
-        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 409, "nothing to merge with the first zone" );
+        const std::string why = plan.zones.size() < 2 ? "nothing to merge with the first zone"
+                                                      : "the zones overlap too little to merge (they meet in a point or "
+                                                        "inside a hole): the union is not one polygon";
+        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 409, why );
         r.body["skipped"] = skipped;
-        return r;
-    }
-
-    SHAPE_POLY_SET merged = first->Outline()->CloneDropTriangulation();
-    merged.ClearArcs();
-    unsigned priority = first->GetAssignedPriority();
-
-    for( size_t i = 1; i < toMerge.size(); i++ )
-    {
-        SHAPE_POLY_SET other = toMerge[i]->Outline()->CloneDropTriangulation();
-        other.ClearArcs();
-        merged.BooleanAdd( other );
-        priority = std::max( priority, toMerge[i]->GetAssignedPriority() );
-    }
-
-    merged.Simplify();
-
-    if( merged.IsSelfIntersecting() || merged.OutlineCount() > 1 )
-    {
-        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 409, "the zones overlap too little to merge (they meet in a point or "
-                                                         "inside a hole): the union is not one polygon" );
-        r.body["skipped"] = skipped;
+        r.body["reason"] = str( plan.error );
         return r;
     }
 
     nlohmann::json removed = nlohmann::json::array();
 
+    for( size_t i = 1; i < plan.zones.size(); i++ )
+        removed.push_back( str( plan.zones[i]->m_Uuid.AsString() ) );
+
+    const unsigned priority = plan.priority;
+    const double   area = plan.outline.Area();
+
     if( !aArgs.value( "dry_run", false ) )
     {
         BOARD_COMMIT commit( context->GetToolManager() );
-        commit.Modify( first );
-        *first->Outline() = merged;
-        first->SetAssignedPriority( priority );
-        first->SetNeedRefill( true );
-        first->HatchBorder();
-
-        for( size_t i = 1; i < toMerge.size(); i++ )
-        {
-            removed.push_back( str( toMerge[i]->m_Uuid.AsString() ) );
-            commit.Remove( toMerge[i] );
-        }
-
-        commit.Push( _( "Merge Zones (API)" ) );
-    }
-    else
-    {
-        for( size_t i = 1; i < toMerge.size(); i++ )
-            removed.push_back( str( toMerge[i]->m_Uuid.AsString() ) );
+        ApplyZoneMerge( commit, plan );
+        commit.Push( _( "Merge Zones" ) );
     }
 
     nlohmann::json result = { { "uuid", str( first->m_Uuid.AsString() ) }, { "merged", removed }, { "skipped", skipped },
-                              { "priority", priority }, { "area_mm2", mm2( merged.Area() ) },
+                              { "priority", priority }, { "area_mm2", mm2( area ) },
                               { "dry_run", aArgs.value( "dry_run", false ) } };
 
     if( !aArgs.value( "dry_run", false ) && !first->GetIsRuleArea() && first->IsOnCopperLayer() && aArgs.value( "fill", true ) )

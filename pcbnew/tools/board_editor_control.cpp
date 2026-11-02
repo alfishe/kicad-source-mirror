@@ -44,6 +44,7 @@
 #include <pcb_target.h>
 #include <pcb_track.h>
 #include <zone.h>
+#include <zone_merge.h>
 #include <pcb_marker.h>
 #include <confirm.h>
 #include <dialogs/dialog_page_settings.h>
@@ -1699,130 +1700,59 @@ int BOARD_EDITOR_CONTROL::modifyLockSelected( MODIFY_MODE aMode )
 }
 
 
-static bool mergeZones( EDA_DRAW_FRAME* aFrame, BOARD_COMMIT& aCommit,
-                        std::vector<ZONE*>& aOriginZones, std::vector<ZONE*>& aMergedZones )
-{
-    aCommit.Modify( aOriginZones[0] );
-
-    aOriginZones[0]->Outline()->ClearArcs();
-
-    for( unsigned int i = 1; i < aOriginZones.size(); i++ )
-    {
-        SHAPE_POLY_SET otherOutline = aOriginZones[i]->Outline()->CloneDropTriangulation();
-        otherOutline.ClearArcs();
-        aOriginZones[0]->Outline()->BooleanAdd( otherOutline );
-    }
-
-    aOriginZones[0]->Outline()->Simplify();
-
-    // We should have one polygon, possibly with holes.  If we end up with two polygons (either
-    // because the intersection was a single point or because the intersection was within one of
-    // the zone's holes) then we can't merge.
-    if( aOriginZones[0]->Outline()->IsSelfIntersecting() || aOriginZones[0]->Outline()->OutlineCount() > 1 )
-    {
-        DisplayErrorMessage( aFrame, _( "Zones have insufficient overlap for merging." ) );
-        aCommit.Revert();
-        return false;
-    }
-
-    // Adopt the highest priority from all merged zones so the result maintains
-    // the most aggressive fill ordering.
-    unsigned highestPriority = aOriginZones[0]->GetAssignedPriority();
-
-    for( unsigned int i = 1; i < aOriginZones.size(); i++ )
-    {
-        highestPriority = std::max( highestPriority, aOriginZones[i]->GetAssignedPriority() );
-        aCommit.Remove( aOriginZones[i] );
-    }
-
-    aOriginZones[0]->SetAssignedPriority( highestPriority );
-
-    aMergedZones.push_back( aOriginZones[0] );
-
-    aOriginZones[0]->SetLocalFlags( 1 );
-    aOriginZones[0]->HatchBorder();
-    aOriginZones[0]->CacheTriangulation();
-
-    return true;
-}
-
-
 int BOARD_EDITOR_CONTROL::ZoneMerge( const TOOL_EVENT& aEvent )
 {
     const PCB_SELECTION& selection = m_toolMgr->GetTool<PCB_SELECTION_TOOL>()->GetSelection();
-    BOARD*               board = getModel<BOARD>();
-    BOARD_COMMIT         commit( m_frame );
 
     if( selection.Size() < 2 )
         return 0;
 
-    int netcode = -1;
-
-    ZONE* firstZone = nullptr;
-    std::vector<ZONE*> toMerge, merged;
+    std::vector<ZONE*> zones;
 
     for( EDA_ITEM* item : selection )
     {
-        ZONE* curr_area = dynamic_cast<ZONE*>( item );
-
-        if( !curr_area )
-            continue;
-
-        if( !firstZone )
-            firstZone = curr_area;
-
-        netcode = curr_area->GetNetCode();
-
-        if( firstZone->GetNetCode() != netcode )
-        {
-            wxLogMessage( _( "Some zone netcodes did not match and were not merged." ) );
-            continue;
-        }
-
-        if( curr_area->GetIsRuleArea() != firstZone->GetIsRuleArea() )
-        {
-            wxLogMessage( _( "Some zones were rule areas and were not merged." ) );
-            continue;
-        }
-
-        if( curr_area->GetLayerSet() != firstZone->GetLayerSet() )
-        {
-            wxLogMessage( _( "Some zone layer sets did not match and were not merged." ) );
-            continue;
-        }
-
-        bool intersects = curr_area == firstZone;
-
-        for( ZONE* candidate : toMerge )
-        {
-            if( intersects )
-                break;
-
-            if( board->TestZoneIntersection( curr_area, candidate ) )
-                intersects = true;
-        }
-
-        if( !intersects )
-        {
-            wxLogMessage( _( "Some zones did not intersect and were not merged." ) );
-            continue;
-        }
-
-        toMerge.push_back( curr_area );
+        if( ZONE* zone = dynamic_cast<ZONE*>( item ) )
+            zones.push_back( zone );
     }
 
     m_toolMgr->RunAction( ACTIONS::selectionClear );
 
-    if( !toMerge.empty() )
-    {
-        if( mergeZones( m_frame, commit, toMerge, merged ) )
-        {
-            commit.Push( _( "Merge Zones" ) );
+    if( zones.empty() )
+        return 0;
 
-            for( EDA_ITEM* item : merged )
-                m_toolMgr->RunAction( ACTIONS::selectItem, item );
+    ZONE_MERGE_PLAN plan = PlanZoneMerge( getModel<BOARD>(), zones );
+    wxString        skipped;
+
+    for( const auto& [zone, why] : plan.skipped )
+    {
+        wxString line;
+
+        switch( why )
+        {
+        case ZONE_MERGE_SKIP::OTHER_NET:    line = _( "Some zone netcodes did not match and were not merged." ); break;
+        case ZONE_MERGE_SKIP::OTHER_KIND:   line = _( "Some zones were rule areas and were not merged." ); break;
+        case ZONE_MERGE_SKIP::OTHER_LAYERS: line = _( "Some zone layer sets did not match and were not merged." ); break;
+        case ZONE_MERGE_SKIP::NO_OVERLAP:   line = _( "Some zones did not intersect and were not merged." ); break;
         }
+
+        if( !skipped.Contains( line ) )
+            skipped += ( skipped.IsEmpty() ? wxString() : wxString( wxS( " " ) ) ) + line;
     }
+
+    if( !plan.error.IsEmpty() )
+    {
+        m_frame->ShowInfoBarError( plan.error + ( skipped.IsEmpty() ? wxString() : wxS( " " ) + skipped ) );
+        return 0;
+    }
+
+    BOARD_COMMIT commit( m_frame );
+    ApplyZoneMerge( commit, plan );
+    commit.Push( _( "Merge Zones" ) );
+
+    m_toolMgr->RunAction( ACTIONS::selectItem, plan.zones.front() );
+
+    if( !skipped.IsEmpty() )
+        m_frame->ShowInfoBarWarning( skipped );
 
     return 0;
 }

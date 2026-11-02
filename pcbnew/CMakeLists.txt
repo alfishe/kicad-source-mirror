@@ -458,6 +458,7 @@ set( PCBNEW_CLASS_SRCS
     footprint_library_export.cpp
     polygon_corner_edit.cpp
     zone_cutout.cpp
+    zone_merge.cpp
     footprint_viewer_frame.cpp
     fp_tree_model_adapter.cpp
     footprint_fields_data_model.cpp
