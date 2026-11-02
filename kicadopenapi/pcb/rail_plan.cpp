@@ -549,9 +549,10 @@ std::vector<RAIL_PIN_PLAN> planRowRailVias( BOARD* aBoard, FOOTPRINT* aFp, const
 
             bool planned = false;
 
+            // a via's edge past the row's inner ends by the clearance: clear of the neighbours' pads at any pitch
             for( const auto& [dia, drill] : sizes )
             {
-                const int depth = padHalf + dia / 2 + minClearance;
+                const int depth = padHalf + dia / 2 + clear;
                 const int pair = viaApart( dia, drill, dia, drill, clear );
                 const int pass = stubApart( dia, drill, clear );
 
@@ -596,7 +597,7 @@ std::vector<RAIL_PIN_PLAN> planRowRailVias( BOARD* aBoard, FOOTPRINT* aFp, const
                 // every other pin: poured nets first, each pin as far from the chosen as one via
                 // from the next
                 const auto [dia, drill] = sizes.back();
-                const int  depth = padHalf + dia / 2 + minClearance;
+                const int  depth = padHalf + dia / 2 + clear;
                 const int  pair = viaApart( dia, drill, dia, drill, clear );
 
                 if( depth + dia / 2 + clear > room )
@@ -635,7 +636,7 @@ std::vector<RAIL_PIN_PLAN> planRowRailVias( BOARD* aBoard, FOOTPRINT* aFp, const
                                                                         [&]( size_t j )
                                                                         { return i == j || std::abs( along( run[i] ) - along( run[j] ) ) >= classPair; } );
                                                 } )
-                                   && padHalf + aOptions.classViaDia + minClearance + clear <= room;
+                                   && padHalf + aOptions.classViaDia + 2 * clear <= room;
 
                 for( size_t i = 0; i < run.size(); ++i )
                 {
@@ -647,7 +648,7 @@ std::vector<RAIL_PIN_PLAN> planRowRailVias( BOARD* aBoard, FOOTPRINT* aFp, const
                     }
                     else if( roomy )
                     {
-                        place( run[i], padHalf + aOptions.classViaDia / 2 + minClearance, aOptions.classViaDia, aOptions.classViaDrill,
+                        place( run[i], padHalf + aOptions.classViaDia / 2 + clear, aOptions.classViaDia, aOptions.classViaDrill,
                                "every_other", "a via at every other pin of the run (two vias a pin apart do not fit)" );
                     }
                     else
