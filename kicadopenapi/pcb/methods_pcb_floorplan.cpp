@@ -286,7 +286,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     const bool rerouteAll = reroute == "all";
 
-    // routing layers: every copper layer, inner layers mostly covered by a rail pour are planes
+    // routing layers: every copper layer the stack-up does not type power
     std::vector<PCB_LAYER_ID> copper;
 
     for( PCB_LAYER_ID l : LSET::AllCuMask( board->GetCopperLayerCount() ).CuStack() )
@@ -391,7 +391,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     // layers
     std::vector<PCB_LAYER_ID> routing;
     nlohmann::json            layerList = nlohmann::json::array();
-    const double              usableArea = usable.Area();
 
     if( aArgs.contains( "layers" ) )
     {
@@ -418,26 +417,18 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
     else
     {
+        // a plane is a layer the stack-up types power; signal, mixed and jumper layers are routed on
         for( PCB_LAYER_ID l : copper )
         {
-            double poured = 0;
-
-            if( l != F_Cu && l != B_Cu )
-            {
-                for( ZONE* zone : board->Zones() )
-                {
-                    if( !zone->GetIsRuleArea() && zone->IsOnLayer( l ) && rails.count( zone->GetNetCode() ) )
-                        poured += zone->Outline()->Area();
-                }
-            }
-
-            const bool plane = usableArea > 0 && poured >= 0.5 * usableArea;
+            const LAYER_T type = board->GetLayerType( l );
+            const bool    plane = type == LT_POWER;
 
             if( !plane )
                 routing.push_back( l );
 
             layerList.push_back( { { "layer", str( board->GetLayerName( l ) ) }, { "routing", !plane },
-                                   { "why", plane ? "plane (a rail pour over half the board or more)" : "signal" } } );
+                                   { "why", plane ? "plane (stack-up type power)"
+                                                  : std::string( "stack-up type " ) + LAYER::ShowType( type ) } } );
         }
     }
 
@@ -2958,8 +2949,8 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                    "blocks (each block's member courtyards merged into a few boxes, or its pcb_blocks bbox, as rigid "
                    "obstacles, with keep-outs that bar tracks and the board outside) and how much of them the links between blocks need. A channel is a cross-section of "
                    "the free space between two obstacles (between: their names, board edge included) along the "
-                   "line of an obstacle's edge; per channel its free length per routing copper layer (inner layers "
-                   "mostly under a rail pour are planes, not counted), the tracks of each net class that cross it "
+                   "line of an obstacle's edge; per channel its free length per routing copper layer (layers the "
+                   "stack-up types power are planes, not counted), the tracks of each net class that cross it "
                    "per layer, the vias that fit across it. Links: each pcb_layout_graph bus between two blocks, and "
                    "the single nets between two blocks, as one bundle with its width (track + clearance of each "
                    "net's class), taking one shortest path through the channels; overflows negotiated over the "
@@ -2989,7 +2980,7 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "depth":{"type":"integer","default":2,"minimum":1,"maximum":6},
                         "max_fanout":{"type":"integer","default":30},
                         "min_bus":{"type":"integer","default":3,"minimum":2,"description":"lines a bundle needs to be a bus (pcb_net_roles min_bundle)"},
-                        "layers":{"type":"array","items":{"type":"string"},"description":"copper layers to route on; default every signal layer (inner rail planes left out)"},
+                        "layers":{"type":"array","items":{"type":"string"},"description":"copper layers to route on; default every layer the stack-up does not type power"},
                         "keepouts":{"type":"array","items":{"type":"object","properties":{
                             "name":{"type":"string"},
                             "rect":{"type":"array","items":{"type":"number"},"description":"[x0, y0, x1, y1] mm"},
