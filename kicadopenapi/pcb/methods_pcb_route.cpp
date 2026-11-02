@@ -3331,6 +3331,109 @@ struct ROUTE_BRANCH
 };
 
 
+/// @brief Cut a pair's two lines back from their target ends to where each has room to turn to its own
+/// pad alone: by the farther line end's distance to its pad plus one pair pitch (width + gap), along each
+/// line on its layer (not past a via or an arc).  aTargets: each net's code and its target pad's position;
+/// aEnds gets each net's new open end.
+static void splitPairBack( PCB_CONTEXT& aContext, BOARD* aBoard, const std::vector<KIID>& aAdded, size_t aFrom,
+                           const std::vector<std::pair<int, VECTOR2I>>& aTargets, const nlohmann::json& aAttempt,
+                           std::map<int, std::pair<PCB_TRACK*, VECTOR2I>>& aEnds )
+{
+    const nlohmann::json dp = aAttempt.value( "diff_pair", nlohmann::json::object() );
+    const double         pitch = pcbIUScale.mmToIU( dp.value( "width_mm", 0.0 ) + dp.value( "gap_mm", 0.0 ) );
+
+    std::map<int, std::vector<PCB_TRACK*>>      lines;   // net code -> the pair's tracks of that net
+    std::map<int, std::pair<PCB_TRACK*, VECTOR2I>> ends;
+    double                                      cut = pitch;
+
+    for( const auto& [net, target] : aTargets )
+    {
+        std::map<std::pair<int, int>, int> endsAt;   // how many of the line's tracks end at a point
+
+        for( size_t i = aFrom; i < aAdded.size(); ++i )
+        {
+            if( PCB_TRACK* t = dynamic_cast<PCB_TRACK*>( aBoard->ResolveItem( aAdded[i], true ) );
+                t && t->Type() == PCB_TRACE_T && t->GetNetCode() == net )
+            {
+                lines[net].push_back( t );
+                endsAt[{ t->GetStart().x, t->GetStart().y }]++;
+                endsAt[{ t->GetEnd().x, t->GetEnd().y }]++;
+            }
+        }
+
+        // the line's open end nearest the target (a bend's corner is no end)
+        for( PCB_TRACK* t : lines[net] )
+        {
+            for( const VECTOR2I& at : { t->GetStart(), t->GetEnd() } )
+            {
+                if( endsAt[{ at.x, at.y }] == 1
+                    && ( !ends.count( net )
+                         || ( at - target ).SquaredEuclideanNorm() < ( ends[net].second - target ).SquaredEuclideanNorm() ) )
+                {
+                    ends[net] = std::make_pair( t, at );
+                }
+            }
+        }
+
+        if( ends.count( net ) )
+            cut = std::max( cut, ( ends[net].second - target ).EuclideanNorm() + pitch );
+    }
+
+    if( ends.size() != 2 )
+        return;
+
+    BOARD_COMMIT commit( aContext.GetToolManager() );
+    std::set<PCB_TRACK*> removed;
+
+    for( auto& [net, end] : ends )
+    {
+        auto [track, at] = end;
+        double left = cut;
+
+        while( track && left > 0 )
+        {
+            const bool     atStart = track->GetStart() == at;
+            const VECTOR2I other = atStart ? track->GetEnd() : track->GetStart();
+            const double   length = ( other - at ).EuclideanNorm();
+
+            if( length > left )
+            {
+                const VECTOR2I to = at + VECTOR2I( KiROUND( ( other.x - at.x ) * left / length ),
+                                                   KiROUND( ( other.y - at.y ) * left / length ) );
+                commit.Modify( track );
+                atStart ? track->SetStart( to ) : track->SetEnd( to );
+                at = to;
+                break;
+            }
+
+            PCB_TRACK* next = nullptr;
+
+            for( PCB_TRACK* t : lines[net] )
+            {
+                if( t != track && !removed.count( t ) && t->GetLayer() == track->GetLayer()
+                    && ( t->GetStart() == other || t->GetEnd() == other ) )
+                {
+                    next = t;
+                }
+            }
+
+            if( !next )
+                break;   // the line's start, a via or an arc: keep the rest
+
+            commit.Remove( track );
+            removed.insert( track );
+            left -= length;
+            track = next;
+            at = other;
+        }
+
+        aEnds[net] = std::make_pair( track, at );
+    }
+
+    commit.Push( _( "Split a pair back to its pads (API)" ) );
+}
+
+
 static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ROUTE_BRANCH* aBranch,
                                  bool aQuiet = false );
 
@@ -8721,6 +8824,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         pairEnds[mine->from->GetNetCode()] = *end;
                 }
             }
+
+            // to two parts side by side the placer bends one line onto the pad it reaches and stops the
+            // other short beside it, closer to its partner than a single route may come: both lines are cut
+            // back to where each has room to turn to its own pad, and each net goes on alone from there
+            if( !pairEnds.empty() )
+                splitPairBack( *context, board, added, pairFrom,
+                               { { job.from->GetNetCode(), job.to->GetPosition() },
+                                 { other.from->GetNetCode(), other.to->GetPosition() } },
+                               pairAttempt, pairEnds );
 
             if( !pairEnds.empty() )
             {
