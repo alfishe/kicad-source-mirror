@@ -63,46 +63,21 @@ int VIA_STITCH_TOOL::ExcludeStitchVia( const TOOL_EVENT& aEvent )
     PCB_SELECTION_TOOL*  selTool = m_toolMgr->GetTool<PCB_SELECTION_TOOL>();
     const PCB_SELECTION& sel = selTool->GetSelection();
 
-    BOARD_COMMIT              commit( this );
-    std::set<PCB_VIA_STITCH*> toRegenerate;
+    std::vector<PCB_VIA*> vias;
 
     for( EDA_ITEM* item : sel )
     {
-        if( item->Type() != PCB_VIA_T )
-            continue;
-
-        PCB_VIA*   via = static_cast<PCB_VIA*>( item );
-        EDA_GROUP* parent = via->GetParentGroup();
-
-        if( !parent )
-            continue;
-
-        PCB_VIA_STITCH* stitch = dynamic_cast<PCB_VIA_STITCH*>( parent->AsEdaItem() );
-
-        if( !stitch )
-            continue;
-
-        if( commit.GetStatus( stitch ) != CHT_MODIFY )
-            commit.Modify( stitch );
-
-        stitch->ExcludePosition( via->GetPosition() );
-        toRegenerate.insert( stitch );
+        if( item->Type() == PCB_VIA_T && PCB_VIA_STITCH::StitchingOf( static_cast<PCB_VIA*>( item ) ) )
+            vias.push_back( static_cast<PCB_VIA*>( item ) );
     }
 
-    if( toRegenerate.empty() )
+    if( vias.empty() )
         return 0;
 
     selTool->ClearSelection();
 
-    GENERATOR_TOOL* genTool = m_toolMgr->GetTool<GENERATOR_TOOL>();
-
-    for( PCB_VIA_STITCH* stitch : toRegenerate )
-    {
-        stitch->EditStart( genTool, board(), &commit );
-        stitch->Update( genTool, board(), &commit );
-        stitch->EditFinish( genTool, board(), &commit );
-    }
-
+    BOARD_COMMIT commit( this );
+    PCB_VIA_STITCH::ExcludeVias( vias, m_toolMgr->GetTool<GENERATOR_TOOL>(), board(), commit );
     commit.Push( _( "Exclude Via From Stitching" ) );
     frame()->RefreshCanvas();
     return 0;
@@ -114,34 +89,18 @@ int VIA_STITCH_TOOL::ClearStitchViaExclusions( const TOOL_EVENT& aEvent )
     PCB_SELECTION_TOOL*  selTool = m_toolMgr->GetTool<PCB_SELECTION_TOOL>();
     const PCB_SELECTION& sel = selTool->GetSelection();
 
-    BOARD_COMMIT              commit( this );
-    std::set<PCB_VIA_STITCH*> toRegenerate;
+    std::vector<PCB_VIA_STITCH*> stitchings;
 
     for( EDA_ITEM* item : sel )
     {
-        PCB_VIA_STITCH* stitch = dynamic_cast<PCB_VIA_STITCH*>( item );
-
-        if( !stitch || !stitch->HasExclusions() )
-            continue;
-
-        if( commit.GetStatus( stitch ) != CHT_MODIFY )
-            commit.Modify( stitch );
-
-        stitch->ClearAllExclusions();
-        toRegenerate.insert( stitch );
+        if( PCB_VIA_STITCH* stitch = dynamic_cast<PCB_VIA_STITCH*>( item ) )
+            stitchings.push_back( stitch );
     }
 
-    if( toRegenerate.empty() )
+    BOARD_COMMIT commit( this );
+
+    if( PCB_VIA_STITCH::ClearExclusions( stitchings, m_toolMgr->GetTool<GENERATOR_TOOL>(), board(), commit ).empty() )
         return 0;
-
-    GENERATOR_TOOL* genTool = m_toolMgr->GetTool<GENERATOR_TOOL>();
-
-    for( PCB_VIA_STITCH* stitch : toRegenerate )
-    {
-        stitch->EditStart( genTool, board(), &commit );
-        stitch->Update( genTool, board(), &commit );
-        stitch->EditFinish( genTool, board(), &commit );
-    }
 
     commit.Push( _( "Clear Via Stitching Exclusions" ) );
     frame()->RefreshCanvas();

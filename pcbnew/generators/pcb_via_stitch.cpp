@@ -1499,11 +1499,86 @@ void PCB_VIA_STITCH::ShowPropertiesDialog( PCB_BASE_EDIT_FRAME* aEditFrame )
     if( dlg.ShowModal() != wxID_OK )
         return;
 
-    EditStart( genTool, GetBoard(), &commit );
-    Update( genTool, GetBoard(), &commit );
-    EditFinish( genTool, GetBoard(), &commit );
+    Generate( genTool, GetBoard(), &commit );
 
     commit.Push( _( "Edit Via Stitching" ) );
+}
+
+
+std::unique_ptr<PCB_VIA_STITCH> PCB_VIA_STITCH::CreateForOutline( BOARD* aBoard, const SHAPE_POLY_SET& aOutline )
+{
+    std::unique_ptr<PCB_VIA_STITCH> stitch = std::make_unique<PCB_VIA_STITCH>();
+    stitch->SetFlags( IS_NEW );
+    stitch->SetParent( aBoard );
+    stitch->SetOutline( aOutline );
+    stitch->InitializeDefaults( aBoard );
+    return stitch;
+}
+
+
+void PCB_VIA_STITCH::Generate( GENERATOR_TOOL* aTool, BOARD* aBoard, BOARD_COMMIT* aCommit )
+{
+    EditStart( aTool, aBoard, aCommit );
+    Update( aTool, aBoard, aCommit );
+    EditFinish( aTool, aBoard, aCommit );
+}
+
+
+PCB_VIA_STITCH* PCB_VIA_STITCH::StitchingOf( const PCB_VIA* aVia )
+{
+    EDA_GROUP* parent = aVia ? aVia->GetParentGroup() : nullptr;
+
+    return parent ? dynamic_cast<PCB_VIA_STITCH*>( parent->AsEdaItem() ) : nullptr;
+}
+
+
+std::set<PCB_VIA_STITCH*> PCB_VIA_STITCH::ExcludeVias( const std::vector<PCB_VIA*>& aVias, GENERATOR_TOOL* aTool,
+                                                       BOARD* aBoard, BOARD_COMMIT& aCommit )
+{
+    std::set<PCB_VIA_STITCH*> changed;
+
+    for( PCB_VIA* via : aVias )
+    {
+        PCB_VIA_STITCH* stitch = StitchingOf( via );
+
+        if( !stitch )
+            continue;
+
+        if( aCommit.GetStatus( stitch ) != CHT_MODIFY )
+            aCommit.Modify( stitch );
+
+        stitch->ExcludePosition( via->GetPosition() );
+        changed.insert( stitch );
+    }
+
+    for( PCB_VIA_STITCH* stitch : changed )
+        stitch->Generate( aTool, aBoard, &aCommit );
+
+    return changed;
+}
+
+
+std::set<PCB_VIA_STITCH*> PCB_VIA_STITCH::ClearExclusions( const std::vector<PCB_VIA_STITCH*>& aStitchings,
+                                                           GENERATOR_TOOL* aTool, BOARD* aBoard, BOARD_COMMIT& aCommit )
+{
+    std::set<PCB_VIA_STITCH*> changed;
+
+    for( PCB_VIA_STITCH* stitch : aStitchings )
+    {
+        if( !stitch || !stitch->HasExclusions() )
+            continue;
+
+        if( aCommit.GetStatus( stitch ) != CHT_MODIFY )
+            aCommit.Modify( stitch );
+
+        stitch->ClearAllExclusions();
+        changed.insert( stitch );
+    }
+
+    for( PCB_VIA_STITCH* stitch : changed )
+        stitch->Generate( aTool, aBoard, &aCommit );
+
+    return changed;
 }
 
 

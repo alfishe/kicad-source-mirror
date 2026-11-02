@@ -51,6 +51,17 @@ KOPENAPI_RESULT KopenapiNoBoard();
 void KopenapiFitPage( BOARD* aBoard, const BOX2I& aOutline );
 
 class ZONE;
+class GENERATOR_TOOL;
+class TOOL_MANAGER;
+class SHAPE_LINE_CHAIN;
+
+/// @brief The polygon of points [[x, y], ...] or rect [x0, y0, x1, y1] in mm, closed; empty with
+/// aError set
+SHAPE_LINE_CHAIN KopenapiOutlineArg( const nlohmann::json& aArgs, std::string& aError );
+
+/// @brief The editor's generator tool: a GUI editor has one, a headless board gets one (registered
+/// only, its router built by Reset)
+GENERATOR_TOOL* KopenapiGeneratorTool( TOOL_MANAGER* aManager );
 
 /// @brief A zone's fill pieces per layer when a layer has more than one: box, area, the net's pads,
 /// vias and tracks on each (an island with no via is cut off)

@@ -229,11 +229,7 @@ void ZONE_CREATE_HELPER::commitZone( std::unique_ptr<ZONE> aZone )
             // Build the stitcher detached from the board so the properties dialog can
             // edit its settings before we commit it.  Parented to the board (without
             // being added) so net lookups in the dialog work.
-            std::unique_ptr<PCB_VIA_STITCH> stitcher = std::make_unique<PCB_VIA_STITCH>();
-            stitcher->SetFlags( IS_NEW );
-            stitcher->SetParent( board );
-            stitcher->SetOutline( *aZone->Outline() );
-            stitcher->InitializeDefaults( board );
+            std::unique_ptr<PCB_VIA_STITCH> stitcher = PCB_VIA_STITCH::CreateForOutline( board, *aZone->Outline() );
 
             // Pop the properties dialog up-front so the user picks net / pitch / pattern
             // before any vias materialize.  Cancel discards the whole creation.
@@ -250,9 +246,7 @@ void ZONE_CREATE_HELPER::commitZone( std::unique_ptr<ZONE> aZone )
             BOARD_COMMIT    commit( &m_tool );
             PCB_VIA_STITCH* released = stitcher.release();
 
-            released->EditStart( generatorTool, board, &commit );
-            released->Update( generatorTool, board, &commit );
-            released->EditFinish( generatorTool, board, &commit );
+            released->Generate( generatorTool, board, &commit );
 
             commit.Push( _( "Create Via Stitch" ) );
 

@@ -43,26 +43,6 @@ int fromMm( double aMm )
 }
 
 
-/// @brief The editor's generator tool: a GUI editor has one, a headless board gets one (registered
-/// only, its router built by Reset; InitTools would re-initialise every other tool)
-GENERATOR_TOOL* generatorTool( TOOL_MANAGER* aManager )
-{
-    wxASSERT( !KopenapiInComputeWorker() );
-
-    if( GENERATOR_TOOL* tool = aManager->GetTool<GENERATOR_TOOL>() )
-        return tool;
-
-    aManager->RegisterTool( new GENERATOR_TOOL );
-
-    GENERATOR_TOOL* tool = aManager->GetTool<GENERATOR_TOOL>();
-
-    if( tool )
-        tool->Reset( TOOL_BASE::RUN );
-
-    return tool;
-}
-
-
 const char* modeName( LENGTH_TUNING_MODE aMode )
 {
     switch( aMode )
@@ -380,7 +360,7 @@ KOPENAPI_RESULT h_pcb_tune_length( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     if( from == to )
         return KOPENAPI_RESULT::Error( 400, "from_mm / to_mm: the span is empty" );
 
-    GENERATOR_TOOL* tool = generatorTool( context->GetToolManager() );
+    GENERATOR_TOOL* tool = KopenapiGeneratorTool( context->GetToolManager() );
 
     if( !tool || !tool->Router() )
         return KOPENAPI_RESULT::Error( 503, "the generator tool is not available" );
@@ -549,7 +529,7 @@ KOPENAPI_RESULT h_pcb_tuning_update( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         }
     }
 
-    GENERATOR_TOOL* tool = generatorTool( context->GetToolManager() );
+    GENERATOR_TOOL* tool = KopenapiGeneratorTool( context->GetToolManager() );
 
     if( !tool || !tool->Router() )
         return KOPENAPI_RESULT::Error( 503, "the generator tool is not available" );
@@ -601,6 +581,26 @@ KOPENAPI_RESULT h_pcb_tuning_update( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 }
 
 } // namespace
+
+
+/// @brief The editor's generator tool: a GUI editor has one, a headless board gets one (registered
+/// only, its router built by Reset; InitTools would re-initialise every other tool)
+GENERATOR_TOOL* KopenapiGeneratorTool( TOOL_MANAGER* aManager )
+{
+    wxASSERT( !KopenapiInComputeWorker() );
+
+    if( GENERATOR_TOOL* tool = aManager->GetTool<GENERATOR_TOOL>() )
+        return tool;
+
+    aManager->RegisterTool( new GENERATOR_TOOL );
+
+    GENERATOR_TOOL* tool = aManager->GetTool<GENERATOR_TOOL>();
+
+    if( tool )
+        tool->Reset( TOOL_BASE::RUN );
+
+    return tool;
+}
 
 
 KOPENAPI_REGISTER( "pcb_tune_length",

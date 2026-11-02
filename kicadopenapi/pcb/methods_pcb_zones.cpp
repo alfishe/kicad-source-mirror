@@ -441,6 +441,13 @@ nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::v
 } // namespace
 
 
+SHAPE_LINE_CHAIN KopenapiOutlineArg( const nlohmann::json& aArgs, std::string& aError )
+{
+    return outlineArg( aArgs, aError );
+}
+
+
+
 void KopenapiNetDomain( BOARD* aBoard, int aNetCode, int aLayer, SHAPE_POLY_SET& aOut )
 {
     aOut.RemoveAllContours();
