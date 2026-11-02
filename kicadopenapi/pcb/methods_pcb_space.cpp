@@ -1294,9 +1294,55 @@ int crossingsBetween( const std::vector<std::string>& aA, const std::vector<std:
 }
 
 
+/// @brief The side a part at the board edge is left by: away from that edge (the panel edge it faces,
+/// else the outline edge of aEdges its courtyard lies on, within 2 mm); empty when it is at no edge.
+/// aFrom: why
+std::string edgeExit( const PART& aPart, const BOX2I& aEdges, std::string& aFrom )
+{
+    if( aEdges.GetWidth() <= 0 )
+        return std::string();
+
+    const BOX2I body = aPart.courtyard.OutlineCount() ? aPart.courtyard.BBox() : aPart.fp->GetBoundingBox( false );
+    const std::pair<std::string, long long> gap[] = {
+        { "west", (long long) body.GetLeft() - aEdges.GetLeft() },
+        { "east", (long long) aEdges.GetRight() - body.GetRight() },
+        { "north", (long long) body.GetTop() - aEdges.GetTop() },
+        { "south", (long long) aEdges.GetBottom() - body.GetBottom() } };
+    std::string edge;
+    long long   nearest = std::numeric_limits<long long>::max();
+
+    for( const auto& [side, d] : gap )
+    {
+        if( d < nearest )
+        {
+            nearest = d;
+            edge = side;
+        }
+    }
+
+    const nlohmann::json pe = KopenapiPanelEdgeJson( aPart.fp );
+    const std::string    facing = pe.is_object() ? pe.value( "facing", nlohmann::json() ).is_string()
+                                                           ? pe["facing"].get<std::string>() : std::string()
+                                                     : std::string();
+    const std::string    faced = facing == "up" ? "north" : facing == "down" ? "south"
+                                 : facing == "left" ? "west" : facing == "right" ? "east" : std::string();
+
+    if( !faced.empty() && faced == edge )
+        aFrom = "away from the board edge it faces (" + pe.value( "source", std::string( "panel edge" ) ) + ")";
+    else if( nearest <= pcbIUScale.mmToIU( 2.0 ) )
+        aFrom = "away from the board edge it lies on";
+    else
+        return std::string();
+
+    static const std::map<std::string, std::string> opposite = {
+        { "west", "east" }, { "east", "west" }, { "north", "south" }, { "south", "north" } };
+    return opposite.at( edge );
+}
+
+
 /// @brief The side a bus leaves its end part by: a connector at the board edge away from that edge
-/// (the panel edge it faces, else the outline edge its courtyard lies on); else as pcb_fanout_ports
-/// plans these pads: the side they are on, pads inside a grid towards the far end
+/// (edgeExit); else as pcb_fanout_ports plans these pads: the side they are on, pads inside a grid
+/// towards the far end
 void setExit( const BOARD_BLOCKS& aB, const BOX2I& aEdges, const VECTOR2I& aFar, LINK_END& aEnd )
 {
     if( aEnd.partIndex < 0 )
@@ -1304,51 +1350,11 @@ void setExit( const BOARD_BLOCKS& aB, const BOX2I& aEdges, const VECTOR2I& aFar,
 
     const PART& part = aB.parts[aEnd.partIndex];
 
-    if( part.connector && aEdges.GetWidth() > 0 )
+    if( part.connector )
     {
-        const BOX2I body = part.courtyard.OutlineCount() ? part.courtyard.BBox() : part.fp->GetBoundingBox( false );
-        const std::pair<std::string, long long> gap[] = {
-            { "west", (long long) body.GetLeft() - aEdges.GetLeft() },
-            { "east", (long long) aEdges.GetRight() - body.GetRight() },
-            { "north", (long long) body.GetTop() - aEdges.GetTop() },
-            { "south", (long long) aEdges.GetBottom() - body.GetBottom() } };
-        std::string edge;
-        long long   nearest = std::numeric_limits<long long>::max();
-
-        for( const auto& [side, d] : gap )
+        if( std::string exit = edgeExit( part, aEdges, aEnd.exitFrom ); !exit.empty() )
         {
-            if( d < nearest )
-            {
-                nearest = d;
-                edge = side;
-            }
-        }
-
-        const nlohmann::json pe = KopenapiPanelEdgeJson( part.fp );
-        const std::string    facing = pe.is_object() ? pe.value( "facing", nlohmann::json() ).is_string()
-                                                               ? pe["facing"].get<std::string>() : std::string()
-                                                         : std::string();
-        const std::string    faced = facing == "up" ? "north" : facing == "down" ? "south"
-                                     : facing == "left" ? "west" : facing == "right" ? "east" : std::string();
-
-        if( !faced.empty() && faced == edge )
-        {
-            aEnd.exitFrom = "away from the board edge it faces (" + pe.value( "source", std::string( "panel edge" ) ) + ")";
-        }
-        else if( nearest <= pcbIUScale.mmToIU( 2.0 ) )
-        {
-            aEnd.exitFrom = "away from the board edge it lies on";
-        }
-        else
-        {
-            edge.clear();
-        }
-
-        if( !edge.empty() )
-        {
-            static const std::map<std::string, std::string> opposite = {
-                { "west", "east" }, { "east", "west" }, { "north", "south" }, { "south", "north" } };
-            aEnd.exit = opposite.at( edge );
+            aEnd.exit = exit;
             return;
         }
     }
@@ -1888,6 +1894,14 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
     const VECTOR2I centre = extent.Centre();
     const int      ownBlock = b.partBlock[anchor];
 
+    // an edge connector (gold fingers included) is left away from the board edge it is at: no pin
+    // leaves towards that edge, and the edge fixes its turn
+    const nlohmann::json panel = KopenapiPanelEdgeJson( a.fp );
+    const bool           fingers = panel.is_object() && panel.value( "source", std::string() ) == "board edge (fingers)";
+    std::string          exitFrom;
+    const std::string    exit = a.connector || fingers
+                                        ? edgeExit( a, board->GetBoardEdgesBoundingBox(), exitFrom ) : std::string();
+
     // the sides clockwise in the board view (y down); a quarter turn clockwise moves a pad one on
     static const std::vector<std::string> sides = { "west", "north", "east", "south" };
 
@@ -1909,7 +1923,8 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         PAD*        pad = nullptr;
         std::string net;
         int         code = 0;
-        std::string side;
+        std::string side;      ///< the side it leaves by
+        std::string padSide;   ///< the side of the package its pad is on
         int         to = -1;
         std::string toSide;
         std::string kind;   ///< signal, local, rail
@@ -1954,7 +1969,8 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         port.pad = pad;
         port.code = code;
         port.net = str( UnescapeString( pad->GetNetname() ) );
-        port.side = padSideOf( extent, pad->GetPosition() );
+        port.padSide = padSideOf( extent, pad->GetPosition() );
+        port.side = exit.empty() ? port.padSide : exit;
 
         if( b.rails.count( code ) )
         {
@@ -2091,7 +2107,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
     int            bestTurns = 0;
     int            bestCost = std::numeric_limits<int>::max();
 
-    for( int q = 0; q < 4; ++q )
+    for( int q = 0; q < ( exit.empty() ? 4 : 1 ); ++q )
     {
         int cost = 0, straight = 0, corner = 0, round = 0;
 
@@ -2131,6 +2147,9 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
         nlohmann::json j = { { "pad", str( p.pad->GetNumber() ) }, { "net", p.net }, { "kind", p.kind },
                              { "layer", p.via ? "other" : "pad" } };
+
+        if( p.padSide != p.side )
+            j["pad_side"] = p.padSide;
 
         if( p.to >= 0 )
         {
@@ -2213,11 +2232,20 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
     const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
 
-    return KOPENAPI_RESULT::Ok( { { "ref", ref }, { "block", ownBlock >= 0 ? b.blocks[ownBlock].name : std::string() },
-                                  { "ports", sideList }, { "groups", groups }, { "vias_for_order", viaNets.size() },
-                                  { "crossings_left", crossingsLeft }, { "turns", counts },
-                                  { "rotation", { { "best_quarter_turns_cw", bestTurns }, { "by_turn", byTurn } } },
-                                  { "keep_open", open }, { "ms", std::round( ms ) } } );
+    nlohmann::json rotation = { { "best_quarter_turns_cw", bestTurns }, { "by_turn", byTurn } };
+    nlohmann::json out = { { "ref", ref }, { "block", ownBlock >= 0 ? b.blocks[ownBlock].name : std::string() },
+                           { "ports", sideList }, { "groups", groups }, { "vias_for_order", viaNets.size() },
+                           { "crossings_left", crossingsLeft }, { "turns", counts }, { "keep_open", open } };
+
+    if( !exit.empty() )
+    {
+        out["exit"] = { { "side", exit }, { "from", exitFrom } };
+        rotation["fixed"] = "the board edge it is at sets its turn";
+    }
+
+    out["rotation"] = rotation;
+    out["ms"] = std::round( ms );
+    return KOPENAPI_RESULT::Ok( out );
 }
 
 
@@ -2730,7 +2758,9 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "crossings_left (pairs that still cross after the vias: another side or the part mirrored, "
                    "L2 / L3). rotation: the quarter turns of the package that make the turns cheapest "
                    "(straight 0, corner 1, round the part 3); a turn keeps the order round the part, so it "
-                   "never changes crossings. keep_open: the sides signals leave by. Read only",
+                   "never changes crossings. keep_open: the sides signals leave by. An edge connector (gold fingers "
+                   "too) is left away from the board edge it is at: every port leaves by that side (exit: side and "
+                   "why, as pcb_layout_graph's bus ends; pad_side: the side its pad is on), its rotation fixed. Read only",
                    R"json({"type":"object","required":["ref"],"properties":{
                         "ref":{"type":"string","description":"the package"},
                         "by":{"type":"string","enum":["auto","sheet"],"default":"auto"},
