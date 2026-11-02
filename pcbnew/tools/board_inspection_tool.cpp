@@ -2146,6 +2146,9 @@ int BOARD_INSPECTION_TOOL::showBoardComparison( const wxString& aOtherPath, cons
         return 0;
     }
 
+    // Net classes and the other project-file settings the differ reads come from the project
+    otherBoard->SetProject( otherPrj );
+
     BOARD*        board = m_frame->GetBoard();
     PCB_DIFF_VIEW view = buildPcbDiffView( board, otherBoard.get(), aOtherPath );
 
@@ -2319,6 +2322,8 @@ int BOARD_INSPECTION_TOOL::CompareBoardWithHistory( const TOOL_EVENT& aEvent )
                     wxFileName::Rmdir( tempDir, wxPATH_RMDIR_RECURSIVE );
                     return false;
                 }
+
+                loaded->SetProject( prj );
 
                 aBoard = std::move( loaded );
                 aPrj = prj;
