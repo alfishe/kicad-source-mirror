@@ -6719,9 +6719,37 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     line.push_back( aAt );
             };
 
+            // a crossing moved along its stretch (inside it at the ribbon's room), the shifts to try: none
+            // first, then outward both ways a pitch at a time (24 pitches at most)
+            auto movedAlong = [&]( const CROSSING& aC, int aBy )
+            {
+                return aC.axis == 0 ? VECTOR2I( aC.at.x + aBy, aC.at.y ) : VECTOR2I( aC.at.x, aC.at.y + aBy );
+            };
+
+            auto shiftsOf = [&]( const CROSSING& aC )
+            {
+                const int        u = aC.axis == 0 ? aC.at.x : aC.at.y;
+                const int        lo = aC.lo + margin + half - u, hi = aC.hi - margin - half - u;
+                const int        step = std::max( 1, pitch );
+                std::vector<int> out = { 0 };
+
+                for( int d = step; d <= std::max( hi, -lo ) && out.size() < 49; d += step )
+                {
+                    if( d <= hi )
+                        out.push_back( d );
+
+                    if( -d >= lo )
+                        out.push_back( -d );
+                }
+
+                return out;
+            };
+
+            int crossingsMoved = 0;
+
             for( size_t k = 0; k < pts.size(); ++k )
             {
-                const CROSSING& x = pts[k];
+                CROSSING& x = pts[k];
                 keep( x.at );
 
                 if( k + 1 == pts.size() || x.axis < 0 || pts[k + 1].axis < 0 || !x.into )
@@ -6742,15 +6770,66 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 if( x.axis != y.axis )
                 {
-                    keep( x.axis == 1 ? VECTOR2I( y.at.x, x.at.y ) : VECTOR2I( x.at.x, y.at.y ) );
+                    auto cornerOf = [&]( const VECTOR2I& aX, const VECTOR2I& aY )
+                    {
+                        return x.axis == 1 ? VECTOR2I( aY.x, aX.y ) : VECTOR2I( aX.x, aY.y );
+                    };
+
+                    auto legsClear = [&]( const VECTOR2I& aX, const VECTOR2I& aY )
+                    {
+                        const VECTOR2I c = cornerOf( aX, aY );
+                        return ribbonClear( aX, c ) && ribbonClear( c, aY );
+                    };
+
+                    // the turn and its two legs clear of the copper: both crossings moved along their
+                    // stretches, the least moved pair that clears
+                    if( !copper.empty() && !legsClear( x.at, y.at ) )
+                    {
+                        const std::vector<int> dx = shiftsOf( x ), dy = shiftsOf( y );
+                        std::optional<std::pair<VECTOR2I, VECTOR2I>> best;
+                        int64_t                                      bestCost = std::numeric_limits<int64_t>::max();
+
+                        for( int u : dx )
+                        {
+                            for( int v : dy )
+                            {
+                                const int64_t cost = int64_t( std::abs( u ) ) + std::abs( v );
+
+                                if( cost >= bestCost )
+                                    continue;
+
+                                const VECTOR2I px = movedAlong( x, u ), py = movedAlong( y, v );
+
+                                if( legsClear( px, py ) )
+                                {
+                                    best = std::make_pair( px, py );
+                                    bestCost = cost;
+                                }
+                            }
+                        }
+
+                        if( best )
+                        {
+                            if( line.back() == x.at )
+                                line.back() = best->first;
+
+                            x.at = best->first;
+                            y.at = best->second;
+                            crossingsMoved++;
+                        }
+                    }
+
+                    keep( cornerOf( x.at, y.at ) );
                     continue;
                 }
 
                 const bool inX = x.axis == 1;
                 const int  a0 = inX ? x.at.x : x.at.y, a1 = inX ? y.at.x : y.at.y;
-                const int  b0 = inX ? x.at.y : x.at.x, b1 = inX ? y.at.y : y.at.x;
+                const int  b0 = inX ? x.at.y : x.at.x;
+                int        b1 = inX ? y.at.y : y.at.x;
 
-                if( b0 == b1 )
+                // in line: straight on where that is clear of the copper, else a jog round it
+                if( b0 == b1 && ( copper.empty() || ribbonClear( x.at, y.at ) ) )
                     continue;
 
                 // through the region with the crossings less than a pitch apart along the way: one straight
@@ -6781,26 +6860,46 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     return ribbonClear( p0, p1 ) && ribbonClear( p1, p2 ) && ribbonClear( p2, p3 );
                 };
 
+                // the nearest clear depth, the second crossing where it is or else moved along its
+                // stretch (the least moved that clears)
                 if( rlo <= rhi && !copper.empty() && !runClear( mid ) )
                 {
                     const int step = std::max( 1, pitch / 4 );
+                    const int b1From = b1;
 
-                    for( int d = step; d <= rhi - rlo; d += step )
+                    for( int v : shiftsOf( y ) )
                     {
-                        if( mid + d <= rhi && runClear( mid + d ) )
+                        b1 = b1From + v;
+                        std::optional<int> clearAt;
+
+                        if( v != 0 && runClear( mid ) )
+                            clearAt = mid;
+
+                        for( int d = step; !clearAt && d <= rhi - rlo; d += step )
                         {
-                            mid += d;
-                            runsMoved++;
-                            break;
+                            if( mid + d <= rhi && runClear( mid + d ) )
+                                clearAt = mid + d;
+                            else if( mid - d >= rlo && runClear( mid - d ) )
+                                clearAt = mid - d;
                         }
 
-                        if( mid - d >= rlo && runClear( mid - d ) )
+                        if( clearAt )
                         {
-                            mid -= d;
-                            runsMoved++;
+                            runsMoved += *clearAt != mid;
+                            mid = *clearAt;
+
+                            if( v != 0 )
+                            {
+                                y.at = movedAlong( y, v );
+                                crossingsMoved++;
+                            }
+
                             break;
                         }
                     }
+
+                    if( b1 != b1From && ( inX ? y.at.y : y.at.x ) != b1 )
+                        b1 = b1From;
                 }
 
                 keep( inX ? VECTOR2I( mid, b0 ) : VECTOR2I( b0, mid ) );
@@ -7068,6 +7167,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( runsMoved )
                 out["runs_moved"] = runsMoved;
+
+            if( crossingsMoved )
+                out["crossings_moved"] = crossingsMoved;
 
             if( line.size() < lineFrom )
                 out["pulled_from"] = lineFrom;
@@ -15151,7 +15253,8 @@ KOPENAPI_REGISTER( "pcb_route",
                    "bus_paths routes a bus along a corridor, pcb_floorplan's path between two blocks or points given: its members side by "
                    "side at their pitch across each portal of the path as fixed corners, in the order they lie across the way in, one "
                    "after another; its line pulled tight inside the regions crossed, clear of copper and track keep-outs (a corner per "
-                   "turn, corridor pulled_from), each member first out through its pin's port tip (pcb_fanout_ports, packages of 8 SMD "
+                   "turn, corridor pulled_from; a turn or run and its legs blocked: the crossings moved along their stretches, "
+                   "corridor crossings_moved), each member first out through its pin's port tip (pcb_fanout_ports, packages of 8 SMD "
                    "pads or more: corridor fanned_out) (answer bus_paths: corridors, members, routed_along; row corridor: name, index, order (its place in the corridor's tries), corners, routed, failed; "
                    "a member the corridor does not route is routed as any other, one routed along it is left out of clean_up); "
                    "rip_up_scope unlocked lets the rip-up take out unlocked copper of earlier calls too (rip_up.earlier_routes_rerouted, "
