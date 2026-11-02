@@ -8,6 +8,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@ struct GRID_NET
 {
     int                                netCode = 0;
     std::vector<BOARD_CONNECTED_ITEM*> ends;
+    std::vector<std::optional<VECTOR2I>> endAt;   ///< per end (when given): a track joined at this point of it only
     int                                width = 0;
     int                                clearance = 0;
     int                                viaDiameter = 0;   ///< 0: no vias for this net

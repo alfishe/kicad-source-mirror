@@ -10,6 +10,7 @@
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
 #include <footprint.h>
+#include <geometry/shape_circle.h>
 #include <geometry/shape_segment.h>
 #include <netclass.h>
 #include <pad.h>
@@ -1463,10 +1464,13 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
         const int             hw = n.width / 2;
         std::vector<uint32_t> deep;   // where the net's track adds no copper to its ends'
 
-        for( BOARD_CONNECTED_ITEM* end : n.ends )
+        for( size_t e = 0; e < n.ends.size(); ++e )
         {
-            std::vector<uint32_t> states;
-            std::array<int, 4>    box = { INT_MAX, INT_MAX, INT_MIN, INT_MIN };
+            BOARD_CONNECTED_ITEM*         end = n.ends[e];
+            const std::optional<VECTOR2I> endAt = e < n.endAt.size() ? n.endAt[e] : std::nullopt;
+            const VECTOR2I                endPos = endAt ? *endAt : end->GetPosition();
+            std::vector<uint32_t>         states;
+            std::array<int, 4>            box = { INT_MAX, INT_MAX, INT_MIN, INT_MIN };
 
             if( PAD* pad = dynamic_cast<PAD*>( end ); pad && pad->GetParentFootprint()
                                                       && finePart.count( pad->GetParentFootprint() ) )
@@ -1514,6 +1518,9 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
 
                 std::shared_ptr<SHAPE> s = end->GetEffectiveShape( layer );
 
+                if( endAt && end->Type() == PCB_TRACE_T )
+                    s = std::make_shared<SHAPE_CIRCLE>( *endAt, static_cast<PCB_TRACK*>( end )->GetWidth() / 2 );
+
                 if( !s )
                     continue;
 
@@ -1544,7 +1551,7 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
                 {
                     int cx, cy;
 
-                    if( grid.CellOf( end->GetPosition(), cx, cy ) )
+                    if( grid.CellOf( endPos, cx, cy ) )
                         states.push_back( (uint32_t) ( offset + grid.Index( cx, cy ) ) );
                 }
 
@@ -1553,7 +1560,7 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
                 {
                     int cx, cy;
 
-                    if( grid.CellOf( end->GetPosition(), cx, cy )
+                    if( grid.CellOf( endPos, cx, cy )
                         && std::count( states.begin() + before, states.end(), offset + grid.Index( cx, cy ) ) )
                     {
                         deep.push_back( (uint32_t) ( offset + grid.Index( cx, cy ) ) );

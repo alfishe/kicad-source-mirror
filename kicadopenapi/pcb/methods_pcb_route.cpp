@@ -8838,6 +8838,103 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             alongRow[aIndex]["failed"] = attempt.value( "reason", std::string() );
     };
 
+    // a pair line's end track gone since: the net's track through the old end now (a route onto it
+    // merged with it), else its track end nearest the old place off the start's island (shoved: new
+    // segments)
+    auto pairEndAgain = [&]( JOB& aJob )
+    {
+        if( !aJob.toPairEnd || !aJob.from )
+            return;
+
+        const bool split = pairLineEnds.count( aJob.toId ) > 0;
+        const auto joined = board->GetConnectivity()->GetConnectedItems( aJob.from );
+        double     best = std::numeric_limits<double>::max();
+
+        for( PCB_TRACK* t : board->Tracks() )
+        {
+            if( t->Type() == PCB_TRACE_T && t->GetNetCode() == aJob.from->GetNetCode() && t->HitTest( aJob.toPos, 0 ) )
+            {
+                aJob.to = t;
+                aJob.toId = t->m_Uuid;
+                best = -1.0;
+                break;
+            }
+        }
+
+        for( PCB_TRACK* t : board->Tracks() )
+        {
+            if( best < 0 || t->Type() != PCB_TRACE_T || t->GetNetCode() != aJob.from->GetNetCode()
+                || std::find( joined.begin(), joined.end(), t ) != joined.end() )
+            {
+                continue;
+            }
+
+            for( const VECTOR2I& at : { t->GetStart(), t->GetEnd() } )
+            {
+                if( const double d = ( at - aJob.toPos ).EuclideanNorm(); d < best )
+                {
+                    best = d;
+                    aJob.to = t;
+                    aJob.toId = t->m_Uuid;
+                    aJob.toPos = at;
+                }
+            }
+        }
+
+        if( split && aJob.to )
+            pairLineEnds.insert( aJob.toId );
+    };
+
+    // a pair's tail the grid did not join, by pns from its far pad to its line's end: its row when it
+    // routes
+    std::map<size_t, std::string> pairTailWhy;   // the tails pns did not route either: why
+
+    auto tailByPns = [&]( size_t aIndex ) -> bool
+    {
+        JOB& wire = jobs[aIndex];
+        wire.from = dynamic_cast<PAD*>( board->ResolveItem( wire.fromId, true ) );
+        wire.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( wire.toId, true ) );
+
+        if( dryRun || !wire.toPairEnd || done[aIndex] || !wire.from )
+            return false;
+
+        if( !wire.to )
+            pairEndAgain( wire );
+
+        if( !wire.to || wire.to->Type() != PCB_TRACE_T )
+        {
+            pairTailWhy[aIndex] = "no track of the net ends where the pair's line ended";
+            return false;
+        }
+
+        if( const auto joined = board->GetConnectivity()->GetConnectedItems( wire.from );
+            std::find( joined.begin(), joined.end(), wire.to ) != joined.end() )
+        {
+            return false;
+        }
+
+        ROUTE_REQUEST tail{ wire.from, wire.to, wire.toPos, static_cast<PCB_TRACK*>( wire.to )->GetLayer(), PNS::RM_Walkaround,
+                            dryRun, {} };
+        tail.fronts = &fronts;
+        tail.neckWidth = neckFor( wire.from, wire.to );
+        tail.pairTail = pairTail( wire.to );
+        nlohmann::json attempt = nlohmann::json::object();
+
+        if( !routeOne( *context, tail, attempt, added ) )
+        {
+            pairTailWhy[aIndex] = attempt.value( "reason", std::string() );
+            return false;
+        }
+
+        const nlohmann::json metrics = attempt.value( "metrics", nlohmann::json::object() );
+        done[aIndex] = true;
+        rowOf[aIndex] = (int) results.size();
+        results.push_back( { { "net", wire.net }, { "from", endName( wire.from ) }, { "to", endName( wire.to ) }, { "routed", true },
+                             { "tries", 1 }, { "engine", "pns" }, { "pair_tail", true }, { "layer", attempt["layer"] },
+                             { "length_mm", metrics.value( "length_mm", 0.0 ) }, { "vias", metrics.value( "vias", 0 ) } } );
+        return true;
+    };
+
     // a first pass bounded per connection: the plateau waits until each connection has had its try
     plateauHeld = firstBudgetS > 0 ? 1 : 0;
 
@@ -8871,37 +8968,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
         job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
 
-        // a pair line's end the routes since have moved (shoved: new segments): its net's track end
-        // nearest the old place, off the start's island
-        if( job.from && !job.to && job.toPairEnd )
-        {
-            const bool split = pairLineEnds.count( job.toId ) > 0;
-            const auto joined = board->GetConnectivity()->GetConnectedItems( job.from );
-            double     best = std::numeric_limits<double>::max();
-
-            for( PCB_TRACK* t : board->Tracks() )
-            {
-                if( t->Type() != PCB_TRACE_T || t->GetNetCode() != job.from->GetNetCode()
-                    || std::find( joined.begin(), joined.end(), t ) != joined.end() )
-                {
-                    continue;
-                }
-
-                for( const VECTOR2I& at : { t->GetStart(), t->GetEnd() } )
-                {
-                    if( const double d = ( at - job.toPos ).EuclideanNorm(); d < best )
-                    {
-                        best = d;
-                        job.to = t;
-                        job.toId = t->m_Uuid;
-                        job.toPos = at;
-                    }
-                }
-            }
-
-            if( split && job.to )
-                pairLineEnds.insert( job.toId );
-        }
+        if( !job.to )
+            pairEndAgain( job );
 
         if( !job.from || !job.to )
         {
@@ -9402,6 +9470,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             }
 
             endsOfJob[index] = { endIndex( n, job.from ), endIndex( n, job.to ) };
+
+            // a pair's line cut short: joined at its open end, not anywhere along it
+            if( job.toPairEnd )
+            {
+                n.endAt.resize( n.ends.size() );
+                n.endAt[endIndex( n, job.to )] = job.toPos;
+            }
             jobsOfNet[it->second].push_back( index );
         }
 
@@ -10203,6 +10278,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     to = n.ends[b];
                     toPos = to->Type() == PCB_PAD_T || to->Type() == PCB_VIA_T ? to->GetPosition() : way.runs.back().points.back();
 
+                    // onto a track the way stops just short of or past its end at: that end (a
+                    // joint inside the track leaves its end over, a sliver the sweep takes out)
+                    if( PCB_TRACK* line = dynamic_cast<PCB_TRACK*>( to ); line && line->Type() == PCB_TRACE_T )
+                    {
+                        for( const VECTOR2I& end : { line->GetStart(), line->GetEnd() } )
+                        {
+                            if( ( end - toPos ).EuclideanNorm() <= line->GetWidth() )
+                                toPos = end;
+                        }
+                    }
+
                     if( from->GetNetCode() > 0 )
                     {
                         const auto joined = board->GetConnectivity()->GetConnectedItems( from );
@@ -10280,6 +10366,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     // the grid planned every net's way out: the ways kept open matter only off the corridor
                     req.fronts = widen == 0 ? nullptr : &fronts;
                     req.neckWidth = pad ? neckFor( pad, to ) : 0;
+                    req.pairTail = pairTail( to );
 
                     for( size_t v = 0; !lanes.corners.empty() && v < lanes.corners[0].size(); ++v )
                     {
@@ -10328,6 +10415,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     JOB& job = jobs[index];
                     job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
                     job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+                    if( !job.to )
+                        pairEndAgain( job );
 
                     const auto joined = job.from ? board->GetConnectivity()->GetConnectedItems( job.from )
                                                  : std::vector<BOARD_CONNECTED_ITEM*>();
@@ -10610,11 +10700,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( detailOf[index] == 1 )
                     continue;
 
+                if( detailStage && jobs[index].toPairEnd && tailByPns( index ) )
+                    continue;
+
                 const auto [a, b] = endsOfJob[index];
                 const bool reached = r && a < r->reached.size() && b < r->reached.size() && r->reached[a] && r->reached[b];
                 const bool ok = detailStage ? netOk[k] && joinedNow( index ) : netOk[k] && reached;
                 nlohmann::json row = { { "net", jobs[index].net }, { "from", endName( jobs[index].from ) }, { "to", endName( jobs[index].to ) },
                                        { "routed", ok }, { "tries", 1 }, { "engine", "grid" } };
+
+                if( pairTailWhy.count( index ) )
+                    row["pair_tail_failed"] = pairTailWhy[index];
 
                 if( ok )
                 {
