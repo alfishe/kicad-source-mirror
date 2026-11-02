@@ -1168,6 +1168,9 @@ struct ROUTE_PROFILE
     int    viaSpotsBlocked = 0;   ///< via spots left out: a via there would touch another net
     int    viaSpotsOffBoard = 0;  ///< via spots left out: on or past the board's edge
     int    viaSpotsInEscapes = 0; ///< via spots left out: in the way out kept open for another net's pad
+    int    viaSpotsOffered = 0;   ///< via spots offered to the tries (after those left out)
+    std::map<std::pair<int, int>, int> viaSpotRings;   ///< ends given spots, by {first, step} from the rules' via
+    std::map<int, int> padExitReach;   ///< walk restarts, by how far out of the pad their corners stand
     int    ripUpsSkipped = 0;     ///< rip-ups not repeated: nothing changed since the same one failed
     int    ripUpsWalled = 0;      ///< rip-ups not made: no plan even through the routes of this call
     int    ripUpsPlanned = 0;     ///< rip-ups whose routes to take out a plan chose (the rest: the nearest in the corridor)
@@ -4705,6 +4708,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         std::optional<VECTOR2I> fanStart, fanEnd;   ///< bus_paths: the fan-out tips at its corridor's ends
         bool                  laneFrom = false, laneTo = false;   ///< bus_paths with lanes: its corridor from / to its laid lane's end
         double                ms = 0;          ///< time of every try for it, rip-up re-routes too
+        int                   triesAll = 0;    ///< tries of every pass, rip-up re-routes too
         nlohmann::json        tried = nlohmann::json::array();   ///< its tries (attempts: true)
     };
 
@@ -5489,10 +5493,27 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     // Via spots to leave an end: inward into the ring of an inward_escapes part first, out of the
     // package next (away from its body, past the pad's end, a little to either side), then around the
-    // end; nearest the other end first within each kind
+    // end; nearest the other end first within each kind.  Sized by the rules' via of the end's net:
+    // the first ring clears the pad's end by half a via and its clearance, the next ones a via pitch
+    // (via + clearance) further; to either side by the pad's pitch in its row (half a via pitch for an
+    // end without neighbours); the ring around one via pitch out of that
     auto spots = [&]( BOARD_CONNECTED_ITEM* aEnd, const VECTOR2I& aPos, const VECTOR2I& aToward )
     {
-        std::vector<VECTOR2I> inward, outward, around;
+        std::vector<VECTOR2I>   inward, outward, around;
+        const PCB_LAYER_ID      viaLayer = aEnd->Type() == PCB_PAD_T ? static_cast<PAD*>( aEnd )->GetPrincipalLayer()
+                                                                     : aEnd->GetLayer();
+        const KOPENAPI_RULE_VIA via = KopenapiRuleVia( board, aEnd->GetNetCode(), aPos, viaLayer );
+        const double            clear = via.dia / 2.0 + via.clearance;
+        const double            step = via.dia + via.clearance;
+        double                  aside = step / 2.0;
+
+        if( aEnd->Type() == PCB_PAD_T && static_cast<PAD*>( aEnd )->GetParentFootprint() )
+        {
+            if( const double pitch = pitchOf( static_cast<PAD*>( aEnd ) ); pitch < std::numeric_limits<double>::max() )
+                aside = pitch;
+        }
+
+        profile.viaSpotRings[{ KiROUND( clear ), KiROUND( step ) }]++;
         const int             grid = pcbIUScale.mmToIU( 0.05 );
         auto                  snap = [&]( const VECTOR2D& p )
         {
@@ -5516,13 +5537,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             const double   half = std::abs( dir.x ) > 0 ? box.GetWidth() / 2.0 : box.GetHeight() / 2.0;
             const VECTOR2D across( -dir.y, dir.x );
 
-            for( double d : { 0.45, 0.75, 1.1, 1.6 } )
+            for( int ring = 0; ring < 4; ++ring )
             {
-                for( double side : { 0.0, 0.4, -0.4, 0.8, -0.8 } )
-                {
-                    outward.push_back( snap( VECTOR2D( aPos ) + dir * ( half + pcbIUScale.mmToIU( d ) )
-                                             + across * pcbIUScale.mmToIU( side ) ) );
-                }
+                for( int side : { 0, 1, -1, 2, -2 } )
+                    outward.push_back( snap( VECTOR2D( aPos ) + dir * ( half + clear + ring * step ) + across * ( side * aside ) ) );
             }
 
             if( auto it = inwardParts.find( fp ); it != inwardParts.end() && pad != it->second )
@@ -5530,7 +5548,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
 
         const BOX2I box = aEnd->GetBoundingBox();
-        const int   reach = std::max( box.GetWidth(), box.GetHeight() ) / 2 + pcbIUScale.mmToIU( 1.3 );
+        const int   reach = std::max( box.GetWidth(), box.GetHeight() ) / 2 + KiROUND( clear + step );
 
         for( int k = 0; k < 8; ++k )
         {
@@ -5540,6 +5558,27 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         auto byTarget = [&]( const VECTOR2I& x, const VECTOR2I& y )
         { return ( x - aToward ).EuclideanNorm() < ( y - aToward ).EuclideanNorm(); };
+
+        // inside the ring of a package's pads (pads of it on both sides across and along): a way in,
+        // which only inward_escapes opens
+        auto insideRing = [&]( const VECTOR2I& aAt )
+        {
+            if( aEnd->Type() != PCB_PAD_T || !static_cast<PAD*>( aEnd )->GetParentFootprint() )
+                return false;
+
+            bool left = false, right = false, above = false, below = false;
+
+            for( PAD* q : static_cast<PAD*>( aEnd )->GetParentFootprint()->Pads() )
+            {
+                const VECTOR2I c = q->GetPosition();
+                left |= c.x < aAt.x;
+                right |= c.x > aAt.x;
+                above |= c.y < aAt.y;
+                below |= c.y > aAt.y;
+            }
+
+            return left && right && above && below;
+        };
 
         auto unusable = [&]( const VECTOR2I& aAt )
         {
@@ -5569,7 +5608,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         inward.erase( std::remove_if( inward.begin(), inward.end(), unusable ), inward.end() );
         outward.erase( std::remove_if( outward.begin(), outward.end(), unusable ), outward.end() );
-        around.erase( std::remove_if( around.begin(), around.end(), unusable ), around.end() );
+        around.erase( std::remove_if( around.begin(), around.end(),
+                                      [&]( const VECTOR2I& p ) { return insideRing( p ) || unusable( p ); } ),
+                      around.end() );
         std::stable_sort( around.begin(), around.end(), byTarget );
 
         std::vector<VECTOR2I> out;
@@ -5588,6 +5629,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         for( size_t i = 0; i < around.size() && i < 3; ++i )
             out.push_back( around[i] );
 
+        profile.viaSpotsOffered += (int) out.size();
         return out;
     };
 
@@ -5658,14 +5700,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         {
             JOB&                                  job;
             ROUTE_PROFILE&                        prof;
+            int&                                  tries;
+            int                                   triesFrom = tries;
             long                                  outer = prof.job;
             std::chrono::steady_clock::time_point from = std::chrono::steady_clock::now();
             ~TIMED()
             {
                 job.ms += msSince( from );
+                job.triesAll += tries - triesFrom;
                 prof.job = outer;
             }
-        } timed{ aJob, profile };
+        } timed{ aJob, profile, aTries };
 
         profile.job = &aJob - jobs.data();
         aJob.laneRouted = false;
@@ -6176,7 +6221,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
 
         // a walkaround that never got away from the start pad (it heads for the target and the pad's
-        // side that way is shut): a corner 1 mm out of each free side of the pad, the outward side first
+        // side that way is shut): a corner out of each free side of the pad, the outward side first, as
+        // far as a track of the net as wide as the rules ask stands clear of the pad's edge at the
+        // net's clearance
         auto exitTry = [&]()
         {
             if( ok || rail || ways.empty() || boxed == 2 || !aAttempt.contains( "stopped_at_mm" ) )
@@ -6188,10 +6235,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             const VECTOR2I stop( pcbIUScale.mmToIU( aAttempt["stopped_at_mm"][0].get<double>() ),
                                  pcbIUScale.mmToIU( aAttempt["stopped_at_mm"][1].get<double>() ) );
             const VECTOR2I size = pad->GetSize( PADSTACK::ALL_LAYERS );
-            const int      reach = pcbIUScale.mmToIU( 1.0 );   // how far out of the pad the corners stand
+            const int      width = KopenapiRuleTrack( board, pad->GetNetCode(), at, pad->GetPrincipalLayer() ).opt;
+            const int      clearance = KopenapiRuleVia( board, pad->GetNetCode(), at, pad->GetPrincipalLayer() ).clearance;
+            const int      reach = width / 2 + clearance;
 
-            // stopped on the pad or nearer it than the corners: they give the walk another start
-            if( ( stop - at ).EuclideanNorm() > std::max( size.x, size.y ) / 2.0 + reach )
+            // stopped on the pad or less than a track and its clearance on both sides off it: the walk
+            // never got away, the corners give it another start
+            if( ( stop - at ).EuclideanNorm() > std::max( size.x, size.y ) / 2.0 + width + 2 * clearance )
                 return;
 
             const VECTOR2I centre = pad->GetParentFootprint() ? pad->GetParentFootprint()->GetPosition() : at;
@@ -6225,7 +6275,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             const PCB_LAYER_ID   layer = pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
 
             if( !exits.empty() )
+            {
                 profile.padExitsTried++;
+                profile.padExitReach[reach]++;
+            }
 
             for( const auto& [score, corner] : exits )
             {
@@ -6337,10 +6390,21 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 return std::abs( d.x ) <= pcbIUScale.mmToIU( 0.05 ) && std::abs( d.y ) <= pcbIUScale.mmToIU( 0.05 );
             };
 
-            auto stoppedShort = [&]( const VECTOR2I& aVia )
+            // the room a via of the net takes (half its size and its clearance, by the rules): a leg
+            // that stopped outside that room round every second via reaches none of them; two stops
+            // within it are the same spot
+            const PCB_LAYER_ID viaLayer = way.from->GetPrincipalLayer();
+            const KOPENAPI_RULE_VIA viaRule = KopenapiRuleVia( board, way.from->GetNetCode(), way.toPos, viaLayer );
+            const double       viaRoom = viaRule.dia / 2.0 + viaRule.clearance;
+
+            auto stoppedShort = [&]( const VECTOR2I& )
             {
-                return aAttempt.contains( "stopped_at_mm" ) && !aAttempt.value( "routed", false )
-                       && ( stopOf() - aVia ).EuclideanNorm() > pcbIUScale.mmToIU( 3.0 );
+                if( !aAttempt.contains( "stopped_at_mm" ) || aAttempt.value( "routed", false ) )
+                    return false;
+
+                const VECTOR2I at = stopOf();
+                return std::none_of( ends.begin(), ends.end(),
+                                     [&]( const VECTOR2I& e ) { return ( at - e ).EuclideanNorm() <= viaRoom; } );
             };
 
             auto stoppedAfter = [&]()
@@ -6446,7 +6510,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         {
                             const VECTOR2I at = stopOf();
                             crossShut = std::any_of( crossStops.begin(), crossStops.end(), [&]( const VECTOR2I& p )
-                                                     { return ( p - at ).EuclideanNorm() <= pcbIUScale.mmToIU( 0.5 ); } );
+                                                     { return ( p - at ).EuclideanNorm() <= viaRoom; } );
                             crossStops.push_back( at );
                             deadCrossing.insert( { va.x, va.y } );
                         }
@@ -13149,6 +13213,21 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         pairsOut.push_back( row );
     }
 
+    // the via spots by the rules' via of each end: how many ends got each ring {first, step}, and how
+    // far out of the pad the walk restarts stood
+    auto viaSpotsJson = [&]()
+    {
+        nlohmann::json rings = nlohmann::json::array(), exits = nlohmann::json::array();
+
+        for( const auto& [size, ends] : profile.viaSpotRings )
+            rings.push_back( { { "first_mm", toMm( size.first ) }, { "step_mm", toMm( size.second ) }, { "ends", ends } } );
+
+        for( const auto& [reach, n] : profile.padExitReach )
+            exits.push_back( { { "reach_mm", toMm( reach ) }, { "restarts", n } } );
+
+        return nlohmann::json{ { "offered", profile.viaSpotsOffered }, { "rings", rings }, { "pad_exit_corners", exits } };
+    };
+
     nlohmann::json answer = { { "connections", connections },
                               { "routed", routed },
                               { "failed", connections - routed },
@@ -13190,6 +13269,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                              { "via_spots_blocked", profile.viaSpotsBlocked },
                                              { "via_spots_off_board", profile.viaSpotsOffBoard },
                                              { "via_spots_in_escapes", profile.viaSpotsInEscapes },
+                                             { "via_spots", viaSpotsJson() },
                                              { "rip_ups_skipped", profile.ripUpsSkipped },
                                              { "rip_ups_planned", profile.ripUpsPlanned },
                                              { "rip_ups_walled", profile.ripUpsWalled },
@@ -13232,9 +13312,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     if( !doubled.empty() )
         cap.Put( answer, "doubled", std::move( doubled ) );
-    for( size_t k = 0; keepTries && k < jobs.size(); ++k )
+    for( size_t k = 0; k < jobs.size(); ++k )
     {
-        if( rowOf[k] >= 0 && !jobs[k].tried.empty() )
+        if( rowOf[k] >= 0 && jobs[k].triesAll > results[rowOf[k]].value( "tries", 0 ) )
+            results[rowOf[k]]["tries"] = jobs[k].triesAll;
+
+        if( keepTries && rowOf[k] >= 0 && !jobs[k].tried.empty() )
             results[rowOf[k]]["attempts"] = std::move( jobs[k].tried );
     }
 
