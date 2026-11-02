@@ -28,6 +28,7 @@
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
 #include <project/net_settings.h>
+#include <geometry/direction45.h>
 #include <geometry/shape_circle.h>
 #include <geometry/shape_segment.h>
 #include <connectivity/connectivity_algo.h>
@@ -6955,9 +6956,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     }
 
-    // legs between two laid lanes whose fronts face each other: a straight run, one 45 degree jog across, a
-    // straight run; the jogs of a bus staggered by (sqrt 2 - 1) pitch per track from the inside of the turn,
-    // so the legs lie side by side at their pitch through the jog too
+    // legs between two laid lanes whose fronts face each other (their last runs snap to opposite directions
+    // of the 45 degree grid): a straight run, one 45 degree jog across, a straight run; the jogs of a bus
+    // staggered by (sqrt 2 - 1) pitch per track from the inside of the turn, so the legs lie side by side at
+    // their pitch through the jog too
     if( lanesOn && lanesLaid > 0 )
     {
         struct LEG
@@ -7001,11 +7003,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( u.EuclideanNorm() <= 0 || w.EuclideanNorm() <= 0 )
                 continue;
 
-            u = u.Resize( 1.0 );
-            w = w.Resize( 1.0 );
+            const DIRECTION_45 du( VECTOR2I( KiROUND( u.x ), KiROUND( u.y ) ) );
+            const DIRECTION_45 dw( VECTOR2I( KiROUND( w.x ), KiROUND( w.y ) ) );
 
-            if( u.Dot( w ) > -0.999 )
+            if( !du.IsDefined() || dw != du.Opposite() )
                 continue;
+
+            const double octant = std::round( std::atan2( u.y, u.x ) / ( M_PI / 4 ) ) * ( M_PI / 4 );
+            u = VECTOR2D( std::cos( octant ), std::sin( octant ) );
 
             const VECTOR2D n( -u.y, u.x );
             const double   along = ( F - N ).Dot( u );
