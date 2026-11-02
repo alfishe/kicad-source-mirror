@@ -238,6 +238,31 @@ private:
             aText.replace( at + 2, end - at - 2, "_" );
         }
 
+        // MinGW / MSVC print %p without the prefix, zero-padded to the pointer width
+        const size_t width = 2 * sizeof( void* );
+
+        for( size_t at = 0; at < aText.size(); )
+        {
+            if( !std::isxdigit( (unsigned char) aText[at] ) || ( at > 0 && std::isalnum( (unsigned char) aText[at - 1] ) ) )
+            {
+                at++;
+                continue;
+            }
+
+            size_t end = at;
+
+            while( end < aText.size() && std::isxdigit( (unsigned char) aText[end] ) )
+                end++;
+
+            if( end - at == width && ( end == aText.size() || !std::isalnum( (unsigned char) aText[end] ) ) )
+            {
+                aText.replace( at, width, "0x_" );
+                end = at + 3;
+            }
+
+            at = end;
+        }
+
         return aText;
     }
 
