@@ -62,6 +62,7 @@ using namespace std::placeholders;
 #include <board.h>
 #include <constraints/board_constraint_adapter.h>
 #include <constraints/constraint_builder.h>
+#include <polygon_corner_edit.h>
 #include <footprint_editor_settings.h>
 #include <connectivity/connectivity_data.h>
 #include <progress_reporter.h>
@@ -2145,37 +2146,13 @@ void PCB_POINT_EDITOR::Reset( RESET_REASON aReason )
 
 bool PCB_POINT_EDITOR::CanAddCorner( const EDA_ITEM& aItem )
 {
-    const KICAD_T type = aItem.Type();
-
-    if( type == PCB_ZONE_T )
-        return true;
-
-    if( type == PCB_SHAPE_T )
-    {
-        const PCB_SHAPE& shape = static_cast<const PCB_SHAPE&>( aItem );
-        const SHAPE_T    shapeType = shape.GetShape();
-        return shapeType == SHAPE_T::SEGMENT || shapeType == SHAPE_T::POLY || shapeType == SHAPE_T::ARC;
-    }
-
-    return false;
+    return CanAddShapeCorner( aItem );
 }
 
 
 bool PCB_POINT_EDITOR::CanChamferCorner( const EDA_ITEM& aItem )
 {
-    const auto type = aItem.Type();
-
-    if( type == PCB_ZONE_T )
-        return true;
-
-    if( type == PCB_SHAPE_T )
-    {
-        const PCB_SHAPE& shape = static_cast<const PCB_SHAPE&>( aItem );
-        const SHAPE_T    shapeType = shape.GetShape();
-        return shapeType == SHAPE_T::POLY;
-    }
-
-    return false;
+    return CanChamferShapeCorner( aItem );
 }
 
 
@@ -3778,52 +3755,21 @@ bool PCB_POINT_EDITOR::CanRemoveCorner( const SELECTION& )
     if( !m_editPoints || !m_editedPoint )
         return false;
 
-    EDA_ITEM*       item = m_editPoints->GetParent();
-    SHAPE_POLY_SET* polyset = nullptr;
-
-    if( !item )
-        return false;
-
-    switch( item->Type() )
-    {
-    case PCB_ZONE_T:
-        polyset = static_cast<ZONE*>( item )->Outline();
-        break;
-
-    case PCB_SHAPE_T:
-        if( static_cast<PCB_SHAPE*>( item )->GetShape() == SHAPE_T::POLY )
-            polyset = &static_cast<PCB_SHAPE*>( item )->GetPolyShape();
-        else
-            return false;
-
-        break;
-
-    default:
-        return false;
-    }
-
-    std::pair<bool, SHAPE_POLY_SET::VERTEX_INDEX> vertex = findVertex( *polyset, *m_editedPoint );
-
-    if( !vertex.first )
-        return false;
-
-    const SHAPE_POLY_SET::VERTEX_INDEX& vertexIdx = vertex.second;
-
-    // Check if there are enough vertices so one can be removed without
-    // degenerating the polygon.
-    // The first condition allows one to remove all corners from holes (when
-    // there are only 2 vertices left, a hole is removed).
-    if( vertexIdx.m_contour == 0
-            && polyset->Polygon( vertexIdx.m_polygon )[vertexIdx.m_contour].PointCount() <= 3 )
-    {
-        return false;
-    }
-
     // Remove corner does not work with lines
     if( dynamic_cast<EDIT_LINE*>( m_editedPoint ) )
         return false;
 
-    return m_editedPoint != nullptr;
+    EDA_ITEM*       item = m_editPoints->GetParent();
+    SHAPE_POLY_SET* polyset = EditableCornerOutline( item );
+
+    if( !polyset )
+        return false;
+
+    std::pair<bool, SHAPE_POLY_SET::VERTEX_INDEX> vertex = findVertex( *polyset, *m_editedPoint );
+    int                                           globalIdx = -1;
+
+    return vertex.first && polyset->GetGlobalIndex( vertex.second, globalIdx )
+           && CanRemoveShapeCorner( item, globalIdx );
 }
 
 
@@ -3840,137 +3786,12 @@ int PCB_POINT_EDITOR::addCorner( const TOOL_EVENT& aEvent )
     if( !item || !CanAddCorner( *item ) )
         return 0;
 
-    PCB_SHAPE* graphicItem = dynamic_cast<PCB_SHAPE*>( item );
     BOARD_COMMIT commit( frame );
 
-    if( item->Type() == PCB_ZONE_T || ( graphicItem && graphicItem->GetShape() == SHAPE_T::POLY ) )
+    if( std::optional<wxString> done = AddShapeCorner( frame->GetBoard(), static_cast<BOARD_ITEM*>( item ), cursorPos,
+                                                       commit ) )
     {
-        unsigned int nearestIdx = 0;
-        unsigned int nextNearestIdx = 0;
-        unsigned int nearestDist = INT_MAX;
-        unsigned int firstPointInContour = 0;
-        SHAPE_POLY_SET* zoneOutline;
-
-        if( item->Type() == PCB_ZONE_T )
-        {
-            ZONE* zone = static_cast<ZONE*>( item );
-            zoneOutline = zone->Outline();
-            zone->SetNeedRefill( true );
-        }
-        else
-        {
-            zoneOutline = &( graphicItem->GetPolyShape() );
-        }
-
-        commit.Modify( item );
-
-        // Search the best outline segment to add a new corner
-        // and therefore break this segment into two segments
-
-        // Object to iterate through the corners of the outlines (main contour and its holes)
-        SHAPE_POLY_SET::ITERATOR iterator = zoneOutline->Iterate( 0, zoneOutline->OutlineCount()-1,
-                                                                  /* IterateHoles */ true );
-        int curr_idx = 0;
-
-        // Iterate through all the corners of the outlines and search the best segment
-        for( ; iterator; iterator++, curr_idx++ )
-        {
-            int jj = curr_idx+1;
-
-            if( iterator.IsEndContour() )
-            {   // We reach the last point of the current contour (main or hole)
-                jj = firstPointInContour;
-                firstPointInContour = curr_idx+1;     // Prepare next contour analysis
-            }
-
-            SEG curr_segment( zoneOutline->CVertex( curr_idx ), zoneOutline->CVertex( jj ) );
-
-            unsigned int distance = curr_segment.Distance( cursorPos );
-
-            if( distance < nearestDist )
-            {
-                nearestDist = distance;
-                nearestIdx = curr_idx;
-                nextNearestIdx = jj;
-            }
-        }
-
-        // Find the point on the closest segment
-        const VECTOR2I& sideOrigin = zoneOutline->CVertex( nearestIdx );
-        const VECTOR2I& sideEnd = zoneOutline->CVertex( nextNearestIdx );
-        SEG             nearestSide( sideOrigin, sideEnd );
-        VECTOR2I        nearestPoint = nearestSide.NearestPoint( cursorPos );
-
-        // Do not add points that have the same coordinates as ones that already belong to polygon
-        // instead, add a point in the middle of the side
-        if( nearestPoint == sideOrigin || nearestPoint == sideEnd )
-            nearestPoint = ( sideOrigin + sideEnd ) / 2;
-
-        zoneOutline->InsertVertex( nextNearestIdx, nearestPoint );
-
-        // Zones cannot carry constraint members but shape polygons can insertion shifts ordinals at or
-        // past new vertex issue 2329 members only exist on hole free polys index past outline count is a hole vertex
-        if( graphicItem && nextNearestIdx < (unsigned) zoneOutline->COutline( 0 ).PointCount() )
-        {
-            RemapPolygonVertexMembers( frame->GetBoard(), graphicItem->m_Uuid, (int) nextNearestIdx, 1,
-                                       [&]( BOARD_ITEM* aConstraint ) { commit.Modify( aConstraint ); },
-                                       [&]( BOARD_ITEM* aConstraint ) { commit.Remove( aConstraint ); } );
-        }
-
-        if( item->Type() == PCB_ZONE_T )
-            static_cast<ZONE*>( item )->HatchBorder();
-
-        commit.Push( _( "Add Zone Corner" ) );
-    }
-    else if( graphicItem )
-    {
-        switch( graphicItem->GetShape() )
-        {
-        case SHAPE_T::SEGMENT:
-        {
-            commit.Modify( graphicItem );
-
-            SEG      seg( graphicItem->GetStart(), graphicItem->GetEnd() );
-            VECTOR2I nearestPoint = seg.NearestPoint( cursorPos );
-
-            // Move the end of the line to the break point..
-            graphicItem->SetEnd( nearestPoint );
-
-            // and add another one starting from the break point
-            PCB_SHAPE* newSegment = static_cast<PCB_SHAPE*>( graphicItem->Duplicate( true, &commit ) );
-            newSegment->ClearSelected();
-            newSegment->SetStart( nearestPoint );
-            newSegment->SetEnd( VECTOR2I( seg.B.x, seg.B.y ) );
-
-            commit.Add( newSegment );
-            commit.Push( _( "Split Segment" ) );
-            break;
-        }
-        case SHAPE_T::ARC:
-        {
-            commit.Modify( graphicItem );
-
-            const SHAPE_ARC arc( graphicItem->GetStart(), graphicItem->GetArcMid(), graphicItem->GetEnd(), 0 );
-            const VECTOR2I  nearestPoint = arc.NearestPoint( cursorPos );
-
-            // Move the end of the arc to the break point..
-            graphicItem->SetEnd( nearestPoint );
-
-            // and add another one starting from the break point
-            PCB_SHAPE* newArc = static_cast<PCB_SHAPE*>( graphicItem->Duplicate( true, &commit ) );
-
-            newArc->ClearSelected();
-            newArc->SetEnd( arc.GetP1() );
-            newArc->SetStart( nearestPoint );
-
-            commit.Add( newArc );
-            commit.Push( _( "Split Arc" ) );
-            break;
-        }
-        default:
-            // No split implemented for other shapes
-            break;
-        }
+        commit.Push( *done );
     }
 
     updatePoints();
@@ -3983,81 +3804,31 @@ int PCB_POINT_EDITOR::removeCorner( const TOOL_EVENT& aEvent )
     if( !m_editPoints || !m_editedPoint )
         return 0;
 
-    EDA_ITEM* item = m_editPoints->GetParent();
-
-    if( !item )
-        return 0;
-
-    SHAPE_POLY_SET* polygon = nullptr;
-
-    if( item->Type() == PCB_ZONE_T )
-    {
-        ZONE* zone = static_cast<ZONE*>( item );
-        polygon = zone->Outline();
-        zone->SetNeedRefill( true );
-    }
-    else if( item->Type() == PCB_SHAPE_T )
-    {
-        PCB_SHAPE* shape = static_cast<PCB_SHAPE*>( item );
-
-        if( shape->GetShape() == SHAPE_T::POLY )
-            polygon = &shape->GetPolyShape();
-    }
+    EDA_ITEM*       item = m_editPoints->GetParent();
+    SHAPE_POLY_SET* polygon = EditableCornerOutline( item );
 
     if( !polygon )
         return 0;
 
     PCB_BASE_FRAME* frame = getEditFrame<PCB_BASE_FRAME>();
-    BOARD_COMMIT commit( frame );
-    auto vertex = findVertex( *polygon, *m_editedPoint );
+    BOARD_COMMIT    commit( frame );
+    auto            vertex = findVertex( *polygon, *m_editedPoint );
+    int             globalIdx = -1;
 
-    if( vertex.first )
+    if( vertex.first && polygon->GetGlobalIndex( vertex.second, globalIdx ) )
     {
-        const auto& vertexIdx = vertex.second;
-        auto& outline = polygon->Polygon( vertexIdx.m_polygon )[vertexIdx.m_contour];
+        CORNER_REMOVAL removal = CORNER_REMOVAL::CORNER;
 
-        if( outline.PointCount() > 3 )
+        if( std::optional<wxString> done = RemoveShapeCorner( frame->GetBoard(), static_cast<BOARD_ITEM*>( item ),
+                                                              globalIdx, commit, &removal ) )
         {
-            // the usual case: remove just the corner when there are >3 vertices
-            commit.Modify( item );
-            polygon->RemoveVertex( vertexIdx );
-
-            // Members only exist on hole free shape polygons where contour relative ordinal is member
-            // index removed vertex member retires its constraint later ordinals shift down issue 2329
-            if( item->Type() == PCB_SHAPE_T && vertexIdx.m_contour == 0 )
-            {
-                RemapPolygonVertexMembers( frame->GetBoard(), item->m_Uuid, vertexIdx.m_vertex, -1,
-                                           [&]( BOARD_ITEM* aConstraint ) { commit.Modify( aConstraint ); },
-                                           [&]( BOARD_ITEM* aConstraint ) { commit.Remove( aConstraint ); } );
-            }
-        }
-        else
-        {
-            // either remove a hole or the polygon when there are <= 3 corners
-            if( vertexIdx.m_contour > 0 )
-            {
-                // remove hole
-                commit.Modify( item );
-                polygon->RemoveContour( vertexIdx.m_contour );
-            }
-            else
-            {
+            if( removal == CORNER_REMOVAL::ITEM )
                 m_toolMgr->RunAction( ACTIONS::selectionClear );
-                commit.Remove( item );
-            }
+
+            setEditedPoint( nullptr );
+            commit.Push( *done );
+            updatePoints();
         }
-
-        setEditedPoint( nullptr );
-
-        if( item->Type() == PCB_ZONE_T )
-            commit.Push( _( "Remove Zone Corner" ) );
-        else
-            commit.Push( _( "Remove Polygon Corner" ) );
-
-        if( item->Type() == PCB_ZONE_T )
-            static_cast<ZONE*>( item )->HatchBorder();
-
-        updatePoints();
     }
 
     return 0;
@@ -4071,100 +3842,20 @@ int PCB_POINT_EDITOR::chamferCorner( const TOOL_EVENT& aEvent )
 
     EDA_ITEM* item = m_editPoints->GetParent();
 
-    if( !item )
+    if( !EditableCornerOutline( item ) )
         return 0;
-
-    SHAPE_POLY_SET* polygon = nullptr;
-
-    if( item->Type() == PCB_ZONE_T )
-    {
-        ZONE* zone = static_cast<ZONE*>( item );
-        polygon = zone->Outline();
-        zone->SetNeedRefill( true );
-    }
-    else if( item->Type() == PCB_SHAPE_T )
-    {
-        PCB_SHAPE* shape = static_cast<PCB_SHAPE*>( item );
-
-        if( shape->GetShape() == SHAPE_T::POLY )
-            polygon = &shape->GetPolyShape();
-    }
-
-    if( !polygon )
-        return 0;
-
-    // Search the best outline corner to break
 
     PCB_BASE_FRAME* frame = getEditFrame<PCB_BASE_FRAME>();
     BOARD_COMMIT    commit( frame );
     const VECTOR2I& cursorPos = getViewControls()->GetCursorPosition();
 
-    unsigned int nearestIdx = 0;
-    unsigned int nearestDist = INT_MAX;
-
-    int curr_idx = 0;
-    // Object to iterate through the corners of the outlines (main contour and its holes)
-    SHAPE_POLY_SET::ITERATOR iterator = polygon->Iterate( 0, polygon->OutlineCount() - 1,
-                                                          /* IterateHoles */ true );
-
-    // Iterate through all the corners of the outlines and search the best segment
-    for( ; iterator; iterator++, curr_idx++ )
-    {
-        unsigned int distance = polygon->CVertex( curr_idx ).Distance( cursorPos );
-
-        if( distance < nearestDist )
-        {
-            nearestDist = distance;
-            nearestIdx = curr_idx;
-        }
-    }
-
-    int prevIdx, nextIdx;
-    if( polygon->GetNeighbourIndexes( nearestIdx, &prevIdx, &nextIdx ) )
-    {
-        const SEG segA{ polygon->CVertex( prevIdx ), polygon->CVertex( nearestIdx ) };
-        const SEG segB{ polygon->CVertex( nextIdx ), polygon->CVertex( nearestIdx ) };
-
-        // A plausible setback that won't consume a whole edge
-        int setback = pcbIUScale.mmToIU( 5 );
-        setback = std::min( setback, (int) ( segA.Length() * 0.25 ) );
-        setback = std::min( setback, (int) ( segB.Length() * 0.25 ) );
-
-        CHAMFER_PARAMS chamferParams{ setback, setback };
-
-        std::optional<CHAMFER_RESULT> chamferResult = ComputeChamferPoints( segA, segB, chamferParams );
-
-        if( chamferResult && chamferResult->m_updated_seg_a && chamferResult->m_updated_seg_b )
-        {
-            commit.Modify( item );
-            polygon->RemoveVertex( nearestIdx );
-
-            // The two end points of the chamfer are the new corners
-            polygon->InsertVertex( nearestIdx, chamferResult->m_updated_seg_b->B );
-            polygon->InsertVertex( nearestIdx, chamferResult->m_updated_seg_a->B );
-
-            // Chamfered corner constraints retire members past it net one higher insert pass must run
-            // first threshold nearestIdx plus 1 deleting first nets negative one instead issue 2329
-            if( item->Type() == PCB_SHAPE_T && nearestIdx < (unsigned) polygon->COutline( 0 ).PointCount() )
-            {
-                auto modify = [&]( BOARD_ITEM* aConstraint ) { commit.Modify( aConstraint ); };
-                auto remove = [&]( BOARD_ITEM* aConstraint ) { commit.Remove( aConstraint ); };
-
-                RemapPolygonVertexMembers( frame->GetBoard(), item->m_Uuid, (int) nearestIdx + 1, 2, modify, remove );
-                RemapPolygonVertexMembers( frame->GetBoard(), item->m_Uuid, (int) nearestIdx, -1, modify, remove );
-            }
-        }
-    }
+    std::optional<wxString> done = ChamferShapeCorner( frame->GetBoard(), static_cast<BOARD_ITEM*>( item ), cursorPos,
+                                                       commit );
 
     setEditedPoint( nullptr );
 
-    if( item->Type() == PCB_ZONE_T )
-        commit.Push( _( "Break Zone Corner" ) );
-    else
-        commit.Push( _( "Break Polygon Corner" ) );
-
-    if( item->Type() == PCB_ZONE_T )
-        static_cast<ZONE*>( item )->HatchBorder();
+    if( done )
+        commit.Push( *done );
 
     updatePoints();
 

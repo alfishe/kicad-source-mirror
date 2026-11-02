@@ -28,8 +28,17 @@ class FOOTPRINT;
 class PAD;
 class FP_3DMODEL;
 class PCB_CONTEXT;
+class PCB_SHAPE;
 class PROJECT;
+class SHAPE_POLY_SET;
 
+
+/// @brief A polygon set's contours in mm, each [[x, y], ...]: every polygon's outline, then its holes
+nlohmann::json KopenapiContoursMm( const SHAPE_POLY_SET& aPoly );
+
+/// @brief A graphic shape's geometry in mm: points_mm (line, rect: start, end; arc: start, mid,
+/// end; bezier: start, two controls, end), circles centre_mm and radius_mm, polygons contours_mm
+void KopenapiShapeGeometry( const PCB_SHAPE& aShape, nlohmann::json& aRow );
 
 /// @brief The open board's context, or nullptr when no board is open
 std::shared_ptr<PCB_CONTEXT> KopenapiPcbContext( KOPENAPI_CONTEXT& aCtx );

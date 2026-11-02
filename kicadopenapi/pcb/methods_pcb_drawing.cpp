@@ -340,6 +340,64 @@ std::optional<KOPENAPI_RESULT> lockedRefusal( const std::vector<BOARD_ITEM*>& aI
 } // namespace
 
 
+nlohmann::json KopenapiContoursMm( const SHAPE_POLY_SET& aPoly )
+{
+    auto           mm = []( int v ) { return std::round( v / pcbIUScale.IU_PER_MM * 10000 ) / 10000; };
+    nlohmann::json contours = nlohmann::json::array();
+
+    for( int o = 0; o < aPoly.OutlineCount(); ++o )
+    {
+        for( int c = 0; c < 1 + aPoly.HoleCount( o ); ++c )
+        {
+            nlohmann::json pts = nlohmann::json::array();
+
+            for( const VECTOR2I& pt : ( c == 0 ? aPoly.COutline( o ) : aPoly.CHole( o, c - 1 ) ).CPoints() )
+                pts.push_back( { mm( pt.x ), mm( pt.y ) } );
+
+            contours.push_back( pts );
+        }
+    }
+
+    return contours;
+}
+
+
+void KopenapiShapeGeometry( const PCB_SHAPE& aShape, nlohmann::json& aRow )
+{
+    auto mm = []( int v ) { return std::round( v / pcbIUScale.IU_PER_MM * 10000 ) / 10000; };
+    auto pt = [&]( const VECTOR2I& p ) { return nlohmann::json::array( { mm( p.x ), mm( p.y ) } ); };
+
+    switch( aShape.GetShape() )
+    {
+    case SHAPE_T::SEGMENT:
+    case SHAPE_T::RECTANGLE:
+        aRow["points_mm"] = { pt( aShape.GetStart() ), pt( aShape.GetEnd() ) };
+        break;
+
+    case SHAPE_T::ARC:
+        aRow["points_mm"] = { pt( aShape.GetStart() ), pt( aShape.GetArcMid() ), pt( aShape.GetEnd() ) };
+        break;
+
+    case SHAPE_T::BEZIER:
+        aRow["points_mm"] = { pt( aShape.GetStart() ), pt( aShape.GetBezierC1() ), pt( aShape.GetBezierC2() ),
+                              pt( aShape.GetEnd() ) };
+        break;
+
+    case SHAPE_T::CIRCLE:
+        aRow["centre_mm"] = pt( aShape.GetCenter() );
+        aRow["radius_mm"] = mm( aShape.GetRadius() );
+        break;
+
+    case SHAPE_T::POLY:
+        aRow["contours_mm"] = KopenapiContoursMm( aShape.GetPolyShape() );
+        break;
+
+    default:
+        break;
+    }
+}
+
+
 static KOPENAPI_RESULT h_pcb_drawing_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -350,6 +408,7 @@ static KOPENAPI_RESULT h_pcb_drawing_list( KOPENAPI_CONTEXT& aCtx, const nlohman
     BOARD*            board = context->GetBoard();
     const std::string layerName = aArgs.value( "layer", std::string() );
     const std::string kind = aArgs.value( "kind", std::string() );
+    const bool        geometry = aArgs.value( "geometry", false );
     nlohmann::json    items = nlohmann::json::array();
     auto              mm = []( int v ) { return std::round( v / pcbIUScale.IU_PER_MM * 100 ) / 100; };
 
@@ -391,6 +450,9 @@ static KOPENAPI_RESULT h_pcb_drawing_list( KOPENAPI_CONTEXT& aCtx, const nlohman
             row["shape"] = str( sh->ShowShape() );
             row["width_mm"] = mm( sh->GetWidth() );
             row["filled"] = sh->IsSolidFill();
+
+            if( geometry )
+                KopenapiShapeGeometry( *sh, row );
         }
         else
         {
@@ -603,9 +665,11 @@ static KOPENAPI_RESULT h_pcb_text_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
 KOPENAPI_REGISTER( "pcb_drawing_list",
                    "List the board's own drawings (not footprints'): texts (text, position, size, width, "
-                   "stroke, angle, drawn box ink_mm) and shapes (shape, stroke, fill) with uuid, layer and box; "
-                   "filter by layer and kind",
+                   "stroke, angle, drawn box ink_mm) and shapes (shape, stroke, fill; with geometry their "
+                   "points_mm / centre_mm and radius_mm / contours_mm) with uuid, layer and box; filter by "
+                   "layer and kind",
                    R"json({"type":"object","properties":{
+                        "geometry":{"type":"boolean","default":false,"description":"shapes' points, circles' centre and radius, polygons' contours (outline, then holes)"},
                         "layer":{"type":"string","description":"e.g. F.SilkS or F.Silkscreen"},
                         "kind":{"type":"string","enum":["text","shape"]}}})json"_json,
                    false, h_pcb_drawing_list );

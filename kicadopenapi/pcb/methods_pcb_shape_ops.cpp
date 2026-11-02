@@ -20,6 +20,8 @@
 #include <pcb_group.h>
 #include <pcb_shape.h>
 #include <pcb_text.h>
+#include <polygon_corner_edit.h>
+#include <zone.h>
 #include <tool/tool_manager.h>
 #include <tools/item_modification_routine.h>
 
@@ -694,6 +696,171 @@ static KOPENAPI_RESULT h_pcb_duplicate( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 }
 
 
+static KOPENAPI_RESULT h_pcb_corner_edit( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*            board = context->GetBoard();
+    const std::string op = aArgs.value( "op", std::string() );
+
+    if( op != "add" && op != "remove" && op != "chamfer" )
+        return KOPENAPI_RESULT::Error( 400, "op: add, remove or chamfer" );
+
+    const std::string name = aArgs.value( "uuid", std::string() );
+    BOARD_ITEM*       item = name.empty() ? nullptr : KopenapiFindBoardItem( board, name );
+
+    if( !item )
+        return KOPENAPI_RESULT::Error( 404, "uuid: a zone or a board shape (pcb_zone_list, pcb_drawing_list)" );
+
+    const bool fits = op == "add" ? CanAddShapeCorner( *item ) : CanChamferShapeCorner( *item );
+
+    if( !fits || item->GetParentFootprint() )
+    {
+        KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error(
+                400, op == "add" ? "add takes zones, polygons, lines and arcs" : op + " takes zones and polygons" );
+        refused.body["kind"] = str( item->GetClass() );
+        return refused;
+    }
+
+    std::optional<VECTOR2I> at;
+
+    if( aArgs.contains( "at_mm" ) )
+    {
+        const nlohmann::json& p = aArgs["at_mm"];
+
+        if( !p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number() )
+            return KOPENAPI_RESULT::Error( 400, "at_mm: [x, y]" );
+
+        at = VECTOR2I( toIU( p[0].get<double>() ), toIU( p[1].get<double>() ) );
+    }
+
+    const bool byIndex = op == "remove" && aArgs.contains( "index" );
+
+    if( !at && !byIndex )
+        return KOPENAPI_RESULT::Error( 400, op == "remove" ? "at_mm (the nearest corner) or index" : "at_mm: [x, y]" );
+
+    if( std::optional<KOPENAPI_RESULT> refused = lockedRefusal( { item }, aArgs ) )
+        return *refused;
+
+    BOARD_COMMIT            commit( context->GetToolManager() );
+    std::optional<wxString> done;
+    nlohmann::json          answer = { { "uuid", str( item->m_Uuid.AsString() ) }, { "op", op } };
+    std::set<KIID>          before;
+
+    for( BOARD_ITEM* drawing : board->Drawings() )
+        before.insert( drawing->m_Uuid );
+
+    if( op == "add" )
+    {
+        done = AddShapeCorner( board, item, *at, commit );
+    }
+    else if( op == "remove" )
+    {
+        const int index = byIndex ? aArgs.value( "index", -1 ) : NearestShapeCorner( item, *at );
+        const int total = EditableCornerOutline( item )->TotalVertices();
+
+        if( index < 0 || index >= total )
+        {
+            KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 400, "index: 0 .. corners - 1" );
+            refused.body["corners"] = total;
+            return refused;
+        }
+
+        if( !CanRemoveShapeCorner( item, index ) )
+        {
+            KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error(
+                    409, "an outline keeps three corners (pcb_item_delete / pcb_zone_delete removes the item)" );
+            refused.body["index"] = index;
+            return refused;
+        }
+
+        CORNER_REMOVAL removal = CORNER_REMOVAL::CORNER;
+        done = RemoveShapeCorner( board, item, index, commit, &removal );
+        answer["index"] = index;
+        answer["removed"] = removal == CORNER_REMOVAL::CORNER ? "corner" : removal == CORNER_REMOVAL::HOLE ? "hole" : "item";
+    }
+    else
+    {
+        std::optional<int> setback;
+
+        if( aArgs.contains( "setback_mm" ) )
+        {
+            const double mm = aArgs.value( "setback_mm", 0.0 );
+
+            if( mm <= 0 )
+                return KOPENAPI_RESULT::Error( 400, "setback_mm must be positive" );
+
+            setback = toIU( mm );
+        }
+
+        bool chamfered = false;
+        done = ChamferShapeCorner( board, item, *at, commit, setback, &chamfered );
+
+        if( !chamfered )
+        {
+            commit.Revert();
+            return KOPENAPI_RESULT::Error( 422, "chamfer: the setback does not fit the corner's sides" );
+        }
+    }
+
+    if( !done )
+    {
+        commit.Revert();
+        return KOPENAPI_RESULT::Error( 422, op + ": nothing changed" );
+    }
+
+    const bool itemGone = answer.value( "removed", std::string() ) == "item";
+    const bool isZone = item->Type() == PCB_ZONE_T;
+    const KIID id = item->m_Uuid;
+
+    answer["description"] = str( *done );
+
+    if( !itemGone )
+    {
+        if( SHAPE_POLY_SET* outline = EditableCornerOutline( item ) )
+        {
+            answer["corners"] = outline->TotalVertices();
+            answer["contours_mm"] = KopenapiContoursMm( *outline );
+        }
+        else if( auto* shape = dynamic_cast<PCB_SHAPE*>( item ) )
+        {
+            nlohmann::json row;
+            KopenapiShapeGeometry( *shape, row );
+            answer["points_mm"] = row["points_mm"];
+        }
+    }
+
+    commit.Push( wxString::Format( wxS( "%s (API)" ), *done ) );
+
+    for( BOARD_ITEM* drawing : board->Drawings() )
+    {
+        if( !before.count( drawing->m_Uuid ) )
+        {
+            nlohmann::json row = describe( drawing );
+
+            if( auto* s = dynamic_cast<PCB_SHAPE*>( drawing ) )
+            {
+                row["shape"] = str( s->ShowShape() );
+                KopenapiShapeGeometry( *s, row );
+            }
+
+            answer["created"].push_back( row );
+        }
+    }
+
+    if( isZone && !itemGone )
+        answer["needs_refill"] = true;
+
+    if( !itemGone )
+        glow( aCtx, { id } );
+
+    return KOPENAPI_RESULT::Ok( answer );
+}
+
+
 KOPENAPI_REGISTER( "pcb_shapes_edit",
                    "Edit board graphics like Edit > Shape Modification: merge / subtract / intersect "
                    "polygons, rectangles and circles (the first uuid is the base, subtract cuts the others "
@@ -749,4 +916,20 @@ KOPENAPI_REGISTER( "pcb_duplicate",
                         "increment":{"type":"integer","default":0}}})json"_json,
                    false, h_pcb_duplicate );
 
-KOPENAPI_MARK_EDITING( "pcb_shapes_edit", "pcb_array", "pcb_duplicate" );
+KOPENAPI_REGISTER( "pcb_corner_edit",
+                   "The point editor's corner edits on a zone (keepouts and rule areas too) or a board "
+                   "polygon: add a corner on the side nearest at_mm (a line or an arc is split there "
+                   "instead), remove the corner at index or nearest at_mm (a hole of three corners goes, "
+                   "an outline keeps three: 409), chamfer the corner nearest at_mm (setback_mm, default the "
+                   "GUI's 5 mm but at most a quarter of either side); vertex constraints follow; one undo "
+                   "step; answers the outline's corners and contours (zones need a refill)",
+                   R"json({"type":"object","required":["op","uuid"],"properties":{
+                        "op":{"type":"string","enum":["add","remove","chamfer"]},
+                        "uuid":{"type":"string","description":"a zone (pcb_zone_list) or a board shape (pcb_drawing_list)"},
+                        "at_mm":{"type":"array","items":{"type":"number"},"description":"[x, y]"},
+                        "index":{"type":"integer","description":"remove: the corner's index over the contours (outline, then holes)"},
+                        "setback_mm":{"type":"number","description":"chamfer setback"},
+                        "override_locks":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_corner_edit );
+
+KOPENAPI_MARK_EDITING( "pcb_shapes_edit", "pcb_corner_edit", "pcb_array", "pcb_duplicate" );
