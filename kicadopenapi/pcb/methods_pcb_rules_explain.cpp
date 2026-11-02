@@ -11,6 +11,7 @@
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
 #include <drc/drc_rule.h>
+#include <drc/drc_rule_condition.h>
 #include <footprint.h>
 #include <geometry/shape.h>
 #include <kicadopenapi_util.h>
@@ -145,6 +146,48 @@ nlohmann::json itemJson( BOARD_ITEM* aItem )
 }
 
 
+/// @brief HTML entities as text: named (&lt; &apos; &nbsp; ...) and numeric (&#39; &#x27;)
+wxString unescapeEntities( const wxString& aText )
+{
+    static const std::map<wxString, wxString> named = { { wxS( "nbsp" ), wxS( " " ) }, { wxS( "lt" ), wxS( "<" ) },
+                                                       { wxS( "gt" ), wxS( ">" ) },    { wxS( "amp" ), wxS( "&" ) },
+                                                       { wxS( "quot" ), wxS( "\"" ) }, { wxS( "apos" ), wxS( "'" ) } };
+    wxString out;
+    size_t   i = 0;
+
+    while( i < aText.length() )
+    {
+        const size_t semi = aText[i] == '&' ? aText.find( ';', i ) : wxString::npos;
+
+        if( semi != wxString::npos && semi - i <= 10 )
+        {
+            const wxString name = aText.Mid( i + 1, semi - i - 1 );
+            unsigned long  code = 0;
+
+            if( auto it = named.find( name ); it != named.end() )
+            {
+                out += it->second;
+                i = semi + 1;
+                continue;
+            }
+
+            if( name.StartsWith( wxS( "#x" ) ) || name.StartsWith( wxS( "#X" ) ) ? name.Mid( 2 ).ToULong( &code, 16 )
+                : name.StartsWith( wxS( "#" ) )                                  ? name.Mid( 1 ).ToULong( &code, 10 )
+                                                                                 : false )
+            {
+                out += wxUniChar( code );
+                i = semi + 1;
+                continue;
+            }
+        }
+
+        out += aText[i++];
+    }
+
+    return out;
+}
+
+
 /// @brief The engine's trace without its HTML (the Inspect dialogs show it as a web page)
 nlohmann::json traceLines( const wxString& aText )
 {
@@ -156,11 +199,7 @@ nlohmann::json traceLines( const wxString& aText )
     {
         wxString line = tok.GetNextToken();
         tags.ReplaceAll( &line, wxEmptyString );
-        line.Replace( wxS( "&nbsp;" ), wxS( " " ) );
-        line.Replace( wxS( "&lt;" ), wxS( "<" ) );
-        line.Replace( wxS( "&gt;" ), wxS( ">" ) );
-        line.Replace( wxS( "&amp;" ), wxS( "&" ) );
-        line.Replace( wxS( "&quot;" ), wxS( "\"" ) );
+        line = unescapeEntities( line );
         line.Trim().Trim( false );
 
         if( !line.IsEmpty() )
@@ -168,6 +207,90 @@ nlohmann::json traceLines( const wxString& aText )
     }
 
     return lines;
+}
+
+
+/// @brief Where a constraint's value comes from: custom rule, net class, board setup, keepout,
+/// footprint, pad, zone, net tie; with the rule's name and condition
+nlohmann::json sourceJson( const DRC_CONSTRAINT& aConstraint )
+{
+    const MINOPTMAX<int>& v = aConstraint.GetValue();
+    const DRC_RULE*       rule = v.HasMin() && aConstraint.GetMinRule() ? aConstraint.GetMinRule()
+                                 : v.HasOpt() && aConstraint.GetOptRule() ? aConstraint.GetOptRule()
+                                 : v.HasMax() && aConstraint.GetMaxRule() ? aConstraint.GetMaxRule()
+                                                                          : aConstraint.GetParentRule();
+    nlohmann::json        s;
+
+    if( rule )
+    {
+        switch( rule->GetImplicitSource() )
+        {
+        case DRC_IMPLICIT_SOURCE::NONE: s["type"] = "custom"; break;
+        case DRC_IMPLICIT_SOURCE::BOARD_SETUP_CONSTRAINT:
+        case DRC_IMPLICIT_SOURCE::BARCODE_DEFAULTS: s["type"] = "board_setup"; break;
+        case DRC_IMPLICIT_SOURCE::KEEPOUT: s["type"] = "keepout"; break;
+        case DRC_IMPLICIT_SOURCE::NET_CLASS: s["type"] = "netclass"; break;
+        case DRC_IMPLICIT_SOURCE::TUNING_PROFILE: s["type"] = "tuning_profile"; break;
+        }
+
+        s["rule"] = str( rule->m_Name );
+
+        if( !rule->m_ImplicitNetclass.IsEmpty() )
+            s["netclass"] = str( rule->m_ImplicitNetclass );
+
+        if( rule->GetImplicitSource() == DRC_IMPLICIT_SOURCE::KEEPOUT && rule->m_ImplicitItemId != niluuid )
+            s["zone"] = str( rule->m_ImplicitItemId.AsString() );
+
+        if( rule->m_Condition && !rule->m_Condition->GetExpression().IsEmpty() )
+            s["condition"] = str( rule->m_Condition->GetExpression() );
+
+        if( !rule->m_LayerSource.IsEmpty() )
+            s["layer"] = str( rule->m_LayerSource );
+
+        return s;
+    }
+
+    // set by the engine itself: an item's own override or a board minimum
+    const wxString name = aConstraint.GetName();
+    const wxString footprintPrefix = wxString::Format( _( "footprint %s" ), wxEmptyString );
+
+    if( name == _( "pad" ) )
+        s["type"] = "pad";
+    else if( name.StartsWith( footprintPrefix ) )
+        s = { { "type", "footprint" }, { "ref", str( name.Mid( footprintPrefix.length() ) ) } };
+    else if( name == _( "zone" ) )
+        s["type"] = "zone";
+    else if( name == _( "net tie" ) )
+        s["type"] = "net_tie";
+    else if( name.StartsWith( _( "board minimum" ) ) )
+        s["type"] = "board_setup";
+    else
+        s["type"] = name.IsEmpty() ? "none" : "item";
+
+    s["rule"] = str( name );
+    return s;
+}
+
+
+/// @brief A constraint's value and source; equal answers compare equal
+nlohmann::json valueJson( const DRC_CONSTRAINT& aConstraint )
+{
+    const MINOPTMAX<int>& v = aConstraint.GetValue();
+    nlohmann::json        j = { { "rule", str( aConstraint.GetName() ) }, { "source", sourceJson( aConstraint ) } };
+
+    if( v.HasMin() )
+        j["min_mm"] = toMm( v.Min() );
+
+    if( v.HasOpt() )
+        j["opt_mm"] = toMm( v.Opt() );
+
+    if( v.HasMax() )
+        j["max_mm"] = toMm( v.Max() );
+
+    if( aConstraint.GetSeverity() == RPT_SEVERITY_IGNORE )
+        j["severity"] = "ignore";
+
+    return j;
 }
 
 
@@ -253,12 +376,15 @@ KOPENAPI_RESULT h_pcb_rules_explain( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
         layer = !copper.empty() ? copper.front() : !any.empty() ? any.front() : a->GetLayer();
     }
 
-    DRC_ENGINE  engine( board, &board->GetDesignSettings() );
-    std::string compileError;
+    // the board's live engine (the one the guard, the router and pcb_drc evaluate) answers; a fresh
+    // one from the rules on disk says whether the live one is current
+    std::shared_ptr<DRC_ENGINE> live = board->GetDesignSettings().m_DRCEngine;
+    DRC_ENGINE                  disk( board, &board->GetDesignSettings() );
+    std::string                 compileError;
 
     try
     {
-        engine.InitEngine( board->GetDesignRulesPath() );
+        disk.InitEngine( board->GetDesignRulesPath() );
     }
     catch( const PARSE_ERROR& error )
     {
@@ -266,12 +392,17 @@ KOPENAPI_RESULT h_pcb_rules_explain( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
         try
         {
-            engine.InitEngine( wxFileName() );
+            disk.InitEngine( wxFileName() );
         }
         catch( const PARSE_ERROR& )
         {
         }
     }
+
+    if( live && !live->RulesValid() )
+        live.reset();
+
+    DRC_ENGINE& engine = live ? *live : disk;
 
     for( ZONE* zone : board->Zones() )
         zone->CacheBoundingBox();
@@ -292,6 +423,8 @@ KOPENAPI_RESULT h_pcb_rules_explain( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     if( b )
         out["b"] = itemJson( b );
+
+    out["engine"] = live ? "live" : "disk";
 
     if( !compileError.empty() )
         out["custom_rules_error"] = compileError;
@@ -318,6 +451,7 @@ KOPENAPI_RESULT h_pcb_rules_explain( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     }
 
     nlohmann::json results = nlohmann::json::array();
+    bool           agree = true;
 
     for( const std::string& name : kinds )
     {
@@ -330,29 +464,43 @@ KOPENAPI_RESULT h_pcb_rules_explain( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
             r["same_net"] = true;
             r["min_mm"] = 0.0;
             r["rule"] = "items of one net";
+            r["source"] = { { "type", "same_net" } };
             results.push_back( r );
             continue;
         }
 
-        DRC_CONSTRAINT c = engine.EvalRules( kind.type, a, kind.pair ? b : nullptr, layer, &reporter );
+        DRC_CONSTRAINT        c = engine.EvalRules( kind.type, a, kind.pair ? b : nullptr, layer, &reporter );
         const MINOPTMAX<int>& v = c.GetValue();
 
-        if( v.HasMin() )
-            r["min_mm"] = toMm( v.Min() );
+        r.update( valueJson( c ) );
 
-        if( v.HasOpt() )
-            r["opt_mm"] = toMm( v.Opt() );
+        if( live )
+        {
+            const nlohmann::json fromDisk = valueJson( disk.EvalRules( kind.type, a, kind.pair ? b : nullptr, layer, nullptr ) );
+            const bool           same = fromDisk == valueJson( c );
 
-        if( v.HasMax() )
-            r["max_mm"] = toMm( v.Max() );
+            r["matches_disk"] = same;
+            agree &= same;
 
-        r["rule"] = str( c.GetName() );
+            if( !same )
+                r["disk"] = fromDisk;
+        }
+
+        // DRC does not test an ignored constraint nor a clearance below zero
+        const bool clearanceKind = kind.pair && kind.type != COURTYARD_CLEARANCE_CONSTRAINT;
 
         if( c.GetSeverity() == RPT_SEVERITY_IGNORE )
-            r["severity"] = "ignore";
-
-        if( kind.pair && actual && v.HasMin()
-            && ( kind.type == CLEARANCE_CONSTRAINT || kind.type == PHYSICAL_CLEARANCE_CONSTRAINT ) )
+        {
+            r["tested"] = false;
+            r["untested_reason"] = "severity ignore";
+        }
+        else if( clearanceKind && v.HasMin() && v.Min() < 0 )
+        {
+            r["tested"] = false;
+            r["untested_reason"] = "negative clearance: DRC does not test it";
+        }
+        else if( kind.pair && actual && v.HasMin()
+                 && ( kind.type == CLEARANCE_CONSTRAINT || kind.type == PHYSICAL_CLEARANCE_CONSTRAINT ) )
         {
             r["ok"] = *actual >= v.Min();
         }
@@ -362,6 +510,9 @@ KOPENAPI_RESULT h_pcb_rules_explain( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
         results.push_back( r );
     }
+
+    if( live )
+        out["live_matches_disk"] = agree;
 
     out["constraints"] = results;
     return KOPENAPI_RESULT::Ok( out );
@@ -377,9 +528,14 @@ KOPENAPI_REGISTER( "pcb_rules_explain",
                    "courtyard_clearance, silk_clearance - or for one item a - track_width, via_diameter, "
                    "annular_width, hole_size, diff_pair_gap, length, skew, thermal_relief_gap, thermal_spoke_width, "
                    "solder_mask_expansion, text_height, text_thickness; default: what the dialog shows for these "
-                   "items. Per constraint min / opt / max mm, the rule that sets it (custom rule, net class, board "
-                   "setup), ok (the items' actual distance on the layer against the clearance) and the rule "
-                   "engine's trace (trace: false leaves it out); layer: default one both are on, copper first",
+                   "items. Per constraint min / opt / max mm, the rule that sets it and its source (type custom, "
+                   "netclass, board_setup, keepout, footprint, pad, zone, net_tie, same_net; the rule's condition, "
+                   "net class, keepout zone), tested: false when DRC skips it (severity ignore, a negative "
+                   "clearance), ok (the items' actual distance on the layer against the clearance) and the rule "
+                   "engine's trace (trace: false leaves it out); layer: default one both are on, copper first. "
+                   "Answered by the board's live rule engine (the one the guard, the router and pcb_drc use); "
+                   "matches_disk / live_matches_disk say whether the rules on disk give the same (else disk: "
+                   "their answer; pcb_drc reads them in)",
                    R"json({"type":"object","required":["a"],"properties":{
                         "a":{"type":"string"},"b":{"type":"string"},
                         "constraints":{"type":"array","items":{"type":"string"}},
