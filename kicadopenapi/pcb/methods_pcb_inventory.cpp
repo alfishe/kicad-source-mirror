@@ -396,6 +396,9 @@ static nlohmann::json padJson( const PAD* aPad, bool aWithFootprint )
     if( aPad->HasHole() )
         pad["drill_mm"] = { mm( aPad->GetDrillSize().x ), mm( aPad->GetDrillSize().y ) };
 
+    if( aPad->GetAttribute() == PAD_ATTRIB::PTH )
+        pad["unused_layers"] = KopenapiUnusedLayersMode( aPad->Padstack() );
+
     if( aWithFootprint )
     {
         const FOOTPRINT*  fp = aPad->GetParentFootprint();

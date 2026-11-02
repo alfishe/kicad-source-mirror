@@ -141,6 +141,12 @@ BOARD_ITEM* KopenapiResolveUuid( BOARD* aBoard, const std::string& aId, std::str
 /// a track method)
 BOARD_ITEM* KopenapiMatchUuid( const std::vector<BOARD_ITEM*>& aItems, const std::string& aId, std::string& aError );
 
+class PADSTACK;
+
+/// @brief A pad's or via's unconnected layer mode as the API names it: keep (all layers), remove
+/// (unconnected ones), keep_outer (removed except the outer / start and end layers), start_end_only
+std::string KopenapiUnusedLayersMode( const PADSTACK& aPadstack );
+
 class SHAPE_POLY_SET;
 
 /// @brief Where a net's pours put its copper on one copper layer, priorities resolved as the zone

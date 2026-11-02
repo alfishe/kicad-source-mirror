@@ -14961,6 +14961,7 @@ static KOPENAPI_RESULT h_pcb_via_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
                            { "layer_span", { str( board->GetLayerName( via->TopLayer() ) ),
                                              str( board->GetLayerName( via->BottomLayer() ) ) } },
                            { "layers", span },
+                           { "unused_layers", KopenapiUnusedLayersMode( via->Padstack() ) },
                            { "locked", via->IsLocked() } } );
     }
 
@@ -17727,7 +17728,7 @@ KOPENAPI_REGISTER( "pcb_track_list",
 KOPENAPI_REGISTER( "pcb_via_list",
                    "Vias of the board with their uuids: all, or of nets, in a region, through a layer, of a via type; "
                    "per via position (at_mm), net and net_code, diameter, drill, via_type (through / blind / buried / "
-                   "micro), layer_span [top, bottom] and the copper layers it passes (layers), locked; totals by type "
+                   "micro), layer_span [top, bottom] and the copper layers it passes (layers), unused_layers (keep / remove / keep_outer: pcb_pads_unused_layers), locked; totals by type "
                    "and by size (diameter / drill: count). Paged: limit / cursor (offset: the same as a number), "
                    "full: true for all",
                    R"json({"type":"object","properties":{

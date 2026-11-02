@@ -457,6 +457,12 @@ LSET PCB_SHAPE::GetLayerSet() const
 
 void PCB_SHAPE::SetLayerSet( const LSET& aLayerSet )
 {
+    if( aLayerSet.count() == 1 && ( aLayerSet & LSET::AllCuMask() ).none() )
+    {
+        SetLayer( aLayerSet.Seq()[0] );
+        return;
+    }
+
     aLayerSet.RunOnLayers(
             [&]( PCB_LAYER_ID layer )
             {

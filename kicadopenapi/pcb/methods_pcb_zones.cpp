@@ -1255,6 +1255,272 @@ static KOPENAPI_RESULT h_pcb_zone_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann
 }
 
 
+/// Duplicate Zone onto Layer (BOARD_EDITOR_CONTROL::ZoneDuplicate): a copy of a zone or keep-out with
+/// its settings, on other layers and / or another net, offset 1 mm when its layers stay the same
+static KOPENAPI_RESULT h_pcb_zone_duplicate( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD* board = context->GetBoard();
+
+    if( !aArgs.contains( "uuid" ) )
+        return KOPENAPI_RESULT::Error( 400, "uuid: the zone or keep-out to duplicate (pcb_zone_list, pcb_keepout_list)" );
+
+    if( std::optional<KOPENAPI_RESULT> refused = footprintZoneRefusal( board, aArgs ) )
+        return *refused;
+
+    std::string        error;
+    std::vector<ZONE*> zones = namedZones( board, aArgs, error );
+
+    if( zones.empty() )
+        return KOPENAPI_RESULT::Error( 404, error );
+
+    ZONE*      source = zones.front();
+    const bool copper = source->GetIsRuleArea() || source->IsOnCopperLayer();
+    LSET       layers = source->GetLayerSet();
+
+    if( aArgs.contains( "layers" ) )
+    {
+        if( !aArgs["layers"].is_array() || aArgs["layers"].empty() )
+            return KOPENAPI_RESULT::Error( 400, "layers: a list of layer names" );
+
+        layers.reset();
+
+        for( const nlohmann::json& l : aArgs["layers"] )
+        {
+            const int id = l.is_string() ? board->GetLayerID( wxString::FromUTF8( l.get<std::string>() ) ) : -1;
+
+            if( id < 0 || id >= PCB_LAYER_ID_COUNT || !board->IsLayerEnabled( (PCB_LAYER_ID) id ) || IsCopperLayer( id ) != copper )
+            {
+                return KOPENAPI_RESULT::Error( 400, std::string( "layers: enabled " ) + ( copper ? "copper" : "non-copper" )
+                                                    + " layers, as the zone's (" + l.dump() + ")" );
+            }
+
+            layers.set( id );
+        }
+    }
+
+    NETINFO_ITEM* net = nullptr;
+
+    if( aArgs.contains( "set_net" ) )
+    {
+        if( source->GetIsRuleArea() )
+            return KOPENAPI_RESULT::Error( 400, "set_net: a keep-out has no net" );
+
+        net = KopenapiFindNet( board, aArgs.value( "set_net", std::string() ) );
+
+        if( !net )
+            return KopenapiNoSuchNet( board, aArgs.value( "set_net", std::string() ) );
+    }
+
+    VECTOR2I offset;
+
+    if( aArgs.contains( "offset_mm" ) )
+    {
+        const nlohmann::json& o = aArgs["offset_mm"];
+
+        if( !o.is_array() || o.size() != 2 || !o[0].is_number() || !o[1].is_number() )
+            return KOPENAPI_RESULT::Error( 400, "offset_mm: [dx, dy]" );
+
+        offset = VECTOR2I( toIU( o[0].get<double>() ), toIU( o[1].get<double>() ) );
+    }
+    else if( layers == source->GetLayerSet() )
+    {
+        offset = VECTOR2I( pcbIUScale.IU_PER_MM, pcbIUScale.IU_PER_MM );
+    }
+
+    auto* zone = new ZONE( *source );
+    zone->ResetUuidDirect();
+    zone->ClearSelected();
+    zone->UnFill();
+    zone->SetLayerSet( layers );
+
+    if( net )
+        zone->SetNet( net );
+
+    if( aArgs.contains( "name" ) )
+        zone->SetZoneName( wxString::FromUTF8( aArgs.value( "name", std::string() ) ) );
+
+    if( !zone->GetZoneName().IsEmpty() )
+        zone->SetZoneName( board->GetUniqueZoneName( zone->GetZoneName() ) );
+
+    if( offset != VECTOR2I() )
+        zone->Move( offset );
+
+    BOARD_COMMIT commit( context->GetToolManager() );
+    commit.Add( zone );
+    commit.Push( _( "Duplicate Zone (API)" ) );
+
+    nlohmann::json result = { { "uuid", str( zone->m_Uuid.AsString() ) }, { "source", str( source->m_Uuid.AsString() ) },
+                              { "name", str( zone->GetZoneName() ) }, { "layers", layerNames( board, zone->GetLayerSet() ) },
+                              { "offset_mm", { toMm( offset.x ), toMm( offset.y ) } }, { "keepout", zone->GetIsRuleArea() } };
+
+    if( !zone->GetIsRuleArea() && zone->IsOnCopperLayer() && aArgs.value( "fill", true ) )
+        result.update( fill( aCtx, *context, { zone } ) );
+    else if( !zone->GetIsRuleArea() )
+        result["net"] = str( UnescapeString( zone->GetNetname() ) );
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
+
+/// Merge Zones (BOARD_EDITOR_CONTROL::ZoneMerge): zones of one net, kind and layer set that overlap
+/// become the first one (outline union, highest priority); the others are deleted
+static KOPENAPI_RESULT h_pcb_zone_merge( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD* board = context->GetBoard();
+
+    if( !aArgs.contains( "uuids" ) || !aArgs["uuids"].is_array() || aArgs["uuids"].size() < 2 )
+        return KOPENAPI_RESULT::Error( 400, "uuids: two or more zones (the first one is kept)" );
+
+    std::vector<ZONE*> named;
+
+    for( const nlohmann::json& id : aArgs["uuids"] )
+    {
+        const nlohmann::json one = { { "uuid", id.is_string() ? id.get<std::string>() : std::string() } };
+
+        if( std::optional<KOPENAPI_RESULT> refused = footprintZoneRefusal( board, one ) )
+            return *refused;
+
+        std::string        error;
+        std::vector<ZONE*> zones = namedZones( board, one, error );
+
+        if( zones.empty() )
+            return KOPENAPI_RESULT::Error( 404, error );
+
+        if( std::find( named.begin(), named.end(), zones.front() ) == named.end() )
+            named.push_back( zones.front() );
+    }
+
+    for( ZONE* zone : named )
+    {
+        if( zone->IsLocked() && !aArgs.value( "override_locks", false ) )
+            return KOPENAPI_RESULT::Error( 409, "zone " + str( zone->m_Uuid.AsString() ) + " is locked (pcb_unlock, or override_locks)" );
+    }
+
+    ZONE*              first = named.front();
+    std::vector<ZONE*> toMerge = { first };
+    std::vector<ZONE*> pending;
+    nlohmann::json     skipped = nlohmann::json::array();
+
+    auto skip = [&]( ZONE* aZone, const std::string& aWhy )
+    {
+        skipped.push_back( { { "uuid", str( aZone->m_Uuid.AsString() ) }, { "reason", aWhy } } );
+    };
+
+    for( size_t i = 1; i < named.size(); i++ )
+    {
+        ZONE* zone = named[i];
+
+        if( zone->GetIsRuleArea() != first->GetIsRuleArea() )
+            skip( zone, "a keep-out and a copper zone" );
+        else if( zone->GetNetCode() != first->GetNetCode() )
+            skip( zone, "another net" );
+        else if( zone->GetLayerSet() != first->GetLayerSet() )
+            skip( zone, "other layers" );
+        else
+            pending.push_back( zone );
+    }
+
+    // overlapping any zone already taken, in any order
+    for( bool grew = true; grew && !pending.empty(); )
+    {
+        grew = false;
+
+        for( auto it = pending.begin(); it != pending.end(); )
+        {
+            const bool touches = std::any_of( toMerge.begin(), toMerge.end(),
+                                              [&]( ZONE* aTaken ) { return board->TestZoneIntersection( *it, aTaken ); } );
+
+            if( touches )
+            {
+                toMerge.push_back( *it );
+                it = pending.erase( it );
+                grew = true;
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    for( ZONE* zone : pending )
+        skip( zone, "does not overlap the others" );
+
+    if( toMerge.size() < 2 )
+    {
+        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 409, "nothing to merge with the first zone" );
+        r.body["skipped"] = skipped;
+        return r;
+    }
+
+    SHAPE_POLY_SET merged = first->Outline()->CloneDropTriangulation();
+    merged.ClearArcs();
+    unsigned priority = first->GetAssignedPriority();
+
+    for( size_t i = 1; i < toMerge.size(); i++ )
+    {
+        SHAPE_POLY_SET other = toMerge[i]->Outline()->CloneDropTriangulation();
+        other.ClearArcs();
+        merged.BooleanAdd( other );
+        priority = std::max( priority, toMerge[i]->GetAssignedPriority() );
+    }
+
+    merged.Simplify();
+
+    if( merged.IsSelfIntersecting() || merged.OutlineCount() > 1 )
+    {
+        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 409, "the zones overlap too little to merge (they meet in a point or "
+                                                         "inside a hole): the union is not one polygon" );
+        r.body["skipped"] = skipped;
+        return r;
+    }
+
+    nlohmann::json removed = nlohmann::json::array();
+
+    if( !aArgs.value( "dry_run", false ) )
+    {
+        BOARD_COMMIT commit( context->GetToolManager() );
+        commit.Modify( first );
+        *first->Outline() = merged;
+        first->SetAssignedPriority( priority );
+        first->SetNeedRefill( true );
+        first->HatchBorder();
+
+        for( size_t i = 1; i < toMerge.size(); i++ )
+        {
+            removed.push_back( str( toMerge[i]->m_Uuid.AsString() ) );
+            commit.Remove( toMerge[i] );
+        }
+
+        commit.Push( _( "Merge Zones (API)" ) );
+    }
+    else
+    {
+        for( size_t i = 1; i < toMerge.size(); i++ )
+            removed.push_back( str( toMerge[i]->m_Uuid.AsString() ) );
+    }
+
+    nlohmann::json result = { { "uuid", str( first->m_Uuid.AsString() ) }, { "merged", removed }, { "skipped", skipped },
+                              { "priority", priority }, { "area_mm2", mm2( merged.Area() ) },
+                              { "dry_run", aArgs.value( "dry_run", false ) } };
+
+    if( !aArgs.value( "dry_run", false ) && !first->GetIsRuleArea() && first->IsOnCopperLayer() && aArgs.value( "fill", true ) )
+        result.update( fill( aCtx, *context, { first } ) );
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
+
 // entries per list of pcb_zones_fill's answer by default
 constexpr size_t ZONES_FILL_LIST_CAP = 20;
 
@@ -1557,5 +1823,34 @@ KOPENAPI_REGISTER( "pcb_keepout_list",
                         "not_allowed":{"type":"array","items":{"type":"string","enum":["tracks","vias","pads","copper_pour","footprints"]},"description":"only the rule areas barring all of these"}}})json"_json,
                    false, h_pcb_keepout_list );
 
-KOPENAPI_MARK_EDITING( "pcb_zone_add", "pcb_zones_fill", "pcb_zone_update", "pcb_zone_delete", "pcb_keepout_add" );
+KOPENAPI_REGISTER( "pcb_zone_duplicate",
+                   "Duplicate Zone onto Layer: a copy of a copper zone or keep-out (uuid) with all its settings, on other "
+                   "layers (copper for a copper zone or keep-out) and / or another net (set_net), renamed if named (name, "
+                   "else the next free one), offset by offset_mm (default 1 mm right and down when the layers stay, as the "
+                   "editor does, else none); a copper zone is filled (fill: false to skip). Change it further with "
+                   "pcb_zone_update",
+                   R"json({"type":"object","required":["uuid"],"properties":{
+                        "uuid":{"type":"string"},
+                        "layers":{"type":"array","items":{"type":"string"}},
+                        "set_net":{"type":"string"},
+                        "name":{"type":"string"},
+                        "offset_mm":{"type":"array","items":{"type":"number"},"description":"[dx, dy]"},
+                        "fill":{"type":"boolean","default":true}}})json"_json,
+                   false, h_pcb_zone_duplicate );
+
+KOPENAPI_REGISTER( "pcb_zone_merge",
+                   "Merge Zones: copper zones (or keep-outs) of one net and the same layers that overlap become the first "
+                   "of uuids: the union of the outlines, the highest priority; the others are deleted. Zones of another "
+                   "net, kind or layers, or not overlapping, are left (skipped, with the reason); 409 when nothing is "
+                   "left to merge or the union is not one polygon; locked ones refused unless override_locks; refilled "
+                   "(fill: false to skip); dry_run checks only",
+                   R"json({"type":"object","required":["uuids"],"properties":{
+                        "uuids":{"type":"array","items":{"type":"string"},"minItems":2},
+                        "override_locks":{"type":"boolean","default":false},
+                        "fill":{"type":"boolean","default":true},
+                        "dry_run":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_zone_merge );
+
+KOPENAPI_MARK_EDITING( "pcb_zone_add", "pcb_zones_fill", "pcb_zone_update", "pcb_zone_delete", "pcb_keepout_add",
+                       "pcb_zone_duplicate", "pcb_zone_merge" );
 KOPENAPI_MARK_CONCURRENT_READS( "pcb_keepout_list", "pcb_zone_list" );
