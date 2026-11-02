@@ -8075,17 +8075,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     const auto  joined = board->GetConnectivity()->GetConnectedItems( track );
                     const bool  fromOn = std::find( joined.begin(), joined.end(), wire.from ) != joined.end();
                     const bool  toOn = std::find( joined.begin(), joined.end(), wire.to ) != joined.end();
-                    PAD*        far = !fromOn ? wire.from : dynamic_cast<PAD*>( wire.to );
+                    PAD*        farPad = !fromOn ? wire.from : dynamic_cast<PAD*>( wire.to );
 
-                    if( fromOn == toOn || !far )
+                    if( fromOn == toOn || !farPad )
                         continue;
 
-                    wire.from = far;
-                    wire.fromId = far->m_Uuid;
+                    wire.from = farPad;
+                    wire.fromId = farPad->m_Uuid;
                     wire.to = track;
                     wire.toId = track->m_Uuid;
                     wire.toPos = at;
-                    wire.length = (double) ( at - far->GetPosition() ).EuclideanNorm();
+                    wire.length = (double) ( at - farPad->GetPosition() ).EuclideanNorm();
                     wire.toPairEnd = true;
                 }
             }
