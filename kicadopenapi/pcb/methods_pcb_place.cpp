@@ -8,6 +8,7 @@
 /// is none, connectors along the board edges, the rest by KiCad's own autoplacer (AR_AUTOPLACER:
 /// a placement matrix inside the outline, ratsnest cost).
 #include "kopenapi_pcb.h"
+#include "rail_plan.h"
 #include "pcb_escape_estimate.h"
 
 #include <kicadopenapi_registry.h>
@@ -3012,9 +3013,59 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
     std::map<PAD*, SPOT_AT> spotOfPin;   // reserved before the caps go
 
+    // the rail-run plan of a fine-pitch anchor (planRowRailVias, as pcb_stitch takes it for the
+    // pin's net), made from the board as it is before any via goes in
+    std::map<int, std::vector<RAIL_PIN_PLAN>> planOfNet;
+
+    auto railPlanOf = [&]( PAD* aPin ) -> const RAIL_PIN_PLAN*
+    {
+        auto it = planOfNet.find( aPin->GetNetCode() );
+
+        if( it == planOfNet.end() )
+        {
+            NETINFO_ITEM*     net = aPin->GetNet();
+            NETCLASS*         netclass = net ? net->GetNetClass() : nullptr;
+            RAIL_PLAN_OPTIONS options;
+
+            options.classViaDia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
+            options.classViaDrill = netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
+
+            if( net )
+                boardMinVia( aBoard, net, options.classViaDia, options.classViaDrill, options.minViaDia, options.minViaDrill );
+
+            it = planOfNet.emplace( aPin->GetNetCode(), planRowRailVias( aBoard, aAnchor, options ) ).first;
+        }
+
+        for( const RAIL_PIN_PLAN& plan : it->second )
+        {
+            if( plan.pad == aPin )
+                return &plan;
+        }
+
+        return nullptr;
+    };
+
+    std::map<const PAD*, int> drillOfSpot;   // the planned via's drill
+
     auto spotFor = [&]( PAD* aPin ) -> std::optional<SPOT_AT>
     {
         NETCLASS*   netclass = aPin->GetEffectiveNetClass();
+        const int   clearance = std::max( aBoard->GetDesignSettings().m_MinClearance, netclass ? netclass->GetClearance() : 0 );
+
+        // a pin the plan covers: its spot or none (skipped: left to the router)
+        if( const RAIL_PIN_PLAN* plan = railPlanOf( aPin ) )
+        {
+            if( !plan->planned || plan->pattern == "fixed" )
+                return std::nullopt;
+
+            const VECTOR2I    in( -plan->outward.x, -plan->outward.y );
+            const std::string inward = std::abs( in.x ) >= std::abs( in.y ) ? ( in.x > 0 ? "right" : "left" ) : ( in.y > 0 ? "down" : "up" );
+
+            drillOfSpot[aPin] = plan->drill;
+            return SPOT_AT{ { plan->spot, aPin->GetNetCode(), plan->dia / 2, clearance, aPin->GetPosition(), stubWidth( aBoard, aPin ) / 2 },
+                            inward };
+        }
+
         const int   diameter = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter()
                                                                       : aBoard->GetDesignSettings().GetCurrentViaSize();
         std::string inward;
@@ -3095,7 +3146,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         via->SetPosition( aSpot.at );
         via->SetLayerPair( F_Cu, B_Cu );
         via->SetWidth( 2 * aSpot.radius );
-        via->SetDrill( netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : ds.GetCurrentViaDrill() );
+        auto planned = drillOfSpot.find( aPin );
+        via->SetDrill( planned != drillOfSpot.end() ? planned->second
+                                                    : netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : ds.GetCurrentViaDrill() );
         via->SetNetCode( aPin->GetNetCode() );
         aCommit.Add( via );
 
@@ -3180,7 +3233,8 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
     };
 
     // every supply pin a bottom cap may take gets its spot first, so the caps keep off the spots of
-    // the pins after them
+    // the pins after them; at a planned row (planRowRailVias) every rail pin's, so the caps also keep
+    // off the vias pcb_stitch lays there later
 
     if( decapOtherSide )
     {
@@ -3194,7 +3248,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         for( PAD* pad : aAnchor->Pads() )
         {
-            if( !supplies.count( pad->GetNetCode() ) )
+            if( !supplies.count( pad->GetNetCode() ) && !( rails.count( pad->GetNetCode() ) && railPlanOf( pad ) ) )
                 continue;
 
             if( std::optional<SPOT_AT> spot = spotFor( pad ) )
