@@ -721,6 +721,9 @@ struct ESCAPE_FRONT
     SHAPE_SEGMENT       shape;
     std::vector<size_t> jobs;          ///< the connections at the pad; none: a pad of another net, open all the call
     bool                open = true;   ///< false once they are all routed
+    std::shared_ptr<const std::set<int>> only;   ///< the nets it walls out; none: every other net
+
+    bool walls( int aNet ) const { return open && pad->GetNetCode() != aNet && ( !only || only->count( aNet ) ); }
 };
 
 
@@ -973,7 +976,7 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
             BOX2I nearBox = front.shape.BBox();
             nearBox.Inflate( aBase + clearance );
 
-            if( !front.open || front.pad->GetNetCode() == netCode || !nearBox.Intersects( box ) )
+            if( !front.walls( netCode ) || !nearBox.Intersects( box ) )
                 continue;
 
             fronts.push_back( &front );
@@ -1362,7 +1365,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         {
             for( const ESCAPE_FRONT& front : *aReq.fronts )
             {
-                if( !front.open || front.pad->GetNetCode() == aReq.from->GetNetCode() )
+                if( !front.walls( aReq.from->GetNetCode() ) )
                     continue;
 
                 auto item = std::make_unique<PCB_SHAPE>( board, SHAPE_T::SEGMENT );
@@ -1781,7 +1784,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
             for( const ESCAPE_FRONT& front : *aReq.fronts )
             {
                 // the way out is the pad's copper: another net keeps its clearance from it
-                if( !front.open || front.pad->GetNetCode() == item->GetNetCode() || !item->IsOnLayer( front.layer )
+                if( !front.walls( item->GetNetCode() ) || !item->IsOnLayer( front.layer )
                     || !item->GetEffectiveShape( front.layer )->Collide( &front.shape, std::max( item->GetOwnClearance( front.layer ) - 1, 0 ) ) )
                 {
                     continue;
@@ -4134,7 +4137,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( const ESCAPE_FRONT& front : fronts )
         {
-            if( front.open && front.pad->GetNetCode() != aEnd->GetNetCode() && front.shape.Collide( &via, clearance - 1 ) )
+            if( front.walls( aEnd->GetNetCode() ) && front.shape.Collide( &via, clearance - 1 ) )
                 return true;
         }
 
@@ -4462,7 +4465,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( const ESCAPE_FRONT& front : fronts )
         {
-            if( front.open && front.pad->GetNetCode() != aFrom->GetNetCode() )
+            if( front.walls( aFrom->GetNetCode() ) )
                 req.keepOut.emplace_back( front.layer, front.shape );
         }
 
@@ -4767,8 +4770,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                             for( const ESCAPE_FRONT& front : fronts )
                             {
-                                if( !front.open || front.pad->GetNetCode() == way.from->GetNetCode()
-                                    || !nearBox.Intersects( front.shape.BBox() ) )
+                                if( !front.walls( way.from->GetNetCode() ) || !nearBox.Intersects( front.shape.BBox() ) )
                                 {
                                     continue;
                                 }
@@ -5964,6 +5966,109 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         const double         fine = pcbIUScale.mmToIU( 0.65 );
         std::map<PAD*, std::vector<size_t>> frontsOf;
 
+        // A signal pad of a fine-pitch row next to a rail pin whose via sits inward of the row: the row
+        // pins on that side leave inward around the via, the way in front of this pad's inner end is
+        // its own (as deep as the via reaches, then room for a track); a route of a neighbour on the row
+        // (within 3.5 pitches) crossing it there walls the pad in, other nets may pass
+        std::vector<PCB_VIA*> rowVias;
+
+        for( PCB_TRACK* t : board->Tracks() )
+        {
+            if( t->Type() == PCB_VIA_T )
+                rowVias.push_back( static_cast<PCB_VIA*>( t ) );
+        }
+
+        auto inwardFront = [&]( PAD* aPad, std::optional<size_t> aJob, std::vector<size_t>& aOf )
+        {
+            const double pitch = pitchOf( aPad );
+
+            if( pitch > fine || !aPad->GetParentFootprint() )
+                return;
+
+            FOOTPRINT* fp = aPad->GetParentFootprint();
+            BOX2I      ring = fp->Pads().front()->GetBoundingBox();
+
+            for( PAD* q : fp->Pads() )
+                ring.Merge( q->GetBoundingBox() );
+
+            const BOX2I    box = aPad->GetBoundingBox();
+            const VECTOR2I d = aPad->GetPosition() - ring.Centre();
+            const bool     horizontal = (double) std::abs( d.x ) * ring.GetHeight() >= (double) std::abs( d.y ) * ring.GetWidth();
+            const VECTOR2I in = horizontal ? VECTOR2I( d.x >= 0 ? -1 : 1, 0 ) : VECTOR2I( 0, d.y >= 0 ? -1 : 1 );
+            const int      half = horizontal ? box.GetWidth() / 2 : box.GetHeight() / 2;
+            const VECTOR2I end = box.Centre() + in * half;   // the pad's inner end
+            NETCLASS*      netclass = aPad->GetEffectiveNetClass();
+            const int      clearance = std::max( std::max( ds.m_MinClearance, 0 ), netclass && netclass->HasClearance() ? netclass->GetClearance() : 0 );
+            const int      width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : ds.GetCurrentTrackWidth();
+            int            depth = 0;
+
+            for( PCB_VIA* via : rowVias )
+            {
+                const VECTOR2I rel = via->GetPosition() - end;
+                const int      along = horizontal ? rel.x * in.x : rel.y * in.y;
+                const int      aside = std::abs( horizontal ? rel.y : rel.x );
+                const int      r = via->GetWidth( via->TopLayer() ) / 2;
+
+                // a via in the band just inward of the row, beside the pad (the next pin or the one after)
+                if( along <= 0 || along > 3 * r + 2 * clearance || aside > KiROUND( 2.5 * pitch ) )
+                    continue;
+
+                // a rail pin with its own via there leaves by it
+                if( via->GetNetCode() == aPad->GetNetCode() )
+                    return;
+
+                if( aside < r )
+                    continue;
+
+                bool railNeighbour = false;
+
+                for( PAD* q : fp->Pads() )
+                {
+                    if( q != aPad && q->GetNetCode() == via->GetNetCode()
+                        && ( q->GetPosition() - aPad->GetPosition() ).EuclideanNorm() < 2.5 * pitch )
+                    {
+                        railNeighbour = true;
+                    }
+                }
+
+                if( railNeighbour )
+                    depth = std::max( depth, along + r + 2 * clearance + width );
+            }
+
+            if( depth <= 0 )
+                return;
+
+            // only the neighbours on the row could cross it there
+            auto nets = std::make_shared<std::set<int>>();
+
+            for( PAD* q : fp->Pads() )
+            {
+                if( q->GetNetCode() > 0 && q->GetNetCode() != aPad->GetNetCode()
+                    && ( q->GetPosition() - aPad->GetPosition() ).EuclideanNorm() < 3.5 * pitch )
+                {
+                    nets->insert( q->GetNetCode() );
+                }
+            }
+
+            for( PCB_LAYER_ID layer : layers )
+            {
+                if( !aPad->IsOnLayer( layer ) || !aPad->FlashLayer( layer ) )
+                    continue;
+
+                ESCAPE_FRONT front;
+                front.pad = aPad;
+                front.layer = layer;
+                front.shape = SHAPE_SEGMENT( end + in * ( width / 2 ), end + in * ( depth - width / 2 ), width );
+                front.only = nets;
+
+                if( aJob )
+                    front.jobs.push_back( *aJob );
+
+                aOf.push_back( fronts.size() );
+                fronts.push_back( std::move( front ) );
+            }
+        };
+
         auto addFronts = [&]( PAD* aPad, std::optional<size_t> aJob )
         {
             if( auto it = frontsOf.find( aPad ); it != frontsOf.end() )
@@ -5982,6 +6087,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             // a bus member's way out is its fan via (kept below)
             if( aJob && jobs[*aJob].busVia && busLayer )
                 return;
+
+            inwardFront( aPad, aJob, frontsOf[aPad] );
 
             // a planned port: its way out to past the courtyard, or to its via and the via's spot
             if( auto port = portGoals.find( aPad ); port != portGoals.end() )
@@ -6810,7 +6917,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( const ESCAPE_FRONT& front : fronts )
         {
-            if( front.jobs.empty() )
+            if( front.jobs.empty() && !front.only )
                 params.keepOpen.push_back( { front.layer, front.shape, front.pad->GetNetCode() } );
         }
         params.viaAway = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_mm", 7.0 ), 0.0, 30.0 ) );
