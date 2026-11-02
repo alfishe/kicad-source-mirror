@@ -1,5 +1,6 @@
 #include "route_plan.h"
 #include "route_raster.h"
+#include "kopenapi_pcb.h"
 
 #include <base_units.h>
 #include <board.h>
@@ -252,6 +253,14 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     {
         if( drc )
         {
+            // the probe where the item is: rules by area (courtyards, rule areas) see it there
+            if( PCB_TRACK* t = dynamic_cast<PCB_TRACK*>( aProbe ) )
+            {
+                const VECTOR2I at = aItem->GetBoundingBox().Centre();
+                t->SetStart( at );
+                t->SetEnd( at );
+            }
+
             DRC_CONSTRAINT c = drc->EvalRules( aType, aProbe, aItem, aLayer );
 
             if( c.GetValue().HasMin() )
@@ -261,9 +270,14 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         return aFloor;
     };
 
+    // the floor under the rules' answer: the board minimum; the net classes' clearance only without
+    // a rules engine (a custom rule may ask less than the class, e.g. inside a fine-pitch courtyard)
     auto netFloor = [&]( BOARD_ITEM* aItem )
     {
         int floor = ds.m_MinClearance;
+
+        if( drc )
+            return floor;
 
         for( BOARD_ITEM* item : { aItem, static_cast<BOARD_ITEM*>( aReq.from ) } )
         {
@@ -501,9 +515,13 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                 nearEnds.push_back( { std::make_shared<SHAPE_SEGMENT>( shape ), 0, l, -1 } );
         }
 
-        // a through via stands in the way out on every layer
+        // a through via stands in the way out on every layer, at the clearance the rules ask of our
+        // net's via there
         if( vias && shape.BBox().Intersects( region ) )
-            grid.Mark( shape, netFloor( aReq.from ) + viaRadius + slack, via );
+        {
+            const int clearance = KopenapiRuleVia( board, net, shape.BBox().Centre(), layer ).clearance;
+            grid.Mark( shape, clearance + viaRadius + slack, via );
+        }
     }
 
     // no via on the end pads themselves: the route leaves a pad on a track

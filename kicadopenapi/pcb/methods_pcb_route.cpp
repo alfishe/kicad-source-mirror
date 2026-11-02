@@ -6197,6 +6197,22 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     BOX2I                                       area = end->GetBoundingBox();
                     area.Inflate( pcbIUScale.mmToIU( 1.0 ) );
 
+                    // a pin on its part's outline: only copper on its outward side stands in its way out
+                    std::optional<VECTOR2I> outward;
+
+                    if( end->Type() == PCB_PAD_T && static_cast<PAD*>( end )->GetParentFootprint() )
+                    {
+                        PAD*       pad = static_cast<PAD*>( end );
+                        FOOTPRINT* fp = pad->GetParentFootprint();
+                        BOX2I      centres( fp->Pads().front()->GetPosition(), VECTOR2I( 0, 0 ) );
+
+                        for( PAD* q : fp->Pads() )
+                            centres.Merge( q->GetPosition() );
+
+                        if( fp->Pads().size() >= 4 )
+                            outward = outwardOf( pad, centres );
+                    }
+
                     for( PCB_TRACK* t : board->Tracks() )
                     {
                         int actual = 0;
@@ -6206,6 +6222,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                             || !t->GetEffectiveShape( layer )->Collide( own.get(), pcbIUScale.mmToIU( 1.0 ), &actual ) )
                         {
                             continue;
+                        }
+
+                        if( outward )
+                        {
+                            const VECTOR2I near = t->Type() == PCB_VIA_T ? t->GetPosition()
+                                                                          : SEG( t->GetStart(), t->GetEnd() ).NearestPoint( at );
+
+                            if( (int64_t) ( near - at ).x * outward->x + (int64_t) ( near - at ).y * outward->y < 0 )
+                                continue;
                         }
 
                         // copper a track of the plan's width passes beside at its clearance does not shut the end in
@@ -18928,7 +18953,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "rip_ups_planned: rip-ups whose routes a plan chose; rip_ups_second: routes taken out that had no way back "
                    "and moved others in turn; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at); "
-                   "a row whose end is shut in has boxed_in (end, which, by: other nets' copper nearer than a track of its width needs, and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
+                   "a row whose end is shut in has boxed_in (end, which, by: other nets' copper nearer than a track of its width needs (for a pin on its part's outline, on its outward side), and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
                    "pairs_stuck: pair tries ended when nothing was placed after 3 steps; front_retries: tries refused for walling in another pin's port (a port try's first, else the first), made again as the connection's last try with the ways out as obstacles to the search (tried / won; the row's try says walls_in_first); pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way; plans_stopped: ended by job_cancel, a budget or stop_on_plateau_s); sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
