@@ -2211,6 +2211,39 @@ public:
         m_edges = aBoard->GetBoardEdgesBoundingBox();
         m_layer = aPart->IsFlipped() ? B_Cu : F_Cu;
 
+        // the other side's parts are no obstacle by courtyard, but their pads on this layer are
+        // (through-hole pads, an exposed pad's back copper): each grown by the clearance
+        const int minClearance = aBoard->GetDesignSettings().m_MinClearance;
+
+        auto clearanceOf = [&]( PAD* aPad )
+        {
+            NETCLASS* nc = aPad->GetNetCode() > 0 ? aPad->GetEffectiveNetClass() : nullptr;
+            return std::max( minClearance, nc && nc->HasClearance() ? nc->GetClearance() : 0 );
+        };
+
+        int partClearance = 0;
+
+        for( PAD* pad : aPart->Pads() )
+            partClearance = std::max( partClearance, clearanceOf( pad ) );
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            if( fp == aPart || fp->IsFlipped() == aPart->IsFlipped() || ( aPending && aPending->count( fp ) ) )
+                continue;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( !pad->IsOnLayer( m_layer ) || !pad->GetBoundingBox().Intersects( around ) )
+                    continue;
+
+                SHAPE_POLY_SET copper;
+                pad->TransformShapeToPolygon( copper, m_layer, std::max( partClearance, clearanceOf( pad ) ), ARC_HIGH_DEF,
+                                              ERROR_OUTSIDE );
+                const BOX2I box = copper.BBox();
+                m_padsBelow.push_back( { std::move( copper ), box, pad->GetNetCode() } );
+            }
+        }
+
         // rule areas on the part's side: no courtyard where footprints are kept out, no pad where
         // tracks or pads are (a pad there can't be connected)
         for( ZONE* zone : aBoard->Zones() )
@@ -2274,6 +2307,30 @@ public:
                 pad->TransformShapeToPolygon( copper, m_layer, 0, ARC_HIGH_DEF, ERROR_OUTSIDE );
                 copper.Move( aDelta );
                 copper.BooleanIntersection( keepout );
+
+                if( !copper.IsEmpty() )
+                    return false;
+            }
+        }
+
+        for( const PAD_BELOW& below : m_padsBelow )
+        {
+            if( !below.box.Intersects( box ) )
+                continue;
+
+            for( PAD* pad : m_part->Pads() )
+            {
+                if( !pad->IsOnLayer( m_layer ) || ( below.net > 0 && pad->GetNetCode() == below.net ) )
+                    continue;
+
+                SHAPE_POLY_SET copper;
+                pad->TransformShapeToPolygon( copper, m_layer, 0, ARC_HIGH_DEF, ERROR_OUTSIDE );
+                copper.Move( aDelta );
+
+                if( !copper.BBox().Intersects( below.box ) )
+                    continue;
+
+                copper.BooleanIntersection( below.copper );
 
                 if( !copper.IsEmpty() )
                     return false;
@@ -2347,8 +2404,16 @@ public:
     }
 
 private:
+    struct PAD_BELOW
+    {
+        SHAPE_POLY_SET copper;   ///< grown by the clearance
+        BOX2I          box;
+        int            net;
+    };
+
     OUTLINE                                              m_outline;
     FOOTPRINT*                                           m_part;
+    std::vector<PAD_BELOW>                               m_padsBelow;
     const std::vector<VIA_SPOT>*                         m_viaSpots;
     std::vector<const CORRIDOR*>                         m_corridors;
     std::vector<std::pair<SHAPE_POLY_SET, BOX2I>>       m_obstacles;
