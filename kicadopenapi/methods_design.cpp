@@ -347,8 +347,14 @@ static KOPENAPI_RESULT h_design_parity( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 }
 
 
-static KOPENAPI_RESULT h_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+static KOPENAPI_RESULT h_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aRawArgs )
 {
+    std::string          aliasError;
+    const nlohmann::json aArgs = KopenapiArgAlias( aRawArgs, "net", "name", aliasError );
+
+    if( !aliasError.empty() )
+        return KOPENAPI_RESULT::Error( 400, aliasError );
+
     const std::string name = aArgs.value( "name", std::string() );
     const std::string pin = aArgs.value( "pin", std::string() );
 
@@ -619,6 +625,7 @@ KOPENAPI_REGISTER( "net_get",
                    "document open too",
                    R"json({"type":"object","properties":{
                         "name":{"type":"string","description":"net name on either side"},
+                        "net":{"type":"string","description":"the same as name"},
                         "pin":{"type":"string","description":"REF.PIN"}}})json"_json,
                    false, h_net_get );
 

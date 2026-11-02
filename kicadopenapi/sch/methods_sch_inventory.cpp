@@ -543,8 +543,14 @@ static nlohmann::json netRow( const NET_ENTRY& aNet, PAD_RESOLVER* aPads )
 }
 
 
-static KOPENAPI_RESULT h_sch_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+static KOPENAPI_RESULT h_sch_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aRawArgs )
 {
+    std::string          aliasError;
+    const nlohmann::json aArgs = KopenapiArgAlias( aRawArgs, "net", "name", aliasError );
+
+    if( !aliasError.empty() )
+        return KOPENAPI_RESULT::Error( 400, aliasError );
+
     std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
 
     if( !context )
@@ -579,8 +585,14 @@ static KOPENAPI_RESULT h_sch_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 }
 
 
-static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aRawArgs )
 {
+    std::string          aliasError;
+    const nlohmann::json aArgs = KopenapiArgAlias( aRawArgs, "net", "name", aliasError );
+
+    if( !aliasError.empty() )
+        return KOPENAPI_RESULT::Error( 400, aliasError );
+
     std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
 
     if( !context )
@@ -884,6 +896,7 @@ KOPENAPI_REGISTER( "sch_net_list",
                    "min_pins, power; paginated",
                    KopenapiPagedSchema( R"json({
                         "name":{"type":"string","description":"glob, e.g. /CPU/* or *CLK*"},
+                        "net":{"type":"string","description":"the same as name"},
                         "min_pins":{"type":"integer","default":0},
                         "power":{"type":"boolean"},
                         "resolve_pads":{"type":"boolean","default":false,"description":"add in_netlist per net (loads footprints; slower)"}})json"_json ),
@@ -893,9 +906,9 @@ KOPENAPI_REGISTER( "sch_net_get",
                    "Schematic net card: every pin (REF.PIN, pin name, electrical type, value, sheet, footprint "
                    "pads and pad_status mapped/unmapped/no_footprint like the netlist exporter), drivers "
                    "vs loads, all names along the hierarchy, per sheet instance the labels, sheet ports, wires "
-                   "and junctions, inferred role with basis; look up by name, code or pin REF.PIN",
+                   "and junctions, inferred role with basis; look up by name (or net), code or pin REF.PIN",
                    R"json({"type":"object","properties":{
-                        "name":{"type":"string"},"code":{"type":"integer"},
+                        "name":{"type":"string"},"net":{"type":"string","description":"the same as name"},"code":{"type":"integer"},
                         "pin":{"type":"string","description":"REF.PIN, e.g. U3.14"}}})json"_json,
                    false, h_sch_net_get );
 

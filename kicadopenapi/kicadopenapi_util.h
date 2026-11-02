@@ -77,6 +77,11 @@ KICOMMON_API bool KopenapiFull( const nlohmann::json& aArgs );
 KICOMMON_API int KopenapiListLimit( const nlohmann::json& aArgs, int aDefault, int aMin = 0,
                                     int aMax = std::numeric_limits<int>::max() );
 
+/// @brief aArgs with aAlias (another spelling callers use, e.g. "net" for a net's "name") as aName;
+/// aError set when both are given and differ
+KICOMMON_API nlohmann::json KopenapiArgAlias( const nlohmann::json& aArgs, const std::string& aAlias,
+                                              const std::string& aName, std::string& aError );
+
 /// @brief One page of aItems: args "limit" (default aDefaultLimit, max aMaxLimit) and "cursor" (opaque,
 /// from the previous page); "full": true gives every item from the cursor on.
 /// Returns { items, total, next_cursor (null on the last page) }.

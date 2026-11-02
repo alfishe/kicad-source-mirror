@@ -304,6 +304,25 @@ int KopenapiListLimit( const nlohmann::json& aArgs, int aDefault, int aMin, int 
 }
 
 
+nlohmann::json KopenapiArgAlias( const nlohmann::json& aArgs, const std::string& aAlias, const std::string& aName,
+                                 std::string& aError )
+{
+    if( !aArgs.is_object() || !aArgs.contains( aAlias ) )
+        return aArgs;
+
+    if( aArgs.contains( aName ) && aArgs[aName] != aArgs[aAlias] )
+    {
+        aError = aAlias + " and " + aName + " name different values (" + aAlias + " is the same as " + aName + ")";
+        return aArgs;
+    }
+
+    nlohmann::json out = aArgs;
+    out[aName] = aArgs[aAlias];
+    out.erase( aAlias );
+    return out;
+}
+
+
 nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json& aArgs, size_t aDefaultLimit,
                              size_t aMaxLimit )
 {

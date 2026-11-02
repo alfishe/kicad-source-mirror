@@ -498,8 +498,14 @@ static KOPENAPI_RESULT h_pcb_footprint_list( KOPENAPI_CONTEXT& aCtx, const nlohm
 }
 
 
-static KOPENAPI_RESULT h_pcb_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+static KOPENAPI_RESULT h_pcb_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aRawArgs )
 {
+    std::string          aliasError;
+    const nlohmann::json aArgs = KopenapiArgAlias( aRawArgs, "net", "name", aliasError );
+
+    if( !aliasError.empty() )
+        return KOPENAPI_RESULT::Error( 400, aliasError );
+
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
     if( !context )
@@ -554,8 +560,14 @@ static KOPENAPI_RESULT h_pcb_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 }
 
 
-static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+static KOPENAPI_RESULT h_pcb_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aRawArgs )
 {
+    std::string          aliasError;
+    const nlohmann::json aArgs = KopenapiArgAlias( aRawArgs, "net", "name", aliasError );
+
+    if( !aliasError.empty() )
+        return KOPENAPI_RESULT::Error( 400, aliasError );
+
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
     if( !context )
@@ -944,6 +956,7 @@ KOPENAPI_REGISTER( "pcb_net_list",
                    "connections, net class; filter by name/class glob, min_pads, unrouted_only; paginated",
                    KopenapiPagedSchema( R"json({
                         "name":{"type":"string","description":"glob, e.g. *CLK* or /CPU/D?"},
+                        "net":{"type":"string","description":"the same as name"},
                         "class":{"type":"string","description":"net class glob"},
                         "min_pads":{"type":"integer","default":0},
                         "unrouted_only":{"type":"boolean","default":false}})json"_json ),
@@ -955,9 +968,9 @@ KOPENAPI_REGISTER( "pcb_net_get",
                    "class rules, routed length per layer, vias, zones, unrouted connections with routing."
                    "unrouted_list (each airwire: from / to as pin REF.PAD or kind track / via / zone, at_mm, "
                    "length_mm; shortest first, cut to list_limit), inferred role (power/ground/clock/"
-                   "reset/diff_pair/interface) with basis; look up by name, code or pin REF.PAD",
+                   "reset/diff_pair/interface) with basis; look up by name (or net), code or pin REF.PAD",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
-                        "name":{"type":"string"},
+                        "name":{"type":"string"},"net":{"type":"string","description":"the same as name"},
                         "code":{"type":"integer"},
                         "pin":{"type":"string","description":"REF.PAD, e.g. U3.14"}}})json"_json, 100 ),
                    false, h_pcb_net_get );
