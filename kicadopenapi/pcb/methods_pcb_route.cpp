@@ -9291,6 +9291,60 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     int escapeSkipped = 0;
 
+    // the pad rows of fine-pitch quad packages: no via on them (it narrows the pins' ways out)
+    std::vector<std::pair<FOOTPRINT*, SHAPE_POLY_SET>> rowBands;
+
+    for( const UNDER_PART& u : ringAreas )
+    {
+        BOX2I centres;
+        int   padHalf = 0;
+        bool  first = true, fine = false;
+
+        for( PAD* pad : u.fp->Pads() )
+        {
+            if( !outward.count( pad ) )
+                continue;
+
+            const BOX2I pb = pad->GetBoundingBox();
+            padHalf = std::max( { padHalf, (int) pb.GetWidth() / 2, (int) pb.GetHeight() / 2 } );
+            fine |= finePads.count( pad ) > 0;
+
+            if( first )
+                centres = BOX2I( pad->GetPosition(), VECTOR2I( 0, 0 ) );
+            else
+                centres.Merge( pad->GetPosition() );
+
+            first = false;
+        }
+
+        if( first || !fine )
+            continue;
+
+        BOX2I outer = centres, inner = centres;
+        outer.Inflate( padHalf );
+        inner.Inflate( -padHalf );
+
+        SHAPE_POLY_SET band;
+        band.NewOutline();
+        band.Append( outer.GetLeft(), outer.GetTop() );
+        band.Append( outer.GetRight(), outer.GetTop() );
+        band.Append( outer.GetRight(), outer.GetBottom() );
+        band.Append( outer.GetLeft(), outer.GetBottom() );
+
+        if( inner.GetWidth() > 0 && inner.GetHeight() > 0 )
+        {
+            SHAPE_POLY_SET hole;
+            hole.NewOutline();
+            hole.Append( inner.GetLeft(), inner.GetTop() );
+            hole.Append( inner.GetRight(), inner.GetTop() );
+            hole.Append( inner.GetRight(), inner.GetBottom() );
+            hole.Append( inner.GetLeft(), inner.GetBottom() );
+            band.BooleanSubtract( hole );
+        }
+
+        rowBands.emplace_back( u.fp, std::move( band ) );
+    }
+
     // the exposed pads of quad packages (pads inside the rows): their vias go in them
     std::set<PAD*> exposedPads;
 
@@ -9857,6 +9911,15 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                                                    : std::nullopt;
                         const PAD*        own = stubPadOf( at );
                         const FOOTPRINT*  body = underWhich( at, start, layer, own ? own->GetParentFootprint() : nullptr );
+
+                        if( !body && join == joinAt.end() )
+                        {
+                            for( const auto& [fp, band] : rowBands )
+                            {
+                                if( band.Collide( at, viaDia / 2 ) )
+                                    body = fp;
+                            }
+                        }
 
                         if( body )
                         {
