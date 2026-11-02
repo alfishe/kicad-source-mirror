@@ -500,7 +500,22 @@ std::vector<std::string> KOPENAPI_REGISTRY::Similar( const std::string& aName, s
     const std::string               wanted = lower( aName );
     const size_t                    close = std::max<size_t>( 3, wanted.size() / 3 ) + 1;
     std::vector<std::pair<size_t, std::string>> spelt;
-    std::vector<std::pair<int, std::string>>    topical;
+    std::vector<std::pair<std::pair<int, size_t>, std::string>> topical;
+
+    // among equal scores, the method whose summary names the topic most often carries it
+    auto mentions = [&]( const KOPENAPI_METHOD& aMethod )
+    {
+        const std::string joined = squeeze( aMethod.summary );
+        size_t            count = 0;
+
+        for( const std::string& term : terms )
+        {
+            for( size_t at = joined.find( term ); at != std::string::npos; at = joined.find( term, at + term.size() ) )
+                ++count;
+        }
+
+        return count;
+    };
 
     for( const KOPENAPI_METHOD& m : methods )
     {
@@ -509,7 +524,7 @@ std::vector<std::string> KOPENAPI_REGISTRY::Similar( const std::string& aName, s
         else if( !terms.empty() && ( domain.empty() || m.name.rfind( domain, 0 ) == 0 ) )
         {
             if( const int score = scoreMethod( m, terms, false ); score > 0 )
-                topical.emplace_back( score, m.name );
+                topical.emplace_back( std::make_pair( score, mentions( m ) ), m.name );
         }
     }
 
