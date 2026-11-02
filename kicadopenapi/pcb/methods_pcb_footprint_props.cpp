@@ -282,6 +282,115 @@ MODEL_META modelMeta( const std::filesystem::path& aModel )
     return meta;
 }
 
+
+/// @brief The Change / Update Footprints dialog's options; aChange: the change dialog's defaults,
+/// else the update dialog's
+struct EXCHANGE_OPTIONS
+{
+    bool matchPads = true;
+    bool removeExtraTexts = false;
+    bool textLayers;
+    bool textEffects;
+    bool textPositions;
+    bool textContent;
+    bool fabAttrs;
+    bool clearances = true;
+    bool models = true;
+    bool transform;
+
+    EXCHANGE_OPTIONS( const nlohmann::json& aArgs, bool aChange ) :
+            matchPads( aArgs.value( "match_pad_positions", true ) ),
+            removeExtraTexts( aArgs.value( "remove_extra_texts", false ) ),
+            textLayers( aArgs.value( "reset_text_layers", aChange ) ),
+            textEffects( aArgs.value( "reset_text_effects", aChange ) ),
+            textPositions( aArgs.value( "reset_text_positions", aChange ) ),
+            textContent( aArgs.value( "reset_text_content", aChange ) ),
+            fabAttrs( aArgs.value( "reset_fabrication_attrs", aChange ) ),
+            clearances( aArgs.value( "reset_clearance_overrides", true ) ),
+            models( aArgs.value( "reset_3d_models", true ) ),
+            transform( aArgs.value( "reset_transform", aChange ) )
+    {
+    }
+
+    void Exchange( BOARD* aBoard, FOOTPRINT* aOld, FOOTPRINT* aNew, BOARD_COMMIT& aCommit, bool* aUpdated,
+                   bool* aShifted ) const
+    {
+        aBoard->ExchangeFootprint( aOld, aNew, aCommit, matchPads, removeExtraTexts, textLayers, textEffects,
+                                   textPositions, textContent, fabAttrs, clearances, models, transform, aUpdated,
+                                   aShifted );
+    }
+};
+
+
+const char* const EXCHANGE_SCHEMA_PROPERTIES = R"json(
+                        "ref":{"type":"string"},"refs":{"type":"array","items":{"type":"string"}},
+                        "all":{"type":"boolean","default":false},
+                        "match_ref":{"type":"string","description":"wildcards * ?"},
+                        "match_value":{"type":"string","description":"wildcards * ?"},
+                        "match_lib_id":{"type":"string","description":"\"Library:Footprint\""},
+                        "match_pad_positions":{"type":"boolean","default":true},
+                        "remove_extra_texts":{"type":"boolean","default":false},
+                        "reset_text_layers":{"type":"boolean"},"reset_text_effects":{"type":"boolean"},
+                        "reset_text_positions":{"type":"boolean"},"reset_text_content":{"type":"boolean"},
+                        "reset_fabrication_attrs":{"type":"boolean"},
+                        "reset_clearance_overrides":{"type":"boolean","default":true},
+                        "reset_3d_models":{"type":"boolean","default":true},
+                        "reset_transform":{"type":"boolean"},
+                        "dry_run":{"type":"boolean","default":false})json";
+
+
+/// @brief The footprints the dialog's match mode picks: ref / refs, all, or match_ref / match_value
+/// (wildcards, case-insensitive) / match_lib_id; in board order. aError when the selector is bad
+std::vector<FOOTPRINT*> matching( BOARD* aBoard, const nlohmann::json& aArgs, std::vector<std::string>& aMissing,
+                                  std::string& aError )
+{
+    const int modes = ( aArgs.contains( "ref" ) || aArgs.contains( "refs" ) ? 1 : 0 )
+                      + ( aArgs.value( "all", false ) ? 1 : 0 ) + ( aArgs.contains( "match_ref" ) ? 1 : 0 )
+                      + ( aArgs.contains( "match_value" ) ? 1 : 0 ) + ( aArgs.contains( "match_lib_id" ) ? 1 : 0 );
+
+    if( modes != 1 )
+    {
+        aError = "one of ref / refs, all, match_ref, match_value, match_lib_id";
+        return {};
+    }
+
+    if( aArgs.contains( "ref" ) || aArgs.contains( "refs" ) )
+        return named( aBoard, aArgs, false, aMissing );
+
+    std::vector<FOOTPRINT*> out;
+    LIB_ID                  id;
+
+    if( aArgs.contains( "match_lib_id" )
+        && ( !aArgs["match_lib_id"].is_string()
+             || id.Parse( wxString::FromUTF8( aArgs["match_lib_id"].get<std::string>() ) ) >= 0 || !id.IsValid() ) )
+    {
+        aError = "match_lib_id: \"Library:Footprint\"";
+        return {};
+    }
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        bool match = true;
+
+        if( aArgs.contains( "match_ref" ) )
+            match = WildCompareString( wxString::FromUTF8( aArgs.value( "match_ref", std::string() ) ),
+                                       fp->GetReference(), false );
+        else if( aArgs.contains( "match_value" ) )
+            match = WildCompareString( wxString::FromUTF8( aArgs.value( "match_value", std::string() ) ),
+                                       fp->GetValue(), false );
+        else if( aArgs.contains( "match_lib_id" ) )
+            match = fp->GetFPID() == id;
+
+        if( match )
+            out.push_back( fp );
+    }
+
+    if( out.empty() )
+        aError = "no footprint matches";
+
+    return out;
+}
+
 } // namespace
 
 
@@ -982,6 +1091,85 @@ static KOPENAPI_RESULT h_pcb_footprint_lib_diff( KOPENAPI_CONTEXT& aCtx, const n
 }
 
 
+static KOPENAPI_RESULT h_pcb_footprint_change( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD* board = context->GetBoard();
+    LIB_ID newId;
+
+    if( !aArgs.contains( "lib_id" ) || !aArgs["lib_id"].is_string()
+        || newId.Parse( wxString::FromUTF8( aArgs["lib_id"].get<std::string>() ) ) >= 0 || !newId.IsValid() )
+    {
+        return KOPENAPI_RESULT::Error( 400, "lib_id: the new footprint, \"Library:Footprint\"" );
+    }
+
+    std::vector<std::string> missing;
+    std::string              error;
+    std::vector<FOOTPRINT*>  fps = matching( board, aArgs, missing, error );
+
+    if( !error.empty() )
+        return KOPENAPI_RESULT::Error( error == "no footprint matches" ? 404 : 400, error );
+
+    if( fps.empty() )
+        return KOPENAPI_RESULT::Error( 404, "no footprint " + missing.front() );
+
+    KopenapiFootprintLibraries( board->GetProject() );
+
+    std::unique_ptr<FOOTPRINT> probe( LoadFootprintFromProject( board, newId ) );
+
+    if( !probe )
+        return KOPENAPI_RESULT::Error( 404, "lib_id: no such footprint in the library tables" );
+
+    const EXCHANGE_OPTIONS options( aArgs, true );
+    const bool             dryRun = aArgs.value( "dry_run", false );
+    BOARD_COMMIT           commit( context->GetToolManager() );
+    nlohmann::json         items = nlohmann::json::array();
+
+    for( FOOTPRINT* fp : fps )
+    {
+        nlohmann::json row = { { "ref", str( fp->GetReference() ) },
+                               { "from", str( fp->GetFPID().Format() ) },
+                               { "to", str( newId.Format() ) } };
+
+        if( dryRun )
+        {
+            row["status"] = "would_change";
+            items.push_back( row );
+            continue;
+        }
+
+        FOOTPRINT* newFp = LoadFootprintFromProject( board, newId );
+        bool       updated = true;
+        bool       shifted = false;
+
+        options.Exchange( board, fp, newFp, commit, &updated, &shifted );
+
+        row["status"] = "changed";
+        row["uuid"] = str( newFp->m_Uuid.AsString() );
+        row["pads"] = newFp->Pads().size();
+
+        if( shifted )
+            row["shifted"] = true;
+
+        items.push_back( row );
+    }
+
+    if( !dryRun )
+        commit.Push( _( "Change Footprints" ) );
+
+    nlohmann::json result = { { "changed", dryRun ? 0 : (int) fps.size() }, { "dry_run", dryRun }, { "items", items } };
+
+    if( !missing.empty() )
+        result["missing"] = missing;
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
+
 static KOPENAPI_RESULT h_pcb_footprint_lib_update( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -991,7 +1179,21 @@ static KOPENAPI_RESULT h_pcb_footprint_lib_update( KOPENAPI_CONTEXT& aCtx, const
 
     BOARD*                   board = context->GetBoard();
     std::vector<std::string> missing;
-    std::vector<FOOTPRINT*>  fps = named( board, aArgs, false, missing );
+    std::vector<FOOTPRINT*>  fps;
+
+    if( aArgs.value( "all", false ) || aArgs.contains( "match_ref" ) || aArgs.contains( "match_value" )
+        || aArgs.contains( "match_lib_id" ) )
+    {
+        std::string error;
+        fps = matching( board, aArgs, missing, error );
+
+        if( !error.empty() )
+            return KOPENAPI_RESULT::Error( error == "no footprint matches" ? 404 : 400, error );
+    }
+    else
+    {
+        fps = named( board, aArgs, false, missing );
+    }
 
     if( fps.empty() )
         return KOPENAPI_RESULT::Error( 404, missing.empty() ? "give ref or refs (the footprints to update)" : "no footprint " + missing.front() );
@@ -1001,6 +1203,26 @@ static KOPENAPI_RESULT h_pcb_footprint_lib_update( KOPENAPI_CONTEXT& aCtx, const
     const bool dryRun = aArgs.value( "dry_run", false );
     const bool keepTexts = aArgs.value( "keep_texts", true );
     const bool keepModels = aArgs.value( "keep_3d_models", false );
+
+    // keep_texts / keep_3d_models are the short forms; a reset_* flag given wins
+    EXCHANGE_OPTIONS options( aArgs, false );
+    auto unless = [&]( const char* aKey, bool& aFlag, bool aValue )
+    {
+        if( !aArgs.contains( aKey ) )
+            aFlag = aValue;
+    };
+
+    unless( "reset_fabrication_attrs", options.fabAttrs, true );
+    unless( "reset_3d_models", options.models, !keepModels );
+
+    if( !keepTexts )
+    {
+        unless( "remove_extra_texts", options.removeExtraTexts, true );
+        unless( "reset_text_layers", options.textLayers, true );
+        unless( "reset_text_effects", options.textEffects, true );
+        unless( "reset_text_positions", options.textPositions, true );
+        unless( "reset_text_content", options.textContent, true );
+    }
 
     BOARD_COMMIT   commit( context->GetToolManager() );
     nlohmann::json items = nlohmann::json::array();
@@ -1020,7 +1242,7 @@ static KOPENAPI_RESULT h_pcb_footprint_lib_update( KOPENAPI_CONTEXT& aCtx, const
 
         nlohmann::json diff = differences( fp, lib );
 
-        if( keepModels )
+        if( !options.models )
         {
             nlohmann::json models = modelDifferences( fp, lib );
 
@@ -1054,10 +1276,7 @@ static KOPENAPI_RESULT h_pcb_footprint_lib_update( KOPENAPI_CONTEXT& aCtx, const
         bool updated = true;
         bool shifted = false;
 
-        // texts keep their place, layer, look and content (the board's), fabrication attributes and
-        // clearance overrides come from the library, as "Update Footprints from Library" offers
-        board->ExchangeFootprint( fp, lib, commit, true, !keepTexts, !keepTexts, !keepTexts, !keepTexts, !keepTexts,
-                                  true, true, !keepModels, false, &updated, &shifted );
+        options.Exchange( board, fp, lib, commit, &updated, &shifted );
 
         row["status"] = "updated";
         row["differences"] = diff;
@@ -1215,18 +1434,36 @@ KOPENAPI_REGISTER( "pcb_footprint_lib_diff",
                    false, h_pcb_footprint_lib_diff, 300 );
 
 KOPENAPI_REGISTER( "pcb_footprint_lib_update",
-                   "Replace placed footprints (ref or refs) by their library copies, as \"Update Footprints "
-                   "from Library\": position, side, nets and fields stay, pads matched by position; texts keep "
+                   "Replace placed footprints by their library copies, as \"Update Footprints from Library\": "
+                   "ref / refs, or the dialog's match modes (all, match_ref / match_value with wildcards, "
+                   "match_lib_id); position, side, nets and fields stay, pads matched by position; texts keep "
                    "the board's place and look (keep_texts false: the library's); 3D models from the "
                    "library unless keep_3d_models (then model differences alone update nothing and are listed "
-                   "as models_kept); always the library files as they are on disk now; dry_run lists what would "
-                   "change; one undo step",
-                   R"json({"type":"object","properties":{
-                        "ref":{"type":"string"},"refs":{"type":"array","items":{"type":"string"}},
+                   "as models_kept); fabrication attributes and clearance overrides from the library. The "
+                   "dialog's reset_* / remove_extra_texts / match_pad_positions flags set each item and win "
+                   "over the short forms. Always the library files as they are on disk now; dry_run lists what "
+                   "would change; one undo step",
+                   nlohmann::json::parse( std::string( R"json({"type":"object","properties":{
                         "keep_texts":{"type":"boolean","default":true},
-                        "keep_3d_models":{"type":"boolean","default":false},
-                        "dry_run":{"type":"boolean","default":false}}})json"_json,
+                        "keep_3d_models":{"type":"boolean","default":false},)json" )
+                                          + EXCHANGE_SCHEMA_PROPERTIES + "}}" ),
                    false, h_pcb_footprint_lib_update, 300 );
+
+KOPENAPI_REGISTER( "pcb_footprint_change",
+                   "Change Footprints, as the board editor's dialog: the matched footprints (ref / refs, all, "
+                   "match_ref / match_value with wildcards * ?, match_lib_id) are replaced by lib_id from the "
+                   "library tables in one undo step: position, side, reference, value, fields and nets stay, "
+                   "pads matched by number and, with match_pad_positions, moved / rotated so the pads land "
+                   "where the old ones were. The dialog's options with its defaults: text layers, sizes, "
+                   "positions and content, fabrication attributes, clearance overrides, 3D models and the "
+                   "transform from the new footprint (reset_* false keeps the board's); remove_extra_texts "
+                   "drops texts the new one lacks. dry_run lists the matches. Answers per footprint ref, from, "
+                   "to, the new uuid and pad count, shifted. The schematic keeps its footprint field until "
+                   "sch_update_from_pcb",
+                   nlohmann::json::parse( std::string( R"json({"type":"object","required":["lib_id"],"properties":{
+                        "lib_id":{"type":"string","description":"the new footprint, \"Library:Footprint\""},)json" )
+                                          + EXCHANGE_SCHEMA_PROPERTIES + "}}" ),
+                   false, h_pcb_footprint_change, 300 );
 
 KOPENAPI_REGISTER( "pcb_parts_check",
                    "Placed footprint <-> library <-> 3D model, one fast pass (default every footprint, "
@@ -1244,4 +1481,5 @@ KOPENAPI_REGISTER( "pcb_parts_check",
                         "problems_only":{"type":"boolean","default":true}})json"_json ),
                    false, h_pcb_parts_check, 300 );
 
-KOPENAPI_MARK_EDITING( "pcb_footprint_update", "pcb_footprint_lib_update", "pcb_footprint_delete" );
+KOPENAPI_MARK_EDITING( "pcb_footprint_update", "pcb_footprint_lib_update", "pcb_footprint_delete",
+                       "pcb_footprint_change" );
