@@ -1128,7 +1128,7 @@ bool PNS_PCBNEW_RULE_RESOLVER::HasUserDefinedPhysicalConstraint()
 
 size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS::ITEM* aOther )
 {
-    if( aItem->Owner() || aItem->BoardItem() )
+    if( aItem->BoardItem() )
         return 0;
 
     size_t h = 0x9E3779B97F4A7C15;
