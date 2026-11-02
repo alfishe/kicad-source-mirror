@@ -2065,18 +2065,119 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return out;
     };
 
+    // corridor_merge: the gates a straight run from one gate to a later one passes are dropped, their
+    // regions kept as the earlier gate's rooms (corridor.md): the run crosses each portal between in
+    // order, inside it less the ribbon's half width and a pitch. The run's ends are moved along their
+    // portals to fit the ribbon there too, the far end in line with the near one where it can be.
+    const bool corridorMerge = aArgs.value( "corridor_merge", true );
+    int        gatesMerged = 0;
+    using AT = std::array<double, 2>;
+
+    auto roomOf = []( const LINK& aLink )
+    {
+        return aLink.demand / 2 + ( aLink.nets.empty() ? 0.0 : aLink.demand / aLink.nets.size() );
+    };
+
+    auto onPortal = [&]( const LINK& aLink, size_t aGate, AT aAt, std::optional<double> aWant )
+    {
+        const PORTAL& p = portals[(size_t) aLink.corridor[aGate][2]];
+        const double  room = roomOf( aLink ), lo = p.lo + room, hi = p.hi - room;
+        double&       u = p.vertical ? aAt[1] : aAt[0];
+
+        if( aWant && *aWant >= lo && *aWant <= hi )
+            u = *aWant;
+        else if( lo <= hi )
+            u = std::clamp( u, lo, hi );
+
+        return aAt;
+    };
+
+    auto straightThrough = [&]( const LINK& aLink, size_t aFrom, const AT& aA, size_t aTo, const AT& aB )
+    {
+        const double room = roomOf( aLink );
+        double       lastT = 0;
+
+        for( size_t i = aFrom + 1; i < aTo; ++i )
+        {
+            const PORTAL& p = portals[(size_t) aLink.corridor[i][2]];
+            const double  span = p.vertical ? aB[0] - aA[0] : aB[1] - aA[1];
+
+            if( std::abs( span ) < 1e-9 )
+                return false;
+
+            const double t = ( p.at - ( p.vertical ? aA[0] : aA[1] ) ) / span;
+            const double u = p.vertical ? aA[1] + t * ( aB[1] - aA[1] ) : aA[0] + t * ( aB[0] - aA[0] );
+
+            if( t <= lastT || t >= 1 || u < p.lo + room - 1e-9 || u > p.hi - room + 1e-9 )
+                return false;
+
+            lastT = t;
+        }
+
+        return true;
+    };
+
+    auto roomJson = [&]( int aRegion )
+    {
+        const REGION& r = regions[(size_t) aRegion];
+        return nlohmann::json{ r2( toMm( xs[r.i0] ) ), r2( toMm( ys[r.j0] ) ), r2( toMm( xs[r.i1] ) ), r2( toMm( ys[r.j1] ) ) };
+    };
+
     auto corridorJson = [&]( const LINK& aLink )
     {
-        nlohmann::json list = nlohmann::json::array();
+        nlohmann::json      list = nlohmann::json::array();
+        const size_t        n = aLink.corridor.size();
+        std::vector<size_t> kept;
+        std::vector<AT>     at( n );
 
-        for( const std::array<double, 4>& c : aLink.corridor )
+        for( size_t j = 0; j < n; ++j )
+            at[j] = { aLink.corridor[j][0], aLink.corridor[j][1] };
+
+        AT   runFrom{}, runTo{};
+        bool merged = false;
+
+        for( size_t j = 0, anchor = 0; j < n; ++j )
         {
+            if( j > 0 && corridorMerge && j + 1 < n )
+            {
+                const PORTAL& to = portals[(size_t) aLink.corridor[j + 1][2]];
+                const AT      a = onPortal( aLink, anchor, at[anchor], std::nullopt );
+                const AT      b = onPortal( aLink, j + 1, at[j + 1], to.vertical ? a[1] : a[0] );
+
+                if( straightThrough( aLink, anchor, a, j + 1, b ) )
+                {
+                    runFrom = a;
+                    runTo = b;
+                    merged = true;
+                    continue;
+                }
+            }
+
+            if( merged )
+            {
+                at[anchor] = runFrom;
+                at[j] = runTo;
+                merged = false;
+            }
+
+            kept.push_back( j );
+            anchor = j;
+        }
+
+        gatesMerged += int( n - kept.size() );
+
+        for( size_t k = 0; k < kept.size(); ++k )
+        {
+            const std::array<double, 4>& c = aLink.corridor[kept[k]];
             const PORTAL& p = portals[(size_t) c[2]];
-            const REGION& r = regions[(size_t) c[3]];
             const auto [lo, hi] = freeStretch( (int) c[2] );
-            list.push_back( { { "at_mm", { r2( c[0] ), r2( c[1] ) } }, { "along", p.vertical ? "y" : "x" },
-                              { "lo_mm", r2( lo ) }, { "hi_mm", r2( hi ) },
-                              { "into_mm", { r2( toMm( xs[r.i0] ) ), r2( toMm( ys[r.j0] ) ), r2( toMm( xs[r.i1] ) ), r2( toMm( ys[r.j1] ) ) } } } );
+            nlohmann::json rooms = nlohmann::json::array();
+
+            for( size_t i = kept[k]; i < ( k + 1 < kept.size() ? kept[k + 1] : kept[k] + 1 ); ++i )
+                rooms.push_back( roomJson( (int) aLink.corridor[i][3] ) );
+
+            list.push_back( { { "at_mm", { r2( at[kept[k]][0] ), r2( at[kept[k]][1] ) } }, { "along", p.vertical ? "y" : "x" },
+                              { "lo_mm", r2( lo ) }, { "hi_mm", r2( hi ) }, { "into_mm", rooms[0] }, { "rooms_mm", rooms } } );
 
             if( copperStretches )
                 list.back()["free_mm"] = copperFree( p.vertical, p.at, lo, hi );
@@ -2270,6 +2371,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
               { "links", linkList },
               { "ports", portList },
               { "summary", { { "links", links.size() },
+                             { "gates_merged", gatesMerged },
                              { "overflowing_links", linksOver },
                              { "links_without_path", linksMissing },
                              { "links_through_blocks", linksThrough },
@@ -2335,6 +2437,7 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
+                        "corridor_merge":{"type":"boolean","default":true,"description":"a corridor's gates (portals crossed) that a straight run from an earlier gate to a later one passes, inside each portal less the ribbon's half width and a pitch, are dropped; the earlier gate's rooms_mm lists the regions the run goes through (corridor.md); summary gates_merged"},
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
                         "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
