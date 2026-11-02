@@ -10,7 +10,7 @@
 /// one path portal to portal from its pads' boxes in one block to those in the other; each channel it
 /// crosses (portals, and the inner grid lines of the free regions it goes through) carries its width
 /// (track + clearance of each net's class).  Overflows are negotiated over channels (PathFinder costs:
-/// present overuse and history).  A bus leaves and enters its end parts' boxes by the side their pads
+/// present overuse and history, one pitch over worth the way round the channel).  A bus leaves and enters its end parts' boxes by the side their pads
 /// face (pcb_layout_graph); a box side's free facing length per layer is its port capacity.
 #include "kopenapi_pcb.h"
 
@@ -171,6 +171,7 @@ struct CUT
     double              hist = 0;
     std::vector<int>    links;
     bool                through = false;   ///< across a box of a block, under its parts
+    double              detour = -1;       ///< mm, the way round the obstacle at its nearer end instead; -1: none
 };
 
 
@@ -276,7 +277,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     const int maxIterations = std::clamp( aArgs.value( "iterations", 8 ), 1, 64 );
     const bool negotiate = aArgs.value( "negotiate", true );
-    const double overflowCost = std::max( 0.0, aArgs.value( "overflow_cost_mm", 5.0 ) );
     const int listLimit = KopenapiListLimit( aArgs, 40, 1 );
     const bool allChannels = aArgs.value( "all_channels", false );
     const std::string reroute = aArgs.value( "reroute", std::string( "overflowed" ) );
@@ -1284,6 +1284,37 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return n.empty() ? obstacleName( *aOther, blocks, keepouts ) : n;
     };
 
+    // the way round a channel instead of through it: from its middle along its line past the obstacle at
+    // its nearer end and back; none where both ends reach the board's outline
+    auto runOut = [&]( auto&& aCells, auto&& aLen, int aFrom, int aStep, int aCount ) -> int64_t
+    {
+        int64_t run = 0;
+
+        for( int t = aFrom; t >= 0 && t < aCount; t += aStep )
+        {
+            const auto [one, other] = aCells( t );
+
+            if( one->kind == CELL_OUT || other->kind == CELL_OUT )
+                return -1;
+
+            if( one->kind == CELL_FREE && other->kind == CELL_FREE )
+                return run;
+
+            run += aLen( t );
+        }
+
+        return -1;
+    };
+
+    auto detourOf = [&]( const CUT& aCut, int64_t aLow, int64_t aHigh )
+    {
+        if( aLow < 0 && aHigh < 0 )
+            return -1.0;
+
+        const int64_t run = aLow < 0 ? aHigh : aHigh < 0 ? aLow : std::min( aLow, aHigh );
+        return toMm( 2.0 * ( double( run ) + ( aCut.to - aCut.from ) / 2.0 ) );
+    };
+
     for( int line = 0; line + 1 < nx; ++line )
     {
         for( int j = 0; j < ny; )
@@ -1323,6 +1354,11 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             cut.to = ys[j];
             cut.low = j0 > 0 ? endName( &at( line, j0 - 1 ), &at( line + 1, j0 - 1 ) ) : "board edge";
             cut.high = j < ny ? endName( &at( line, j ), &at( line + 1, j ) ) : "board edge";
+            {
+                auto pair = [&]( int t ) { return std::make_pair( &at( line, t ), &at( line + 1, t ) ); };
+                auto len = [&]( int t ) { return int64_t( ys[t + 1] - ys[t] ); };
+                cut.detour = detourOf( cut, runOut( pair, len, j0 - 1, -1, ny ), runOut( pair, len, j, 1, ny ) );
+            }
 
             for( int f : cut.free )
                 cut.total += f;
@@ -1370,6 +1406,11 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             cut.to = xs[i];
             cut.low = i0 > 0 ? endName( &at( i0 - 1, line ), &at( i0 - 1, line + 1 ) ) : "board edge";
             cut.high = i < nx ? endName( &at( i, line ), &at( i, line + 1 ) ) : "board edge";
+            {
+                auto pair = [&]( int t ) { return std::make_pair( &at( t, line ), &at( t, line + 1 ) ); };
+                auto len = [&]( int t ) { return int64_t( xs[t + 1] - xs[t] ); };
+                cut.detour = detourOf( cut, runOut( pair, len, i0 - 1, -1, nx ), runOut( pair, len, i, 1, nx ) );
+            }
 
             for( int f : cut.free )
                 cut.total += f;
@@ -1415,6 +1456,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             cut.to = dir == 0 ? bb.GetBottom() : bb.GetRight();
             cut.free.assign( nl, 0 );
             cut.low = cut.high = blocks[boxes[k].block].name;
+            cut.detour = toMm( cut.to - cut.from );
 
             for( int l = 0; l < nl; ++l )
             {
@@ -1522,6 +1564,13 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 regionOf[size_t( j ) * nx + k] = r;
         }
     }
+
+    // no path is longer than every passable region's half perimeter together: the cost of one pitch over
+    // a channel with no way round it
+    double longestWay = 0;
+
+    for( const REGION& r : regions )
+        longestWay += toMm( double( xs[r.i1] - xs[r.i0] ) + double( ys[r.j1] - ys[r.j0] ) );
 
     // portals: the boundary two regions share (one segment, on one channel when both are free)
     std::vector<PORTAL> portals;
@@ -1710,7 +1759,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             {
                 const CUT&   cut = cuts[aCut];
                 const double over = std::max( 0.0, cut.use + aLink.demand - capacity( cut ) ) / defaultPitch;
-                cutCostAt[aCut] = ( aPresent * over + cut.hist ) * overflowCost;
+                cutCostAt[aCut] = ( aPresent * over + cut.hist ) * ( cut.detour >= 0 ? cut.detour : longestWay );
                 cutAt[aCut] = epoch;
             }
 
@@ -2298,6 +2347,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                                { "length_mm", r2( toMm( c.to - c.from ) ) },
                                { "between", { c.low, c.high } },
                                { "through", c.through },
+                               { "detour_mm", c.detour >= 0 ? nlohmann::json( r2( c.detour ) ) : nlohmann::json() },
                                { "free_mm", perLayer },
                                { "capacity_mm", r2( cap ) },
                                { "tracks", tracks },
@@ -2891,7 +2941,8 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                    "per layer, the vias that fit across it. Links: each pcb_layout_graph bus between two blocks, and "
                    "the single nets between two blocks, as one bundle with its width (track + clearance of each "
                    "net's class), taking one shortest path through the channels; overflows negotiated over the "
-                   "channels (present overuse and history costs) and the best round kept. Answers channels by use, "
+                   "channels (present overuse and history costs, a pitch over a channel worth its detour_mm: the way round "
+                   "the obstacle at its nearer end, else every region's half perimeter together) and the best round kept. Answers channels by use, "
                    "overflows (demand over capacity, tracks over), links with their channel path, corridor (per portal crossed: the point, the "
                    "portal's axis, its stretch free on both sides and the region entered; pcb_route bus_paths floorplan routes a bus along it), length, blocks "
                    "they must cross (boxes overlapping or no way round) and the box sides they leave and enter by (a bus by "
@@ -2933,7 +2984,6 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
                         "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
-                        "overflow_cost_mm":{"type":"number","default":5,"description":"detour worth one track over a channel's capacity, first round (doubles each round)"},
                         "all_channels":{"type":"boolean","default":false,"description":"list every channel, not only the used ones"},
                         "list_limit":{"type":"integer","default":40,"description":"channels listed, net names and links per entry"},"full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"},
                         "show":{"type":"boolean","default":false,"description":"GUI: overlay group 'floorplan'"}}})json"_json,
