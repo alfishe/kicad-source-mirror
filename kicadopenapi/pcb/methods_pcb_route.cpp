@@ -17493,12 +17493,7 @@ static KOPENAPI_RESULT h_pcb_fanout( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     if( cols < 2 || rows < 2 || innerRows.size() < 2 || innerCols.size() < 2 )
         return peripheralFanout( aCtx, *context, board, fp, aArgs );
 
-    // sizes from the pitch (the reference designs: 0.5 mm 0.28 / 0.15, 0.8 mm 0.4 - 0.5 / 0.2 - 0.25,
-    // 1.0 mm 0.5 / 0.2), the board's minimums as a floor
     const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
-    const double                 pitchMm = pitch / pcbIUScale.IU_PER_MM;
-    const double defDia = pitchMm < 0.6 ? 0.3 : pitchMm < 0.7 ? 0.35 : pitchMm < 0.9 ? 0.45 : 0.5;
-    const double defDrill = pitchMm < 0.6 ? 0.15 : pitchMm < 0.9 ? 0.2 : 0.25;
     // the board's rules at a via between the balls (custom rules under a BGA count): smallest via,
     // drill and ring, and the clearance a via of one net keeps to a ball of another
     int minDia = bds.m_ViasMinSize, minDrill = bds.m_MinThroughDrill, minRing = bds.m_ViasMinAnnularWidth;
@@ -17544,10 +17539,15 @@ static KOPENAPI_RESULT h_pcb_fanout( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     const int room = KiROUND( pitch / M_SQRT2 );
     const int fitDia = 2 * ( room - ballRadius - clearance );
 
-    int viaDia = aArgs.contains( "via_diameter_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", defDia ) )
-                                                   : std::max( minDia, std::min( pcbIUScale.mmToIU( defDia ), fitDia ) );
-    int viaDrill = aArgs.contains( "via_drill_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", defDrill ) )
-                                                    : std::max( minDrill, std::min( pcbIUScale.mmToIU( defDrill ), viaDia - 2 * std::max( minRing, 1 ) ) );
+    // the via the rules size for the balls' nets where it fits between them, else the largest that fits
+    // (its drill keeping the minimum ring); the board's minimums as a floor
+    const VECTOR2I          spot = balls.front()->GetPosition() + VECTOR2I( pitch / 2, pitch / 2 );
+    const KOPENAPI_RULE_VIA ruleVia = KopenapiRuleVia( board, balls.front()->GetNetCode(), spot, F_Cu );
+    const int               fitted = std::max( minDia, std::min( ruleVia.dia, fitDia ) );
+
+    int viaDia = aArgs.contains( "via_diameter_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", 0.0 ) ) : fitted;
+    int viaDrill = aArgs.contains( "via_drill_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", 0.0 ) )
+                                                    : std::max( minDrill, std::min( ruleVia.drill, viaDia - 2 * std::max( minRing, 1 ) ) );
 
     // vias already under the package: the design's own size (the most common one), when its rules allow it
     if( !aArgs.contains( "via_diameter_mm" ) && !aArgs.contains( "via_drill_mm" ) )
@@ -17595,7 +17595,20 @@ static KOPENAPI_RESULT h_pcb_fanout( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
                                                     + " mm is below the board's rules (diameter / drill / ring): lower "
                                                       "constraints in pcb_rules_set, or give via_diameter_mm / via_drill_mm" );
 
-    const int defaultDirect = pitchMm >= 0.75 ? 1 : 0;
+    // the outer rings that leave on their own layer: ring n's track passes between the balls of the n - 1
+    // rings outside it, so n - 1 tracks of the rules' width fit in the gap between two balls at the rules'
+    // clearances; none when not even the outer ring's tracks run side by side at the pitch
+    const int ruleWidth = KopenapiRuleTrack( board, balls.front()->GetNetCode(), balls.front()->GetPosition(), F_Cu ).opt;
+    int       defaultDirect = 0;
+
+    if( ruleWidth + clearance <= pitch )
+    {
+        defaultDirect = 1;
+
+        while( defaultDirect < 20 && defaultDirect * ruleWidth + ( defaultDirect + 1 ) * clearance <= pitch - 2 * ballRadius )
+            defaultDirect++;
+    }
+
     const int direct = std::clamp( aArgs.value( "outer_rings_direct", defaultDirect ), 0, 20 );
     const bool dryRun = aArgs.value( "dry_run", false );
     const std::string zoneMode = aArgs.value( "zones", std::string( "refill" ) );
@@ -18151,9 +18164,11 @@ KOPENAPI_REGISTER( "pcb_fanout",
                    "ball a short track to a through via on the diagonal between four balls, pointing away from "
                    "the package centre (quadrant dog-bone; another diagonal when that spot is taken). Balls of "
                    "nets with no other pad are left alone, so are the outer rings that leave on their layer "
-                   "(outer_rings_direct: default 1 at 0.75 mm pitch and coarser, 0 finer). Via size: given, or "
-                   "the one most used under the package when the rules allow it, or from the pitch (0.5 mm "
-                   "0.3 / 0.15, 0.65 mm 0.35 / 0.2, 0.8 mm 0.45 / 0.2, 1.0 mm 0.5 / 0.25); stub width the net class's (width_mm to set); the guard and the board's minimums "
+                   "(outer_rings_direct: default as many rings as the rules' tracks pass between two outer balls - ring n "
+                   "needs n - 1 tracks in the gap at the clearances - plus the outer one, 0 when not even its tracks run "
+                   "side by side at the pitch). Via size: given, or the one most used under the package when the rules "
+                   "allow it, or the via the rules size for the net where it fits between four balls, else the largest "
+                   "that fits (drill keeping the minimum ring); stub width the net class's (width_mm to set); the guard and the board's minimums "
                    "apply; pours give way and are refilled; one undo step; dry_run plans only. Answers per ball "
                    "(via spot, ring, outward) and the skipped ones with the reason (lists cut to list_limit, "
                    "default 20; full: true for all); then pcb_route from the vias. A package with its pads on a ring "
