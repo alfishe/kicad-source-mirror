@@ -265,6 +265,26 @@ std::vector<std::string> tokens( const nlohmann::json::json_pointer& aPointer )
     return out;
 }
 
+/// @brief The schema of the value at aPointer (through properties and items), or null
+const nlohmann::json* schemaAt( const nlohmann::json& aSchema, const nlohmann::json::json_pointer& aPointer )
+{
+    const nlohmann::json* schema = &aSchema;
+
+    for( const std::string& token : tokens( aPointer ) )
+    {
+        const nlohmann::json* object = schema->is_object() ? objectSchema( *schema ) : nullptr;
+
+        if( object && ( *object )["properties"].contains( token ) )
+            schema = &( *object )["properties"][token];
+        else if( schema->is_object() && schema->contains( "items" ) && ( *schema )["items"].is_object() )
+            schema = &( *schema )["items"];
+        else
+            return nullptr;
+    }
+
+    return schema;
+}
+
 } // namespace
 
 
@@ -329,22 +349,28 @@ std::string KopenapiValidateArgs( const std::string& aMethod, const nlohmann::js
     // its oneOf / anyOf gives the reason that form has
     const nlohmann::json value = integralAsIntegers( aArgs );
 
+    if( errors.Message().find( "enum" ) != std::string::npos )
+    {
+        const nlohmann::json* schema = schemaAt( aSchema, errors.Pointer() );
+
+        if( schema && schema->is_object() && schema->contains( "enum" ) && ( *schema )["enum"].is_array() )
+        {
+            std::string values;
+
+            for( const nlohmann::json& v : ( *schema )["enum"] )
+                values += ( values.empty() ? "" : ", " ) + ( v.is_string() ? v.get<std::string>() : v.dump() );
+
+            return errors.Message() + " (one of: " + values + ")";
+        }
+    }
+
     if( errors.Message().find( "subschema" ) != std::string::npos && value.contains( errors.Pointer() ) )
     {
         const nlohmann::json& at = value.at( errors.Pointer() );
-        const nlohmann::json* schema = &aSchema;
+        const nlohmann::json* schema = schemaAt( aSchema, errors.Pointer() );
 
-        for( const std::string& token : tokens( errors.Pointer() ) )
-        {
-            const nlohmann::json* object = schema->is_object() ? objectSchema( *schema ) : nullptr;
-
-            if( object && ( *object )["properties"].contains( token ) )
-                schema = &( *object )["properties"][token];
-            else if( schema->is_object() && schema->contains( "items" ) && ( *schema )["items"].is_object() )
-                schema = &( *schema )["items"];
-            else
-                return errors.Message();
-        }
+        if( !schema )
+            return errors.Message();
 
         const nlohmann::json* form = at.is_object() && schema->is_object() && !schema->contains( "properties" )
                                              ? objectSchema( *schema )
