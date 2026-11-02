@@ -38,6 +38,7 @@
 #include <project/project_file.h>
 #include <wildcards_and_files_ext.h>
 #include <drc/drc_engine.h>
+#include <drc/drc_item.h>
 #include <pcb_shape.h>
 #include <tool/actions.h>
 #include <kiway.h>
@@ -787,6 +788,68 @@ bool writeCustomRules( const wxString& aPath, const std::string& aText )
 constexpr size_t RULES_LIST_CAP = 20;
 
 
+/// @brief The DRC checks whose severity Board Setup sets, by their settings key (as in the project file)
+std::map<std::string, int> severityKeys()
+{
+    std::map<std::string, int> keys;
+
+    for( const RC_ITEM& item : DRC_ITEM::GetItemsWithSeverities() )
+    {
+        if( item.GetErrorCode() > 0 && !item.GetSettingsKey().IsEmpty() )
+            keys[str( item.GetSettingsKey() )] = item.GetErrorCode();
+    }
+
+    return keys;
+}
+
+
+nlohmann::json severitiesJson( BOARD* aBoard )
+{
+    BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
+    nlohmann::json         out = nlohmann::json::object();
+
+    for( const auto& [key, code] : severityKeys() )
+    {
+        const SEVERITY s = bds.GetSeverity( code );
+        out[key] = s == RPT_SEVERITY_ERROR ? "error" : s == RPT_SEVERITY_WARNING ? "warning" : "ignore";
+    }
+
+    return out;
+}
+
+
+/// @brief Board Setup's pre-defined sizes (the editor's track / via / pair size choices; the first
+/// entry of each list is KiCad's "use net class" placeholder, left out here) and pad mask / paste
+nlohmann::json sizesJson( BOARD_DESIGN_SETTINGS& aBds )
+{
+    nlohmann::json tracks = nlohmann::json::array(), vias = nlohmann::json::array(), pairs = nlohmann::json::array();
+
+    for( size_t i = 1; i < aBds.m_TrackWidthList.size(); ++i )
+        tracks.push_back( toMm( aBds.m_TrackWidthList[i] ) );
+
+    for( size_t i = 1; i < aBds.m_ViasDimensionsList.size(); ++i )
+        vias.push_back( { { "diameter_mm", toMm( aBds.m_ViasDimensionsList[i].m_Diameter ) },
+                          { "drill_mm", toMm( aBds.m_ViasDimensionsList[i].m_Drill ) } } );
+
+    for( size_t i = 1; i < aBds.m_DiffPairDimensionsList.size(); ++i )
+        pairs.push_back( { { "width_mm", toMm( aBds.m_DiffPairDimensionsList[i].m_Width ) },
+                           { "gap_mm", toMm( aBds.m_DiffPairDimensionsList[i].m_Gap ) },
+                           { "via_gap_mm", toMm( aBds.m_DiffPairDimensionsList[i].m_ViaGap ) } } );
+
+    return { { "track_widths_mm", tracks }, { "via_sizes", vias }, { "diff_pairs", pairs } };
+}
+
+
+nlohmann::json maskPasteJson( BOARD_DESIGN_SETTINGS& aBds )
+{
+    return { { "mask_expansion_mm", toMm( aBds.m_SolderMaskExpansion ) },
+             { "mask_min_width_mm", toMm( aBds.m_SolderMaskMinWidth ) },
+             { "mask_to_copper_clearance_mm", toMm( aBds.m_SolderMaskToCopperClearance ) },
+             { "paste_clearance_mm", toMm( aBds.m_SolderPasteMargin ) },
+             { "paste_ratio", aBds.m_SolderPasteMarginRatio } };
+}
+
+
 nlohmann::json rulesJson( BOARD* aBoard, const KOPENAPI_LIST_CAP& aCap )
 {
     BOARD_DESIGN_SETTINGS&         bds = aBoard->GetDesignSettings();
@@ -861,7 +924,9 @@ nlohmann::json rulesJson( BOARD* aBoard, const KOPENAPI_LIST_CAP& aCap )
                            { "thickness_mm", toMm( bds.GetBoardThickness() ) },
                            { "constraints", constraints },
                            { "netclasses", classes },
-                           { "custom_rules", customRules( aBoard ) } };
+                           { "custom_rules", customRules( aBoard ) },
+                           { "predefined_sizes", sizesJson( bds ) },
+                           { "mask_paste", maskPasteJson( bds ) } };
     aCap.Put( out, "netclass_patterns", std::move( patterns ) );
     return out;
 }
@@ -882,7 +947,12 @@ static KOPENAPI_RESULT h_pcb_rules_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( !context )
         return KopenapiNoBoard();
 
-    return KOPENAPI_RESULT::Ok( rulesJson( context->GetBoard(), KOPENAPI_LIST_CAP( aArgs, RULES_LIST_CAP ) ) );
+    nlohmann::json out = rulesJson( context->GetBoard(), KOPENAPI_LIST_CAP( aArgs, RULES_LIST_CAP ) );
+
+    if( aArgs.value( "severities", true ) )
+        out["severities"] = severitiesJson( context->GetBoard() );
+
+    return KOPENAPI_RESULT::Ok( out );
 }
 
 
@@ -1001,7 +1071,158 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
+    const std::map<std::string, int> severityCodes = severityKeys();
+
+    if( aArgs.contains( "severities" ) )
+    {
+        if( !aArgs["severities"].is_object() )
+            return KOPENAPI_RESULT::Error( 400, "severities: object of check -> error / warning / ignore (pcb_rules_get)" );
+
+        for( const auto& [key, value] : aArgs["severities"].items() )
+        {
+            if( !severityCodes.count( key ) )
+                return KOPENAPI_RESULT::Error( 400, "severities: unknown check '" + key + "' (the keys of pcb_rules_get severities)" );
+
+            const std::string v = value.is_string() ? value.get<std::string>() : std::string();
+
+            if( v != "error" && v != "warning" && v != "ignore" )
+                return KOPENAPI_RESULT::Error( 400, "severities." + key + ": error, warning or ignore" );
+        }
+    }
+
+    std::optional<std::vector<int>>                 trackWidths;
+    std::optional<std::vector<VIA_DIMENSION>>       viaSizes;
+    std::optional<std::vector<DIFF_PAIR_DIMENSION>> diffPairs;
+
+    if( aArgs.contains( "predefined_sizes" ) )
+    {
+        const nlohmann::json& sizes = aArgs["predefined_sizes"];
+        auto mm = [&]( const nlohmann::json& aValue, bool aZeroOk ) -> std::optional<int>
+        {
+            if( !aValue.is_number() || aValue.get<double>() < 0 || ( !aZeroOk && aValue.get<double>() == 0 ) )
+                return std::nullopt;
+
+            return toIU( aValue.get<double>() );
+        };
+
+        if( !sizes.is_object() )
+            return KOPENAPI_RESULT::Error( 400, "predefined_sizes: {track_widths_mm, via_sizes, diff_pairs}" );
+
+        if( sizes.contains( "track_widths_mm" ) )
+        {
+            trackWidths.emplace();
+
+            for( const nlohmann::json& w : sizes["track_widths_mm"] )
+            {
+                std::optional<int> v = mm( w, false );
+
+                if( !v )
+                    return KOPENAPI_RESULT::Error( 400, "predefined_sizes.track_widths_mm: widths above 0 (mm)" );
+
+                trackWidths->push_back( *v );
+            }
+        }
+
+        if( sizes.contains( "via_sizes" ) )
+        {
+            viaSizes.emplace();
+
+            for( const nlohmann::json& via : sizes["via_sizes"] )
+            {
+                std::optional<int> d = via.is_object() ? mm( via.value( "diameter_mm", nlohmann::json() ), false ) : std::nullopt;
+                std::optional<int> h = via.is_object() ? mm( via.value( "drill_mm", nlohmann::json() ), false ) : std::nullopt;
+
+                if( !d || !h || *h >= *d )
+                    return KOPENAPI_RESULT::Error( 400, "predefined_sizes.via_sizes: [{diameter_mm, drill_mm}], the drill smaller than the diameter" );
+
+                viaSizes->emplace_back( *d, *h );
+            }
+        }
+
+        if( sizes.contains( "diff_pairs" ) )
+        {
+            diffPairs.emplace();
+
+            for( const nlohmann::json& pair : sizes["diff_pairs"] )
+            {
+                std::optional<int> w = pair.is_object() ? mm( pair.value( "width_mm", nlohmann::json() ), false ) : std::nullopt;
+                std::optional<int> g = pair.is_object() ? mm( pair.value( "gap_mm", nlohmann::json() ), false ) : std::nullopt;
+                std::optional<int> vg = pair.is_object() ? mm( pair.value( "via_gap_mm", nlohmann::json( 0 ) ), true ) : std::nullopt;
+
+                if( !w || !g || !vg )
+                    return KOPENAPI_RESULT::Error( 400, "predefined_sizes.diff_pairs: [{width_mm, gap_mm, via_gap_mm?}] above 0" );
+
+                diffPairs->emplace_back( *w, *g, *vg );
+            }
+        }
+    }
+
+    if( aArgs.contains( "mask_paste" ) )
+    {
+        if( !aArgs["mask_paste"].is_object() )
+            return KOPENAPI_RESULT::Error( 400, "mask_paste: {mask_expansion_mm, mask_min_width_mm, mask_to_copper_clearance_mm, paste_clearance_mm, paste_ratio}" );
+
+        for( const auto& [key, value] : aArgs["mask_paste"].items() )
+        {
+            if( maskPasteJson( bds ).count( key ) == 0 )
+                return KOPENAPI_RESULT::Error( 400, "mask_paste: unknown '" + key + "' (as pcb_rules_get mask_paste)" );
+
+            const bool signedOk = key == "mask_expansion_mm" || key == "paste_clearance_mm" || key == "paste_ratio";
+
+            if( !value.is_number() || ( !signedOk && value.get<double>() < 0 ) || std::abs( value.get<double>() ) > 10 )
+                return KOPENAPI_RESULT::Error( 400, "mask_paste." + key + ": a number (mm; paste_ratio a fraction, -0.5 = 50 % smaller)" );
+        }
+    }
+
     // Apply
+    if( aArgs.contains( "severities" ) )
+    {
+        for( const auto& [key, value] : aArgs["severities"].items() )
+        {
+            const std::string v = value.get<std::string>();
+            bds.m_DRCSeverities[severityCodes.at( key )] = v == "error"     ? RPT_SEVERITY_ERROR
+                                                           : v == "warning" ? RPT_SEVERITY_WARNING
+                                                                            : RPT_SEVERITY_IGNORE;
+        }
+    }
+
+    auto withPlaceholder = []( auto aList, auto aPlaceholder )
+    {
+        std::sort( aList.begin(), aList.end() );
+        aList.erase( std::unique( aList.begin(), aList.end() ), aList.end() );
+        aList.insert( aList.begin(), aPlaceholder );
+        return aList;
+    };
+
+    if( trackWidths )
+        bds.m_TrackWidthList = withPlaceholder( *trackWidths, 0 );
+
+    if( viaSizes )
+        bds.m_ViasDimensionsList = withPlaceholder( *viaSizes, VIA_DIMENSION( 0, 0 ) );
+
+    if( diffPairs )
+        bds.m_DiffPairDimensionsList = withPlaceholder( *diffPairs, DIFF_PAIR_DIMENSION( 0, 0, 0 ) );
+
+    if( aArgs.contains( "mask_paste" ) )
+    {
+        const nlohmann::json& mp = aArgs["mask_paste"];
+
+        if( mp.contains( "mask_expansion_mm" ) )
+            bds.m_SolderMaskExpansion = toIU( mp["mask_expansion_mm"].get<double>() );
+
+        if( mp.contains( "mask_min_width_mm" ) )
+            bds.m_SolderMaskMinWidth = toIU( mp["mask_min_width_mm"].get<double>() );
+
+        if( mp.contains( "mask_to_copper_clearance_mm" ) )
+            bds.m_SolderMaskToCopperClearance = toIU( mp["mask_to_copper_clearance_mm"].get<double>() );
+
+        if( mp.contains( "paste_clearance_mm" ) )
+            bds.m_SolderPasteMargin = toIU( mp["paste_clearance_mm"].get<double>() );
+
+        if( mp.contains( "paste_ratio" ) )
+            bds.m_SolderPasteMarginRatio = mp["paste_ratio"].get<double>();
+    }
+
     if( aArgs.contains( "copper_layers" ) )
     {
         board->SetCopperLayerCount( aArgs["copper_layers"] );
@@ -1138,6 +1359,10 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     if( !warnings.empty() )
         result["warnings"] = warnings;
+
+    if( aArgs.contains( "severities" ) )
+        result["severities"] = severitiesJson( board );
+
     result["note"] = "net classes and constraints are saved with the board's project (pcb_save)";
     return KOPENAPI_RESULT::Ok( result );
 }
@@ -1194,15 +1419,22 @@ KOPENAPI_REGISTER( "pcb_rules_get",
                    "Board design rules: copper layer count, thickness, board-wide minimum constraints "
                    "(clearance, track width, via, drill, edge and hole clearances, mm), net classes with "
                    "their values and member nets (net_count; nets capped at list_limit, full: true for all), net class pattern "
-                   "assignments, the custom rules (.kicad_dru text)",
-                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{}})json"_json, RULES_LIST_CAP ), false, h_pcb_rules_get );
+                   "assignments, the custom rules (.kicad_dru text), Board Setup's pre-defined sizes (track widths, "
+                   "vias, diff pairs), pad mask / paste values and the severity of every DRC check (error / warning / "
+                   "ignore; severities: false leaves them out)",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
+                        "severities":{"type":"boolean","default":true}}})json"_json, RULES_LIST_CAP ), false, h_pcb_rules_get );
 
 KOPENAPI_REGISTER( "pcb_rules_set",
                    "Set board design rules (all or nothing): copper_layers, thickness_mm, constraints {name: "
                    "mm} as listed by pcb_rules_get, netclasses [{name ('Default' edits the default), "
                    "clearance_mm, track_width_mm, via_diameter_mm, via_drill_mm, diff_pair_width_mm, "
                    "diff_pair_gap_mm, nets: [names or patterns like '+*V*', 'GND']}] - e.g. a Power class "
-                   "0.5 mm wide for the rails; custom_rules (KiCad's rule language); answers the rules as now in force "
+                   "0.5 mm wide for the rails; custom_rules (KiCad's rule language); severities {check: error / warning / "
+                   "ignore} (Board Setup > Violation Severity; keys as pcb_rules_get lists them); predefined_sizes "
+                   "{track_widths_mm, via_sizes [{diameter_mm, drill_mm}], diff_pairs [{width_mm, gap_mm, via_gap_mm}]} "
+                   "(each list given replaces the old one); mask_paste {mask_expansion_mm, mask_min_width_mm, "
+                   "mask_to_copper_clearance_mm, paste_clearance_mm, paste_ratio}; answers the rules as now in force "
                    "(as pcb_rules_get: member nets capped at list_limit)",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
                         "copper_layers":{"type":"integer"},
@@ -1214,7 +1446,15 @@ KOPENAPI_REGISTER( "pcb_rules_set",
                             "via_diameter_mm":{"type":"number"},"via_drill_mm":{"type":"number"},
                             "diff_pair_width_mm":{"type":"number"},"diff_pair_gap_mm":{"type":"number"},
                             "nets":{"type":"array","items":{"type":"string"},"description":"the class's nets / patterns: replaces its earlier ones, and the nets leave other classes; [] empties it"},
-                            "delete":{"type":"boolean","description":"remove this class and its net patterns"}}}}}})json"_json, RULES_LIST_CAP ),
+                            "delete":{"type":"boolean","description":"remove this class and its net patterns"}}}},
+                        "severities":{"type":"object","additionalProperties":{"type":"string","enum":["error","warning","ignore"]}},
+                        "predefined_sizes":{"type":"object","properties":{
+                            "track_widths_mm":{"type":"array","items":{"type":"number"}},
+                            "via_sizes":{"type":"array","items":{"type":"object","properties":{"diameter_mm":{"type":"number"},"drill_mm":{"type":"number"}}}},
+                            "diff_pairs":{"type":"array","items":{"type":"object","properties":{"width_mm":{"type":"number"},"gap_mm":{"type":"number"},"via_gap_mm":{"type":"number"}}}}}},
+                        "mask_paste":{"type":"object","properties":{
+                            "mask_expansion_mm":{"type":"number"},"mask_min_width_mm":{"type":"number"},
+                            "mask_to_copper_clearance_mm":{"type":"number"},"paste_clearance_mm":{"type":"number"},"paste_ratio":{"type":"number"}}}}})json"_json, RULES_LIST_CAP ),
                    false, h_pcb_rules_set );
 
 KOPENAPI_MARK_EDITING( "pcb_netlist_apply", "pcb_outline_set", "pcb_rules_set" );
