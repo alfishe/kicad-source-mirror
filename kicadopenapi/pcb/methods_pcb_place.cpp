@@ -3872,11 +3872,78 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         }
     }
 
+    // the rest: a part on rails only, one of them the anchor's (a ferrite or a diode in its supply),
+    // next to the anchor's pin of that rail (ground aside), the one nearest the part
     for( FOOTPRINT* part : indirect )
     {
-        unplaced.push_back( { { "ref", str( part->GetReference() ) },
-                              { "reason", "shares no net with " + str( aAnchor->GetReference() )
-                                                  + " or a placed part of the block (rails aside)" } } );
+        PAD*       target = nullptr;
+        const bool railsOnly = std::all_of( part->Pads().begin(), part->Pads().end(), [&]( PAD* aPad )
+                                            { return aPad->GetNetCode() <= 0 || rails.count( aPad->GetNetCode() ); } );
+
+        for( PAD* pad : railsOnly ? part->Pads() : std::deque<PAD*>() )
+        {
+            NETINFO_ITEM* info = aBoard->FindNet( pad->GetNetCode() );
+
+            if( !anchorPads.count( pad->GetNetCode() ) || !info
+                || KopenapiNetRoleFromName( str( UnescapeString( info->GetNetname() ) ) ).value( "role", "" ) == "ground" )
+            {
+                continue;
+            }
+
+            for( PAD* pin : anchorPads[pad->GetNetCode()] )
+            {
+                if( !target || ( pin->GetPosition() - part->GetPosition() ).EuclideanNorm()
+                                       < ( target->GetPosition() - part->GetPosition() ).EuclideanNorm() )
+                {
+                    target = pin;
+                }
+            }
+        }
+
+        if( !target )
+        {
+            unplaced.push_back( { { "ref", str( part->GetReference() ) },
+                                  { "reason", "shares no net with " + str( aAnchor->GetReference() )
+                                                      + " or a placed part of the block (rails aside)" } } );
+            continue;
+        }
+
+        aCommit.Modify( part );
+
+        const POSE was{ part->GetPosition(), part->GetOrientation(), part->IsFlipped() };
+
+        if( ( aAnchor->IsFlipped() != part->IsFlipped() ) != aOpposite )
+            part->Flip( part->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );
+
+        NEAR_OPTIONS options = aOptions;
+        options.partPad.clear();
+        options.partHeight = heightOf( part );
+
+        if( options.hostRingMm < 0 )
+            options.hostRingMm = finePitch( aAnchor ) ? 1.0 : 0.0;
+
+        NEAR_PLACEMENT placement = placeNear( aBoard, part, target, options );
+
+        keepIfNearer( part, target, was, placement, options );
+
+        if( !placement.ok )
+        {
+            unplaced.push_back( { { "ref", str( part->GetReference() ) }, { "reason", placement.reason } } );
+            continue;
+        }
+
+        part->SetAttributes( part->GetAttributes() & ~FP_JUST_ADDED );
+        aMoved.push_back( part->m_Uuid );
+        done.push_back( part );
+
+        nlohmann::json row = nearJson( placement, target );
+        row["ref"] = str( part->GetReference() );
+        row["x_mm"] = toMm( part->GetPosition().x );
+        row["y_mm"] = toMm( part->GetPosition().y );
+        row["rotation_deg"] = part->GetOrientation().AsDegrees();
+        row["side"] = part->IsFlipped() ? "bottom" : "top";
+        row["by"] = "rail";
+        placed.push_back( row );
     }
 
     aOut["anchor"] = str( aAnchor->GetReference() );
