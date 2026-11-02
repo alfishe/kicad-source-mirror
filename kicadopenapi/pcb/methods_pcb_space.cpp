@@ -1911,6 +1911,38 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         return it == sides.end() ? -1 : (int) ( it - sides.begin() );
     };
 
+    // the nets in the order a track along the side meets them, clockwise (board view, y down): along
+    // the exit side when there is one (a finger row is one line, not a ring round a centre), else
+    // round the package
+    auto orderHere = [&]( const std::set<int>& aNets ) -> std::vector<std::string>
+    {
+        if( exit.empty() )
+            return partOrder( a.fp, aNets ).order;
+
+        std::vector<std::pair<int, std::string>> row;
+
+        for( PAD* pad : a.fp->Pads() )
+        {
+            if( pad->GetNumber().IsEmpty() || !aNets.count( pad->GetNetCode() ) )
+                continue;
+
+            const VECTOR2I at = pad->GetPosition();
+            const int      along = exit == "north" ? at.x : exit == "east" ? at.y : exit == "south" ? -at.x : -at.y;
+            row.emplace_back( along, str( UnescapeString( pad->GetNetname() ) ) );
+        }
+
+        std::stable_sort( row.begin(), row.end(), []( const auto& x, const auto& y ) { return x.first < y.first; } );
+        std::vector<std::string> order;
+
+        for( const auto& [along, net] : row )
+        {
+            if( std::find( order.begin(), order.end(), net ) == order.end() )
+                order.push_back( net );
+        }
+
+        return order;
+    };
+
     auto towards = [&]( const VECTOR2I& aTo ) -> std::string
     {
         const VECTOR2I d = aTo - centre;
@@ -2044,8 +2076,8 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         if( nets.size() < 2 )
             continue;
 
-        const PART_ORDER here = partOrder( a.fp, nets );
-        const PART_ORDER there = partOrder( b.parts[farPart].fp, nets );
+        const std::vector<std::string> here = orderHere( nets );
+        const PART_ORDER               there = partOrder( b.parts[farPart].fp, nets );
         std::map<std::string, int> at;
 
         for( size_t k = 0; k < there.order.size(); ++k )
@@ -2054,7 +2086,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         std::vector<int>         seq;
         std::vector<std::string> names;
 
-        for( const std::string& n : here.order )
+        for( const std::string& n : here )
         {
             if( auto it = at.find( n ); it != at.end() )
             {
@@ -2206,7 +2238,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
     for( const PORT& p : ports )
         all.insert( p.code );
 
-    const PART_ORDER cw = partOrder( a.fp, all );
+    const std::vector<std::string> cw = orderHere( all );
 
     for( auto& [side, list] : bySide )
     {
@@ -2214,8 +2246,8 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         std::stable_sort( rows.begin(), rows.end(),
                           [&]( const nlohmann::json& x, const nlohmann::json& y )
                           {
-                              auto ix = std::find( cw.order.begin(), cw.order.end(), x["net"].get<std::string>() );
-                              auto iy = std::find( cw.order.begin(), cw.order.end(), y["net"].get<std::string>() );
+                              auto ix = std::find( cw.begin(), cw.end(), x["net"].get<std::string>() );
+                              auto iy = std::find( cw.begin(), cw.end(), y["net"].get<std::string>() );
                               return ix < iy;
                           } );
         sideList[side] = rows;
