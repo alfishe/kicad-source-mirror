@@ -7,9 +7,11 @@
 #include <base_units.h>
 #include <board.h>
 #include <board_commit.h>
+#include <board_netlist_payload.h>
 #include <board_reannotate.h>
 #include <footprint.h>
 #include <kicadopenapi_keepalive.h>
+#include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
 #include <tool/tool_manager.h>
 
@@ -17,6 +19,7 @@
 #include <cctype>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -244,11 +247,53 @@ KOPENAPI_RESULT h_pcb_reannotate( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     if( !bad.empty() )
         out["bad_refs"] = bad;
 
-    if( !dryRun && !changes.empty() )
-        out["next"] = "the schematic keeps the old references: update it from the board (KiCad's Update Schematic "
+    // the schematic follows (Update Schematic from PCB, references only) when it is open
+    const nlohmann::json backAnnotate = aArgs.value( "back_annotate", nlohmann::json( "auto" ) );
+
+    if( !dryRun && !changes.empty() && backAnnotate != false )
+    {
+        std::optional<KOPENAPI_METHOD> update = KOPENAPI_REGISTRY::Get().Find( "design_update_schematic" );
+        KOPENAPI_RESULT                sch = update ? update->handler( aCtx, { { "references", true },
+                                                                              { "footprints", false },
+                                                                              { "values", false },
+                                                                              { "net_names", false },
+                                                                              { "attributes", false },
+                                                                              { "other_fields", false } } )
+                                                    : KOPENAPI_RESULT::Error( 503, "design_update_schematic is not available" );
+
+        if( sch.status == 200 )
+        {
+            out["schematic"] = { { "changes", sch.body.value( "changes", 0 ) },
+                                 { "errors", sch.body.value( "errors", 0 ) } };
+
+            if( sch.body.value( "errors", 0 ) > 0 )
+                out["schematic"]["messages"] = sch.body["messages"];
+        }
+        else
+        {
+            out["schematic"] = { { "skipped", sch.body.value( "error", nlohmann::json::object() )
+                                                       .value( "message", std::string( "no schematic open" ) ) } };
+        }
+    }
+
+    if( !dryRun && !changes.empty() && !out.contains( "schematic" ) )
+        out["next"] = "the schematic keeps the old references: design_update_schematic (KiCad's Update Schematic "
                       "from PCB)";
+    else if( out.contains( "schematic" ) && out["schematic"].contains( "skipped" ) )
+        out["next"] = "the schematic keeps the old references: open it (sch_open), then design_update_schematic";
 
     return KOPENAPI_RESULT::Ok( out );
+}
+
+
+KOPENAPI_RESULT h_pcb_netlist_kicad( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    return KOPENAPI_RESULT::Ok( { { "netlist", BoardBackAnnotationNetlist( context->GetBoard() ) } } );
 }
 
 } // namespace
@@ -263,7 +308,9 @@ KOPENAPI_REGISTER( "pcb_reannotate",
                    "front); front_prefix / back_prefix added (remove_*_prefix: removed). scope all / front / back, "
                    "or refs (only those). exclude: prefixes or references ending in *; exclude_locked; excluded "
                    "numbers are not reused. Empty / invalid references stay and are refused (409) unless force. "
-                   "Answers the changes, the sort order, excluded; dry_run previews. One undo step",
+                   "Answers the changes, the sort order, excluded; dry_run previews. One undo step. "
+                   "back_annotate (default auto: when a schematic is open) then renames the symbols too "
+                   "(design_update_schematic, references only; its own undo step)",
                    R"json({"type":"object","properties":{
                         "scope":{"type":"string","enum":["all","front","back"],"default":"all"},
                         "refs":{"type":"array","items":{"type":"string"}},
@@ -279,7 +326,16 @@ KOPENAPI_REGISTER( "pcb_reannotate",
                         "exclude":{"type":"array","items":{"type":"string"}},
                         "exclude_locked":{"type":"boolean","default":false},
                         "force":{"type":"boolean","default":false},
+                        "back_annotate":{"oneOf":[{"type":"boolean"},{"type":"string","enum":["auto"]}],"default":"auto"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_reannotate );
 
+KOPENAPI_REGISTER( "pcb_netlist_kicad",
+                   "The open board as the netlist KiCad's Update Schematic from PCB reads (S-expression: per "
+                   "footprint reference, value, footprint, path, pad nets, fields, attributes; board-only "
+                   "footprints left out), unsaved edits included; input of sch_update_from_pcb",
+                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_netlist_kicad );
+
 KOPENAPI_MARK_EDITING( "pcb_reannotate" );
+
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_netlist_kicad" );

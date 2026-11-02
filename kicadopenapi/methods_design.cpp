@@ -3,6 +3,7 @@
 ///
 ///   design_parity  compare schematic and board: components, and nets by connectivity
 ///   net_get        one net seen from both sides, matched through pads
+///   design_update_board / design_update_schematic  KiCad's Update PCB from Schematic and back
 ///
 /// They live in kicommon and combine the domain methods through the registry (sch_netlist,
 /// pcb_netlist, sch_net_get, pcb_net_get), so eeschema and pcbnew stay independent.  Nets are
@@ -589,6 +590,33 @@ static KOPENAPI_RESULT h_design_update_board( KOPENAPI_CONTEXT& aCtx, const nloh
 }
 
 
+static KOPENAPI_RESULT h_design_update_schematic( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    // 1. the board as Update Schematic from PCB reads it, unsaved edits included
+    KOPENAPI_RESULT pcb = callMethod( aCtx, "pcb_netlist_kicad" );
+
+    if( pcb.status != 200 )
+        return pcb;
+
+    // 2. KiCad's Update Schematic from PCB on the open schematic
+    nlohmann::json apply = { { "netlist", pcb.body["netlist"] } };
+
+    for( const char* key : { "references", "footprints", "values", "net_names", "attributes", "other_fields",
+                             "prefer_unit_swaps", "prefer_pin_swaps", "dry_run", "list_limit", "full" } )
+    {
+        if( aArgs.contains( key ) )
+            apply[key] = aArgs[key];
+    }
+
+    KOPENAPI_RESULT result = callMethod( aCtx, "sch_update_from_pcb", apply );
+
+    if( result.status == 200 && !aArgs.value( "dry_run", false ) && result.body.value( "changes", 0 ) > 0 )
+        result.body["next"] = "sch_save; design_parity to check both sides agree";
+
+    return result;
+}
+
+
 KOPENAPI_REGISTER( "design_update_board",
                    "Schematic -> board in one call (KiCad's Update PCB from Schematic): takes the open "
                    "schematic's netlist (unsaved edits included), opens the project's board or creates it "
@@ -604,6 +632,23 @@ KOPENAPI_REGISTER( "design_update_board",
                         "replace_footprints":{"type":"boolean","default":true},
                         "override_locks":{"type":"boolean","default":false,"description":"locked footprints are not replaced or removed otherwise"}}})json"_json, 50 ),
                    false, h_design_update_board, 600 );
+
+KOPENAPI_REGISTER( "design_update_schematic",
+                   "Board -> schematic in one call (KiCad's Update Schematic from PCB): the open board's "
+                   "footprints (unsaved edits included) matched to the open schematic's symbols by path; "
+                   "references, footprints, values, net_names (pad net swaps as symbol unit / pin swaps where "
+                   "possible, else label renames), attributes and other_fields, each default true as in the "
+                   "editor; the editor's report (list_limit, full); dry_run to preview. One undo step on the "
+                   "schematic",
+                   R"json({"type":"object","properties":{
+                        "references":{"type":"boolean","default":true},"footprints":{"type":"boolean","default":true},
+                        "values":{"type":"boolean","default":true},"net_names":{"type":"boolean","default":true},
+                        "attributes":{"type":"boolean","default":true},"other_fields":{"type":"boolean","default":true},
+                        "prefer_unit_swaps":{"type":"boolean","default":true},
+                        "prefer_pin_swaps":{"type":"boolean","default":true},
+                        "dry_run":{"type":"boolean","default":false},
+                        "list_limit":{"type":"integer","default":200},"full":{"type":"boolean","default":false}}})json"_json,
+                   false, h_design_update_schematic, 600 );
 
 KOPENAPI_REGISTER( "design_parity",
                    "Compare schematic and board (both open): components (missing on either side, value / "
@@ -629,4 +674,4 @@ KOPENAPI_REGISTER( "net_get",
                         "pin":{"type":"string","description":"REF.PIN"}}})json"_json,
                    false, h_net_get );
 
-KOPENAPI_MARK_EDITING( "design_update_board" );
+KOPENAPI_MARK_EDITING( "design_update_board", "design_update_schematic" );

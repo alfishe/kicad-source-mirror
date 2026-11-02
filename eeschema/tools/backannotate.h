@@ -34,6 +34,8 @@ class REPORTER;
 class SCH_SHEET_LIST;
 class SCH_EDIT_FRAME;
 class SCH_COMMIT;
+class SCHEMATIC;
+class TOOL_MANAGER;
 
 struct BACKANNOTATE_UNIT_SWAP_CANDIDATE
 {
@@ -137,7 +139,20 @@ public:
                    bool aProcessNetNames, bool aProcessAttributes, bool aProcessOtherFields,
                    bool aPreferUnitSwaps, bool aPreferPinSwaps, bool aDryRun );
 
+    /**
+     * Without an editor frame (headless sessions): the netlist comes from the caller, the
+     * changes are committed through \a aToolMgr. Re-linking footprints is not checked for a fully
+     * annotated schematic and PushNewLinksToPCB() is not available.
+     */
+    BACK_ANNOTATE( SCHEMATIC* aSchematic, TOOL_MANAGER* aToolMgr, REPORTER& aReporter, bool aRelinkFootprints,
+                   bool aProcessFootprints, bool aProcessValues, bool aProcessReferences,
+                   bool aProcessNetNames, bool aProcessAttributes, bool aProcessOtherFields,
+                   bool aPreferUnitSwaps, bool aPreferPinSwaps, bool aDryRun );
+
     ~BACK_ANNOTATE() = default;
+
+    /// Number of user-level changes of the last BackAnnotateSymbols()
+    int GetChangesCount() const { return m_changesCount; }
 
     /**
      * Get netlist from the Pcbnew.
@@ -208,6 +223,8 @@ private:
     SCH_MULTI_UNIT_REFERENCE_MAP m_multiUnitsRefs;
     std::deque<CHANGELIST_ITEM>  m_changelist;
     SCH_EDIT_FRAME*              m_frame;
+    SCHEMATIC*                   m_schematic;
+    TOOL_MANAGER*                m_toolMgr;
 
     int                          m_changesCount;    // Number of user-level changes
 };

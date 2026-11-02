@@ -45,6 +45,7 @@
 #include <kiway_mail.h>
 #include <string_utils.h>
 #include <netlist_reader/pcb_netlist.h>
+#include <board_netlist_payload.h>
 #include <netlist_reader/board_netlist_updater.h>
 #include <gal/painter.h>
 #include <pcb_painter.h>
@@ -651,64 +652,8 @@ void PCB_EDIT_FRAME::KiwayMailIn( KIWAY_MAIL_EVENT& mail )
         break;
 
     case MAIL_PCB_GET_NETLIST:
-    {
-        NETLIST          netlist;
-        STRING_FORMATTER sf;
-
-        for( FOOTPRINT* footprint : GetBoard()->Footprints() )
-        {
-            if( footprint->GetAttributes() & FP_BOARD_ONLY )
-                continue; // Don't add board-only footprints to the netlist
-
-            COMPONENT* component = new COMPONENT( footprint->GetFPID(), footprint->GetReference(),
-                                                  footprint->GetValue(), footprint->GetPath(), {} );
-
-            for( PAD* pad : footprint->Pads() )
-            {
-                const wxString& netname = pad->GetShortNetname();
-
-                if( !netname.IsEmpty() )
-                {
-                    component->AddNet( pad->GetNumber(), netname, pad->GetPinFunction(),
-                                       pad->GetPinType() );
-                }
-            }
-
-            nlohmann::ordered_map<wxString, wxString> fields;
-
-            for( PCB_FIELD* field : footprint->GetFields() )
-            {
-                wxCHECK2( field, continue );
-
-                fields[field->GetUntranslatedName()] = field->GetText();
-            }
-
-            component->SetFields( fields );
-
-            // Add DNP and exclusion properties
-            std::map<wxString, wxString> properties;
-
-            if( footprint->GetAttributes() & FP_DNP )
-                properties.emplace( "dnp", "" );
-
-            if( footprint->GetAttributes() & FP_EXCLUDE_FROM_BOM )
-                properties.emplace( "exclude_from_bom", "" );
-
-            if( footprint->GetAttributes() & FP_EXCLUDE_FROM_SIM )
-                properties.emplace( "exclude_from_sim", "" );
-
-            if( footprint->GetAttributes() & FP_EXCLUDE_FROM_POS_FILES )
-                properties.emplace( "exclude_from_pos_files", "" );
-
-            component->SetProperties( properties );
-
-            netlist.AddComponent( component );
-        }
-
-        netlist.Format( "pcb_netlist", &sf, 0, CTL_OMIT_FILTERS );
-        payload = sf.GetString();
+        payload = BoardBackAnnotationNetlist( GetBoard() );
         break;
-    }
 
     case MAIL_PCB_UPDATE_LINKS:
         try
