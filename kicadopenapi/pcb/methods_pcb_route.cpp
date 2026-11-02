@@ -10288,11 +10288,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             };
 
             std::vector<DETAIL> order;
+            std::vector<int>    branchesOfNet( gridNets.size(), 0 );
 
             for( size_t k = 0; k < gridNets.size() && k < gr.nets.size(); ++k )
             {
                 for( GRID_BRANCH& branch : GridBranches( gridNets[k], gr.nets[k], gr.cell ) )
+                {
                     order.push_back( { k, std::move( branch ) } );
+                    branchesOfNet[k]++;
+                }
             }
 
             std::stable_sort( order.begin(), order.end(),
@@ -10601,7 +10605,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     if( !job.to || std::find( joined.begin(), joined.end(), job.to ) == joined.end() )
                     {
                         detailOf[index] = 2;
-                        detailWhy[index] = netWhy[k].empty() ? std::string( "pns did not join it" ) : netWhy[k];
+                        if( branchesOfNet[k] == 0 )
+                        {
+                            detailWhy[index] = std::string( "no branch cut: " )
+                                               + ( k >= gr.nets.size() || gr.nets[k].tracks.empty()
+                                                           ? "the grid found no way for the net on its cells (cell "
+                                                                     + mmText( toMm( gr.cell ) ) + " mm)"
+                                                           : "the grid's copper runs between none of its ends" );
+                        }
+                        else
+                        {
+                            detailWhy[index] = netWhy[k].empty() ? std::string( "pns did not join it" ) : netWhy[k];
+                        }
                         continue;
                     }
 
@@ -11493,6 +11508,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     row.erase( "blocked_end" );
                     row.erase( "budget" );
                     row["retried"] = true;
+                    row["engine"] = "pns";
                     row["layer"] = attempt["layer"];
                     row["mode"] = attempt["mode"];
                     row["length_mm"] = attempt["metrics"]["length_mm"];
