@@ -2,6 +2,7 @@
 
 #include <geometry/shape_segment.h>
 #include <layer_ids.h>
+#include <math/box2.h>
 #include <math/vector2d.h>
 
 #include <atomic>
@@ -88,6 +89,7 @@ struct GRID_PARAMS
     float                     pfGrowth = 1.6f; ///< and how much it grows each round (VPR's pres_fac_mult)
     bool                      record = false;  ///< keep each variant's timeline (GRID_RESULT::timeline)
     bool                      fillsOut = false; ///< zone fills (but teardrops') are no obstacle: the caller takes them out (a dry run that would)
+    bool                      space = false;   ///< keep the winner's free space per net class (GRID_RESULT::space) for rooms
     /// @brief A paused job: true while the variants wait between two nets; aSerial / aBy / aN the last
     /// job_step (KopenapiJobHeld).  Any thread
     std::function<bool( uint64_t& aSerial, std::string& aBy, int& aN )> held;
@@ -177,6 +179,8 @@ struct CROWDING
     std::vector<int> by;
 };
 
+struct GRID_SPACE;
+
 struct GRID_RESULT
 {
     std::vector<GRID_NET_RESULT> nets;   ///< in the order of the request
@@ -223,6 +227,42 @@ struct GRID_RESULT
     std::vector<int64_t>         expandedByStage;   ///< the winner's: rounds, legalising, the short again, fewer vias
     std::vector<std::pair<int, int64_t>> costliest;   ///< the winner's nets that took the most search states
     std::shared_ptr<GRID_TIMELINE>    timeline;    ///< with GRID_PARAMS::record: every variant's steps
+    std::shared_ptr<const GRID_SPACE> space;   ///< with GRID_PARAMS::space
+};
+
+/// @brief The grid as the winner left it: per net class and routing layer, which cells a track's
+/// centre may take (fixed copper and every net's planned copper with its clearance)
+struct GRID_SPACE
+{
+    VECTOR2I origin;
+    int      cell = 1;
+    int      nx = 0, ny = 0;
+    std::vector<PCB_LAYER_ID>         layers;   ///< the routing layers
+    std::vector<int>                  sizesOf;  ///< per net of the request: its class
+    std::vector<int>                  codeOf;   ///< per net of the request: its net code
+    std::vector<std::vector<int32_t>> taken;    ///< per class: layers * cells; 0 free, a net code: only that net, -1 none
+
+    /// @brief A track of the request's net aNet may run through the cell
+    bool Free( int aNet, int aLayer, int aX, int aY ) const;
+};
+
+/// @brief Rooms of corridors from a grid's free space: a straight run's cells widened while the cells
+/// stay free for the net and no other net's room has them; one net's rooms may share cells, other
+/// nets' rooms never do
+class GRID_ROOMS
+{
+public:
+    GRID_ROOMS( std::shared_ptr<const GRID_SPACE> aSpace, int aGrowCells );
+
+    /// @brief The rooms of the run aFrom -> aTo of the request's net aNet on aLayer (board units, in
+    /// order along the run): one when the run is axis-parallel, a room per cell of a diagonal; none
+    /// without a space or off the routing layers
+    std::vector<BOX2I> Rooms( int aNet, PCB_LAYER_ID aLayer, const VECTOR2I& aFrom, const VECTOR2I& aTo );
+
+private:
+    std::shared_ptr<const GRID_SPACE> m_space;
+    int                               m_grow = 0;
+    std::vector<int32_t>              m_claimed;   ///< layers * cells: the net (request index + 1) whose room has it
 };
 
 /// @brief The way one connection takes through its net's copper on the grid: runs of track per

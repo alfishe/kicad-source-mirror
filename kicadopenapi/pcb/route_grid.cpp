@@ -4732,6 +4732,45 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
             result.nets.back().walls = world.nets[n].walls;
     }
 
+    if( aParams.space )
+    {
+        auto space = std::make_shared<GRID_SPACE>();
+        space->origin = world.grid.origin;
+        space->cell = world.grid.cell;
+        space->nx = world.grid.nx;
+        space->ny = world.grid.ny;
+        space->layers = aParams.layers;
+        space->taken = std::vector<std::vector<int32_t>>( world.track.begin(), world.track.end() );
+        space->sizesOf.assign( world.nets.size(), 0 );
+        space->codeOf.assign( world.nets.size(), 0 );
+
+        for( size_t n = 0; n < world.nets.size(); ++n )
+        {
+            const size_t asked = asAsked.empty() ? n : asAsked[n];
+            space->sizesOf[asked] = world.nets[n].sizes;
+            space->codeOf[asked] = world.nets[n].code;
+        }
+
+        for( size_t n = 0; n < win.Nets().size() && n < world.nets.size(); ++n )
+        {
+            if( win.Halted() && win.Conflicts( (int) n ) > 0 )
+                continue;
+
+            const int32_t code = world.nets[n].code;
+
+            for( size_t k = 0; k < win.Nets()[n].markedTrack.size() && k < space->taken.size(); ++k )
+            {
+                for( uint32_t st : win.Nets()[n].markedTrack[k] )
+                {
+                    int32_t& t = space->taken[k][st];
+                    t = t == 0 || t == code ? code : -1;
+                }
+            }
+        }
+
+        result.space = std::move( space );
+    }
+
     if( !asAsked.empty() )
     {
         std::vector<GRID_NET_RESULT> asked( result.nets.size() );
@@ -5188,6 +5227,130 @@ std::vector<GRID_BRANCH> GridBranches( const GRID_NET& aNet, const GRID_NET_RESU
             b.bLayer = g.nodes[path.back()].first;
             out.push_back( std::move( b ) );
         }
+    }
+
+    return out;
+}
+
+
+bool GRID_SPACE::Free( int aNet, int aLayer, int aX, int aY ) const
+{
+    if( aNet < 0 || aNet >= (int) sizesOf.size() || aLayer < 0 || aLayer >= (int) layers.size() || aX < 0 || aY < 0
+        || aX >= nx || aY >= ny )
+    {
+        return false;
+    }
+
+    const int32_t t = taken[sizesOf[aNet]][( (size_t) aLayer * ny + aY ) * nx + aX];
+    return t == 0 || t == codeOf[aNet];
+}
+
+
+GRID_ROOMS::GRID_ROOMS( std::shared_ptr<const GRID_SPACE> aSpace, int aGrowCells ) :
+        m_space( std::move( aSpace ) ),
+        m_grow( std::max( 0, aGrowCells ) )
+{
+    if( m_space )
+        m_claimed.assign( m_space->layers.size() * m_space->nx * m_space->ny, 0 );
+}
+
+
+std::vector<BOX2I> GRID_ROOMS::Rooms( int aNet, PCB_LAYER_ID aLayer, const VECTOR2I& aFrom, const VECTOR2I& aTo )
+{
+    std::vector<BOX2I> out;
+
+    if( !m_space )
+        return out;
+
+    const GRID_SPACE& g = *m_space;
+    const auto        layerIt = std::find( g.layers.begin(), g.layers.end(), aLayer );
+
+    if( layerIt == g.layers.end() )
+        return out;
+
+    const int    l = (int) ( layerIt - g.layers.begin() );
+    const size_t plane = (size_t) l * g.nx * g.ny;
+
+    auto cellOf = [&]( const VECTOR2I& aP )
+    {
+        return std::make_pair( std::clamp( (int) std::lround( (double) ( aP.x - g.origin.x ) / g.cell ), 0, g.nx - 1 ),
+                               std::clamp( (int) std::lround( (double) ( aP.y - g.origin.y ) / g.cell ), 0, g.ny - 1 ) );
+    };
+
+    auto open = [&]( int aX, int aY )
+    {
+        const int32_t c = m_claimed[plane + (size_t) aY * g.nx + aX];
+        return g.Free( aNet, l, aX, aY ) && ( c == 0 || c == aNet + 1 );
+    };
+
+    // a box of cells x0 y0 x1 y1 grown a row at a time on the sides given while the new row is open
+    auto grow = [&]( std::array<int, 4> aBox, bool aAcrossX, bool aAcrossY )
+    {
+        for( int round = 0; round < m_grow; ++round )
+        {
+            bool grew = false;
+
+            for( int side = 0; side < 4; ++side )
+            {
+                const bool alongX = side < 2;   // the new row is a column: the box widens in x
+
+                if( ( alongX && !aAcrossX ) || ( !alongX && !aAcrossY ) )
+                    continue;
+
+                const int at = side == 0 ? aBox[0] - 1 : side == 1 ? aBox[2] + 1 : side == 2 ? aBox[1] - 1 : aBox[3] + 1;
+
+                if( at < 0 || at >= ( alongX ? g.nx : g.ny ) )
+                    continue;
+
+                bool ok = true;
+
+                for( int u = alongX ? aBox[1] : aBox[0]; ok && u <= ( alongX ? aBox[3] : aBox[2] ); ++u )
+                    ok = alongX ? open( at, u ) : open( u, at );
+
+                if( !ok )
+                    continue;
+
+                ( side == 0 ? aBox[0] : side == 1 ? aBox[2] : side == 2 ? aBox[1] : aBox[3] ) = at;
+                grew = true;
+            }
+
+            if( !grew )
+                break;
+        }
+
+        for( int y = aBox[1]; y <= aBox[3]; ++y )
+        {
+            for( int x = aBox[0]; x <= aBox[2]; ++x )
+            {
+                int32_t& c = m_claimed[plane + (size_t) y * g.nx + x];
+
+                if( c == 0 )
+                    c = aNet + 1;
+            }
+        }
+
+        const VECTOR2I half( g.cell / 2, g.cell / 2 );
+        const VECTOR2I p0 = g.origin + VECTOR2I( aBox[0] * g.cell, aBox[1] * g.cell ) - half;
+        const VECTOR2I p1 = g.origin + VECTOR2I( aBox[2] * g.cell, aBox[3] * g.cell ) + half;
+        out.push_back( BOX2I( p0, p1 - p0 ) );
+    };
+
+    const auto [x0, y0] = cellOf( aFrom );
+    const auto [x1, y1] = cellOf( aTo );
+
+    if( x0 == x1 || y0 == y1 )
+    {
+        grow( { std::min( x0, x1 ), std::min( y0, y1 ), std::max( x0, x1 ), std::max( y0, y1 ) }, x0 == x1, y0 == y1 );
+        return out;
+    }
+
+    const int steps = std::max( std::abs( x1 - x0 ), std::abs( y1 - y0 ) );
+
+    for( int t = 0; t <= steps; ++t )
+    {
+        const int x = x0 + (int) std::lround( (double) ( x1 - x0 ) * t / steps );
+        const int y = y0 + (int) std::lround( (double) ( y1 - y0 ) * t / steps );
+        grow( { x, y, x, y }, true, true );
     }
 
     return out;
