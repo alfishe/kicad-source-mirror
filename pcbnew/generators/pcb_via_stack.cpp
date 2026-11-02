@@ -913,23 +913,10 @@ int PCB_VIA_STACK::ExpandMultiHopMicrovias( BOARD* aBoard, BOARD_COMMIT* aCommit
 }
 
 
-void PCB_VIA_STACK::ShowPropertiesDialog( PCB_BASE_EDIT_FRAME* aEditFrame )
+void PCB_VIA_STACK::ApplySettings( const VIA_STACK_PRESET& aSettings, GENERATOR_TOOL* aTool, BOARD_COMMIT& aCommit )
 {
-    // Dialog edits a scratch copy so the undo snapshot below sees the pre-edit settings.
-    PCB_VIA_STACK temp( GetBoard(), GetLayer() );
-    temp.ApplyPreset( ToPreset() );
-    temp.SetNetCode( GetNetCode() );
-
-    DIALOG_MICROVIA_STACK dlg( aEditFrame, &temp );
-
-    if( dlg.ShowModal() != wxID_OK )
-        return;
-
-    BOARD_COMMIT    commit( aEditFrame );
-    GENERATOR_TOOL* tool = aEditFrame->GetToolManager()->GetTool<GENERATOR_TOOL>();
-
-    commit.Modify( this );
-    ApplyPreset( temp.ToPreset() );
+    aCommit.Modify( this );
+    ApplyPreset( aSettings );
 
     // A staggered stack stores explicit hop positions, so re-space them to the (possibly new)
     // pitch while keeping each hop's direction. Without this, editing the pitch changes the
@@ -952,7 +939,7 @@ void PCB_VIA_STACK::ShowPropertiesDialog( PCB_BASE_EDIT_FRAME* aEditFrame )
         SetHops( rescaled );
     }
 
-    EditStart( tool, GetBoard(), &commit );
+    EditStart( aTool, GetBoard(), &aCommit );
 
     // If the stack has no net, inherit it from the copper it now sits on. This is the
     // supported way to net a stack, the connecting traces are generator owned and locked.
@@ -967,9 +954,173 @@ void PCB_VIA_STACK::ShowPropertiesDialog( PCB_BASE_EDIT_FRAME* aEditFrame )
         SetNetCode( FindNetAtPosition( GetBoard(), GetPosition(), span ) );
     }
 
-    Update( tool, GetBoard(), &commit );
-    EditFinish( tool, GetBoard(), &commit );
+    Update( aTool, GetBoard(), &aCommit );
+    EditFinish( aTool, GetBoard(), &aCommit );
+}
 
+
+std::optional<wxString> PCB_VIA_STACK::CheckSettings( BOARD* aBoard, const VIA_STACK_PRESET& aSettings,
+                                                      EDA_UNITS aUnits )
+{
+    if( aSettings.m_StartLayer == aSettings.m_EndLayer )
+        return _( "The start and end layers must be different." );
+
+    if( !IsSpanValid( aBoard, aSettings.m_StartLayer, aSettings.m_EndLayer ) )
+        return _( "Select a start and an end layer present on this board." );
+
+    if( aSettings.m_Staggered && aSettings.m_Pitch <= 0 )
+        return _( "Staggered stacks need a pitch greater than zero." );
+
+    if( aSettings.m_Pitch > pcbIUScale.mmToIU( MAX_MICROVIA_STACK_PITCH_MM ) )
+    {
+        return wxString::Format( _( "The pitch must be %s or less." ),
+                                 EDA_UNIT_UTILS::UI::MessageTextFromValue( pcbIUScale, aUnits,
+                                                                           pcbIUScale.mmToIU( MAX_MICROVIA_STACK_PITCH_MM ) ) );
+    }
+
+    if( !aSettings.m_UseNetclass )
+    {
+        if( std::optional<PCB_VIA::VIA_PARAMETER_ERROR> error = PCB_VIA::ValidateViaParameters(
+                    aSettings.m_ViaSize, aSettings.m_ViaDrill, aSettings.m_StartLayer, aSettings.m_EndLayer ) )
+        {
+            return error->m_Message;
+        }
+    }
+
+    return std::nullopt;
+}
+
+
+PCB_VIA_STACK* PCB_VIA_STACK::MakeFromItems( const std::vector<BOARD_ITEM*>& aItems, BOARD* aBoard,
+                                             BOARD_COMMIT& aCommit, wxString* aError,
+                                             const std::function<void()>& aBeforeStaging )
+{
+    std::vector<BOARD_ITEM*> members;
+    wxString                 error;
+    PCB_VIA_STACK*           stack = CreateFromItems( aItems, aBoard, &members, &error );
+
+    if( !stack )
+    {
+        if( error.IsEmpty() )
+        {
+            error = _( "A microvia stack needs two or more microvias on the same net, each spanning "
+                       "one layer step, with no gap between them." );
+        }
+
+        if( aError )
+            *aError = error;
+
+        return nullptr;
+    }
+
+    if( aBeforeStaging )
+        aBeforeStaging();
+
+    aCommit.Add( stack );
+
+    for( BOARD_ITEM* item : members )
+    {
+        if( EDA_GROUP* existingGroup = item->GetParentGroup() )
+            aCommit.Modify( existingGroup->AsEdaItem(), nullptr, RECURSE_MODE::NO_RECURSE );
+
+        aCommit.Modify( item );
+        stack->AddItem( item );
+    }
+
+    return stack;
+}
+
+
+PCB_VIA_STACK* PCB_VIA_STACK::Place( BOARD* aBoard, const PCB_VIA_STACK& aSettings, const VECTOR2I& aPosition,
+                                     const std::vector<VECTOR2I>& aHops, GENERATOR_TOOL* aTool,
+                                     BOARD_COMMIT& aCommit,
+                                     const std::function<bool( BOARD_CONNECTED_ITEM* )>& aViolates,
+                                     bool aAllowViolations )
+{
+    PCB_VIA_STACK* stack = static_cast<PCB_VIA_STACK*>( aSettings.Clone() );
+
+    // Clone keeps the source uuid, each placed stack needs its own.
+    stack->SetUuidDirect( KIID() );
+    stack->SetParent( aBoard );
+
+    if( !aHops.empty() )
+    {
+        SHAPE_LINE_CHAIN chain;
+
+        for( const VECTOR2I& p : aHops )
+            chain.Append( p, true );
+
+        stack->SetHops( chain );
+        stack->SetPosition( aHops.front() );
+    }
+    else
+    {
+        stack->ClearHops();
+        stack->SetPosition( aPosition );
+    }
+
+    LSET span;
+
+    for( PCB_LAYER_ID layer :
+         LAYER_RANGE( stack->GetStartLayer(), stack->GetEndLayer(), aBoard->GetCopperLayerCount() ) )
+        span.set( layer );
+
+    // Inherit the net of whatever the first hop lands on.
+    stack->SetNetCode( FindNetAtPosition( aBoard, stack->GetPosition(), span ) );
+    stack->SetFlags( IS_NEW );
+
+    // Refuse placement over foreign copper, matching the plain via tool. Build the
+    // stack's vias off-board and check each before anything is committed.
+    std::vector<BOARD_ITEM*> candidates = stack->BuildMembers( aBoard, stack->GetNetCode() );
+    bool                     violates = false;
+
+    for( BOARD_ITEM* item : candidates )
+    {
+        if( BOARD_CONNECTED_ITEM* copper = dynamic_cast<BOARD_CONNECTED_ITEM*>( item ) )
+        {
+            // Candidates are freed below, so their pointers must not seed the rule caches
+            copper->SetFlags( ROUTER_TRANSIENT );
+
+            if( aViolates && aViolates( copper ) )
+            {
+                violates = true;
+                break;
+            }
+        }
+    }
+
+    for( BOARD_ITEM* item : candidates )
+        delete item;
+
+    if( violates && !aAllowViolations )
+    {
+        delete stack;
+        return nullptr;
+    }
+
+    stack->EditStart( aTool, aBoard, &aCommit );
+    stack->Update( aTool, aBoard, &aCommit );
+    stack->EditFinish( aTool, aBoard, &aCommit );
+
+    stack->ClearFlags( IS_NEW );
+    return stack;
+}
+
+
+void PCB_VIA_STACK::ShowPropertiesDialog( PCB_BASE_EDIT_FRAME* aEditFrame )
+{
+    // Dialog edits a scratch copy so the undo snapshot below sees the pre-edit settings.
+    PCB_VIA_STACK temp( GetBoard(), GetLayer() );
+    temp.ApplyPreset( ToPreset() );
+    temp.SetNetCode( GetNetCode() );
+
+    DIALOG_MICROVIA_STACK dlg( aEditFrame, &temp );
+
+    if( dlg.ShowModal() != wxID_OK )
+        return;
+
+    BOARD_COMMIT commit( aEditFrame );
+    ApplySettings( temp.ToPreset(), aEditFrame->GetToolManager()->GetTool<GENERATOR_TOOL>(), commit );
     commit.Push( GetCommitMessage() );
 }
 
@@ -1287,73 +1438,26 @@ int DRAWING_TOOL::PlaceMicroviaStack( const TOOL_EVENT& aEvent )
 
     auto placeStack = [&]( const VECTOR2I& aCursor ) -> bool
     {
-        BOARD_COMMIT    commit( m_frame );
-        PCB_VIA_STACK*  stack = static_cast<PCB_VIA_STACK*>( settings.Clone() );
-        GENERATOR_TOOL* genTool = m_toolMgr->GetTool<GENERATOR_TOOL>();
-
-        // Clone keeps the source uuid, each placed stack needs its own.
-        stack->SetUuidDirect( KIID() );
-        stack->SetParent( board );
+        BOARD_COMMIT commit( m_frame );
 
         // The preview may have truncated the span, place the full one.
-        stack->SetEndLayer( spanLayers.back() );
+        settings.SetEndLayer( spanLayers.back() );
 
-        if( staggered )
-        {
-            SHAPE_LINE_CHAIN chain;
-
-            for( const VECTOR2I& p : hops )
-                chain.Append( p, true );
-
-            stack->SetHops( chain );
-            stack->SetPosition( hops.front() );
-        }
-        else
-        {
-            stack->ClearHops();
-            stack->SetPosition( aCursor );
-        }
-
-        // Inherit the net of whatever the first hop lands on.
-        stack->SetNetCode( PCB_VIA_STACK::FindNetAtPosition( board, stack->GetPosition(), spanSet ) );
-        stack->SetFlags( IS_NEW );
-
-        // Refuse placement over foreign copper, matching the plain via tool. Build the
-        // stack's vias off-board and check each before anything is committed.
-        std::vector<BOARD_ITEM*> candidates = stack->BuildMembers( board, stack->GetNetCode() );
-        bool                     violates = false;
-
-        for( BOARD_ITEM* item : candidates )
-        {
-            if( BOARD_CONNECTED_ITEM* copper = dynamic_cast<BOARD_CONNECTED_ITEM*>( item ) )
-            {
-                // Candidates are freed below, so their pointers must not seed the rule caches
-                copper->SetFlags( ROUTER_TRANSIENT );
-
-                if( CheckItemDRCViolation( copper, m_frame, drcEngine.get(), worstClearance, drcEpsilon ) )
+        PCB_VIA_STACK* stack = PCB_VIA_STACK::Place(
+                board, settings, aCursor, staggered ? hops : std::vector<VECTOR2I>(),
+                m_toolMgr->GetTool<GENERATOR_TOOL>(), commit,
+                [&]( BOARD_CONNECTED_ITEM* aItem )
                 {
-                    violates = true;
-                    break;
-                }
-            }
-        }
+                    return CheckItemDRCViolation( aItem, m_frame, drcEngine.get(), worstClearance, drcEpsilon );
+                },
+                allowDRCViolations );
 
-        for( BOARD_ITEM* item : candidates )
-            delete item;
-
-        if( violates && !allowDRCViolations )
+        if( !stack )
         {
             m_frame->ShowInfoBarError( _( "Microvia stack location violates DRC." ), true,
                                        WX_INFOBAR::MESSAGE_TYPE::DRC_VIOLATION );
-            delete stack;
             return false;
         }
-
-        stack->EditStart( genTool, board, &commit );
-        stack->Update( genTool, board, &commit );
-        stack->EditFinish( genTool, board, &commit );
-
-        stack->ClearFlags( IS_NEW );
 
         // Only the last hop reaches the end layer, and a staggered one is not at the cursor.
         for( BOARD_ITEM* item : stack->GetBoardItems() )

@@ -25,6 +25,7 @@
 #include <set>
 #include <utility>
 
+#include <eda_units.h>
 #include <geometry/shape_line_chain.h>
 #include <pcb_generator.h>
 
@@ -159,6 +160,45 @@ public:
 
     void             ApplyPreset( const VIA_STACK_PRESET& aPreset );
     VIA_STACK_PRESET ToPreset() const;
+
+    /**
+     * The properties dialog's checks: different start and end layers present on the board, a
+     * pitch for a staggered stack and within the limit, a valid via size and drill unless they
+     * come from the net class.
+     *
+     * @return why \a aSettings are refused, nothing when they are fine.
+     */
+    static std::optional<wxString> CheckSettings( BOARD* aBoard, const VIA_STACK_PRESET& aSettings,
+                                                  EDA_UNITS aUnits = EDA_UNITS::MM );
+
+    /**
+     * Apply edited properties in \a aCommit (not pushed): a staggered stack's hops re-spaced to
+     * the pitch, a stack without a net takes the net of the copper under it, regenerated.
+     */
+    void ApplySettings( const VIA_STACK_PRESET& aSettings, GENERATOR_TOOL* aTool, BOARD_COMMIT& aCommit );
+
+    /**
+     * Create Microvia Stack from \a aItems in \a aCommit (not pushed): the stack added and its
+     * members attached (CreateFromItems).  \a aBeforeStaging runs once the stack is made and
+     * before anything is staged (the editor clears its selection there).
+     *
+     * @return the stack, or nullptr with \a aError set when the items do not make one.
+     */
+    static PCB_VIA_STACK* MakeFromItems( const std::vector<BOARD_ITEM*>& aItems, BOARD* aBoard, BOARD_COMMIT& aCommit,
+                                         wxString* aError = nullptr,
+                                         const std::function<void()>& aBeforeStaging = nullptr );
+
+    /**
+     * Place Microvia Stack: a stack with \a aSettings over its full span at \a aPosition, or along
+     * \a aHops for a staggered one, with the net of the copper the first hop lands on, generated
+     * in \a aCommit (not pushed).  \a aViolates tells whether a hop would violate DRC; such a
+     * place is refused unless \a aAllowViolations.
+     *
+     * @return the stack, nullptr when refused.
+     */
+    static PCB_VIA_STACK* Place( BOARD* aBoard, const PCB_VIA_STACK& aSettings, const VECTOR2I& aPosition,
+                                 const std::vector<VECTOR2I>& aHops, GENERATOR_TOOL* aTool, BOARD_COMMIT& aCommit,
+                                 const std::function<bool( BOARD_CONNECTED_ITEM* )>& aViolates, bool aAllowViolations );
 
     /**
      * Build a stack from existing board items (microvias plus optional connecting traces).

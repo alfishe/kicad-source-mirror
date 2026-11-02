@@ -59,8 +59,13 @@ class STATUS_MIN_MAX_POPUP;
  * block placement over foreign copper consistently.
  */
 int  ComputeWorstViaClearance( PCB_BASE_EDIT_FRAME* aFrame, DRC_ENGINE* aEngine );
+int  ComputeWorstViaClearance( BOARD* aBoard, DRC_ENGINE* aEngine );
 bool CheckItemDRCViolation( BOARD_CONNECTED_ITEM* aItem, PCB_BASE_EDIT_FRAME* aFrame, DRC_ENGINE* aEngine,
                             int aWorstClearance, int aEpsilon );
+
+/// The same check against \a aNearby, the items around \a aItem (the frame's version takes them from its view)
+bool CheckItemDRCViolation( BOARD_CONNECTED_ITEM* aItem, const std::vector<BOARD_ITEM*>& aNearby, DRC_ENGINE* aEngine,
+                            int aEpsilon );
 
 
 /**

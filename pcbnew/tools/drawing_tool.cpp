@@ -3925,12 +3925,17 @@ int DRAWING_TOOL::DrawZone( const TOOL_EVENT& aEvent )
 
 int ComputeWorstViaClearance( PCB_BASE_EDIT_FRAME* aFrame, DRC_ENGINE* aEngine )
 {
+    return ComputeWorstViaClearance( aFrame->GetBoard(), aEngine );
+}
+
+
+int ComputeWorstViaClearance( BOARD* aBoard, DRC_ENGINE* aEngine )
+{
     int worst = 0;
 
     try
     {
-        if( aFrame )
-            aEngine->InitEngine( aFrame->GetBoard()->GetDesignRulesPath() );
+        aEngine->InitEngine( aBoard->GetDesignRulesPath() );
 
         DRC_CONSTRAINT constraint;
 
@@ -3940,7 +3945,7 @@ int ComputeWorstViaClearance( PCB_BASE_EDIT_FRAME* aFrame, DRC_ENGINE* aEngine )
         if( aEngine->QueryWorstConstraint( HOLE_CLEARANCE_CONSTRAINT, constraint ) )
             worst = std::max( worst, constraint.GetValue().Min() );
 
-        for( FOOTPRINT* footprint : aFrame->GetBoard()->Footprints() )
+        for( FOOTPRINT* footprint : aBoard->Footprints() )
         {
             for( PAD* pad : footprint->Pads() )
             {
@@ -4067,7 +4072,7 @@ bool CheckItemDRCViolation( BOARD_CONNECTED_ITEM* aItem, PCB_BASE_EDIT_FRAME* aF
                             int aWorstClearance, int aEpsilon )
 {
     std::vector<KIGFX::VIEW::LAYER_ITEM_PAIR> items;
-    std::set<BOARD_ITEM*>                     checkedItems;
+    std::vector<BOARD_ITEM*>                  nearby;
     BOX2I                                     bbox = aItem->GetBoundingBox();
 
     bbox.Inflate( aWorstClearance );
@@ -4075,11 +4080,21 @@ bool CheckItemDRCViolation( BOARD_CONNECTED_ITEM* aItem, PCB_BASE_EDIT_FRAME* aF
 
     for( std::pair<KIGFX::VIEW_ITEM*, int> it : items )
     {
-        if( !it.first->IsBOARD_ITEM() )
-            continue;
+        if( it.first->IsBOARD_ITEM() )
+            nearby.push_back( static_cast<BOARD_ITEM*>( it.first ) );
+    }
 
-        BOARD_ITEM* item = static_cast<BOARD_ITEM*>( it.first );
+    return CheckItemDRCViolation( aItem, nearby, aEngine, aEpsilon );
+}
 
+
+bool CheckItemDRCViolation( BOARD_CONNECTED_ITEM* aItem, const std::vector<BOARD_ITEM*>& aNearby, DRC_ENGINE* aEngine,
+                            int aEpsilon )
+{
+    std::set<BOARD_ITEM*> checkedItems;
+
+    for( BOARD_ITEM* item : aNearby )
+    {
         if( item->Type() == PCB_ZONE_T && !static_cast<ZONE*>( item )->GetIsRuleArea() )
         {
             continue; // the pour is not refilled yet, so it still looks solid where the via is going

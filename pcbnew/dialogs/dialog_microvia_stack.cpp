@@ -81,30 +81,18 @@ bool DIALOG_MICROVIA_STACK::TransferDataFromWindow()
     PCB_LAYER_ID endLayer = ToLAYER_ID( m_endLayer->GetLayerSelection() );
     bool         staggered = m_typeChoice->GetSelection() == 1;
 
-    if( startLayer == endLayer )
-    {
-        DisplayErrorMessage( this, _( "The start and end layers must be different." ) );
-        return false;
-    }
+    VIA_STACK_PRESET check = m_stack->ToPreset();
+    check.m_StartLayer = startLayer;
+    check.m_EndLayer = endLayer;
+    check.m_Staggered = staggered;
+    check.m_Pitch = m_pitch.GetIntValue();
+    check.m_UseNetclass = m_useNetclass->GetValue();
+    check.m_ViaSize = m_viaSize.GetIntValue();
+    check.m_ViaDrill = m_viaDrill.GetIntValue();
 
-    if( !PCB_VIA_STACK::IsSpanValid( m_stack->GetBoard(), startLayer, endLayer ) )
+    if( std::optional<wxString> error = PCB_VIA_STACK::CheckSettings( m_stack->GetBoard(), check, GetUserUnits() ) )
     {
-        DisplayErrorMessage( this, _( "Select a start and an end layer present on this board." ) );
-        return false;
-    }
-
-    if( staggered && m_pitch.GetIntValue() <= 0 )
-    {
-        DisplayErrorMessage( this, _( "Staggered stacks need a pitch greater than zero." ) );
-        return false;
-    }
-
-    if( m_pitch.GetIntValue() > pcbIUScale.mmToIU( MAX_MICROVIA_STACK_PITCH_MM ) )
-    {
-        wxString limit = EDA_UNIT_UTILS::UI::MessageTextFromValue(
-                pcbIUScale, GetUserUnits(), pcbIUScale.mmToIU( MAX_MICROVIA_STACK_PITCH_MM ) );
-
-        DisplayErrorMessage( this, wxString::Format( _( "The pitch must be %s or less." ), limit ) );
+        DisplayErrorMessage( this, *error );
         return false;
     }
 
@@ -125,13 +113,6 @@ bool DIALOG_MICROVIA_STACK::TransferDataFromWindow()
     }
     else
     {
-        if( std::optional<PCB_VIA::VIA_PARAMETER_ERROR> error = PCB_VIA::ValidateViaParameters(
-                    m_viaSize.GetIntValue(), m_viaDrill.GetIntValue(), startLayer, endLayer ) )
-        {
-            DisplayErrorMessage( this, error->m_Message );
-            return false;
-        }
-
         m_stack->SetViaSize( m_viaSize.GetIntValue() );
         m_stack->SetViaDrill( m_viaDrill.GetIntValue() );
     }
