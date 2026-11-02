@@ -3,11 +3,16 @@
 #ifndef KICADOPENAPI_LIBRARIES_H
 #define KICADOPENAPI_LIBRARIES_H
 
+#include <functional>
+
 #include <json_common.h>
 #include <kicommon.h>
+#include <wx/string.h>
 
 class KIWAY;
 class LIBRARY_MANAGER_ADAPTER;
+class PROJECT;
+struct KOPENAPI_RESULT;
 
 
 /// @brief The library tables behind an adapter — global and project — with their path, whether they
@@ -33,5 +38,26 @@ KICOMMON_API void KopenapiCheckGlobalLibraryTables();
 /// lives in statics of that kiface's copy of pcbcommon.  Made by cvpcb (ERC), pcbnew's library
 /// search would see empty libraries.
 KICOMMON_API void KopenapiEnsureFootprintLibraries( KIWAY* aKiway = nullptr );
+
+
+/// @brief One kind of library table for the *_lib_table_add / _remove / _set methods
+struct KOPENAPI_LIB_TABLE_KIND
+{
+    LIBRARY_MANAGER_ADAPTER*                       adapter = nullptr;
+    std::function<wxString( const wxString& )>     guessType;      ///< plugin type of a library path
+    std::function<bool( const wxString& )>         isType;         ///< a plugin type name of this kind
+    std::function<wxString( const wxString& )>     nicknameOf;     ///< the Add Library nickname of a path
+};
+
+/// @brief Library Tables dialog edits through EditLibraryTable: add a row, remove one, change one
+KICOMMON_API KOPENAPI_RESULT KopenapiLibTableAdd( PROJECT& aProject, const KOPENAPI_LIB_TABLE_KIND& aKind,
+                                                  const nlohmann::json& aArgs );
+KICOMMON_API KOPENAPI_RESULT KopenapiLibTableRemove( PROJECT& aProject, const KOPENAPI_LIB_TABLE_KIND& aKind,
+                                                     const nlohmann::json& aArgs );
+KICOMMON_API KOPENAPI_RESULT KopenapiLibTableSet( PROJECT& aProject, const KOPENAPI_LIB_TABLE_KIND& aKind,
+                                                  const nlohmann::json& aArgs );
+
+/// @brief The argument schema of KopenapiLibTableAdd / Remove / Set ("add", "remove", "set")
+KICOMMON_API nlohmann::json KopenapiLibTableSchema( const std::string& aOperation );
 
 #endif

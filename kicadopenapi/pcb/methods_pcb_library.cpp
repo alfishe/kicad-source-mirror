@@ -13,11 +13,13 @@
 #include <board.h>
 #include <footprint.h>
 #include <footprint_library_adapter.h>
+#include <footprint_library_export.h>
 #include <kicadopenapi_libraries.h>
 #include <kicadopenapi_util.h>
 #include <kiway.h>
 #include <libraries/library_table.h>
 #include <pad.h>
+#include <pcb_io/pcb_io_mgr.h>
 #include <project_pcb.h>
 
 #include <algorithm>
@@ -463,3 +465,51 @@ KOPENAPI_REGISTER( "pcb_lib_footprint_get",
                         "lib_id":{"type":"string","description":"e.g. Package_TO_SOT_SMD:SOT-223-3_TabPin2"},
                         "edge_method":{"type":"string","enum":["auto","marker","infer"],"default":"auto","description":"panel_edge from the footprint's marker, inferred from its body, or marker else inferred"}}})json"_json,
                    false, h_pcb_lib_footprint_get, 600 );
+
+
+static KOPENAPI_RESULT libTable( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs,
+                                 KOPENAPI_RESULT ( *aOperation )( PROJECT&, const KOPENAPI_LIB_TABLE_KIND&,
+                                                                  const nlohmann::json& ) )
+{
+    PROJECT* project = libraryProject( aCtx );
+
+    if( !project )
+        return KOPENAPI_RESULT::Error( 503, "no project to read library tables from" );
+
+    KOPENAPI_LIB_TABLE_KIND kind;
+    kind.adapter = PROJECT_PCB::FootprintLibAdapter( project );
+    kind.guessType = []( const wxString& aPath ) { return FootprintLibraryType( aPath ); };
+    kind.isType = []( const wxString& aType )
+                  { return PCB_IO_MGR::EnumFromStr( aType ) != PCB_IO_MGR::PCB_FILE_UNKNOWN; };
+    kind.nicknameOf = []( const wxString& aPath ) { return FootprintLibraryNickname( aPath ); };
+    return aOperation( *project, kind, aArgs );
+}
+
+
+KOPENAPI_REGISTER( "pcb_lib_table_add",
+                   "Add a footprint library to the project (default) or global fp-lib-table, as Add Library and "
+                   "the Footprint Libraries dialog: path (absolute, normalised to ${KIPRJMOD} or a path "
+                   "variable, or a URI with a variable), nickname (default the file name), type (default "
+                   "guessed), options, description, enabled. The table is checked as the dialog does "
+                   "(legal, unique nicknames), saved and reloaded, the library loaded. Answers the row with its "
+                   "expanded path, status and whether the path exists; a nickname the table has 409",
+                   KopenapiLibTableSchema( "add" ), false,
+                   []( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+                   { return libTable( aCtx, aArgs, KopenapiLibTableAdd ); } );
+
+KOPENAPI_REGISTER( "pcb_lib_table_remove",
+                   "Remove a footprint library from the project or global fp-lib-table (default the project "
+                   "table if it has the nickname, else the global), as the Footprint Libraries dialog; the "
+                   "library files stay. Answers the removed row; now_from global when a global row of that "
+                   "name shows again",
+                   KopenapiLibTableSchema( "remove" ), false,
+                   []( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+                   { return libTable( aCtx, aArgs, KopenapiLibTableRemove ); } );
+
+KOPENAPI_REGISTER( "pcb_lib_table_set",
+                   "Change a footprint library row of the project or global fp-lib-table, as the Footprint "
+                   "Libraries dialog: new_nickname, path, type, options, description, enabled. Answers the "
+                   "row as it is now",
+                   KopenapiLibTableSchema( "set" ), false,
+                   []( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+                   { return libTable( aCtx, aArgs, KopenapiLibTableSet ); } );

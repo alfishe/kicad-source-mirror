@@ -15,6 +15,7 @@
 #include <base_units.h>
 #include <kicadopenapi_util.h>
 #include <kiway.h>
+#include <kiway_player.h>
 #include <lib_symbol.h>
 #include <libraries/library_table.h>
 #include <libraries/symbol_library_adapter.h>
@@ -728,3 +729,63 @@ KOPENAPI_REGISTER( "sch_lib_symbol_save",
                         "name":{"type":"string","description":"symbol name in the library; default the lib_id's item name (lib_id / ref only)"},
                         "overwrite":{"type":"boolean","default":false,"description":"replace a different symbol of that name"}}})json"_json,
                    false, h_sch_lib_symbol_save, 600 );
+
+
+static KOPENAPI_RESULT libTable( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs,
+                                 KOPENAPI_RESULT ( *aOperation )( PROJECT&, const KOPENAPI_LIB_TABLE_KIND&,
+                                                                  const nlohmann::json& ) )
+{
+    PROJECT* project = libraryProject( aCtx );
+
+    if( !project )
+        return KOPENAPI_RESULT::Error( 503, "no project to read library tables from" );
+
+    KOPENAPI_LIB_TABLE_KIND kind;
+    kind.adapter = PROJECT_SCH::SymbolLibAdapter( project );
+    kind.guessType = []( const wxString& aPath )
+                     {
+                         // a library not written yet is told by its extension, as the symbol editor's New Library
+                         SCH_IO_MGR::SCH_FILE_T type = SCH_IO_MGR::GuessPluginTypeFromLibPath( aPath );
+
+                         if( type == SCH_IO_MGR::SCH_FILE_UNKNOWN )
+                             type = SCH_IO_MGR::GuessPluginTypeFromLibPath( aPath, KICTL_CREATE );
+
+                         if( type == SCH_IO_MGR::SCH_FILE_UNKNOWN )
+                             type = SCH_IO_MGR::SCH_LEGACY;
+
+                         return SCH_IO_MGR::ShowType( type );
+                     };
+    kind.isType = []( const wxString& aType )
+                  { return SCH_IO_MGR::EnumFromStr( aType ) != SCH_IO_MGR::SCH_FILE_UNKNOWN; };
+    kind.nicknameOf = []( const wxString& aPath ) { return wxFileName( aPath ).GetName(); };
+    return aOperation( *project, kind, aArgs );
+}
+
+
+KOPENAPI_REGISTER( "sch_lib_table_add",
+                   "Add a symbol library to the project (default) or global sym-lib-table, as the symbol "
+                   "editor's Add Library and the Symbol Libraries dialog: path (absolute, normalised to "
+                   "${KIPRJMOD} or a path variable, or a URI with a variable), nickname (default the file "
+                   "name), type (default guessed), options, description, enabled, visible. The table is checked "
+                   "as the dialog does (legal, unique nicknames), saved and reloaded, the library loaded. "
+                   "Answers the row with its expanded path, status and whether the path exists; a nickname the "
+                   "table has 409",
+                   KopenapiLibTableSchema( "add" ), false,
+                   []( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+                   { return libTable( aCtx, aArgs, KopenapiLibTableAdd ); } );
+
+KOPENAPI_REGISTER( "sch_lib_table_remove",
+                   "Remove a symbol library from the project or global sym-lib-table (default the project table "
+                   "if it has the nickname, else the global), as the Symbol Libraries dialog; the library file "
+                   "stays. Answers the removed row; now_from global when a global row of that name shows again",
+                   KopenapiLibTableSchema( "remove" ), false,
+                   []( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+                   { return libTable( aCtx, aArgs, KopenapiLibTableRemove ); } );
+
+KOPENAPI_REGISTER( "sch_lib_table_set",
+                   "Change a symbol library row of the project or global sym-lib-table, as the Symbol "
+                   "Libraries dialog: new_nickname, path, type, options, description, enabled, visible. "
+                   "Answers the row as it is now",
+                   KopenapiLibTableSchema( "set" ), false,
+                   []( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+                   { return libTable( aCtx, aArgs, KopenapiLibTableSet ); } );
