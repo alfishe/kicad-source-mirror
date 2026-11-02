@@ -2673,9 +2673,9 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                               return rx != ry ? rx < ry : lanes[x].lo < lanes[y].lo;
                           } );
 
-        // the vias the package's fan-out lays by its pads (pcb_fanout, dry run): the rails' and the moved pins' as
-        // the plan has them, and for every other pin not turning, where its via would go were it walled in. The
-        // lanes keep clear of them, past their pads
+        // the via spots of the package's fan-out (pcb_fanout ports, dry run: via_spots): the rails' and the moved
+        // pins' laid, and for every other pin not turning, where its via goes should it leave by one. The lanes
+        // keep clear of them, past their pads
         struct SPOT
         {
             VECTOR2I   at;
@@ -2690,63 +2690,44 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
         if( std::optional<KOPENAPI_METHOD> fanout = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout" ) )
         {
-            std::set<const PORT*> turning;
-            nlohmann::json        stayNets = nlohmann::json::array();
+            std::set<const PAD*> turning;
 
             for( const LANE& l : lanes )
             {
                 if( l.turn > 0 )
-                    turning.insert( l.port );
+                    turning.insert( l.port->pad );
             }
 
-            for( const PORT& p : ports )
+            const KOPENAPI_RESULT fan = fanout->handler( aCtx, { { "ref", str( a.fp->GetReference() ) }, { "ports", true }, { "dry_run", true },
+                                                                 { "full", true }, { "zones", "keep" } } );
+            const nlohmann::json  noSpots = nlohmann::json::array();
+            const nlohmann::json& rows = fan.status == 200 && fan.body.contains( "via_spots" ) && fan.body["via_spots"].is_array()
+                                                 ? fan.body["via_spots"] : noSpots;
+            const int             dia = fan.status == 200 && fan.body.contains( "via" )
+                                                ? pcbIUScale.mmToIU( fan.body["via"].value( "diameter_mm", 0.0 ) ) : 0;
+
+            for( const nlohmann::json& row : rows )
             {
-                if( !turning.count( &p ) && p.kind != "rail" && !p.via && p.pad->GetAttribute() == PAD_ATTRIB::SMD )
-                    stayNets.push_back( p.net );
-            }
+                const std::string name = row.value( "pad", std::string() );
+                PAD*              pad = nullptr;
 
-            std::set<std::string> spotted;
-            const nlohmann::json  common = { { "ref", str( a.fp->GetReference() ) }, { "dry_run", true }, { "full", true }, { "zones", "keep" } };
-
-            for( nlohmann::json args : { nlohmann::json( { { "ports", true } } ), nlohmann::json( { { "nets", stayNets } } ) } )
-            {
-                if( args.contains( "nets" ) && stayNets.empty() )
-                    continue;
-
-                args.update( common );
-                const KOPENAPI_RESULT fan = fanout->handler( aCtx, args );
-
-                if( fan.status != 200 || !fan.body.contains( "pins" ) || !fan.body["pins"].is_array() )
-                    continue;
-
-                for( const nlohmann::json& row : fan.body["pins"] )
+                for( PAD* q : a.fp->Pads() )
                 {
-                    const std::string name = row.value( "pad", std::string() );
-
-                    if( !row.contains( "row" ) || !row.contains( "end_mm" ) || !spotted.insert( name ).second )
-                        continue;
-
-                    PAD* pad = nullptr;
-
-                    for( PAD* q : a.fp->Pads() )
-                    {
-                        if( str( a.fp->GetReference() ) + "." + str( q->GetNumber() ) == name )
-                            pad = q;
-                    }
-
-                    if( !pad )
-                        continue;
-
-                    NETCLASS* netclass = pad->GetEffectiveNetClass();
-                    SPOT      spot;
-                    spot.at = VECTOR2I( pcbIUScale.mmToIU( row["end_mm"][0].get<double>() ), pcbIUScale.mmToIU( row["end_mm"][1].get<double>() ) );
-                    spot.dia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
-                    spot.net = pad->GetNetCode();
-                    spot.pad = pad;
-                    spots.push_back( spot );
-                    spotPads.insert( pad );
-                    spotsOut.push_back( { { "pad", name }, { "at_mm", row["end_mm"] } } );
+                    if( str( a.fp->GetReference() ) + "." + str( q->GetNumber() ) == name )
+                        pad = q;
                 }
+
+                if( !pad || !row.contains( "at_mm" ) || ( !row.value( "laid", false ) && turning.count( pad ) ) )
+                    continue;
+
+                SPOT spot;
+                spot.at = VECTOR2I( pcbIUScale.mmToIU( row["at_mm"][0].get<double>() ), pcbIUScale.mmToIU( row["at_mm"][1].get<double>() ) );
+                spot.dia = dia;
+                spot.net = pad->GetNetCode();
+                spot.pad = pad;
+                spots.push_back( spot );
+                spotPads.insert( pad );
+                spotsOut.push_back( { { "pad", name }, { "at_mm", row["at_mm"] } } );
             }
         }
 
@@ -3201,12 +3182,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                     {
                         row["layer"] = "other";
                         row["why"] = "yields to the lanes round the part: its fan-out via to the other layer";
-
-                        for( const SPOT& spot : spots )
-                        {
-                            if( spot.pad == p.pad )
-                                row["via_mm"] = mmAt( spot.at );
-                        }
+                        row["yields"] = true;
                     }
                 }
             }
@@ -3884,7 +3860,7 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "crossings and length_mm, the one taken). yields: where "
                    "two ways are in each other's way (a turning lane running in front of a pin whose way out is straight, or two lanes "
                    "crossing on one layer) one yields: a straight way out yields to a ring (the pin dives by its fan-out via, its port "
-                   "layer other, via_mm the spot the lanes keep clear of) unless the ring has no room (blocked, off the board) or the pin no via spot; of two lanes the one "
+                   "layer other, yields true: its via at its spot in pcb_fanout ports via_spots, which the lanes keep clear of) unless the ring has no room (blocked, off the board) or the pin no via spot; of two lanes the one "
                    "whose yield costs fewer vias, then less added length, deeper (out past the other, clear of all) or onto the other "
                    "layer (pad, net, to, conflict walls_in or crosses, by deeper or via, vias, length_mm). dropped: the lanes gone onto "
                    "the other layer (walls_in or crosses, layer other). Also each port's lane (rank, offset_mm, polyline_mm) and each lane as a corridor (corridor.md: its corners the gates, its slot the rooms). pitch_mm, "
