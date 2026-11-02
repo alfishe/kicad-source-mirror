@@ -550,6 +550,10 @@ public:
 
     void rebuildTuningInfo();
 
+    /// The result of the last Update(): the tuned length (or delay / skew) and its status
+    long long GetTuningLength() const { return m_tuningLength; }
+    PNS::MEANDER_PLACER_BASE::TUNING_STATUS GetTuningStatus() const { return m_tuningStatus; }
+
     // @return the user-facing status string for a tuning result ("too long", "tuned", ...)
     static wxString StatusMessage( PNS::MEANDER_PLACER_BASE::TUNING_STATUS aStatus );
 

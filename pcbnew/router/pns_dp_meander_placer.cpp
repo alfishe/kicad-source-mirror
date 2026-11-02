@@ -114,6 +114,16 @@ bool DP_MEANDER_PLACER::Start( const VECTOR2I& aP, ITEM* aStartItem )
     if( m_originPair.Dimensions().Gap() < 0 )
         m_originPair.SetGap( Router()->Sizes().DiffPairGap() );
 
+    // Couple the segments at the pair's own gap; an empty constraint only matches touching lines.
+    if( m_originPair.GapConstraint().IsNull() )
+    {
+        DP_DIMENSIONS dims = m_originPair.Dimensions();
+        DP_GAP_CONSTRAINT gapConstraint;
+        gapConstraint.SetOpt( dims.Gap() );
+        dims.SetGapConstraint( gapConstraint );
+        m_originPair.SetDimensions( dims );
+    }
+
     if( !m_originPair.PLine().SegmentCount() || !m_originPair.NLine().SegmentCount() )
         return false;
 
