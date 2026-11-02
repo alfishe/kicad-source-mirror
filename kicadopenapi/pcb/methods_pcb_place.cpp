@@ -3377,58 +3377,6 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             }
         }
 
-        // still out of reach (the inductor: always): in the old spots of the group's parts yet to go
-        // (they move anyway)
-        if( placement.ok && member.decoupling && ( placement.padDistanceMm > aDecapMaxMm || member.inductor ) && !viaPad )
-        {
-            const VECTOR2I             pos = member.part->GetPosition();
-            const EDA_ANGLE            angle = member.part->GetOrientation();
-            std::set<const FOOTPRINT*> pending;
-            NEAR_OPTIONS               free = options;
-
-            for( size_t i = size_t( &member - members.data() ) + 1; i < members.size(); ++i )
-                pending.insert( members[i].part );
-
-            free.pending = &pending;
-
-            NEAR_PLACEMENT closer = placeNear( aBoard, member.part, target, free );
-
-            // the inductor closes the switching loop: inside the ring and at the narrow gap whenever
-            // that is closer
-            if( closer.ok && ( closer.padDistanceMm > aDecapMaxMm || member.inductor )
-                && ( free.hostRingMm > 0 || ( member.inductor && !free.gapGiven && free.gapMm > 0.25 ) ) )
-            {
-                const VECTOR2I  ringPos = member.part->GetPosition();
-                const EDA_ANGLE ringAngle = member.part->GetOrientation();
-
-                free.hostRingMm = 0;
-
-                if( member.inductor && !free.gapGiven )
-                    free.gapMm = std::min( free.gapMm, 0.25 );
-
-                if( NEAR_PLACEMENT inside = placeNear( aBoard, member.part, target, free );
-                    inside.ok && inside.padDistanceMm < closer.padDistanceMm )
-                {
-                    closer = inside;
-                }
-                else
-                {
-                    member.part->SetOrientation( ringAngle );
-                    member.part->SetPosition( ringPos );
-                }
-            }
-
-            if( closer.ok && closer.padDistanceMm < placement.padDistanceMm )
-            {
-                placement = closer;
-            }
-            else
-            {
-                member.part->SetOrientation( angle );
-                member.part->SetPosition( pos );
-            }
-        }
-
         // still out of reach: under the anchor on the other side, when that brings it within reach (a
         // cap, or a filter resistor; the inductor stays on the regulator's side)
         if( placement.ok && member.decoupling && ( member.capacitor || ( !member.inductor && member.part->Pads().size() == 2 ) )
@@ -3489,6 +3437,58 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             {
                 viaSpots.resize( count );
                 member.part->Flip( member.part->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );
+                member.part->SetOrientation( angle );
+                member.part->SetPosition( pos );
+            }
+        }
+
+        // still out of reach on either side (the inductor: always): in the old spots of the group's
+        // parts yet to go (they move anyway)
+        if( placement.ok && member.decoupling && ( placement.padDistanceMm > aDecapMaxMm || member.inductor ) && !viaPad )
+        {
+            const VECTOR2I             pos = member.part->GetPosition();
+            const EDA_ANGLE            angle = member.part->GetOrientation();
+            std::set<const FOOTPRINT*> pending;
+            NEAR_OPTIONS               free = options;
+
+            for( size_t i = size_t( &member - members.data() ) + 1; i < members.size(); ++i )
+                pending.insert( members[i].part );
+
+            free.pending = &pending;
+
+            NEAR_PLACEMENT closer = placeNear( aBoard, member.part, target, free );
+
+            // the inductor closes the switching loop: inside the ring and at the narrow gap whenever
+            // that is closer
+            if( closer.ok && ( closer.padDistanceMm > aDecapMaxMm || member.inductor )
+                && ( free.hostRingMm > 0 || ( member.inductor && !free.gapGiven && free.gapMm > 0.25 ) ) )
+            {
+                const VECTOR2I  ringPos = member.part->GetPosition();
+                const EDA_ANGLE ringAngle = member.part->GetOrientation();
+
+                free.hostRingMm = 0;
+
+                if( member.inductor && !free.gapGiven )
+                    free.gapMm = std::min( free.gapMm, 0.25 );
+
+                if( NEAR_PLACEMENT inside = placeNear( aBoard, member.part, target, free );
+                    inside.ok && inside.padDistanceMm < closer.padDistanceMm )
+                {
+                    closer = inside;
+                }
+                else
+                {
+                    member.part->SetOrientation( ringAngle );
+                    member.part->SetPosition( ringPos );
+                }
+            }
+
+            if( closer.ok && closer.padDistanceMm < placement.padDistanceMm )
+            {
+                placement = closer;
+            }
+            else
+            {
                 member.part->SetOrientation( angle );
                 member.part->SetPosition( pos );
             }
