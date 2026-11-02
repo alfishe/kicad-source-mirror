@@ -427,6 +427,7 @@ set( PCBNEW_CLASS_SRCS
 
     array_pad_number_provider.cpp
     board_loader.cpp
+    board_reannotate.cpp
     constraints/board_constraint_adapter.cpp
     constraints/constraint_system_2d.cpp
     tools/constraint_edit_tool.cpp

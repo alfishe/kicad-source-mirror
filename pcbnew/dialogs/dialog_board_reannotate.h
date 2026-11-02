@@ -21,6 +21,9 @@
 
 #pragma once
 
+#include <memory>
+
+#include <board_reannotate.h>
 #include <dialogs/dialog_board_reannotate_base.h>
 #include <layer_ids.h>
 #include <netlist_reader/pcb_netlist.h>
@@ -31,54 +34,6 @@
 #include <tool/actions.h>
 #include <tool/tool_manager.h>
 #include <tools/pcb_selection_tool.h>
-
-#define SORTXFIRST 0b000       // Sort on X
-#define SORTYFIRST 0b100       // Sort on Y
-#define ASCENDINGFIRST 0b000   // Sort low to high
-#define DESCENDINGFIRST 0b010  // Sort high to low
-#define ASCENDINGSECOND 0b000  // Sort low to high
-#define DESCENDINGSECOND 0b001 // Sort high to low
-
-#define MINGRID 1000
-#define MAXERROR 10
-#define VALIDPREFIX "_-+=/\\"  // Prefixs can be alpha or these symbols
-
-enum ACTION_CODE
-{
-    UPDATE_REFDES,
-    EMPTY_REFDES,
-    INVALID_REFDES,
-    EXCLUDE_REFDES
-};
-
-struct REFDES_CHANGE
-{
-    KIID         Uuid;
-    wxString     NewRefDes;         // The new reference designation (F_U21)
-    wxString     OldRefDesString;   // What the old refdes preamble + number was
-    bool         Front;             // True if on the front of the board
-    ACTION_CODE  Action;            // Used to skip (if #, etc)
-};
-
-struct REFDES_INFO
-{
-    KIID        Uuid;
-    bool        Front;              // True if on the front of the board
-    wxString    RefDesString;       // What its refdes is R1, C2
-    wxString    RefDesPrefix;       // ie R, C, etc
-    int         x, y;               // The coordinates
-    int         roundedx, roundedy; // The coordinates after rounding.
-    ACTION_CODE Action;             // Used to skip (if #, etc)
-    LIB_ID      FPID;
-};
-
-struct REFDES_PREFIX_INFO
-{
-    wxString               RefDesPrefix;
-    unsigned int           LastUsedRefDes;
-    std::set<unsigned int> UnavailableRefs;
-};
-
 
 class DIALOG_BOARD_REANNOTATE : public DIALOG_BOARD_REANNOTATE_BASE
 {
@@ -136,23 +91,9 @@ private:
     /// @return false if fail, true if success.
     bool ReannotateBoard( void );
 
-    /// Build the footprint lists, sort it, filter for excludes, then build the change list.
+    /// Plan the change list from the dialog's options and log it.
     /// @return true if success, false if errors
-    bool BuildFootprintList( std::vector<REFDES_INFO>& aBadRefDes );
-
-    /// Build list of unavailable references. E.g. unselected footprints or locked footprints.
-    void BuildUnavailableRefsList();
-
-    /// Scan through the footprint arrays and create the from -> to array.
-    void BuildChangeArray( std::vector<REFDES_INFO>& aFootprints, unsigned int aStartRefDes,
-                           const wxString& aPrefix, bool aRemovePrefix,
-                           std::vector<REFDES_INFO>& aBadRefDes );
-
-    /// @return the new reference for this footprint.
-    REFDES_CHANGE* GetNewRefDes( FOOTPRINT* aFootprint );
-
-    /// Round an int coordinate to a suitable grid
-    int RoundToGrid( int aCoord, int aGrid );
+    bool BuildFootprintList();
 
     /// Convert coordinates to wxString.
     /// @return the string
@@ -161,17 +102,10 @@ private:
     /// Check to make sure the prefix (if there is one) is properly constructed.
     void FilterPrefix( wxTextCtrl* aPrefix );
 
-    /// Get the structure representing the information currently held for aRefDesPrefix or create one
-    /// if it doesn't exist
-    REFDES_PREFIX_INFO* GetOrBuildRefDesInfo( const wxString& aRefDesPrefix, int aStartRefDes = 1 );
-
 private:
     PCB_EDIT_FRAME*  m_frame;
     FOOTPRINTS       m_footprints;
 
-    std::vector<REFDES_CHANGE>      m_changeArray;
-    std::vector<REFDES_INFO>        m_frontFootprints;
-    std::vector<REFDES_INFO>        m_backFootprints;
-    std::vector<REFDES_PREFIX_INFO> m_refDesPrefixInfos;
-    std::vector<wxString>           m_excludeArray;
+    std::unique_ptr<BOARD_REANNOTATOR> m_reannotator;
+    std::vector<wxString>              m_excludeArray;
 };
