@@ -722,6 +722,7 @@ struct ESCAPE_FRONT
     SHAPE_SEGMENT       shape;
     std::vector<size_t> jobs;          ///< the connections at the pad; none: a pad of another net, open all the call
     bool                open = true;   ///< false once they are all routed
+    bool                port = false;  ///< the layout plan's port of a signal pin (ports)
     std::shared_ptr<const std::set<int>> only;   ///< the nets it walls out; none: every other net
 
     bool walls( int aNet ) const { return open && pad->GetNetCode() != aNet && ( !only || only->count( aNet ) ); }
@@ -736,11 +737,12 @@ struct PORT_GOAL
     std::optional<PCB_LAYER_ID> otherLayer;
     VECTOR2I                    dir;
     VECTOR2I                    start;          ///< where the way out leaves the pad
-    VECTOR2I                    tip;            ///< past the courtyard
+    VECTOR2I                    tip;            ///< past the courtyard; at its edge for a pin planned round the part
     int                         width = 0;
     bool                        other = false;  ///< the plan moves it to the other layer
     std::optional<VECTOR2I>     via;            ///< ... by a via here
     std::string                 side, to;
+    bool                        round = false;  ///< planned round the part: it turns as soon as it is out
 };
 
 
@@ -792,6 +794,12 @@ struct ROUTE_REQUEST
     /// @brief Ways out of pads kept open: a route putting copper of another net across one is refused
     const std::vector<ESCAPE_FRONT>* fronts = nullptr;
 
+    /// @brief The ways out are obstacles in the search too (a try again after a refused one)
+    bool frontsInWorld = false;
+
+    /// @brief A longer route is not taken (> 0)
+    double maxLength = 0;
+
     /// @brief Each try appended here (pcb_route attempts: true)
     nlohmann::json* tried = nullptr;
 };
@@ -825,6 +833,12 @@ struct ROUTE_PROFILE
     std::map<std::string, int> ripUpsFailedAt;   ///< failed rip-ups by what failed: the route, a victim, a cut one
     int    ripUpsSecond = 0;      ///< victims with no way back that took out routes in turn
     int    pairsStuck = 0;        ///< pair tries ended early: nothing placed after the first steps
+    int    frontRetries = 0;      ///< tries refused for walling in a port, made again last with the ways out as obstacles
+    int    frontRetriesWon = 0;   ///< ... routed so
+
+    /// @brief While a connection is tried: its first try refused for walling in a port, to make again last
+    std::optional<ROUTE_REQUEST>* wallRefused = nullptr;
+    nlohmann::json*               wallRefusedAt = nullptr;
     int    padExitsTried = 0;     ///< starts stuck in their pad that tried a corner out of a free side
     int    padExitsWon = 0;       ///< ... routed that way
     int    plans = 0;             ///< global plans made (PlanRoute)
@@ -1361,8 +1375,8 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         router->LoadSettings( &settings );
         router->SyncWorld();
 
-        // a way out of another net's pad kept open is that net's copper to the router: it walks around
-        if( aReq.fronts && !aReq.diffPair )
+        // a way out of another net's pad kept open is that net's copper to the router when asked: it walks around
+        if( aReq.fronts && aReq.frontsInWorld && !aReq.diffPair )
         {
             for( const ESCAPE_FRONT& front : *aReq.fronts )
             {
@@ -1380,8 +1394,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
                 solid->SetLayer( iface->GetPNSLayerFromBoardLayer( front.layer ) );
                 solid->SetNet( front.pad->GetNet() );
                 solid->SetParent( item.get() );
-                solid->SetShape( front.shape.Clone() );
+                // SetPos moves the shape by the change of position: before the shape, not after it
                 solid->SetPos( front.shape.GetSeg().Center() );
+                solid->SetShape( front.shape.Clone() );
                 solid->SetRoutable( false );
                 router->GetWorld()->Add( std::move( solid ) );
                 frontItems.push_back( std::move( item ) );
@@ -1802,13 +1817,28 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
                                      { "by", key },
                                      { "way_out_mm", { { toMm( front.shape.GetSeg().A.x ), toMm( front.shape.GetSeg().A.y ) },
                                                        { toMm( front.shape.GetSeg().B.x ), toMm( front.shape.GetSeg().B.y ) } } },
-                                     { "at_mm", { toMm( at.x ), toMm( at.y ) } } };
+                                     { "at_mm", { toMm( at.x ), toMm( at.y ) } },
+                                     { "route_mm", toMm( length ) } };
+
+                if( front.port )
+                    aOut["walls_in"]["port"] = true;
+
                 iface->Staged().Revert();
                 return false;
             }
         }
     }
     const double         direct = ( target - start ).EuclideanNorm();
+
+    if( aReq.maxLength > 0 && length > aReq.maxLength )
+    {
+        iface->Staged().Revert();
+        aOut["routed"] = false;
+        aOut["reason"] = "too long round the ways out kept open";
+        aOut["length_mm"] = toMm( length );
+        aOut["max_length_mm"] = toMm( aReq.maxLength );
+        return false;
+    }
 
     aOut["segments"] = segments;
     aOut["metrics"] = { { "length_mm", toMm( length ) },
@@ -2262,6 +2292,17 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     const bool   ok = routeOneImpl( aContext, aReq, aOut, aAdded );
     ROUTE_PROFILE  scratch;
     ROUTE_PROFILE& profile = ROUTE_PROFILES::Of( aContext.GetBoard(), scratch );
+
+    if( !ok && profile.wallRefused && !*profile.wallRefused && aReq.fronts && !aReq.frontsInWorld && !aReq.diffPair
+        && aReq.from && aReq.from->Type() == PCB_PAD_T && aReq.to && aReq.to->Type() == PCB_PAD_T
+        && aOut.contains( "walls_in" ) && aOut["walls_in"].value( "port", false ) )
+    {
+        ROUTE_REQUEST again = aReq;
+        again.frontsInWorld = true;
+        again.maxLength = 1.5 * pcbIUScale.mmToIU( aOut["walls_in"].value( "route_mm", 0.0 ) );
+        profile.wallRefused->emplace( std::move( again ) );
+        *profile.wallRefusedAt = aOut["walls_in"];
+    }
 
     const double ms = msSince( started );
     profile.attempts++;
@@ -3160,6 +3201,7 @@ static KOPENAPI_RESULT routeOrBranch( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ROUTE_BRANCH* aBranch,
                                  bool aQuiet )
 {
+
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
     if( !context )
@@ -4425,6 +4467,26 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         if( !aForward )
             ways.erase( ways.begin() );
 
+        // a try refused for walling in another pin's port: made again as the last try, with the ways out as
+        // obstacles to the search (made at once, its detour round the part shuts the ports after it)
+        std::optional<ROUTE_REQUEST> portRefused, wallRefused;
+        nlohmann::json               portRefusedAs, portRefusedWall, wallRefusedAt;
+
+        struct WATCH
+        {
+            ROUTE_PROFILE&                prof;
+            std::optional<ROUTE_REQUEST>* outer = prof.wallRefused;
+            nlohmann::json*               outerAt = prof.wallRefusedAt;
+            ~WATCH()
+            {
+                prof.wallRefused = outer;
+                prof.wallRefusedAt = outerAt;
+            }
+        } watch{ profile };
+
+        profile.wallRefused = &wallRefused;
+        profile.wallRefusedAt = &wallRefusedAt;
+
         // a planned port at an end (ports): the route leaves that pin through its way out, to the tip past
         // the courtyard or through its planned via, and arrives through the far pin's port when the layers
         // allow; from the port's end when only the far end has one
@@ -4537,16 +4599,30 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 ok = routeOne( *context, req, aAttempt, added );
                 portMs += msSince( portStarted );
 
+                nlohmann::json as = { { "pad", endName( a ) }, { "side", ga->side }, { "layer", ga->via ? "other" : "pad" } };
+
+                if( ga->via )
+                    as["via_mm"] = { toMm( ga->via->x ), toMm( ga->via->y ) };
+
+                if( gb )
+                    as["far"] = endName( b );
+
+                if( ga->round )
+                    as["round_the_part"] = true;
+
                 if( ok )
                 {
                     portWon++;
-                    aAttempt["port"] = { { "pad", endName( a ) }, { "side", ga->side }, { "layer", ga->via ? "other" : "pad" } };
-
-                    if( ga->via )
-                        aAttempt["port"]["via_mm"] = { toMm( ga->via->x ), toMm( ga->via->y ) };
-
-                    if( gb )
-                        aAttempt["port"]["far"] = endName( b );
+                    aAttempt["port"] = std::move( as );
+                }
+                else if( !portRefused && !req.diffPair && aAttempt.contains( "walls_in" )
+                         && aAttempt["walls_in"].value( "port", false ) )
+                {
+                    portRefused = req;
+                    portRefused->frontsInWorld = true;
+                    portRefused->maxLength = 1.5 * pcbIUScale.mmToIU( aAttempt["walls_in"].value( "route_mm", 0.0 ) );
+                    portRefusedAs = std::move( as );
+                    portRefusedWall = aAttempt["walls_in"];
                 }
             }
         };
@@ -5037,6 +5113,35 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( ok )
                 break;
+        }
+
+        profile.wallRefused = nullptr;
+
+        if( !ok && ( portRefused || wallRefused ) && aTries < maxTries && !overTime() )
+        {
+            const bool     port = portRefused.has_value();
+            nlohmann::json again = nlohmann::json::object();
+            aTries++;
+            portTries += port;
+            profile.frontRetries++;
+            const auto started = std::chrono::steady_clock::now();
+            ok = routeOne( *context, port ? *portRefused : *wallRefused, again, added );
+
+            if( port )
+                portMs += msSince( started );
+
+            again["walls_in_first"] = port ? portRefusedWall : wallRefusedAt;
+
+            if( ok )
+            {
+                portWon += port;
+                profile.frontRetriesWon++;
+
+                if( port )
+                    again["port"] = std::move( portRefusedAs );
+
+                aAttempt = std::move( again );
+            }
         }
 
         if( !ok && overTime() )
@@ -5686,6 +5791,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         goal.side = side;
                         goal.to = port.value( "to", std::string() );
                         goal.other = port.value( "layer", std::string() ) == "other";
+                        goal.round = port.value( "turn", std::string() ) == "round_the_part";
 
                         for( PCB_LAYER_ID l : layers )
                         {
@@ -5709,7 +5815,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         const int64_t  edge = dir.x != 0 ? ( dir.x > 0 ? courtyard.GetRight() : -(int64_t) courtyard.GetLeft() )
                                                          : ( dir.y > 0 ? courtyard.GetBottom() : -(int64_t) courtyard.GetTop() );
                         const int64_t  at = (int64_t) end.x * dir.x + (int64_t) end.y * dir.y;
-                        const int      reach = (int) std::max<int64_t>( width, edge - at + clearance + width / 2 );
+                        // round the part: kept open only to the courtyard, the neighbours turn right past it
+                        const int      reach = (int) std::max<int64_t>( width, goal.round ? edge - at : edge - at + clearance + width / 2 );
 
                         goal.width = width;
                         goal.start = end + dir * ( width / 2 );
@@ -5998,6 +6105,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     front.pad = aPad;
                     front.layer = aLayer;
                     front.shape = aShape;
+                    front.port = true;
 
                     if( aJob )
                         front.jobs.push_back( *aJob );
@@ -9130,6 +9238,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                              { "rip_ups_failed_at", profile.ripUpsFailedAt },
                                              { "rip_ups_second", profile.ripUpsSecond },
                                              { "pairs_stuck", profile.pairsStuck },
+                                             { "front_retries", { { "tried", profile.frontRetries }, { "won", profile.frontRetriesWon } } },
                                              { "pad_exits", { { "tried", profile.padExitsTried }, { "won", profile.padExitsWon } } },
                                              { "plans", profile.plans },
                                              { "plans_found", profile.plansFound },
@@ -13800,7 +13909,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "and moved others in turn; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at); "
                    "a row whose end is shut in has boxed_in (end, which, by: other nets' copper nearer than a track of its width needs, and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
-                   "pairs_stuck: pair tries ended when nothing was placed after 3 steps; pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way; plans_stopped: ended by job_cancel, a budget or stop_on_plateau_s); sync_ms: building the router's world for each; move_ms: the path search; "
+                   "pairs_stuck: pair tries ended when nothing was placed after 3 steps; front_retries: tries refused for walling in another pin's port (a port try's first, else the first), made again as the connection's last try with the ways out as obstacles to the search (tried / won; the row's try says walls_in_first); pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way; plans_stopped: ended by job_cancel, a budget or stop_on_plateau_s); sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
                    "rip_up, gaps); "
@@ -13823,7 +13932,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "wall_cap_x":{"type":"number","default":10,"minimum":1,"description":"budgets work: a budget also ends after this many times its seconds on the wall clock (wall_caps counts them; a capped run is no longer load-independent)"},
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
                         "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
-                        "ports":{"oneOf":[{"type":"boolean"},{"type":"array","items":{"type":"string"}}],"description":"layout level 1 goals: the signal pins of these packages (true: every package with 8 SMD pads or more) follow their port from pcb_fanout_ports: the way out on the pin's side is kept open to past the courtyard on the pad's layer (layer other: to the via spot the plan's fan-out would lay, the spot kept free on every layer), and the pin's routes leave through it first (the tip as a corner, or the via), arriving through the far pin's port when the layers allow; a connection that does not route that way is routed as any other. Rows routed so name port; ports answers per package the pins and vias planned, tries and won"},
+                        "ports":{"oneOf":[{"type":"boolean"},{"type":"array","items":{"type":"string"}}],"description":"layout level 1 goals: the signal pins of these packages (true: every package with 8 SMD pads or more) follow their port from pcb_fanout_ports: the way out on the pin's side is kept open to past the courtyard on the pad's layer (a pin planned round_the_part: to the courtyard's edge, it turns right past it; layer other: to the via spot the plan's fan-out would lay, the spot kept free on every layer), and the pin's routes leave through it first (the tip as a corner, or the via), arriving through the far pin's port when the layers allow; a connection that does not route that way is routed as any other. Rows routed so name port (round_the_part when planned so); ports answers per package the pins and vias planned, tries, won and ms"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again, up to 3 choices of them per connection and round; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
