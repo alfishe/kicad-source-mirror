@@ -1045,6 +1045,7 @@ struct PORT_GOAL
     int                         width = 0;
     bool                        other = false;  ///< the plan moves it to the other layer
     std::optional<VECTOR2I>     via;            ///< ... by a via here
+    bool                        viaPlanned = false;   ///< ... at the plan's spot (a pin yielding to lanes): it leaves by it
     std::string                 side, to;
     bool                        round = false;  ///< planned round the part: it turns as soon as it is out
     std::vector<VECTOR2I>       lane;           ///< lanes: its planned lane from the pad's end, out past its turn
@@ -5305,9 +5306,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 std::swap( ga, gb );
             }
 
-            // lanes at both ends: from the end whose lanes set the order
-            if( lanesOn && gb && !ga->lane.empty() && !gb->lane.empty() && b->Type() == PCB_PAD_T
-                && setsOrder( static_cast<PAD*>( b )->GetParentFootprint(), a->GetParentFootprint() ) )
+            // from the end whose pin yields to lanes (it must leave by the via the plan gives), else with lanes
+            // at both ends from the end whose lanes set the order
+            if( gb && b->Type() == PCB_PAD_T
+                && ( ( gb->viaPlanned && gb->otherLayer && !ga->via )
+                     || ( lanesOn && !ga->via && !gb->via && !ga->lane.empty() && !gb->lane.empty()
+                          && setsOrder( static_cast<PAD*>( b )->GetParentFootprint(), a->GetParentFootprint() ) ) ) )
             {
                 PAD* other = static_cast<PAD*>( b );
                 b = a;
@@ -6677,6 +6681,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     if( goal.other && !( viasAllowed && goal.otherLayer ) )
                         goal.other = false;
 
+                    // the plan's own spot for the via (lanes: the spot they keep clear of)
+                    if( const nlohmann::json& at = port.contains( "via_mm" ) ? port["via_mm"] : nlohmann::json();
+                        goal.other && at.is_array() && at.size() == 2 && at[0].is_number() && at[1].is_number() )
+                    {
+                        goal.via = VECTOR2I( pcbIUScale.mmToIU( at[0].get<double>() ), pcbIUScale.mmToIU( at[1].get<double>() ) );
+                        goal.viaPlanned = true;
+                    }
+
                     NETCLASS*      netclass = pad->GetEffectiveNetClass();
                     const int      clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
                     const BOX2I    box = pad->GetBoundingBox();
@@ -6781,7 +6793,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                         for( auto& [pad, goal] : portGoals )
                         {
-                            if( pad->GetParentFootprint() == fp && goal.other && str( pad->GetNumber() ) == number )
+                            if( pad->GetParentFootprint() == fp && goal.other && !goal.via && str( pad->GetNumber() ) == number )
                             {
                                 goal.via = VECTOR2I( pcbIUScale.mmToIU( row["end_mm"][0].get<double>() ),
                                                      pcbIUScale.mmToIU( row["end_mm"][1].get<double>() ) );
@@ -18221,7 +18233,7 @@ KOPENAPI_REGISTER( "pcb_fanout",
                         "width_mm":{"type":"number"},
                         "stagger":{"type":"integer","minimum":1,"maximum":4,"description":"ring packages: via lines the neighbours alternate over (default 2 when a via plus clearance is wider than the pitch, else 1)"},
                         "vias":{"type":"boolean","default":true,"description":"ring packages: false gives the stubs only, ending just outside the courtyard"},
-                        "ports":{"type":"boolean","default":false,"description":"ring packages: follow the layout plan (pcb_fanout_ports): a via only for rails and for pins whose far end's order moves them to the other layer; the rest stubs out past the courtyard on the pad's layer; each pin answers its port (kind, layer, to)"},
+                        "ports":{"type":"boolean","default":false,"description":"ring packages: follow the layout plan (pcb_fanout_ports): a via only for rails, for pins whose far end's order moves them to the other layer and for pins that yield to lanes (at the plan's via_mm, the route leaving from that end); the rest stubs out past the courtyard on the pad's layer; each pin answers its port (kind, layer, to)"},
                         "stubs":{"type":"boolean","default":true,"description":"with ports: false lays only the planned vias (rails, pins to the other layer); the other pins are left to pcb_route"},
                         "direction":{"type":"string","enum":["inward","up","down","left","right"],"description":"stubs straight this way (edge mode); inward: away from the board edge the pads sit on (found by itself for card-edge fingers)"},
                         "stub_mm":{"type":"number","description":"edge mode: stub length from the pad centre"},

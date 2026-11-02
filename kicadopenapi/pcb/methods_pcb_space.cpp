@@ -2574,70 +2574,6 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             return !aWho.empty();
         };
 
-        // a turning lane runs in front of the pins its run passes on its layer: one whose way out is straight
-        // out there (not a lane nested inside it the same way round, not a rail pin, not one moved to the
-        // other layer) would be walled in, so that lane is dropped and its pin keeps its port only
-        nlohmann::json dropped = nlohmann::json::array();
-
-        {
-            auto within = [&]( int64_t aAt, int64_t aLo, int64_t aHi )
-            {
-                for( int64_t k : { -loop, (int64_t) 0, loop } )
-                {
-                    if( aLo < aAt + k && aAt + k < aHi )
-                        return true;
-                }
-
-                return false;
-            };
-
-            std::map<const PORT*, const LANE*> laneOf;
-
-            for( const LANE& l : lanes )
-                laneOf[l.port] = &l;
-
-            std::set<size_t> drop;
-
-            for( size_t k = 0; k < lanes.size(); ++k )
-            {
-                const LANE&              l = lanes[k];
-                std::vector<std::string> walled;
-
-                if( l.turn == 0 )
-                    continue;
-
-                for( const PORT& q : ports )
-                {
-                    const int qSide = sideIndex( q.padSide );
-
-                    if( &q == l.port || q.kind == "rail" || q.via || qSide < 0 || q.pad->GetAttribute() != PAD_ATTRIB::SMD
-                        || !q.pad->IsOnLayer( l.layer ) || !within( perimeter( qSide, q.pad->GetPosition() ), l.lo, l.hi ) )
-                    {
-                        continue;
-                    }
-
-                    auto it = laneOf.find( &q );
-
-                    if( it != laneOf.end() && it->second->turn > 0 && it->second->cw == l.cw
-                        && within( it->second->lo, l.lo - 1, l.hi + 1 ) && within( it->second->hi, l.lo - 1, l.hi + 1 ) )
-                    {
-                        continue;
-                    }
-
-                    walled.push_back( str( a.fp->GetReference() ) + "." + str( q.pad->GetNumber() ) );
-                }
-
-                if( !walled.empty() )
-                {
-                    drop.insert( k );
-                    dropped.push_back( { { "net", l.port->net }, { "pad", str( l.port->pad->GetNumber() ) }, { "walls_in", walled } } );
-                }
-            }
-
-            for( auto it = drop.rbegin(); it != drop.rend(); ++it )
-                lanes.erase( lanes.begin() + *it );
-        }
-
         // the shortest runs first: each a pitch outside every lane its run overlaps
         std::vector<size_t> order;
 
@@ -2658,13 +2594,15 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         // lanes keep clear of them, past their pads
         struct SPOT
         {
-            VECTOR2I at;
-            int      dia = 0;
-            int      net = 0;
+            VECTOR2I   at;
+            int        dia = 0;
+            int        net = 0;
+            const PAD* pad = nullptr;
         };
 
-        std::vector<SPOT> spots;
-        nlohmann::json    spotsOut = nlohmann::json::array();
+        std::vector<SPOT>    spots;
+        std::set<const PAD*> spotPads;
+        nlohmann::json       spotsOut = nlohmann::json::array();
 
         if( std::optional<KOPENAPI_METHOD> fanout = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout" ) )
         {
@@ -2720,7 +2658,9 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                     spot.at = VECTOR2I( pcbIUScale.mmToIU( row["end_mm"][0].get<double>() ), pcbIUScale.mmToIU( row["end_mm"][1].get<double>() ) );
                     spot.dia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
                     spot.net = pad->GetNetCode();
+                    spot.pad = pad;
                     spots.push_back( spot );
+                    spotPads.insert( pad );
                     spotsOut.push_back( { { "pad", name }, { "at_mm", row["end_mm"] } } );
                 }
             }
@@ -2798,133 +2738,396 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             }
         }
 
-        // the lanes leaving by one corner to one side end on one front, two pitches past the outermost: they
-        // leave it side by side, none cutting across the ends of those inside it
-        std::map<std::pair<int, int>, int> front;
-
-        for( size_t k : order )
-        {
-            const std::pair<int, int> key( lanes[k].turn == 2 ? lanes[k].next : lanes[k].own, lanes[k].to );
-            front[key] = std::max( front[key], lanes[k].off );
-        }
-
-        for( size_t k : order )
-        {
-            LANE&     l = lanes[k];
-            const int farLine = lineAt( l.to, front[{ l.turn == 2 ? l.next : l.own, l.to }] + 2 * pitch );
-
-            if( l.to % 2 == 0 )
-                l.pts.back().x = farLine;
-            else
-                l.pts.back().y = farLine;
-        }
-
-        // a straight one: out past the lanes running by its pin
-        for( LANE& l : lanes )
-        {
-            if( l.turn != 0 )
-                continue;
-
-            int off = base;
-
-            for( size_t k : order )
-            {
-                if( overlaps( l, lanes[k] ) )
-                    off = std::max( off, lanes[k].off + pitch );
-            }
-
-            build( l, off );
-            l.pts.push_back( l.pts.back() + outward[l.own] * pitch );
-            meets( l, l.blockedBy );
-            l.blocked = !l.blockedBy.empty();
-        }
-
         auto mmAt = []( const VECTOR2I& aAt )
         {
             return nlohmann::json::array( { std::round( aAt.x / pcbIUScale.IU_PER_MM * 1000.0 ) / 1000.0,
                                             std::round( aAt.y / pcbIUScale.IU_PER_MM * 1000.0 ) / 1000.0 } );
         };
 
+        std::set<size_t>      yielded;   // lanes that yield: onto the other layer by the pin's fan-out via
+        std::set<const PORT*> dives;     // pins whose straight way out yields: down by their fan-out via
+
+        // the lanes leaving by one corner to one side end on one front, two pitches past the outermost: they
+        // leave it side by side, none cutting across the ends of those inside it; a straight one runs out past
+        // the lanes running by its pin
+        auto finish = [&]()
+        {
+            std::map<std::pair<int, int>, int> front;
+
+            for( size_t k : order )
+            {
+                if( yielded.count( k ) )
+                    continue;
+
+                build( lanes[k], lanes[k].off );
+                const std::pair<int, int> key( lanes[k].turn == 2 ? lanes[k].next : lanes[k].own, lanes[k].to );
+                front[key] = std::max( front[key], lanes[k].off );
+            }
+
+            for( size_t k : order )
+            {
+                if( yielded.count( k ) )
+                    continue;
+
+                LANE&     l = lanes[k];
+                const int farLine = lineAt( l.to, front[{ l.turn == 2 ? l.next : l.own, l.to }] + 2 * pitch );
+
+                if( l.to % 2 == 0 )
+                    l.pts.back().x = farLine;
+                else
+                    l.pts.back().y = farLine;
+            }
+
+            for( size_t x = 0; x < lanes.size(); ++x )
+            {
+                LANE& l = lanes[x];
+
+                if( l.turn != 0 || yielded.count( x ) )
+                    continue;
+
+                int off = base;
+
+                for( size_t k : order )
+                {
+                    if( !yielded.count( k ) && overlaps( l, lanes[k] ) )
+                        off = std::max( off, lanes[k].off + pitch );
+                }
+
+                build( l, off );
+                l.pts.push_back( l.pts.back() + outward[l.own] * pitch );
+                l.blockedBy.clear();
+                meets( l, l.blockedBy );
+                l.blocked = !l.blockedBy.empty();
+            }
+        };
+
+        auto within = [&]( int64_t aAt, int64_t aLo, int64_t aHi )
+        {
+            for( int64_t k : { -loop, (int64_t) 0, loop } )
+            {
+                if( aLo < aAt + k && aAt + k < aHi )
+                    return true;
+            }
+
+            return false;
+        };
+
+        std::map<const PORT*, size_t> laneOf;
+
+        for( size_t k = 0; k < lanes.size(); ++k )
+            laneOf[lanes[k].port] = k;
+
+        // the pins a turning lane runs in front of on its layer whose way out is straight out there (not a
+        // lane nested inside it the same way round, not a rail pin, not one on the other layer)
+        auto walls = [&]( size_t aLane )
+        {
+            const LANE&              l = lanes[aLane];
+            std::vector<const PORT*> walled;
+
+            for( const PORT& q : ports )
+            {
+                const int qSide = sideIndex( q.padSide );
+
+                if( &q == l.port || q.kind == "rail" || q.via || dives.count( &q ) || qSide < 0
+                    || q.pad->GetAttribute() != PAD_ATTRIB::SMD || !q.pad->IsOnLayer( l.layer )
+                    || !within( perimeter( qSide, q.pad->GetPosition() ), l.lo, l.hi ) )
+                {
+                    continue;
+                }
+
+                auto it = laneOf.find( &q );
+
+                if( it != laneOf.end() && yielded.count( it->second ) )
+                    continue;
+
+                if( it != laneOf.end() && lanes[it->second].turn > 0 && lanes[it->second].cw == l.cw
+                    && within( lanes[it->second].lo, l.lo - 1, l.hi + 1 ) && within( lanes[it->second].hi, l.lo - 1, l.hi + 1 ) )
+                {
+                    continue;
+                }
+
+                walled.push_back( &q );
+            }
+
+            return walled;
+        };
+
+        auto crossAt = [&]( size_t x, size_t y ) -> std::optional<VECTOR2I>
+        {
+            if( lanes[x].layer != lanes[y].layer )
+                return std::nullopt;
+
+            for( size_t i = 0; i + 1 < lanes[x].pts.size(); ++i )
+            {
+                for( size_t k = 0; k + 1 < lanes[y].pts.size(); ++k )
+                {
+                    if( OPT_VECTOR2I hit = SEG( lanes[x].pts[i], lanes[x].pts[i + 1] ).Intersect( SEG( lanes[y].pts[k], lanes[y].pts[k + 1] ) ) )
+                        return *hit;
+                }
+            }
+
+            return std::nullopt;
+        };
+
+        auto crossesAny = [&]( size_t x )
+        {
+            for( size_t y = 0; y < lanes.size(); ++y )
+            {
+                if( y != x && !yielded.count( y ) && crossAt( x, y ) )
+                    return true;
+            }
+
+            return false;
+        };
+
+        auto lengthOf = []( const LANE& l )
+        {
+            double length = 0;
+
+            for( size_t i = 1; i < l.pts.size(); ++i )
+                length += ( l.pts[i] - l.pts[i - 1] ).EuclideanNorm();
+
+            return length;
+        };
+
+        // room: the lane laid where it is planned, clear of other copper and on the board
+        auto hasRoom = [&]( const LANE& l )
+        {
+            if( l.blocked )
+                return false;
+
+            for( const VECTOR2I& pt : l.pts )
+            {
+                if( !edges.Contains( pt ) )
+                    return false;
+            }
+
+            return true;
+        };
+
+        // the vias a pin takes to leave on the other layer: down by its fan-out via, up again by another where
+        // its far pad is on the pad's layer only
+        auto viasOf = [&]( const PORT& p )
+        {
+            if( p.to < 0 )
+                return 1;
+
+            for( PAD* f : b.parts[p.to].fp->Pads() )
+            {
+                if( f->GetNetCode() == p.code && f->GetAttribute() == PAD_ATTRIB::SMD && f->IsOnLayer( p.pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu ) )
+                    return 2;
+            }
+
+            return 1;
+        };
+
+        auto padName = [&]( const PORT& p ) { return str( a.fp->GetReference() ) + "." + str( p.pad->GetNumber() ); };
+
+        nlohmann::json yields = nlohmann::json::array(), dropped = nlohmann::json::array();
+
+        // a straight way out yields to a ring: the pin dives by its fan-out via
+        auto dive = [&]( const PORT& q, const LANE& ring, const char* aWhy )
+        {
+            dives.insert( &q );
+
+            if( auto it = laneOf.find( &q ); it != laneOf.end() )
+                yielded.insert( it->second );
+
+            yields.push_back( { { "pad", str( q.pad->GetNumber() ) }, { "net", q.net }, { "to", padName( *ring.port ) },
+                                { "conflict", aWhy }, { "by", "via" }, { "vias", viasOf( q ) }, { "length_mm", 0.0 } } );
+        };
+
+        // a lane yields onto the other layer
+        auto lift = [&]( size_t x, const std::string& aTo, const char* aWhy )
+        {
+            yielded.insert( x );
+            dives.insert( lanes[x].port );
+            yields.push_back( { { "pad", str( lanes[x].port->pad->GetNumber() ) }, { "net", lanes[x].port->net }, { "to", aTo },
+                                { "conflict", aWhy }, { "by", "via" }, { "vias", viasOf( *lanes[x].port ) }, { "length_mm", 0.0 } } );
+            dropped.push_back( { { "net", lanes[x].port->net }, { "pad", str( lanes[x].port->pad->GetNumber() ) },
+                                 { aWhy == std::string( "walls_in" ) ? "walls_in" : "crosses", { aTo } }, { "layer", "other" } } );
+        };
+
+        // a ring and a straight way out in each other's way: the ring keeps its way where it has room and the
+        // pin has a via spot, else the ring goes onto the other layer
+        auto ringOrStraight = [&]( size_t aRing, const PORT& q, const char* aWhy )
+        {
+            if( hasRoom( lanes[aRing] ) && spotPads.count( q.pad ) )
+                dive( q, lanes[aRing], aWhy );
+            else
+                lift( aRing, padName( q ), aWhy );
+        };
+
+        // two lanes in each other's way: the one that yields costs less, by its vias, then its added length;
+        // a ring yields deeper (out past the other, clear of every lane, the fan-out's vias and other copper)
+        // or onto the other layer
+        auto byCost = [&]( size_t x, size_t y, const char* aWhy )
+        {
+            struct OPTION
+            {
+                size_t lane;
+                int    off;   ///< deeper to; -1: onto the other layer
+                int    vias;
+                double length;
+            };
+
+            std::vector<OPTION> options;
+            const size_t        outer = lanes[x].off >= lanes[y].off ? x : y;
+
+            for( size_t z : { outer, outer == x ? y : x } )
+            {
+                const size_t other = z == x ? y : x;
+                LANE&        l = lanes[z];
+
+                if( l.turn == 0 )
+                    continue;
+
+                const int    saved = l.off;
+                const double before = lengthOf( l );
+
+                for( int off = lanes[other].off + pitch; off <= lanes[other].off + steps * pitch; off += pitch )
+                {
+                    l.off = off;
+                    finish();
+                    std::set<std::string> who;
+
+                    if( !crossesAny( z ) && clearsSpots( l ) && !meets( l, who ) && hasRoom( l ) )
+                    {
+                        options.push_back( { z, off, 0, lengthOf( l ) - before } );
+                        break;
+                    }
+                }
+
+                l.off = saved;
+                finish();
+            }
+
+            for( size_t z : { outer, outer == x ? y : x } )
+                options.push_back( { z, -1, viasOf( *lanes[z].port ), 0.0 } );
+
+            const OPTION* best = &options.front();
+
+            for( const OPTION& o : options )
+            {
+                if( o.vias < best->vias || ( o.vias == best->vias && o.length < best->length ) )
+                    best = &o;
+            }
+
+            const size_t other = best->lane == x ? y : x;
+
+            if( best->off < 0 )
+            {
+                lift( best->lane, padName( *lanes[other].port ), aWhy );
+                return;
+            }
+
+            LANE& l = lanes[best->lane];
+            l.off = best->off;
+            l.rank = std::max( l.rank, lanes[other].rank + 1 );
+            yields.push_back( { { "pad", str( l.port->pad->GetNumber() ) }, { "net", l.port->net }, { "to", padName( *lanes[other].port ) },
+                                { "conflict", aWhy }, { "by", "deeper" }, { "vias", 0 },
+                                { "length_mm", std::round( best->length / pcbIUScale.IU_PER_MM * 100 ) / 100 } } );
+        };
+
+        finish();
+
+        // each conflict yields one lane or pin, so the conflicts run out within one per lane and pin and
+        // one per deepening (a deepened lane crosses none)
+        for( size_t pass = 0; pass <= lanes.size() * ( lanes.size() + 1 ) + ports.size(); ++pass )
+        {
+            bool resolved = false;
+
+            for( size_t k : order )
+            {
+                if( yielded.count( k ) )
+                    continue;
+
+                if( const std::vector<const PORT*> walled = walls( k ); !walled.empty() )
+                {
+                    auto it = laneOf.find( walled.front() );
+
+                    if( it != laneOf.end() && lanes[it->second].turn > 0 )
+                        byCost( k, it->second, "walls_in" );
+                    else
+                        ringOrStraight( k, *walled.front(), "walls_in" );
+
+                    resolved = true;
+                    break;
+                }
+            }
+
+            for( size_t x = 0; !resolved && x < lanes.size(); ++x )
+            {
+                for( size_t y = x + 1; !resolved && y < lanes.size(); ++y )
+                {
+                    if( yielded.count( x ) || yielded.count( y ) || !crossAt( x, y ) )
+                        continue;
+
+                    if( ( lanes[x].turn == 0 ) != ( lanes[y].turn == 0 ) )
+                        ringOrStraight( lanes[x].turn == 0 ? y : x, *lanes[lanes[x].turn == 0 ? x : y].port, "crosses" );
+                    else
+                        byCost( x, y, "crosses" );
+
+                    resolved = true;
+                }
+            }
+
+            finish();
+
+            if( !resolved )
+                break;
+        }
+
         nlohmann::json         list = nlohmann::json::array(), crossings = nlohmann::json::array();
         std::vector<int>       crossCount( lanes.size(), 0 );
-        std::vector<std::tuple<size_t, size_t, VECTOR2I>> crossing;
         int                    shifted = 0, blocked = 0, offBoard = 0;
 
         for( size_t x = 0; x < lanes.size(); ++x )
         {
             for( size_t y = x + 1; y < lanes.size(); ++y )
             {
-                if( lanes[x].layer != lanes[y].layer )
+                if( yielded.count( x ) || yielded.count( y ) )
                     continue;
 
-                std::optional<VECTOR2I> at;
-
-                for( size_t i = 0; !at && i + 1 < lanes[x].pts.size(); ++i )
+                if( std::optional<VECTOR2I> at = crossAt( x, y ) )
                 {
-                    for( size_t k = 0; !at && k + 1 < lanes[y].pts.size(); ++k )
-                    {
-                        if( OPT_VECTOR2I hit = SEG( lanes[x].pts[i], lanes[x].pts[i + 1] ).Intersect( SEG( lanes[y].pts[k], lanes[y].pts[k + 1] ) ) )
-                            at = *hit;
-                    }
+                    crossCount[x]++;
+                    crossCount[y]++;
+                    crossings.push_back( { { "pads", { str( lanes[x].port->pad->GetNumber() ), str( lanes[y].port->pad->GetNumber() ) } },
+                                           { "at_mm", mmAt( *at ) } } );
                 }
-
-                if( at )
-                    crossing.push_back( { x, y, *at } );
             }
         }
 
-        // two lanes crossing on one layer cannot both be laid: the turning lane with the most crossings is
-        // dropped, again until none cross
-        std::set<size_t> crossDropped;
-
-        while( true )
+        for( PORT& p : ports )
         {
-            std::vector<int> count( lanes.size(), 0 );
-
-            for( const auto& [x, y, at] : crossing )
-            {
-                if( !crossDropped.count( x ) && !crossDropped.count( y ) )
-                {
-                    count[x] += lanes[x].turn > 0;
-                    count[y] += lanes[y].turn > 0;
-                }
-            }
-
-            const auto worst = std::max_element( count.begin(), count.end() );
-
-            if( worst == count.end() || *worst == 0 )
-                break;
-
-            crossDropped.insert( worst - count.begin() );
-        }
-
-        for( const auto& [x, y, at] : crossing )
-        {
-            if( crossDropped.count( x ) || crossDropped.count( y ) )
+            if( !dives.count( &p ) )
                 continue;
 
-            crossCount[x]++;
-            crossCount[y]++;
-            crossings.push_back( { { "pads", { str( lanes[x].port->pad->GetNumber() ), str( lanes[y].port->pad->GetNumber() ) } },
-                                   { "at_mm", mmAt( at ) } } );
-        }
+            p.via = true;
 
-        for( size_t x : crossDropped )
-        {
-            nlohmann::json crosses = nlohmann::json::array();
-
-            for( const auto& [p, q, at] : crossing )
+            for( auto& [side, rows] : bySide )
             {
-                if( p == x || q == x )
-                    crosses.push_back( str( a.fp->GetReference() ) + "." + str( lanes[p == x ? q : p].port->pad->GetNumber() ) );
-            }
+                for( nlohmann::json& row : rows )
+                {
+                    if( row.value( "pad", std::string() ) == str( p.pad->GetNumber() ) )
+                    {
+                        row["layer"] = "other";
+                        row["why"] = "yields to the lanes round the part: its fan-out via to the other layer";
 
-            dropped.push_back( { { "net", lanes[x].port->net }, { "pad", str( lanes[x].port->pad->GetNumber() ) }, { "crosses", crosses } } );
+                        for( const SPOT& spot : spots )
+                        {
+                            if( spot.pad == p.pad )
+                                row["via_mm"] = mmAt( spot.at );
+                        }
+                    }
+                }
+            }
         }
 
         for( size_t x = 0; x < lanes.size(); ++x )
         {
-            if( crossDropped.count( x ) )
+            if( yielded.count( x ) )
                 continue;
 
             const LANE&    l = lanes[x];
@@ -3003,9 +3206,9 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             }
         }
 
-        lanesOut = { { "pitch_mm", mm( pitch ) }, { "base_mm", mm( base ) }, { "count", lanes.size() - crossDropped.size() },
+        lanesOut = { { "pitch_mm", mm( pitch ) }, { "base_mm", mm( base ) }, { "count", lanes.size() - yielded.size() },
                      { "shifted", shifted }, { "blocked", blocked }, { "off_board", offBoard },
-                     { "crossings", crossings }, { "dropped", dropped }, { "via_spots", spotsOut }, { "lanes", list } };
+                     { "crossings", crossings }, { "dropped", dropped }, { "yields", yields }, { "via_spots", spotsOut }, { "lanes", list } };
     }
 
     // ports along each side in the order a track leaving it meets them (clockwise)
@@ -3590,9 +3793,13 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "lanes going by their pin. The pins of one side going round the part to one far part all go one way round: the way whose "
                    "modelled paths (out to their offsets, round both corners, straight on to their far pins) cross fewer of each other and of "
                    "the package's straight ways out on their layer, then the shorter in total (round_ways: per side and far part both ways' "
-                   "crossings and length_mm, the one taken). dropped: the "
-                   "lanes not planned, with walls_in (the pins whose straight way out the lane would run in front of) or crosses (the lanes "
-                   "it would cross; the one crossing most dropped first); their pins keep their ports. Also each port's lane (rank, offset_mm, polyline_mm) and each lane as a corridor (corridor.md: its corners the gates, its slot the rooms). pitch_mm, "
+                   "crossings and length_mm, the one taken). yields: where "
+                   "two ways are in each other's way (a turning lane running in front of a pin whose way out is straight, or two lanes "
+                   "crossing on one layer) one yields: a straight way out yields to a ring (the pin dives by its fan-out via, its port "
+                   "layer other, via_mm the spot the lanes keep clear of) unless the ring has no room (blocked, off the board) or the pin no via spot; of two lanes the one "
+                   "whose yield costs fewer vias, then less added length, deeper (out past the other, clear of all) or onto the other "
+                   "layer (pad, net, to, conflict walls_in or crosses, by deeper or via, vias, length_mm). dropped: the lanes gone onto "
+                   "the other layer (walls_in or crosses, layer other). Also each port's lane (rank, offset_mm, polyline_mm) and each lane as a corridor (corridor.md: its corners the gates, its slot the rooms). pitch_mm, "
                    "base_mm, counts and the crossings (pads, at_mm). Read only",
 
                    R"json({"type":"object","required":["ref"],"properties":{
