@@ -256,8 +256,9 @@ KOPENAPI_RULE_VIA KopenapiRuleVia( BOARD* aBoard, int aNetCode, const VECTOR2I& 
 bool KopenapiPadFinePitch( BOARD* aBoard, PAD* aPad );
 
 /// @brief How far past its outer end a pad's way out reaches as the rules size it: a via of its net with
-/// the clearance to its row neighbours of other nets on both sides (KopenapiRuleVia), plus the offset
-/// of a second, staggered via line where two vias do not fit side by side at the row's pitch
+/// the clearance to the pads of other nets that room comes within that clearance of (KopenapiRuleVia;
+/// the row neighbours, not a pin across the package), plus the offset of a second, staggered via line
+/// where two vias do not fit side by side at the row's pitch
 int KopenapiPadEscapeDepth( BOARD* aBoard, PAD* aPad );
 
 /// @brief A pad whose way out runs beside a wall: an other-net pad of its footprint across its way out

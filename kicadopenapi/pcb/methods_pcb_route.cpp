@@ -824,17 +824,33 @@ int KopenapiPadEscapeDepth( BOARD* aBoard, PAD* aPad )
 
     for( PAD* q : aPad->GetParentFootprint()->Pads() )
     {
-        if( q == aPad || !KopenapiPadNeighbours( q, aPad ) )
-            continue;
-
-        pitch = std::min( pitch, double( ( q->GetPosition() - aPad->GetPosition() ).EuclideanNorm() ) );
-
-        if( q->GetNetCode() != aPad->GetNetCode() )
-            rule.clearance = std::max( rule.clearance, KopenapiRuleVia( aBoard, aPad->GetNetCode(), aPad->GetPosition(), layer, q ).clearance );
+        if( q != aPad && KopenapiPadNeighbours( q, aPad ) )
+            pitch = std::min( pitch, double( ( q->GetPosition() - aPad->GetPosition() ).EuclideanNorm() ) );
     }
 
-    const double apart = rule.dia + rule.clearance;
-    return 2 * rule.clearance + rule.dia + ( pitch < apart ? KiROUND( std::sqrt( apart * apart - pitch * pitch ) ) : 0 );
+    auto depthAt = [&]( int aClearance )
+    {
+        const double apart = rule.dia + aClearance;
+        return 2 * aClearance + rule.dia + ( pitch < apart ? KiROUND( std::sqrt( apart * apart - pitch * pitch ) ) : 0 );
+    };
+
+    // the clearance to a pad of another net counts where the room, as deep as that clearance makes it, comes
+    // within it of that pad: the pins the via sits between, not a pin across the package
+    const std::shared_ptr<SHAPE> own = aPad->GetEffectiveShape( layer );
+    int                          clearance = rule.clearance;
+
+    for( PAD* q : aPad->GetParentFootprint()->Pads() )
+    {
+        if( q == aPad || q->GetNetCode() == aPad->GetNetCode() || !KopenapiPadNeighbours( q, aPad ) )
+            continue;
+
+        const int c = KopenapiRuleVia( aBoard, aPad->GetNetCode(), aPad->GetPosition(), layer, q ).clearance;
+
+        if( c > clearance && own->Collide( q->GetEffectiveShape( layer ).get(), depthAt( c ) + c ) )
+            clearance = c;
+    }
+
+    return depthAt( clearance );
 }
 
 
