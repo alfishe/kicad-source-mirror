@@ -379,6 +379,36 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
     // for their rule
     const int widest = std::max( { ds.GetBiggestClearanceValue(), floor, ds.m_HoleClearance, 1 } );
 
+    // the rule caches (intersectsCourtyard and the like) are keyed by item address and only cleared when
+    // the board drops an item: copper not on the board yet (a dry run's, a refused try's) is freed without
+    // that, and a later item at the same address took its answer; moved copper keeps its old place's
+    std::vector<BOARD_ITEM*> unflag;
+
+    for( const std::vector<BOARD_CONNECTED_ITEM*>* list : { &aChanged, aStaged } )
+    {
+        if( !list )
+            continue;
+
+        for( BOARD_CONNECTED_ITEM* item : *list )
+        {
+            if( item && !item->HasFlag( ROUTER_TRANSIENT ) )
+            {
+                item->SetFlags( ROUTER_TRANSIENT );
+                unflag.push_back( item );
+            }
+        }
+    }
+
+    struct UNFLAG
+    {
+        std::vector<BOARD_ITEM*>& items;
+        ~UNFLAG()
+        {
+            for( BOARD_ITEM* item : items )
+                item->ClearFlags( ROUTER_TRANSIENT );
+        }
+    } unflagAtEnd{ unflag };
+
     auto required = [&]( BOARD_ITEM* aA, BOARD_ITEM* aB, PCB_LAYER_ID aLayer ) -> int
     {
         if( drc )
