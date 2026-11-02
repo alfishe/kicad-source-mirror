@@ -2186,6 +2186,49 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         }
     }
 
+    // the way round the part per side and far part: from the far pins' offsets off the centre line (each
+    // pin's nearest far pin of its net), else the pins' own offsets
+    std::map<std::pair<int, int>, std::pair<int64_t, int64_t>> roundLean;   // (own side, far part) -> far, own sums
+    std::map<std::pair<int, int>, int>                         roundCount;
+
+    for( const PORT& p : ports )
+    {
+        const int own = sideIndex( p.side ), to = sideIndex( p.toSide );
+
+        if( p.to < 0 || own < 0 || to < 0 || turnOf( own, to ) != 2 )
+            continue;
+
+        VECTOR2I farPin = b.parts[p.to].centre;
+        double   nearest = std::numeric_limits<double>::max();
+
+        for( PAD* fp : b.parts[p.to].fp->Pads() )
+        {
+            if( fp->GetNetCode() == p.code && ( fp->GetPosition() - p.pad->GetPosition() ).EuclideanNorm() < nearest )
+            {
+                nearest = ( fp->GetPosition() - p.pad->GetPosition() ).EuclideanNorm();
+                farPin = fp->GetPosition();
+            }
+        }
+
+        const bool     across = own == 0 || own == 2;
+        const VECTOR2I off = farPin - centre;
+        const VECTOR2I at = p.pad->GetPosition() - centre;
+        auto&          sums = roundLean[{ own, p.to }];
+        sums.first += across ? off.y : off.x;
+        sums.second += across ? at.y : at.x;
+        roundCount[{ own, p.to }]++;
+    }
+
+    auto roundNext = [&]( int aOwn, int aTo ) -> int
+    {
+        const bool    across = aOwn == 0 || aOwn == 2;
+        const auto&   sums = roundLean[{ aOwn, aTo }];
+        const int64_t n = std::max( 1, roundCount[{ aOwn, aTo }] );
+        const int64_t tol = ( across ? extent.GetHeight() : extent.GetWidth() ) / 4;
+        const int64_t lean = std::abs( sums.first / n ) > tol ? sums.first : sums.second;
+        return across ? ( lean <= 0 ? 1 : 3 ) : ( lean <= 0 ? 0 : 2 );
+    };
+
     static const char* turnName[3] = { "straight", "corner", "round_the_part" };
     std::map<std::string, nlohmann::json> bySide;
     std::map<std::string, int>            counts;
@@ -2216,28 +2259,12 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                 j["turn"] = turnName[turnOf( own, to )];
                 counts[turnName[turnOf( own, to )]] += p.kind == "signal";
 
-                // round the part: by the side the far pin lies off the line through the centre, else by the
-                // pin's half of its side
+                // round the part: one way for all the pins of a side going to one far part (a bus keeps its
+                // order only so), by the side their far pins lie off the line through the centre, else by
+                // their pins' half of the side
                 if( turnOf( own, to ) == 2 )
                 {
-                    VECTOR2I farPin = b.parts[p.to].centre;
-                    double   nearest = std::numeric_limits<double>::max();
-
-                    for( PAD* fp : b.parts[p.to].fp->Pads() )
-                    {
-                        if( fp->GetNetCode() == p.code && ( fp->GetPosition() - p.pad->GetPosition() ).EuclideanNorm() < nearest )
-                        {
-                            nearest = ( fp->GetPosition() - p.pad->GetPosition() ).EuclideanNorm();
-                            farPin = fp->GetPosition();
-                        }
-                    }
-
-                    const bool     across = own == 0 || own == 2;
-                    const VECTOR2I off = farPin - centre;
-                    const VECTOR2I at = p.pad->GetPosition() - centre;
-                    const int      tol = ( across ? extent.GetHeight() : extent.GetWidth() ) / 4;
-                    const int      lean = across ? ( std::abs( off.y ) > tol ? off.y : at.y ) : ( std::abs( off.x ) > tol ? off.x : at.x );
-                    const int      next = across ? ( lean <= 0 ? 1 : 3 ) : ( lean <= 0 ? 0 : 2 );
+                    const int next = roundNext( own, p.to );
                     p.next = next;
                     j["round"] = next == ( own + 1 ) % 4 ? "cw" : "ccw";
                     j["sides"] = { sides[own], sides[next], sides[to] };
@@ -2443,6 +2470,70 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             return !aWho.empty();
         };
 
+        // a turning lane runs in front of the pins its run passes on its layer: one whose way out is straight
+        // out there (not a lane nested inside it the same way round, not a rail pin, not one moved to the
+        // other layer) would be walled in, so that lane is dropped and its pin keeps its port only
+        nlohmann::json dropped = nlohmann::json::array();
+
+        {
+            auto within = [&]( int64_t aAt, int64_t aLo, int64_t aHi )
+            {
+                for( int64_t k : { -loop, (int64_t) 0, loop } )
+                {
+                    if( aLo < aAt + k && aAt + k < aHi )
+                        return true;
+                }
+
+                return false;
+            };
+
+            std::map<const PORT*, const LANE*> laneOf;
+
+            for( const LANE& l : lanes )
+                laneOf[l.port] = &l;
+
+            std::set<size_t> drop;
+
+            for( size_t k = 0; k < lanes.size(); ++k )
+            {
+                const LANE&              l = lanes[k];
+                std::vector<std::string> walled;
+
+                if( l.turn == 0 )
+                    continue;
+
+                for( const PORT& q : ports )
+                {
+                    const int qSide = sideIndex( q.padSide );
+
+                    if( &q == l.port || q.kind == "rail" || q.via || qSide < 0 || q.pad->GetAttribute() != PAD_ATTRIB::SMD
+                        || !q.pad->IsOnLayer( l.layer ) || !within( perimeter( qSide, q.pad->GetPosition() ), l.lo, l.hi ) )
+                    {
+                        continue;
+                    }
+
+                    auto it = laneOf.find( &q );
+
+                    if( it != laneOf.end() && it->second->turn > 0 && it->second->cw == l.cw
+                        && within( it->second->lo, l.lo - 1, l.hi + 1 ) && within( it->second->hi, l.lo - 1, l.hi + 1 ) )
+                    {
+                        continue;
+                    }
+
+                    walled.push_back( str( a.fp->GetReference() ) + "." + str( q.pad->GetNumber() ) );
+                }
+
+                if( !walled.empty() )
+                {
+                    drop.insert( k );
+                    dropped.push_back( { { "net", l.port->net }, { "pad", str( l.port->pad->GetNumber() ) }, { "walls_in", walled } } );
+                }
+            }
+
+            for( auto it = drop.rbegin(); it != drop.rend(); ++it )
+                lanes.erase( lanes.begin() + *it );
+        }
+
         // the shortest runs first: each a pitch outside every lane its run overlaps
         std::vector<size_t> order;
 
@@ -2458,8 +2549,6 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                               return rx != ry ? rx < ry : lanes[x].lo < lanes[y].lo;
                           } );
 
-        // a rail pin's via by its pad (a fine pitch's stagger as the router's ways out): a lane running past it
-        // keeps outside the via
         // a pin a lane runs in front of (a rail pin, a pin going to another layer, a straight one, a pair's):
         // walled in on its layer, it leaves by a via by its pad; the lane keeps outside that via
         std::vector<std::tuple<int64_t, int, PCB_LAYER_ID>> viaReach;
@@ -2473,30 +2562,66 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
         for( const PORT& p : ports )
         {
-            const int side = sideIndex( p.padSide );
-
-            if( turning.count( &p ) || side < 0 || p.pad->GetAttribute() != PAD_ATTRIB::SMD )
+            if( turning.count( &p ) || p.pad->GetAttribute() != PAD_ATTRIB::SMD )
                 continue;
 
-            NETCLASS*      netclass = p.pad->GetEffectiveNetClass();
-            const int      clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
-            const int      via = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
-            const BOX2I    box = p.pad->GetBoundingBox();
-            const VECTOR2I end = box.Centre() + outward[side] * ( side % 2 == 0 ? box.GetWidth() / 2 : box.GetHeight() / 2 );
-            const int      past = (int) ( (int64_t) ( end - onSide( side, 0, end ) ).x * outward[side].x
-                                          + (int64_t) ( end - onSide( side, 0, end ) ).y * outward[side].y );
-            double         padPitch = std::numeric_limits<double>::max();
+            // by its pad's side, by the side it leaves by when that is another, and for a pin leaving by a via
+            // at the end of its row by the side round that corner (the via may go there)
+            std::set<int> by;
+            const int     own = sideIndex( p.padSide );
 
-            for( PAD* q : a.fp->Pads() )
+            for( int s : { own, sideIndex( p.side ) } )
             {
-                if( q != p.pad && padSideOf( extent, q->GetPosition() ) == p.padSide )
-                    padPitch = std::min( padPitch, (double) ( q->GetPosition() - p.pad->GetPosition() ).EuclideanNorm() );
+                if( s >= 0 )
+                    by.insert( s );
             }
 
-            const double apart = via + clearance;
-            const int    depth = 2 * clearance + via + ( padPitch < apart ? KiROUND( std::sqrt( apart * apart - padPitch * padPitch ) ) : 0 );
-            viaReach.emplace_back( perimeter( side, p.pad->GetPosition() ), past + depth + clearance,
-                                    p.pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu );
+            if( own >= 0 && ( p.kind == "rail" || p.via ) )
+            {
+                const bool alongY = own % 2 == 0;
+                const int  here = alongY ? p.pad->GetPosition().y : p.pad->GetPosition().x;
+                bool       first = true, last = true;
+
+                for( PAD* q : a.fp->Pads() )
+                {
+                    if( q == p.pad || padSideOf( extent, q->GetPosition() ) != p.padSide )
+                        continue;
+
+                    const int there = alongY ? q->GetPosition().y : q->GetPosition().x;
+                    first = first && there > here;
+                    last = last && there < here;
+                }
+
+                if( first )
+                    by.insert( alongY ? 1 : 0 );
+
+                if( last )
+                    by.insert( alongY ? 3 : 2 );
+            }
+
+            for( int side : by )
+            {
+
+                NETCLASS*      netclass = p.pad->GetEffectiveNetClass();
+                const int      clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
+                const int      via = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
+                const BOX2I    box = p.pad->GetBoundingBox();
+                const VECTOR2I end = box.Centre() + outward[side] * ( side % 2 == 0 ? box.GetWidth() / 2 : box.GetHeight() / 2 );
+                const int      past = (int) ( (int64_t) ( end - onSide( side, 0, end ) ).x * outward[side].x
+                                              + (int64_t) ( end - onSide( side, 0, end ) ).y * outward[side].y );
+                double         padPitch = std::numeric_limits<double>::max();
+
+                for( PAD* q : a.fp->Pads() )
+                {
+                    if( q != p.pad && padSideOf( extent, q->GetPosition() ) == p.padSide )
+                        padPitch = std::min( padPitch, (double) ( q->GetPosition() - p.pad->GetPosition() ).EuclideanNorm() );
+                }
+
+                const double apart = via + clearance;
+                const int    depth = 2 * clearance + via + ( padPitch < apart ? KiROUND( std::sqrt( apart * apart - padPitch * padPitch ) ) : 0 );
+                viaReach.emplace_back( perimeter( side, p.pad->GetPosition() ), past + depth + clearance,
+                                        p.pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu );
+            }
         }
 
         const int steps = 16;
@@ -2598,6 +2723,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
         nlohmann::json         list = nlohmann::json::array(), crossings = nlohmann::json::array();
         std::vector<int>       crossCount( lanes.size(), 0 );
+        std::vector<std::tuple<size_t, size_t, VECTOR2I>> crossing;
         int                    shifted = 0, blocked = 0, offBoard = 0;
 
         for( size_t x = 0; x < lanes.size(); ++x )
@@ -2619,17 +2745,64 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                 }
 
                 if( at )
+                    crossing.push_back( { x, y, *at } );
+            }
+        }
+
+        // two lanes crossing on one layer cannot both be laid: the turning lane with the most crossings is
+        // dropped, again until none cross
+        std::set<size_t> crossDropped;
+
+        while( true )
+        {
+            std::vector<int> count( lanes.size(), 0 );
+
+            for( const auto& [x, y, at] : crossing )
+            {
+                if( !crossDropped.count( x ) && !crossDropped.count( y ) )
                 {
-                    crossCount[x]++;
-                    crossCount[y]++;
-                    crossings.push_back( { { "pads", { str( lanes[x].port->pad->GetNumber() ), str( lanes[y].port->pad->GetNumber() ) } },
-                                           { "at_mm", mmAt( *at ) } } );
+                    count[x] += lanes[x].turn > 0;
+                    count[y] += lanes[y].turn > 0;
                 }
             }
+
+            const auto worst = std::max_element( count.begin(), count.end() );
+
+            if( worst == count.end() || *worst == 0 )
+                break;
+
+            crossDropped.insert( worst - count.begin() );
+        }
+
+        for( const auto& [x, y, at] : crossing )
+        {
+            if( crossDropped.count( x ) || crossDropped.count( y ) )
+                continue;
+
+            crossCount[x]++;
+            crossCount[y]++;
+            crossings.push_back( { { "pads", { str( lanes[x].port->pad->GetNumber() ), str( lanes[y].port->pad->GetNumber() ) } },
+                                   { "at_mm", mmAt( at ) } } );
+        }
+
+        for( size_t x : crossDropped )
+        {
+            nlohmann::json crosses = nlohmann::json::array();
+
+            for( const auto& [p, q, at] : crossing )
+            {
+                if( p == x || q == x )
+                    crosses.push_back( str( a.fp->GetReference() ) + "." + str( lanes[p == x ? q : p].port->pad->GetNumber() ) );
+            }
+
+            dropped.push_back( { { "net", lanes[x].port->net }, { "pad", str( lanes[x].port->pad->GetNumber() ) }, { "crosses", crosses } } );
         }
 
         for( size_t x = 0; x < lanes.size(); ++x )
         {
+            if( crossDropped.count( x ) )
+                continue;
+
             const LANE&    l = lanes[x];
             nlohmann::json poly = nlohmann::json::array();
             bool           out = false;
@@ -2706,9 +2879,9 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             }
         }
 
-        lanesOut = { { "pitch_mm", mm( pitch ) }, { "base_mm", mm( base ) }, { "count", lanes.size() },
+        lanesOut = { { "pitch_mm", mm( pitch ) }, { "base_mm", mm( base ) }, { "count", lanes.size() - crossDropped.size() },
                      { "shifted", shifted }, { "blocked", blocked }, { "off_board", offBoard },
-                     { "crossings", crossings }, { "lanes", list } };
+                     { "crossings", crossings }, { "dropped", dropped }, { "lanes", list } };
     }
 
     // ports along each side in the order a track leaving it meets them (clockwise)
@@ -3284,8 +3457,11 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "offset_mm past the courtyard, polyline_mm (pad end, out to the offset, the corners, out past the "
                    "last to one front for the lanes leaving there, two pitches past the outermost), shift_mm and moved_by (other parts' pads, other nets' tracks or vias in its way: "
                    "moved out a pitch at a time, the lanes outside it with it), blocked_by (still in the way after "
-                   "16 pitches), outside the vias its package's other connected SMD pins on its layer take by their pads when it runs past them, off_board, crossings with other lanes on its layer; straight ones run out past the "
-                   "lanes going by their pin. Also each port's lane (rank, offset_mm, polyline_mm) and each lane as a corridor (corridor.md: its corners the gates, its slot the rooms). pitch_mm, "
+                   "16 pitches), outside the vias its package's other connected SMD pins on its layer take by their pads when it runs past them (a "
+                   "rail pin at the end of a row: also round that corner), off_board, crossings with other lanes on its layer; straight ones run out past the "
+                   "lanes going by their pin. The pins of one side going round the part to one far part all go one way round. dropped: the "
+                   "lanes not planned, with walls_in (the pins whose straight way out the lane would run in front of) or crosses (the lanes "
+                   "it would cross; the one crossing most dropped first); their pins keep their ports. Also each port's lane (rank, offset_mm, polyline_mm) and each lane as a corridor (corridor.md: its corners the gates, its slot the rooms). pitch_mm, "
                    "base_mm, counts and the crossings (pads, at_mm). Read only",
 
                    R"json({"type":"object","required":["ref"],"properties":{
