@@ -674,12 +674,17 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     std::vector<int>     parent( states, -1 );
     std::vector<int8_t>  dirIn( states, -1 );
 
+    auto heuristicAt = [&]( int aX, int aY )
+    {
+        const int dx = std::abs( aX - gx );
+        const int dy = std::abs( aY - gy );
+        return 10 * std::max( dx, dy ) + 4 * std::min( dx, dy );
+    };
+
     auto heuristic = [&]( int aState )
     {
         const int c = aState % (int) cells;
-        const int dx = std::abs( c % grid.nx - gx );
-        const int dy = std::abs( c / grid.nx - gy );
-        return 10 * std::max( dx, dy ) + 4 * std::min( dx, dy );
+        return heuristicAt( c % grid.nx, c / grid.nx );
     };
 
     OPEN_LIST open;
@@ -714,7 +719,12 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         const int                 f = top.first;
         const int                 s = top.second;
 
-        if( f - heuristic( s ) > g[s] )
+        const int l = s / (int) cells;
+        const int c = s % (int) cells;
+        const int x = c % grid.nx;
+        const int y = c / grid.nx;
+
+        if( f - heuristicAt( x, y ) > g[s] )
             continue;   // a stale entry
 
         plan.expanded++;
@@ -725,25 +735,21 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             break;
         }
 
-        const int l = s / (int) cells;
-        const int c = s % (int) cells;
-        const int x = c % grid.nx;
-        const int y = c / grid.nx;
-
         if( ( x == 0 && cutSide[0] ) || ( y == 0 && cutSide[1] ) || ( x == grid.nx - 1 && cutSide[2] )
             || ( y == grid.ny - 1 && cutSide[3] ) )
         {
             reachedCut = true;
         }
 
-        auto relax = [&]( int aNext, int aCost, int8_t aDir )
+        // aNext lies at cell ( aX, aY )
+        auto relax = [&]( int aNext, int aX, int aY, int aCost, int8_t aDir )
         {
             if( g[s] + aCost < g[aNext] )
             {
                 g[aNext] = g[s] + aCost;
                 parent[aNext] = s;
                 dirIn[aNext] = aDir;
-                open.Push( g[aNext] + heuristic( aNext ), aNext );
+                open.Push( g[aNext] + heuristicAt( aX, aY ), aNext );
             }
         };
 
@@ -767,7 +773,8 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             const int turn = ( dirIn[s] >= 0 && dirIn[s] != d ) ? 6 : 0;
             const int nearby = nearPad[base + grid.Index( x2, y2 )] ? ESCAPE_COST : 0;
             const int cross = softCost( trackSoft, base + grid.Index( x2, y2 ) );
-            relax( l * (int) cells + grid.Index( x2, y2 ), ( ( d & 1 ) ? 14 : 10 ) + turn + nearby + cross, (int8_t) d );
+            relax( l * (int) cells + grid.Index( x2, y2 ), x2, y2, ( ( d & 1 ) ? 14 : 10 ) + turn + nearby + cross,
+                   (int8_t) d );
         }
 
         if( vias && !via[c] )
@@ -776,7 +783,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             {
                 if( l2 != l && !track[(size_t) l2 * cells + c] )
                 {
-                    relax( l2 * (int) cells + c,
+                    relax( l2 * (int) cells + c, x, y,
                            viaCost + softCost( viaSoft, c ) + softCost( trackSoft, (size_t) l2 * cells + c ), -1 );
                 }
             }
