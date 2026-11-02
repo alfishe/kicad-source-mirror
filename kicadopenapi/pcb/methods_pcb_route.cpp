@@ -13841,6 +13841,274 @@ static KOPENAPI_RESULT h_pcb_tracks_delete( KOPENAPI_CONTEXT& aCtx, const nlohma
 }
 
 
+static KOPENAPI_RESULT h_pcb_tracks_update( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    if( std::optional<KOPENAPI_RESULT> busy = guiRouting() )
+        return *busy;
+
+    BOARD* board = context->GetBoard();
+
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
+    auto positiveMm = [&]( const char* aKey, std::optional<int>& aOut ) -> std::optional<KOPENAPI_RESULT>
+    {
+        if( !aArgs.contains( aKey ) )
+            return std::nullopt;
+
+        if( !aArgs[aKey].is_number() || aArgs[aKey].get<double>() <= 0 || aArgs[aKey].get<double>() > 100 )
+            return KOPENAPI_RESULT::Error( 400, std::string( aKey ) + ": a size in mm above 0" );
+
+        aOut = pcbIUScale.mmToIU( aArgs[aKey].get<double>() );
+        return std::nullopt;
+    };
+
+    std::optional<int> width, viaDiameter, viaDrill;
+
+    for( auto [key, value] : { std::pair<const char*, std::optional<int>*>{ "width_mm", &width },
+                               { "via_diameter_mm", &viaDiameter },
+                               { "via_drill_mm", &viaDrill } } )
+    {
+        if( std::optional<KOPENAPI_RESULT> bad = positiveMm( key, *value ) )
+            return *bad;
+    }
+
+    std::optional<PCB_LAYER_ID> layer;
+
+    if( aArgs.contains( "to_layer" ) )
+    {
+        layer = aArgs["to_layer"].is_string() ? parseLayer( board, aArgs["to_layer"].get<std::string>() ) : std::nullopt;
+
+        if( !layer )
+            return KOPENAPI_RESULT::Error( 400, "to_layer: an enabled copper layer (pcb_layer_list), e.g. B.Cu" );
+    }
+
+    const bool fromRules = aArgs.value( "from_rules", false );
+
+    if( fromRules && ( width || viaDiameter || viaDrill ) )
+        return KOPENAPI_RESULT::Error( 400, "from_rules sets the sizes from the design rules: give it without width_mm / via_*_mm" );
+
+    if( !fromRules && !width && !viaDiameter && !viaDrill && !layer )
+        return KOPENAPI_RESULT::Error( 400, "nothing to change: width_mm, via_diameter_mm, via_drill_mm, to_layer or from_rules" );
+
+    const std::string zoneMode = aArgs.value( "zones", std::string( "refill" ) );
+
+    if( zoneMode != "refill" && zoneMode != "keep" )
+        return KOPENAPI_RESULT::Error( 400, "zones: refill (pour fills give way, refilled after) or keep" );
+
+    nlohmann::json                 missing = nlohmann::json::array();
+    std::optional<KOPENAPI_RESULT> error;
+    std::vector<PCB_TRACK*>        selected = selectTracks( board, aArgs, true, missing, error );
+
+    if( error )
+        return *error;
+
+    struct CHANGE
+    {
+        PCB_TRACK*   item;
+        int          width;
+        int          drill;
+        PCB_LAYER_ID layer;
+        std::string  rule;
+    };
+
+    const bool              overrideLocks = aArgs.value( "override_locks", false );
+    const bool              dryRun = aArgs.value( "dry_run", false );
+    const KOPENAPI_LIST_CAP cap( aArgs );
+    std::vector<CHANGE>     changes;
+    nlohmann::json          locked = nlohmann::json::array();
+    nlohmann::json          badVias = nlohmann::json::array();
+    int                     unchanged = 0;
+
+    for( PCB_TRACK* track : selected )
+    {
+        PCB_VIA*  via = track->Type() == PCB_VIA_T ? static_cast<PCB_VIA*>( track ) : nullptr;
+        const int now = via ? via->GetWidth( PADSTACK::ALL_LAYERS ) : track->GetWidth();
+        CHANGE    c{ track, now, via ? via->GetDrillValue() : 0, via ? UNDEFINED_LAYER : track->GetLayer(), {} };
+
+        if( fromRules )
+        {
+            wxString       source;
+            MINOPTMAX<int> w = track->GetWidthConstraint( &source );
+
+            if( w.HasOpt() )
+                c.width = w.PinnedOpt();
+            else if( w.Min() > 0 )
+                c.width = w.Min();
+
+            c.rule = str( source );
+
+            if( via )
+            {
+                MINOPTMAX<int> d = via->GetDrillConstraint();
+
+                if( d.HasOpt() )
+                    c.drill = d.PinnedOpt();
+                else if( d.Min() > 0 )
+                    c.drill = d.Min();
+            }
+        }
+        else if( via )
+        {
+            c.width = viaDiameter.value_or( c.width );
+            c.drill = viaDrill.value_or( c.drill );
+        }
+        else
+        {
+            c.width = width.value_or( c.width );
+            c.layer = layer.value_or( c.layer );
+        }
+
+        if( via && c.drill >= c.width )
+        {
+            badVias.push_back( str( track->m_Uuid.AsString() ) );
+            continue;
+        }
+
+        if( c.width == now && ( !via || c.drill == via->GetDrillValue() ) && ( via || c.layer == track->GetLayer() ) )
+        {
+            unchanged++;
+            continue;
+        }
+
+        if( track->IsLocked() && !overrideLocks )
+        {
+            locked.push_back( str( track->m_Uuid.AsString() ) );
+            continue;
+        }
+
+        changes.push_back( c );
+    }
+
+    if( !badVias.empty() )
+    {
+        KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 400, "the drill would not be smaller than the via diameter; nothing changed" );
+        refused.body["vias"] = badVias;
+        return refused;
+    }
+
+    std::map<std::string, nlohmann::json> byNet;
+    std::vector<PCB_TRACK*>               items;
+    std::map<std::string, int>            rules;
+    int                                   tracks = 0, vias = 0;
+
+    for( const CHANGE& c : changes )
+    {
+        nlohmann::json& net = byNet[str( UnescapeString( c.item->GetNetname() ) )];
+
+        if( net.is_null() )
+            net = { { "tracks", 0 }, { "vias", 0 } };
+
+        net[c.item->Type() == PCB_VIA_T ? "vias" : "tracks"] = net[c.item->Type() == PCB_VIA_T ? "vias" : "tracks"].get<int>() + 1;
+        ( c.item->Type() == PCB_VIA_T ? vias : tracks )++;
+        items.push_back( c.item );
+
+        if( !c.rule.empty() )
+            rules[c.rule]++;
+    }
+
+    nlohmann::json out = { { "changed", { { "tracks", tracks }, { "vias", vias } } },
+                           { "unchanged", unchanged }, { "applied", false } };
+    bulkSummary( out, cap, items, byNet );
+    cap.Put( out, "missing", missing );
+    out["locked_skipped_count"] = locked.size();
+    cap.Put( out, "locked_skipped", locked );
+
+    if( fromRules )
+        out["rules"] = rules;
+
+    if( changes.empty() )
+    {
+        out["reason"] = !locked.empty() ? "everything to change is locked (override_locks: true)"
+                        : unchanged > 0 ? "everything selected has these values already"
+                                        : "nothing matches";
+        return KOPENAPI_RESULT::Ok( out );
+    }
+
+    {
+        nlohmann::json uuids = nlohmann::json::array();
+
+        for( const CHANGE& c : changes )
+            uuids.push_back( str( c.item->m_Uuid.AsString() ) );
+
+        cap.Put( out, "uuids", std::move( uuids ) );
+    }
+
+    BOARD_COMMIT                       commit( context->GetToolManager() );
+    std::vector<BOARD_CONNECTED_ITEM*> changed;
+
+    for( const CHANGE& c : changes )
+    {
+        commit.Modify( c.item );
+
+        if( PCB_VIA* via = dynamic_cast<PCB_VIA*>( c.item ) )
+        {
+            via->SetWidth( PADSTACK::ALL_LAYERS, c.width );
+            via->SetDrill( c.drill );
+        }
+        else
+        {
+            c.item->SetWidth( c.width );
+            c.item->SetLayer( c.layer );
+        }
+
+        changed.push_back( c.item );
+    }
+
+    const nlohmann::json violations = guard( board, changed, {}, zoneMode == "refill" );
+    const bool           force = aArgs.value( "force", false );
+
+    if( !violations.empty() )
+    {
+        out["violations_count"] = violations.size();
+        cap.Put( out, "violations", violations );
+    }
+
+    if( dryRun || ( !violations.empty() && !force ) )
+    {
+        commit.Revert();
+
+        if( dryRun )
+            return KOPENAPI_RESULT::Ok( out );
+
+        KOPENAPI_RESULT rejected = KOPENAPI_RESULT::Error( 422, "rejected by the guard: the changed copper would touch another net "
+                                                                "or enter a keep-out (violations); nothing changed; force: true "
+                                                                "applies it anyway, as the editor's dialog does" );
+        rejected.body.update( out );
+        return rejected;
+    }
+
+    commit.Push( _( "Edit track and via properties (API)" ) );
+
+    if( zoneMode == "refill" )
+    {
+        bool filled = false;
+
+        for( ZONE* zone : board->Zones() )
+            filled |= !zone->GetIsRuleArea() && zone->IsFilled();
+
+        if( filled )
+        {
+            refillPours( *context, board );
+            out["zones_refilled"] = true;
+        }
+    }
+
+    board->BuildConnectivity();
+    board->GetConnectivity()->RecalculateRatsnest();
+    showRoutes( aCtx, {} );
+
+    out["applied"] = true;
+    out.update( KopenapiUnroutedJson( board ) );
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
 static KOPENAPI_RESULT h_pcb_tracks_cleanup( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -15964,6 +16232,36 @@ KOPENAPI_REGISTER( "pcb_tracks_delete",
                         "dry_run":{"type":"boolean","default":false}}})json"_json ),
                    false, h_pcb_tracks_delete, 300 );
 
+KOPENAPI_REGISTER( "pcb_tracks_update",
+                   "Change routed tracks and vias in one undo step, as KiCad's Edit Track & Via Properties: "
+                   "width_mm (tracks and arcs), via_diameter_mm / via_drill_mm (vias), to_layer (tracks onto "
+                   "another copper layer), or from_rules: each item to the size its design rules give it (net "
+                   "class, custom rules; answer: rules used and how often). The items: the selectors of "
+                   "pcb_tracks_delete (uuids, net / nets, all, between, region, layer, kinds). A guard refuses "
+                   "(422, violations, nothing changed) when the changed copper would touch another net or enter "
+                   "a keep-out; force: true applies anyway, as the dialog does. Locked copper is kept "
+                   "(override_locks); dry_run tells what would change and the violations. Pour fills give way "
+                   "and are refilled after (zones: keep leaves them). Answers counts, per net and per layer, "
+                   "unchanged (already so), the first uuids (list_limit, full: true for all)",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
+                        "uuids":{"type":"array","items":{"type":"string"},"description":"exactly these (pcb_track_list); the filters below are ignored"},
+                        "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
+                        "all":{"type":"boolean","description":"every track and via - with layer / kinds to narrow"},
+                        "between":{"type":"array","items":{"type":"string"},"description":"[\"REF.PAD\", \"REF.PAD\"]: the copper joining them"},
+                        "region":{"type":"array","items":{"type":"number"},"description":"[x0_mm, y0_mm, x1_mm, y1_mm]"},
+                        "region_mode":{"type":"string","enum":["inside","touching"],"default":"inside"},
+                        "layer":{"type":"string","description":"select the items on this layer"},
+                        "kinds":{"type":"array","items":{"type":"string","enum":["track","via"]}},
+                        "width_mm":{"type":"number","description":"new width of the tracks"},
+                        "via_diameter_mm":{"type":"number"},"via_drill_mm":{"type":"number"},
+                        "to_layer":{"type":"string","description":"move the tracks to this copper layer"},
+                        "from_rules":{"type":"boolean","default":false,"description":"sizes from the design rules (net class, custom rules), as the dialog's 'Set to net class / custom rule values'"},
+                        "zones":{"type":"string","enum":["refill","keep"],"default":"refill"},
+                        "force":{"type":"boolean","default":false,"description":"apply despite the guard's violations"},
+                        "override_locks":{"type":"boolean","default":false},
+                        "dry_run":{"type":"boolean","default":false}}})json"_json ),
+                   false, h_pcb_tracks_update, 300 );
+
 KOPENAPI_REGISTER( "pcb_tracks_cleanup",
                    "Board cleanup as KiCad's Cleanup Tracks & Vias, in one undo step: dangling tracks and vias "
                    "(ends that reach nothing, repeated until none is left), vias inside a pad or another via, "
@@ -16104,5 +16402,5 @@ KOPENAPI_REGISTER( "pcb_route_strategies",
                         "reroute_recent":{"type":"integer","default":2}}})json"_json,
                    false, h_pcb_route_strategies );
 
-KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_tracks_cleanup", "pcb_track_add", "pcb_via_add", "pcb_fanout" );
+KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_tracks_update", "pcb_tracks_cleanup", "pcb_track_add", "pcb_via_add", "pcb_fanout" );
 KOPENAPI_MARK_CONCURRENT_READS( "pcb_track_list", "pcb_via_list" );
