@@ -8,6 +8,7 @@
 /// is none, connectors along the board edges, the rest by KiCad's own autoplacer (AR_AUTOPLACER:
 /// a placement matrix inside the outline, ratsnest cost).
 #include "kopenapi_pcb.h"
+#include "pcb_escape_estimate.h"
 
 #include <kicadopenapi_registry.h>
 #include <netinfo.h>
@@ -3432,6 +3433,42 @@ std::optional<KOPENAPI_RESULT> groupParts( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard
     return std::nullopt;
 }
 
+/// @brief orientation of a block's anchor: keep (nothing), auto (chosen by routability, the turns set
+/// later) or a count of quarter turns clockwise; a locked anchor turns only with override_locks
+std::optional<KOPENAPI_RESULT> anchorTurns( const nlohmann::json& aSpec, FOOTPRINT* aAnchor, bool aOverrideLocks,
+                                            std::optional<int>& aTurns )
+{
+    const nlohmann::json o = aSpec.value( "orientation", nlohmann::json( "keep" ) );
+
+    if( o == "keep" )
+        return std::nullopt;
+
+    if( o != "auto" && !( o.is_number_integer() && o.get<int>() >= 0 && o.get<int>() <= 3 ) )
+        return KOPENAPI_RESULT::Error( 400, "orientation: keep, auto (the quarter turn of the anchor the block routes best "
+                                            "in) or 0..3 quarter turns clockwise" );
+
+    if( o.is_number_integer() )
+        aTurns = o.get<int>();
+
+    if( aAnchor->IsLocked() && !aOverrideLocks && o != 0 )
+        return KOPENAPI_RESULT::Error( 409, str( aAnchor->GetReference() ) + " is locked: orientation turns it only with "
+                                                                              "override_locks: true" );
+
+    return std::nullopt;
+}
+
+
+/// @brief Turn the anchor by quarter turns clockwise (board view) about its courtyard's centre
+void turnAnchor( BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, int aTurns )
+{
+    if( aTurns % 4 == 0 )
+        return;
+
+    aCommit.Modify( aAnchor );
+    aAnchor->Rotate( courtyard( aAnchor ).BBox().Centre(), EDA_ANGLE( -90.0 * aTurns, DEGREES_T ) );
+}
+
+
 } // namespace
 
 
@@ -4496,15 +4533,107 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
         {
             const size_t                before = moved.size();
             const double                escapeKeep = spec.value( "escape_keep_mm", 2.0 );
-            std::vector<CORRIDOR>       corridors = escapeKeep > 0 ? signalCorridors( aCtx, board, escapeKeep, parts ) : std::vector<CORRIDOR>();
+            std::vector<CORRIDOR>       corridors;
 
-            for( CORRIDOR& c : portCorridors( aCtx, board, anchor, portsKeep( spec ), spec.value( "open_sides", nlohmann::json() ) ) )
-                corridors.push_back( std::move( c ) );
+            auto place = [&]( BOARD_COMMIT& aCommit, nlohmann::json& aOut, std::vector<KIID>& aMoved )
+            {
+                corridors = escapeKeep > 0 ? signalCorridors( aCtx, board, escapeKeep, parts ) : std::vector<CORRIDOR>();
 
-            options.corridors = &corridors;
-            placeGroup( board, commit, anchor, parts, options, side == "opposite", decapMax,
-                        spec.contains( "decap_bottom" ) ? std::optional<bool>( spec.value( "decap_bottom", false ) ) : std::nullopt,
-                        out, moved );
+                for( CORRIDOR& c : portCorridors( aCtx, board, anchor, portsKeep( spec ), spec.value( "open_sides", nlohmann::json() ) ) )
+                    corridors.push_back( std::move( c ) );
+
+                options.corridors = &corridors;
+                placeGroup( board, aCommit, anchor, parts, options, side == "opposite", decapMax,
+                            spec.contains( "decap_bottom" ) ? std::optional<bool>( spec.value( "decap_bottom", false ) ) : std::nullopt,
+                            aOut, aMoved );
+            };
+
+            std::optional<int>   turns;
+            nlohmann::json       orientation;
+
+            if( std::optional<KOPENAPI_RESULT> error = anchorTurns( spec, anchor, overrideLocks, turns ) )
+                return fail( *error );
+
+            if( spec.value( "orientation", nlohmann::json( "keep" ) ) == "auto" )
+            {
+                // each quarter turn tried: the block placed in a step taken back, the way out of the
+                // anchor's neighbourhood estimated, the cheapest kept
+                const auto                  started = std::chrono::steady_clock::now();
+                const std::set<int>         rails = railNets( board );
+                const double                margin = spec.value( "orientation_margin_mm", 6.0 );
+                nlohmann::json              byTurn = nlohmann::json::array();
+                std::vector<int>            failed( 4, 0 );
+                std::vector<double>         rest( 4, 0.0 );
+
+                for( int q = 0; q < 4; ++q )
+                {
+                    BOARD_COMMIT      trial( context->GetToolManager() );
+                    nlohmann::json    trialOut = nlohmann::json::object();
+                    std::vector<KIID> trialMoved;
+
+                    turnAnchor( trial, anchor, q );
+                    place( trial, trialOut, trialMoved );
+
+                    const ESCAPE_ESTIMATE e = EstimateEscape( board, anchor, rails, margin );
+                    const size_t          unplaced = trialOut.value( "unplaced", nlohmann::json::array() ).size();
+
+                    trial.Revert();
+
+                    failed[q] = e.boxedIn + e.firstPassFailed + e.overflowing + (int) unplaced;
+                    rest[q] = e.vias + e.lengthMm / 10.0;
+
+                    byTurn.push_back( { { "quarter_turns_cw", q }, { "cost", std::round( ( 10.0 * failed[q] + rest[q] ) * 10 ) / 10 },
+                                        { "failed", failed[q] }, { "connections", e.connections }, { "boxed_in", e.boxedIn },
+                                        { "first_pass_failed", e.firstPassFailed }, { "overflowing", e.overflowing }, { "vias", e.vias },
+                                        { "length_mm", e.lengthMm }, { "unplaced", unplaced }, { "boxed_in_at", e.boxedPads },
+                                        { "ms", std::round( e.ms ) } } );
+                    orientation["cell_mm"] = e.cellMm;
+                }
+
+                // fewest connections without a way first; among those the shortest (vias + length), but
+                // the anchor stays as it is unless that saves a tenth
+                const int fewest = *std::min_element( failed.begin(), failed.end() );
+                int       best = -1;
+
+                for( int q = 0; q < 4; ++q )
+                {
+                    if( failed[q] == fewest && ( best < 0 || rest[q] < rest[best] ) )
+                        best = q;
+                }
+
+                if( failed[0] == fewest && rest[best] > 0.9 * rest[0] )
+                {
+                    best = 0;
+                    orientation["why"] = "kept: no turn gets more connections out, none saves a tenth of the vias and length";
+                }
+                else
+                {
+                    orientation["why"] = failed[best] < failed[0] ? "fewer connections without a way out"
+                                                                  : "as many ways out, a tenth or more shorter";
+                }
+
+                turns = best;
+                orientation["by"] = "routability";
+                orientation["by_turn"] = byTurn;
+                orientation["ms"] = std::round( std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count() );
+            }
+
+            if( turns )
+            {
+                if( *turns != 0 )
+                {
+                    turnAnchor( commit, anchor, *turns );
+                    moved.push_back( anchor->m_Uuid );
+                }
+
+                orientation["quarter_turns_cw"] = *turns;
+                orientation["rotation_deg"] = anchor->GetOrientation().AsDegrees();
+            }
+
+            place( commit, out, moved );
+
+            if( turns )
+                out["orientation"] = orientation;
 
             for( const CORRIDOR& corridor : corridors )
                 out["corridors"].push_back( corridor.name );
@@ -4568,7 +4697,9 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
 
 static const char* PLACE_GROUP_BLOCK = R"json({
-    "anchor":{"type":"string","description":"reference of the main part; it does not move"},
+    "anchor":{"type":"string","description":"reference of the main part; it does not move (orientation may turn it in place)"},
+    "orientation":{"description":"the anchor's quarter turn: keep (default); auto - each of the four tried (the block placed, then a quick route of every non-rail connection with an end within orientation_margin_mm of the anchor's courtyard, the far ends reached straight from the box's edge, on a grid of the anchor's pad pitch (or one track pitch) over the routing layers, shortest first without rip-up, then negotiated), the turn with the fewest connections left without a way (boxed in, failed in the first pass, still sharing cells, parts unplaced), of those the one with the fewest vias + mm / 10; the anchor stays as it is unless a turn gets more connections out or saves a tenth (why says which); or 0..3 quarter turns clockwise. The anchor turns about its courtyard's centre; a locked one needs override_locks. Answer orientation: quarter_turns_cw, rotation_deg, why, by_turn (auto: per turn failed, its parts, vias, length_mm, cost = 10 x failed + vias + mm / 10)","oneOf":[{"type":"string","enum":["keep","auto"]},{"type":"integer","minimum":0,"maximum":3}]},
+    "orientation_margin_mm":{"type":"number","default":6,"description":"orientation auto: how far round the anchor's courtyard the estimate routes"},
     "parts":{"type":"array","items":{"type":"string"}},
     "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
     "depth":{"type":"integer","description":"from_schematic: how far sch_subcircuit grows (default 2)"},
