@@ -5435,6 +5435,52 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                 std::vector<int>            failed( 4, 0 );
                 std::vector<double>         rest( 4, 0.0 );
 
+                const std::set<const FOOTPRINT*> members( parts.begin(), parts.end() );
+                const OUTLINE                    outline( board );
+
+                // what the anchor's courtyard runs into: other parts of its side (not the block's, those are
+                // placed after) and the board's edge; a turn may not add to what it overlaps already
+                auto overlapping = [&]()
+                {
+                    const SHAPE_POLY_SET  body = courtyard( anchor );
+                    const BOX2I           box = body.BBox();
+                    std::set<std::string> into;
+
+                    if( !outline.Contains( body ) )
+                        into.insert( "board edge" );
+
+                    for( FOOTPRINT* fp : board->Footprints() )
+                    {
+                        if( fp == anchor || members.count( fp ) || fp->IsFlipped() != anchor->IsFlipped() )
+                            continue;
+
+                        SHAPE_POLY_SET other = courtyard( fp );
+
+                        if( !other.BBox().Intersects( box ) )
+                            continue;
+
+                        other.BooleanIntersection( body );
+
+                        if( !other.IsEmpty() )
+                            into.insert( str( fp->GetReference() ) );
+                    }
+
+                    return into;
+                };
+
+                const std::set<std::string> overlapsNow = overlapping();
+
+                auto turnedInto = [&]() -> std::string
+                {
+                    for( const std::string& ref : overlapping() )
+                    {
+                        if( !overlapsNow.count( ref ) )
+                            return ref;
+                    }
+
+                    return {};
+                };
+
                 for( int q = 0; q < 4; ++q )
                 {
                     BOARD_COMMIT      trial( context->GetToolManager() );
@@ -5442,6 +5488,15 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                     std::vector<KIID> trialMoved;
 
                     turnAnchor( trial, anchor, q );
+
+                    if( const std::string into = q ? turnedInto() : std::string(); !into.empty() )
+                    {
+                        trial.Revert();
+                        failed[q] = std::numeric_limits<int>::max() / 2;
+                        byTurn.push_back( { { "quarter_turns_cw", q }, { "blocked_by", into } } );
+                        continue;
+                    }
+
                     place( trial, trialOut, trialMoved );
 
                     const ESCAPE_ESTIMATE e = EstimateEscape( board, anchor, rails, margin );
@@ -5581,7 +5636,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
 static const char* PLACE_GROUP_BLOCK = R"json({
     "anchor":{"type":"string","description":"reference of the main part; it does not move (orientation may turn it in place)"},
-    "orientation":{"description":"the anchor's quarter turn: keep (default); auto - each of the four tried (the block placed, then a quick route of every non-rail connection with an end within orientation_margin_mm of the anchor's courtyard, the far ends reached straight from the box's edge, on a grid of the anchor's pad pitch (or one track pitch) over the routing layers, the rails' stitching vias as pcb_stitch lays them as walls and each via taking its room on every layer, shortest first without rip-up, then negotiated), the turn with the fewest connections left without a way (boxed in, failed in the first pass, still sharing cells, parts unplaced), of those the one with the fewest vias + mm / 10; the anchor stays as it is unless a turn gets more connections out or saves a tenth (why says which); or 0..3 quarter turns clockwise. The anchor turns about its courtyard's centre; a locked one needs override_locks. Answer orientation: quarter_turns_cw, rotation_deg, why, by_turn (auto: per turn failed, its parts, vias, length_mm, rail_vias, cost = 10 x failed + vias + mm / 10)","oneOf":[{"type":"string","enum":["keep","auto"]},{"type":"integer","minimum":0,"maximum":3}]},
+    "orientation":{"description":"the anchor's quarter turn: keep (default); auto - each of the four tried (the block placed, then a quick route of every non-rail connection with an end within orientation_margin_mm of the anchor's courtyard, the far ends reached straight from the box's edge, on a grid of the anchor's pad pitch (or one track pitch) over the routing layers, the rails' stitching vias as pcb_stitch lays them as walls and each via taking its room on every layer, shortest first without rip-up, then negotiated), the turn with the fewest connections left without a way (boxed in, failed in the first pass, still sharing cells, parts unplaced), of those the one with the fewest vias + mm / 10; the anchor stays as it is unless a turn gets more connections out or saves a tenth (why says which); a turn whose courtyard runs into another part of its side (not the block's) or over the board's edge is not tried (by_turn blocked_by); or 0..3 quarter turns clockwise. The anchor turns about its courtyard's centre; a locked one needs override_locks. Answer orientation: quarter_turns_cw, rotation_deg, why, by_turn (auto: per turn failed, its parts, vias, length_mm, rail_vias, cost = 10 x failed + vias + mm / 10)","oneOf":[{"type":"string","enum":["keep","auto"]},{"type":"integer","minimum":0,"maximum":3}]},
     "orientation_margin_mm":{"type":"number","default":6,"description":"orientation auto: how far round the anchor's courtyard the estimate routes"},
     "parts":{"type":"array","items":{"type":"string"}},
     "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
