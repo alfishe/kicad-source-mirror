@@ -11136,6 +11136,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
     };
 
     const bool                 withPorts = aArgs.value( "ports", false );
+    const bool                 portStubs = aArgs.value( "stubs", true );
     std::map<std::string, PORT_PLAN> plan;
 
     if( withPorts )
@@ -11394,6 +11395,10 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
             const auto     portOf = plan.find( str( pad->GetNumber() ) );
             const bool     padVia = !withPorts ? withVias
                                     : portOf != plan.end() && ( portOf->second.kind == "rail" || portOf->second.layer == "other" );
+
+            if( withPorts && !portStubs && !padVia )
+                continue;
+
             const VECTOR2I knee = point( along( at ), tipLine );
             const VECTOR2I ray = point( fanned, rayEnd );
 
@@ -12631,6 +12636,7 @@ KOPENAPI_REGISTER( "pcb_fanout",
                         "stagger":{"type":"integer","minimum":1,"maximum":4,"description":"ring packages: via lines the neighbours alternate over (default 2 when a via plus clearance is wider than the pitch, else 1)"},
                         "vias":{"type":"boolean","default":true,"description":"ring packages: false gives the stubs only, ending just outside the courtyard"},
                         "ports":{"type":"boolean","default":false,"description":"ring packages: follow the layout plan (pcb_fanout_ports): a via only for rails and for pins whose far end's order moves them to the other layer; the rest stubs out past the courtyard on the pad's layer; each pin answers its port (kind, layer, to)"},
+                        "stubs":{"type":"boolean","default":true,"description":"with ports: false lays only the planned vias (rails, pins to the other layer); the other pins are left to pcb_route"},
                         "direction":{"type":"string","enum":["inward","up","down","left","right"],"description":"stubs straight this way (edge mode); inward: away from the board edge the pads sit on (found by itself for card-edge fingers)"},
                         "stub_mm":{"type":"number","description":"edge mode: stub length from the pad centre"},
                         "via":{"type":"string","enum":["none","always","stagger"],"default":"none","description":"edge mode: a via at each stub end, stagger: on two alternating lines"},
