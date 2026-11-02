@@ -1,6 +1,10 @@
 #pragma once
 
 #include <geometry/shape.h>
+#include <geometry/shape_circle.h>
+#include <geometry/shape_compound.h>
+#include <geometry/shape_rect.h>
+#include <geometry/shape_segment.h>
 #include <geometry/shape_poly_set.h>
 #include <math/vector2d.h>
 
@@ -45,16 +49,217 @@ struct PLAN_GRID
         const int   x1 = std::min( nx - 1, (int) std::ceil( (double) ( bb.GetRight() - origin.x ) / cell ) );
         const int   y1 = std::min( ny - 1, (int) std::ceil( (double) ( bb.GetBottom() - origin.y ) / cell ) );
 
+        PIECE      pieces[MAX_PIECES];
+        const int  count = Pieces( aShape, aInflate, pieces );
+
         for( int y = y0; y <= y1; ++y )
         {
+            // per piece the row's cells it surely covers and those it may cover; the shape's own
+            // test decides only between the two
+            int sureLo[MAX_PIECES], sureHi[MAX_PIECES], mayLo[MAX_PIECES], mayHi[MAX_PIECES];
+
+            for( int k = 0; k < count; ++k )
+            {
+                RowSpan( pieces[k], y, pieces[k].radius - SURE, x0, x1, sureLo[k], sureHi[k] );
+                RowSpan( pieces[k], y, pieces[k].radius + SURE, x0, x1, mayLo[k], mayHi[k] );
+            }
+
             for( int x = x0; x <= x1; ++x )
             {
                 const size_t i = aOffset + Index( x, y );
 
-                if( !aSkip( i ) && aShape.Collide( Centre( x, y ), aInflate ) )
+                if( aSkip( i ) )
+                    continue;
+
+                bool sure = false;
+                bool may = count < 0;
+
+                for( int k = 0; k < count && !sure; ++k )
+                {
+                    sure = x >= sureLo[k] && x <= sureHi[k];
+                    may = may || ( x >= mayLo[k] && x <= mayHi[k] );
+                }
+
+                if( sure || ( may && aShape.Collide( Centre( x, y ), aInflate ) ) )
                     aVisit( i );
             }
         }
+    }
+
+    /// @brief A part of a shape whose cells per row are found in closed form: a round-ended
+    /// segment (a circle when its ends meet) or an axis-aligned box, grown by a radius
+    struct PIECE
+    {
+        bool   box = false;
+        double ax = 0, ay = 0, bx = 0, by = 0;   ///< the segment's ends, or the box's corners, from the origin
+        double radius = 0;                       ///< a point nearer than this collides (the shapes square a negative one)
+    };
+
+    static constexpr int    MAX_PIECES = 8;
+    static constexpr double SURE = 2.0;   ///< far above the rounding of the shapes' integer distances
+
+    /// @return the pieces of the shape, or -1 when a part has no closed form (every cell is tested)
+    int Pieces( const SHAPE& aShape, int aInflate, PIECE* aPieces ) const
+    {
+        int count = 0;
+
+        auto add = [&]( const SHAPE* aPart ) -> bool
+        {
+            if( count == MAX_PIECES )
+                return false;
+
+            PIECE& p = aPieces[count];
+
+            switch( aPart->Type() )
+            {
+            case SH_SEGMENT:
+            {
+                const SHAPE_SEGMENT* s = static_cast<const SHAPE_SEGMENT*>( aPart );
+                p.ax = (double) s->GetSeg().A.x - origin.x;
+                p.ay = (double) s->GetSeg().A.y - origin.y;
+                p.bx = (double) s->GetSeg().B.x - origin.x;
+                p.by = (double) s->GetSeg().B.y - origin.y;
+                p.radius = std::abs( (double) ( ( s->GetWidth() + 1 ) / 2 + aInflate ) );
+                break;
+            }
+            case SH_CIRCLE:
+            {
+                const SHAPE_CIRCLE* c = static_cast<const SHAPE_CIRCLE*>( aPart );
+                p.ax = p.bx = (double) c->GetCenter().x - origin.x;
+                p.ay = p.by = (double) c->GetCenter().y - origin.y;
+                p.radius = std::abs( (double) ( c->GetRadius() + aInflate ) );
+                break;
+            }
+            case SH_RECT:
+            {
+                const SHAPE_RECT* r = static_cast<const SHAPE_RECT*>( aPart );
+
+                if( r->GetRadius() > 0 || r->GetWidth() < 0 || r->GetHeight() < 0 )
+                    return false;
+
+                p.box = true;
+                p.ax = (double) r->GetPosition().x - origin.x;
+                p.ay = (double) r->GetPosition().y - origin.y;
+                p.bx = p.ax + r->GetWidth();
+                p.by = p.ay + r->GetHeight();
+                p.radius = std::abs( (double) aInflate );
+                break;
+            }
+            default:
+                return false;
+            }
+
+            ++count;
+            return true;
+        };
+
+        if( aShape.Type() == SH_COMPOUND )
+        {
+            for( const SHAPE* part : static_cast<const SHAPE_COMPOUND&>( aShape ).Shapes() )
+            {
+                if( !add( part ) )
+                    return -1;
+            }
+
+            return count;
+        }
+
+        return add( &aShape ) ? count : -1;
+    }
+
+    /// @brief The cells [aLo, aHi] of row aY within aX0..aX1 whose centres are within aRadius of the
+    /// piece (a box takes its inside too); aLo > aHi when there are none
+    void RowSpan( const PIECE& aPiece, int aY, double aRadius, int aX0, int aX1, int& aLo, int& aHi ) const
+    {
+        aLo = aX1 + 1;
+        aHi = aX0 - 1;
+
+        const double py = (double) aY * cell;
+        double       lo = HUGE_VAL;
+        double       hi = -HUGE_VAL;
+
+        auto disc = [&]( double aCx, double aCy, double aR )
+        {
+            const double dy = py - aCy;
+
+            if( aR < 0 || std::abs( dy ) > aR )
+                return;
+
+            const double h = std::sqrt( aR * aR - dy * dy );
+            lo = std::min( lo, aCx - h );
+            hi = std::max( hi, aCx + h );
+        };
+
+        if( aPiece.box )
+        {
+            if( aRadius < 0 )
+                aRadius = 0;   // the box's inside collides at any clearance
+
+            const double dy = std::max( { aPiece.ay - py, 0.0, py - aPiece.by } );
+
+            if( dy > aRadius )
+                return;
+
+            const double h = std::sqrt( aRadius * aRadius - dy * dy );
+            lo = aPiece.ax - h;
+            hi = aPiece.bx + h;
+        }
+        else
+        {
+            if( aRadius < 0 )
+                return;
+
+            disc( aPiece.ax, aPiece.ay, aRadius );
+            disc( aPiece.bx, aPiece.by, aRadius );
+
+            // the band beside the segment: 0 <= ( P - A ).u <= |u|^2 and |u x ( P - A )| <= r |u|
+            const double ux = aPiece.bx - aPiece.ax;
+            const double uy = aPiece.by - aPiece.ay;
+            const double len2 = ux * ux + uy * uy;
+
+            if( len2 > 0 )
+            {
+                const double dy = py - aPiece.ay;
+                const double side = aRadius * std::sqrt( len2 );
+                double       bandLo = -HUGE_VAL;
+                double       bandHi = HUGE_VAL;
+                bool         empty = false;
+
+                // aMin <= aK * t + aC <= aMax with t = x - A.x
+                auto clip = [&]( double aK, double aC, double aMin, double aMax )
+                {
+                    if( aK == 0 )
+                    {
+                        empty = empty || aC < aMin || aC > aMax;
+                        return;
+                    }
+
+                    double t0 = ( aMin - aC ) / aK;
+                    double t1 = ( aMax - aC ) / aK;
+
+                    if( t0 > t1 )
+                        std::swap( t0, t1 );
+
+                    bandLo = std::max( bandLo, t0 );
+                    bandHi = std::min( bandHi, t1 );
+                };
+
+                clip( ux, uy * dy, 0, len2 );
+                clip( -uy, ux * dy, -side, side );
+
+                if( !empty && bandLo <= bandHi )
+                {
+                    lo = std::min( lo, aPiece.ax + bandLo );
+                    hi = std::max( hi, aPiece.ax + bandHi );
+                }
+            }
+        }
+
+        if( lo > hi )
+            return;
+
+        aLo = std::max( aX0, (int) std::ceil( lo / cell ) );
+        aHi = std::min( aX1, (int) std::floor( hi / cell ) );
     }
 
     /// @brief Each() for polygons (zone fills, outlines: thousands of corners): the polygon grown by
