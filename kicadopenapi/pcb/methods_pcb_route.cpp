@@ -6855,39 +6855,6 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             corridorOut.push_back( out );
         }
 
-        // a corridor's members one after another, across it in order, where the first of them was
-        if( corridorMembers > 0 )
-        {
-            std::vector<JOB> ordered;
-            std::set<int>    emitted;
-
-            for( size_t k = 0; k < jobs.size(); ++k )
-            {
-                if( jobs[k].corridorOf < 0 )
-                {
-                    ordered.push_back( jobs[k] );
-                    continue;
-                }
-
-                if( !emitted.insert( jobs[k].corridorOf ).second )
-                    continue;
-
-                std::vector<const JOB*> members;
-
-                for( const JOB& j : jobs )
-                {
-                    if( j.corridorOf == jobs[k].corridorOf )
-                        members.push_back( &j );
-                }
-
-                std::sort( members.begin(), members.end(), []( const JOB* x, const JOB* y ) { return x->corridorRank < y->corridorRank; } );
-
-                for( const JOB* j : members )
-                    ordered.push_back( *j );
-            }
-
-            jobs = std::move( ordered );
-        }
     }
 
     jobs.insert( jobs.begin(), trunks.begin(), trunks.end() );
@@ -7282,12 +7249,80 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return counts;
     };
 
+    // corridors as soft goals: at the turn of a corridor's first connection, each of its members one try
+    // along it, across it in order, in a tenth of the connection's budget (3 s without one); a member it
+    // routes is kept for its own turn, the others keep their turn and whole budget as without the corridor
+    std::vector<int>            alongTried( jobs.size(), 0 );   // 1: routed along, -1: failed along
+    std::vector<nlohmann::json> alongAttempt( jobs.size() ), alongRow( jobs.size() );
+    std::set<int>               corridorsTried;
+
+    auto tryAlong = [&]( size_t aIndex, int aOrder )
+    {
+        JOB& job = jobs[aIndex];
+        job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
+        job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+        if( !job.from || !job.to )
+            return;
+
+        const PCB_LAYER_ID padLayer = job.from->IsOnLayer( F_Cu ) ? F_Cu : job.from->IsOnLayer( B_Cu ) ? B_Cu
+                                                                                                     : job.from->GetLayerSet().CuStack().front();
+        const auto alongStarted = std::chrono::steady_clock::now();
+        const long outer = profile.job;
+        profile.job = (long) aIndex;
+
+        if( doneOf )
+            refreshFronts();
+
+        ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
+        req.fronts = &fronts;
+        req.neckWidth = neckFor( job.from, job.to );
+
+        for( const VECTOR2I& corner : job.corridor )
+            req.vias.emplace_back( corner, std::nullopt );
+
+        setDeadline( ( firstBudgetS > 0 ? firstBudgetS : 30.0 ) / 10 );
+        nlohmann::json attempt = nlohmann::json::object();
+        const bool     ok = routeOne( *context, req, attempt, added );
+        tryDeadline.reset();
+        job.ms += msSince( alongStarted );
+        profile.job = outer;
+
+        job.corridorRouted = ok;
+        corridorRoutedCount += ok;
+        done[aIndex] = done[aIndex] || ok;
+        alongTried[aIndex] = ok ? 1 : -1;
+        alongAttempt[aIndex] = attempt;
+        alongRow[aIndex] = { { "name", corridorOut[job.corridorOf].value( "name", std::string() ) },
+                             { "index", job.corridorPlace }, { "order", aOrder }, { "corners", job.corridor.size() }, { "routed", ok } };
+
+        if( !ok )
+            alongRow[aIndex]["failed"] = attempt.value( "reason", std::string() );
+    };
+
     // a first pass bounded per connection: the plateau waits until each connection has had its try
     plateauHeld = firstBudgetS > 0 ? 1 : 0;
 
     for( size_t index = 0; index < jobs.size(); ++index )
     {
         JOB& job = jobs[index];
+
+        if( job.corridorOf >= 0 && !job.corridor.empty() && job.bus < 0 && !grid && corridorsTried.insert( job.corridorOf ).second )
+        {
+            std::vector<size_t> members;
+
+            for( size_t k = 0; k < jobs.size(); ++k )
+            {
+                if( jobs[k].corridorOf == job.corridorOf && !jobs[k].corridor.empty() && jobs[k].bus < 0 && rowOf[k] < 0 )
+                    members.push_back( k );
+            }
+
+            std::stable_sort( members.begin(), members.end(),
+                              [&]( size_t x, size_t y ) { return jobs[x].corridorRank < jobs[y].corridorRank; } );
+
+            for( size_t k = 0; k < members.size(); ++k )
+                tryAlong( members[k], (int) k );
+        }
 
         if( grid && partner[index] < 0 )
             continue;   // on the grid below
@@ -7439,7 +7474,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
 
         // an airwire an earlier route (a pair's trunk, a path through a pad) already joined
-        if( !dryRun && job.to->Type() == PCB_PAD_T )
+        if( !dryRun && alongTried[index] <= 0 && job.to->Type() == PCB_PAD_T )
         {
             const auto joined = board->GetConnectivity()->GetConnectedItems( job.from );
 
@@ -7504,36 +7539,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         nlohmann::json corridorRow;
 
-        if( !ok && !job.corridor.empty() && !( job.busVia && busLayer ) )
+        if( !ok && alongTried[index] != 0 )
         {
-            const PCB_LAYER_ID padLayer = job.from->IsOnLayer( F_Cu ) ? F_Cu : job.from->IsOnLayer( B_Cu ) ? B_Cu
-                                                                                                         : job.from->GetLayerSet().CuStack().front();
-            const auto alongStarted = std::chrono::steady_clock::now();
-            const long outer = profile.job;
-            profile.job = (long) index;
+            corridorRow = alongRow[index];
 
-            if( doneOf )
-                refreshFronts();
-
-            ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
-            req.fronts = &fronts;
-            req.neckWidth = neckFor( job.from, job.to );
-
-            for( const VECTOR2I& corner : job.corridor )
-                req.vias.emplace_back( corner, std::nullopt );
-
-            attempt = nlohmann::json::object();
-            tries++;
-            ok = routeOne( *context, req, attempt, added );
-            job.ms += msSince( alongStarted );
-            profile.job = outer;
-            job.corridorRouted = ok;
-            corridorRoutedCount += ok;
-            corridorRow = { { "name", corridorOut[job.corridorOf].value( "name", std::string() ) },
-                            { "index", job.corridorPlace }, { "corners", job.corridor.size() }, { "routed", ok } };
-
-            if( !ok )
-                corridorRow["failed"] = attempt.value( "reason", std::string() );
+            if( alongTried[index] > 0 )
+            {
+                ok = true;
+                attempt = alongAttempt[index];
+            }
         }
 
         if( !ok )
@@ -14908,7 +14922,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "bus routes a bundle's members one after another in pin order, bus_layer through a diagonal via fan (answer bus, row bus); "
                    "bus_paths routes a bus along a corridor, pcb_floorplan's path between two blocks or points given: its members side by "
                    "side at their pitch across each portal of the path as fixed corners, in the order they lie across the way in, one "
-                   "after another (answer bus_paths: corridors, members, routed_along; row corridor: name, index, corners, routed, failed; "
+                   "after another (answer bus_paths: corridors, members, routed_along; row corridor: name, index, order (its place in the corridor's tries), corners, routed, failed; "
                    "a member the corridor does not route is routed as any other, one routed along it is left out of clean_up); "
                    "rip_up_scope unlocked lets the rip-up take out unlocked copper of earlier calls too (rip_up.earlier_routes_rerouted, "
                    "other_nets_moved); the first pass gives each connection first_pass_budget_s (row budget, profile budget); "
@@ -14930,7 +14944,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
                         "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
                         "ports":{"oneOf":[{"type":"boolean"},{"type":"array","items":{"type":"string"}}],"description":"layout level 1 goals: the signal pins of these packages (true: every package with 8 SMD pads or more) follow their port from pcb_fanout_ports: the way out on the pin's side is kept open to past the courtyard on the pad's layer (a pin planned round_the_part: to the courtyard's edge, it turns right past it; layer other: to the via spot the plan's fan-out would lay, the spot kept free on every layer), and the pin's routes leave through it first (the tip as a corner, or the via), arriving through the far pin's port when the layers allow; a connection that does not route that way is routed as any other. Rows routed so name port (round_the_part when planned so); ports answers per package the pins and vias planned, tries, won and ms"},
-                        "bus_paths":{"description":"pns: \"off\", \"floorplan\" (or {floorplan: {pcb_floorplan arguments}}): every bus link pcb_floorplan finds, along its corridor, the connections of its nets between the two blocks' parts; or [{name, nets, points_mm: [[x_mm, y_mm] (a free point) or {at_mm, along: x | y, lo_mm, hi_mm, into_mm: [x0, y0, x1, y1]} (a portal crossed into that region: the ribbon inside lo..hi, joined to the next portal by axis-parallel runs inside the region)]}]: the connections of those nets, from the end nearer the first point. The answer's corridors give the centre line (line_mm) the members run beside at their pitch","default":"off"},
+                        "bus_paths":{"description":"pns: \"off\", \"floorplan\" (or {floorplan: {pcb_floorplan arguments}}): every bus link pcb_floorplan finds, along its corridor, the connections of its nets between the two blocks' parts; or [{name, nets, points_mm: [[x_mm, y_mm] (a free point) or {at_mm, along: x | y, lo_mm, hi_mm, into_mm: [x0, y0, x1, y1]} (a portal crossed into that region: the ribbon inside lo..hi, joined to the next portal by axis-parallel runs inside the region)]}]: the connections of those nets, from the end nearer the first point. A corridor is a soft goal: at the turn of its first connection each member gets one try along it, across it in order, in a tenth of first_pass_budget_s; the members it does not route keep their turn and their usual tries with their whole budget. The answer's corridors give the centre line (line_mm) the members run beside at their pitch","default":"off"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again, up to 3 choices of them per connection and round; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
