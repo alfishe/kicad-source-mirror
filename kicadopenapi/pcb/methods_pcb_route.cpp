@@ -4047,6 +4047,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // stage detail, a time policy: a branch is one of many and the grid's copper is its fallback, so one
     // branch gets a tenth of a connection's first-pass time (3 s when that is unbounded)
     const double branchBudgetS = std::clamp( aArgs.value( "detail_branch_budget_s", firstBudgetS > 0 ? firstBudgetS / 10 : 3.0 ), 0.0, 3600.0 );
+    // a time policy: a corridor's try along it is a soft goal (the member keeps its own turn and whole budget
+    // after), so it gets the same share
+    const double corridorTryBudgetS = std::clamp( aArgs.value( "corridor_try_budget_s", firstBudgetS > 0 ? firstBudgetS / 10 : 3.0 ), 0.0, 3600.0 );
     std::optional<std::chrono::steady_clock::time_point> tryDeadline;
     std::string budgetName = "first_pass_budget_s";
 
@@ -8951,7 +8954,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     };
 
     // corridors as soft goals: at the turn of a corridor's first connection, each of its members one try
-    // along it, across it in order, in a tenth of the connection's budget (3 s without one); a member it
+    // along it, across it in order, in corridor_try_budget_s; a member it
     // routes is kept for its own turn, the others keep their turn and whole budget as without the corridor
     std::vector<int>            alongTried( jobs.size(), 0 );   // 1: routed along, -1: failed along
     std::vector<nlohmann::json> alongAttempt( jobs.size() ), alongRow( jobs.size() );
@@ -9013,7 +9016,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             }
         }
 
-        setDeadline( ( firstBudgetS > 0 ? firstBudgetS : 30.0 ) / 10 );
+        setDeadline( corridorTryBudgetS );
         nlohmann::json attempt = nlohmann::json::object();
         const bool     ok = routeOne( *context, req, attempt, added );
 
@@ -17971,7 +17974,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "max_rounds":{"type":"integer","default":40,"description":"grid: negotiation rounds before the nets still crowding each other are routed apart or left out"},
                         "cell_mm":{"type":"number","default":0,"description":"grid: the cell, 0 a third of the finest track pitch (width + clearance) on a 0.025 mm step (stage global: half the pitch)"},
                         "stage":{"type":"string","enum":["full","global","detail"],"default":"full","description":"engine grid: full lays the grid's copper; detail: the global stage, then the grid's copper of each net cut into branches between its junctions (ends, points where three ways meet), each branch by pns along its corridor (read as bus_paths reads one: the lane's corners and via gates as waypoints; bundles first, then branches between two ends, then onto a junction, shorter first; one that does not route tries its via sites alone, then the grid's copper of it through the guard): rows engine pns with detail branches, or engine grid with pns_detail (why pns did not); grid.detail {branches, by_corridor, by_via_sites, already_joined, to_grid_copper}; global only finds each connection's way on a coarse grid (cell half a track pitch), nothing laid: per connection from, to, found, corridor (the shared corridor type, docs corridor.md: {name, net, from, to, points_mm: gates at the corners {at_mm, along, lo_mm = hi_mm, layer, rooms_mm}, via gates {at_mm, via: {from_layer, to_layer}, layer}, the last a free point}; rooms are runs of free cells widened up to 1 mm, other nets' never overlap; bus_paths takes it as given), vias_mm (where it changes layer), layers, length_mm; answer connections, covered, vias, grid (variant, cell_mm, rounds, build_ms, route_ms, variant_stats)"},
-                        "race_wait":{"type":"number","default":0.25,"description":"grid: once the first variant is done, the others get this share of its time again (race_wait_min_s at least); stages global and detail 0.1 (a time policy: their grid result is a plan the detail stage refines)"},"race_wait_min_s":{"type":"number","default":2,"minimum":0,"description":"grid: the least time the other variants get once the first is done (seconds)"},"detail_branch_budget_s":{"type":"number","minimum":0,"description":"stage detail: seconds pns gets for one branch along its corridor (a time policy: a branch is one of many and has the grid's copper as its fallback); default first_pass_budget_s / 10, 3 when that is 0"},
+                        "race_wait":{"type":"number","default":0.25,"description":"grid: once the first variant is done, the others get this share of its time again (race_wait_min_s at least); stages global and detail 0.1 (a time policy: their grid result is a plan the detail stage refines)"},"race_wait_min_s":{"type":"number","default":2,"minimum":0,"description":"grid: the least time the other variants get once the first is done (seconds)"},"corridor_try_budget_s":{"type":"number","minimum":0,"description":"seconds one member's try along its corridor gets at the turn of the corridor's first connection (a time policy: the try is a soft goal, the member keeps its own turn and budget after); default first_pass_budget_s / 10, 3 when that is 0"},"detail_branch_budget_s":{"type":"number","minimum":0,"description":"stage detail: seconds pns gets for one branch along its corridor (a time policy: a branch is one of many and has the grid's copper as its fallback); default first_pass_budget_s / 10, 3 when that is 0"},
                         "via_keepout_mm":{"type":"number","default":5,"description":"grid: only a chip's own nets put vias this far around it (pads on four sides, or an array outside its balls) while the board routes; other nets left short and, once all are joined, the via-saving pass may use it; 0 off"},
                         "bundles":{"description":"grid: \"auto\" (pcb_net_roles' bundles), \"off\", or [{name, nets}] in member order: a bundle's nets between the same parts are routed first, side by side (the answer's grid.bundles: name, parts, nets)","default":"auto"},
                         "via_away_mm":{"type":"number","default":7,"description":"grid: a signal via nearer a chip's pads (not an array's) than this costs more, linearly to the pads; 0 off"},
