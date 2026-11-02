@@ -25,7 +25,13 @@
 #include <kiway.h>
 #include <frame_type.h>
 #include <pcb_edit_frame.h>
+#include <eda_group.h>
+#include <pcb_field.h>
 #include <pcb_track.h>
+#include <project/project_file.h>
+#include <string_utils.h>
+#include <template_fieldnames.h>
+#include <kicadopenapi_registry.h>
 #include <wildcards_and_files_ext.h>
 
 #include <picosha2.h>
@@ -35,6 +41,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 
@@ -438,12 +445,216 @@ static KOPENAPI_RESULT h_pcb_footprint_update( KOPENAPI_CONTEXT& aCtx, const nlo
             return KOPENAPI_RESULT::Error( 400, std::string( key ) + ": true or false" );
     }
 
+    // the field edits of Footprint Properties / Bulk Edit Footprint Fields: name -> text, null removes
+    std::map<wxString, std::optional<wxString>> fieldEdits;
+    std::map<wxString, bool>                    showEdits;
+    const wxString refName = GetDefaultFieldName( FIELD_T::REFERENCE, UNTRANSLATED );
+    const wxString valueName = GetDefaultFieldName( FIELD_T::VALUE, UNTRANSLATED );
+    const wxString fpName = GetDefaultFieldName( FIELD_T::FOOTPRINT, UNTRANSLATED );
+
+    if( aArgs.contains( "fields" ) )
+    {
+        if( !aArgs["fields"].is_object() )
+            return KOPENAPI_RESULT::Error( 400, "fields: {name: text, or null to remove}" );
+
+        for( const auto& [key, val] : aArgs["fields"].items() )
+        {
+            const wxString name = wxString::FromUTF8( key );
+
+            if( name.IsEmpty() || ( !val.is_string() && !val.is_null() ) )
+                return KOPENAPI_RESULT::Error( 400, "fields: {name: text, or null to remove}" );
+
+            if( name.CmpNoCase( fpName ) == 0 )
+                return KOPENAPI_RESULT::Error( 400, "fields: Footprint is the library link: lib_id" );
+
+            if( name.CmpNoCase( refName ) == 0 )
+                return KOPENAPI_RESULT::Error( 400, "fields: the reference is renamed with reference" );
+
+            if( val.is_null() )
+                fieldEdits[name] = std::nullopt;
+            else
+                fieldEdits[name] = wxString::FromUTF8( val.get<std::string>() );
+        }
+    }
+
+    if( aArgs.contains( "value" ) )
+    {
+        if( !aArgs["value"].is_string() )
+            return KOPENAPI_RESULT::Error( 400, "value: text" );
+
+        fieldEdits[valueName] = wxString::FromUTF8( aArgs["value"].get<std::string>() );
+    }
+
+    for( const auto& [name, text] : fieldEdits )
+    {
+        if( !text && ( name.CmpNoCase( valueName ) == 0
+                       || name.CmpNoCase( GetDefaultFieldName( FIELD_T::DATASHEET, UNTRANSLATED ) ) == 0
+                       || name.CmpNoCase( GetDefaultFieldName( FIELD_T::DESCRIPTION, UNTRANSLATED ) ) == 0 ) )
+        {
+            return KOPENAPI_RESULT::Error( 400, "fields: " + str( name ) + " is mandatory and cannot be removed" );
+        }
+    }
+
+    if( aArgs.contains( "show_fields" ) )
+    {
+        if( !aArgs["show_fields"].is_object() )
+            return KOPENAPI_RESULT::Error( 400, "show_fields: {name: true or false}" );
+
+        for( const auto& [key, val] : aArgs["show_fields"].items() )
+        {
+            if( !val.is_boolean() )
+                return KOPENAPI_RESULT::Error( 400, "show_fields: {name: true or false}" );
+
+            showEdits[wxString::FromUTF8( key )] = val.get<bool>();
+        }
+    }
+
+    wxString newRef;
+
+    if( aArgs.contains( "reference" ) )
+    {
+        if( !aArgs["reference"].is_string() )
+            return KOPENAPI_RESULT::Error( 400, "reference: the new reference designator" );
+
+        newRef = wxString::FromUTF8( aArgs["reference"].get<std::string>() );
+
+        if( fps.size() != 1 )
+            return KOPENAPI_RESULT::Error( 400, "reference: renames one footprint (ref), not several" );
+
+        if( newRef.IsEmpty() || newRef.find_first_of( wxS( " \t\r\n" ) ) != wxString::npos )
+            return KOPENAPI_RESULT::Error( 400, "reference: not empty, no whitespace" );
+
+        if( newRef != fps.front()->GetReference() && !aArgs.value( "allow_duplicate", false ) )
+        {
+            for( FOOTPRINT* other : board->Footprints() )
+            {
+                if( other != fps.front() && other->GetReference() == newRef )
+                {
+                    KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 409, "reference " + str( newRef ) + " is taken "
+                                                                     "(allow_duplicate: true keeps both)" );
+                    r.body["taken_by"] = str( other->m_Uuid.AsString() );
+                    return r;
+                }
+            }
+        }
+    }
+
+    // field values go to a variant as in the editor: the board's current one unless variant is given
+    wxString variant = board->GetCurrentVariant();
+
+    if( aArgs.contains( "variant" ) )
+    {
+        if( !aArgs["variant"].is_string() )
+            return KOPENAPI_RESULT::Error( 400, "variant: a variant name, \"\" for the base values" );
+
+        variant = wxString::FromUTF8( aArgs["variant"].get<std::string>() );
+
+        if( !variant.IsEmpty() && variant.CmpNoCase( GetDefaultVariantName() ) != 0 && !board->HasVariant( variant ) )
+            return KOPENAPI_RESULT::Error( 404, "variant: no variant " + str( variant ) );
+    }
+
+    const bool baseValues = variant.IsEmpty() || variant.CmpNoCase( GetDefaultVariantName() ) == 0;
+
+    if( !baseValues )
+    {
+        for( const auto& [name, text] : fieldEdits )
+        {
+            if( !text )
+                return KOPENAPI_RESULT::Error( 400, "fields: a field is removed from the base values (variant \"\")" );
+        }
+    }
+
+    TEMPLATES* templates = board->GetProject() ? &board->GetProject()->GetProjectFile().m_TemplateFieldNames : nullptr;
+
     BOARD_COMMIT   commit( context->GetToolManager() );
     nlohmann::json items = nlohmann::json::array();
+    nlohmann::json warnings = nlohmann::json::array();
+    std::string    oldRef;
+    bool           renamed = false, valueChanged = false, fieldsChanged = false;
 
     for( FOOTPRINT* fp : fps )
     {
         commit.Modify( fp );
+
+        if( !newRef.IsEmpty() && newRef != fp->GetReference() )
+        {
+            oldRef = str( fp->GetReference() );
+            fp->SetReference( newRef );
+            renamed = true;
+        }
+
+        for( const auto& [name, text] : fieldEdits )
+        {
+            PCB_FIELD* field = nullptr;
+
+            for( PCB_FIELD* candidate : fp->GetFields() )
+            {
+                if( candidate->GetName().CmpNoCase( name ) == 0 )
+                    field = candidate;
+            }
+
+            if( !text )
+            {
+                if( field && !field->IsMandatory() )
+                {
+                    if( EDA_GROUP* parentGroup = field->GetParentGroup() )
+                        parentGroup->RemoveItem( field );
+
+                    fp->Remove( field );
+                    delete field;
+                    fieldsChanged = true;
+                }
+                else if( !field )
+                {
+                    warnings.push_back( str( fp->GetReference() ) + " has no field " + str( name ) );
+                }
+
+                continue;
+            }
+
+            if( !field )
+            {
+                field = new PCB_FIELD( fp, FIELD_T::USER, name );
+                field->SetLayer( fp->GetLayer() == F_Cu ? F_Fab : B_Fab );
+                field->SetFPRelativePosition( { 0, 0 } );
+                field->StyleFromSettings( board->GetDesignSettings(), true );
+
+                const TEMPLATE_FIELDNAME* tmpl = templates ? templates->GetFieldName( name ) : nullptr;
+                field->SetVisible( tmpl ? tmpl->m_Visible : false );
+                fp->Add( field );
+            }
+
+            if( field->IsPrivate() )
+                field->SetPrivate( false );
+
+            const wxString newText = board->ConvertCrossReferencesToKIIDs( *text );
+
+            if( fp->GetFieldValueForVariant( variant, field->GetName() ) != newText )
+            {
+                if( baseValues )
+                    field->SetText( newText );
+                else if( FOOTPRINT_VARIANT* v = fp->AddVariant( variant ) )
+                    v->SetFieldValue( field->GetName(), newText );
+
+                ( name.CmpNoCase( valueName ) == 0 ? valueChanged : fieldsChanged ) = true;
+            }
+        }
+
+        for( const auto& [name, show] : showEdits )
+        {
+            PCB_FIELD* field = nullptr;
+
+            for( PCB_FIELD* candidate : fp->GetFields() )
+            {
+                if( candidate->GetName().CmpNoCase( name ) == 0 )
+                    field = candidate;
+            }
+
+            if( field )
+                field->SetVisible( show );
+            else
+                warnings.push_back( str( fp->GetReference() ) + " has no field " + str( name ) );
+        }
 
         if( aArgs.contains( "type" ) )
             fp->SetFootprintType( footprintTypes().at( aArgs["type"].get<std::string>() ) );
@@ -470,14 +681,75 @@ static KOPENAPI_RESULT h_pcb_footprint_update( KOPENAPI_CONTEXT& aCtx, const nlo
                            { "exclude_from_bom", fp->IsExcludedFromBOM() },
                            { "exclude_from_pos", fp->IsExcludedFromPosFiles() },
                            { "dnp", fp->IsDNP() } } );
+
+        if( !fieldEdits.empty() || !showEdits.empty() || !newRef.IsEmpty() )
+        {
+            nlohmann::json fields = nlohmann::json::object();
+
+            for( const PCB_FIELD* field : fp->GetFields() )
+            {
+                fields[str( field->GetName() )] = { { "text", str( board->ConvertKIIDsToCrossReferences(
+                                                                    fp->GetFieldValueForVariant( variant, field->GetName() ) ) ) },
+                                                    { "visible", field->IsVisible() } };
+            }
+
+            items.back()["value"] = str( fp->GetFieldValueForVariant( variant, valueName ) );
+            items.back()["fields"] = fields;
+
+            if( !oldRef.empty() && fps.size() == 1 )
+                items.back()["old_ref"] = oldRef;
+        }
     }
 
     commit.Push( _( "Update footprint properties (API)" ) );
+    context->SetContentModified();
 
     nlohmann::json result = { { "updated", items.size() }, { "items", items } };
 
+    if( !baseValues )
+        result["variant"] = str( variant );
+
     if( !missing.empty() )
         result["missing"] = missing;
+
+    if( !warnings.empty() )
+        result["warnings"] = warnings;
+
+    // references, values and fields reach the schematic through Update Schematic from PCB
+    const nlohmann::json backAnnotate = aArgs.value( "back_annotate", nlohmann::json( "auto" ) );
+
+    const bool schematicSide = renamed || valueChanged || fieldsChanged;
+
+    if( schematicSide && baseValues && backAnnotate != false )
+    {
+        std::optional<KOPENAPI_METHOD> update = KOPENAPI_REGISTRY::Get().Find( "design_update_schematic" );
+        KOPENAPI_RESULT                sch = update ? update->handler( aCtx, { { "references", renamed },
+                                                                              { "footprints", false },
+                                                                              { "values", valueChanged },
+                                                                              { "net_names", false },
+                                                                              { "attributes", false },
+                                                                              { "other_fields", fieldsChanged } } )
+                                                    : KOPENAPI_RESULT::Error( 503, "design_update_schematic is not available" );
+
+        if( sch.status == 200 )
+        {
+            result["schematic"] = { { "changes", sch.body.value( "changes", 0 ) },
+                                    { "errors", sch.body.value( "errors", 0 ) } };
+
+            if( sch.body.value( "errors", 0 ) > 0 )
+                result["schematic"]["messages"] = sch.body["messages"];
+        }
+        else
+        {
+            result["schematic"] = { { "skipped", sch.body.value( "error", nlohmann::json::object() )
+                                                          .value( "message", std::string( "no schematic open" ) ) } };
+        }
+    }
+
+    if( schematicSide && baseValues && !result.contains( "schematic" ) )
+        result["next"] = "the schematic keeps the old text: design_update_schematic (KiCad's Update Schematic from PCB)";
+    else if( result.contains( "schematic" ) && result["schematic"].contains( "skipped" ) )
+        result["next"] = "the schematic keeps the old text: open it (sch_open), then design_update_schematic";
 
     return KOPENAPI_RESULT::Ok( result );
 }
@@ -893,13 +1165,27 @@ static KOPENAPI_RESULT h_pcb_parts_check( KOPENAPI_CONTEXT& aCtx, const nlohmann
 KOPENAPI_REGISTER( "pcb_footprint_update",
                    "Change a placed footprint's properties (ref or refs): type (smd / through_hole / "
                    "unspecified), lib_id (relink to another library footprint; the copper stays), board_only, "
-                   "exclude_from_bom, exclude_from_pos, dnp; one undo step; answers the new values",
+                   "exclude_from_bom, exclude_from_pos, dnp; as Footprint Properties / Bulk Edit Footprint "
+                   "Fields: reference (rename one footprint; a taken reference 409 unless allow_duplicate), "
+                   "value, fields {name: text (a new field is added hidden on Fab), null removes a user field}, "
+                   "show_fields {name: visible}; field values go to the board's current variant unless variant "
+                   "(\"\" = base values). One undo step; answers the new values and fields. back_annotate (default "
+                   "auto: a schematic is open) then runs Update Schematic from PCB with references, values and "
+                   "other fields",
                    R"json({"type":"object","properties":{
                         "ref":{"type":"string"},"refs":{"type":"array","items":{"type":"string"}},
                         "type":{"type":"string","enum":["smd","through_hole","unspecified"]},
                         "lib_id":{"type":"string","description":"\"Library:Footprint\""},
                         "board_only":{"type":"boolean"},"exclude_from_bom":{"type":"boolean"},
-                        "exclude_from_pos":{"type":"boolean"},"dnp":{"type":"boolean"}}})json"_json,
+                        "exclude_from_pos":{"type":"boolean"},"dnp":{"type":"boolean"},
+                        "reference":{"type":"string","description":"new reference designator (one footprint)"},
+                        "allow_duplicate":{"type":"boolean","default":false},
+                        "value":{"type":"string"},
+                        "fields":{"type":"object","additionalProperties":{"type":["string","null"]},
+                                  "description":"name -> text; null removes a user field"},
+                        "show_fields":{"type":"object","additionalProperties":{"type":"boolean"}},
+                        "variant":{"type":"string","description":"default: the board's current variant; \"\" = base"},
+                        "back_annotate":{"oneOf":[{"type":"boolean"},{"type":"string","enum":["auto"]}],"default":"auto"}}})json"_json,
                    false, h_pcb_footprint_update );
 
 KOPENAPI_REGISTER( "pcb_footprint_delete",
