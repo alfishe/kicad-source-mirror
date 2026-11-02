@@ -453,6 +453,9 @@ void BOARD::IncrementTimeStamp()
 
     m_timeStamp++;
     clearCachesLocked();
+
+    if( m_designSettings && m_designSettings->m_DRCEngine )
+        m_designSettings->m_DRCEngine->OnBoardChanged();
 }
 
 

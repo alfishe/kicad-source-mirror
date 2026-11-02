@@ -770,6 +770,7 @@ void DRC_ENGINE::compileRules()
 
     m_hasExplicitClearanceRules = false;
     m_hasGeometryDependentRules = false;
+    m_ownClearanceVolatile = false;
     m_explicitConstraints.clear();
 
     for( auto& [constraintType, ruleList] : m_constraintMap )
@@ -782,6 +783,14 @@ void DRC_ENGINE::compileRules()
 
                 if( constraintType == CLEARANCE_CONSTRAINT )
                     m_hasExplicitClearanceRules = true;
+
+                // a condition can read what a board change alters (an item's width or place,
+                // a courtyard it lies in): the own-clearance cache is cleared on every change
+                if( c->condition
+                    && ( constraintType == CLEARANCE_CONSTRAINT || constraintType == HOLE_CLEARANCE_CONSTRAINT ) )
+                {
+                    m_ownClearanceVolatile = true;
+                }
 
                 if( !m_hasGeometryDependentRules
                     && c->condition
@@ -3175,7 +3184,14 @@ int DRC_ENGINE::GetCachedOwnClearance( const BOARD_ITEM* aItem, PCB_LAYER_ID aLa
 {
     DRC_OWN_CLEARANCE_CACHE_KEY key{ aItem->m_Uuid, aLayer };
 
-    // Fast path: check cache with shared (read) lock
+    // Keyed by uuid: a clone or a dry-run item shares or reuses one without being the board's
+    // item, a router transient is never invalidated; their clearance is computed fresh.  The
+    // source is not cached.
+    const BOARD* board = aItem->GetBoard();
+    const bool   cacheable = !( aItem->GetFlags() & ROUTER_TRANSIENT )
+                           && ( aItem->IsIndexedInBoard() || ( board && board->IsFootprintHolder() ) );
+
+    if( cacheable && !aSource )
     {
         std::shared_lock<std::shared_mutex> readLock( m_clearanceCacheMutex );
 
@@ -3213,6 +3229,7 @@ int DRC_ENGINE::GetCachedOwnClearance( const BOARD_ITEM* aItem, PCB_LAYER_ID aLa
     }
 
     // Store in cache with exclusive (write) lock using double-checked locking
+    if( cacheable )
     {
         std::unique_lock<std::shared_mutex> writeLock( m_clearanceCacheMutex );
 
@@ -3248,6 +3265,23 @@ void DRC_ENGINE::ClearClearanceCache()
 {
     std::unique_lock<std::shared_mutex> writeLock( m_clearanceCacheMutex );
     m_ownClearanceCache.clear();
+}
+
+
+void DRC_ENGINE::OnBoardChanged()
+{
+    if( !m_ownClearanceVolatile )
+        return;
+
+    std::unique_lock<std::shared_mutex> writeLock( m_clearanceCacheMutex );
+    m_ownClearanceCache.clear();
+}
+
+
+size_t DRC_ENGINE::OwnClearanceCacheSize() const
+{
+    std::shared_lock<std::shared_mutex> readLock( m_clearanceCacheMutex );
+    return m_ownClearanceCache.size();
 }
 
 

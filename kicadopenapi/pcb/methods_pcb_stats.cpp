@@ -11,6 +11,7 @@
 #include <base_units.h>
 #include <board.h>
 #include <board_design_settings.h>
+#include <drc/drc_engine.h>
 #include <board_statistics_report.h>
 #include <connectivity/connectivity_data.h>
 #include <footprint.h>
@@ -366,6 +367,9 @@ static KOPENAPI_RESULT h_pcb_stats( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     out["rules"] = rulesSummary( board );
     out["rule_caches"] = { { "entries", board->RuleCacheEntries() } };
 
+    if( std::shared_ptr<DRC_ENGINE> drc = board->GetDesignSettings().m_DRCEngine )
+        out["rule_caches"]["own_clearance_entries"] = drc->OwnClearanceCacheSize();
+
     out["elapsed_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - start )
                                 .count();
@@ -408,7 +412,9 @@ KOPENAPI_REGISTER( "pcb_stats",
                    "zones and rule areas, nets, unrouted connections; design-rule defaults (rules: minimum clearance, "
                    "track width, via, drill, edge and hole clearances; net classes with clearance, track width, via size "
                    "and net_count; member nets: pcb_rules_get); rule_caches.entries: entries held by the rule-expression "
-                   "caches (courtyard/area/keepout/field), dropped on every board change",
+                   "caches (courtyard/area/keepout/field), dropped on every board change; rule_caches.own_clearance_entries: "
+                   "the board items' own clearances held for the clearance outlines and the router (dropped on every "
+                   "board change when a custom clearance rule has a condition)",
                    R"json({"type":"object","properties":{}})json"_json, false, h_pcb_stats );
 
 KOPENAPI_REGISTER( "pcb_clearance_stats",

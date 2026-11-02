@@ -274,6 +274,14 @@ public:
     void ClearClearanceCache();
 
     /**
+     * Called by the board on every change: clears the own-clearance cache when a custom clearance
+     * rule has a condition (its answer can follow an item's width, place or neighbours).
+     */
+    void OnBoardChanged();
+
+    size_t OwnClearanceCacheSize() const;
+
+    /**
      * Pre-populate the clearance cache for the items whose clearance outline is drawn, so the
      * first render does not evaluate rules item by item.  Entries already cached are kept; the
      * rest is filled on demand by GetCachedOwnClearance().
@@ -423,6 +431,7 @@ protected:
     mutable std::shared_mutex m_clearanceCacheMutex;
     bool m_hasExplicitClearanceRules = false;
     bool m_hasGeometryDependentRules = false;
+    bool m_ownClearanceVolatile = false;
     bool m_hasDiffPairClearanceOverrides = false;
     std::map<DRC_CONSTRAINT_T, std::vector<DRC_ENGINE_CONSTRAINT*>> m_explicitConstraints;
 };

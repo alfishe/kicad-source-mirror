@@ -14726,6 +14726,11 @@ static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
             row["locked"] = t->IsLocked();
             row["dangling"] = conn && conn->TestTrackEndpointDangling( t, true );
 
+            wxString source;
+            t->GetOwnClearance( t->GetLayer(), &source );
+            row["clearance_mm"] = toMm( t->GetOwnClearance( t->GetLayer() ) );
+            row["clearance_source"] = str( source );
+
             if( t->Type() == PCB_VIA_T )
             {
                 PCB_VIA*       via = static_cast<PCB_VIA*>( t );
@@ -17610,7 +17615,7 @@ KOPENAPI_REGISTER( "pcb_track_list",
                         "limit":{"type":"integer","default":500,"description":"items per page, 1..5000 (ignored with full)"},
                         "cursor":{"type":"string","description":"next_cursor of the previous page"},
                         "offset":{"type":"integer","default":0,"description":"the same as cursor, as a number (next_offset)"},
-                        "full":{"type":"boolean","default":false,"description":"everything: every item (no limit or cursor) with all fields: net_code, netclass, locked, dangling; vias: via_type, layer_span; arcs: mid_mm; large on a big design"}}})json"_json,
+                        "full":{"type":"boolean","default":false,"description":"everything: every item (no limit or cursor) with all fields: net_code, netclass, locked, dangling, clearance_mm / clearance_source (its own clearance as the clearance outline and the router use it, and the rule it comes from); vias: via_type, layer_span; arcs: mid_mm; large on a big design"}}})json"_json,
                    false, h_pcb_track_list );
 
 KOPENAPI_REGISTER( "pcb_via_list",
