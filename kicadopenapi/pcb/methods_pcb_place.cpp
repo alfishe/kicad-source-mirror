@@ -3382,11 +3382,64 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         return it == heights.end() ? std::nullopt : std::optional<double>( it->second );
     };
 
+    struct POSE
+    {
+        VECTOR2I  pos;
+        EDA_ANGLE angle;
+        bool      flipped;
+    };
+
+    // a part placed before (a board laid out already, the block placed again) stays where it was when
+    // that is clear of the other courtyards and the kept corridors and no farther from its target
+    auto keepIfNearer = [&]( FOOTPRINT* aPart, PAD* aTarget, const POSE& aWas, NEAR_PLACEMENT& aPlacement,
+                             const NEAR_OPTIONS& aPlaceOptions )
+    {
+        if( !aPlacement.ok || !aPlacement.partPad || viaSpotOf.count( aPart ) )
+            return;
+
+        const POSE now{ aPart->GetPosition(), aPart->GetOrientation(), aPart->IsFlipped() };
+
+        auto pose = [&]( const POSE& aPose )
+        {
+            if( aPart->IsFlipped() != aPose.flipped )
+                aPart->Flip( aPart->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );
+
+            aPart->SetOrientation( aPose.angle );
+            aPart->SetPosition( aPose.pos );
+        };
+
+        pose( aWas );
+
+        const double was = toMm( ( aPlacement.partPad->GetPosition() - aTarget->GetPosition() ).EuclideanNorm() );
+        bool         keep = was <= aPlacement.padDistanceMm;
+
+        if( keep )
+        {
+            const SHAPE_POLY_SET area = courtyard( aPart );
+            const PLACE_SPACE    space( aBoard, aPart, aWas.pos, 0, nullptr, 0, std::nullopt, aPlaceOptions.corridors,
+                                        &viaSpots );
+            keep = space.Free( area, area.BBox(), VECTOR2I( 0, 0 ) );
+        }
+
+        if( keep )
+        {
+            aPlacement.padDistanceMm = was;
+            aPlacement.direction = "kept";
+            aPlacement.corridor.clear();
+            aPlacement.under.clear();
+        }
+        else
+        {
+            pose( now );
+        }
+    };
+
     for( const MEMBER& member : members )
     {
         const int net = member.nets.front();
         PAD*      target = nullptr;
         double    bestScore = std::numeric_limits<double>::max();
+        const POSE was{ member.part->GetPosition(), member.part->GetOrientation(), member.part->IsFlipped() };
 
         for( PAD* candidate : anchorPads[net] )
         {
@@ -3610,6 +3663,8 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             }
         }
 
+        keepIfNearer( member.part, target, was, placement, options );
+
         // a series part on a signal pin across from the one on its neighbour pin (a pair's resistors
         // the other way round than their pins): the two alike trade places, so their ways do not cross
         const bool series = isSeries( member ) && !viaPad;
@@ -3779,6 +3834,8 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
             aCommit.Modify( part );
 
+            const POSE was{ part->GetPosition(), part->GetOrientation(), part->IsFlipped() };
+
             if( ( aAnchor->IsFlipped() != part->IsFlipped() ) != aOpposite )
                 part->Flip( part->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );
 
@@ -3786,7 +3843,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             options.partPad.clear();
             options.partHeight = heightOf( part );
 
-            const NEAR_PLACEMENT placement = placeNear( aBoard, part, target, options );
+            NEAR_PLACEMENT placement = placeNear( aBoard, part, target, options );
+
+            keepIfNearer( part, target, was, placement, options );
 
             if( placement.ok )
             {
@@ -5684,7 +5743,8 @@ KOPENAPI_REGISTER( "pcb_place_group",
                    "net of the anchor (max_net_pads); from_schematic: the members of the anchor's block in the "
                    "open schematic. A part bound to a member rather than to the anchor goes next to that "
                    "member, or to a part placed at the anchor by an earlier call. decoupling: per_pin / "
-                   "schematic (listed in the answer). Parts stay inside the board outline; a part low enough "
+                   "schematic (listed in the answer). A part already where it is no farther from its target than the new spot, clear of "
+                   "the other courtyards and the kept corridors (a board laid out already), stays (direction kept). Parts stay inside the board outline; a part low enough "
                    "(3D model) may go under a footprint with the field max_height_under_mm (a daughterboard "
                    "over its headers: only its pads are in the way; the row says under). side opposite: on "
                    "the other side of the board, under the pads. groups: several blocks in one call, in order. "
