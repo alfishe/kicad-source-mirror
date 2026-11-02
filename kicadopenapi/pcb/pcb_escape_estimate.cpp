@@ -1,10 +1,12 @@
 #include "pcb_escape_estimate.h"
+#include "rail_plan.h"
 
 #include <base_units.h>
 #include <board.h>
 #include <board_design_settings.h>
 #include <footprint.h>
 #include <netclass.h>
+#include <netinfo.h>
 #include <pad.h>
 #include <pcb_track.h>
 #include <zone.h>
@@ -21,6 +23,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <vector>
 
@@ -95,6 +98,7 @@ struct ESCAPE_CONNECTION
     PAD*             to = nullptr;
     bool             toInside = true;
     std::vector<int> path;
+    std::vector<int> viaNodes;   ///< the cells its vias take, on every layer
     int              vias = 0;
     double           lengthMm = 0;
     bool             found = false;
@@ -320,6 +324,136 @@ ESCAPE_ESTIMATE EstimateEscape( BOARD* aBoard, FOOTPRINT* aPart, const std::set<
         }
     }
 
+    // the rails' stitching vias, through every layer (a rail with a plane on another layer): the runs of
+    // the anchor's rail pins as pcb_stitch plans them inward, every other rail pad one at the nearest
+    // spot beside it
+    std::map<int, std::set<PCB_LAYER_ID>> planeLayers;
+
+    for( ZONE* zone : aBoard->Zones() )
+    {
+        if( !zone->GetIsRuleArea() && aRails.count( zone->GetNetCode() ) )
+        {
+            for( PCB_LAYER_ID layer : zone->GetLayerSet().CuStack() )
+                planeLayers[zone->GetNetCode()].insert( layer );
+        }
+    }
+
+    auto reserveVia = [&]( const VECTOR2I& aAt, int aDia, int aNet )
+    {
+        BOX2I bb( aAt, VECTOR2I( 0, 0 ) );
+        bb.Inflate( aDia / 2 + reach );
+
+        for( int l = 0; l < (int) grid.layers.size(); ++l )
+            grid.Mark( l, bb, aNet, [&]( const VECTOR2I& p ) { return ( p - aAt ).EuclideanNorm() <= aDia / 2 + reach; } );
+
+        out.railVias++;
+        out.railViaSpots.push_back( { pcbIUScale.IUTomm( aAt.x ), pcbIUScale.IUTomm( aAt.y ) } );
+    };
+
+    auto hasPlane = [&]( int aNet, PCB_LAYER_ID aBesides )
+    {
+        const auto planes = planeLayers.find( aNet );
+        return planes != planeLayers.end()
+               && std::any_of( planes->second.begin(), planes->second.end(), [&]( PCB_LAYER_ID l ) { return l != aBesides; } );
+    };
+
+    std::set<const PAD*> planned;
+
+    for( PAD* pad : aPart->Pads() )
+    {
+        if( !aRails.count( pad->GetNetCode() ) )
+            continue;
+
+        NETINFO_ITEM*     net = pad->GetNet();
+        NETCLASS*         nc = net ? net->GetNetClass() : nullptr;
+        RAIL_PLAN_OPTIONS options;
+        options.classViaDia = nc && nc->HasViaDiameter() ? nc->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
+        options.classViaDrill = nc && nc->HasViaDrill() ? nc->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
+        boardMinVia( aBoard, net, options.classViaDia, options.classViaDrill, options.minViaDia, options.minViaDrill );
+
+        for( const RAIL_PIN_PLAN& plan : planRowRailVias( aBoard, aPart, options ) )
+        {
+            if( !plan.planned || planned.count( plan.pad ) || !hasPlane( plan.pad->GetNetCode(), plan.pad->GetPrincipalLayer() ) )
+                continue;
+
+            planned.insert( plan.pad );
+            reserveVia( plan.spot, plan.dia, plan.pad->GetNetCode() );
+
+            for( int l = 0; l < (int) grid.layers.size(); ++l )
+            {
+                if( !plan.pad->IsOnLayer( grid.layers[l] ) )
+                    continue;
+
+                BOX2I bb( plan.stub.A, VECTOR2I( 0, 0 ) );
+                bb.Merge( plan.stub.B );
+                bb.Inflate( reach );
+                grid.Mark( l, bb, plan.pad->GetNetCode(), [&]( const VECTOR2I& p ) { return plan.stub.Distance( p ) <= reach; } );
+            }
+        }
+
+        break;
+    }
+
+    BOX2I partCentres( aPart->GetPosition(), VECTOR2I( 0, 0 ) );
+
+    for( PAD* pad : aPart->Pads() )
+        partCentres.Merge( pad->GetPosition() );
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        for( PAD* pad : fp->Pads() )
+        {
+            const int netCode = pad->GetNetCode();
+
+            if( !aRails.count( netCode ) || !grid.Inside( pad->GetPosition() ) || pad->HasHole() )
+                continue;
+
+            if( fp == aPart && ( planned.count( pad ) || std::find( rowPads.begin(), rowPads.end(), pad ) == rowPads.end() ) )
+                continue;
+
+            const PCB_LAYER_ID padLayer = pad->GetPrincipalLayer();
+
+            if( !hasPlane( netCode, padLayer ) )
+                continue;
+
+            // an anchor's pin: inward, as pcb_stitch puts it, its way out left open
+            const std::optional<VECTOR2I> outward = fp == aPart ? outwardOf( pad, partCentres ) : std::nullopt;
+            std::shared_ptr<SHAPE>        shape = pad->GetEffectiveShape( padLayer );
+            const BOX2I                   padBox = pad->GetBoundingBox();
+            const int              span = std::max( padBox.GetWidth(), padBox.GetHeight() ) / 2 + via + clearance;
+            const int              c0 = ( pad->GetPosition().x - grid.box.GetLeft() ) / grid.cell;
+            const int              r0 = ( pad->GetPosition().y - grid.box.GetTop() ) / grid.cell;
+            const int              k = span / grid.cell + 1;
+            int                    bestC = -1, bestR = -1;
+            double                 best = std::numeric_limits<double>::max();
+
+            for( int r = std::max( 0, r0 - k ); r <= std::min( grid.rows - 1, r0 + k ); ++r )
+            {
+                for( int c = std::max( 0, c0 - k ); c <= std::min( grid.cols - 1, c0 + k ); ++c )
+                {
+                    const VECTOR2I at = grid.Centre( c, r );
+                    const double   d = ( at - pad->GetPosition() ).EuclideanNorm();
+
+                    if( outward && ( (int64_t) ( at - pad->GetPosition() ).x * outward->x
+                                     + (int64_t) ( at - pad->GetPosition() ).y * outward->y ) > 0 )
+                    {
+                        continue;
+                    }
+
+                    if( d < best && d <= span && !shape->Collide( at, via / 2 ) && grid.ViaFits( c, r, netCode ) )
+                    {
+                        best = d;
+                        bestC = c;
+                        bestR = r;
+                    }
+                }
+            }
+
+            if( bestC >= 0 )
+                reserveVia( grid.Centre( bestC, bestR ), via, netCode );
+        }
+    }
+
     // the connections: per net with a pad in the box, the shortest tree over its pads, its edges with
     // an end in the box (an end outside: the other one is taken as the start)
     std::vector<ESCAPE_CONNECTION> conns;
@@ -395,6 +529,23 @@ ESCAPE_ESTIMATE EstimateEscape( BOARD* aBoard, FOOTPRINT* aPart, const std::set<
             n += u != aNet;
 
         return n;
+    };
+
+    // a via's cells on every layer
+    auto viaBlock = [&]( int aCol, int aRow )
+    {
+        std::vector<int> block;
+
+        for( int l = 0; l < (int) grid.layers.size(); ++l )
+        {
+            for( int r = std::max( 0, aRow - grid.viaReach ); r <= std::min( grid.rows - 1, aRow + grid.viaReach ); ++r )
+            {
+                for( int c = std::max( 0, aCol - grid.viaReach ); c <= std::min( grid.cols - 1, aCol + grid.viaReach ); ++c )
+                    block.push_back( grid.Node( l, c, r ) );
+            }
+        }
+
+        return block;
     };
 
     auto route = [&]( ESCAPE_CONNECTION& aConn, double aPresent, bool aHard )
@@ -482,17 +633,34 @@ ESCAPE_ESTIMATE EstimateEscape( BOARD* aBoard, FOOTPRINT* aPart, const std::set<
                 relax( next, k < 4 ? step : diagonal );
             }
 
-            if( grid.layers.size() > 1 && grid.ViaFits( c, r, aConn.net ) && !( aHard && others( n, aConn.net ) > 0 ) )
+            if( grid.layers.size() > 1 && grid.ViaFits( c, r, aConn.net ) )
             {
-                for( int ll = 0; ll < (int) grid.layers.size(); ++ll )
+                int crowd = 0;
+
+                for( int b : viaBlock( c, r ) )
+                    crowd = std::max( crowd, others( b, aConn.net ) );
+
+                if( !( aHard && crowd > 0 ) )
                 {
-                    if( ll != l )
-                        relax( grid.Node( ll, c, r ), viaCost );
+                    const double price = viaCost * ( 1.0 + history[n] ) * ( 1.0 + aPresent * crowd );
+
+                    for( int ll = 0; ll < (int) grid.layers.size(); ++ll )
+                    {
+                        const int next = grid.Node( ll, c, r );
+
+                        if( ll != l && d + price < dist[next] )
+                        {
+                            dist[next] = d + price;
+                            from[next] = n;
+                            open.push( { dist[next], next } );
+                        }
+                    }
                 }
             }
         }
 
         aConn.path.clear();
+        aConn.viaNodes.clear();
         aConn.vias = 0;
         aConn.lengthMm = 0;
         aConn.found = bestNode >= 0;
@@ -510,6 +678,13 @@ ESCAPE_ESTIMATE EstimateEscape( BOARD* aBoard, FOOTPRINT* aPart, const std::set<
             if( a / grid.Cells() != b / grid.Cells() )
             {
                 aConn.vias++;
+
+                for( int v : viaBlock( a % grid.cols, ( a % grid.Cells() ) / grid.cols ) )
+                {
+                    if( std::find( aConn.path.begin(), aConn.path.end(), v ) == aConn.path.end() )
+                        aConn.viaNodes.push_back( v );
+                }
+
                 continue;
             }
 
@@ -527,7 +702,12 @@ ESCAPE_ESTIMATE EstimateEscape( BOARD* aBoard, FOOTPRINT* aPart, const std::set<
 
     auto take = [&]( ESCAPE_CONNECTION& aConn, int aSign )
     {
-        for( int n : aConn.path )
+        std::vector<int> cells = aConn.path;
+        cells.insert( cells.end(), aConn.viaNodes.begin(), aConn.viaNodes.end() );
+        std::sort( cells.begin(), cells.end() );
+        cells.erase( std::unique( cells.begin(), cells.end() ), cells.end() );
+
+        for( int n : cells )
         {
             if( aSign > 0 )
             {
@@ -599,7 +779,11 @@ ESCAPE_ESTIMATE EstimateEscape( BOARD* aBoard, FOOTPRINT* aPart, const std::set<
 
         for( ESCAPE_CONNECTION& conn : conns )
         {
-            if( conn.found && std::any_of( conn.path.begin(), conn.path.end(), [&]( int n ) { return others( n, conn.net ) > 0; } ) )
+            auto crowded = [&]( int n ) { return others( n, conn.net ) > 0; };
+
+            if( conn.found
+                && ( std::any_of( conn.path.begin(), conn.path.end(), crowded )
+                     || std::any_of( conn.viaNodes.begin(), conn.viaNodes.end(), crowded ) ) )
                 overflowing++;
         }
 
