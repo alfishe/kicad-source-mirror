@@ -2506,6 +2506,103 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             lanes.push_back( l );
         }
 
+        // the room round the package as pcb_floorplan's boxes give it: the parts' courtyards, those within a
+        // pitch of each other one box; on each side from the courtyard to the nearest other box facing it, or
+        // to the board's edge
+        int64_t room[4] = { court.GetLeft() - (int64_t) edges.GetLeft(), court.GetTop() - (int64_t) edges.GetTop(),
+                            edges.GetRight() - (int64_t) court.GetRight(), edges.GetBottom() - (int64_t) court.GetBottom() };
+        {
+            std::vector<BOX2I> boxes;
+            std::vector<bool>  own;
+
+            for( FOOTPRINT* fp : board->Footprints() )
+            {
+                boxes.push_back( courtyardOf( fp ).BBox() );
+                own.push_back( fp == a.fp );
+            }
+
+            for( bool grew = true; grew; )
+            {
+                grew = false;
+
+                for( size_t i = 0; i < boxes.size(); ++i )
+                {
+                    for( size_t j = 0; !own[i] && j < boxes.size(); ++j )
+                    {
+                        BOX2I grown = boxes[j];
+                        grown.Inflate( pitch );
+
+                        if( own[j] && grown.Intersects( boxes[i] ) )
+                        {
+                            own[i] = true;
+                            grew = true;
+                        }
+                    }
+                }
+            }
+
+            for( size_t i = 0; i < boxes.size(); ++i )
+            {
+                const BOX2I& x = boxes[i];
+
+                if( own[i] )
+                    continue;
+
+                const bool acrossY = x.GetBottom() > court.GetTop() && x.GetTop() < court.GetBottom();
+                const bool acrossX = x.GetRight() > court.GetLeft() && x.GetLeft() < court.GetRight();
+
+                if( acrossY && x.GetRight() <= court.GetLeft() )
+                    room[0] = std::min<int64_t>( room[0], court.GetLeft() - x.GetRight() );
+
+                if( acrossX && x.GetBottom() <= court.GetTop() )
+                    room[1] = std::min<int64_t>( room[1], court.GetTop() - x.GetBottom() );
+
+                if( acrossY && x.GetLeft() >= court.GetRight() )
+                    room[2] = std::min<int64_t>( room[2], x.GetLeft() - court.GetRight() );
+
+                if( acrossX && x.GetTop() >= court.GetBottom() )
+                    room[3] = std::min<int64_t>( room[3], x.GetTop() - court.GetBottom() );
+            }
+        }
+
+        // how far past the courtyard the ways out of each side's pins reach, as pcb_route's escape fronts have
+        // them: from the pad's end a via of its net with a clearance on both sides, staggered where two vias do
+        // not fit side by side at the pins' pitch
+        int64_t wayOut[4] = { 0, 0, 0, 0 };
+
+        for( const PORT& q : ports )
+        {
+            const int qSide = sideIndex( q.padSide );
+
+            if( qSide < 0 )
+                continue;
+
+            double pinPitch = std::numeric_limits<double>::max();
+
+            for( PAD* o : a.fp->Pads() )
+            {
+                if( o != q.pad )
+                    pinPitch = std::min<double>( pinPitch, ( o->GetPosition() - q.pad->GetPosition() ).EuclideanNorm() );
+            }
+
+            NETCLASS*    netclass = q.pad->GetEffectiveNetClass();
+            const int    clearance = std::max( ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0 );
+            const int    dia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
+            const double apart = dia + clearance;
+            const int64_t depth = 2 * clearance + dia + ( pinPitch < apart ? KiROUND( std::sqrt( apart * apart - pinPitch * pinPitch ) ) : 0 );
+            const BOX2I   box = q.pad->GetBoundingBox();
+            const int64_t end = qSide == 0 ? court.GetLeft() - (int64_t) box.GetLeft() : qSide == 1 ? court.GetTop() - (int64_t) box.GetTop()
+                                : qSide == 2 ? box.GetRight() - (int64_t) court.GetRight() : box.GetBottom() - (int64_t) court.GetBottom();
+            wayOut[qSide] = std::max( wayOut[qSide], end + depth );
+        }
+
+        // the farthest offset a lane may take: its track and a clearance inside the room of every side it runs by
+        auto limit = [&]( const LANE& l ) -> int64_t
+        {
+            const int64_t r = l.turn == 2 ? std::min( room[l.own], room[l.next] ) : room[l.own];
+            return r - l.width / 2 - l.clearance;
+        };
+
         auto overlaps = [&]( const LANE& x, const LANE& y )
         {
             for( int64_t k : { -loop, (int64_t) 0, loop } )
@@ -2530,7 +2627,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             if( l.turn == 2 )
                 l.pts.push_back( cornerOf( l.next, l.to, aOff ) );
 
-            l.pts.push_back( l.pts.back() + outward[l.to] * ( 2 * pitch ) );
+            l.pts.push_back( l.pts.back() + outward[l.to] * pitch );
         };
 
         // what a lane meets past the courtyard: other parts' pads and other nets' tracks and vias on its layer
@@ -2686,8 +2783,6 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             return true;
         };
 
-        const int steps = 16;
-
         for( size_t m = 0; m < order.size(); ++m )
         {
             LANE& l = lanes[order[m]];
@@ -2708,29 +2803,27 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             }
 
             // out past the fan-out's vias: where it lies with nothing else in the way
-            for( int step = 0; step < steps; ++step )
+            for( build( l, off ); !clearsSpots( l ) && off + pitch <= limit( l ); build( l, off ) )
             {
-                build( l, off );
-
-                if( clearsSpots( l ) )
-                    break;
-
                 off += pitch;
                 l.nominal += pitch;
             }
 
+            // out past other copper while the room lasts
             for( int step = 0;; ++step )
             {
                 build( l, off + step * pitch );
                 std::set<std::string> who;
 
-                if( !meets( l, who ) )
+                if( !meets( l, who ) && off + step * pitch <= limit( l ) )
                     break;
 
                 l.blockedBy.insert( who.begin(), who.end() );
 
-                if( step == steps )
+                if( off + ( step + 1 ) * pitch > limit( l ) )
                 {
+                    l.blockedBy.insert( "room" );
+
                     l.blocked = true;
                     build( l, off );
                     break;
@@ -2747,9 +2840,10 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         std::set<size_t>      yielded;   // lanes that yield: onto the other layer by the pin's fan-out via
         std::set<const PORT*> dives;     // pins whose straight way out yields: down by their fan-out via
 
-        // the lanes leaving by one corner to one side end on one front, two pitches past the outermost: they
-        // leave it side by side, none cutting across the ends of those inside it; a straight one runs out past
-        // the lanes running by its pin
+        // the lanes leaving by one corner to one side end on one front, the next slot (a pitch) past the
+        // outermost and clear of the ways out of that side's pins, within the room on that side: they leave it
+        // side by side, none cutting across the ends of those inside it nor across a pin's way out; a straight
+        // one runs out past the lanes running by its pin
         auto finish = [&]()
         {
             std::map<std::pair<int, int>, int> front;
@@ -2770,7 +2864,13 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                     continue;
 
                 LANE&     l = lanes[k];
-                const int farLine = lineAt( l.to, front[{ l.turn == 2 ? l.next : l.own, l.to }] + 2 * pitch );
+                const int64_t outer = front[{ l.turn == 2 ? l.next : l.own, l.to }];
+                const int64_t past = std::max<int64_t>( outer + pitch, wayOut[l.to] + l.clearance + l.width / 2 );
+                const int     far = lineAt( l.to, (int) std::max<int64_t>( outer, std::min<int64_t>( past, room[l.to] - l.width / 2 - l.clearance ) ) );
+
+                // published to the micron (polyline_mm): rounded outward, so the front holds as read
+                const double  um = pcbIUScale.mmToIU( 0.001 );
+                const int     farLine = KiROUND( ( outward[l.to].x + outward[l.to].y > 0 ? std::ceil( far / um ) : std::floor( far / um ) ) * um );
 
                 if( l.to % 2 == 0 )
                     l.pts.back().x = farLine;
@@ -2985,15 +3085,15 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                 const int    saved = l.off;
                 const double before = lengthOf( l );
 
-                for( int off = lanes[other].off + pitch; off <= lanes[other].off + steps * pitch; off += pitch )
+                for( int64_t off = lanes[other].off + pitch; off <= limit( l ); off += pitch )
                 {
-                    l.off = off;
+                    l.off = (int) off;
                     finish();
                     std::set<std::string> who;
 
                     if( !crossesAny( z ) && clearsSpots( l ) && !meets( l, who ) && hasRoom( l ) )
                     {
-                        options.push_back( { z, off, 0, lengthOf( l ) - before } );
+                        options.push_back( { z, (int) off, 0, lengthOf( l ) - before } );
                         break;
                     }
                 }
@@ -3785,9 +3885,10 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "on its pad's layer is to run in round the package, planned before any route: per lane the pad, "
                    "net, side, turn, way (cw / ccw), sides passed, rank (0 innermost: the pin nearest its corner), "
                    "offset_mm past the courtyard, polyline_mm (pad end, out to the offset, the corners, out past the "
-                   "last to one front for the lanes leaving there, two pitches past the outermost), shift_mm and moved_by (other parts' pads, other nets' tracks or vias in its way: "
-                   "moved out a pitch at a time, the lanes outside it with it), blocked_by (still in the way after "
-                   "16 pitches), clear of the vias the package's fan-out lays by its pads (pcb_fanout dry run: the rails' and moved pins' as "
+                   "last to one front for the lanes leaving there, a pitch past the outermost and a clearance past the ways out of that side's pins as pcb_route's escape fronts have them, within the room on that side), shift_mm and moved_by (other parts' pads, other nets' tracks or vias in its way: "
+                   "moved out a pitch at a time, the lanes outside it with it), blocked_by (still in the way where the "
+                   "room ends, or room: the room round the package as pcb_floorplan's boxes give it, courtyards a pitch "
+                   "apart one box, from the courtyard to the nearest other box or the board's edge), clear of the vias the package's fan-out lays by its pads (pcb_fanout dry run: the rails' and moved pins' as "
                    "planned, every other pin not turning where its via would go; via_spots: pad, at_mm) by a via's half, a clearance and its "
                    "half width along its runs past its pad, off_board, crossings with other lanes on its layer; straight ones run out past the "
                    "lanes going by their pin. The pins of one side going round the part to one far part all go one way round: the way whose "
