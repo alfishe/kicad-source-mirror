@@ -14,6 +14,7 @@
 /// face (pcb_layout_graph); a box side's free facing length per layer is its port capacity.
 #include "kopenapi_pcb.h"
 
+#include <numeric>
 #include <api/pcb_context.h>
 #include <base_units.h>
 #include <board.h>
@@ -188,6 +189,8 @@ struct LINK
     std::vector<int> cuts;
     std::set<int>    crosses;
     std::vector<int> topologyOnly;   ///< nets in the bus by their ends only, not by their name
+    std::vector<std::pair<VECTOR2I, VECTOR2I>> pins;   ///< per net its hop's pads at a and at b
+    int              cluster = -1;     ///< a bus split by its pins' spread: the cluster's index
     std::vector<std::array<double, 4>> corridor;   ///< portal crossings in path order: x, y (mm), portal, region entered
     double           length = 0;
     bool             found = false;
@@ -715,6 +718,25 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     std::map<std::tuple<int, int, std::string>, LINK> linkMap;
+    std::map<int, std::pair<double, std::string>>     netRule;   ///< net -> its width + clearance (mm), class
+
+    auto addNet = [&]( LINK& aLink, int aNet, const VECTOR2I& aAtA, const VECTOR2I& aAtB )
+    {
+        aLink.nets.push_back( aNet );
+        aLink.pins.emplace_back( aAtA, aAtB );
+        aLink.demand += netRule[aNet].first;
+
+        if( topologyOnly.count( aNet ) && !aLink.bus.empty() )
+            aLink.topologyOnly.push_back( aNet );
+
+        for( int x : netBoxes[aNet][aLink.a] )
+            aLink.aBoxes.insert( x );
+
+        for( int x : netBoxes[aNet][aLink.b] )
+            aLink.bBoxes.insert( x );
+
+        aLink.classes.insert( netRule[aNet].second );
+    };
 
     for( const auto& [net, set] : netBlocks )
     {
@@ -739,8 +761,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             classes[className] = classRule( nc, className );
 
         const FP_CLASS& rule = classes[className];
-        const double    width = toMm( rule.width + rule.clearance );
         auto            bus = busOfNet.find( net );
+        netRule[net] = { toMm( rule.width + rule.clearance ), className };
 
         for( size_t added = 1; added < pads.size(); ++added )
         {
@@ -775,25 +797,113 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             l.a = a;
             l.b = b;
             l.bus = bus == busOfNet.end() ? std::string() : bus->second;
-            l.nets.push_back( net );
-            l.demand += width;
-
-            if( topologyOnly.count( net ) && !l.bus.empty() )
-                l.topologyOnly.push_back( net );
-
-            for( int x : netBoxes[net][a] )
-                l.aBoxes.insert( x );
-
-            for( int x : netBoxes[net][b] )
-                l.bBoxes.insert( x );
-            l.classes.insert( className );
+            const bool fromA = pads[bj].first == a;
+            addNet( l, net, fromA ? pads[bj].second : pads[via[bj]].second, fromA ? pads[via[bj]].second : pads[bj].second );
         }
     }
 
+    // a bus is a ribbon only where its pins lie close at both ends: within bus_spread_k times the ribbon's
+    // width (its lines at their pitch) across each end; a bus spread wider is cut, in the order its pins
+    // lie at a, into clusters that fit, each its own link; a pin alone goes with the single nets
+    const double      spreadK = std::max( 0.0, aArgs.value( "bus_spread_k", 4.0 ) );
+    std::vector<LINK> clusters;
+    std::vector<std::tuple<int, int, std::string>> splitKeys;
+
+    for( auto& [key, l] : linkMap )
+    {
+        if( l.bus.empty() || l.nets.size() < 2 || spreadK <= 0 )
+            continue;
+
+        const int reach = iu( spreadK * l.demand );
+        BOX2I     spanA( l.pins.front().first, VECTOR2I( 0, 0 ) );
+
+        for( const auto& [atA, atB] : l.pins )
+            spanA.Merge( atA );
+
+        const bool          alongX = spanA.GetWidth() >= spanA.GetHeight();
+        std::vector<size_t> order( l.nets.size() );
+        std::iota( order.begin(), order.end(), 0 );
+        std::stable_sort( order.begin(), order.end(), [&]( size_t x, size_t y )
+                          { return alongX ? l.pins[x].first.x < l.pins[y].first.x : l.pins[x].first.y < l.pins[y].first.y; } );
+
+        std::vector<std::vector<size_t>> groups;
+        BOX2I                            boxA, boxB;
+
+        for( size_t k : order )
+        {
+            BOX2I a = boxA, b = boxB;
+            a.Merge( l.pins[k].first );
+            b.Merge( l.pins[k].second );
+
+            if( groups.empty() || std::max( a.GetWidth(), a.GetHeight() ) > reach || std::max( b.GetWidth(), b.GetHeight() ) > reach )
+            {
+                groups.push_back( { k } );
+                boxA = BOX2I( l.pins[k].first, VECTOR2I( 0, 0 ) );
+                boxB = BOX2I( l.pins[k].second, VECTOR2I( 0, 0 ) );
+                continue;
+            }
+
+            groups.back().push_back( k );
+            boxA = a;
+            boxB = b;
+        }
+
+        if( groups.size() == 1 )
+            continue;
+
+        splitKeys.push_back( key );
+        int cluster = 0;
+
+        for( const std::vector<size_t>& g : groups )
+        {
+            if( g.size() < 2 )
+                continue;
+
+            LINK part;
+            part.a = l.a;
+            part.b = l.b;
+            part.bus = l.bus;
+            part.cluster = cluster++;
+
+            for( size_t k : g )
+                addNet( part, l.nets[k], l.pins[k].first, l.pins[k].second );
+
+            clusters.push_back( std::move( part ) );
+        }
+    }
+
+    for( const auto& key : splitKeys )
+    {
+        LINK bus = std::move( linkMap[key] );
+        linkMap.erase( key );
+        std::set<int> clustered;
+
+        for( const LINK& c : clusters )
+        {
+            if( c.a == bus.a && c.b == bus.b && c.bus == bus.bus )
+                clustered.insert( c.nets.begin(), c.nets.end() );
+        }
+
+        for( size_t k = 0; k < bus.nets.size(); ++k )
+        {
+            if( clustered.count( bus.nets[k] ) )
+                continue;
+
+            LINK& singles = linkMap[{ bus.a, bus.b, std::string() }];
+            singles.a = bus.a;
+            singles.b = bus.b;
+            addNet( singles, bus.nets[k], bus.pins[k].first, bus.pins[k].second );
+        }
+    }
+
+    const int         busesSplit = (int) splitKeys.size();
     std::vector<LINK> links;
 
     for( auto& [key, l] : linkMap )
         links.push_back( std::move( l ) );
+
+    for( LINK& c : clusters )
+        links.push_back( std::move( c ) );
 
     // a bus leaves (enters) a block by the side of its end part that its pads face
     const bool portSides = aArgs.value( "port_sides", true );
@@ -1467,8 +1577,32 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         using ENTRY = std::pair<double, int>;
         std::priority_queue<ENTRY, std::vector<ENTRY>, std::greater<ENTRY>> open;
 
+        // at an end whose boxes reach farther than a ribbon's spread (bus_spread_k ribbons, an edge
+        // connector's long row): the way starts by its pins' middle there, and its cost runs on to it at b
+        double pinAX = 0, pinAY = 0, pinBX = 0, pinBY = 0;
+
+        for( const auto& [atA, atB] : aLink.pins )
+        {
+            pinAX += toMm( atA.x ) / aLink.pins.size();
+            pinAY += toMm( atA.y ) / aLink.pins.size();
+            pinBX += toMm( atB.x ) / aLink.pins.size();
+            pinBY += toMm( atB.y ) / aLink.pins.size();
+        }
+
+        BOX2I source = boxes[*fromBoxes.begin()].box;
+
+        for( int k : fromBoxes )
+            source.Merge( boxes[k].box );
+
+        const int  spread = iu( spreadK * aLink.demand );
+        const bool anchorA = !aLink.pins.empty() && spreadK > 0 && std::max( source.GetWidth(), source.GetHeight() ) > spread;
+        const bool anchorB = !aLink.pins.empty() && spreadK > 0 && std::max( target.GetWidth(), target.GetHeight() ) > spread;
+
         auto relax = [&]( int aNode, double aCost, int aPrev, std::pair<double, double> aAt )
         {
+            if( anchorB && intoTarget( aNode ) )
+                aCost += std::abs( aAt.first - pinBX ) + std::abs( aAt.second - pinBY );
+
             if( seenAt[aNode] != epoch || aCost < cost[aNode] )
             {
                 seenAt[aNode] = epoch;
@@ -1491,8 +1625,17 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 if( aOn && portalSide( portals[p], aLink.aPort ) != aLink.aSide )
                     continue;
 
-                if( !barred( node ) )
+                if( barred( node ) )
+                    continue;
+
+                if( !anchorA )
+                {
                     relax( node, cutCost( portals[p].cut ), -1, nearest( portals[p], cx, cy ) );
+                    continue;
+                }
+
+                const auto at = nearest( portals[p], pinAX, pinAY );
+                relax( node, cutCost( portals[p].cut ) + std::abs( at.first - pinAX ) + std::abs( at.second - pinAY ), -1, at );
             }
         }
 
@@ -2226,6 +2369,9 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                              { "classes", l.classes }, { "found", l.found }, { "path", path },
                              { "corridor", corridorJson( l ) },
                              { "length_mm", r2( l.length ) }, { "through_blocks", through }, { "overflow", over } };
+        if( l.cluster >= 0 )
+            j["cluster"] = l.cluster;
+
         linksOver += over;
         linksMissing += !l.found;
         linksThrough += !l.crosses.empty();
@@ -2371,6 +2517,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
               { "links", linkList },
               { "ports", portList },
               { "summary", { { "links", links.size() },
+                             { "buses_split", busesSplit },
                              { "gates_merged", gatesMerged },
                              { "overflowing_links", linksOver },
                              { "links_without_path", linksMissing },
@@ -2436,6 +2583,7 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "snap_mm":{"type":"number","minimum":0,"description":"obstacle edges closer than this share one grid line (default one Default track pitch; 0: exact). Gaps narrower close, obstacles thinner keep both edges"},
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
+                        "bus_spread_k":{"type":"number","default":4,"minimum":0,"description":"a bus link is a ribbon only where its pins lie within this many times its ribbon's width (its lines at their pitch) across each end; a bus spread wider is cut, in the order of its pins at a, into clusters that fit, each its own link (link cluster: its index; summary buses_split), a pin alone goes with the single nets; at an end whose boxes reach farther than that (an edge connector's row) a link's way starts by its pins' middle there; 0: never cut nor anchored"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
                         "corridor_merge":{"type":"boolean","default":true,"description":"a corridor's gates (portals crossed) that a straight run from an earlier gate to a later one passes, inside each portal less the ribbon's half width and a pitch, are dropped; the earlier gate's rooms_mm lists the regions the run goes through (corridor.md); summary gates_merged"},
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
