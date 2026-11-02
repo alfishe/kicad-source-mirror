@@ -407,6 +407,22 @@ BOARD_BLOCKS buildBlocks( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, const GROUP_OPT
         return n > 0 && !b.rails.count( n ) && ( aOpt.maxFanout <= 0 || netPads[n] <= aOpt.maxFanout );
     };
 
+    // a supply of one anchor and a few small parts (a relay's coil net, switched by its driver
+    // transistor): the anchor reaches those parts through it
+    auto localRail = [&]( int n )
+    {
+        if( n <= 0 || !b.rails.count( n ) || b.grounds.count( n ) )
+            return false;
+
+        int anchorsOn = 0;
+        int smallOn = 0;
+
+        for( int o : netParts[n] )
+            ( isSmall( o ) ? smallOn : anchorsOn ) += b.parts[o].mechanical ? 0 : 1;
+
+        return anchorsOn == 1 && smallOn <= 3;
+    };
+
     // signal members: breadth-first from each anchor through small parts
     struct REACH
     {
@@ -434,7 +450,7 @@ BOARD_BLOCKS buildBlocks( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, const GROUP_OPT
 
             for( int n : b.parts[cur].nets )
             {
-                if( !signalNet( n ) )
+                if( !signalNet( n ) && !( cur == a && localRail( n ) ) )
                     continue;
 
                 for( int o : netParts[n] )
@@ -3201,7 +3217,8 @@ static KOPENAPI_RESULT h_pcb_space( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
 KOPENAPI_REGISTER( "pcb_blocks",
                    "Functional blocks of the placed board (groups of components, clusters, modules): each IC / "
-                   "connector with the small parts reached through its signal nets and its decoupling (rail "
+                   "connector with the small parts reached through its signal nets (and a supply of its own that only "
+                   "a few small parts share: a relay coil and its driver) and its decoupling (rail "
                    "capacitors given to the nearest supply pad), or one block per schematic sheet; per block "
                    "parts, courtyard area as a union (front / back), bbox and how full it is, centroid, tallest "
                    "part (3D model height), rails, links to other blocks (shared nets), panel edge of connectors, "
