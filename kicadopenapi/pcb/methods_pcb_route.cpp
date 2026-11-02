@@ -13765,7 +13765,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                             for( int h = 0; h < fill->HoleCount( o ); ++h )
                                 island.AddHole( fill->CHole( o, h ) );
 
-                            if( !island.Contains( pos, -1, pcbIUScale.mmToIU( 0.05 ) ) )
+                            if( !island.Contains( pos, -1, board->GetDesignSettings().m_MaxError ) )
                                 continue;   // the island this anchor belongs to
 
                             SHAPE_POLY_SET room = island;
