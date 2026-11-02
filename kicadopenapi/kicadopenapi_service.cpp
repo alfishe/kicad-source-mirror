@@ -1891,7 +1891,7 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::traceJson( const nlohmann::json& aAr
         return { { "enabled", false }, { "busy", busyJson() },
                  { "hint", "api_trace {enabled: true, buffer_bytes?, file?} starts tracing" } };
 
-    const size_t   limit = std::max( aArgs.value( "limit", 50 ), 1 );
+    const size_t   limit = KopenapiListLimit( aArgs, 50, 1, std::numeric_limits<int>::max(), "limit" );
     const std::string only = aArgs.value( "method", std::string() );
     const double   slowerMs = aArgs.value( "slower_ms", 0.0 );
     nlohmann::json calls = nlohmann::json::array();

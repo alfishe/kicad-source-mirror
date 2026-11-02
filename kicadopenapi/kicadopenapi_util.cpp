@@ -290,15 +290,22 @@ bool KopenapiFull( const nlohmann::json& aArgs )
 }
 
 
-int KopenapiListLimit( const nlohmann::json& aArgs, int aDefault, int aMin, int aMax )
+nlohmann::json KopenapiWithFull( nlohmann::json aSchema )
+{
+    aSchema["properties"]["full"] = KopenapiFullSchema();
+    return aSchema;
+}
+
+
+int KopenapiListLimit( const nlohmann::json& aArgs, int aDefault, int aMin, int aMax, const std::string& aKey )
 {
     if( KopenapiFull( aArgs ) )
         return std::numeric_limits<int>::max();
 
     int limit = aDefault;
 
-    if( aArgs.is_object() && aArgs.contains( "list_limit" ) && aArgs["list_limit"].is_number_integer() )
-        limit = static_cast<int>( std::clamp<long long>( aArgs["list_limit"].get<long long>(), aMin, aMax ) );
+    if( aArgs.is_object() && aArgs.contains( aKey ) && aArgs[aKey].is_number_integer() )
+        limit = static_cast<int>( std::clamp<long long>( aArgs[aKey].get<long long>(), aMin, aMax ) );
 
     return std::clamp( limit, aMin, aMax );
 }

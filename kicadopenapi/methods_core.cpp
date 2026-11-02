@@ -21,6 +21,7 @@
 #include <wx/app.h>
 #include <wx/log.h>
 #include <wx/stdpaths.h>
+#include <kicadopenapi_util.h>
 #include <wx/utils.h>
 
 #include <algorithm>
@@ -52,7 +53,7 @@ KOPENAPI_REGISTER( "documents", "List open documents (schematic, PCB) with path,
 static KOPENAPI_RESULT h_errors( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
 {
     const uint64_t    since = aArgs.value( "since", static_cast<uint64_t>( 0 ) );
-    const size_t      limit = std::clamp( aArgs.value( "limit", 100 ), 1, 1000 );
+    const size_t      limit = KopenapiListLimit( aArgs, 100, 1, 1000, "limit" );
     const std::string level = aArgs.value( "level", std::string( "warning" ) );
 
     nlohmann::json out = KOPENAPI_JOURNAL::Summary();
@@ -68,12 +69,12 @@ static KOPENAPI_RESULT h_errors( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs 
 KOPENAPI_REGISTER( "errors",
                    "Errors and warnings KiCad reported (never shown as dialogs): operation that caused "
                    "them, message, time, source location; poll with since=last_seq",
-                   R"json({"type":"object","properties":{
+                   KopenapiWithFull( R"json({"type":"object","properties":{
                         "since":{"type":"integer","default":0,"description":"Only records with seq greater than this"},
                         "limit":{"type":"integer","default":100,"minimum":1,"maximum":1000},
                         "level":{"type":"string","enum":["warning","error"],"default":"warning",
                                  "description":"Minimum severity"},
-                        "clear":{"type":"boolean","default":false,"description":"Drop collected records after reading"}}})json"_json,
+                        "clear":{"type":"boolean","default":false,"description":"Drop collected records after reading"}}})json"_json ),
                    false, h_errors );
 
 
@@ -456,14 +457,14 @@ KOPENAPI_REGISTER( "api_trace",
                    "answers even while KiCad is busy. Kept in a "
                    "buffer (buffer_bytes, default 1 MB) and optionally appended to a file as JSON lines "
                    "(file; null stops). Env KICAD_OPENAPI_TRACE=1 also logs every call to the journal",
-                   R"json({"type":"object","properties":{
+                   KopenapiWithFull( R"json({"type":"object","properties":{
                         "enabled":{"type":"boolean","description":"true starts tracing, false stops it and frees the buffer"},
                         "limit":{"type":"integer","default":50},
                         "with_args":{"type":"boolean","default":false},
                         "buffer_bytes":{"type":"integer","description":"set the buffer size (default 1048576)"},
                         "file":{"type":["string","null"],"description":"append every call to this file (JSON lines); null: stop"},
                         "method":{"type":"string","description":"glob on the method name"},
-                        "slower_ms":{"type":"number","description":"only calls that took longer (queued + run)"}}})json"_json,
+                        "slower_ms":{"type":"number","description":"only calls that took longer (queued + run)"}}})json"_json ),
                    false, h_api_trace );
 
 
@@ -577,7 +578,7 @@ static KOPENAPI_RESULT h_doc_changes( KOPENAPI_CONTEXT&, const nlohmann::json& a
         return KOPENAPI_RESULT::Error( 400, "domain: pcb or sch" );
 
     return KOPENAPI_RESULT::Ok( KOPENAPI_CHANGE_FEED::Since( domain, aArgs.value( "since", uint64_t( 0 ) ),
-                                                             std::clamp( aArgs.value( "limit", 100 ), 1, 1000 ),
+                                                             KopenapiListLimit( aArgs, 100, 1, 1000, "limit" ),
                                                              aArgs.value( "fold", false ) ) );
 }
 
@@ -587,12 +588,12 @@ KOPENAPI_REGISTER( "doc_changes",
                    "batch, GUI edit) with item ids added / changed / removed and its source; poll with "
                    "since=next_since. truncated: the reader missed change sets (or the document was "
                    "replaced: reset) and re-reads the document. Answered while jobs run",
-                   R"json({"type":"object","properties":{
+                   KopenapiWithFull( R"json({"type":"object","properties":{
                         "domain":{"type":"string","enum":["pcb","sch"],"default":"pcb"},
                         "since":{"type":"integer","default":0,"description":"The version last seen (next_since)"},
                         "limit":{"type":"integer","default":100,"minimum":1,"maximum":1000},
                         "fold":{"type":"boolean","default":false,
-                                "description":"One change set for the whole span (an item added then removed drops out)"}}})json"_json,
+                                "description":"One change set for the whole span (an item added then removed drops out)"}}})json"_json ),
                    false, h_doc_changes );
 
 

@@ -72,10 +72,14 @@ KICOMMON_API nlohmann::json KopenapiFullSchema();
 /// @brief True when aArgs asks for everything ("full": true)
 KICOMMON_API bool KopenapiFull( const nlohmann::json& aArgs );
 
-/// @brief A method's own cap of the lists in its answer: "list_limit" (default aDefault) within
-/// aMin..aMax; no cap with "full": true
+/// @brief aSchema with the "full" property
+KICOMMON_API nlohmann::json KopenapiWithFull( nlohmann::json aSchema );
+
+/// @brief A method's own cap: aKey ("list_limit" for the lists in its answer, "limit" for a feed's
+/// entries; default aDefault) within aMin..aMax; no cap with "full": true
 KICOMMON_API int KopenapiListLimit( const nlohmann::json& aArgs, int aDefault, int aMin = 0,
-                                    int aMax = std::numeric_limits<int>::max() );
+                                    int aMax = std::numeric_limits<int>::max(),
+                                    const std::string& aKey = "list_limit" );
 
 /// @brief aArgs with aAlias (another spelling callers use, e.g. "net" for a net's "name") as aName;
 /// aError set when both are given and differ

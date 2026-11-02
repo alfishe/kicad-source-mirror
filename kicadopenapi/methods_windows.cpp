@@ -265,7 +265,7 @@ static KOPENAPI_RESULT h_window_capture( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
 static KOPENAPI_RESULT h_progress_dialogs( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
 {
-    return KOPENAPI_RESULT::Ok( KOPENAPI_PROGRESS::Snapshot( aArgs.value( "limit", 50 ) ) );
+    return KOPENAPI_RESULT::Ok( KOPENAPI_PROGRESS::Snapshot( KopenapiListLimit( aArgs, 50, 0, 200, "limit" ) ) );
 }
 
 
@@ -273,8 +273,8 @@ KOPENAPI_REGISTER( "progress_dialogs",
                    "KiCad's progress windows (what a user waits on: loading libraries, schematic, board, "
                    "3D, DRC, ...): the open ones (title, open for ms) and the recent ones with when they "
                    "opened and closed (ms since process start, wall time) and their duration",
-                   R"json({"type":"object","properties":{
-                        "limit":{"type":"integer","default":50,"maximum":200}}})json"_json,
+                   KopenapiWithFull( R"json({"type":"object","properties":{
+                        "limit":{"type":"integer","default":50,"maximum":200}}})json"_json ),
                    false, h_progress_dialogs );
 
 

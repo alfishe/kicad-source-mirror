@@ -6,6 +6,7 @@
 
 #include <wx/dir.h>
 #include <wx/filename.h>
+#include <kicadopenapi_util.h>
 #include <wx/utils.h>
 
 #include <chrono>
@@ -344,7 +345,7 @@ void KOPENAPI_HISTORY::AfterEdit( KOPENAPI_CONTEXT& aCtx, const KOPENAPI_RESULT&
 KOPENAPI_RESULT KOPENAPI_HISTORY::Log( const nlohmann::json& aArgs ) const
 {
     IMPL*          d = const_cast<KOPENAPI_HISTORY*>( this )->impl();
-    const size_t   limit = std::max( 1, aArgs.value( "limit", 50 ) );
+    const size_t   limit = KopenapiListLimit( aArgs, 50, 1, std::numeric_limits<int>::max(), "limit" );
     nlohmann::json entries = nlohmann::json::array();
 
     for( auto it = d->log.rbegin(); it != d->log.rend() && entries.size() < limit; ++it )
@@ -741,7 +742,7 @@ KOPENAPI_REGISTER( "edit_log",
                    "Log of the API calls that changed the open schematic / board (newest first): method, "
                    "arguments, time, status; the checkpoints between them. Steps for rollback are the "
                    "successful entries",
-                   R"json({"type":"object","properties":{"limit":{"type":"integer","default":50}}})json"_json,
+                   KopenapiWithFull( R"json({"type":"object","properties":{"limit":{"type":"integer","default":50}}})json"_json ),
                    false, h_edit_log );
 
 KOPENAPI_REGISTER( "checkpoint",
