@@ -18,7 +18,9 @@ namespace kopenapi::platform
 /// @brief Root for KiCad runtime files: /tmp on macOS (as the IPC API does), the OS temp dir elsewhere
 std::filesystem::path TempRoot();
 
-/// @brief <TempRoot>/kicad/openapi — one <pid>.json per running kicadopenapi service
+/// @brief Env KOPENAPI_DISC_DIR when set and not empty (isolates a set of services and their
+/// clients from all others), else <TempRoot>/kicad/openapi — one <pid>.json per running
+/// kicadopenapi service
 std::filesystem::path DiscoveryDir();
 
 /// @brief Directory of the running executable (argv0 is the fallback)
@@ -34,6 +36,9 @@ bool ProcessAlive(long pid);
 
 /// @brief Sets an environment variable of this process (inherited by processes it starts)
 void SetEnv(const std::string& name, const std::string& value);
+
+/// @brief SetEnv for a path (any characters the OS allows in a path, on Windows too)
+void SetEnvPath(const char* name, const std::filesystem::path& value);
 
 /// @brief Starts argv[0] with argv detached from our stdio: stdin from the null device, stdout and
 /// stderr appended to logFile, own process group, default signal handling. Returns the pid,

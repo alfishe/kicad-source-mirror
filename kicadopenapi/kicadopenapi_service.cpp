@@ -1125,7 +1125,9 @@ nlohmann::json KICAD_OPENAPI_SERVICE::IMPL::openApiJson() const
         { "info",
           { { "title", "kicadopenapi" },
             { "version", KOPENAPI_VERSION },
-            { "description", "In-process Web API of a KiCad process (" + appName + ")" } } },
+            { "description", "In-process Web API of a KiCad process (" + appName + "). Each "
+                              "running service announces itself in <dir>/<pid>.json (url, mcp, status): "
+                              "dir is env KOPENAPI_DISC_DIR when set, else <tmp>/kicad/openapi" } } },
         { "servers", json::array( { { { "url", "http://" + std::string( KOPENAPI_HOST_ADDR ) + ":"
                                                      + std::to_string( port ) } } } ) },
         { "paths", paths },

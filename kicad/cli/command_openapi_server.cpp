@@ -149,7 +149,10 @@ CLI::OPENAPI_SERVER_COMMAND::OPENAPI_SERVER_COMMAND() :
         COMMAND( "openapi-server" )
 {
     m_argParser.add_description(
-            UTF8STDSTR( _( "Run the kicadopenapi Web API headless (no windows, no IPC)" ) ) );
+            UTF8STDSTR( _( "Run the kicadopenapi Web API headless (no windows, no IPC). The service "
+                           "announces itself in <dir>/<pid>.json: dir is env KOPENAPI_DISC_DIR when "
+                           "set (a set of servers and clients isolated from all others), else "
+                           "<tmp>/kicad/openapi" ) ) );
 
     m_argParser.add_argument( ARG_PATH )
             .default_value( std::string() )

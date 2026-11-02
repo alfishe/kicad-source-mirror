@@ -35,7 +35,12 @@ fs::path TempRoot()
 
 fs::path DiscoveryDir()
 {
-    return TempRoot() / "kicad" / "openapi";
+#if defined(_WIN32)
+    fs::path dir = EnvPathWindows("KOPENAPI_DISC_DIR");
+#else
+    fs::path dir = EnvPathPosix("KOPENAPI_DISC_DIR");
+#endif
+    return dir.empty() ? TempRoot() / "kicad" / "openapi" : dir;
 }
 
 fs::path ExecutableDir(const char* argv0)
@@ -84,6 +89,15 @@ bool ProcessAlive(long pid)
     return ProcessAliveWindows(pid);
 #else
     return ProcessAlivePosix(pid);
+#endif
+}
+
+void SetEnvPath(const char* name, const fs::path& value)
+{
+#if defined(_WIN32)
+    SetEnvPathWindows(name, value);
+#else
+    SetEnvPathPosix(name, value);
 #endif
 }
 

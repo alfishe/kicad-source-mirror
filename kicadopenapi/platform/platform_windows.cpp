@@ -93,6 +93,22 @@ void SetEnvWindows(const std::string& name, const std::string& value)
     _putenv_s(name.c_str(), value.c_str());
 }
 
+static std::wstring wideName(const char* name)
+{
+    return std::wstring(name, name + std::char_traits<char>::length(name));
+}
+
+std::filesystem::path EnvPathWindows(const char* name)
+{
+    const wchar_t* value = _wgetenv(wideName(name).c_str());
+    return value ? std::filesystem::path(value) : std::filesystem::path();
+}
+
+void SetEnvPathWindows(const char* name, const std::filesystem::path& value)
+{
+    _wputenv_s(wideName(name).c_str(), value.c_str());
+}
+
 bool ProcessAliveWindows(long pid)
 {
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));

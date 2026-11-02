@@ -48,6 +48,17 @@ void SetEnvPosix(const std::string& name, const std::string& value)
     setenv(name.c_str(), value.c_str(), 1);
 }
 
+std::filesystem::path EnvPathPosix(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value ? std::filesystem::path(value) : std::filesystem::path();
+}
+
+void SetEnvPathPosix(const char* name, const std::filesystem::path& value)
+{
+    setenv(name, value.c_str(), 1);
+}
+
 namespace
 {
 /// Children started by the spawn functions here: only these are collected by ProcessAlive (a child

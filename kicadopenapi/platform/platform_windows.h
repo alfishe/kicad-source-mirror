@@ -17,6 +17,8 @@ std::filesystem::path ExecutablePathWindows();
 long CurrentPidWindows();
 bool ProcessAliveWindows(long pid);
 void SetEnvWindows(const std::string& name, const std::string& value);
+std::filesystem::path EnvPathWindows(const char* name);
+void SetEnvPathWindows(const char* name, const std::filesystem::path& value);
 long SpawnDetachedWindows(const std::vector<std::string>& argv, const std::filesystem::path& logFile,
                           std::string& error);
 void KillProcessWindows(long pid);

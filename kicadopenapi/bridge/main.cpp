@@ -124,7 +124,8 @@ void Usage()
                  "  --start-timeout DUR     wait for a started instance (env KICAD_MCP_START_TIMEOUT)\n"
                  "  --kicad PATH            GUI executable (env KICAD_MCP_KICAD; default: next to the bridge)\n"
                  "  --kicad-cli PATH        kicad-cli executable (env KICAD_MCP_KICAD_CLI; default: next to the bridge)\n"
-                 "  --discovery-dir DIR     discovery directory (default <tmp>/kicad/openapi)\n"
+                 "  --discovery-dir DIR     discovery directory (env KOPENAPI_DISC_DIR; default <tmp>/kicad/openapi);\n"
+                 "                          instances this bridge starts announce themselves there too\n"
                  "Instances start from a snapshot of a macOS .app bundle (<bundle dir>/run-snapshots/), so a\n"
                  "rebuild does not change files under them; env KICAD_MCP_RUN_SNAPSHOT=0 starts the bundle itself.\n";
 }
@@ -1400,6 +1401,7 @@ int main(int argc, char** argv)
 
     // KiCad processes this bridge starts work for an agent: they never stop on a modal question
     platform::SetEnv("KICAD_OPENAPI_AGENT", "1");
+    platform::SetEnvPath("KOPENAPI_DISC_DIR", cfg->discoveryDir);
 
     // the agent's identity for remote control sessions (remote_session): one per bridge process
     bridge::SetExtraHeader("X-Kicad-Session", "bridge-" + std::to_string(platform::CurrentPid()) + "-"
