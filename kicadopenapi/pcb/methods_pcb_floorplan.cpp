@@ -191,6 +191,7 @@ struct LINK
     std::vector<int> topologyOnly;   ///< nets in the bus by their ends only, not by their name
     std::vector<std::pair<VECTOR2I, VECTOR2I>> pins;   ///< per net its hop's pads at a and at b
     int              cluster = -1;     ///< a bus split by its pins' spread: the cluster's index
+    std::string      bundle;           ///< what the rules bundle its nets by ("" none: no corridor)
     std::vector<std::array<double, 4>> corridor;   ///< portal crossings in path order: x, y (mm), portal, region entered
     double           length = 0;
     bool             found = false;
@@ -717,6 +718,59 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
+    // a bus's nets go as one ribbon (a corridor) only where the rules bundle them: a differential pair,
+    // a length or skew rule (.kicad_dru), a netclass other than Default; per bundle its own link
+    std::map<int, std::string> bundleOf;
+
+    if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+    {
+        KOPENAPI_RESULT res = roles->handler( aCtx, nlohmann::json::object() );
+
+        if( res.status == 200 )
+        {
+            const nlohmann::json rows = res.body.value( "nets", nlohmann::json::array() );
+            const nlohmann::json pairs = res.body.value( "pairs", nlohmann::json::array() );
+
+            for( const nlohmann::json& row : rows )
+            {
+                NETINFO_ITEM* net = KopenapiFindNet( board, row.value( "net", std::string() ) );
+
+                if( !net )
+                    continue;
+
+                const nlohmann::json rules = row.value( "rules", nlohmann::json::object() );
+                std::string          cls;
+
+                if( const NETCLASS* nc = net->GetNetClass() )
+                {
+                    for( const NETCLASS* part : nc->GetConstituentNetclasses() )
+                    {
+                        if( part && !part->IsDefault() && part->GetName() != NETCLASS::Default )
+                            cls += ( cls.empty() ? "" : "," ) + str( part->GetName() );
+                    }
+                }
+
+                if( rules.contains( "skew" ) )
+                    bundleOf[net->GetNetCode()] = "skew rule " + rules["skew"].value( "rule", std::string() );
+                else if( rules.contains( "length" ) )
+                    bundleOf[net->GetNetCode()] = "length rule " + rules["length"].value( "rule", std::string() );
+                else if( !cls.empty() )
+                    bundleOf[net->GetNetCode()] = "netclass " + cls;
+            }
+
+            for( const nlohmann::json& pair : pairs )
+            {
+                const std::string name = "diff pair " + pair.value( "p", std::string() ) + " / " + pair.value( "n", std::string() );
+
+                for( const char* side : { "p", "n" } )
+                {
+                    if( NETINFO_ITEM* net = KopenapiFindNet( board, pair.value( side, std::string() ) ) )
+                        bundleOf[net->GetNetCode()] = name;
+                }
+            }
+        }
+    }
+
     std::map<std::tuple<int, int, std::string>, LINK> linkMap;
     std::map<int, std::pair<double, std::string>>     netRule;   ///< net -> its width + clearance (mm), class
 
@@ -793,10 +847,13 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             if( a == b || !hops.insert( { a, b } ).second )
                 continue;
 
-            LINK&     l = linkMap[{ a, b, bus == busOfNet.end() ? std::string() : bus->second }];
+            const std::string busName = bus == busOfNet.end() ? std::string() : bus->second;
+            const std::string bundle = busName.empty() || !bundleOf.count( net ) ? std::string() : bundleOf[net];
+            LINK&     l = linkMap[{ a, b, bundle.empty() ? busName : busName + "\n" + bundle }];
             l.a = a;
             l.b = b;
-            l.bus = bus == busOfNet.end() ? std::string() : bus->second;
+            l.bus = busName;
+            l.bundle = bundle;
             const bool fromA = pads[bj].first == a;
             addNet( l, net, fromA ? pads[bj].second : pads[via[bj]].second, fromA ? pads[via[bj]].second : pads[bj].second );
         }
@@ -863,6 +920,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             part.a = l.a;
             part.b = l.b;
             part.bus = l.bus;
+            part.bundle = l.bundle;
             part.cluster = cluster++;
 
             for( size_t k : g )
@@ -880,7 +938,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
         for( const LINK& c : clusters )
         {
-            if( c.a == bus.a && c.b == bus.b && c.bus == bus.bus )
+            if( c.a == bus.a && c.b == bus.b && c.bus == bus.bus && c.bundle == bus.bundle )
                 clustered.insert( c.nets.begin(), c.nets.end() );
         }
 
@@ -2213,8 +2271,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     // order, inside it less the ribbon's half width and a pitch. The run's ends are moved along their
     // portals to fit the ribbon there too, the far end in line with the near one where it can be.
     const bool corridorMerge = aArgs.value( "corridor_merge", true );
-    const double detourK = std::max( 0.0, aArgs.value( "detour_k", 3.0 ) );
-    const int    corridorMinNets = std::max( 0, aArgs.value( "corridor_min_nets", 3 ) );
     int          corridorsDropped = 0;
     int        gatesMerged = 0;
     using AT = std::array<double, 2>;
@@ -2375,27 +2431,67 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( l.cluster >= 0 )
             j["cluster"] = l.cluster;
 
-        // a bus whose way is many times longer than the way straight across between its ends: no corridor
-        // (a ribbon that far round would take the space of the routes it passes)
-        if( !l.bus.empty() && (int) l.nets.size() < corridorMinNets && !j["corridor"].empty() )
-        {
-            j["corridor"] = nlohmann::json::array();
-            j["corridor_dropped"] = "fewer nets than corridor_min_nets";
-            corridorsDropped++;
-        }
+        if( !l.bundle.empty() )
+            j["bundle"] = l.bundle;
 
-        if( detourK > 0 && !l.bus.empty() && j["corridor"].size() >= 2 )
+        // a corridor only for nets the rules bundle, and only where every gate's free stretch holds the
+        // ribbon (its nets at their width and clearance)
+        if( !l.bus.empty() && !j["corridor"].empty() )
         {
-            const nlohmann::json& first = j["corridor"].front()["at_mm"];
-            const nlohmann::json& last = j["corridor"].back()["at_mm"];
-            const double          across = std::abs( first[0].get<double>() - last[0].get<double>() )
-                                         + std::abs( first[1].get<double>() - last[1].get<double>() );
+            std::string why;
 
-            if( l.length > detourK * std::max( across, 1.0 ) )
+            if( l.bundle.empty() )
+            {
+                why = "no rule bundles its nets (a differential pair, a length or skew rule, a netclass other than Default)";
+            }
+            else
+            {
+                const nlohmann::json& gates = j["corridor"];
+
+                for( size_t k = 0; k < gates.size() && why.empty(); ++k )
+                {
+                    const nlohmann::json& g = gates[k];
+                    const double          free = g.value( "hi_mm", 0.0 ) - g.value( "lo_mm", 0.0 );
+
+                    if( free + 1e-6 < l.demand )
+                    {
+                        why = "capacity: the gate at " + g["at_mm"].dump() + " is " + nlohmann::json( r2( free ) ).dump()
+                              + " mm free, the ribbon " + nlohmann::json( r2( l.demand ) ).dump() + " mm";
+                        break;
+                    }
+
+                    if( k + 1 == gates.size() )
+                        break;
+
+                    // a room between two gates on parallel portals (one room: the ribbon runs through it from
+                    // one to the other), across the way through it
+                    const nlohmann::json rooms = g.value( "rooms_mm", nlohmann::json::array() );
+                    const std::string    from = g.value( "along", std::string() );
+
+                    if( rooms.size() != 1 || from.empty() || from != gates[k + 1].value( "along", std::string() ) )
+                        continue;
+
+                    const bool alongX = from == "y";
+
+                    for( const nlohmann::json& room : rooms )
+                    {
+                        const double across = alongX ? room[3].get<double>() - room[1].get<double>()
+                                                     : room[2].get<double>() - room[0].get<double>();
+
+                        if( across + 1e-6 < l.demand )
+                        {
+                            why = "capacity: the room " + room.dump() + " is " + nlohmann::json( r2( across ) ).dump()
+                                  + " mm across the way, the ribbon " + nlohmann::json( r2( l.demand ) ).dump() + " mm";
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if( !why.empty() )
             {
                 j["corridor"] = nlohmann::json::array();
-                j["detour"] = r2( l.length / std::max( across, 1.0 ) );
-                j["corridor_dropped"] = "detour";
+                j["corridor_dropped"] = why;
                 corridorsDropped++;
             }
         }
@@ -2589,7 +2685,10 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                    "its end's exit side, pcb_layout_graph ends: an edge connector away from the board edge, else the pcb_fanout_ports side); ports: per box side used its facing "
                    "length (free or another box's, facing_boxes_mm) per layer as capacity against the bundles' width "
                    "through it. A bus link names its topology-only members (pcb_layout_graph net_source topology: in the bus "
-                   "by their end parts only). show: channels in "
+                   "by their end parts only). A bus's nets are one ribbon only where the rules bundle them (pcb_net_roles: a "
+                   "differential pair, a length or skew rule, a netclass other than Default): a link per bundle (bundle), and "
+                   "a corridor only for a bundle whose every gate's free stretch, and every room run through from one portal to a parallel one across that way, holds its ribbon (else corridor [], "
+                   "corridor_dropped why; summary corridors_dropped). show: channels in "
                    "the GUI coloured by use. "
                    "Read only",
                    R"json({"type":"object","properties":{
@@ -2614,8 +2713,6 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
                         "bus_spread_k":{"type":"number","default":4,"minimum":0,"description":"a bus link is a ribbon only where its pins lie within this many times its ribbon's width (its lines at their pitch) across each end; a bus spread wider is cut, in the order of its pins at a, into clusters that fit, each its own link (link cluster: its index; summary buses_split), a pin alone goes with the single nets; at an end whose boxes reach farther than that (an edge connector's row) a link's way starts by its pins' middle there; 0: never cut nor anchored"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
-                        "corridor_min_nets":{"type":"integer","default":3,"minimum":0,"description":"a bus link of fewer nets gets no corridor (corridor [], corridor_dropped)"},
-                        "detour_k":{"type":"number","default":3,"minimum":0,"description":"a bus link whose way is longer than this many times the Manhattan distance between its first and last gates gets no corridor (corridor [], corridor_dropped detour, detour: the ratio; summary corridors_dropped); 0: never dropped"},
                         "corridor_merge":{"type":"boolean","default":true,"description":"a corridor's gates (portals crossed) that a straight run from an earlier gate to a later one passes, inside each portal less the ribbon's half width and a pitch, are dropped; the earlier gate's rooms_mm lists the regions the run goes through (corridor.md); summary gates_merged"},
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
