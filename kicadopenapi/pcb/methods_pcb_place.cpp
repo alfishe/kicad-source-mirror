@@ -1879,7 +1879,42 @@ std::vector<CORRIDOR> signalCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, do
 /// @brief The anchor's port sides from the layout plan (pcb_fanout_ports): per side, the pads whose nets go
 /// to another block, as a band from the pads out past the courtyard by aKeepMm; the block's parts keep out
 /// of it, so the signals leave the block without weaving between them
-std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnchor, double aKeepMm )
+/// @brief ports_keep_mm, 3 when only open_sides is given
+double portsKeep( const nlohmann::json& aSpec )
+{
+    return aSpec.value( "ports_keep_mm", aSpec.contains( "open_sides" ) ? 3.0 : 0.0 );
+}
+
+
+std::optional<std::string> openSidesError( const nlohmann::json& aSpec )
+{
+    if( !aSpec.contains( "open_sides" ) )
+        return std::nullopt;
+
+    const nlohmann::json& open = aSpec["open_sides"];
+
+    if( open.is_number_integer() && open.get<int>() >= 0 && open.get<int>() <= 4 )
+        return std::nullopt;
+
+    if( open.is_array() )
+    {
+        for( const nlohmann::json& name : open )
+        {
+            if( !name.is_string() || ( name != "west" && name != "east" && name != "north" && name != "south" ) )
+                return "open_sides: names are west, east, north, south";
+        }
+
+        return std::nullopt;
+    }
+
+    return "open_sides: a count 0..4 (the sides with the most ports first) or a list of west / east / north / south";
+}
+
+
+/// @param aOpen which sides: null - every side with ports; a count - that many, the most ports first;
+/// a list of names - those (a named side with no ports: its whole courtyard edge)
+std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnchor, double aKeepMm,
+                                     const nlohmann::json& aOpen = nullptr )
 {
     std::optional<KOPENAPI_METHOD> ports = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" );
 
@@ -1901,8 +1936,51 @@ std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOT
     std::vector<CORRIDOR> out;
 
     const nlohmann::json  sides = r.body.value( "ports", nlohmann::json::object() );
+    static const char*    names[] = { "west", "east", "north", "south" };
+    std::vector<std::pair<std::string, int>> ranked;   // side, signal ports
 
-    for( const auto& [side, list] : sides.items() )
+    for( const char* name : names )
+    {
+        int count = 0;
+
+        if( sides.contains( name ) && sides[name].is_array() )
+        {
+            for( const nlohmann::json& port : sides[name] )
+                count += port.value( "kind", std::string() ) == "signal" ? 1 : 0;
+        }
+
+        ranked.emplace_back( name, count );
+    }
+
+    std::stable_sort( ranked.begin(), ranked.end(), []( const auto& a, const auto& b ) { return a.second > b.second; } );
+
+    std::vector<std::string> chosen;
+
+    if( aOpen.is_array() )
+    {
+        for( const nlohmann::json& name : aOpen )
+        {
+            if( name.is_string() )
+                chosen.push_back( name.get<std::string>() );
+        }
+    }
+    else if( aOpen.is_number_integer() )
+    {
+        const size_t count = size_t( std::clamp( aOpen.get<int>(), 0, 4 ) );
+
+        for( const auto& [name, ports] : ranked )
+        {
+            if( ports > 0 && chosen.size() < count )
+                chosen.push_back( name );
+        }
+    }
+    else
+    {
+        for( const auto& item : sides.items() )
+            chosen.push_back( item.key() );
+    }
+
+    for( const std::string& side : chosen )
     {
         if( side != "west" && side != "east" && side != "north" && side != "south" )
             continue;
@@ -1910,6 +1988,7 @@ std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOT
         CORRIDOR              corridor;
         std::optional<BOX2I>  span;
         std::set<std::string> to;
+        const nlohmann::json  list = sides.contains( side ) && sides[side].is_array() ? sides[side] : nlohmann::json::array();
 
         for( const nlohmann::json& port : list )
         {
@@ -1930,8 +2009,24 @@ std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOT
                 span = it->second->GetBoundingBox();
         }
 
-        if( !span || corridor.nets.size() < 2 )
+        if( ( !span || corridor.nets.size() < 2 ) && !aOpen.is_array() )
             continue;
+
+        if( !span || corridor.nets.size() < 2 )
+        {
+            corridor.nets.clear();
+            to.clear();
+            span = cy;
+
+            if( side == "west" )
+                span->SetWidth( 0 );
+            else if( side == "east" )
+                span->SetX( cy.GetRight() ), span->SetWidth( 0 );
+            else if( side == "north" )
+                span->SetHeight( 0 );
+            else
+                span->SetY( cy.GetBottom() ), span->SetHeight( 0 );
+        }
 
         BOX2I band = *span;
 
@@ -1955,7 +2050,7 @@ std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOT
         for( const std::string& t : to )
             corridor.name += ( corridor.name.back() == '(' ? "" : ", " ) + t;
 
-        corridor.name += ")";
+        corridor.name += to.empty() ? "open)" : ")";
         out.push_back( std::move( corridor ) );
     }
 
@@ -4172,7 +4267,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         std::vector<FOOTPRINT*> parts;
         NEAR_OPTIONS            options;
 
-        if( groupParts( aCtx, board, group, anchor, parts, false ) || nearOptions( group, options, 1.0 ) )
+        if( groupParts( aCtx, board, group, anchor, parts, false ) || nearOptions( group, options, 1.0 ) || openSidesError( group ) )
         {
             notes.push_back( "group skipped (anchor / parts not found or locked): " + group.dump() );
             continue;
@@ -4183,7 +4278,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         const double                escapeKeep = group.value( "escape_keep_mm", 2.0 );
         std::vector<CORRIDOR>       corridors = escapeKeep > 0 ? signalCorridors( aCtx, board, escapeKeep, parts ) : std::vector<CORRIDOR>();
 
-        for( CORRIDOR& c : portCorridors( aCtx, board, anchor, group.value( "ports_keep_mm", 0.0 ) ) )
+        for( CORRIDOR& c : portCorridors( aCtx, board, anchor, portsKeep( group ), group.value( "open_sides", nlohmann::json() ) ) )
             corridors.push_back( std::move( c ) );
 
         options.corridors = &corridors;
@@ -4361,6 +4456,9 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
         if( side != "same" && side != "opposite" )
             return fail( KOPENAPI_RESULT::Error( 400, "side: same (as the anchor) or opposite (under it, on the other side of the board)" ) );
 
+        if( std::optional<std::string> wrong = openSidesError( spec ) )
+            return fail( KOPENAPI_RESULT::Error( 400, *wrong ) );
+
         nlohmann::json decoupling;
 
         if( spec.contains( "decoupling" ) )
@@ -4400,7 +4498,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
             const double                escapeKeep = spec.value( "escape_keep_mm", 2.0 );
             std::vector<CORRIDOR>       corridors = escapeKeep > 0 ? signalCorridors( aCtx, board, escapeKeep, parts ) : std::vector<CORRIDOR>();
 
-            for( CORRIDOR& c : portCorridors( aCtx, board, anchor, spec.value( "ports_keep_mm", 0.0 ) ) )
+            for( CORRIDOR& c : portCorridors( aCtx, board, anchor, portsKeep( spec ), spec.value( "open_sides", nlohmann::json() ) ) )
                 corridors.push_back( std::move( c ) );
 
             options.corridors = &corridors;
@@ -4479,6 +4577,7 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off"},
     "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach (its pin then takes a via); default on for a fine-pitch anchor (0.65 mm or less), off otherwise; the row says side"},
     "ports_keep_mm":{"type":"number","default":0,"minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard this far, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter; a decoupling capacitor only when that alone brings it within decap_max_mm); corridors lists them as ports <side> (<far parts>); 0 off"},
+    "open_sides":{"description":"layout level 2 variants: which of the anchor's port sides ports_keep_mm keeps open (default 3 mm when only this is given): a count 0..4 - the sides with the most signal ports first; or a list of west / east / north / south - those, a side without ports along its whole courtyard edge; default every side with ports. corridors names the bands; block gives the outline each variant takes (bbox_mm, area_mm2)","oneOf":[{"type":"integer","minimum":0,"maximum":4},{"type":"array","items":{"type":"string","enum":["west","east","north","south"]}}]},
     "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
     "side":{"type":"string","enum":["same","opposite"],"default":"same"},
     "gap_mm":{"type":"number","default":1.0,"description":"between courtyards (room for tracks between the parts; TC-13 2 layers: 0.5 mm routed 68 of 81, 1.0 mm 73); by default a part that finds no place at 1.0 mm takes 0.5"},
