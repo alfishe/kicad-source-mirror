@@ -92,6 +92,11 @@ public:
                              SCHEMATIC* aSch,
                              const wxString& aDrawingSheetOverride = wxEmptyString );
 
+    /// @copydoc InitRenderSettings, without a handler: errors go to \a aReporter
+    static void InitPlotRenderSettings( SCH_RENDER_SETTINGS* aRenderSettings, const wxString& aTheme,
+                                        SCHEMATIC* aSch, const wxString& aDrawingSheetOverride,
+                                        REPORTER& aReporter );
+
 private:
     SCHEMATIC* getSchematic( const wxString& aPath, bool aRequireRoot = true );
 

@@ -258,6 +258,14 @@ SCHEMATIC* EESCHEMA_JOBS_HANDLER::getSchematic( const wxString& aPath, bool aReq
 void EESCHEMA_JOBS_HANDLER::InitRenderSettings( SCH_RENDER_SETTINGS* aRenderSettings, const wxString& aTheme,
                                                 SCHEMATIC* aSch, const wxString& aDrawingSheetOverride )
 {
+    InitPlotRenderSettings( aRenderSettings, aTheme, aSch, aDrawingSheetOverride, *m_reporter );
+}
+
+
+void EESCHEMA_JOBS_HANDLER::InitPlotRenderSettings( SCH_RENDER_SETTINGS* aRenderSettings, const wxString& aTheme,
+                                                    SCHEMATIC* aSch, const wxString& aDrawingSheetOverride,
+                                                    REPORTER& aReporter )
+{
     COLOR_SETTINGS* cs = ::GetColorSettings( aTheme );
     aRenderSettings->LoadColors( cs );
     aRenderSettings->m_ShowHiddenPins = false;
@@ -283,9 +291,9 @@ void EESCHEMA_JOBS_HANDLER::InitRenderSettings( SCH_RENDER_SETTINGS* aRenderSett
         if( !DS_DATA_MODEL::GetTheInstance().LoadFromName( path, wxGetCwd(), &aSch->Project(),
                                                            { aSch->GetEmbeddedFiles() }, &msg ) )
         {
-            m_reporter->Report( wxString::Format( _( "Error loading drawing sheet '%s'." ), path ) + wxS( "\n" ) + msg
-                                        + wxS( "\n" ),
-                                RPT_SEVERITY_ERROR );
+            aReporter.Report( wxString::Format( _( "Error loading drawing sheet '%s'." ), path ) + wxS( "\n" ) + msg
+                                      + wxS( "\n" ),
+                              RPT_SEVERITY_ERROR );
             return false;
         }
 
