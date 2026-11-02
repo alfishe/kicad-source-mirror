@@ -20,6 +20,7 @@
 #include <pcb_group.h>
 #include <pcb_io/pcb_io.h>
 #include <pcb_io/pcb_io_mgr.h>
+#include <pcb_io/common/plugin_common_layer_mapping.h>
 #include <project.h>
 #include <tool/tool_manager.h>
 #include <wildcards_and_files_ext.h>
@@ -279,6 +280,315 @@ KOPENAPI_RESULT h_pcb_design_block_save( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 }
 
 
+/// @brief What Append Board brought into the board
+struct APPENDED
+{
+    std::vector<BOARD_ITEM*> added;      ///< every new item, footprints' children excluded
+    std::vector<BOARD_ITEM*> top;        ///< the ones a selection would hold (not in a group that came along)
+    int                      netsAdded = 0;
+    VECTOR2I                 anchor;     ///< the top-left item's position before any move
+    VECTOR2I                 delta;
+    nlohmann::json           warnings = nlohmann::json::array();
+    nlohmann::json           layers = nlohmann::json::object();   ///< foreign layers mapped
+    nlohmann::json           unmapped = nlohmann::json::array();  ///< foreign layers not brought in
+};
+
+
+/// @brief As the editor's Append Board: aFile read into the board through its plugin, nets by
+/// name, the board's stackup kept, the layers it uses enabled, the new items staged in aCommit
+/// and moved so the top-left one is at aAt. Foreign layers map by aLayerMap (name -> KiCad
+/// layer name), else the plugin's best guess. nullopt with aError / aStatus on failure; the
+/// board is then as before
+std::optional<APPENDED> appendBoard( BOARD* aBoard, BOARD_COMMIT& aCommit, const wxString& aFile,
+                                     PCB_IO_MGR::PCB_FILE_T aType, const std::optional<VECTOR2I>& aAt,
+                                     const nlohmann::json& aLayerMap, std::string& aError, int& aStatus )
+{
+    APPENDED                out;
+    BOARD_ITEM_SET          existingItems = aBoard->GetItemSet();
+    std::set<NETINFO_ITEM*> existingNets;
+
+    for( NETINFO_ITEM* net : aBoard->GetNetInfo() )
+        existingNets.insert( net );
+
+    for( BOARD_ITEM* item : existingItems )
+        item->SetFlags( SKIP_STRUCT );
+
+    auto clearSkipStruct = [&]()
+    {
+        for( BOARD_ITEM* item : existingItems )
+            item->ClearFlags( SKIP_STRUCT );
+    };
+
+    std::map<wxString, wxString> oldProperties = aBoard->GetProperties();
+    PAGE_INFO                    oldPageInfo = aBoard->GetPageSettings();
+    TITLE_BLOCK                  oldTitleBlock = aBoard->GetTitleBlock();
+    const int                    initialCopperLayerCount = aBoard->GetCopperLayerCount();
+    const LSET                   initialEnabledLayers = aBoard->GetEnabledLayers();
+    std::string                  mapError;
+
+    try
+    {
+        std::map<std::string, UTF8> props;
+        const VECTOR2I              page = aBoard->GetPageSettings().GetSizeIU( pcbIUScale.IU_PER_MILS );
+
+        props["page_width"] = std::to_string( page.x );
+        props["page_height"] = std::to_string( page.y );
+        props[PCB_IO_LOAD_PROPERTIES::APPEND_PRESERVE_DESTINATION_STACKUP] = "";
+
+        IO_RELEASER<PCB_IO> pi( PCB_IO_MGR::FindPlugin( aType ) );
+
+        if( !pi )
+        {
+            clearSkipStruct();
+            aError = "no reader for this file";
+            aStatus = 400;
+            return std::nullopt;
+        }
+
+        // the editor asks; the API goes on and says what it was asked
+        pi->SetQueryUserCallback(
+                [&]( wxString aTitle, int, wxString aMessage, wxString ) -> bool
+                {
+                    out.warnings.push_back( str( aTitle + wxS( ": " ) + aMessage ) );
+                    return true;
+                } );
+
+        // the editor's Map Layers dialog: the given mapping, else the plugin's guess
+        if( LAYER_MAPPABLE_PLUGIN* mappable = dynamic_cast<LAYER_MAPPABLE_PLUGIN*>( pi.get() ) )
+        {
+            mappable->RegisterCallback(
+                    [&]( const std::vector<INPUT_LAYER_DESC>& aDescs )
+                    {
+                        std::map<wxString, PCB_LAYER_ID> map;
+
+                        for( const INPUT_LAYER_DESC& desc : aDescs )
+                        {
+                            PCB_LAYER_ID layer = desc.AutoMapLayer;
+                            const std::string name = str( desc.Name );
+
+                            if( aLayerMap.is_object() && aLayerMap.contains( name ) )
+                            {
+                                const std::string target = aLayerMap[name].is_string() ? aLayerMap[name].get<std::string>()
+                                                                                        : std::string();
+                                const int id = target.empty() ? UNDEFINED_LAYER : aBoard->GetLayerID( wx( target ) );
+
+                                if( !target.empty() && ( id < 0 || !desc.PermittedLayers.Contains( (PCB_LAYER_ID) id ) ) )
+                                    mapError = "layer_map: '" + name + "' cannot go on '" + target + "'";
+                                else
+                                    layer = (PCB_LAYER_ID) id;
+                            }
+
+                            map[desc.Name] = layer;
+                            if( layer < 0 )
+                                out.unmapped.push_back( name );
+                            else
+                                out.layers[name] = str( LayerName( layer ) );
+                        }
+
+                        return map;
+                    } );
+        }
+
+        pi->LoadAndAppendBoard( aFile, *aBoard, &props, nullptr );
+    }
+    catch( const IO_ERROR& ioe )
+    {
+        clearSkipStruct();
+        aError = "could not be read: " + str( ioe.What() );
+        aStatus = 422;
+        return std::nullopt;
+    }
+
+    std::map<wxString, wxString> newProperties = aBoard->GetProperties();
+
+    for( const auto& [key, value] : oldProperties )
+        newProperties[key] = value;
+
+    aBoard->SetProperties( newProperties );
+    aBoard->SetPageSettings( oldPageInfo );
+    aBoard->SetTitleBlock( oldTitleBlock );
+
+    aBoard->BuildListOfNets();
+    aBoard->SynchronizeNetsAndNetClasses( true );
+    aBoard->BuildConnectivity();
+
+    for( NETINFO_ITEM* net : aBoard->GetNetInfo() )
+    {
+        if( !existingNets.contains( net ) )
+        {
+            aCommit.Added( net );
+            out.netsAdded++;
+        }
+    }
+
+    if( aBoard->GetCopperLayerCount() > initialCopperLayerCount )
+        aBoard->SetCopperLayerCount( aBoard->GetCopperLayerCount() );
+
+    LSET enabledLayers = aBoard->GetEnabledLayers() | initialEnabledLayers;
+    aBoard->SetEnabledLayers( enabledLayers );
+    aBoard->SetVisibleLayers( enabledLayers );
+    aBoard->GetDesignSettings().GetStackupDescriptor().SynchronizeWithBoard( &aBoard->GetDesignSettings() );
+
+    if( aBoard->GetCopperLayerCount() != initialCopperLayerCount )
+        out.warnings.push_back( "the board changed from " + std::to_string( initialCopperLayerCount ) + " to "
+                                + std::to_string( aBoard->GetCopperLayerCount() ) + " copper layers, stackup updated" );
+
+    for( BOARD_ITEM* item : aBoard->GetItemSet() )
+    {
+        if( item->Type() == PCB_MARKER_T || ( item->GetFlags() & SKIP_STRUCT ) )
+            continue;
+
+        out.added.push_back( item );
+    }
+
+    clearSkipStruct();
+
+    for( BOARD_ITEM* item : out.added )
+        aCommit.Added( item );
+
+    if( !mapError.empty() || out.added.empty() )
+    {
+        aCommit.Revert();
+        aError = mapError.empty() ? "nothing to append" : mapError;
+        aStatus = mapError.empty() ? 422 : 400;
+        return std::nullopt;
+    }
+
+    std::set<EDA_ITEM*> addedSet( out.added.begin(), out.added.end() );
+
+    for( BOARD_ITEM* item : out.added )
+    {
+        if( !item->GetParentGroup() || !addedSet.count( item->GetParentGroup()->AsEdaItem() ) )
+            out.top.push_back( item );
+    }
+
+    // where the editor's move starts: the top-left item's position (smallest x, then y)
+    BOARD_ITEM* topLeft = nullptr;
+
+    for( BOARD_ITEM* item : out.top )
+    {
+        const VECTOR2I p = item->GetPosition();
+
+        if( !topLeft || p.x < topLeft->GetPosition().x
+            || ( p.x == topLeft->GetPosition().x && p.y < topLeft->GetPosition().y ) )
+        {
+            topLeft = item;
+        }
+    }
+
+    out.anchor = topLeft->GetPosition();
+    out.delta = aAt ? *aAt - out.anchor : VECTOR2I( 0, 0 );
+
+    if( out.delta != VECTOR2I( 0, 0 ) )
+    {
+        for( BOARD_ITEM* item : out.top )
+            item->Move( out.delta );
+    }
+
+    return out;
+}
+
+
+/// @brief The editor's "place as group": the appended top-level items (not footprint children)
+/// in one new group; nullptr when fewer than two
+PCB_GROUP* groupAppended( BOARD* aBoard, BOARD_COMMIT& aCommit, const APPENDED& aAppended, const wxString& aName )
+{
+    std::vector<BOARD_ITEM*> groupable;
+
+    for( BOARD_ITEM* item : aAppended.top )
+    {
+        if( !item->GetParentFootprint() )
+            groupable.push_back( item );
+    }
+
+    if( groupable.size() < 2 )
+        return nullptr;
+
+    PCB_GROUP* group = new PCB_GROUP( aBoard );
+    group->SetName( aName );
+
+    for( BOARD_ITEM* item : aAppended.top )
+    {
+        if( item->IsLocked() )
+            group->SetLocked( true );
+    }
+
+    aCommit.Add( group );
+
+    for( BOARD_ITEM* item : groupable )
+    {
+        aCommit.Modify( item );
+        group->AddItem( item );
+    }
+
+    return group;
+}
+
+
+/// @brief The appended footprints' references, and (duplicate_refs) the ones now on the board twice
+void reportRefs( BOARD* aBoard, const APPENDED& aAppended, nlohmann::json& aOut )
+{
+    std::map<wxString, int> refCount;
+    nlohmann::json          refs = nlohmann::json::array();
+    std::set<wxString>      duplicates;
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+        refCount[fp->GetReference()]++;
+
+    for( BOARD_ITEM* item : aAppended.added )
+    {
+        if( item->Type() != PCB_FOOTPRINT_T )
+            continue;
+
+        const wxString ref = static_cast<FOOTPRINT*>( item )->GetReference();
+        refs.push_back( str( ref ) );
+
+        if( refCount[ref] > 1 )
+            duplicates.insert( ref );
+    }
+
+    aOut["footprints"] = refs;
+
+    if( !duplicates.empty() )
+    {
+        nlohmann::json dup = nlohmann::json::array();
+
+        for( const wxString& ref : duplicates )
+            dup.push_back( str( ref ) );
+
+        aOut["duplicate_refs"] = dup;
+    }
+
+    if( !aAppended.warnings.empty() )
+        aOut["warnings"] = aAppended.warnings;
+
+    if( !aAppended.layers.empty() )
+        aOut["layer_map"] = aAppended.layers;
+
+    if( !aAppended.unmapped.empty() )
+        aOut["unmapped_layers"] = aAppended.unmapped;
+}
+
+
+std::optional<VECTOR2I> atMm( const nlohmann::json& aArgs, bool& aBad )
+{
+    aBad = false;
+
+    if( !aArgs.contains( "at_mm" ) )
+        return std::nullopt;
+
+    const nlohmann::json& a = aArgs["at_mm"];
+
+    if( !a.is_array() || a.size() != 2 || !a[0].is_number() || !a[1].is_number() )
+    {
+        aBad = true;
+        return std::nullopt;
+    }
+
+    return VECTOR2I( pcbIUScale.mmToIU( a[0].get<double>() ), pcbIUScale.mmToIU( a[1].get<double>() ) );
+}
+
+
 KOPENAPI_RESULT h_pcb_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -301,17 +611,11 @@ KOPENAPI_RESULT h_pcb_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( name.IsEmpty() )
         return KOPENAPI_RESULT::Error( 400, "name: the design block (pcb_design_block_list)" );
 
-    std::optional<VECTOR2I> at;
+    bool                    badAt = false;
+    std::optional<VECTOR2I> at = atMm( aArgs, badAt );
 
-    if( aArgs.contains( "at_mm" ) )
-    {
-        const nlohmann::json& a = aArgs["at_mm"];
-
-        if( !a.is_array() || a.size() != 2 || !a[0].is_number() || !a[1].is_number() )
-            return KOPENAPI_RESULT::Error( 400, "at_mm: [x, y]" );
-
-        at = VECTOR2I( pcbIUScale.mmToIU( a[0].get<double>() ), pcbIUScale.mmToIU( a[1].get<double>() ) );
-    }
+    if( badAt )
+        return KOPENAPI_RESULT::Error( 400, "at_mm: [x, y]" );
 
     if( !KopenapiDesignBlockExists( project, *lib, name ) )
         return KOPENAPI_RESULT::Error( 404, "name: no design block '" + str( name ) + "' in "
@@ -325,184 +629,31 @@ KOPENAPI_RESULT h_pcb_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( block->GetBoardFile().IsEmpty() || !wxFileName::FileExists( block->GetBoardFile() ) )
         return KOPENAPI_RESULT::Error( 422, "design block '" + str( name ) + "' has no layout to place" );
 
-    // As the editor's Append Board: the block's board read into this one, the items it brings
-    // marked by what was there before
-    BOARD_COMMIT   commit( context->GetToolManager() );
-    BOARD_ITEM_SET existingItems = brd->GetItemSet();
-    std::set<NETINFO_ITEM*> existingNets;
+    BOARD_COMMIT            commit( context->GetToolManager() );
+    std::optional<APPENDED> appended = appendBoard( brd, commit, block->GetBoardFile(), PCB_IO_MGR::KICAD_SEXP, at,
+                                                    nlohmann::json(), error, status );
 
-    for( NETINFO_ITEM* net : brd->GetNetInfo() )
-        existingNets.insert( net );
-
-    for( BOARD_ITEM* item : existingItems )
-        item->SetFlags( SKIP_STRUCT );
-
-    auto clearSkipStruct = [&]()
+    if( !appended )
     {
-        for( BOARD_ITEM* item : existingItems )
-            item->ClearFlags( SKIP_STRUCT );
-    };
+        if( error == "nothing to append" )
+            return KOPENAPI_RESULT::Error( 422, "design block '" + str( name ) + "' has an empty layout" );
 
-    std::map<wxString, wxString> oldProperties = brd->GetProperties();
-    PAGE_INFO                    oldPageInfo = brd->GetPageSettings();
-    TITLE_BLOCK                  oldTitleBlock = brd->GetTitleBlock();
-    const int                    initialCopperLayerCount = brd->GetCopperLayerCount();
-    const LSET                   initialEnabledLayers = brd->GetEnabledLayers();
-    nlohmann::json               warnings = nlohmann::json::array();
-
-    try
-    {
-        std::map<std::string, UTF8> props;
-        const VECTOR2I              page = brd->GetPageSettings().GetSizeIU( pcbIUScale.IU_PER_MILS );
-
-        props["page_width"] = std::to_string( page.x );
-        props["page_height"] = std::to_string( page.y );
-        props[PCB_IO_LOAD_PROPERTIES::APPEND_PRESERVE_DESTINATION_STACKUP] = "";
-
-        IO_RELEASER<PCB_IO> pi( PCB_IO_MGR::FindPlugin( PCB_IO_MGR::KICAD_SEXP ) );
-
-        // the editor asks; the API goes on and says what it was asked
-        pi->SetQueryUserCallback(
-                [&]( wxString aTitle, int, wxString aMessage, wxString ) -> bool
-                {
-                    warnings.push_back( str( aTitle + wxS( ": " ) + aMessage ) );
-                    return true;
-                } );
-
-        pi->LoadAndAppendBoard( block->GetBoardFile(), *brd, &props, nullptr );
-    }
-    catch( const IO_ERROR& ioe )
-    {
-        clearSkipStruct();
-        return KOPENAPI_RESULT::Error( 422, "the design block's layout could not be read: " + str( ioe.What() ) );
-    }
-
-    std::map<wxString, wxString> newProperties = brd->GetProperties();
-
-    for( const auto& [key, value] : oldProperties )
-        newProperties[key] = value;
-
-    brd->SetProperties( newProperties );
-    brd->SetPageSettings( oldPageInfo );
-    brd->SetTitleBlock( oldTitleBlock );
-
-    brd->BuildListOfNets();
-    brd->SynchronizeNetsAndNetClasses( true );
-    brd->BuildConnectivity();
-
-    int netsAdded = 0;
-
-    for( NETINFO_ITEM* net : brd->GetNetInfo() )
-    {
-        if( !existingNets.contains( net ) )
-        {
-            commit.Added( net );
-            netsAdded++;
-        }
-    }
-
-    if( brd->GetCopperLayerCount() > initialCopperLayerCount )
-        brd->SetCopperLayerCount( brd->GetCopperLayerCount() );
-
-    LSET enabledLayers = brd->GetEnabledLayers() | initialEnabledLayers;
-    brd->SetEnabledLayers( enabledLayers );
-    brd->SetVisibleLayers( enabledLayers );
-    brd->GetDesignSettings().GetStackupDescriptor().SynchronizeWithBoard( &brd->GetDesignSettings() );
-
-    if( brd->GetCopperLayerCount() != initialCopperLayerCount )
-        warnings.push_back( "the board changed from " + std::to_string( initialCopperLayerCount ) + " to "
-                            + std::to_string( brd->GetCopperLayerCount() ) + " copper layers, stackup updated" );
-
-    std::vector<BOARD_ITEM*> added;
-
-    for( BOARD_ITEM* item : brd->GetItemSet() )
-    {
-        if( item->Type() == PCB_MARKER_T || ( item->GetFlags() & SKIP_STRUCT ) )
-            continue;
-
-        added.push_back( item );
-    }
-
-    clearSkipStruct();
-
-    if( added.empty() )
-    {
-        commit.Revert();
-        return KOPENAPI_RESULT::Error( 422, "design block '" + str( name ) + "' has an empty layout" );
-    }
-
-    // the items a selection would hold: not inside a group that came with them
-    std::set<EDA_ITEM*>      addedSet( added.begin(), added.end() );
-    std::vector<BOARD_ITEM*> top;
-
-    for( BOARD_ITEM* item : added )
-    {
-        if( !item->GetParentGroup() || !addedSet.count( item->GetParentGroup()->AsEdaItem() ) )
-            top.push_back( item );
-
-        commit.Added( item );
-    }
-
-    // where the editor's move starts: the top-left item's position (smallest x, then y)
-    BOARD_ITEM* topLeft = nullptr;
-
-    for( BOARD_ITEM* item : top )
-    {
-        const VECTOR2I p = item->GetPosition();
-
-        if( !topLeft || p.x < topLeft->GetPosition().x
-            || ( p.x == topLeft->GetPosition().x && p.y < topLeft->GetPosition().y ) )
-        {
-            topLeft = item;
-        }
-    }
-
-    const VECTOR2I anchor = topLeft->GetPosition();
-    const VECTOR2I delta = at ? *at - anchor : VECTOR2I( 0, 0 );
-
-    if( delta != VECTOR2I( 0, 0 ) )
-    {
-        for( BOARD_ITEM* item : top )
-            item->Move( delta );
+        return KOPENAPI_RESULT::Error( status, "the design block's layout " + error );
     }
 
     nlohmann::json out = { { "lib_id", str( block->GetLibId().Format() ) },
-                           { "items", added.size() },
-                           { "nets_added", netsAdded },
-                           { "anchor_mm", { toMm( anchor.x + delta.x ), toMm( anchor.y + delta.y ) } },
-                           { "moved_by_mm", { toMm( delta.x ), toMm( delta.y ) } } };
+                           { "items", appended->added.size() },
+                           { "nets_added", appended->netsAdded },
+                           { "anchor_mm", { toMm( appended->anchor.x + appended->delta.x ),
+                                            toMm( appended->anchor.y + appended->delta.y ) } },
+                           { "moved_by_mm", { toMm( appended->delta.x ), toMm( appended->delta.y ) } } };
 
     // a group linked to the block, as the editor's "place as group" (its default)
     if( aArgs.value( "group", true ) )
     {
-        std::vector<BOARD_ITEM*> groupable;
-
-        for( BOARD_ITEM* item : top )
+        if( PCB_GROUP* group = groupAppended( brd, commit, *appended, block->GetLibId().GetLibItemName() ) )
         {
-            if( !item->GetParentFootprint() )
-                groupable.push_back( item );
-        }
-
-        if( groupable.size() >= 2 )
-        {
-            PCB_GROUP* group = new PCB_GROUP( brd );
-            group->SetName( block->GetLibId().GetLibItemName() );
             group->SetDesignBlockLibId( block->GetLibId() );
-
-            for( BOARD_ITEM* item : top )
-            {
-                if( item->IsLocked() )
-                    group->SetLocked( true );
-            }
-
-            commit.Add( group );
-
-            for( BOARD_ITEM* item : groupable )
-            {
-                commit.Modify( item );
-                group->AddItem( item );
-            }
-
             out["group"] = { { "uuid", str( group->m_Uuid.AsString() ) },
                              { "name", str( group->GetName() ) },
                              { "design_block", str( group->GetDesignBlockLibId().Format() ) } };
@@ -514,40 +665,69 @@ KOPENAPI_RESULT h_pcb_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
     context->SetContentModified();
 
     // the editor does not reannotate an appended block: say which references now repeat
-    std::map<wxString, int> refCount;
-    nlohmann::json          refs = nlohmann::json::array();
+    reportRefs( brd, *appended, out );
 
-    for( FOOTPRINT* fp : brd->Footprints() )
-        refCount[fp->GetReference()]++;
+    return KOPENAPI_RESULT::Ok( out );
+}
 
-    std::set<wxString> duplicates;
 
-    for( BOARD_ITEM* item : added )
+KOPENAPI_RESULT h_pcb_append( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*         brd = context->GetBoard();
+    const wxString path = wx( aArgs.value( "path", std::string() ) );
+
+    if( path.IsEmpty() || !wxFileName( path ).IsAbsolute() )
+        return KOPENAPI_RESULT::Error( 400, "path: the absolute path of a board file" );
+
+    if( !wxFileName::FileExists( path ) )
+        return KOPENAPI_RESULT::Error( 404, "path: no such file" );
+
+    bool                    badAt = false;
+    std::optional<VECTOR2I> at = atMm( aArgs, badAt );
+
+    if( badAt )
+        return KOPENAPI_RESULT::Error( 400, "at_mm: [x, y]" );
+
+    if( aArgs.contains( "layer_map" ) && !aArgs["layer_map"].is_object() )
+        return KOPENAPI_RESULT::Error( 400, "layer_map: {\"source layer\": \"KiCad layer\" or null}" );
+
+    // KiCad boards and the importers File > Import > Non-KiCad Board offers
+    const PCB_IO_MGR::PCB_FILE_T type = PCB_IO_MGR::FindPluginTypeFromBoardPath( path );
+
+    if( type == PCB_IO_MGR::FILE_TYPE_NONE )
+        return KOPENAPI_RESULT::Error( 400, "path: not a board format KiCad reads" );
+
+    std::string             error;
+    int                     status = 400;
+    BOARD_COMMIT            commit( context->GetToolManager() );
+    std::optional<APPENDED> appended = appendBoard( brd, commit, path, type, at, aArgs.value( "layer_map", nlohmann::json() ),
+                                                    error, status );
+
+    if( !appended )
+        return KOPENAPI_RESULT::Error( status, "path: " + error );
+
+    nlohmann::json out = { { "format", str( PCB_IO_MGR::ShowType( type ) ) },
+                           { "items", appended->added.size() },
+                           { "nets_added", appended->netsAdded },
+                           { "anchor_mm", { toMm( appended->anchor.x + appended->delta.x ),
+                                            toMm( appended->anchor.y + appended->delta.y ) } },
+                           { "moved_by_mm", { toMm( appended->delta.x ), toMm( appended->delta.y ) } } };
+
+    if( aArgs.value( "group", false ) )
     {
-        if( item->Type() != PCB_FOOTPRINT_T )
-            continue;
-
-        const wxString ref = static_cast<FOOTPRINT*>( item )->GetReference();
-        refs.push_back( str( ref ) );
-
-        if( refCount[ref] > 1 )
-            duplicates.insert( ref );
+        if( PCB_GROUP* group = groupAppended( brd, commit, *appended, wxFileName( path ).GetName() ) )
+            out["group"] = { { "uuid", str( group->m_Uuid.AsString() ) }, { "name", str( group->GetName() ) } };
     }
 
-    out["footprints"] = refs;
-
-    if( !duplicates.empty() )
-    {
-        nlohmann::json dup = nlohmann::json::array();
-
-        for( const wxString& ref : duplicates )
-            dup.push_back( str( ref ) );
-
-        out["duplicate_refs"] = dup;
-    }
-
-    if( !warnings.empty() )
-        out["warnings"] = warnings;
+    commit.Push( _( "Append Board" ) );
+    brd->BuildConnectivity();
+    context->SetContentModified();
+    reportRefs( brd, *appended, out );
 
     return KOPENAPI_RESULT::Ok( out );
 }
@@ -591,4 +771,19 @@ KOPENAPI_REGISTER( "pcb_design_block_place",
                         "group":{"type":"boolean","default":true}}})json"_json,
                    false, h_pcb_design_block_place );
 
-KOPENAPI_MARK_EDITING( "pcb_design_block_save", "pcb_design_block_place" );
+KOPENAPI_REGISTER( "pcb_append",
+                   "Append Board, as the editor's (also File > Import > Non-KiCad Board into this board): a KiCad "
+                   "board or one KiCad imports (Altium, Eagle, CADSTAR, EasyEDA, PADS, ...) read into this board in "
+                   "one undo step: nets by name, this board's stackup kept, the layers it uses enabled; its top-left "
+                   "item at at_mm (default where the file has it); group (default false) puts it in one group named "
+                   "after the file. A foreign board's layers map by layer_map (source name -> KiCad layer, null to "
+                   "drop) else the importer's guess; the answer says the mapping (layer_map, and unmapped_layers left out). References are not renumbered: "
+                   "duplicate_refs names the ones now on the board twice",
+                   R"json({"type":"object","required":["path"],"properties":{
+                        "path":{"type":"string","description":"absolute path"},
+                        "at_mm":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},
+                        "group":{"type":"boolean","default":false},
+                        "layer_map":{"type":"object","additionalProperties":{"type":["string","null"]}}}})json"_json,
+                   false, h_pcb_append, 600 );
+
+KOPENAPI_MARK_EDITING( "pcb_design_block_save", "pcb_design_block_place", "pcb_append" );
