@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <deque>
+#include <fstream>
+#include <iterator>
 #include <map>
 
 
@@ -26,6 +28,7 @@ struct DOC_MARK
 {
     std::optional<KOPENAPI_UNDO_MARK> undo;
     std::string                       snapshot;   ///< directory with the copy
+    std::optional<uint64_t>           token;      ///< headless: the document's change token then
 };
 
 /// @brief Every open document at one moment
@@ -162,6 +165,9 @@ struct KOPENAPI_HISTORY::IMPL
                     doc.snapshot = dir;
                 else
                     removeDir( dir );
+
+                if( !doc.snapshot.empty() && history.changeToken )
+                    doc.token = history.changeToken( aCtx );
             }
 
             if( doc.undo || !doc.snapshot.empty() )
@@ -225,8 +231,61 @@ struct KOPENAPI_HISTORY::IMPL
         return done;
     }
 
-    /// @brief Whether a mark taken now would equal aBefore: true only when every document is a GUI
-    /// document whose undo stack has the same command on top (headless copies cannot tell cheaply)
+    /// @brief Whether the files of two directories are the same, byte for byte
+    static bool sameFiles( const std::string& aA, const std::string& aB )
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        size_t          count = 0;
+
+        for( const auto& entry : fs::directory_iterator( aA, ec ) )
+        {
+            const fs::path other = fs::path( aB ) / entry.path().filename();
+            ++count;
+
+            if( fs::file_size( entry.path(), ec ) != fs::file_size( other, ec ) || ec )
+                return false;
+
+            std::ifstream a( entry.path(), std::ios::binary );
+            std::ifstream b( other, std::ios::binary );
+
+            if( !std::equal( std::istreambuf_iterator<char>( a ), std::istreambuf_iterator<char>(),
+                             std::istreambuf_iterator<char>( b ) ) )
+            {
+                return false;
+            }
+        }
+
+        for( const auto& entry : fs::directory_iterator( aB, ec ) )
+        {
+            ( void ) entry;
+
+            if( count-- == 0 )
+                return false;
+        }
+
+        return !ec && count == 0;
+    }
+
+    /// @brief A headless document is unchanged since its copy: its change token moved, it changed;
+    /// otherwise a fresh copy equals the one taken before (edits outside a commit do not move the
+    /// token)
+    bool headlessUnchanged( KOPENAPI_CONTEXT& aCtx, const KOPENAPI_DOC_HISTORY& aHistory, const DOC_MARK& aDoc )
+    {
+        if( aDoc.snapshot.empty() || !aHistory.snapshot )
+            return false;
+
+        if( aDoc.token && aHistory.changeToken && aHistory.changeToken( aCtx ) != aDoc.token )
+            return false;
+
+        const std::string now = snapshotDir();
+        const bool        same = aHistory.snapshot( aCtx, now ) && sameFiles( aDoc.snapshot, now );
+        removeDir( now );
+        return same;
+    }
+
+    /// @brief Whether a mark taken now would equal aBefore: every GUI document's undo stack has the
+    /// same command on top, every headless document's content is the same as its copy
     bool unchangedSince( KOPENAPI_CONTEXT& aCtx, const MARK& aBefore )
     {
         if( aBefore.docs.empty() )
@@ -238,7 +297,18 @@ struct KOPENAPI_HISTORY::IMPL
         {
             auto it = histories.find( domain );
 
-            if( !doc.undo || it == histories.end() || !it->second.undoMark )
+            if( it == histories.end() )
+                return false;
+
+            if( !doc.undo )
+            {
+                if( !headlessUnchanged( aCtx, it->second, doc ) )
+                    return false;
+
+                continue;
+            }
+
+            if( !it->second.undoMark )
                 return false;
 
             std::optional<KOPENAPI_UNDO_MARK> now = it->second.undoMark( aCtx );
@@ -329,10 +399,13 @@ void KOPENAPI_HISTORY::AfterEdit( KOPENAPI_CONTEXT& aCtx, const KOPENAPI_RESULT&
         }
     }
 
-    // A successful call that changed nothing (a pointer move, a zoom through pcb_action) is no
-    // step: it would only push real steps out of the log
+    // A successful call that changed nothing (a read, a pointer move, a zoom through pcb_action) is
+    // no step: it would only push real steps out of the log, and its copy is dropped
     if( aResult.status < 400 && d->unchangedSince( aCtx, entry.before ) )
+    {
+        IMPL::drop( entry.before );
         return;
+    }
 
     if( aResult.status >= 400 )
         entry.error = aResult.Message();

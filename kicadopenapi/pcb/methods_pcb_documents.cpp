@@ -905,6 +905,16 @@ static KOPENAPI_DOC_HISTORY history()
         return true;
     };
 
+    h.changeToken = []( KOPENAPI_CONTEXT& aCtx ) -> std::optional<uint64_t>
+    {
+        if( !aCtx.headless || !s_headless || !s_headless->GetBoard() )
+            return std::nullopt;
+
+        const BOARD* board = s_headless->GetBoard();
+        return ( static_cast<uint64_t>( reinterpret_cast<uintptr_t>( board ) ) << 20 )
+               ^ static_cast<uint32_t>( board->GetTimeStamp() );
+    };
+
     h.restore = []( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
     {
         if( !aCtx.headless || !s_headless )

@@ -149,6 +149,10 @@ struct KOPENAPI_DOC_HISTORY
     /// @brief Headless: write a copy of the open document into aDir; false when none is open
     std::function<bool( KOPENAPI_CONTEXT&, const std::string& aDir )> snapshot;
 
+    /// @brief Headless: a value that moves with every commit to the open document (with the
+    /// document's identity); an unmoved token makes the history compare a fresh copy instead
+    std::function<std::optional<uint64_t>( KOPENAPI_CONTEXT& )> changeToken;
+
     /// @brief Headless: load the copy from aDir back as the open document (its own path, unsaved)
     std::function<bool( KOPENAPI_CONTEXT&, const std::string& aDir )> restore;
 
