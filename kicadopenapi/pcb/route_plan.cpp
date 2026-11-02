@@ -630,13 +630,14 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         return 10 * std::max( dx, dy ) + 4 * std::min( dx, dy );
     };
 
-    using ENTRY = std::pair<int, int>;   // f, state
-    std::priority_queue<ENTRY, std::vector<ENTRY>, std::greater<ENTRY>> open;
+    // f in the high half, the state in the low: one compare orders entries as the pair ( f, state )
+    auto entry = []( int aF, int aState ) { return ( (uint64_t) (uint32_t) aF << 32 ) | (uint32_t) aState; };
+    std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>> open;
 
     for( int s : starts )
     {
         g[s] = 0;
-        open.emplace( heuristic( s ), s );
+        open.push( entry( heuristic( s ), s ) );
     }
 
     for( const auto& [s, esc] : startEscapes )
@@ -644,7 +645,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         if( esc.cost < g[s] )
         {
             g[s] = esc.cost;
-            open.emplace( g[s] + heuristic( s ), s );
+            open.push( entry( g[s] + heuristic( s ), s ) );
         }
     }
 
@@ -659,7 +660,9 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             break;
         }
 
-        const auto [f, s] = open.top();
+        const uint64_t top = open.top();
+        const int      f = (int) ( top >> 32 );
+        const int      s = (int) (uint32_t) top;
         open.pop();
 
         if( f - heuristic( s ) > g[s] )
@@ -691,7 +694,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                 g[aNext] = g[s] + aCost;
                 parent[aNext] = s;
                 dirIn[aNext] = aDir;
-                open.emplace( g[aNext] + heuristic( aNext ), aNext );
+                open.push( entry( g[aNext] + heuristic( aNext ), aNext ) );
             }
         };
 
