@@ -32,6 +32,7 @@
 #include <geometry/shape_segment.h>
 #include <connectivity/connectivity_algo.h>
 #include <connectivity/connectivity_data.h>
+#include <length_delay_calculation/length_delay_calculation.h>
 #include <ratsnest/ratsnest_data.h>
 #include <footprint.h>
 #include <geometry/shape.h>
@@ -3814,6 +3815,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         bool                  power;
         bool                  trunk = false;   ///< a differential pair's trunk, not an airwire
         bool                  foreign = false; ///< copper of an earlier call (rip_up_scope unlocked), no row
+        bool                  toPairEnd = false;   ///< to the open end of a pair's line that ended short
         int                   bus = -1;        ///< its bus (index in busOut), its place in the bus's order
         int                   busIndex = -1;
         std::optional<VECTOR2I> busVia = std::nullopt;   ///< its spot in the bus's via fan (bus_layer)
@@ -7693,6 +7695,34 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
         job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
 
+        // a pair line's end the routes since have moved (shoved: new segments): its net's track end
+        // nearest the old place, off the start's island
+        if( job.from && !job.to && job.toPairEnd )
+        {
+            const auto joined = board->GetConnectivity()->GetConnectedItems( job.from );
+            double     best = std::numeric_limits<double>::max();
+
+            for( PCB_TRACK* t : board->Tracks() )
+            {
+                if( t->Type() != PCB_TRACE_T || t->GetNetCode() != job.from->GetNetCode()
+                    || std::find( joined.begin(), joined.end(), t ) != joined.end() )
+                {
+                    continue;
+                }
+
+                for( const VECTOR2I& at : { t->GetStart(), t->GetEnd() } )
+                {
+                    if( const double d = ( at - job.toPos ).EuclideanNorm(); d < best )
+                    {
+                        best = d;
+                        job.to = t;
+                        job.toId = t->m_Uuid;
+                        job.toPos = at;
+                    }
+                }
+            }
+        }
+
         if( !job.from || !job.to )
         {
             rowOf[index] = (int) results.size();
@@ -7735,6 +7765,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             nlohmann::json pairAttempt = nlohmann::json::object();
             int            pairTries = 0;
             bool           pairOk = false;
+            const size_t   pairFrom = added.size();
 
             other.from = dynamic_cast<PAD*>( board->ResolveItem( other.fromId, true ) );
             other.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( other.toId, true ) );
@@ -7785,6 +7816,75 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
             }
 
+            // the pair's placer fixes what it laid when it cannot snap onto both target pads (pads far
+            // apart: two parts not side by side): the coupled part stays, each net's airwire is then
+            // routed alone from its far pad to the end of the pair's line
+            std::map<int, std::pair<PCB_TRACK*, VECTOR2I>> pairEnds;   // net code -> its line's open end
+
+            if( pairOk && !dryRun )
+            {
+                for( JOB* mine : { &job, &other } )
+                {
+                    const auto joined = board->GetConnectivity()->GetConnectedItems( mine->from );
+
+                    if( std::find( joined.begin(), joined.end(), mine->to ) != joined.end() )
+                        continue;
+
+                    std::optional<std::pair<PCB_TRACK*, VECTOR2I>> end;
+
+                    for( size_t i = pairFrom; i < added.size(); ++i )
+                    {
+                        PCB_TRACK* t = dynamic_cast<PCB_TRACK*>( board->ResolveItem( added[i], true ) );
+
+                        if( !t || t->Type() != PCB_TRACE_T || t->GetNetCode() != mine->from->GetNetCode() )
+                            continue;
+
+                        for( const VECTOR2I& at : { t->GetStart(), t->GetEnd() } )
+                        {
+                            if( !end || ( at - mine->to->GetPosition() ).SquaredEuclideanNorm()
+                                                < ( end->second - mine->to->GetPosition() ).SquaredEuclideanNorm() )
+                            {
+                                end = std::make_pair( t, at );
+                            }
+                        }
+                    }
+
+                    if( end )
+                        pairEnds[mine->from->GetNetCode()] = *end;
+                }
+            }
+
+            if( !pairEnds.empty() )
+            {
+                for( size_t k = 0; k < jobs.size(); ++k )
+                {
+                    JOB& wire = jobs[k];
+
+                    if( wire.trunk || rowOf[k] >= 0 || done[k] || !wire.from || !wire.to
+                        || !pairEnds.count( wire.from->GetNetCode() ) )
+                    {
+                        continue;
+                    }
+
+                    const auto& [track, at] = pairEnds[wire.from->GetNetCode()];
+                    const auto  joined = board->GetConnectivity()->GetConnectedItems( track );
+                    const bool  fromOn = std::find( joined.begin(), joined.end(), wire.from ) != joined.end();
+                    const bool  toOn = std::find( joined.begin(), joined.end(), wire.to ) != joined.end();
+                    PAD*        far = !fromOn ? wire.from : dynamic_cast<PAD*>( wire.to );
+
+                    if( fromOn == toOn || !far )
+                        continue;
+
+                    wire.from = far;
+                    wire.fromId = far->m_Uuid;
+                    wire.to = track;
+                    wire.toId = track->m_Uuid;
+                    wire.toPos = at;
+                    wire.length = (double) ( at - far->GetPosition() ).EuclideanNorm();
+                    wire.toPairEnd = true;
+                }
+            }
+
             if( pairOk )
             {
                 const double length = pairAttempt["metrics"].value( "length_mm", 0.0 );
@@ -7807,6 +7907,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                            { "vias", k == index ? pairAttempt["metrics"].value( "vias", 0 ) : 0 } };
 
                     row["diff_pair"].update( pairAttempt["diff_pair"] );
+
+                    if( pairEnds.count( mine->from->GetNetCode() ) )
+                    {
+                        const VECTOR2I at = pairEnds[mine->from->GetNetCode()].second;
+                        row["diff_pair"]["ends_short_mm"] = { toMm( at.x ), toMm( at.y ) };
+                    }
+
                     done[k] = true;
                     rowOf[k] = (int) results.size();
                     results.push_back( row );
@@ -10552,6 +10659,62 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     }
 
+    // each pair's two nets as laid: their lengths (as DRC's skew test takes them: tracks, vias through
+    // the stackup, pad to die) and skew, against the board's skew rule for them
+    nlohmann::json pairsOut = nlohmann::json::array();
+
+    for( const auto& [codeP, codeN] : explicitPairs )
+    {
+        double     lengthOf[2] = { 0.0, 0.0 };
+        PCB_TRACK* anyOf[2] = { nullptr, nullptr };
+
+        for( int side : { 0, 1 } )
+        {
+            const int                                  code = side ? codeN : codeP;
+            std::vector<LENGTH_DELAY_CALCULATION_ITEM> items;
+            LENGTH_DELAY_CALCULATION*                  calc = board->GetLengthCalculation();
+
+            for( BOARD_CONNECTED_ITEM* item : board->GetConnectivity()->GetNetItems( code, { PCB_TRACE_T, PCB_ARC_T, PCB_VIA_T, PCB_PAD_T } ) )
+            {
+                if( PCB_TRACK* t = dynamic_cast<PCB_TRACK*>( item ); t && t->Type() != PCB_VIA_T && !anyOf[side] )
+                    anyOf[side] = t;
+
+                if( LENGTH_DELAY_CALCULATION_ITEM it = calc->GetLengthCalculationItem( item );
+                    it.Type() != LENGTH_DELAY_CALCULATION_ITEM::TYPE::UNKNOWN )
+                {
+                    items.emplace_back( it );
+                }
+            }
+
+            constexpr PATH_OPTIMISATIONS opts = { .OptimiseVias = true, .MergeTracks = true,
+                                                  .OptimiseTracesInPads = true, .InferViaInPad = false };
+            const LENGTH_DELAY_STATS     stats = calc->CalculateLengthDetails( items, opts, nullptr, nullptr,
+                                                                               LENGTH_DELAY_LAYER_OPT::NO_LAYER_DETAIL,
+                                                                               LENGTH_DELAY_DOMAIN_OPT::NO_DELAY_DETAIL );
+            lengthOf[side] = (double) stats.TrackLength + stats.ViaLength + stats.PadToDieLength;
+        }
+
+        const double   skew = std::abs( lengthOf[0] - lengthOf[1] );
+        nlohmann::json row = { { "p", str( board->FindNet( codeP )->GetNetname() ) },
+                               { "n", str( board->FindNet( codeN )->GetNetname() ) },
+                               { "length_mm", { toMm( lengthOf[0] ), toMm( lengthOf[1] ) } },
+                               { "skew_mm", toMm( skew ) } };
+
+        if( std::shared_ptr<DRC_ENGINE> drc = board->GetDesignSettings().m_DRCEngine; drc && anyOf[0] )
+        {
+            const DRC_CONSTRAINT c = drc->EvalRules( SKEW_CONSTRAINT, anyOf[0], nullptr, anyOf[0]->GetLayer() );
+
+            if( c.GetParentRule() && !c.GetParentRule()->IsImplicit() && c.GetValue().HasMax() )
+            {
+                row["skew_max_mm"] = toMm( c.GetValue().Max() );
+                row["skew_rule"] = str( c.GetParentRule()->m_Name );
+                row["skew_ok"] = skew <= c.GetValue().Max();
+            }
+        }
+
+        pairsOut.push_back( row );
+    }
+
     nlohmann::json answer = { { "connections", connections },
                               { "routed", routed },
                               { "failed", connections - routed },
@@ -10571,6 +10734,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "grid", gridOut },
                               { "plane_layers_skipped", planeLayers },
                               { "diff_pairs_skipped", pairsSkipped },
+                              { "diff_pair_lengths", pairsOut },
                               { "dry_run", dryRun },
                               { "stopped", KopenapiJobCancelled() },
                               { "stopped_on_plateau", plateauStopped },
@@ -15327,7 +15491,9 @@ KOPENAPI_REGISTER( "pcb_route",
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
                    "rip_up, gaps); "
-                   "nets a pcb_net_roles pair names (USB_DP_MCU / USB_DM_MCU too) are routed coupled as well (diff_pairs); "
+                   "nets a pcb_net_roles pair names (USB_DP_MCU / USB_DM_MCU too) are routed coupled as well (diff_pairs); a pair whose target pads lie apart is coupled up to where "
+                   "its line ends (row diff_pair.ends_short_mm), each net goes on alone from there; diff_pair_lengths: each pair's two "
+                   "net lengths and skew, against a custom skew rule (skew_max_mm, skew_rule, skew_ok); "
                    "bus routes a bundle's members one after another in pin order, bus_layer through a diagonal via fan (answer bus, row bus); "
                    "bus_paths routes a bus along a corridor, pcb_floorplan's path between two blocks or points given: its members side by "
                    "side at their pitch across each portal of the path as fixed corners, in the order they lie across the way in, one "
