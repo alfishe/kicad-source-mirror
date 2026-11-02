@@ -8,6 +8,7 @@
 /// step in the GUI, the same in headless.  New footprints all land on one insertion point; they
 /// are laid out in rows beside the board so nothing overlaps until placement (task 3.2).
 #include "kopenapi_pcb.h"
+#include <kicadopenapi_netclasses.h>
 
 #include <api/pcb_context.h>
 #include <base_units.h>
@@ -731,35 +732,6 @@ std::vector<std::pair<const char*, int BOARD_DESIGN_SETTINGS::*>> constraintFiel
 }
 
 
-/// @brief Net class values: name -> getter / setter in mm
-struct CLASS_FIELD
-{
-    const char*                             name;
-    std::function<std::optional<int>( NETCLASS& )> get;
-    std::function<void( NETCLASS&, int )>   set;
-};
-
-
-const std::vector<CLASS_FIELD>& classFields()
-{
-    static const std::vector<CLASS_FIELD> fields = {
-        { "clearance_mm", []( NETCLASS& c ) { return c.HasClearance() ? std::optional<int>( c.GetClearance() ) : std::nullopt; },
-          []( NETCLASS& c, int v ) { c.SetClearance( v ); } },
-        { "track_width_mm", []( NETCLASS& c ) { return c.HasTrackWidth() ? std::optional<int>( c.GetTrackWidth() ) : std::nullopt; },
-          []( NETCLASS& c, int v ) { c.SetTrackWidth( v ); } },
-        { "via_diameter_mm", []( NETCLASS& c ) { return c.HasViaDiameter() ? std::optional<int>( c.GetViaDiameter() ) : std::nullopt; },
-          []( NETCLASS& c, int v ) { c.SetViaDiameter( v ); } },
-        { "via_drill_mm", []( NETCLASS& c ) { return c.HasViaDrill() ? std::optional<int>( c.GetViaDrill() ) : std::nullopt; },
-          []( NETCLASS& c, int v ) { c.SetViaDrill( v ); } },
-        { "diff_pair_width_mm", []( NETCLASS& c ) { return c.HasDiffPairWidth() ? std::optional<int>( c.GetDiffPairWidth() ) : std::nullopt; },
-          []( NETCLASS& c, int v ) { c.SetDiffPairWidth( v ); } },
-        { "diff_pair_gap_mm", []( NETCLASS& c ) { return c.HasDiffPairGap() ? std::optional<int>( c.GetDiffPairGap() ) : std::nullopt; },
-          []( NETCLASS& c, int v ) { c.SetDiffPairGap( v ); } } };
-
-    return fields;
-}
-
-
 // the project's custom design rules (.kicad_dru), "" when there are none
 std::string customRules( BOARD* aBoard )
 {
@@ -859,29 +831,9 @@ nlohmann::json rulesJson( BOARD* aBoard, const KOPENAPI_LIST_CAP& aCap )
     for( const auto& [name, member] : constraintFields() )
         constraints[name] = toMm( bds.*member );
 
-    auto classJson = [&]( const std::shared_ptr<NETCLASS>& aClass )
-    {
-        nlohmann::json c = { { "name", str( aClass->GetName() ) } };
-
-        for( const CLASS_FIELD& f : classFields() )
-        {
-            if( std::optional<int> v = f.get( *aClass ) )
-                c[f.name] = toMm( *v );
-        }
-
-        return c;
-    };
-
-    nlohmann::json classes = nlohmann::json::array();
-    classes.push_back( classJson( net->GetDefaultNetclass() ) );
-
-    for( const auto& [name, netclass] : net->GetNetclasses() )
-        classes.push_back( classJson( netclass ) );
-
-    nlohmann::json patterns = nlohmann::json::array();
-
-    for( const auto& [matcher, netclass] : net->GetNetclassPatternAssignments() )
-        patterns.push_back( { { "pattern", str( matcher->GetPattern() ) }, { "netclass", str( netclass ) } } );
+    const nlohmann::json classesAndPatterns = KopenapiNetclassesJson( *net, false );
+    nlohmann::json       classes = classesAndPatterns["netclasses"];
+    nlohmann::json       patterns = classesAndPatterns["patterns"];
 
     // Which class each net ends up in
     std::map<std::string, nlohmann::json> members;
@@ -1049,26 +1001,8 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     if( aArgs.contains( "netclasses" ) )
     {
-        if( !aArgs["netclasses"].is_array() )
-            return KOPENAPI_RESULT::Error( 400, "netclasses: array of {name, clearance_mm, track_width_mm, ..., nets}" );
-
-        for( const nlohmann::json& c : aArgs["netclasses"] )
-        {
-            if( !c.is_object() || !c.contains( "name" ) || !c["name"].is_string() || c["name"].get<std::string>().empty() )
-                return KOPENAPI_RESULT::Error( 400, "every netclass needs a 'name' (\"Default\" edits the default class)" );
-
-            for( const CLASS_FIELD& f : classFields() )
-            {
-                if( c.contains( f.name ) && !positive( c[f.name] ) )
-                    return KOPENAPI_RESULT::Error( 400, std::string( f.name ) + ": a number >= 0 (mm)" );
-            }
-
-            if( c.contains( "nets" ) && !c["nets"].is_array() )
-                return KOPENAPI_RESULT::Error( 400, "nets: array of net names or patterns (*, ?)" );
-
-            if( c.value( "delete", false ) && c.value( "name", std::string() ) == str( NETCLASS::Default ) )
-                return KOPENAPI_RESULT::Error( 400, "the Default class cannot be deleted" );
-        }
+        if( const std::string why = KopenapiNetclassesCheck( aArgs["netclasses"] ); !why.empty() )
+            return KOPENAPI_RESULT::Error( 400, why );
     }
 
     const std::map<std::string, int> severityCodes = severityKeys();
@@ -1242,80 +1176,7 @@ static KOPENAPI_RESULT h_pcb_rules_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     if( aArgs.contains( "netclasses" ) )
-    {
-        for( const nlohmann::json& c : aArgs["netclasses"] )
-        {
-            const wxString           name = wxString::FromUTF8( c["name"].get<std::string>() );
-            std::shared_ptr<NETCLASS> netclass;
-
-            // the class's patterns, or the patterns of other classes naming the same nets, go
-            auto dropPatterns = [&]( const std::function<bool( const wxString&, const wxString& )>& aDrop )
-            {
-                auto& assignments = net->GetNetclassPatternAssignments();
-                std::vector<std::pair<std::unique_ptr<EDA_COMBINED_MATCHER>, wxString>> kept;
-
-                for( auto& [matcher, cls] : assignments )
-                {
-                    if( !aDrop( matcher->GetPattern(), cls ) )
-                        kept.emplace_back( std::move( matcher ), cls );
-                }
-
-                net->SetNetclassPatternAssignments( std::move( kept ) );
-            };
-
-            if( c.value( "delete", false ) )
-            {
-                dropPatterns( [&]( const wxString&, const wxString& aClass ) { return aClass == name; } );
-
-                std::map<wxString, std::shared_ptr<NETCLASS>> classes = net->GetNetclasses();
-                classes.erase( name );
-                net->SetNetclasses( classes );
-                continue;
-            }
-
-            if( c.contains( "nets" ) )
-            {
-                std::set<wxString> named;
-
-                for( const nlohmann::json& pattern : c["nets"] )
-                {
-                    if( pattern.is_string() )
-                        named.insert( wxString::FromUTF8( pattern.get<std::string>() ) );
-                }
-
-                dropPatterns( [&]( const wxString& aPattern, const wxString& aClass )
-                              { return aClass == name || named.count( aPattern ); } );
-            }
-
-            if( name == NETCLASS::Default )
-            {
-                netclass = net->GetDefaultNetclass();
-            }
-            else if( net->GetNetclasses().count( name ) )
-            {
-                netclass = net->GetNetclasses().at( name );
-            }
-            else
-            {
-                netclass = std::make_shared<NETCLASS>( name, false );
-                net->SetNetclass( name, netclass );
-            }
-
-            for( const CLASS_FIELD& f : classFields() )
-            {
-                if( c.contains( f.name ) )
-                    f.set( *netclass, toIU( c[f.name].get<double>() ) );
-            }
-
-            for( const nlohmann::json& pattern : c.value( "nets", nlohmann::json::array() ) )
-            {
-                if( pattern.is_string() )
-                    net->SetNetclassPatternAssignment( wxString::FromUTF8( pattern.get<std::string>() ), name );
-            }
-        }
-
-        net->ClearAllCaches();
-    }
+        KopenapiNetclassesApply( *net, aArgs["netclasses"] );
 
     board->SynchronizeNetsAndNetClasses( false );
 

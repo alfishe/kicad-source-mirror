@@ -4018,7 +4018,7 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
         if( !netclass.empty() && wxString::FromUTF8( netclass ) != NETCLASS::Default
             && !netSettings->HasNetclass( wxString::FromUTF8( netclass ) ) )
-            result["warning_netclass"] = "net class " + netclass + " is not defined (sch_netclass_assign create: true, or Schematic Setup)";
+            result["warning_netclass"] = "net class " + netclass + " is not defined (sch_netclass_set)";
     }
 
     if( pins == 0 )

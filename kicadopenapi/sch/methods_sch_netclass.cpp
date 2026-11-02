@@ -1,11 +1,13 @@
 /// @file methods_sch_netclass.cpp
-/// @brief kicadopenapi Assign Netclass (schematic): a net name pattern gets a net class in the
-/// project's net settings, as the editor's Assign Netclass dialog
+/// @brief kicadopenapi net classes from the schematic: Assign Netclass (a net name pattern gets a
+/// class, as the editor's dialog) and the classes themselves (Schematic Setup > Net Classes), in
+/// the project's net settings the board uses too
 #include "kopenapi_sch.h"
 #include "kopenapi_sch_model.h"
 
 #include <api/sch_context.h>
 #include <eda_pattern_match.h>
+#include <kicadopenapi_netclasses.h>
 #include <kicadopenapi_registry.h>
 #include <kicadopenapi_util.h>
 #include <netclass.h>
@@ -18,6 +20,7 @@
 #include <schematic.h>
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <vector>
 
@@ -83,7 +86,7 @@ static KOPENAPI_RESULT h_sch_netclass_assign( KOPENAPI_CONTEXT& aCtx, const nloh
         for( const auto& [name, cls] : netSettings->GetNetclasses() )
             classes.push_back( str( name ) );
 
-        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 404, "no net class " + netclass + " (create: true adds it)" );
+        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 404, "no net class " + netclass + " (create: true adds it; sizes: sch_netclass_set)" );
         r.body["netclasses"] = classes;
         return r;
     }
@@ -237,6 +240,82 @@ static KOPENAPI_RESULT h_sch_netclass_assign( KOPENAPI_CONTEXT& aCtx, const nloh
 }
 
 
+/// Classes, patterns and the nets each class holds now (a net in several classes under each,
+/// under Default only when it has no other)
+static nlohmann::json netclassesAnswer( SCHEMATIC* aSchematic, const nlohmann::json& aArgs )
+{
+    NET_SETTINGS&  settings = *aSchematic->Project().GetProjectFile().NetSettings();
+    nlohmann::json answer = KopenapiNetclassesJson( settings, true );
+    std::map<std::string, nlohmann::json> members;
+
+    for( const NET_ENTRY& net : collectNets( aSchematic ) )
+    {
+        std::shared_ptr<NETCLASS> effective = settings.GetEffectiveNetClass( wxString::FromUTF8( net.name ) );
+        std::vector<std::string>  names;
+
+        for( NETCLASS* part : effective->GetConstituentNetclasses() )
+        {
+            if( part->GetName() != NETCLASS::Default )
+                names.push_back( str( part->GetName() ) );
+        }
+
+        if( names.empty() )
+            names.push_back( NETCLASS::Default );
+
+        for( const std::string& name : names )
+            members[name].push_back( net.name );
+    }
+
+    KOPENAPI_LIST_CAP cap( aArgs, 50 );
+    nlohmann::json    classes = nlohmann::json::array();
+
+    for( nlohmann::json c : answer["netclasses"] )
+    {
+        nlohmann::json nets = members.count( c["name"] ) ? members[c["name"]] : nlohmann::json::array();
+        c["net_count"] = nets.size();
+        cap.Put( c, "nets", std::move( nets ) );
+        classes.push_back( std::move( c ) );
+    }
+
+    answer["netclasses"] = classes;
+    return answer;
+}
+
+
+static KOPENAPI_RESULT h_sch_netclass_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    return KOPENAPI_RESULT::Ok( netclassesAnswer( context->GetSchematic(), aArgs ) );
+}
+
+
+static KOPENAPI_RESULT h_sch_netclass_set( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    if( !aArgs.contains( "netclasses" ) )
+        return KOPENAPI_RESULT::Error( 400, "give 'netclasses': [{name, values, nets, delete}]" );
+
+    if( const std::string why = KopenapiNetclassesCheck( aArgs["netclasses"] ); !why.empty() )
+        return KOPENAPI_RESULT::Error( 400, why );
+
+    SCHEMATIC* schematic = context->GetSchematic();
+    KopenapiNetclassesApply( *schematic->Project().GetProjectFile().NetSettings(), aArgs["netclasses"] );
+
+    nlohmann::json answer = netclassesAnswer( schematic, aArgs );
+    answer["note"] = "project settings, as Schematic Setup > Net Classes: no undo step; saved with the project (sch_save); "
+                     "the board reads the same classes";
+    return KOPENAPI_RESULT::Ok( answer );
+}
+
+
 KOPENAPI_REGISTER( "sch_netclass_assign",
                    "Assign Netclass (schematic): nets by name pattern get a net class in the project's net "
                    "settings, as the editor's dialog. pattern (a net name, wildcard * ?, or /regex/), nets "
@@ -246,7 +325,7 @@ KOPENAPI_REGISTER( "sch_netclass_assign",
                    "sizes). dry_run answers the matching nets only; remove: true takes the patterns back. "
                    "Answers the nets the patterns match with the class now in force (net_class: label "
                    "assignments by directive labels win, as in KiCad). A net class by a flag on the wire: "
-                   "sch_label_add kind directive. Board side: pcb_rules_set netclasses",
+                   "sch_label_add kind directive. The classes and their sizes: sch_netclass_set",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","required":["netclass"],"properties":{
                         "netclass":{"type":"string"},
                         "pattern":{"type":"string"},
@@ -257,4 +336,37 @@ KOPENAPI_REGISTER( "sch_netclass_assign",
                         "dry_run":{"type":"boolean","default":false}}})json"_json, 100 ),
                    false, h_sch_netclass_assign );
 
-KOPENAPI_MARK_EDITING( "sch_netclass_assign" );
+static nlohmann::json netclassSetSchema()
+{
+    nlohmann::json item = { { "type", "object" }, { "required", { "name" } } };
+    nlohmann::json props = KopenapiNetclassBoardSchema();
+    props.update( KopenapiNetclassSchematicSchema() );
+    props["name"] = { { "type", "string" } };
+    props["nets"] = { { "type", "array" }, { "items", { { "type", "string" } } },
+                      { "description", "the class's nets / patterns: replaces its earlier ones, and the nets leave other classes; [] empties it" } };
+    props["delete"] = { { "type", "boolean" }, { "description", "remove this class and its net patterns" } };
+    item["properties"] = props;
+
+    return KOPENAPI_LIST_CAP::Schema( { { "type", "object" }, { "required", { "netclasses" } },
+                                        { "properties", { { "netclasses", { { "type", "array" }, { "items", item } } } } } }, 50 );
+}
+
+
+KOPENAPI_REGISTER( "sch_netclass_list",
+                   "Net classes of the project (Schematic Setup > Net Classes; the board uses the same): each class "
+                   "with the values it sets (board: clearance, track, via, diff pair; schematic: wire / bus width, "
+                   "color, line style), the nets it holds now (patterns and directive labels; net_count, nets "
+                   "capped at list_limit), and the pattern assignments",
+                   KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{}})json"_json, 50 ),
+                   false, h_sch_netclass_list );
+
+KOPENAPI_REGISTER( "sch_netclass_set",
+                   "Define net classes from the schematic, without a board (Schematic Setup > Net Classes): "
+                   "netclasses [{name ('Default' edits the default), clearance_mm, track_width_mm, "
+                   "via_diameter_mm, via_drill_mm, diff_pair_width_mm, diff_pair_gap_mm, wire_width_mm, "
+                   "bus_width_mm, color, line_style, nets: [names or patterns], delete}] - the same project net "
+                   "settings and rules as pcb_rules_set netclasses, so the board gets these classes. All or "
+                   "nothing (400 names the bad value). Answers as sch_netclass_list",
+                   netclassSetSchema(), false, h_sch_netclass_set );
+
+KOPENAPI_MARK_EDITING( "sch_netclass_assign", "sch_netclass_set" );
