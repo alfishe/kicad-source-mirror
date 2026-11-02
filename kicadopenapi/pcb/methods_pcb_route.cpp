@@ -4002,6 +4002,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // the planned ports of signal pins (ports), filled once the jobs are final
     std::map<const PAD*, PORT_GOAL> portGoals;
     int                             portTries = 0, portWon = 0;
+    double                          portMs = 0;
+    std::set<size_t>                portTried;   // jobs whose port try was made: once per call
 
     // a via of the end's net there would stand in the way out kept open for another net's pad: the
     // router walks around that, a try through it is wasted
@@ -4416,8 +4418,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         // allow; from the port's end when only the far end has one
         auto portTry = [&]()
         {
-            if( ok || rail || portGoals.empty() || aTries >= maxTries || overTime() )
+            if( ok || rail || portGoals.empty() || aTries >= maxTries || overTime()
+                || !portTried.insert( &aJob - jobs.data() ).second )
+            {
                 return;
+            }
 
             auto goalOf = [&]( BOARD_CONNECTED_ITEM* aEnd ) -> const PORT_GOAL*
             {
@@ -4516,7 +4521,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 aAttempt = nlohmann::json::object();
                 aTries++;
                 portTries++;
+                const auto portStarted = std::chrono::steady_clock::now();
                 ok = routeOne( *context, req, aAttempt, added );
+                portMs += msSince( portStarted );
 
                 if( ok )
                 {
@@ -9023,7 +9030,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         for( const auto& [pad, goal] : portGoals )
             portVias += goal.via.has_value();
 
-        answer["ports"] = { { "packages", portsOut }, { "pins", portGoals.size() }, { "vias", portVias }, { "tries", portTries }, { "won", portWon } };
+        answer["ports"] = { { "packages", portsOut }, { "pins", portGoals.size() }, { "vias", portVias }, { "tries", portTries }, { "won", portWon },
+                            { "ms", std::round( portMs ) } };
     }
 
     cap.Put( answer, "other_nets_moved", std::move( moved ) );
