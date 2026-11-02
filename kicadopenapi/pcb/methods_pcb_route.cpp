@@ -6604,7 +6604,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             std::vector<VECTOR2I> line;
             int                   runsMoved = 0;
 
-            // copper of other nets on the members' layer, for the runs inside the regions
+            // copper of other nets on the members' layer, for the runs inside the regions (and the pulls)
             std::vector<std::pair<BOX2I, std::shared_ptr<SHAPE>>> copper;
 
             auto addCopper = [&]( BOARD_CONNECTED_ITEM* aItem )
@@ -6620,6 +6620,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 for( PAD* pad : fp->Pads() )
                     addCopper( pad );
+            }
+
+            // and the rule areas tracks may not cross there
+            for( ZONE* zone : board->Zones() )
+            {
+                if( zone->GetIsRuleArea() && zone->GetDoNotAllowTracks() && zone->IsOnLayer( startLayer ) )
+                    copper.emplace_back( zone->Outline()->BBox(), std::make_shared<SHAPE_POLY_SET>( *zone->Outline() ) );
             }
 
             auto ribbonClear = [&]( const VECTOR2I& aFrom, const VECTOR2I& aTo )
@@ -6651,7 +6658,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( k + 1 == pts.size() || x.axis < 0 || pts[k + 1].axis < 0 || !x.into )
                     continue;
 
-                const CROSSING& y = pts[k + 1];
+                CROSSING& y = pts[k + 1];
+
+                // a jog of less than two pitches between two crossings in line: the second moved in line
+                // with the first where its stretch has room
+                if( x.axis == y.axis )
+                {
+                    int&      v = x.axis == 0 ? y.at.x : y.at.y;
+                    const int u = x.axis == 0 ? x.at.x : x.at.y;
+
+                    if( v != u && std::abs( v - u ) < 2 * pitch && u >= y.lo + margin + half && u <= y.hi - margin - half )
+                        v = u;
+                }
 
                 if( x.axis != y.axis )
                 {
@@ -6666,9 +6684,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( b0 == b1 )
                     continue;
 
+                // through the region with the crossings less than a pitch apart along the way: one straight
+                // (or diagonal) run, no jog past the second and back; out through the side it came in by:
+                // as deep as the ribbon needs
                 const VECTOR2D way = travelAt( k );
-                int            mid = std::abs( a1 - a0 ) < pitch ? a0 + KiROUND( ( inX ? way.x : way.y ) * ( margin + half ) )
-                                                                 : int( ( int64_t( a0 ) + a1 ) / 2 );
+                const bool     back = way.Dot( travelAt( k + 1 ) ) < 0;
+
+                if( !back && std::abs( a1 - a0 ) < pitch )
+                    continue;
+
+                int            mid = back && std::abs( a1 - a0 ) < pitch ? a0 + KiROUND( ( inX ? way.x : way.y ) * ( margin + half ) )
+                                                                         : int( ( int64_t( a0 ) + a1 ) / 2 );
                 const int      rlo = ( inX ? x.into->GetLeft() : x.into->GetTop() ) + margin + half;
                 const int      rhi = ( inX ? x.into->GetRight() : x.into->GetBottom() ) - margin - half;
 
@@ -6717,6 +6743,125 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 const VECTOR2D v( aD );
                 return v.EuclideanNorm() > 0 ? v.Resize( 1.0 ) : VECTOR2D( 0.0, 0.0 );
             };
+
+            // the line pulled tight: from each vertex on to the farthest one a straight run (axis-parallel
+            // or else diagonal) or one turn reaches inside the regions crossed and clear of the copper, so
+            // the corners are the turns and the way never goes back
+            const size_t lineFrom = line.size();
+
+            auto inRegions = [&]( const VECTOR2I& aFrom, const VECTOR2I& aTo )
+            {
+                const double length = ( aTo - aFrom ).EuclideanNorm();
+                const int    steps = std::max( 1, (int) std::ceil( length / std::max( pitch, 1 ) ) );
+                const VECTOR2D across = length > 0 ? VECTOR2D( -( aTo.y - aFrom.y ) / length, ( aTo.x - aFrom.x ) / length )
+                                                   : VECTOR2D( 0.0, 0.0 );
+
+                for( int t = 0; t <= steps; ++t )
+                {
+                    const double   f = double( t ) / steps;
+                    const VECTOR2D at( aFrom.x + ( aTo.x - aFrom.x ) * f, aFrom.y + ( aTo.y - aFrom.y ) * f );
+
+                    // the ribbon's middle and both its sides, a pitch off them
+                    for( double side : { 0.0, 1.0, -1.0 } )
+                    {
+                        const VECTOR2D p = at + across * ( side * ( half + margin ) );
+                        const VECTOR2I q( KiROUND( p.x ), KiROUND( p.y ) );
+                        bool           inside = false;
+
+                        for( const CROSSING& x : pts )
+                        {
+                            if( x.into && BOX2I( *x.into ).Inflate( 10 ).Contains( q ) )
+                            {
+                                inside = true;
+                                break;
+                            }
+                        }
+
+                        if( !inside )
+                            return false;
+                    }
+                }
+
+                return true;
+            };
+
+            auto clear = [&]( const VECTOR2I& aFrom, const VECTOR2I& aTo )
+            {
+                return inRegions( aFrom, aTo ) && ribbonClear( aFrom, aTo );
+            };
+
+            // the first and the last run kept: the ways out of the end blocks and into them
+            if( line.size() > 4 )
+            {
+                std::vector<VECTOR2I> tight = { line[0], line[1] };
+                const size_t          last = line.size() - 2;
+
+                for( size_t i = 1; i < last; )
+                {
+                    size_t                  next = i + 1;
+                    std::optional<VECTOR2I> turn;
+
+                    for( size_t j = last; j > i + 1; --j )
+                    {
+                        const VECTOR2I a = line[i], b = line[j];
+                        const VECTOR2I c0( b.x, a.y ), c1( a.x, b.y );
+
+                        if( ( a.x == b.x || a.y == b.y ) && clear( a, b ) )
+                        {
+                            next = j;
+                            break;
+                        }
+
+                        if( clear( a, c0 ) && clear( c0, b ) )
+                        {
+                            next = j;
+                            turn = c0;
+                            break;
+                        }
+
+                        if( clear( a, c1 ) && clear( c1, b ) )
+                        {
+                            next = j;
+                            turn = c1;
+                            break;
+                        }
+
+                        if( clear( a, b ) )
+                        {
+                            next = j;
+                            break;
+                        }
+                    }
+
+                    if( turn )
+                        tight.push_back( *turn );
+
+                    tight.push_back( line[next] );
+                    i = next;
+                }
+
+                tight.push_back( line.back() );
+                line = std::move( tight );
+            }
+
+            // corners only where the line turns: a vertex in line with its neighbours, or one the line
+            // comes back from (a way back along the same line), is dropped
+            for( bool dropped = true; dropped && line.size() > 2; )
+            {
+                dropped = false;
+
+                for( size_t v = 1; v + 1 < line.size(); ++v )
+                {
+                    const VECTOR2D a = unit( line[v] - line[v - 1] ), b = unit( line[v + 1] - line[v] );
+
+                    if( a.EuclideanNorm() == 0 || b.EuclideanNorm() == 0 || std::abs( a.x * b.y - a.y * b.x ) < 1e-6 )
+                    {
+                        line.erase( line.begin() + (long) v );
+                        dropped = true;
+                        break;
+                    }
+                }
+            }
 
             const VECTOR2D firstWay = travelAt( 0 );
             const VECTOR2D lastWay = pts.back().axis >= 0 && pts.back().into ? travelAt( pts.size() - 1 ) : unit( endMid - line.back() );
@@ -6848,6 +6993,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( runsMoved )
                 out["runs_moved"] = runsMoved;
+
+            if( line.size() < lineFrom )
+                out["pulled_from"] = lineFrom;
 
             if( partEnds )
                 out["ends_on_copper"] = partEnds;
