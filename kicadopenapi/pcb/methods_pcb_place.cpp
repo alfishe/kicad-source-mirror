@@ -3391,9 +3391,10 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
     // a part placed before (a board laid out already, the block placed again) stays where it was when
     // that is clear of the other courtyards and the kept corridors and no farther from its target (or
-    // no new spot was found)
+    // no new spot was found); a series part keeps it only inside the ports band its pin leaves by, when
+    // there is one, and a new spot in that band takes its place
     auto keepIfNearer = [&]( FOOTPRINT* aPart, PAD* aTarget, const POSE& aWas, NEAR_PLACEMENT& aPlacement,
-                             const NEAR_OPTIONS& aPlaceOptions )
+                             const NEAR_OPTIONS& aPlaceOptions, bool aSeries = false )
     {
         if( viaSpotOf.count( aPart ) )
             return;
@@ -3416,6 +3417,24 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         const POSE now{ aPart->GetPosition(), aPart->GetOrientation(), aPart->IsFlipped() };
 
+        // in the ports band of its pin's side: nullopt when that side has none
+        auto inBand = [&]() -> std::optional<bool>
+        {
+            const std::string prefix = "ports " + pinSide( aAnchor, aTarget ) + " ";
+            std::optional<bool> inside;
+
+            for( const CORRIDOR& corridor : corridors )
+            {
+                if( corridor.name.rfind( prefix, 0 ) == 0 )
+                    inside = inside.value_or( false ) || corridor.area.Contains( aPart->GetPosition() );
+            }
+
+            return inside;
+        };
+
+        if( aSeries && found.ok && inBand().value_or( false ) )
+            return;
+
         auto pose = [&]( const POSE& aPose )
         {
             if( aPart->IsFlipped() != aPose.flipped )
@@ -3437,6 +3456,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
                                         &viaSpots );
             keep = space.Free( area, area.BBox(), VECTOR2I( 0, 0 ) );
         }
+
+        if( keep && aSeries )
+            keep = inBand().value_or( true );
 
         if( keep )
         {
@@ -3683,7 +3705,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             }
         }
 
-        keepIfNearer( member.part, target, was, placement, options );
+        keepIfNearer( member.part, target, was, placement, options, isSeries( member ) && !viaPad );
 
         // a series part on a signal pin across from the one on its neighbour pin (a pair's resistors
         // the other way round than their pins): the two alike trade places, so their ways do not cross
@@ -5831,7 +5853,7 @@ KOPENAPI_REGISTER( "pcb_place_group",
                    "open schematic. A part bound to a member rather than to the anchor goes next to that "
                    "member, or to a part placed at the anchor by an earlier call. decoupling: per_pin / "
                    "schematic (listed in the answer). A part already where it is no farther from its target than the new spot, clear of "
-                   "the other courtyards and the kept corridors (a board laid out already), stays (direction kept). Parts stay inside the board outline; a part low enough "
+                   "the other courtyards and the kept corridors (a board laid out already), stays (direction kept) - a series part only inside the ports band of its pin's side, when ports_keep_mm keeps one, and a new spot in that band goes before it. Parts stay inside the board outline; a part low enough "
                    "(3D model) may go under a footprint with the field max_height_under_mm (a daughterboard "
                    "over its headers: only its pads are in the way; the row says under). side opposite: on "
                    "the other side of the board, under the pads. groups: several blocks in one call, in order. "
