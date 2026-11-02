@@ -9090,9 +9090,50 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         return KopenapiNoSuchNet( board, str( netName ) );
 
     NETCLASS*  netclass = net->GetNetClass();
-    const int  viaDia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
-    const int  viaDrill = netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
+    const int  classViaDia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
+    const int  classViaDrill = netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
     const int  width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : pcbIUScale.mmToIU( 0.3 );
+
+    // the via being tried: the net class's, or the board's smallest at a fine-pitch row pin where the
+    // class's does not fit inward
+    int viaDia = classViaDia;
+    int viaDrill = classViaDrill;
+    int minViaDia = 0;
+    int minViaDrill = 0;
+
+    {
+        const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+        int                          drill = bds.m_MinThroughDrill;
+        int                          ring = bds.m_ViasMinAnnularWidth;
+        int                          dia = bds.m_ViasMinSize;
+
+        if( std::shared_ptr<DRC_ENGINE> drc = bds.m_DRCEngine )
+        {
+            PCB_VIA probe( board );
+            probe.SetFlags( ROUTER_TRANSIENT );
+            probe.SetViaType( VIATYPE::THROUGH );
+            probe.SetLayerPair( F_Cu, B_Cu );
+            probe.SetNet( net );
+
+            auto minOf = [&]( DRC_CONSTRAINT_T aType, int aFloor )
+            {
+                DRC_CONSTRAINT c = drc->EvalRules( aType, &probe, nullptr, F_Cu );
+                return c.GetValue().HasMin() ? std::max( c.GetValue().Min(), aFloor ) : aFloor;
+            };
+
+            drill = minOf( HOLE_SIZE_CONSTRAINT, drill );
+            ring = minOf( ANNULAR_WIDTH_CONSTRAINT, ring );
+            dia = minOf( VIA_DIAMETER_CONSTRAINT, dia );
+        }
+
+        dia = std::max( dia, drill + 2 * ring );
+
+        if( drill > 0 && dia > drill && dia < classViaDia )
+        {
+            minViaDia = dia;
+            minViaDrill = std::min( drill, classViaDrill );
+        }
+    }
 
     // under_parts avoid: no via or stub inside a quad package's ring of pads (its exposed pad stays open)
     const std::string underParts = aArgs.value( "under_parts", std::string( "avoid" ) );
@@ -9370,6 +9411,81 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                [&]( const UNDER_PART& u ) { return u.fp == pad->GetParentFootprint(); } );
     };
 
+    // the way inward of a rail pin of another net in a fine-pitch row (a power pin, or a pin of a net
+    // with a pour), not yet on another layer: kept free while a spot elsewhere fits, so that each
+    // rail of a run of them gets its via
+    struct LANE
+    {
+        const PAD*    pad;
+        SHAPE_SEGMENT shape;   // a stub of the board's narrowest track straight in, 1 mm past the pad
+    };
+
+    std::vector<LANE> lanes;
+
+    {
+        std::set<int> poured;
+
+        for( ZONE* z : board->Zones() )
+        {
+            if( !z->GetIsRuleArea() )
+                poured.insert( z->GetNetCode() );
+        }
+
+        const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+        std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
+
+        for( const auto& [pad, dir] : outward )
+        {
+            if( pad->GetNetCode() == net->GetNetCode() || pad->GetNetCode() <= 0 || !rowPin( pad ) )
+                continue;
+
+            if( !poured.count( pad->GetNetCode() ) && !pad->GetPinType().Contains( wxT( "power" ) ) )
+                continue;
+
+            bool reached = false;
+
+            for( BOARD_CONNECTED_ITEM* c : conn->GetConnectedItems( pad ) )
+            {
+                reached |= c->Type() == PCB_VIA_T || c->Type() == PCB_ZONE_T;
+
+                if( c->Type() == PCB_TRACE_T || c->Type() == PCB_ARC_T )
+                {
+                    for( BOARD_CONNECTED_ITEM* o : conn->GetConnectedItems( c ) )
+                        reached |= o->Type() == PCB_VIA_T;
+                }
+            }
+
+            if( reached )
+                continue;
+
+            const BOX2I pb = pad->GetBoundingBox();
+            const int   padHalf = dir.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
+            const VECTOR2I end = pad->GetPosition() - dir * ( padHalf + pcbIUScale.mmToIU( 1.0 ) );
+            lanes.push_back( { pad, SHAPE_SEGMENT( pad->GetPosition(), end, bds.m_TrackMinWidth ) } );
+        }
+    }
+
+    const int laneClearance = std::max( minClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0 );
+    const int holeClearance = board->GetDesignSettings().m_HoleClearance;
+
+    // the rail neighbour whose way inward a via at aAt (its stub from aFrom) would shut
+    auto inLane = [&]( const VECTOR2I& aAt, const std::optional<VECTOR2I>& aFrom ) -> const PAD*
+    {
+        const int reach = std::max( viaDia / 2 + laneClearance, viaDrill / 2 + holeClearance );
+        const int stubHalf = board->GetDesignSettings().m_TrackMinWidth / 2;
+
+        for( const LANE& l : lanes )
+        {
+            if( l.shape.Collide( aAt, reach ) )
+                return l.pad;
+
+            if( aFrom && l.shape.Collide( SEG( *aFrom, aAt ), stubHalf + laneClearance ) )
+                return l.pad;
+        }
+
+        return nullptr;
+    };
+
     SHAPE_POLY_SET boardShape;
     board->GetBoardPolygonOutlines( boardShape, true );
     const int edgeClearance = board->GetDesignSettings().m_CopperEdgeClearance;
@@ -9431,6 +9547,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     std::set<BOARD_CONNECTED_ITEM*> done;
     int               offPlaneSkipped = 0;
     int               neckedStubs = 0;
+    int               minVias = 0;   // vias of the board's smallest size at fine-pitch row pins
 
     // a pad of the net centred at aAt (where an island's stub starts)
     auto padAt = [&]( const VECTOR2I& aAt ) -> PAD*
@@ -9578,555 +9695,615 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
             const bool  onTrack = item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T;
             const BOX2I box = item->Type() == PCB_ZONE_T || onTrack ? BOX2I( pos, VECTOR2I( 0, 0 ) ) : item->GetBoundingBox();
             bool        ok = false;
+            viaDia = classViaDia;
+            viaDrill = classViaDrill;
 
+            // the net class's via, then the board's smallest at a fine-pitch row pin; first keeping the
+            // ways inward of rail neighbours free, then (when that was what refused spots) without. In
+            // a run of rail pins the smallest goes first where the class's leaves no stub between two
+            // vias a pin apart (the vias of the run alternate in depth)
+            int  laneRefused = 0;
+            bool smallFirst = false;
 
-            // Candidate spots, nearest first: around a pad; inside a zone island (on a grid over the
-            // island, the via's copper fully in it)
-            std::vector<VECTOR2I>                         candidates;
-            std::map<std::pair<int, int>, VECTOR2I>       stubFrom;   // where the stub to a spot starts
-            std::map<std::pair<int, int>, PAD*>           stubPadAt;  // the pad a stub leaves, where not at its centre
-            std::set<std::pair<int, int>>                 inwardAt;   // spots inward of a pad of a quad package's row
-            std::set<std::pair<int, int>>                 inPad;      // spots in an exposed pad: no stub
-            std::map<std::pair<int, int>, BOARD_CONNECTED_ITEM*> joinAt;   // a stub into the exposed pad or a via of the net: no via
-            std::set<std::pair<int, int>>                 slantAt;    // inward spots off the pad's axis
-
-            if( item->Type() == PCB_ZONE_T )
+            if( minViaDia && rowPin( item ) )
             {
-                ZONE* zone = static_cast<ZONE*>( item );
+                const PAD* own = static_cast<const PAD*>( item );
+                const int  stubMin = board->GetDesignSettings().m_TrackMinWidth;
 
-                for( PCB_LAYER_ID l : zone->GetLayerSet().CuStack() )
+                for( const LANE& l : lanes )
                 {
-                    if( !zone->HasFilledPolysForLayer( l ) )
+                    const int pitch = ( l.pad->GetPosition() - own->GetPosition() ).EuclideanNorm();
+
+                    if( l.pad->GetParentFootprint() != own->GetParentFootprint() || pitch > pcbIUScale.mmToIU( 0.65 ) )
                         continue;
 
-                    const std::shared_ptr<SHAPE_POLY_SET>& fill = zone->GetFilledPolysList( l );
-
-                    for( int o = 0; o < fill->OutlineCount(); ++o )
-                    {
-                        SHAPE_POLY_SET island;
-                        island.AddOutline( fill->COutline( o ) );
-
-                        for( int h = 0; h < fill->HoleCount( o ); ++h )
-                            island.AddHole( fill->CHole( o, h ) );
-
-                        if( !island.Contains( pos, -1, pcbIUScale.mmToIU( 0.05 ) ) )
-                            continue;   // the island this anchor belongs to
-
-                        SHAPE_POLY_SET room = island;
-                        room.Deflate( viaDia / 2, CORNER_STRATEGY::ROUND_ALL_CORNERS, ARC_HIGH_DEF );
-
-                        const BOX2I ib = island.BBox();
-
-                        for( int x = ib.GetLeft(); x <= ib.GetRight(); x += step )
-                        {
-                            for( int y = ib.GetTop(); y <= ib.GetBottom(); y += step )
-                            {
-                                if( room.Contains( VECTOR2I( x, y ) ) )
-                                    candidates.emplace_back( x, y );
-                            }
-                        }
-                    }
+                    smallFirst |= 2 * pitch - classViaDia < 2 * laneClearance + stubMin
+                                  || 2 * pitch - classViaDrill - 2 * holeClearance < stubMin;
                 }
             }
-            else
-            {
-                // around the pad; for an island of tracks around every pad and track end of it on this layer
-                std::vector<std::pair<VECTOR2I, int>> bases = { { pos, std::max( box.GetWidth(), box.GetHeight() ) / 2 } };
 
-                if( onTrack )
+            for( int attempt = 0; attempt < 4 && !ok; ++attempt )
+            {
+                const bool small = ( attempt % 2 == 1 ) != smallFirst;
+                const bool keepLanes = attempt < 2;
+
+                if( small && ( !minViaDia || !rowPin( item ) ) )
+                    continue;
+
+                if( !keepLanes && !laneRefused )
+                    break;
+
+                viaDia = small ? minViaDia : classViaDia;
+                viaDrill = small ? minViaDrill : classViaDrill;
+
+                // Candidate spots, nearest first: around a pad; inside a zone island (on a grid over the
+                // island, the via's copper fully in it)
+                std::vector<VECTOR2I>                         candidates;
+                std::map<std::pair<int, int>, VECTOR2I>       stubFrom;   // where the stub to a spot starts
+                std::map<std::pair<int, int>, PAD*>           stubPadAt;  // the pad a stub leaves, where not at its centre
+                std::set<std::pair<int, int>>                 inwardAt;   // spots inward of a pad of a quad package's row
+                std::set<std::pair<int, int>>                 inPad;      // spots in an exposed pad: no stub
+                std::map<std::pair<int, int>, BOARD_CONNECTED_ITEM*> joinAt;   // a stub into the exposed pad or a via of the net: no via
+                std::set<std::pair<int, int>>                 slantAt;    // inward spots off the pad's axis
+
+                if( item->Type() == PCB_ZONE_T )
                 {
-                    for( BOARD_CONNECTED_ITEM* other : board->GetConnectivity()->GetConnectedItems( item ) )
+                    ZONE* zone = static_cast<ZONE*>( item );
+
+                    for( PCB_LAYER_ID l : zone->GetLayerSet().CuStack() )
                     {
-                        if( other->GetNetCode() != net->GetNetCode() || !other->IsOnLayer( layer ) )
+                        if( !zone->HasFilledPolysForLayer( l ) )
                             continue;
 
-                        if( other->Type() == PCB_PAD_T )
+                        const std::shared_ptr<SHAPE_POLY_SET>& fill = zone->GetFilledPolysList( l );
+
+                        for( int o = 0; o < fill->OutlineCount(); ++o )
                         {
-                            const BOX2I pb = other->GetBoundingBox();
-                            bases.emplace_back( other->GetPosition(), std::max( pb.GetWidth(), pb.GetHeight() ) / 2 );
-                        }
-                        else if( other->Type() == PCB_TRACE_T || other->Type() == PCB_ARC_T )
-                        {
-                            bases.emplace_back( static_cast<PCB_TRACK*>( other )->GetStart(), 0 );
-                            bases.emplace_back( static_cast<PCB_TRACK*>( other )->GetEnd(), 0 );
-                        }
-                    }
-                }
+                            SHAPE_POLY_SET island;
+                            island.AddOutline( fill->COutline( o ) );
 
-                for( const auto& [base, half] : bases )
-                {
-                    // inward from a pad of a quad package's row: spots in the ring before its exposed pad
-                    PAD* basePad = item->Type() == PCB_PAD_T && base == pos ? static_cast<PAD*>( item ) : padAt( base );
+                            for( int h = 0; h < fill->HoleCount( o ); ++h )
+                                island.AddHole( fill->CHole( o, h ) );
 
-                    if( auto dir = basePad ? outward.find( basePad ) : outward.end(); dir != outward.end() )
-                    {
-                        const bool quad = std::any_of( ringAreas.begin(), ringAreas.end(),
-                                                       [&]( const UNDER_PART& u ) { return u.fp == basePad->GetParentFootprint(); } );
-                        const BOX2I    pb = basePad->GetBoundingBox();
-                        const int      padHalf = dir->second.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
-                        const int      narrow = dir->second.x ? pb.GetHeight() : pb.GetWidth();
-                        const VECTOR2I across( -dir->second.y, dir->second.x );
+                            if( !island.Contains( pos, -1, pcbIUScale.mmToIU( 0.05 ) ) )
+                                continue;   // the island this anchor belongs to
 
-                        // straight in from the pad's centre, or slanted from its inner end past the
-                        // vias of its row neighbours
-                        const VECTOR2I tip = base - dir->second * std::max( padHalf - narrow / 2, 0 );
+                            SHAPE_POLY_SET room = island;
+                            room.Deflate( viaDia / 2, CORNER_STRATEGY::ROUND_ALL_CORNERS, ARC_HIGH_DEF );
 
-                        // a pin of the exposed pad's net: a stub into it, no via
-                        for( PAD* ep : exposedPads )
-                        {
-                            if( ep->GetParentFootprint() != basePad->GetParentFootprint() || ep->GetNetCode() != net->GetNetCode() )
-                                continue;
+                            const BOX2I ib = island.BBox();
 
-                            BOX2I eb = ep->GetBoundingBox();
-                            eb.Inflate( -narrow );
-
-                            if( eb.GetWidth() <= 0 || eb.GetHeight() <= 0 )
-                                continue;
-
-                            const VECTOR2I at( std::clamp( tip.x, eb.GetLeft(), eb.GetRight() ),
-                                               std::clamp( tip.y, eb.GetTop(), eb.GetBottom() ) );
-                            candidates.push_back( at );
-                            stubFrom[{ at.x, at.y }] = at.x == tip.x || at.y == tip.y ? base : tip;
-                            stubPadAt[{ at.x, at.y }] = basePad;
-                            joinAt[{ at.x, at.y }] = ep;
-                        }
-
-                        // a via of the net already in the ring next to it (a row neighbour's): a stub to it
-                        for( PCB_TRACK* t : board->Tracks() )
-                        {
-                            if( !quad || t->Type() != PCB_VIA_T || t->GetNetCode() != net->GetNetCode() )
-                                continue;
-
-                            const VECTOR2I at = t->GetPosition();
-                            const VECTOR2I d = at - tip;
-
-                            if( (double) d.EuclideanNorm() > pcbIUScale.mmToIU( 1.2 ) || d.Dot( dir->second ) >= 0
-                                || !std::any_of( ringAreas.begin(), ringAreas.end(),
-                                                 [&]( const UNDER_PART& u )
-                                                 { return u.fp == basePad->GetParentFootprint() && u.area.Contains( at ); } ) )
+                            for( int x = ib.GetLeft(); x <= ib.GetRight(); x += step )
                             {
-                                continue;
-                            }
-
-                            candidates.push_back( at );
-                            stubFrom[{ at.x, at.y }] = tip;
-                            stubPadAt[{ at.x, at.y }] = basePad;
-                            joinAt[{ at.x, at.y }] = t;
-                        }
-
-                        for( int k = 0; quad && k < 20; ++k )
-                        {
-                            for( int side : { 0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5 } )
-                            {
-                                const VECTOR2I at = base - dir->second * ( padHalf + viaDia / 2 + minClearance + k * pcbIUScale.mmToIU( 0.1 ) )
-                                                    + across * ( side * pcbIUScale.mmToIU( 0.2 ) );
-                                candidates.push_back( at );
-                                stubFrom[{ at.x, at.y }] = side ? tip : base;
-                                stubPadAt[{ at.x, at.y }] = basePad;
-                                inwardAt.insert( { at.x, at.y } );
-
-                                if( side )
-                                    slantAt.insert( { at.x, at.y } );
-                            }
-                        }
-                    }
-                    else if( basePad && base == pos && exposedPads.count( basePad ) )
-                    {
-                        // an exposed pad: a via in it, nearest its centre first
-                        const BOX2I pb = basePad->GetBoundingBox();
-                        SHAPE_POLY_SET room;
-                        basePad->TransformShapeToPolygon( room, layer, 0, ARC_HIGH_DEF, ERROR_INSIDE );
-                        room.Deflate( viaDia / 2, CORNER_STRATEGY::ROUND_ALL_CORNERS, ARC_HIGH_DEF );
-
-                        for( int x = pb.GetLeft(); x <= pb.GetRight(); x += step )
-                        {
-                            for( int y = pb.GetTop(); y <= pb.GetBottom(); y += step )
-                            {
-                                const VECTOR2I at( KiROUND( (double) x / step ) * step, KiROUND( (double) y / step ) * step );
-
-                                if( room.OutlineCount() && room.Contains( at ) && !inPad.count( { at.x, at.y } ) )
+                                for( int y = ib.GetTop(); y <= ib.GetBottom(); y += step )
                                 {
-                                    candidates.push_back( at );
-                                    stubFrom[{ at.x, at.y }] = base;
-                                    stubPadAt[{ at.x, at.y }] = basePad;
-                                    inPad.insert( { at.x, at.y } );
+                                    if( room.Contains( VECTOR2I( x, y ) ) )
+                                        candidates.emplace_back( x, y );
                                 }
                             }
                         }
                     }
+                }
+                else
+                {
+                    // around the pad; for an island of tracks around every pad and track end of it on this layer
+                    std::vector<std::pair<VECTOR2I, int>> bases = { { pos, std::max( box.GetWidth(), box.GetHeight() ) / 2 } };
 
-                    for( int ring = 0; ring < 6; ++ring )
+                    if( onTrack )
                     {
-                        const int reach = half + viaDia / 2 + pcbIUScale.mmToIU( 0.4 ) + ring * pcbIUScale.mmToIU( 0.5 );
-
-                        for( int k = 0; k < 16; ++k )
+                        for( BOARD_CONNECTED_ITEM* other : board->GetConnectivity()->GetConnectedItems( item ) )
                         {
-                            const double a = k * M_PI / 8;
-                            VECTOR2I     at = base + VECTOR2I( KiROUND( reach * std::cos( a ) ), KiROUND( reach * std::sin( a ) ) );
-                            at = VECTOR2I( KiROUND( (double) at.x / step ) * step, KiROUND( (double) at.y / step ) * step );
-                            candidates.push_back( at );
-                            stubFrom[{ at.x, at.y }] = base;
+                            if( other->GetNetCode() != net->GetNetCode() || !other->IsOnLayer( layer ) )
+                                continue;
+
+                            if( other->Type() == PCB_PAD_T )
+                            {
+                                const BOX2I pb = other->GetBoundingBox();
+                                bases.emplace_back( other->GetPosition(), std::max( pb.GetWidth(), pb.GetHeight() ) / 2 );
+                            }
+                            else if( other->Type() == PCB_TRACE_T || other->Type() == PCB_ARC_T )
+                            {
+                                bases.emplace_back( static_cast<PCB_TRACK*>( other )->GetStart(), 0 );
+                                bases.emplace_back( static_cast<PCB_TRACK*>( other )->GetEnd(), 0 );
+                            }
                         }
                     }
-                }
-            }
 
-            if( planeless )
-                std::erase_if( candidates, [&]( const VECTOR2I& at ) { return !inwardAt.count( { at.x, at.y } ) && !joinAt.count( { at.x, at.y } ); } );
-
-            // nearest to the anchor first; for an island the stub length decides (a spot near any of its pads)
-            auto stubLength = [&]( const VECTOR2I& at )
-            {
-                auto it = stubFrom.find( { at.x, at.y } );
-                return ( at - ( it == stubFrom.end() ? pos : it->second ) ).EuclideanNorm();
-            };
-
-            // a via only where the net's plane is on another layer (priorities resolved): inside a
-            // higher-priority pour of another net it would reach nothing or a sliver of the plane
-            auto onPlane = [&]( const VECTOR2I& at )
-            {
-                for( const auto& [l, plane] : planes )
-                {
-                    if( l != layer && plane.Contains( at ) )
-                        return true;
-                }
-
-                return false;
-            };
-
-            std::map<std::pair<int, int>, bool> planeAt;
-
-            // the 400 best spots (on the plane first, then the shortest stub; ties in candidate
-            // order), keys computed once: a zone island yields tens of thousands of spots
-            struct SPOT_KEY
-            {
-                bool   plane;
-                int    rank;
-                double stub;
-                size_t index;
-            };
-
-            // the pad a spot's stub leaves (none for a zone island's spot)
-            auto stubPadOf = [&]( const VECTOR2I& at ) -> PAD*
-            {
-                if( item->Type() == PCB_ZONE_T )
-                    return nullptr;
-
-                if( auto own = stubPadAt.find( { at.x, at.y } ); own != stubPadAt.end() )
-                    return own->second;
-
-                auto       it = stubFrom.find( { at.x, at.y } );
-                const bool fromPos = it == stubFrom.end() || it->second == pos;
-
-                if( fromPos && item->Type() == PCB_PAD_T )
-                    return static_cast<PAD*>( item );
-
-                return padAt( fromPos ? pos : it->second );
-            };
-
-            // inward under the pad's own package first, then beside a pad of coarse pitch (a cap), a
-            // fine-pitch pin's surroundings last
-            auto rankOf = [&]( const VECTOR2I& at )
-            {
-                PAD* from = stubPadOf( at );
-
-                if( !from )
-                    return 1;
-
-                if( joinAt.count( { at.x, at.y } ) )
-                    return -2;
-
-                if( inPad.count( { at.x, at.y } ) || ( inwardAt.count( { at.x, at.y } ) && !slantAt.count( { at.x, at.y } ) ) )
-                    return -1;
-
-                for( const UNDER_PART& u : ringAreas )
-                {
-                    if( u.fp == from->GetParentFootprint() && u.area.Contains( at ) )
-                        return 0;
-                }
-
-                return finePads.count( from ) ? 2 : 1;
-            };
-
-            std::vector<SPOT_KEY> keys;
-            keys.reserve( candidates.size() );
-
-            for( size_t i = 0; i < candidates.size(); ++i )
-            {
-                const VECTOR2I& at = candidates[i];
-                const bool      plane = planeAt.emplace( std::make_pair( at.x, at.y ), onPlane( at ) ).first->second
-                                        || joinAt.count( { at.x, at.y } );
-                keys.push_back( { plane, item->Type() == PCB_ZONE_T ? 1 : rankOf( at ), static_cast<double>( stubLength( at ) ), i } );
-            }
-
-            const size_t keep = std::min<size_t>( keys.size(), 400 );
-            std::partial_sort( keys.begin(), keys.begin() + keep, keys.end(),
-                               []( const SPOT_KEY& x, const SPOT_KEY& y )
-                               {
-                                   if( x.plane != y.plane )
-                                       return x.plane;
-
-                                   if( x.rank != y.rank )
-                                       return x.rank < y.rank;
-
-                                   if( x.stub != y.stub )
-                                       return x.stub < y.stub;
-
-                                   return x.index < y.index;
-                               } );
-
-            std::vector<VECTOR2I> best;
-            best.reserve( keep );
-
-            for( size_t i = 0; i < keep; ++i )
-                best.push_back( candidates[keys[i].index] );
-
-            candidates = std::move( best );
-
-            const int offPlaneBefore = offPlaneSkipped;
-            std::map<std::string, int> underSkipped;   // spots under a part's body, per part
-            std::map<std::string, int> escapeOf;       // spots in a pin's escape, per pin
-
-            {
-                for( const VECTOR2I& at : candidates )
-                {
-                    if( ok )
-                        break;
-
-                    if( inner.OutlineCount() && !inner.Contains( at ) )
-                        continue;   // too close to the board edge
-
-                    const auto join = joinAt.find( { at.x, at.y } );
-
-                    if( !planes.empty() && !planeAt[{ at.x, at.y }] )
+                    for( const auto& [base, half] : bases )
                     {
-                        offPlaneSkipped++;
-                        continue;
-                    }
+                        // inward from a pad of a quad package's row: spots in the ring before its exposed pad
+                        PAD* basePad = item->Type() == PCB_PAD_T && base == pos ? static_cast<PAD*>( item ) : padAt( base );
 
-                    {
-                        const auto        from = stubFrom.find( { at.x, at.y } );
-                        const bool        stub = item->Type() == PCB_PAD_T || onTrack;
-                        const std::optional<VECTOR2I> start = stub ? std::optional<VECTOR2I>( from == stubFrom.end() ? pos : from->second )
-                                                                   : std::nullopt;
-                        const PAD*        own = stubPadOf( at );
-                        const FOOTPRINT*  body = underWhich( at, start, layer, own ? own->GetParentFootprint() : nullptr );
-
-                        if( !body && join == joinAt.end() )
+                        if( auto dir = basePad ? outward.find( basePad ) : outward.end(); dir != outward.end() )
                         {
-                            for( const auto& [fp, band] : rowBands )
+                            const bool quad = std::any_of( ringAreas.begin(), ringAreas.end(),
+                                                           [&]( const UNDER_PART& u ) { return u.fp == basePad->GetParentFootprint(); } );
+                            const BOX2I    pb = basePad->GetBoundingBox();
+                            const int      padHalf = dir->second.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
+                            const int      narrow = dir->second.x ? pb.GetHeight() : pb.GetWidth();
+                            const VECTOR2I across( -dir->second.y, dir->second.x );
+
+                            // straight in from the pad's centre, or slanted from its inner end past the
+                            // vias of its row neighbours
+                            const VECTOR2I tip = base - dir->second * std::max( padHalf - narrow / 2, 0 );
+
+                            // a pin of the exposed pad's net: a stub into it, no via
+                            for( PAD* ep : exposedPads )
                             {
-                                if( band.Collide( at, viaDia / 2 ) )
-                                    body = fp;
+                                if( ep->GetParentFootprint() != basePad->GetParentFootprint() || ep->GetNetCode() != net->GetNetCode() )
+                                    continue;
+
+                                BOX2I eb = ep->GetBoundingBox();
+                                eb.Inflate( -narrow );
+
+                                if( eb.GetWidth() <= 0 || eb.GetHeight() <= 0 )
+                                    continue;
+
+                                const VECTOR2I at( std::clamp( tip.x, eb.GetLeft(), eb.GetRight() ),
+                                                   std::clamp( tip.y, eb.GetTop(), eb.GetBottom() ) );
+                                candidates.push_back( at );
+                                stubFrom[{ at.x, at.y }] = at.x == tip.x || at.y == tip.y ? base : tip;
+                                stubPadAt[{ at.x, at.y }] = basePad;
+                                joinAt[{ at.x, at.y }] = ep;
+                            }
+
+                            // a via of the net already in the ring next to it (a row neighbour's): a stub to it
+                            for( PCB_TRACK* t : board->Tracks() )
+                            {
+                                if( !quad || t->Type() != PCB_VIA_T || t->GetNetCode() != net->GetNetCode() )
+                                    continue;
+
+                                const VECTOR2I at = t->GetPosition();
+                                const VECTOR2I d = at - tip;
+
+                                if( (double) d.EuclideanNorm() > pcbIUScale.mmToIU( 1.2 ) || d.Dot( dir->second ) >= 0
+                                    || !std::any_of( ringAreas.begin(), ringAreas.end(),
+                                                     [&]( const UNDER_PART& u )
+                                                     { return u.fp == basePad->GetParentFootprint() && u.area.Contains( at ); } ) )
+                                {
+                                    continue;
+                                }
+
+                                candidates.push_back( at );
+                                stubFrom[{ at.x, at.y }] = tip;
+                                stubPadAt[{ at.x, at.y }] = basePad;
+                                joinAt[{ at.x, at.y }] = t;
+                            }
+
+                            for( int k = 0; quad && k < 20; ++k )
+                            {
+                                for( int side : { 0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5 } )
+                                {
+                                    const VECTOR2I at = base - dir->second * ( padHalf + viaDia / 2 + minClearance + k * pcbIUScale.mmToIU( 0.1 ) )
+                                                        + across * ( side * pcbIUScale.mmToIU( 0.2 ) );
+                                    candidates.push_back( at );
+                                    stubFrom[{ at.x, at.y }] = side ? tip : base;
+                                    stubPadAt[{ at.x, at.y }] = basePad;
+                                    inwardAt.insert( { at.x, at.y } );
+
+                                    if( side )
+                                        slantAt.insert( { at.x, at.y } );
+                                }
+                            }
+                        }
+                        else if( basePad && base == pos && exposedPads.count( basePad ) )
+                        {
+                            // an exposed pad: a via in it, nearest its centre first
+                            const BOX2I pb = basePad->GetBoundingBox();
+                            SHAPE_POLY_SET room;
+                            basePad->TransformShapeToPolygon( room, layer, 0, ARC_HIGH_DEF, ERROR_INSIDE );
+                            room.Deflate( viaDia / 2, CORNER_STRATEGY::ROUND_ALL_CORNERS, ARC_HIGH_DEF );
+
+                            for( int x = pb.GetLeft(); x <= pb.GetRight(); x += step )
+                            {
+                                for( int y = pb.GetTop(); y <= pb.GetBottom(); y += step )
+                                {
+                                    const VECTOR2I at( KiROUND( (double) x / step ) * step, KiROUND( (double) y / step ) * step );
+
+                                    if( room.OutlineCount() && room.Contains( at ) && !inPad.count( { at.x, at.y } ) )
+                                    {
+                                        candidates.push_back( at );
+                                        stubFrom[{ at.x, at.y }] = base;
+                                        stubPadAt[{ at.x, at.y }] = basePad;
+                                        inPad.insert( { at.x, at.y } );
+                                    }
+                                }
                             }
                         }
 
-                        if( body )
+                        for( int ring = 0; ring < 6; ++ring )
                         {
-                            underSkipped[str( body->GetReference() )]++;
+                            const int reach = half + viaDia / 2 + pcbIUScale.mmToIU( 0.4 ) + ring * pcbIUScale.mmToIU( 0.5 );
+
+                            for( int k = 0; k < 16; ++k )
+                            {
+                                const double a = k * M_PI / 8;
+                                VECTOR2I     at = base + VECTOR2I( KiROUND( reach * std::cos( a ) ), KiROUND( reach * std::sin( a ) ) );
+                                at = VECTOR2I( KiROUND( (double) at.x / step ) * step, KiROUND( (double) at.y / step ) * step );
+                                candidates.push_back( at );
+                                stubFrom[{ at.x, at.y }] = base;
+                            }
+                        }
+                    }
+                }
+
+                if( planeless )
+                    std::erase_if( candidates, [&]( const VECTOR2I& at ) { return !inwardAt.count( { at.x, at.y } ) && !joinAt.count( { at.x, at.y } ); } );
+
+                if( small )
+                    std::erase_if( candidates, [&]( const VECTOR2I& at ) { return !inwardAt.count( { at.x, at.y } ); } );
+
+                // nearest to the anchor first; for an island the stub length decides (a spot near any of its pads)
+                auto stubLength = [&]( const VECTOR2I& at )
+                {
+                    auto it = stubFrom.find( { at.x, at.y } );
+                    return ( at - ( it == stubFrom.end() ? pos : it->second ) ).EuclideanNorm();
+                };
+
+                // a via only where the net's plane is on another layer (priorities resolved): inside a
+                // higher-priority pour of another net it would reach nothing or a sliver of the plane
+                auto onPlane = [&]( const VECTOR2I& at )
+                {
+                    for( const auto& [l, plane] : planes )
+                    {
+                        if( l != layer && plane.Contains( at ) )
+                            return true;
+                    }
+
+                    return false;
+                };
+
+                std::map<std::pair<int, int>, bool> planeAt;
+
+                // the 400 best spots (on the plane first, then the shortest stub; ties in candidate
+                // order), keys computed once: a zone island yields tens of thousands of spots
+                struct SPOT_KEY
+                {
+                    bool   plane;
+                    int    rank;
+                    double stub;
+                    size_t index;
+                };
+
+                // the pad a spot's stub leaves (none for a zone island's spot)
+                auto stubPadOf = [&]( const VECTOR2I& at ) -> PAD*
+                {
+                    if( item->Type() == PCB_ZONE_T )
+                        return nullptr;
+
+                    if( auto own = stubPadAt.find( { at.x, at.y } ); own != stubPadAt.end() )
+                        return own->second;
+
+                    auto       it = stubFrom.find( { at.x, at.y } );
+                    const bool fromPos = it == stubFrom.end() || it->second == pos;
+
+                    if( fromPos && item->Type() == PCB_PAD_T )
+                        return static_cast<PAD*>( item );
+
+                    return padAt( fromPos ? pos : it->second );
+                };
+
+                // inward under the pad's own package first, then beside a pad of coarse pitch (a cap), a
+                // fine-pitch pin's surroundings last
+                auto rankOf = [&]( const VECTOR2I& at )
+                {
+                    PAD* from = stubPadOf( at );
+
+                    if( !from )
+                        return 1;
+
+                    if( joinAt.count( { at.x, at.y } ) )
+                        return -2;
+
+                    if( inPad.count( { at.x, at.y } ) || ( inwardAt.count( { at.x, at.y } ) && !slantAt.count( { at.x, at.y } ) ) )
+                        return -1;
+
+                    for( const UNDER_PART& u : ringAreas )
+                    {
+                        if( u.fp == from->GetParentFootprint() && u.area.Contains( at ) )
+                            return 0;
+                    }
+
+                    return finePads.count( from ) ? 2 : 1;
+                };
+
+                std::vector<SPOT_KEY> keys;
+                keys.reserve( candidates.size() );
+
+                for( size_t i = 0; i < candidates.size(); ++i )
+                {
+                    const VECTOR2I& at = candidates[i];
+                    const bool      plane = planeAt.emplace( std::make_pair( at.x, at.y ), onPlane( at ) ).first->second
+                                            || joinAt.count( { at.x, at.y } );
+                    keys.push_back( { plane, item->Type() == PCB_ZONE_T ? 1 : rankOf( at ), static_cast<double>( stubLength( at ) ), i } );
+                }
+
+                const size_t keep = std::min<size_t>( keys.size(), 400 );
+                std::partial_sort( keys.begin(), keys.begin() + keep, keys.end(),
+                                   []( const SPOT_KEY& x, const SPOT_KEY& y )
+                                   {
+                                       if( x.plane != y.plane )
+                                           return x.plane;
+
+                                       if( x.rank != y.rank )
+                                           return x.rank < y.rank;
+
+                                       if( x.stub != y.stub )
+                                           return x.stub < y.stub;
+
+                                       return x.index < y.index;
+                                   } );
+
+                std::vector<VECTOR2I> best;
+                best.reserve( keep );
+
+                for( size_t i = 0; i < keep; ++i )
+                    best.push_back( candidates[keys[i].index] );
+
+                candidates = std::move( best );
+
+                const int offPlaneBefore = offPlaneSkipped;
+                std::map<std::string, int> underSkipped;   // spots under a part's body, per part
+                std::map<std::string, int> escapeOf;       // spots in a pin's escape, per pin
+
+                {
+                    for( const VECTOR2I& at : candidates )
+                    {
+                        if( ok )
+                            break;
+
+                        if( inner.OutlineCount() && !inner.Contains( at ) )
+                            continue;   // too close to the board edge
+
+                        const auto join = joinAt.find( { at.x, at.y } );
+
+                        if( !planes.empty() && !planeAt[{ at.x, at.y }] )
+                        {
+                            offPlaneSkipped++;
                             continue;
                         }
 
-                        if( const PAD* pin = inEscape( at, start, layer, own ) )
                         {
-                            escapeOf[str( pin->GetParentFootprint()->GetReference() ) + "." + str( pin->GetNumber() )]++;
-                            escapeSkipped++;
+                            const auto        from = stubFrom.find( { at.x, at.y } );
+                            const bool        stub = item->Type() == PCB_PAD_T || onTrack;
+                            const std::optional<VECTOR2I> start = stub ? std::optional<VECTOR2I>( from == stubFrom.end() ? pos : from->second )
+                                                                       : std::nullopt;
+                            const PAD*        own = stubPadOf( at );
+                            const FOOTPRINT*  body = underWhich( at, start, layer, own ? own->GetParentFootprint() : nullptr );
+
+                            if( !body && join == joinAt.end() )
+                            {
+                                for( const auto& [fp, band] : rowBands )
+                                {
+                                    if( band.Collide( at, viaDia / 2 ) )
+                                        body = fp;
+                                }
+                            }
+
+                            if( body )
+                            {
+                                underSkipped[str( body->GetReference() )]++;
+                                continue;
+                            }
+
+                            if( keepLanes && join == joinAt.end() && rowPin( item ) )
+                            {
+                                if( const PAD* pin = inLane( at, start ) )
+                                {
+                                    escapeOf[str( pin->GetParentFootprint()->GetReference() ) + "." + str( pin->GetNumber() )]++;
+                                    laneRefused++;
+                                    continue;
+                                }
+                            }
+
+                            if( const PAD* pin = inEscape( at, start, layer, own ) )
+                            {
+                                escapeOf[str( pin->GetParentFootprint()->GetReference() ) + "." + str( pin->GetNumber() )]++;
+                                escapeSkipped++;
+                                continue;
+                            }
+                        }
+
+                        // keep clear of every hole (vias placed earlier, THT pads): hole-to-hole rule
+                        bool holeClash = false;
+                        const int webMin = board->GetDesignSettings().m_HoleToHoleMin;
+
+                        for( PCB_TRACK* t : board->Tracks() )
+                        {
+                            if( t->Type() == PCB_VIA_T )
+                            {
+                                PCB_VIA* v = static_cast<PCB_VIA*>( t );
+                                holeClash |= ( v->GetPosition() - at ).EuclideanNorm() < ( v->GetDrillValue() + viaDrill ) / 2 + webMin;
+                            }
+                        }
+
+                        for( FOOTPRINT* fp : board->Footprints() )
+                        {
+                            for( PAD* p : fp->Pads() )
+                            {
+                                if( p->HasHole() )
+                                    holeClash |= ( p->GetPosition() - at ).EuclideanNorm()
+                                                 < ( std::max( p->GetDrillSize().x, p->GetDrillSize().y ) + viaDrill ) / 2 + webMin;
+                            }
+                        }
+
+                        if( join != joinAt.end() )
+                        {
+                            auto stubTrack = std::make_unique<PCB_TRACK>( board );
+                            stubTrack->SetStart( stubFrom[{ at.x, at.y }] );
+                            stubTrack->SetEnd( at );
+                            stubTrack->SetLayer( layer );
+                            stubTrack->SetNet( net );
+                            PAD* from = stubPadAt[{ at.x, at.y }];
+                            stubTrack->SetWidth( padNeck( board, from, width, layer ).width );
+                            std::vector<BOARD_CONNECTED_ITEM*> fresh = { stubTrack.get() };
+
+                            if( !guard( board, fresh, {}, true ).empty()
+                                && ( !neckToFit( board, stubTrack.get(), {}, true, stubMinWidth( board, from, net->GetNetCode(), layer ) )
+                                     || !guard( board, fresh, {}, true ).empty() ) )
+                            {
+                                continue;
+                            }
+
+                            BOARD_COMMIT commit( context->GetToolManager() );
+                            added.push_back( stubTrack->m_Uuid );
+                            commit.Add( stubTrack.release() );
+                            commit.Push( _( "Stitching stub (API)" ) );
+                            KopenapiKeepUiAlive();
+                            const PAD* toPad = dynamic_cast<const PAD*>( join->second );
+                            joined.push_back( { { "for", stitchedFor( item ) },
+                                                { "to", toPad ? str( toPad->GetParentFootprint()->GetReference() ) + "." + str( toPad->GetNumber() )
+                                                              : std::string( "via" ) },
+                                                { "at_mm", { toMm( at.x ), toMm( at.y ) } } } );
+                            done.insert( item );
+                            ok = true;
                             continue;
                         }
-                    }
 
-                    // keep clear of every hole (vias placed earlier, THT pads): hole-to-hole rule
-                    bool holeClash = false;
-                    const int webMin = board->GetDesignSettings().m_HoleToHoleMin;
-
-                    for( PCB_TRACK* t : board->Tracks() )
-                    {
-                        if( t->Type() == PCB_VIA_T )
-                        {
-                            PCB_VIA* v = static_cast<PCB_VIA*>( t );
-                            holeClash |= ( v->GetPosition() - at ).EuclideanNorm() < ( v->GetDrillValue() + viaDrill ) / 2 + webMin;
-                        }
-                    }
-
-                    for( FOOTPRINT* fp : board->Footprints() )
-                    {
-                        for( PAD* p : fp->Pads() )
-                        {
-                            if( p->HasHole() )
-                                holeClash |= ( p->GetPosition() - at ).EuclideanNorm()
-                                             < ( std::max( p->GetDrillSize().x, p->GetDrillSize().y ) + viaDrill ) / 2 + webMin;
-                        }
-                    }
-
-                    if( join != joinAt.end() )
-                    {
-                        auto stubTrack = std::make_unique<PCB_TRACK>( board );
-                        stubTrack->SetStart( stubFrom[{ at.x, at.y }] );
-                        stubTrack->SetEnd( at );
-                        stubTrack->SetLayer( layer );
-                        stubTrack->SetNet( net );
-                        PAD* from = stubPadAt[{ at.x, at.y }];
-                        stubTrack->SetWidth( padNeck( board, from, width, layer ).width );
-                        std::vector<BOARD_CONNECTED_ITEM*> fresh = { stubTrack.get() };
-
-                        if( !guard( board, fresh, {}, true ).empty()
-                            && ( !neckToFit( board, stubTrack.get(), {}, true, stubMinWidth( board, from, net->GetNetCode(), layer ) )
-                                 || !guard( board, fresh, {}, true ).empty() ) )
-                        {
+                        if( holeClash )
                             continue;
+
+                        auto via = std::make_unique<PCB_VIA>( board );
+                        via->SetPosition( at );
+                        via->SetViaType( VIATYPE::THROUGH );
+                        via->SetLayerPair( F_Cu, B_Cu );
+                        via->SetWidth( viaDia );
+                        via->SetDrill( viaDrill );
+                        via->SetNet( net );
+
+                        std::unique_ptr<PCB_TRACK> track;
+                        PAD*                       stubPad = nullptr;
+                        STUB_NECK                  neck{ width, std::string() };
+
+                        // a pad, or the end of a track that joins pads into an island without the plane
+                        if( ( item->Type() == PCB_PAD_T || onTrack ) && !inPad.count( { at.x, at.y } ) )
+                        {
+                            track = std::make_unique<PCB_TRACK>( board );
+                            auto from = stubFrom.find( { at.x, at.y } );
+                            track->SetStart( from == stubFrom.end() ? pos : from->second );
+                            track->SetEnd( at );
+                            track->SetLayer( layer );
+                            track->SetNet( net );
+
+                            // the pad the stub leaves: necked as the router does at fine-pitch pads
+                            auto own = stubPadAt.find( { at.x, at.y } );
+                            stubPad = own != stubPadAt.end() ? own->second
+                                      : item->Type() == PCB_PAD_T ? static_cast<PAD*>( item ) : padAt( track->GetStart() );
+                            neck = padNeck( board, stubPad, width, layer );
+                            track->SetWidth( neck.width );
                         }
+
+                        std::vector<BOARD_CONNECTED_ITEM*> fresh = { via.get() };
+
+                        if( track )
+                            fresh.push_back( track.get() );
+
+                        if( !guard( board, fresh, {}, true ).empty() )
+                        {
+                            // the stub may still fit narrower: the via alone has to pass first
+                            std::vector<BOARD_CONNECTED_ITEM*> viaOnly = { via.get() };
+                            const int                          before = track ? track->GetWidth() : 0;
+
+                            if( !track || !stubPad || !guard( board, viaOnly, {}, true, nullptr ).empty()
+                                || !neckToFit( board, track.get(), viaOnly, true,
+                                               stubMinWidth( board, stubPad, net->GetNetCode(), layer ) )
+                                || !guard( board, fresh, {}, true ).empty() )
+                            {
+                                continue;
+                            }
+
+                            if( track->GetWidth() < before )
+                            {
+                                neck.why += std::string( neck.why.empty() ? "" : "; " ) + "clearance to the copper next to "
+                                            + str( stubPad->GetParentFootprint()->GetReference() ) + "."
+                                            + str( stubPad->GetNumber() );
+                            }
+                        }
+
+                        const int stubWidth = track ? track->GetWidth() : 0;
 
                         BOARD_COMMIT commit( context->GetToolManager() );
-                        added.push_back( stubTrack->m_Uuid );
-                        commit.Add( stubTrack.release() );
-                        commit.Push( _( "Stitching stub (API)" ) );
+                        const bool   hasTrack = !!track;
+                        added.push_back( via->m_Uuid );
+                        commit.Add( via.release() );
+
+                        if( track )
+                        {
+                            added.push_back( track->m_Uuid );
+                            commit.Add( track.release() );
+                        }
+
+                        commit.Push( _( "Stitching via (API)" ) );
                         KopenapiKeepUiAlive();
-                        const PAD* toPad = dynamic_cast<const PAD*>( join->second );
-                        joined.push_back( { { "for", stitchedFor( item ) },
-                                            { "to", toPad ? str( toPad->GetParentFootprint()->GetReference() ) + "." + str( toPad->GetNumber() )
-                                                          : std::string( "via" ) },
-                                            { "at_mm", { toMm( at.x ), toMm( at.y ) } } } );
+                        fresh_vias.push_back( { item, added.end()[hasTrack ? -2 : -1], hasTrack ? added.back() : niluuid, at, layer } );
+                        placed.push_back( { { "via", str( fresh_vias.back().via.AsString() ) },
+                                            { "at_mm", { toMm( at.x ), toMm( at.y ) } },
+                                            { "for", stitchedFor( item ) } } );
+
+                        if( inwardAt.count( { at.x, at.y } ) )
+                            placed.back()["inward"] = true;
+
+                        if( viaDia != classViaDia )
+                        {
+                            placed.back()["via_mm"] = { toMm( viaDia ), toMm( viaDrill ) };
+                            placed.back()["board_min_via"] = true;
+                            minVias++;
+                        }
+
+                        if( planeless )
+                        {
+                            placed.back()["port"] = true;
+                            ports.insert( fresh_vias.back().via );
+                        }
+
+                        if( hasTrack && stubWidth < width )
+                        {
+                            placed.back()["stub_width_mm"] = toMm( stubWidth );
+                            placed.back()["necked_from_mm"] = toMm( width );
+                            placed.back()["necked_why"] = neck.why;
+                            neckedStubs++;
+                        }
                         done.insert( item );
                         ok = true;
-                        continue;
                     }
-
-                    if( holeClash )
-                        continue;
-
-                    auto via = std::make_unique<PCB_VIA>( board );
-                    via->SetPosition( at );
-                    via->SetViaType( VIATYPE::THROUGH );
-                    via->SetLayerPair( F_Cu, B_Cu );
-                    via->SetWidth( viaDia );
-                    via->SetDrill( viaDrill );
-                    via->SetNet( net );
-
-                    std::unique_ptr<PCB_TRACK> track;
-                    PAD*                       stubPad = nullptr;
-                    STUB_NECK                  neck{ width, std::string() };
-
-                    // a pad, or the end of a track that joins pads into an island without the plane
-                    if( ( item->Type() == PCB_PAD_T || onTrack ) && !inPad.count( { at.x, at.y } ) )
-                    {
-                        track = std::make_unique<PCB_TRACK>( board );
-                        auto from = stubFrom.find( { at.x, at.y } );
-                        track->SetStart( from == stubFrom.end() ? pos : from->second );
-                        track->SetEnd( at );
-                        track->SetLayer( layer );
-                        track->SetNet( net );
-
-                        // the pad the stub leaves: necked as the router does at fine-pitch pads
-                        auto own = stubPadAt.find( { at.x, at.y } );
-                        stubPad = own != stubPadAt.end() ? own->second
-                                  : item->Type() == PCB_PAD_T ? static_cast<PAD*>( item ) : padAt( track->GetStart() );
-                        neck = padNeck( board, stubPad, width, layer );
-                        track->SetWidth( neck.width );
-                    }
-
-                    std::vector<BOARD_CONNECTED_ITEM*> fresh = { via.get() };
-
-                    if( track )
-                        fresh.push_back( track.get() );
-
-                    if( !guard( board, fresh, {}, true ).empty() )
-                    {
-                        // the stub may still fit narrower: the via alone has to pass first
-                        std::vector<BOARD_CONNECTED_ITEM*> viaOnly = { via.get() };
-                        const int                          before = track ? track->GetWidth() : 0;
-
-                        if( !track || !stubPad || !guard( board, viaOnly, {}, true, nullptr ).empty()
-                            || !neckToFit( board, track.get(), viaOnly, true,
-                                           stubMinWidth( board, stubPad, net->GetNetCode(), layer ) )
-                            || !guard( board, fresh, {}, true ).empty() )
-                        {
-                            continue;
-                        }
-
-                        if( track->GetWidth() < before )
-                        {
-                            neck.why += std::string( neck.why.empty() ? "" : "; " ) + "clearance to the copper next to "
-                                        + str( stubPad->GetParentFootprint()->GetReference() ) + "."
-                                        + str( stubPad->GetNumber() );
-                        }
-                    }
-
-                    const int stubWidth = track ? track->GetWidth() : 0;
-
-                    BOARD_COMMIT commit( context->GetToolManager() );
-                    const bool   hasTrack = !!track;
-                    added.push_back( via->m_Uuid );
-                    commit.Add( via.release() );
-
-                    if( track )
-                    {
-                        added.push_back( track->m_Uuid );
-                        commit.Add( track.release() );
-                    }
-
-                    commit.Push( _( "Stitching via (API)" ) );
-                    KopenapiKeepUiAlive();
-                    fresh_vias.push_back( { item, added.end()[hasTrack ? -2 : -1], hasTrack ? added.back() : niluuid, at, layer } );
-                    placed.push_back( { { "via", str( fresh_vias.back().via.AsString() ) },
-                                        { "at_mm", { toMm( at.x ), toMm( at.y ) } },
-                                        { "for", stitchedFor( item ) } } );
-
-                    if( inwardAt.count( { at.x, at.y } ) )
-                        placed.back()["inward"] = true;
-
-                    if( planeless )
-                    {
-                        placed.back()["port"] = true;
-                        ports.insert( fresh_vias.back().via );
-                    }
-
-                    if( hasTrack && stubWidth < width )
-                    {
-                        placed.back()["stub_width_mm"] = toMm( stubWidth );
-                        placed.back()["necked_from_mm"] = toMm( width );
-                        placed.back()["necked_why"] = neck.why;
-                        neckedStubs++;
-                    }
-                    done.insert( item );
-                    ok = true;
                 }
-            }
 
-            if( !ok )
-            {
-                int underCount = 0, escapeCount = 0;
-                std::string underNames, escapeNames;
-
-                for( const auto& [ref, n] : underSkipped )
+                if( !ok )
                 {
-                    underCount += n;
-                    underNames += ( underNames.empty() ? "" : ", " ) + ref;
+                    int underCount = 0, escapeCount = 0;
+                    std::string underNames, escapeNames;
+
+                    for( const auto& [ref, n] : underSkipped )
+                    {
+                        underCount += n;
+                        underNames += ( underNames.empty() ? "" : ", " ) + ref;
+                    }
+
+                    for( const auto& [pin, n] : escapeOf )
+                    {
+                        escapeCount += n;
+
+                        if( escapeNames.size() < 120 )
+                            escapeNames += ( escapeNames.empty() ? "" : ", " ) + pin;
+                    }
+
+                    const int offPlaneHere = offPlaneSkipped - offPlaneBefore;
+
+                    misses[item] = { { "for", stitchedFor( item ) },
+                                     { "at_mm", { toMm( pos.x ), toMm( pos.y ) } },
+                                     { "reason", !candidates.empty() && escapeCount > 0 && escapeCount + underCount + offPlaneHere >= (int) candidates.size()
+                                                         ? "every spot near it lies in the straight escape of a fine-pitch, pair or clock pin ("
+                                                                   + escapeNames + "; escape_keep_mm to shorten) or under a part's body"
+                                                 : !candidates.empty() && underCount > 0 && underCount + offPlaneSkipped - offPlaneBefore >= (int) candidates.size()
+                                                         ? "every spot near it lies under the body of " + underNames
+                                                                   + " (inside its ring of pads; under_parts: allow to place there)"
+                                                 : candidates.empty() ? "no spot to try (the island is too small for a via)"
+                                                 : offPlaneSkipped - offPlaneBefore == (int) candidates.size()
+                                                         ? "no spot near it over the net's plane on another layer (a "
+                                                           "higher-priority pour of another net or a keep-out covers it there)"
+                                                         : "no free spot within reach: every spot near it touches "
+                                                           "other copper, a hole, a keep-out, the board edge or lies off the net's plane" } };
                 }
-
-                for( const auto& [pin, n] : escapeOf )
-                {
-                    escapeCount += n;
-
-                    if( escapeNames.size() < 120 )
-                        escapeNames += ( escapeNames.empty() ? "" : ", " ) + pin;
-                }
-
-                const int offPlaneHere = offPlaneSkipped - offPlaneBefore;
-
-                misses[item] = { { "for", stitchedFor( item ) },
-                                 { "at_mm", { toMm( pos.x ), toMm( pos.y ) } },
-                                 { "reason", !candidates.empty() && escapeCount > 0 && escapeCount + underCount + offPlaneHere >= (int) candidates.size()
-                                                     ? "every spot near it lies in the straight escape of a fine-pitch, pair or clock pin ("
-                                                               + escapeNames + "; escape_keep_mm to shorten) or under a part's body"
-                                             : !candidates.empty() && underCount > 0 && underCount + offPlaneSkipped - offPlaneBefore >= (int) candidates.size()
-                                                     ? "every spot near it lies under the body of " + underNames
-                                                               + " (inside its ring of pads; under_parts: allow to place there)"
-                                             : candidates.empty() ? "no spot to try (the island is too small for a via)"
-                                             : offPlaneSkipped - offPlaneBefore == (int) candidates.size()
-                                                     ? "no spot near it over the net's plane on another layer (a "
-                                                       "higher-priority pour of another net or a keep-out covers it there)"
-                                                     : "no free spot within reach: every spot near it touches "
-                                                       "other copper, a hole, a keep-out, the board edge or lies off the net's plane" } };
             }
         }
 
@@ -10263,7 +10440,8 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                   { "vias", placed },
                                   { "joined", joined },
                                   { "necked_stubs", neckedStubs },
-                                                                    { "dangling_vias_removed", danglingRemoved },
+                                  { "board_min_vias", minVias },
+                                  { "dangling_vias_removed", danglingRemoved },
                                   { "not_reached", [&]()
                                     {
                                         nlohmann::json out = nlohmann::json::array();
@@ -10322,7 +10500,8 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                     { "vias_added", answer["vias"].size() },
                                     { "joined_count", answer["joined"].size() },
                                     { "necked_stubs", neckedStubs },
-                                                                        { "dangling_vias_removed", danglingRemoved },
+                                    { "board_min_vias", minVias },
+                                    { "dangling_vias_removed", danglingRemoved },
                                     { "not_reached_count", answer["not_reached"].size() },
                                     { "islands_left_count", answer["islands_left"].size() },
                                     { "spots_off_plane", offPlaneSkipped },
@@ -13237,7 +13416,8 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "piece under 2 mm2 after the refill is taken out; footprint and board keep-outs are honoured; spots_off_plane) and the "
                    "connections still open (unrouted); a pad of a quad package's row first joins the package's exposed pad of its net by a stub "
                    "(joined: for, to), else its via goes inward first (under its own package, between the pad row and the exposed pad, "
-                   "straight in or slanted from the pad's inner end; the row says inward), an exposed pad's via goes in the pad, an island's "
+                   "straight in or slanted from the pad's inner end; the row says inward; where the net class's via does not fit there, the "
+                   "board's smallest via within its rules: board_min_via, via_mm, count board_min_vias), an exposed pad's via goes in the pad, an island's "
                    "beside a coarse-pitch pad (a cap) before a fine-pitch pin; a net without a plane gets vias only at the fine-pitch pins of "
                    "quad packages, inward, kept as their way to the other layers for the router (port: true; the other ends are left "
                    "to the router, not_reached says so); no via or stub in the "
