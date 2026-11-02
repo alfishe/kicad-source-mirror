@@ -437,6 +437,9 @@ public:
      */
     void ReleaseDRCCaches();
 
+    /// Entries held by the rule-expression caches (courtyard, area, keepout, field).
+    std::size_t RuleCacheEntries() const;
+
     int GetTimeStamp() const { return m_timeStamp.load( std::memory_order_acquire ); }
 
     /**

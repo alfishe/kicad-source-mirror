@@ -255,6 +255,25 @@ bool collidesWithCourtyard( BOARD_ITEM* aItem, std::shared_ptr<SHAPE>& aItemShap
 };
 
 
+/**
+ * The board's rule caches name items by address.  An item the board never indexed (a dry run,
+ * a detached clone, a router transient) can be freed without a board change and its address
+ * handed to the next such item, so answers about it are computed fresh, never cached.
+ */
+static bool ruleCacheable( const BOARD_ITEM* aItem )
+{
+    if( aItem->GetFlags() & ROUTER_TRANSIENT )
+        return false;
+
+    if( aItem->IsIndexedInBoard() )
+        return true;
+
+    const BOARD* board = aItem->GetBoard();
+
+    return board && board->IsFootprintHolder();
+}
+
+
 static bool testFootprintSelector( FOOTPRINT* aFp, const wxString& aSelector )
 {
     // NOTE: This code may want to be somewhat more generalized, but for now it's implemented
@@ -363,7 +382,7 @@ static void intersectsCourtyardFunc( LIBEVAL::CONTEXT* aCtx, void* self )
             [item, arg, context]() -> double
             {
                 BOARD*         board = item->GetBoard();
-                bool           transient = ( item->GetFlags() & ROUTER_TRANSIENT ) != 0;
+                bool           transient = !ruleCacheable( item );
                 const wxString selector = arg->AsString();
 
                 // Whole-predicate memo: the same condition repeated across many rules resolves
@@ -387,13 +406,15 @@ static void intersectsCourtyardFunc( LIBEVAL::CONTEXT* aCtx, void* self )
                             PTR_PTR_CACHE_KEY key = { fp, item };
                             bool              cached = false;
 
-                            if( !transient && board->m_IntersectsCourtyardCache.Get( key, cached ) )
+                            bool keyed = !transient && ruleCacheable( fp );
+
+                            if( keyed && board->m_IntersectsCourtyardCache.Get( key, cached ) )
                                 return cached;
 
                             bool hit = collidesWithCourtyard( item, itemShape, context, fp, F_Cu )
                                     || collidesWithCourtyard( item, itemShape, context, fp, B_Cu );
 
-                            if( !transient )
+                            if( keyed )
                                 board->m_IntersectsCourtyardCache.Set( key, hit );
 
                             return hit;
@@ -439,7 +460,7 @@ static void intersectsFrontCourtyardFunc( LIBEVAL::CONTEXT* aCtx, void* self )
             [item, arg, context]() -> double
             {
                 BOARD*         board = item->GetBoard();
-                bool           transient = ( item->GetFlags() & ROUTER_TRANSIENT ) != 0;
+                bool           transient = !ruleCacheable( item );
                 const wxString selector = arg->AsString();
 
                 // See intersectsCourtyard: "A"/"B" are pair-relative and not memoizable here.
@@ -460,14 +481,16 @@ static void intersectsFrontCourtyardFunc( LIBEVAL::CONTEXT* aCtx, void* self )
                             PTR_PTR_CACHE_KEY key = { fp, item };
                             bool              cached = false;
 
-                            if( !transient && board->m_IntersectsFCourtyardCache.Get( key, cached ) )
+                            bool keyed = !transient && ruleCacheable( fp );
+
+                            if( keyed && board->m_IntersectsFCourtyardCache.Get( key, cached ) )
                                 return cached;
 
                             PCB_LAYER_ID layerId = fp->IsFlipped() ? B_Cu : F_Cu;
 
                             bool hit = collidesWithCourtyard( item, itemShape, context, fp, layerId );
 
-                            if( !transient )
+                            if( keyed )
                                 board->m_IntersectsFCourtyardCache.Set( key, hit );
 
                             return hit;
@@ -508,7 +531,7 @@ static void intersectsBackCourtyardFunc( LIBEVAL::CONTEXT* aCtx, void* self )
             [item, arg, context]() -> double
             {
                 BOARD*         board = item->GetBoard();
-                bool           transient = ( item->GetFlags() & ROUTER_TRANSIENT ) != 0;
+                bool           transient = !ruleCacheable( item );
                 const wxString selector = arg->AsString();
 
                 // See intersectsCourtyard: "A"/"B" are pair-relative and not memoizable here.
@@ -529,14 +552,16 @@ static void intersectsBackCourtyardFunc( LIBEVAL::CONTEXT* aCtx, void* self )
                             PTR_PTR_CACHE_KEY key = { fp, item };
                             bool              cached = false;
 
-                            if( !transient && board->m_IntersectsBCourtyardCache.Get( key, cached ) )
+                            bool keyed = !transient && ruleCacheable( fp );
+
+                            if( keyed && board->m_IntersectsBCourtyardCache.Get( key, cached ) )
                                 return cached;
 
                             PCB_LAYER_ID layerId = fp->IsFlipped() ? F_Cu : B_Cu;
 
                             bool hit = collidesWithCourtyard( item, itemShape, context, fp, layerId );
 
-                            if( !transient )
+                            if( keyed )
                                 board->m_IntersectsBCourtyardCache.Set( key, hit );
 
                             return hit;
@@ -552,7 +577,9 @@ static void intersectsBackCourtyardFunc( LIBEVAL::CONTEXT* aCtx, void* self )
 
 static SHAPE_POLY_SET getDeflatedZoneOutline( BOARD* aBoard, ZONE* aArea )
 {
-    // Check cache first with read lock
+    const bool keyed = ruleCacheable( aArea );
+
+    if( keyed )
     {
         std::shared_lock<std::shared_mutex> readLock( aBoard->m_CachesMutex );
         auto it = aBoard->m_DeflatedZoneOutlineCache.find( aArea );
@@ -567,7 +594,7 @@ static SHAPE_POLY_SET getDeflatedZoneOutline( BOARD* aBoard, ZONE* aArea )
     areaOutline.Deflate( aBoard->GetDesignSettings().GetDRCEpsilon(), CORNER_STRATEGY::ALLOW_ACUTE_CORNERS,
                          ARC_LOW_DEF );
 
-    // Store in cache
+    if( keyed )
     {
         std::unique_lock<std::shared_mutex> writeLock( aBoard->m_CachesMutex );
         aBoard->m_DeflatedZoneOutlineCache[aArea] = areaOutline;
@@ -841,7 +868,7 @@ static void doIntersectsAreaFunc( LIBEVAL::CONTEXT* aCtx, void* self, bool aForK
             {
                 BOARD*         board = item->GetBoard();
                 PCB_LAYER_ID   aLayer = context->GetLayer();
-                bool           transient = ( item->GetFlags() & ROUTER_TRANSIENT ) != 0;
+                bool           transient = !ruleCacheable( item );
                 const wxString selector = arg->AsString();
 
                 auto&          resultsCache = aForKeepout ? board->m_IntersectsKeepoutResultCache
@@ -892,7 +919,7 @@ static void doIntersectsAreaFunc( LIBEVAL::CONTEXT* aCtx, void* self, bool aForK
                             else
                                 testLayers = commonLayers;
 
-                            bool isTransient = ( item->GetFlags() & ROUTER_TRANSIENT ) != 0;
+                            bool isTransient = transient || !ruleCacheable( aArea );
                             std::vector<PCB_LAYER_ID> layersToCompute;
 
                             if( !isTransient )
@@ -983,7 +1010,7 @@ static void enclosedByAreaFunc( LIBEVAL::CONTEXT* aCtx, void* self )
                 BOARD*         board = item->GetBoard();
                 int            maxError = board->GetDesignSettings().m_MaxError;
                 PCB_LAYER_ID   layer = context->GetLayer();
-                bool           transient = ( item->GetFlags() & ROUTER_TRANSIENT ) != 0;
+                bool           transient = !ruleCacheable( item );
                 const wxString selector = arg->AsString();
 
                 // See intersectsCourtyard: "A"/"B" are pair-relative and not memoizable here.
@@ -1015,8 +1042,9 @@ static void enclosedByAreaFunc( LIBEVAL::CONTEXT* aCtx, void* self )
                             PTR_PTR_LAYER_CACHE_KEY key = { aArea, item, layer };
                             bool                    cached = false;
 
-                            if( ( item->GetFlags() & ROUTER_TRANSIENT ) == 0
-                                && board->m_EnclosedByAreaCache.Get( key, cached ) )
+                            bool keyed = !transient && ruleCacheable( aArea );
+
+                            if( keyed && board->m_EnclosedByAreaCache.Get( key, cached ) )
                             {
                                 return cached;
                             }
@@ -1065,7 +1093,7 @@ static void enclosedByAreaFunc( LIBEVAL::CONTEXT* aCtx, void* self )
                                 enclosedByArea = itemShape.IsEmpty();
                             }
 
-                            if( ( item->GetFlags() & ROUTER_TRANSIENT ) == 0 )
+                            if( keyed )
                                 board->m_EnclosedByAreaCache.Set( key, enclosedByArea );
 
                             return enclosedByArea;
@@ -1670,13 +1698,15 @@ static void getFieldFunc( LIBEVAL::CONTEXT* aCtx, void* self )
                     ITEM_FIELD_CACHE_KEY key{ item, std::hash<wxString>{}( fieldName ) };
                     wxString             cached;
 
-                    if( board && board->m_ItemFieldCache.Get( key, cached ) )
+                    bool                 keyed = board && ruleCacheable( fp );
+
+                    if( keyed && board->m_ItemFieldCache.Get( key, cached ) )
                         return cached;
 
                     PCB_FIELD* field = fp->GetField( fieldName );
                     wxString   text = field ? field->GetText() : wxString();
 
-                    if( board )
+                    if( keyed )
                         board->m_ItemFieldCache.Set( key, text );
 
                     return text;

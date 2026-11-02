@@ -464,6 +464,18 @@ void BOARD::ReleaseDRCCaches()
 }
 
 
+std::size_t BOARD::RuleCacheEntries() const
+{
+    return m_IntersectsAreaCache.Size() + m_IntersectsKeepoutCache.Size()
+           + m_EnclosedByAreaCache.Size() + m_IntersectsCourtyardCache.Size()
+           + m_IntersectsFCourtyardCache.Size() + m_IntersectsBCourtyardCache.Size()
+           + m_IntersectsCourtyardResultCache.Size() + m_IntersectsFCourtyardResultCache.Size()
+           + m_IntersectsBCourtyardResultCache.Size() + m_IntersectsAreaResultCache.Size()
+           + m_IntersectsKeepoutResultCache.Size() + m_EnclosedByAreaResultCache.Size()
+           + m_ItemFieldCache.Size();
+}
+
+
 void BOARD::clearCachesLocked()
 {
     m_footprintCourtyardIndex.reset();

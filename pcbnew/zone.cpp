@@ -799,6 +799,11 @@ const BOX2I ZONE::GetBoundingBox() const
         if( m_bboxCacheTimeStamp.load( std::memory_order_acquire ) == board->GetTimeStamp() )
             return m_bboxCache;
 
+        // The board map names zones by address; a zone it never indexed (a dry run, a detached
+        // clone) can be freed without a board change and its address handed to the next one.
+        if( !IsIndexedInBoard() && !board->IsFootprintHolder() )
+            return computeBoundingBox();
+
         std::unordered_map<const ZONE*, BOX2I>& cache = board->m_ZoneBBoxCache;
 
         {
@@ -853,6 +858,7 @@ void ZONE::CacheBoundingBox()
     if( board )
     {
         // Board cache, for callers that read it directly.
+        if( IsIndexedInBoard() || board->IsFootprintHolder() )
         {
             std::unique_lock<std::shared_mutex> writeLock( board->m_CachesMutex );
             board->m_ZoneBBoxCache[this] = bbox;

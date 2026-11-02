@@ -364,6 +364,7 @@ static KOPENAPI_RESULT h_pcb_stats( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
 
     out["vias"] = vias;
     out["rules"] = rulesSummary( board );
+    out["rule_caches"] = { { "entries", board->RuleCacheEntries() } };
 
     out["elapsed_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - start )
@@ -406,7 +407,8 @@ KOPENAPI_REGISTER( "pcb_stats",
                    "layer count and names, thickness, footprints (THT/SMD/side/DNP), pads, tracks per layer, vias, "
                    "zones and rule areas, nets, unrouted connections; design-rule defaults (rules: minimum clearance, "
                    "track width, via, drill, edge and hole clearances; net classes with clearance, track width, via size "
-                   "and net_count; member nets: pcb_rules_get)",
+                   "and net_count; member nets: pcb_rules_get); rule_caches.entries: entries held by the rule-expression "
+                   "caches (courtyard/area/keepout/field), dropped on every board change",
                    R"json({"type":"object","properties":{}})json"_json, false, h_pcb_stats );
 
 KOPENAPI_REGISTER( "pcb_clearance_stats",

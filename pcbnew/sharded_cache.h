@@ -117,11 +117,7 @@ public:
         return true;
     }
 
-private:
-    /// Entry count above which Clear() fans its per-shard deallocation across the worker pool.
-    static constexpr std::size_t PARALLEL_CLEAR_THRESHOLD = 100000;
-
-    /// Only Clear() needs this; an exact concurrent size has no sound external use, so private.
+    /// Entry count, summed shard by shard; a snapshot only while other threads write.
     std::size_t Size() const
     {
         std::size_t total = 0;
@@ -134,6 +130,10 @@ private:
 
         return total;
     }
+
+private:
+    /// Entry count above which Clear() fans its per-shard deallocation across the worker pool.
+    static constexpr std::size_t PARALLEL_CLEAR_THRESHOLD = 100000;
 
     struct SHARD
     {
