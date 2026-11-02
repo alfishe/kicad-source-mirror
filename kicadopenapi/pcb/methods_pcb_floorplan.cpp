@@ -562,7 +562,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const FP_CLASS& defaults = classes["Default"];
     const double    defaultPitch = std::max( 0.01, toMm( defaults.width + defaults.clearance ) );
 
-    // obstacles: per block its members' courtyards, boxes merged while their union stays full
+    // obstacles: per block its members' courtyards, boxes merged where no track passes between them
     // (obstacles: bbox, one box per block as pcb_blocks gives it)
     const std::string obstacles = aArgs.value( "obstacles", std::string( "parts" ) );
 
@@ -570,7 +570,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return KOPENAPI_RESULT::Error( 400, "obstacles: parts or bbox" );
 
     const int    mergeGap = iu( std::max( 0.0, aArgs.value( "merge_gap_mm", toMm( defaults.width + defaults.clearance ) ) ) );
-    const double minFill = std::clamp( aArgs.value( "merge_fill", 0.7 ), 0.0, 1.0 );
     const int    maxBoxes = std::clamp( aArgs.value( "max_boxes", 8 ), 1, 64 );
 
     std::map<std::string, FOOTPRINT*> fpOfRef;
@@ -639,7 +638,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                         BOX2I grown = own[i].box;
                         grown.Inflate( mergeGap );
 
-                        if( grown.Intersects( own[j].box ) && fillOf( i, j ) >= minFill )
+                        if( grown.Intersects( own[j].box ) )
                         {
                             join( i, j );
                             merged = true;
@@ -2809,9 +2808,8 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                             "rect":{"type":"array","items":{"type":"number"},"description":"[x0, y0, x1, y1] mm"},
                             "layers":{"type":"array","items":{"type":"string"},"description":"default every routing layer"}}},"description":"more areas that bar tracks, besides the board's rule areas"},
                         "edge_clearance_mm":{"type":"number","description":"default: the board's copper-to-edge clearance"},
-                        "obstacles":{"type":"string","enum":["parts","bbox"],"default":"parts","description":"parts: each block's member courtyards, merged into boxes while their union stays full; bbox: one box per block (pcb_blocks bbox)"},
-                        "merge_gap_mm":{"type":"number","description":"courtyards closer than this may merge (default one Default track pitch)"},
-                        "merge_fill":{"type":"number","default":0.7,"minimum":0,"maximum":1,"description":"two boxes merge when their areas fill this much of their union"},
+                        "obstacles":{"type":"string","enum":["parts","bbox"],"default":"parts","description":"parts: each block's member courtyards, merged into boxes where no track passes between them (closer than merge_gap_mm); bbox: one box per block (pcb_blocks bbox)"},
+                        "merge_gap_mm":{"type":"number","description":"courtyards closer than this merge (default one Default track pitch: no track between them)"},
                         "max_boxes":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"boxes per block at most"},
                         "snap_mm":{"type":"number","minimum":0,"description":"obstacle edges closer than this share one grid line (default one Default track pitch; 0: exact). Gaps narrower close, obstacles thinner keep both edges"},
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
