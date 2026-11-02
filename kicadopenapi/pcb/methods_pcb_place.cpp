@@ -1942,10 +1942,37 @@ std::vector<CORRIDOR> signalCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, do
 /// @brief The anchor's port sides from the layout plan (pcb_fanout_ports): per side, the pads whose nets go
 /// to another block, as a band from the pads out past the courtyard by aKeepMm; the block's parts keep out
 /// of it, so the signals leave the block without weaving between them
-/// @brief ports_keep_mm, 3 when only open_sides is given
+/// @brief A ports band (portCorridors) as a row: its name and box
+nlohmann::json bandJson( const CORRIDOR& aBand )
+{
+    auto mm = []( int aIU ) { return std::round( toMm( aIU ) * 1000 ) / 1000; };
+
+    return { { "name", aBand.name },
+             { "bbox_mm", { mm( aBand.box.GetLeft() ), mm( aBand.box.GetTop() ), mm( aBand.box.GetRight() ), mm( aBand.box.GetBottom() ) } } };
+}
+
+
+/// @brief ports_keep_mm when given (0 off), else -1: each band as deep as its side's signal ports
+/// need (portCorridors)
 double portsKeep( const nlohmann::json& aSpec )
 {
-    return aSpec.value( "ports_keep_mm", aSpec.contains( "open_sides" ) ? 3.0 : 0.0 );
+    return aSpec.value( "ports_keep_mm", -1.0 );
+}
+
+
+/// @brief The room a track of aNet takes beside the next: its class's width and clearance, no less
+/// than the board's minimums; a differential pair's (aPairs) both tracks, their gap and a clearance
+int trackPitch( BOARD* aBoard, const NETINFO_ITEM* aNet, const std::map<int, int>* aPairs )
+{
+    BOARD_DESIGN_SETTINGS& ds = aBoard->GetDesignSettings();
+    const NETCLASS*        nc = aNet ? aNet->GetNetClass() : nullptr;
+    const int              width = std::max( nc && nc->HasTrackWidth() ? nc->GetTrackWidth() : 0, ds.m_TrackMinWidth );
+    const int              clearance = std::max( nc && nc->HasClearance() ? nc->GetClearance() : 0, ds.m_MinClearance );
+
+    if( aNet && aPairs && aPairs->count( aNet->GetNetCode() ) )
+        return 2 * width + ( nc && nc->HasDiffPairGap() ? nc->GetDiffPairGap() : clearance ) + clearance;
+
+    return width + clearance;
 }
 
 
@@ -1974,14 +2001,16 @@ std::optional<std::string> openSidesError( const nlohmann::json& aSpec )
 }
 
 
+/// @param aKeepMm how far past the courtyard; below 0 derived per side: the pitch (trackPitch) of
+/// each signal port on it summed (a pair once), the depth those tracks take fanning out side by side
 /// @param aOpen which sides: null - every side with ports; a count - that many, the most ports first;
 /// a list of names - those (a named side with no ports: its whole courtyard edge)
 std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnchor, double aKeepMm,
-                                     const nlohmann::json& aOpen = nullptr )
+                                     const nlohmann::json& aOpen = nullptr, const std::map<int, int>* aPairs = nullptr )
 {
     std::optional<KOPENAPI_METHOD> ports = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" );
 
-    if( !ports || !aAnchor || aKeepMm <= 0 )
+    if( !ports || !aAnchor || aKeepMm == 0 )
         return {};
 
     const KOPENAPI_RESULT r = ports->handler( aCtx, { { "ref", str( aAnchor->GetReference() ) } } );
@@ -1995,7 +2024,6 @@ std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOT
         padOf.emplace( pad->GetNumber(), pad );
 
     const BOX2I           cy = courtyard( aAnchor ).BBox();
-    const int             keep = toIU( aKeepMm );
     std::vector<CORRIDOR> out;
 
     const nlohmann::json  sides = r.body.value( "ports", nlohmann::json::object() );
@@ -2016,6 +2044,37 @@ std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOT
     }
 
     std::stable_sort( ranked.begin(), ranked.end(), []( const auto& a, const auto& b ) { return a.second > b.second; } );
+
+    auto depthOf = [&]( const std::string& aSide )
+    {
+        int           depth = 0;
+        std::set<int> pairsSeen, netsSeen;
+
+        for( const nlohmann::json& port : sides.contains( aSide ) && sides[aSide].is_array() ? sides[aSide] : nlohmann::json::array() )
+        {
+            auto it = port.value( "kind", std::string() ) == "signal" ? padOf.find( wxString::FromUTF8( port.value( "pad", std::string() ) ) )
+                                                                      : padOf.end();
+
+            if( it == padOf.end() )
+                continue;
+
+            const int  net = it->second->GetNetCode();
+            const auto partner = aPairs ? aPairs->find( net ) : std::map<int, int>::const_iterator();
+
+            if( !netsSeen.insert( net ).second )
+                continue;
+
+            if( !aPairs || partner == aPairs->end() || pairsSeen.insert( std::min( net, partner->second ) ).second )
+                depth += trackPitch( aBoard, it->second->GetNet(), aPairs );
+        }
+
+        return depth;
+    };
+
+    int deepest = 0;
+
+    for( const char* name : names )
+        deepest = std::max( deepest, depthOf( name ) );
 
     std::vector<std::string> chosen;
 
@@ -2090,6 +2149,12 @@ std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOT
             else
                 span->SetY( cy.GetBottom() ), span->SetHeight( 0 );
         }
+
+        // a side named open without ports of its own: as deep as the deepest side's
+        const int keep = aKeepMm > 0 ? toIU( aKeepMm ) : corridor.nets.empty() ? deepest : depthOf( side );
+
+        if( keep <= 0 )
+            continue;
 
         BOX2I band = *span;
 
@@ -3005,6 +3070,19 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
     const PLACE_SPACE kept( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, aOptions.corridors, spots,
                             aOptions.pending, aOptions.rooms );
 
+    // the anchor's ports bands (its signals' escape, portCorridors) stay kept when a part yields the
+    // other corridors to come within reach
+    std::vector<CORRIDOR> bands;
+
+    for( size_t i = 0; aOptions.corridors && i < aOptions.corridors->size(); ++i )
+    {
+        if( ( *aOptions.corridors )[i].name.rfind( "ports ", 0 ) == 0 )
+            bands.push_back( ( *aOptions.corridors )[i] );
+    }
+
+    const PLACE_SPACE yielding( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, bands.empty() ? nullptr : &bands,
+                                spots, aOptions.pending, aOptions.rooms );
+
     std::optional<OWN_VIAS> vias;
 
     if( need )
@@ -3183,7 +3261,7 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
     if( corridors && ( chosen.best == std::numeric_limits<double>::max()
                        || ( aOptions.corridorYieldMm >= 0 && toMm( chosen.best ) > aOptions.corridorYieldMm ) ) )
     {
-        SPOT open = search( space );
+        SPOT open = search( chosen.best == std::numeric_limits<double>::max() ? space : yielding );
 
         if( open.best != std::numeric_limits<double>::max()
             && ( chosen.best == std::numeric_limits<double>::max() || toMm( open.best ) <= aOptions.corridorYieldMm ) )
@@ -5981,10 +6059,11 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         const double                escapeKeep = group.value( "escape_keep_mm", 2.0 );
         std::vector<CORRIDOR>       corridors = escapeKeep > 0 ? signalCorridors( aCtx, board, escapeKeep, parts ) : std::vector<CORRIDOR>();
 
-        for( CORRIDOR& c : portCorridors( aCtx, board, anchor, portsKeep( group ), group.value( "open_sides", nlohmann::json() ) ) )
+        const std::map<int, int>        pairs = diffPairs( aCtx, board );
+
+        for( CORRIDOR& c : portCorridors( aCtx, board, anchor, portsKeep( group ), group.value( "open_sides", nlohmann::json() ), &pairs ) )
             corridors.push_back( std::move( c ) );
 
-        const std::map<int, int>        pairs = diffPairs( aCtx, board );
         std::map<const FOOTPRINT*, int> rooms;
 
         std::vector<VIA_SPOT> ownVias;
@@ -6001,7 +6080,12 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
                     row, placed, group.value( "decap_vias", true ) );
 
         for( const CORRIDOR& corridor : corridors )
+        {
             row["corridors"].push_back( corridor.name );
+
+            if( corridor.name.rfind( "ports ", 0 ) == 0 )
+                row["ports_bands"].push_back( bandJson( corridor ) );
+        }
 
         groupCommit.Push( _( "Place group (API)" ) );
         poursStale = poursStale || row.contains( "pours_stale" );
@@ -6223,7 +6307,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
             {
                 corridors = escapeKeep > 0 ? signalCorridors( aCtx, board, escapeKeep, parts ) : std::vector<CORRIDOR>();
 
-                for( CORRIDOR& c : portCorridors( aCtx, board, anchor, portsKeep( spec ), spec.value( "open_sides", nlohmann::json() ) ) )
+                for( CORRIDOR& c : portCorridors( aCtx, board, anchor, portsKeep( spec ), spec.value( "open_sides", nlohmann::json() ), &pairs ) )
                     corridors.push_back( std::move( c ) );
 
                 options.corridors = &corridors;
@@ -6394,7 +6478,12 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                 out["orientation"] = orientation;
 
             for( const CORRIDOR& corridor : corridors )
+            {
                 out["corridors"].push_back( corridor.name );
+
+                if( corridor.name.rfind( "ports ", 0 ) == 0 )
+                    out["ports_bands"].push_back( bandJson( corridor ) );
+            }
 
             for( size_t k = before; k < moved.size(); ++k )
             {
@@ -6478,9 +6567,9 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "bulk_max_mm":{"type":"number","default":10,"description":"a bulk capacitor (10 uF or more, or electrolytic: a CP_ footprint; its row says bulk) serves the rail, not one pin: placed as near as the others, it is listed in decoupling_far only past this"},
     "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off"},
     "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach: each supply pin gets a via spot just beyond its inner end, under the body, clear of the other nets' copper and spots by the clearance (else beyond its outer end; a neighbour pin of the net within 1.2 mm shares it), and the cap's pad goes inward of the spot where there is room, else on any side of it, its other pads clear of every spot; the row gives via_spot_mm; default on for a fine-pitch anchor (0.65 mm or less), off otherwise; the row says side"},
-    "ports_keep_mm":{"type":"number","default":0,"minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard this far, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter, and a series part - two pads, one signal net of the anchor's - the band of its pin's side; a decoupling capacitor only when that alone brings it within decap_max_mm); two alike series parts on neighbour pins the other way round than the pins trade places (swapped); corridors lists them as ports <side> (<far parts>); 0 off"},
+    "ports_keep_mm":{"type":"number","minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter, and a series part - two pads, one signal net of the anchor's - the band of its pin's side). Default: each band as deep as its side's signal ports take fanning out side by side - each port's class track width + clearance summed, a differential pair once at 2 widths + its gap + a clearance; given: that many mm for every side; 0 off. No part yields to a band to come within reach (a decoupling capacitor goes to the other side or beside it); only a part with no spot at all outside the bands enters one (its row names it, in_corridor). Two alike series parts on neighbour pins the other way round than the pins trade places (swapped); corridors lists them as ports <side> (<far parts>), ports_bands gives their boxes"},
     "decap_vias":{"type":"boolean","default":true,"description":"decap_bottom: lay each bottom cap's via at its spot with a stub from the pin on the pin's layer (net class sizes, the stub no wider than the pin), in the same undo step, and the cap's pad joined to it on the cap's side where that track keeps clear; the rows say via_laid / via_joined, the answer vias_laid; the planes are refilled after"},
-    "open_sides":{"description":"layout level 2 variants: which of the anchor's port sides ports_keep_mm keeps open (default 3 mm when only this is given): a count 0..4 - the sides with the most signal ports first; or a list of west / east / north / south - those, a side without ports along its whole courtyard edge; default every side with ports. corridors names the bands; block gives the outline each variant takes (bbox_mm, area_mm2)","oneOf":[{"type":"integer","minimum":0,"maximum":4},{"type":"array","items":{"type":"string","enum":["west","east","north","south"]}}]},
+    "open_sides":{"description":"layout level 2 variants: which of the anchor's port sides ports_keep_mm keeps open (a named side without ports: as deep as the deepest): a count 0..4 - the sides with the most signal ports first; or a list of west / east / north / south - those, a side without ports along its whole courtyard edge; default every side with ports. corridors names the bands; block gives the outline each variant takes (bbox_mm, area_mm2)","oneOf":[{"type":"integer","minimum":0,"maximum":4},{"type":"array","items":{"type":"string","enum":["west","east","north","south"]}}]},
     "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
     "side":{"type":"string","enum":["same","opposite"],"default":"same"},
     "gap_mm":{"type":"number","description":"between courtyards, fixed. Default: from the design rules, per spot: the courtyard clearance plus a channel for the anchor's signal pins the part stands in front of (each its class's track width + clearance; at least one default-class track). Each pad on a net with a plane also keeps a spot for its via beside it (its class's via, a clearance off the pad; clear of other nets' pads, of the anchor's planned rail vias and its fine-pitch pins' straight escapes, escape_keep_mm), where pcb_stitch lays it (row via_room_mm). A part with no room for that goes at the courtyard clearance (row channel_short)"},
