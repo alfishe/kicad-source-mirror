@@ -3452,8 +3452,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         if( keep )
         {
             const SHAPE_POLY_SET area = courtyard( aPart );
-            const PLACE_SPACE    space( aBoard, aPart, aWas.pos, 0, nullptr, 0, std::nullopt, aPlaceOptions.corridors,
-                                        &viaSpots );
+            const PLACE_SPACE    space( aBoard, aPart, aWas.pos, 0, aTarget->GetParentFootprint(),
+                                        toIU( std::max( 0.0, aPlaceOptions.hostRingMm ) ), std::nullopt,
+                                        aPlaceOptions.corridors, &viaSpots );
             keep = space.Free( area, area.BBox(), VECTOR2I( 0, 0 ) );
         }
 
