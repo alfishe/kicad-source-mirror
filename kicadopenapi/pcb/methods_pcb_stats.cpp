@@ -7,6 +7,7 @@
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
+#include <kicadopenapi_util.h>
 #include <base_units.h>
 #include <board.h>
 #include <board_design_settings.h>
@@ -300,10 +301,32 @@ static nlohmann::json outlineStats( BOARD* aBoard )
     const BOX2I bbox = outlines.BBox();
 
     return { { "has_outline", true },
+             { "bbox_mm", { mm( bbox.GetLeft() ), mm( bbox.GetTop() ), mm( bbox.GetRight() ), mm( bbox.GetBottom() ) } },
              { "width_mm", mm( bbox.GetWidth() ) },
              { "height_mm", mm( bbox.GetHeight() ) },
              { "area_mm2", mm2( area ) },
              { "outlines", outlines.OutlineCount() } };
+}
+
+
+/// @brief The design-rule defaults: board-wide minimums and each net class's values with its net count
+static nlohmann::json rulesSummary( BOARD* aBoard )
+{
+    nlohmann::json rules = KopenapiRulesJson( aBoard, KOPENAPI_LIST_CAP( nlohmann::json::object(), 0 ) );
+
+    for( nlohmann::json& c : rules["netclasses"] )
+    {
+        for( const char* key : { "nets", "nets_total", "truncated" } )
+            c.erase( std::string( key ) );
+    }
+
+    const size_t patterns = rules.contains( "netclass_patterns_total" ) ? rules["netclass_patterns_total"].get<size_t>()
+                                                                        : rules.value( "netclass_patterns", nlohmann::json::array() ).size();
+
+    return { { "constraints", rules["constraints"] },
+             { "netclasses", rules["netclasses"] },
+             { "netclass_patterns", patterns },
+             { "custom_rules", !rules.value( "custom_rules", std::string() ).empty() } };
 }
 
 
@@ -340,6 +363,7 @@ static KOPENAPI_RESULT h_pcb_stats( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     };
 
     out["vias"] = vias;
+    out["rules"] = rulesSummary( board );
 
     out["elapsed_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - start )
@@ -378,8 +402,11 @@ static KOPENAPI_RESULT h_pcb_clearance_stats( KOPENAPI_CONTEXT& aCtx, const nloh
 
 
 KOPENAPI_REGISTER( "pcb_stats",
-                   "Board statistics in one call (milliseconds): outline size/area, layers, footprints "
-                   "(THT/SMD/side/DNP), pads, tracks per layer, vias, zones, nets, unrouted connections",
+                   "Board info / summary and statistics in one call (milliseconds): outline bbox, size and area, copper "
+                   "layer count and names, thickness, footprints (THT/SMD/side/DNP), pads, tracks per layer, vias, "
+                   "zones and rule areas, nets, unrouted connections; design-rule defaults (rules: minimum clearance, "
+                   "track width, via, drill, edge and hole clearances; net classes with clearance, track width, via size "
+                   "and net_count; member nets: pcb_rules_get)",
                    R"json({"type":"object","properties":{}})json"_json, false, h_pcb_stats );
 
 KOPENAPI_REGISTER( "pcb_clearance_stats",

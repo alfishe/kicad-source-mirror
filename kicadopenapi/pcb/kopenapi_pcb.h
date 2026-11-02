@@ -175,6 +175,12 @@ class PCB_TRACK;
 std::vector<PCB_TRACK*> KopenapiSelectTracks( BOARD* aBoard, const nlohmann::json& aArgs, bool aNeedSelector,
                                               nlohmann::json& aMissing, std::optional<KOPENAPI_RESULT>& aError );
 
+class KOPENAPI_LIST_CAP;
+
+/// @brief Board design rules as pcb_rules_get answers them: copper layers, thickness, constraints,
+/// net classes (member nets capped by aCap), patterns, custom rules
+nlohmann::json KopenapiRulesJson( BOARD* aBoard, const KOPENAPI_LIST_CAP& aCap );
+
 /// @brief The item's extent as a user sees it (a footprint without its texts)
 BOX2I KopenapiBoardItemBox( const BOARD_ITEM* aItem );
 

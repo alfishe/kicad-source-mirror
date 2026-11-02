@@ -869,6 +869,12 @@ nlohmann::json rulesJson( BOARD* aBoard, const KOPENAPI_LIST_CAP& aCap )
 } // namespace
 
 
+nlohmann::json KopenapiRulesJson( BOARD* aBoard, const KOPENAPI_LIST_CAP& aCap )
+{
+    return rulesJson( aBoard, aCap );
+}
+
+
 static KOPENAPI_RESULT h_pcb_rules_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
