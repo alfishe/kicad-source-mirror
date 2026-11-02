@@ -3,12 +3,14 @@
 /// capacity per copper layer and the demand of the buses and links between blocks on them.  Read only.
 ///
 /// Blocks (their members' courtyards merged into a few boxes), all-layer keep-outs and the board outside
-/// are obstacles.  Their box edges cut the board into a non-uniform grid of cells; a channel is a maximal
-/// free run of cell boundaries along one grid line (a cross-section of the free space between two
-/// obstacles).  Every bundle (the nets of one bus between two blocks, or the single nets between them)
-/// takes one cell path from its pads' boxes in one block to those in the other; each channel it crosses
-/// carries its width (track + clearance of each net's class).  Overflows are negotiated over channels
-/// (PathFinder costs: present overuse and history).
+/// are obstacles.  Their box edges (edges closer than snap_mm on one line) cut the board into a non-uniform
+/// grid of cells; a channel is a maximal free run of cell boundaries along one grid line (a cross-section
+/// of the free space between two obstacles).  Cells alike merge into rectangular regions; regions meet at
+/// portals.  Every bundle (the nets of one bus between two blocks, or the single nets between them) takes
+/// one path portal to portal from its pads' boxes in one block to those in the other; each channel it
+/// crosses (portals, and the inner grid lines of the free regions it goes through) carries its width
+/// (track + clearance of each net's class).  Overflows are negotiated over channels (PathFinder costs:
+/// present overuse and history).
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -175,7 +177,6 @@ struct LINK
     std::set<std::string> classes;
     std::set<int>    aBoxes, bBoxes;   ///< the boxes its nets leave from at a and at b
     std::vector<int> cuts;
-    std::vector<int> cells;
     std::set<int>    crosses;
     double           length = 0;
     bool             found = false;
@@ -248,6 +249,12 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const double foreignPenalty = std::max( 1.0, aArgs.value( "through_block_factor", 10.0 ) );
     const int listLimit = std::max( 1, aArgs.value( "list_limit", 40 ) );
     const bool allChannels = aArgs.value( "all_channels", false );
+    const std::string reroute = aArgs.value( "reroute", std::string( "overflowed" ) );
+
+    if( reroute != "overflowed" && reroute != "all" )
+        return KOPENAPI_RESULT::Error( 400, "reroute: overflowed or all" );
+
+    const bool rerouteAll = reroute == "all";
 
     // routing layers: every copper layer, inner layers mostly covered by a rail pour are planes
     std::vector<PCB_LAYER_ID> copper;
@@ -749,19 +756,80 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             ys.push_back( std::clamp( y, extent.GetTop(), extent.GetBottom() ) );
     };
 
+    // lines closer than snap_mm are one line, except the two edges of an obstacle thinner than that
+    const int          snapTol = iu( std::max( 0.0, aArgs.value( "snap_mm", defaultPitch ) ) );
+    std::map<int, int> thinX, thinY;   ///< far edge -> the largest near edge of a thin obstacle
+
+    auto thin = [&]( std::map<int, int>& aMap, int aLow, int aHigh )
+    {
+        if( aHigh - aLow >= snapTol || aHigh <= aLow )
+            return;
+
+        auto [it, added] = aMap.emplace( aHigh, aLow );
+
+        if( !added )
+            it->second = std::max( it->second, aLow );
+    };
+
+    auto addObstacle = [&]( const BOX2I& aBox )
+    {
+        addLines( aBox );
+        thin( thinX, std::clamp( aBox.GetLeft(), extent.GetLeft(), extent.GetRight() ),
+              std::clamp( aBox.GetRight(), extent.GetLeft(), extent.GetRight() ) );
+        thin( thinY, std::clamp( aBox.GetTop(), extent.GetTop(), extent.GetBottom() ),
+              std::clamp( aBox.GetBottom(), extent.GetTop(), extent.GetBottom() ) );
+    };
+
     addLines( ub );
 
     for( const FP_BOX& b : boxes )
-        addLines( b.box );
+        addObstacle( b.box );
 
     for( const FP_KEEPOUT& k : keepouts )
-        addLines( k.box );
+        addObstacle( k.box );
 
-    for( std::vector<int>* v : { &xs, &ys } )
+    std::vector<int> rawX, rawY, repX, repY;
+    int              rawLines = 0;
+
+    auto snapLines = [&]( std::vector<int>& aLines, const std::map<int, int>& aThin, std::vector<int>& aRaw,
+                          std::vector<int>& aRep )
     {
-        std::sort( v->begin(), v->end() );
-        v->erase( std::unique( v->begin(), v->end() ), v->end() );
-    }
+        std::sort( aLines.begin(), aLines.end() );
+        aLines.erase( std::unique( aLines.begin(), aLines.end() ), aLines.end() );
+        aRaw = aLines;
+        rawLines += (int) aRaw.size();
+        aRep.assign( aRaw.size(), aRaw.front() );
+        aLines.assign( 1, aRaw.front() );
+
+        for( size_t k = 1; k < aRaw.size(); ++k )
+        {
+            auto       t = aThin.find( aRaw[k] );
+            const bool keep = t != aThin.end() && t->second >= aLines.back();
+
+            if( aRaw[k] - aLines.back() >= snapTol || keep )
+                aLines.push_back( aRaw[k] );
+
+            aRep[k] = aLines.back();
+        }
+
+        // the extent's far edge stays where it is
+        if( aLines.back() != aRaw.back() )
+        {
+            const int old = aLines.back();
+            aLines.back() = aRaw.back();
+            std::replace( aRep.begin(), aRep.end(), old, aRaw.back() );
+        }
+    };
+
+    snapLines( xs, thinX, rawX, repX );
+    snapLines( ys, thinY, rawY, repY );
+
+    auto snapTo = []( const std::vector<int>& aRaw, const std::vector<int>& aRep, int aV )
+    {
+        const auto it = std::lower_bound( aRaw.begin(), aRaw.end(), aV );
+        const size_t k = std::min( size_t( it - aRaw.begin() ), aRaw.size() - 1 );
+        return aRep[k];
+    };
 
     const int nx = (int) xs.size() - 1, ny = (int) ys.size() - 1;
 
@@ -771,13 +839,24 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     std::vector<CELL> cells( size_t( nx ) * ny );
     auto at = [&]( int i, int j ) -> CELL& { return cells[size_t( j ) * nx + i]; };
 
-    auto span = []( const std::vector<int>& aLines, int aLow, int aHigh )
+    // the cells a box takes (i0 .. i1 - 1); one at least when it has an area
+    auto span = [&]( const std::vector<int>& aLines, const std::vector<int>& aRaw, const std::vector<int>& aRep,
+                     int aLow, int aHigh )
     {
         const int last = (int) aLines.size() - 1;
-        const int i0 = int( std::lower_bound( aLines.begin(), aLines.end(), aLow ) - aLines.begin() );
-        const int i1 = int( std::lower_bound( aLines.begin(), aLines.end(), aHigh ) - aLines.begin() );
-        return std::make_pair( std::min( i0, last ), std::min( i1, last ) );   // cells i0 .. i1 - 1
+        const int low = snapTo( aRaw, aRep, std::clamp( aLow, aRaw.front(), aRaw.back() ) );
+        const int high = snapTo( aRaw, aRep, std::clamp( aHigh, aRaw.front(), aRaw.back() ) );
+        const int i0 = std::min( int( std::lower_bound( aLines.begin(), aLines.end(), low ) - aLines.begin() ), last );
+        int       i1 = std::min( int( std::lower_bound( aLines.begin(), aLines.end(), high ) - aLines.begin() ), last );
+
+        if( i1 <= i0 && aHigh > aLow && aLow < aRaw.back() && aHigh > aRaw.front() )
+            i1 = std::min( i0 + 1, last );
+
+        return std::make_pair( i0, i1 );
     };
+
+    auto spanX = [&]( const BOX2I& aBox ) { return span( xs, rawX, repX, aBox.GetLeft(), aBox.GetRight() ); };
+    auto spanY = [&]( const BOX2I& aBox ) { return span( ys, rawY, repY, aBox.GetTop(), aBox.GetBottom() ); };
 
     for( int j = 0; j < ny; ++j )
     {
@@ -791,8 +870,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     for( size_t k = 0; k < keepouts.size(); ++k )
     {
-        const auto [i0, i1] = span( xs, keepouts[k].box.GetLeft(), keepouts[k].box.GetRight() );
-        const auto [j0, j1] = span( ys, keepouts[k].box.GetTop(), keepouts[k].box.GetBottom() );
+        const auto [i0, i1] = spanX( keepouts[k].box );
+        const auto [j0, j1] = spanY( keepouts[k].box );
 
         for( int j = j0; j < j1; ++j )
         {
@@ -814,8 +893,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     for( size_t k = 0; k < boxes.size(); ++k )
     {
-        const auto [i0, i1] = span( xs, boxes[k].box.GetLeft(), boxes[k].box.GetRight() );
-        const auto [j0, j1] = span( ys, boxes[k].box.GetTop(), boxes[k].box.GetBottom() );
+        const auto [i0, i1] = spanX( boxes[k].box );
+        const auto [j0, j1] = spanY( boxes[k].box );
         const int  b = boxes[k].block;
 
         for( int j = j0; j < j1; ++j )
@@ -944,22 +1023,205 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     auto capacity = [&]( const CUT& aCut ) { return toMm( double( aCut.total ) ); };
 
-    // one bundle's cell path: A* from its first block's cells to the other's
-    const size_t        n = cells.size();
-    std::vector<double> cost( n ), cx( nx ), cy( ny );
-    std::vector<int>    prev( n );
-    std::vector<unsigned> seenAt( n, 0 ), doneAt( n, 0 ), targetAt( n, 0 );
-    unsigned              epoch = 0;
+    const auto gridDone = clock::now();
 
-    for( int i = 0; i < nx; ++i )
-        cx[i] = toMm( ( double( xs[i] ) + xs[i + 1] ) / 2 );
+    // regions: rectangles of cells alike (free, or the same boxes), rows' runs merged downwards
+    struct REGION
+    {
+        int              i0, i1, j0, j1;
+        int              cell;
+        std::vector<int> portals;
+        int              vOff = 0, vCount = 0, hOff = 0, hCount = 0;   ///< inner lines (free regions)
+    };
+
+    struct PORTAL
+    {
+        int    r0, r1;     ///< r0 left of / above r1
+        int    cut;
+        bool   vertical;   ///< at x = at, from lo to hi in y (else at y = at, lo .. hi in x), mm
+        double at, lo, hi;
+    };
+
+    auto alike = []( const CELL& aOne, const CELL& aOther )
+    {
+        if( aOne.kind != aOther.kind )
+            return false;
+
+        return aOne.kind == CELL_FREE || ( aOne.inside == aOther.inside && aOne.boxes == aOther.boxes );
+    };
+
+    auto passableKind = []( const CELL& aCell ) { return aCell.kind == CELL_FREE || aCell.kind == CELL_BLOCK; };
+
+    const size_t        n = cells.size();
+    std::vector<int>    regionOf( n, -1 );
+    std::vector<REGION> regions;
 
     for( int j = 0; j < ny; ++j )
-        cy[j] = toMm( ( double( ys[j] ) + ys[j + 1] ) / 2 );
+    {
+        for( int i = 0; i < nx; )
+        {
+            const CELL& c = at( i, j );
+
+            if( !passableKind( c ) )
+            {
+                ++i;
+                continue;
+            }
+
+            const int i0 = i;
+
+            while( i < nx && alike( at( i, j ), c ) )
+                ++i;
+
+            int r = j > 0 ? regionOf[size_t( j - 1 ) * nx + i0] : -1;
+
+            if( r >= 0 && regions[r].i0 == i0 && regions[r].i1 == i && regions[r].j1 == j && alike( cells[regions[r].cell], c ) )
+            {
+                regions[r].j1 = j + 1;
+            }
+            else
+            {
+                r = (int) regions.size();
+                regions.push_back( { i0, i, j, j + 1, j * nx + i0, {}, 0, 0, 0, 0 } );
+            }
+
+            for( int k = i0; k < i; ++k )
+                regionOf[size_t( j ) * nx + k] = r;
+        }
+    }
+
+    // portals: the boundary two regions share (one segment, on one channel when both are free)
+    std::vector<PORTAL> portals;
+
+    auto addPortal = [&]( int aR0, int aR1, int aCut, bool aVertical, int aAt, int aLow, int aHigh )
+    {
+        regions[aR0].portals.push_back( (int) portals.size() );
+        regions[aR1].portals.push_back( (int) portals.size() );
+        portals.push_back( { aR0, aR1, aCut, aVertical, toMm( aAt ), toMm( aLow ), toMm( aHigh ) } );
+    };
+
+    for( int i = 0; i + 1 < nx; ++i )
+    {
+        for( int j = 0; j < ny; )
+        {
+            const int r0 = regionOf[size_t( j ) * nx + i], r1 = regionOf[size_t( j ) * nx + i + 1];
+
+            if( r0 < 0 || r1 < 0 || r0 == r1 )
+            {
+                ++j;
+                continue;
+            }
+
+            const int j0 = j;
+
+            while( j < ny && regionOf[size_t( j ) * nx + i] == r0 && regionOf[size_t( j ) * nx + i + 1] == r1 )
+                ++j;
+
+            addPortal( r0, r1, vEdge[size_t( j0 ) * ( nx - 1 ) + i], true, xs[i + 1], ys[j0], ys[j] );
+        }
+    }
+
+    for( int j = 0; j + 1 < ny; ++j )
+    {
+        for( int i = 0; i < nx; )
+        {
+            const int r0 = regionOf[size_t( j ) * nx + i], r1 = regionOf[size_t( j + 1 ) * nx + i];
+
+            if( r0 < 0 || r1 < 0 || r0 == r1 )
+            {
+                ++i;
+                continue;
+            }
+
+            const int i0 = i;
+
+            while( i < nx && regionOf[size_t( j ) * nx + i] == r0 && regionOf[size_t( j + 1 ) * nx + i] == r1 )
+                ++i;
+
+            addPortal( r0, r1, hEdge[size_t( j ) * nx + i0], false, ys[j + 1], xs[i0], xs[i] );
+        }
+    }
+
+    // a free region's inner grid lines: one channel each over the region (crossed inside it)
+    std::vector<int>    lineCut;
+    std::vector<double> lineAt, linePre;
+
+    for( REGION& r : regions )
+    {
+        if( cells[r.cell].kind != CELL_FREE )
+            continue;
+
+        r.vOff = (int) lineCut.size();
+        r.vCount = r.i1 - r.i0 - 1;
+
+        for( int i = r.i0 + 1; i < r.i1; ++i )
+        {
+            lineCut.push_back( vEdge[size_t( r.j0 ) * ( nx - 1 ) + i - 1] );
+            lineAt.push_back( toMm( xs[i] ) );
+        }
+
+        lineCut.push_back( -1 );
+        lineAt.push_back( 0 );
+        r.hOff = (int) lineCut.size();
+        r.hCount = r.j1 - r.j0 - 1;
+
+        for( int j = r.j0 + 1; j < r.j1; ++j )
+        {
+            lineCut.push_back( hEdge[size_t( j - 1 ) * nx + r.i0] );
+            lineAt.push_back( toMm( ys[j] ) );
+        }
+
+        lineCut.push_back( -1 );
+        lineAt.push_back( 0 );
+    }
+
+    linePre.assign( lineCut.size(), 0 );
+
+    std::vector<std::vector<int>> boxRegions( boxes.size() );
+
+    for( size_t k = 0; k < boxes.size(); ++k )
+    {
+        for( int c : boxCells[k] )
+        {
+            if( regionOf[c] >= 0 )
+                boxRegions[k].push_back( regionOf[c] );
+        }
+
+        std::sort( boxRegions[k].begin(), boxRegions[k].end() );
+        boxRegions[k].erase( std::unique( boxRegions[k].begin(), boxRegions[k].end() ), boxRegions[k].end() );
+    }
+
+    const auto regionsDone = clock::now();
+
+    // one bundle's path: A* over portals (entered towards one of their regions) from its pads' boxes in
+    // one block to those in the other; a node's point on its portal is the one nearest the point before
+    // (at the start: nearest the target)
+    const size_t          nodes = portals.size() * 2;
+    std::vector<double>   cost( nodes ), cutCostAt( cuts.size() ), pointX( nodes ), pointY( nodes );
+    std::vector<int>      prev( nodes );
+    std::vector<unsigned> seenAt( nodes, 0 ), doneAt( nodes, 0 ), targetAt( regions.size(), 0 ),
+            preAt( regions.size(), 0 ), cutAt( cuts.size(), 0 );
+    unsigned              epoch = 0;
 
     auto has = []( const CELL& aCell, int aBlock )
     {
         return std::find( aCell.blocks.begin(), aCell.blocks.end(), aBlock ) != aCell.blocks.end();
+    };
+
+    auto entered = [&]( int aNode ) { return aNode & 1 ? portals[aNode >> 1].r1 : portals[aNode >> 1].r0; };
+
+    auto nearest = []( const PORTAL& aP, double aX, double aY )
+    {
+        return aP.vertical ? std::make_pair( aP.at, std::clamp( aY, aP.lo, aP.hi ) )
+                           : std::make_pair( std::clamp( aX, aP.lo, aP.hi ), aP.at );
+    };
+
+    // inner lines of a list between two coordinates: [t0, t1)
+    auto innerRange = [&]( int aOff, int aCount, double aOne, double aOther )
+    {
+        const double lo = std::min( aOne, aOther ), hi = std::max( aOne, aOther );
+        const auto   b = lineAt.begin() + aOff, e = b + aCount;
+        return std::make_pair( aOff + int( std::upper_bound( b, e, lo ) - b ), aOff + int( std::lower_bound( b, e, hi ) - b ) );
     };
 
     auto routeLink = [&]( LINK& aLink, double aPresent )
@@ -976,149 +1238,241 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         const double tx0 = toMm( target.GetLeft() ), tx1 = toMm( target.GetRight() );
         const double ty0 = toMm( target.GetTop() ), ty1 = toMm( target.GetBottom() );
 
-        auto h = [&]( int i, int j )
+        auto h = [&]( double aX, double aY )
         {
-            const double dx = cx[i] < tx0 ? tx0 - cx[i] : cx[i] > tx1 ? cx[i] - tx1 : 0;
-            const double dy = cy[j] < ty0 ? ty0 - cy[j] : cy[j] > ty1 ? cy[j] - ty1 : 0;
+            const double dx = aX < tx0 ? tx0 - aX : aX > tx1 ? aX - tx1 : 0;
+            const double dy = aY < ty0 ? ty0 - aY : aY > ty1 ? aY - ty1 : 0;
             return dx + dy;
         };
 
         ++epoch;
-
-        for( int k : toBoxes )
-        {
-            for( int c : boxCells[k] )
-                targetAt[c] = epoch;
-        }
-
-        using ENTRY = std::pair<double, int>;
-        std::priority_queue<ENTRY, std::vector<ENTRY>, std::greater<ENTRY>> open;
-
-        for( int k : fromBoxes )
-        {
-            for( int c : boxCells[k] )
-            {
-                cost[c] = 0;
-                prev[c] = -1;
-                seenAt[c] = epoch;
-                open.emplace( h( c % nx, c / nx ), c );
-            }
-        }
 
         auto cutCost = [&]( int aCut )
         {
             if( aCut < 0 )
                 return 0.0;
 
-            const CUT&   cut = cuts[aCut];
-            const double over = std::max( 0.0, cut.use + aLink.demand - capacity( cut ) ) / defaultPitch;
-            return ( aPresent * over + cut.hist ) * overflowCost;
+            if( cutAt[aCut] != epoch )
+            {
+                const CUT&   cut = cuts[aCut];
+                const double over = std::max( 0.0, cut.use + aLink.demand - capacity( cut ) ) / defaultPitch;
+                cutCostAt[aCut] = ( aPresent * over + cut.hist ) * overflowCost;
+                cutAt[aCut] = epoch;
+            }
+
+            return cutCostAt[aCut];
         };
+
+        auto prefix = [&]( int aRegion )
+        {
+            REGION& r = regions[aRegion];
+
+            if( preAt[aRegion] == epoch )
+                return;
+
+            preAt[aRegion] = epoch;
+
+            for( auto [off, count] : { std::make_pair( r.vOff, r.vCount ), std::make_pair( r.hOff, r.hCount ) } )
+            {
+                double sum = 0;
+
+                for( int t = 0; t <= count; ++t )
+                {
+                    linePre[off + t] = sum;
+
+                    if( t < count )
+                        sum += cutCost( lineCut[off + t] );
+                }
+            }
+        };
+
+        // the cost of the inner lines crossed going from one point to another in a free region
+        auto innerCost = [&]( int aRegion, double aX0, double aY0, double aX1, double aY1 )
+        {
+            const REGION& r = regions[aRegion];
+
+            if( r.vCount <= 0 && r.hCount <= 0 )
+                return 0.0;
+
+            prefix( aRegion );
+            const auto [v0, v1] = innerRange( r.vOff, r.vCount, aX0, aX1 );
+            const auto [h0, h1] = innerRange( r.hOff, r.hCount, aY0, aY1 );
+            return linePre[v1] - linePre[v0] + linePre[h1] - linePre[h0];
+        };
+
+        // 0: no way in; else the cost factor per mm inside
+        auto factorOf = [&]( int aRegion )
+        {
+            const CELL& c = cells[regions[aRegion].cell];
+
+            if( c.kind != CELL_BLOCK || has( c, aLink.a ) || has( c, aLink.b ) )
+                return 1.0;
+
+            return c.inside ? foreignPenalty : 0.0;
+        };
+
+        aLink.cuts.clear();
+        aLink.crosses.clear();
+        aLink.length = 0;
+        aLink.found = false;
+
+        std::vector<int> starts;
+
+        for( int k : toBoxes )
+        {
+            for( int r : boxRegions[k] )
+                targetAt[r] = epoch;
+        }
+
+        for( int k : fromBoxes )
+        {
+            for( int r : boxRegions[k] )
+            {
+                if( targetAt[r] == epoch )
+                {
+                    aLink.found = true;
+                    return;
+                }
+
+                starts.push_back( r );
+            }
+        }
+
+        using ENTRY = std::pair<double, int>;
+        std::priority_queue<ENTRY, std::vector<ENTRY>, std::greater<ENTRY>> open;
+
+        auto relax = [&]( int aNode, double aCost, int aPrev, std::pair<double, double> aAt )
+        {
+            if( seenAt[aNode] != epoch || aCost < cost[aNode] )
+            {
+                seenAt[aNode] = epoch;
+                cost[aNode] = aCost;
+                prev[aNode] = aPrev;
+                pointX[aNode] = aAt.first;
+                pointY[aNode] = aAt.second;
+                open.emplace( aCost + h( aAt.first, aAt.second ), aNode );
+            }
+        };
+
+        const double cx = ( tx0 + tx1 ) / 2, cy = ( ty0 + ty1 ) / 2;
+
+        for( int r : starts )
+        {
+            for( int p : regions[r].portals )
+            {
+                const int node = 2 * p + ( portals[p].r0 == r ? 1 : 0 );
+
+                if( factorOf( entered( node ) ) > 0 )
+                    relax( node, cutCost( portals[p].cut ), -1, nearest( portals[p], cx, cy ) );
+            }
+        }
 
         int reached = -1;
 
         while( !open.empty() )
         {
-            const int c = open.top().second;
+            const int node = open.top().second;
             open.pop();
 
-            if( doneAt[c] == epoch )
+            if( doneAt[node] == epoch )
                 continue;
 
-            doneAt[c] = epoch;
-            const int i = c % nx, j = c / nx;
+            doneAt[node] = epoch;
+            const int r = entered( node );
 
-            if( targetAt[c] == epoch )
+            if( targetAt[r] == epoch )
             {
-                reached = c;
+                reached = node;
                 break;
             }
 
-            const int di[4] = { 1, -1, 0, 0 }, dj[4] = { 0, 0, 1, -1 };
+            const double  x = pointX[node], y = pointY[node];
+            const double  factor = factorOf( r );
+            const bool    inFree = cells[regions[r].cell].kind == CELL_FREE;
 
-            for( int k = 0; k < 4; ++k )
+            for( int q : regions[r].portals )
             {
-                const int ni = i + di[k], nj = j + dj[k];
-
-                if( ni < 0 || nj < 0 || ni >= nx || nj >= ny )
+                if( q == ( node >> 1 ) )
                     continue;
 
-                const int   d = nj * nx + ni;
-                const CELL& cell = cells[d];
-                double      factor = 1;
+                const PORTAL& to = portals[q];
+                const int     next = 2 * q + ( to.r0 == r ? 1 : 0 );
 
-                if( cell.kind == CELL_WALL || cell.kind == CELL_OUT )
+                if( doneAt[next] == epoch || factorOf( entered( next ) ) <= 0 )
                     continue;
 
-                if( cell.kind == CELL_BLOCK && !has( cell, aLink.a ) && !has( cell, aLink.b ) )
-                {
-                    if( !cell.inside )
-                        continue;
-
-                    factor = foreignPenalty;
-                }
-
-                int edge = -1;
-
-                if( k == 0 )
-                    edge = vEdge[size_t( j ) * ( nx - 1 ) + i];
-                else if( k == 1 )
-                    edge = vEdge[size_t( j ) * ( nx - 1 ) + ni];
-                else if( k == 2 )
-                    edge = hEdge[size_t( j ) * nx + i];
-                else
-                    edge = hEdge[size_t( nj ) * nx + i];
-
-                const double step = ( std::abs( cx[ni] - cx[i] ) + std::abs( cy[nj] - cy[j] ) ) * factor + cutCost( edge );
-                const double next = cost[c] + step;
-
-                if( seenAt[d] != epoch || next < cost[d] )
-                {
-                    seenAt[d] = epoch;
-                    cost[d] = next;
-                    prev[d] = c;
-                    open.emplace( next + h( ni, nj ), d );
-                }
+                const auto   at = nearest( to, x, y );
+                const double step = ( std::abs( at.first - x ) + std::abs( at.second - y ) ) * factor
+                                    + ( inFree ? innerCost( r, x, y, at.first, at.second ) : 0.0 ) + cutCost( to.cut );
+                relax( next, cost[node] + step, node, at );
             }
         }
 
-        aLink.cuts.clear();
-        aLink.cells.clear();
-        aLink.crosses.clear();
-        aLink.length = 0;
-        aLink.found = reached >= 0;
-
-        if( !aLink.found )
+        if( reached < 0 )
             return;
 
-        for( int c = reached; c >= 0; c = prev[c] )
-            aLink.cells.push_back( c );
+        aLink.found = true;
+        std::vector<int> path;
 
-        std::reverse( aLink.cells.begin(), aLink.cells.end() );
+        for( int k = reached; k >= 0; k = prev[k] )
+            path.push_back( k );
 
-        for( size_t k = 0; k < aLink.cells.size(); ++k )
+        std::reverse( path.begin(), path.end() );
+
+        for( size_t k = 0; k < path.size(); ++k )
         {
-            const int   c = aLink.cells[k];
-            const CELL& cell = cells[c];
+            const PORTAL& to = portals[path[k] >> 1];
 
-            if( cell.kind == CELL_BLOCK && !has( cell, aLink.a ) && !has( cell, aLink.b ) )
-                aLink.crosses.insert( cell.blocks[0] );
+            if( k > 0 )
+            {
+                const int    r = entered( path[k - 1] );
+                const double x0 = pointX[path[k - 1]], y0 = pointY[path[k - 1]];
+                const double x1 = pointX[path[k]], y1 = pointY[path[k]];
+                const CELL&  c = cells[regions[r].cell];
+                aLink.length += std::abs( x1 - x0 ) + std::abs( y1 - y0 );
 
-            if( k == 0 )
-                continue;
+                if( c.kind == CELL_BLOCK && !has( c, aLink.a ) && !has( c, aLink.b ) )
+                    aLink.crosses.insert( c.blocks[0] );
 
-            const int p = aLink.cells[k - 1];
-            const int pi = p % nx, pj = p / nx, ci = c % nx, cj = c / nx;
-            aLink.length += std::abs( cx[ci] - cx[pi] ) + std::abs( cy[cj] - cy[pj] );
-            int edge = -1;
+                if( c.kind == CELL_FREE )
+                {
+                    const REGION& reg = regions[r];
+                    const auto [v0, v1] = innerRange( reg.vOff, reg.vCount, x0, x1 );
+                    const auto [h0, h1] = innerRange( reg.hOff, reg.hCount, y0, y1 );
 
-            if( cj == pj )
-                edge = vEdge[size_t( cj ) * ( nx - 1 ) + std::min( ci, pi )];
-            else
-                edge = hEdge[size_t( std::min( cj, pj ) ) * nx + ci];
+                    // in the order a path crosses them
+                    std::vector<int> inner;
 
-            if( edge >= 0 )
-                aLink.cuts.push_back( edge );
+                    for( int t = v0; t < v1; ++t )
+                        inner.push_back( t );
+
+                    if( x1 < x0 )
+                        std::reverse( inner.begin(), inner.end() );
+
+                    for( int t : inner )
+                    {
+                        if( lineCut[t] >= 0 )
+                            aLink.cuts.push_back( lineCut[t] );
+                    }
+
+                    inner.clear();
+
+                    for( int t = h0; t < h1; ++t )
+                        inner.push_back( t );
+
+                    if( y1 < y0 )
+                        std::reverse( inner.begin(), inner.end() );
+
+                    for( int t : inner )
+                    {
+                        if( lineCut[t] >= 0 )
+                            aLink.cuts.push_back( lineCut[t] );
+                    }
+                }
+            }
+
+            if( to.cut >= 0 )
+                aLink.cuts.push_back( to.cut );
         }
     };
 
@@ -1166,17 +1520,37 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     {
         const double present = it == 0 ? 0.0 : std::pow( 2.0, it - 1 );
 
+        int rerouted = 0;
+
         for( int k : order )
         {
+            if( it > 0 && !rerouteAll )
+            {
+                bool over = false;
+
+                for( int c : links[k].cuts )
+                {
+                    if( cuts[c].use - capacity( cuts[c] ) > 1e-6 )
+                    {
+                        over = true;
+                        break;
+                    }
+                }
+
+                if( !over )
+                    continue;
+            }
+
             apply( links[k], -1 );
             routeLink( links[k], present );
             apply( links[k], +1 );
+            ++rerouted;
         }
 
         ++ran;
         double    total = 0;
         const int count = overflowOf( total );
-        history.push_back( { { "iteration", it + 1 }, { "overflows", count }, { "over_mm", r2( total ) } } );
+        history.push_back( { { "iteration", it + 1 }, { "overflows", count }, { "over_mm", r2( total ) }, { "rerouted", rerouted } } );
 
         if( count < bestCount || ( count == bestCount && total < bestTotal - 1e-9 ) )
         {
@@ -1199,6 +1573,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     links = best;
+    const auto routed = clock::now();
 
     for( CUT& c : cuts )
     {
@@ -1403,7 +1778,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     for( const LINK& l : links )
-        zeroLength += l.found && l.cells.size() <= 1;
+        zeroLength += l.found && l.length <= 0;
 
     nlohmann::json keepoutList = nlohmann::json::array();
 
@@ -1443,12 +1818,19 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const double ms = std::chrono::duration<double, std::milli>( now - started ).count();
     const double floorplanMs = std::chrono::duration<double, std::milli>( now - analysed ).count();
 
+    auto msBetween = []( clock::time_point aFrom, clock::time_point aTo )
+    {
+        return std::chrono::duration<double, std::milli>( aTo - aFrom ).count();
+    };
+
     return KOPENAPI_RESULT::Ok(
             { { "layers", layerList },
               { "classes", classList },
               { "blocks", blockList },
               { "keepouts", keepoutList },
-              { "grid", { { "columns", nx }, { "rows", ny }, { "cells", cells.size() }, { "free_cells", freeCells } } },
+              { "grid", { { "columns", nx }, { "rows", ny }, { "cells", cells.size() }, { "free_cells", freeCells },
+                          { "lines_before_snap", rawLines }, { "snap_mm", r3( toMm( snapTol ) ) },
+                          { "regions", regions.size() }, { "portals", portals.size() } } },
               { "channel_count", cuts.size() },
               { "channels_used", std::count_if( cuts.begin(), cuts.end(), []( const CUT& c ) { return c.use > 0; } ) },
               { "channels", channels },
@@ -1467,7 +1849,11 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
               { "negotiation", { { "enabled", negotiate }, { "iterations", ran }, { "best_iteration", bestIteration },
                                  { "history", history } } },
               { "ms", r2( ms ) },
-              { "floorplan_ms", r2( floorplanMs ) } } );
+              { "floorplan_ms", r2( floorplanMs ) },
+              { "timing_ms", { { "grid", r2( msBetween( analysed, gridDone ) ) },
+                               { "regions", r2( msBetween( gridDone, regionsDone ) ) },
+                               { "routing", r2( msBetween( regionsDone, routed ) ) },
+                               { "answer", r2( msBetween( routed, now ) ) } } } } );
 }
 
 
@@ -1502,7 +1888,9 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "merge_gap_mm":{"type":"number","description":"courtyards closer than this may merge (default one Default track pitch)"},
                         "merge_fill":{"type":"number","default":0.7,"minimum":0,"maximum":1,"description":"two boxes merge when their areas fill this much of their union"},
                         "max_boxes":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"boxes per block at most"},
+                        "snap_mm":{"type":"number","minimum":0,"description":"obstacle edges closer than this share one grid line (default one Default track pitch; 0: exact). Gaps narrower close, obstacles thinner keep both edges"},
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
+                        "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
                         "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
                         "overflow_cost_mm":{"type":"number","default":5,"description":"detour worth one track over a channel's capacity, first round (doubles each round)"},
                         "through_block_factor":{"type":"number","default":10,"minimum":1,"description":"cost of a path through another block's box per mm, against free space"},
