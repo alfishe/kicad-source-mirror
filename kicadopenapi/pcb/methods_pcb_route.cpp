@@ -17,6 +17,7 @@
 
 #include <kicadopenapi_history.h>
 #include "route_plan.h"
+#include "rail_plan.h"
 
 #include <api/pcb_context.h>
 #include <kicadopenapi_keepalive.h>
@@ -2879,155 +2880,6 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 constexpr size_t ROUTE_LIST_CAP = 100;
 
 
-/// @brief The way out of a pad of a part's outer row: the axis of its side, pointing away from the part
-/// (none for a pad inside the rows: an exposed pad, a ball inside an array)
-static std::optional<VECTOR2I> outwardOf( const PAD* aPad, const BOX2I& aCentres )
-{
-    const VECTOR2I c = aPad->GetPosition();
-    const BOX2I    pb = aPad->GetBoundingBox();
-    const bool     onX = c.x == aCentres.GetLeft() || c.x == aCentres.GetRight();
-    const bool     onY = c.y == aCentres.GetTop() || c.y == aCentres.GetBottom();
-
-    if( onX && ( !onY || pb.GetWidth() >= pb.GetHeight() ) )
-        return VECTOR2I( c.x == aCentres.GetLeft() ? -1 : 1, 0 );
-
-    if( onY )
-        return VECTOR2I( 0, c.y == aCentres.GetTop() ? -1 : 1 );
-
-    return std::nullopt;
-}
-
-
-/// @brief Under a quad package's body (QFP / QFN / LGA, pads on four sides): the area inside its
-/// ring of pads on its side, where a track or via of another net walls its pins in.  With an
-/// exposed pad the area is the ring between the pad rows and the exposed pad (the exposed pad and
-/// its clearance stay open: its own vias go there); parts with an array of pads inside (BGA) have
-/// no such area
-struct UNDER_PART
-{
-    FOOTPRINT*     fp;
-    PCB_LAYER_ID   layer;
-    SHAPE_POLY_SET area;
-    bool           exposedPad;
-};
-
-
-static std::vector<UNDER_PART> underPartAreas( BOARD* aBoard )
-{
-    std::vector<UNDER_PART>      out;
-    const BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
-    std::shared_ptr<NETCLASS>    defaultClass = bds.m_NetSettings ? bds.m_NetSettings->GetDefaultNetclass() : nullptr;
-    const int clearance = std::max( { bds.m_MinClearance, defaultClass && defaultClass->HasClearance() ? defaultClass->GetClearance() : 0, 0 } );
-
-    for( FOOTPRINT* fp : aBoard->Footprints() )
-    {
-        if( fp->Pads().size() < 8 )
-            continue;
-
-        BOX2I centres;
-        int   padLength = 0;
-        bool  first = true;
-
-        for( PAD* pad : fp->Pads() )
-        {
-            if( first )
-                centres = BOX2I( pad->GetPosition(), VECTOR2I( 0, 0 ) );
-            else
-                centres.Merge( pad->GetPosition() );
-
-            first = false;
-        }
-
-        // the pad rows: the pads on the box of the centres; their length sets how far in the ring starts
-        for( PAD* pad : fp->Pads() )
-        {
-            const VECTOR2I c = pad->GetPosition();
-
-            if( c.x == centres.GetLeft() || c.x == centres.GetRight() || c.y == centres.GetTop() || c.y == centres.GetBottom() )
-            {
-                const BOX2I pb = pad->GetBoundingBox();
-                padLength = std::max( { padLength, (int) pb.GetWidth(), (int) pb.GetHeight() } );
-            }
-        }
-
-        BOX2I inner = centres;
-        inner.Inflate( -( padLength / 2 + pcbIUScale.mmToIU( 0.1 ) ) );
-
-        if( inner.GetWidth() <= 0 || inner.GetHeight() <= 0 )
-            continue;
-
-        // pads on all four sides (a quad package); two rows (SOIC, headers) leave room between
-        int sides[4] = { 0, 0, 0, 0 };
-
-        for( PAD* pad : fp->Pads() )
-        {
-            const VECTOR2I c = pad->GetPosition();
-            const bool     spanX = c.x >= inner.GetLeft() && c.x <= inner.GetRight();
-            const bool     spanY = c.y >= inner.GetTop() && c.y <= inner.GetBottom();
-            sides[0] += c.x < inner.GetLeft() && spanY;
-            sides[1] += c.x > inner.GetRight() && spanY;
-            sides[2] += c.y < inner.GetTop() && spanX;
-            sides[3] += c.y > inner.GetBottom() && spanX;
-        }
-
-        if( std::any_of( std::begin( sides ), std::end( sides ), []( int n ) { return n < 2; } ) )
-            continue;
-
-        // pads inside: an exposed pad (one or two numbers, its paste / thermal pieces) or an array
-        std::vector<PAD*>     insidePads;
-        std::set<wxString>    insideNumbers;
-
-        for( PAD* pad : fp->Pads() )
-        {
-            if( inner.Contains( pad->GetPosition() ) )
-            {
-                insidePads.push_back( pad );
-                insideNumbers.insert( pad->GetNumber() );
-            }
-        }
-
-        if( insideNumbers.size() > 2 )
-            continue;
-
-        SHAPE_POLY_SET area;
-        area.NewOutline();
-        area.Append( inner.GetLeft(), inner.GetTop() );
-        area.Append( inner.GetRight(), inner.GetTop() );
-        area.Append( inner.GetRight(), inner.GetBottom() );
-        area.Append( inner.GetLeft(), inner.GetBottom() );
-
-        if( !insidePads.empty() )
-        {
-            SHAPE_POLY_SET open;
-
-            for( PAD* pad : insidePads )
-            {
-                for( PCB_LAYER_ID l : pad->GetLayerSet().CuStack() )
-                {
-                    if( l == ( fp->GetLayer() == B_Cu ? B_Cu : F_Cu ) )
-                        pad->TransformShapeToPolygon( open, l, clearance, ARC_LOW_DEF, ERROR_OUTSIDE );
-                }
-            }
-
-            BOX2I openBox = open.BBox();
-            openBox.Inflate( clearance );
-            SHAPE_POLY_SET hole;
-            hole.NewOutline();
-            hole.Append( openBox.GetLeft(), openBox.GetTop() );
-            hole.Append( openBox.GetRight(), openBox.GetTop() );
-            hole.Append( openBox.GetRight(), openBox.GetBottom() );
-            hole.Append( openBox.GetLeft(), openBox.GetBottom() );
-            area.BooleanSubtract( hole );
-
-            if( area.OutlineCount() == 0 )
-                continue;
-        }
-
-        out.push_back( { fp, fp->GetLayer() == B_Cu ? B_Cu : F_Cu, std::move( area ), !insidePads.empty() } );
-    }
-
-    return out;
-}
 
 
 static KOPENAPI_RESULT routeOrBranch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs );
@@ -9322,39 +9174,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     int minViaDia = 0;
     int minViaDrill = 0;
 
-    {
-        const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
-        int                          drill = bds.m_MinThroughDrill;
-        int                          ring = bds.m_ViasMinAnnularWidth;
-        int                          dia = bds.m_ViasMinSize;
-
-        if( std::shared_ptr<DRC_ENGINE> drc = bds.m_DRCEngine )
-        {
-            PCB_VIA probe( board );
-            probe.SetFlags( ROUTER_TRANSIENT );
-            probe.SetViaType( VIATYPE::THROUGH );
-            probe.SetLayerPair( F_Cu, B_Cu );
-            probe.SetNet( net );
-
-            auto minOf = [&]( DRC_CONSTRAINT_T aType, int aFloor )
-            {
-                DRC_CONSTRAINT c = drc->EvalRules( aType, &probe, nullptr, F_Cu );
-                return c.GetValue().HasMin() ? std::max( c.GetValue().Min(), aFloor ) : aFloor;
-            };
-
-            drill = minOf( HOLE_SIZE_CONSTRAINT, drill );
-            ring = minOf( ANNULAR_WIDTH_CONSTRAINT, ring );
-            dia = minOf( VIA_DIAMETER_CONSTRAINT, dia );
-        }
-
-        dia = std::max( dia, drill + 2 * ring );
-
-        if( drill > 0 && dia > drill && dia < classViaDia )
-        {
-            minViaDia = dia;
-            minViaDrill = std::min( drill, classViaDrill );
-        }
-    }
+    boardMinVia( board, net, classViaDia, classViaDrill, minViaDia, minViaDrill );
 
     // under_parts avoid: no via or stub inside a quad package's ring of pads (its exposed pad stays open)
     const std::string underParts = aArgs.value( "under_parts", std::string( "avoid" ) );
@@ -9656,12 +9476,10 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         return nullptr;
     };
 
-    // Rail pins of a fine-pitch row (power pins, pins of a poured net or of the exposed pad's net):
-    // each run of them side by side gets its via pattern once, from the board alone, so every call
-    // sees the same plan: one depth, alternating depths, or where the pitch and the hole clearance
-    // leave no stub between two vias a pin apart, a via at every other pin (poured nets first). A
-    // planned spot of another net not yet on another layer is kept free, as is the way inward of a
-    // signal pin pcb_fanout_ports moves to the other layer
+    // Rail pins of a fine-pitch row: each run of them side by side gets its via pattern once, from
+    // the board alone (planRowRailVias), so every call sees the same plan. A planned spot of another
+    // net not yet on another layer is kept free, as is the way inward of a signal pin
+    // pcb_fanout_ports moves to the other layer
     struct PLANNED
     {
         VECTOR2I spot;
@@ -9680,6 +9498,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     std::map<const PAD*, PLANNED> plannedVia;
     std::set<const PAD*>          runSkipped;
+    std::set<const PAD*>          railPins;
     std::vector<LANE>             lanes;
     const int                     holeClearance = board->GetDesignSettings().m_HoleClearance;
     const int                     holeToHole = board->GetDesignSettings().m_HoleToHoleMin;
@@ -9704,14 +9523,6 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     };
 
     {
-        std::set<int> poured;
-
-        for( ZONE* z : board->Zones() )
-        {
-            if( !z->GetIsRuleArea() )
-                poured.insert( z->GetNetCode() );
-        }
-
         std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
 
         auto reached = [&]( const PAD* aPad )
@@ -9734,186 +9545,27 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
             return false;
         };
 
-        auto epOf = [&]( const PAD* aPad ) -> const PAD*
+        RAIL_PLAN_OPTIONS options;
+        options.classViaDia = classViaDia;
+        options.classViaDrill = classViaDrill;
+        options.minViaDia = minViaDia;
+        options.minViaDrill = minViaDrill;
+
+        std::set<const FOOTPRINT*> packages;
+
+        for( const UNDER_PART& u : ringAreas )
         {
-            for( const PAD* ep : exposedPads )
+            if( std::any_of( u.fp->Pads().begin(), u.fp->Pads().end(), [&]( const PAD* aPad ) { return rowPin( aPad ); } ) )
+                packages.insert( u.fp );
+
+            for( const RAIL_PIN_PLAN& p : planRowRailVias( board, u.fp, options ) )
             {
-                if( ep->GetParentFootprint() == aPad->GetParentFootprint() )
-                    return ep;
-            }
+                railPins.insert( p.pad );
 
-            return nullptr;
-        };
-
-        auto firstClass = [&]( const PAD* aPad )
-        {
-            const PAD* ep = epOf( aPad );
-            return poured.count( aPad->GetNetCode() ) || ( ep && ep->GetNetCode() == aPad->GetNetCode() );
-        };
-
-        auto railOf = [&]( const PAD* aPad )
-        {
-            return aPad->GetNetCode() > 0 && ( firstClass( aPad ) || aPad->GetPinType().Contains( wxT( "power" ) ) );
-        };
-
-        std::map<std::tuple<const FOOTPRINT*, int, int>, std::vector<const PAD*>> rows;
-
-        for( const auto& [pad, dir] : outward )
-        {
-            if( rowPin( pad ) )
-                rows[{ pad->GetParentFootprint(), dir.x, dir.y }].push_back( pad );
-        }
-
-        for( auto& [key, row] : rows )
-        {
-            const VECTOR2I dir( std::get<1>( key ), std::get<2>( key ) );
-            const VECTOR2I across( -dir.y, dir.x );
-            auto           along = [&]( const PAD* aPad ) { return (int64_t) aPad->GetPosition().x * across.x + (int64_t) aPad->GetPosition().y * across.y; };
-
-            std::sort( row.begin(), row.end(), [&]( const PAD* x, const PAD* y ) { return along( x ) < along( y ); } );
-
-            std::vector<std::vector<const PAD*>> runs( 1 );
-
-            for( size_t i = 0; i < row.size(); ++i )
-            {
-                const PAD* p = row[i];
-                const bool apart = i > 0 && along( p ) - along( row[i - 1] ) > pcbIUScale.mmToIU( 0.65 );
-
-                if( !railOf( p ) || apart )
-                    runs.emplace_back();
-
-                if( !railOf( p ) )
-                    continue;
-
-                if( !runs.back().empty() && runs.back().back()->GetNetCode() == p->GetNetCode() )
-                    continue;   // beside a pin of its own net: joined to that one's via
-
-                runs.back().push_back( p );
-            }
-
-            for( const std::vector<const PAD*>& run : runs )
-            {
-                if( run.size() < 2 )
-                    continue;
-
-                int clear = 0;
-
-                for( const PAD* p : run )
-                    clear = std::max( clear, clearOf( p ) );
-
-                const BOX2I pb = run.front()->GetBoundingBox();
-                const int   padHalf = dir.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
-                int         room = padHalf + pcbIUScale.mmToIU( 2.0 );
-
-                if( const PAD* ep = epOf( run.front() ) )
-                {
-                    const BOX2I    eb = ep->GetBoundingBox();
-                    const VECTOR2I c = run.front()->GetPosition();
-                    room = dir.x > 0 ? c.x - eb.GetRight() : dir.x < 0 ? eb.GetLeft() - c.x : dir.y > 0 ? c.y - eb.GetBottom()
-                                                                                                       : eb.GetTop() - c.y;
-                }
-
-                std::vector<int> gaps;
-
-                for( size_t i = 0; i + 1 < run.size(); ++i )
-                    gaps.push_back( (int) ( along( run[i + 1] ) - along( run[i] ) ) );
-
-                std::vector<std::pair<int, int>> sizes = { { classViaDia, classViaDrill } };
-
-                if( minViaDia )
-                    sizes.emplace_back( minViaDia, minViaDrill );
-
-                auto place = [&]( const PAD* aPad, int aDepth, int aDia, int aDrill )
-                { plannedVia[aPad] = { aPad->GetPosition() - dir * aDepth, aDia, aDrill }; };
-
-                bool planned = false;
-
-                for( const auto& [dia, drill] : sizes )
-                {
-                    const int depth = padHalf + dia / 2 + minClearance;
-                    const int pair = viaApart( dia, drill, dia, drill, clear );
-                    const int pass = stubApart( dia, drill, clear );
-
-                    if( depth + dia / 2 + clear > room )
-                        continue;
-
-                    if( std::all_of( gaps.begin(), gaps.end(), [&]( int g ) { return g >= pair; } ) )
-                    {
-                        for( const PAD* p : run )
-                            place( p, depth, dia, drill );
-
-                        planned = true;
-                        break;
-                    }
-
-                    bool alternate = true;
-                    int  rise = 0;
-
-                    for( size_t i = 0; i < gaps.size(); ++i )
-                    {
-                        alternate &= gaps[i] >= pass && ( i + 1 >= gaps.size() || gaps[i] + gaps[i + 1] >= pair );
-
-                        if( gaps[i] < pair )
-                            rise = std::max( rise, (int) std::ceil( std::sqrt( (double) pair * pair - (double) gaps[i] * gaps[i] ) ) );
-                    }
-
-                    if( alternate && depth + rise + dia / 2 + clear <= room )
-                    {
-                        for( size_t i = 0; i < run.size(); ++i )
-                            place( run[i], depth + ( i % 2 ? rise : 0 ), dia, drill );
-
-                        planned = true;
-                        break;
-                    }
-                }
-
-                if( planned )
-                    continue;
-
-                // every other pin: poured nets first, each pin as far from the chosen as one via
-                // from the next
-                const auto [dia, drill] = sizes.back();
-                const int  depth = padHalf + dia / 2 + minClearance;
-                const int  pair = viaApart( dia, drill, dia, drill, clear );
-
-                if( depth + dia / 2 + clear > room )
-                    continue;
-
-                std::vector<size_t> order( run.size() );
-                std::iota( order.begin(), order.end(), 0 );
-                std::stable_sort( order.begin(), order.end(),
-                                  [&]( size_t x, size_t y ) { return firstClass( run[x] ) && !firstClass( run[y] ); } );
-                std::vector<size_t> chosen;
-
-                for( size_t i : order )
-                {
-                    if( std::all_of( chosen.begin(), chosen.end(),
-                                     [&]( size_t j ) { return std::abs( along( run[i] ) - along( run[j] ) ) >= pair; } ) )
-                    {
-                        chosen.push_back( i );
-                    }
-                }
-
-                // the class's via where the chosen leave room for it
-                const int classPair = viaApart( classViaDia, classViaDrill, classViaDia, classViaDrill, clear );
-                const bool roomy = std::all_of( chosen.begin(), chosen.end(),
-                                                [&]( size_t i )
-                                                {
-                                                    return std::all_of( chosen.begin(), chosen.end(),
-                                                                        [&]( size_t j )
-                                                                        { return i == j || std::abs( along( run[i] ) - along( run[j] ) ) >= classPair; } );
-                                                } )
-                                   && padHalf + classViaDia + minClearance + clear <= room;
-
-                for( size_t i = 0; i < run.size(); ++i )
-                {
-                    if( std::find( chosen.begin(), chosen.end(), i ) == chosen.end() )
-                        runSkipped.insert( run[i] );
-                    else if( roomy )
-                        place( run[i], padHalf + classViaDia / 2 + minClearance, classViaDia, classViaDrill );
-                    else
-                        place( run[i], depth, dia, drill );
-                }
+                if( p.planned )
+                    plannedVia[p.pad] = { p.spot, p.dia, p.drill };
+                else if( p.skipped )
+                    runSkipped.insert( p.pad );
             }
         }
 
@@ -9925,11 +9577,6 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
         // signal pins that leave by a via (pcb_fanout_ports layer other; without its plan, every
         // fine-pitch row pin with an open connection): their straight way in and a via there
-        std::set<const FOOTPRINT*> packages;
-
-        for( const auto& [key, row] : rows )
-            packages.insert( std::get<0>( key ) );
-
         const int signalDia = minViaDia ? minViaDia : classViaDia;
         const int signalDrill = minViaDia ? minViaDrill : classViaDrill;
 
@@ -9959,7 +9606,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
             for( const auto& [pad, dir] : outward )
             {
-                if( pad->GetParentFootprint() != fp || !rowPin( pad ) || railOf( pad ) || pad->GetNetCode() <= 0 || reached( pad ) )
+                if( pad->GetParentFootprint() != fp || !rowPin( pad ) || railPins.count( pad ) || pad->GetNetCode() <= 0 || reached( pad ) )
                     continue;
 
                 if( havePlan && !moved.count( str( pad->GetNumber() ) ) )
@@ -11104,6 +10751,73 @@ static KOPENAPI_RESULT h_pcb_stitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     }
 
     return result;
+}
+
+
+static KOPENAPI_RESULT h_pcb_rail_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    BOARD*            board = context->GetBoard();
+    const std::string ref = aArgs.value( "ref", std::string() );
+    FOOTPRINT*        fp = ref.empty() ? nullptr : board->FindFootprintByReference( wxString::FromUTF8( ref ) );
+
+    if( !fp )
+        return KOPENAPI_RESULT::Error( 404, "ref: no footprint '" + ref + "' (the quad package whose rail pins to plan)" );
+
+    if( std::string rulesError; !KopenapiDesignRulesFromDisk( board, &rulesError ) )
+        return KOPENAPI_RESULT::Error( 422, rulesError );
+
+    const std::string netText = aArgs.value( "net", std::string( "GND" ) );
+    NETINFO_ITEM*     net = KopenapiFindNet( board, netText );
+
+    if( !net )
+        return KopenapiNoSuchNet( board, netText );
+
+    NETCLASS*         netclass = net->GetNetClass();
+    RAIL_PLAN_OPTIONS options;
+    options.classViaDia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
+    options.classViaDrill = netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
+    boardMinVia( board, net, options.classViaDia, options.classViaDrill, options.minViaDia, options.minViaDrill );
+
+    nlohmann::json pins = nlohmann::json::array();
+    int            planned = 0, skipped = 0, fixed = 0;
+
+    for( const RAIL_PIN_PLAN& p : planRowRailVias( board, fp, options ) )
+    {
+        nlohmann::json row = { { "pad", str( fp->GetReference() ) + "." + str( p.pad->GetNumber() ) },
+                               { "net", str( UnescapeString( p.pad->GetNetname() ) ) },
+                               { "outward", { p.outward.x, p.outward.y } },
+                               { "planned", p.planned },
+                               { "skipped", p.skipped },
+                               { "pattern", p.pattern },
+                               { "reason", p.reason } };
+
+        if( p.planned )
+        {
+            row["at_mm"] = { toMm( p.spot.x ), toMm( p.spot.y ) };
+            row["via_mm"] = toMm( p.dia );
+            row["drill_mm"] = toMm( p.drill );
+            row["stub_mm"] = { { toMm( p.stub.A.x ), toMm( p.stub.A.y ) }, { toMm( p.stub.B.x ), toMm( p.stub.B.y ) } };
+        }
+
+        planned += p.planned;
+        skipped += p.skipped;
+        fixed += p.pattern == "fixed";
+        pins.push_back( std::move( row ) );
+    }
+
+    nlohmann::json body = { { "ref", ref }, { "pins", std::move( pins ) }, { "planned_count", planned },
+                            { "skipped_count", skipped }, { "fixed_count", fixed },
+                            { "class_via_mm", toMm( options.classViaDia ) }, { "class_drill_mm", toMm( options.classViaDrill ) } };
+
+    if( options.minViaDia )
+        body["board_min_via_mm"] = { toMm( options.minViaDia ), toMm( options.minViaDrill ) };
+
+    return KOPENAPI_RESULT::Ok( body );
 }
 
 
@@ -14090,6 +13804,19 @@ KOPENAPI_REGISTER( "pcb_stitch",
                         "dry_run":{"type":"boolean","default":false,"description":"the whole call (vias, stubs, refills) runs on the board and is taken back: the answer is what it places (409 when no copy of the board could be made)"},
                         "under_parts":{"type":"string","enum":["avoid","allow"],"default":"avoid","description":"avoid: no via or stub of another part inside the ring of pads of a quad package (QFP / QFN / LGA) on its side - the ring is the package's own pins' (their vias go inward) and the exposed pad and its clearance stay open for its own vias; BGAs are not affected; not_reached says when only such spots were near. allow: other parts' vias may go there too"}}})json"_json ),
                    false, h_pcb_stitch, 300 );
+
+KOPENAPI_REGISTER( "pcb_rail_plan",
+                   "The vias pcb_stitch plans inward of the rail pins (power pins, pins of a poured net or of the exposed pad's net) "
+                   "of a fine-pitch quad package's rows, without laying any: per pin the spot (at_mm), via and drill, the stub from "
+                   "the pad, the pattern of its run (one_depth; alternating depths; every_other where two vias a pin apart do not fit, "
+                   "poured nets first; fixed: a via joined to the pin already, kept, its neighbours planned around it) and why; "
+                   "skipped pins are left to the router (a tight run, a spot too near a fixed via, a spot or stub in a rule area that "
+                   "forbids it). A pin beside one of its own net joins that one's via (planned false). Sizes as pcb_stitch of net takes "
+                   "them: the net class's via first, the board's smallest within its rules where it does not fit. Read only",
+                   R"json({"type":"object","required":["ref"],"properties":{
+                        "ref":{"type":"string","description":"the package"},
+                        "net":{"type":"string","default":"GND","description":"the net whose class gives the via sizes (as pcb_stitch net)"}}})json"_json,
+                   false, h_pcb_rail_plan, 60 );
 
 KOPENAPI_REGISTER( "pcb_track_list",
                    "Tracks and vias with their uuids: all, or of nets, in a region, on a layer, or the copper "
