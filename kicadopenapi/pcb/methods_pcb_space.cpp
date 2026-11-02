@@ -2198,7 +2198,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                 // pin's half of its side
                 if( turnOf( own, to ) == 2 )
                 {
-                    VECTOR2I far = b.parts[p.to].centre;
+                    VECTOR2I farPin = b.parts[p.to].centre;
                     double   nearest = std::numeric_limits<double>::max();
 
                     for( PAD* fp : b.parts[p.to].fp->Pads() )
@@ -2206,12 +2206,12 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                         if( fp->GetNetCode() == p.code && ( fp->GetPosition() - p.pad->GetPosition() ).EuclideanNorm() < nearest )
                         {
                             nearest = ( fp->GetPosition() - p.pad->GetPosition() ).EuclideanNorm();
-                            far = fp->GetPosition();
+                            farPin = fp->GetPosition();
                         }
                     }
 
                     const bool     across = own == 0 || own == 2;
-                    const VECTOR2I off = far - centre;
+                    const VECTOR2I off = farPin - centre;
                     const VECTOR2I at = p.pad->GetPosition() - centre;
                     const int      tol = ( across ? extent.GetHeight() : extent.GetWidth() ) / 4;
                     const int      lean = across ? ( std::abs( off.y ) > tol ? off.y : at.y ) : ( std::abs( off.x ) > tol ? off.x : at.x );
