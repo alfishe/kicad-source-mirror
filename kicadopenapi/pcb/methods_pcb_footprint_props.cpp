@@ -21,6 +21,11 @@
 #include <kicadopenapi_util.h>
 #include <libraries/library_manager.h>
 #include <pad.h>
+#include <geometry/shape.h>
+#include <kiway.h>
+#include <frame_type.h>
+#include <pcb_edit_frame.h>
+#include <pcb_track.h>
 #include <wildcards_and_files_ext.h>
 
 #include <picosha2.h>
@@ -478,6 +483,181 @@ static KOPENAPI_RESULT h_pcb_footprint_update( KOPENAPI_CONTEXT& aCtx, const nlo
 }
 
 
+static KOPENAPI_RESULT h_pcb_footprint_delete( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    std::vector<std::string> refs;
+
+    if( aArgs.contains( "ref" ) && aArgs["ref"].is_string() )
+        refs.push_back( aArgs["ref"].get<std::string>() );
+
+    for( const nlohmann::json& r : aArgs.value( "refs", nlohmann::json::array() ) )
+    {
+        if( r.is_string() )
+            refs.push_back( r.get<std::string>() );
+    }
+
+    if( refs.empty() )
+        return KOPENAPI_RESULT::Error( 400, "ref or refs: the footprints to delete (pcb_footprint_list)" );
+
+    BOARD*                   board = context->GetBoard();
+    std::set<std::string>    wanted( refs.begin(), refs.end() );
+    std::set<std::string>    found;
+    std::vector<FOOTPRINT*>  fps;
+
+    // every footprint with that reference: a duplicated one goes as a whole
+    for( FOOTPRINT* fp : board->Footprints() )
+    {
+        const std::string ref = str( fp->GetReference() );
+
+        if( wanted.count( ref ) )
+        {
+            fps.push_back( fp );
+            found.insert( ref );
+        }
+    }
+
+    nlohmann::json missing = nlohmann::json::array();
+
+    for( const std::string& ref : wanted )
+    {
+        if( !found.count( ref ) )
+            missing.push_back( ref );
+    }
+
+    if( fps.empty() )
+        return KOPENAPI_RESULT::Error( 404, "no footprint " + missing.front().get<std::string>() );
+
+    if( !aArgs.value( "override_locks", false ) )
+    {
+        nlohmann::json locked = nlohmann::json::array();
+
+        for( FOOTPRINT* fp : fps )
+        {
+            if( fp->IsLocked() )
+                locked.push_back( str( fp->GetReference() ) );
+        }
+
+        if( !locked.empty() )
+        {
+            KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 409, "locked footprints are in the request (pcb_unlock, "
+                                                                   "or override_locks: true)" );
+            refused.body["locked"] = locked;
+            return refused;
+        }
+    }
+
+    // copper ending on a pad of its own net: it stays unless rip_attached
+    std::vector<PAD*> pads;
+
+    for( FOOTPRINT* fp : fps )
+        pads.insert( pads.end(), fp->Pads().begin(), fp->Pads().end() );
+
+    const bool               dryRun = aArgs.value( "dry_run", false );
+    const bool               rip = aArgs.value( "rip_attached", false );
+    std::vector<PCB_TRACK*>  attached;
+
+    for( PCB_TRACK* track : board->Tracks() )
+    {
+        for( PAD* pad : pads )
+        {
+            if( pad->GetNetCode() <= 0 || pad->GetNetCode() != track->GetNetCode() )
+                continue;
+
+            bool touches = false;
+
+            for( PCB_LAYER_ID layer : track->GetLayerSet().CuStack() )
+            {
+                if( !pad->IsOnLayer( layer ) )
+                    continue;
+
+                const std::shared_ptr<SHAPE> shape = pad->GetEffectiveShape( layer );
+
+                if( track->Type() == PCB_VIA_T )
+                    touches = shape->Collide( track->GetPosition() );
+                else
+                    touches = shape->Collide( track->GetStart() ) || shape->Collide( track->GetEnd() );
+
+                if( touches )
+                    break;
+            }
+
+            if( touches )
+            {
+                attached.push_back( track );
+                break;
+            }
+        }
+    }
+
+    nlohmann::json items = nlohmann::json::array();
+    int            padCount = 0;
+
+    for( FOOTPRINT* fp : fps )
+    {
+        std::set<std::string> nets;
+
+        for( PAD* pad : fp->Pads() )
+        {
+            if( pad->GetNetCode() > 0 )
+                nets.insert( str( pad->GetNetname() ) );
+        }
+
+        padCount += int( fp->Pads().size() );
+        items.push_back( { { "ref", str( fp->GetReference() ) },
+                           { "uuid", str( fp->m_Uuid.AsString() ) },
+                           { "lib_id", str( fp->GetFPID().Format() ) },
+                           { "pads", fp->Pads().size() },
+                           { "nets", nets } } );
+    }
+
+    nlohmann::json attachedIds = nlohmann::json::array();
+
+    for( PCB_TRACK* track : attached )
+        attachedIds.push_back( str( track->m_Uuid.AsString() ) );
+
+    if( !dryRun )
+    {
+        BOARD_COMMIT commit( context->GetToolManager() );
+
+        for( FOOTPRINT* fp : fps )
+            commit.Remove( fp );
+
+        if( rip )
+        {
+            for( PCB_TRACK* track : attached )
+                commit.Remove( track );
+        }
+
+        commit.Push( _( "Delete footprints (API)" ) );
+
+        if( !aCtx.headless )
+        {
+            if( auto* frame = dynamic_cast<PCB_EDIT_FRAME*>( aCtx.kiway ? aCtx.kiway->Player( FRAME_PCB_EDITOR, false ) : nullptr ) )
+            {
+                frame->GetCanvas()->Refresh();
+                KopenapiRefresh3D( frame );
+            }
+        }
+    }
+
+    nlohmann::json result = { { "deleted", dryRun ? 0 : int( fps.size() ) },
+                              { "dry_run", dryRun },
+                              { "footprints", fps.size() },
+                              { "pads", padCount },
+                              { "items", items },
+                              { "attached_copper", attachedIds },
+                              { "attached_removed", !dryRun && rip ? int( attached.size() ) : 0 },
+                              { "missing", missing } };
+
+    return KOPENAPI_RESULT::Ok( result );
+}
+
+
 static KOPENAPI_RESULT h_pcb_footprint_lib_diff( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -722,6 +902,20 @@ KOPENAPI_REGISTER( "pcb_footprint_update",
                         "exclude_from_pos":{"type":"boolean"},"dnp":{"type":"boolean"}}})json"_json,
                    false, h_pcb_footprint_update );
 
+KOPENAPI_REGISTER( "pcb_footprint_delete",
+                   "Delete placed footprints (ref or refs; every footprint with that reference) in one undo "
+                   "step, as Delete in the board editor; locked ones refuse (409) unless override_locks. Tracks "
+                   "and vias ending on their pads (same net) stay and are listed in attached_copper; "
+                   "rip_attached: true removes them in the same step. dry_run tells what would go. Answers per "
+                   "footprint ref, uuid, lib_id, pads and nets; missing refs. The schematic still has the "
+                   "symbols: design_update_board puts them back unless they are removed there too",
+                   R"json({"type":"object","properties":{
+                        "ref":{"type":"string"},"refs":{"type":"array","items":{"type":"string"}},
+                        "rip_attached":{"type":"boolean","default":false},
+                        "override_locks":{"type":"boolean","default":false},
+                        "dry_run":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_footprint_delete );
+
 KOPENAPI_REGISTER( "pcb_footprint_lib_diff",
                    "How placed footprints differ from their library copies (DRC's lib_footprint_mismatch / "
                    "lib_footprint_issues, explained): per footprint status (same, differs, not_in_library, "
@@ -764,4 +958,4 @@ KOPENAPI_REGISTER( "pcb_parts_check",
                         "problems_only":{"type":"boolean","default":true}})json"_json ),
                    false, h_pcb_parts_check, 300 );
 
-KOPENAPI_MARK_EDITING( "pcb_footprint_update", "pcb_footprint_lib_update" );
+KOPENAPI_MARK_EDITING( "pcb_footprint_update", "pcb_footprint_lib_update", "pcb_footprint_delete" );
