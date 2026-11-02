@@ -1048,9 +1048,9 @@ void PCB_CONTROL::pruneItemLayers( std::vector<BOARD_ITEM*>& aItems )
 
     if( returnItems.size() < aItems.size() )
     {
-        DisplayError( m_frame, _( "Warning: some pasted items were on layers which are not "
-                                  "present in the current board.\n"
-                                  "These items could not be pasted.\n" ) );
+        m_frame->ShowInfoBarWarning( _( "Some pasted items were on layers which are not present in the current "
+                                        "board. These items could not be pasted." ),
+                                     true );
     }
 
     aItems = returnItems;
@@ -1129,7 +1129,7 @@ int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
 
                     if( !tableEditTool->validatePasteIntoSelection( selection, errorMsg ) )
                     {
-                        DisplayError( m_frame, errorMsg );
+                        m_frame->ShowInfoBarError( errorMsg, true );
                         return 0;
                     }
 
@@ -1140,7 +1140,7 @@ int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
                     }
                     else
                     {
-                        DisplayError( m_frame, _( "Failed to paste cells" ) );
+                        m_frame->ShowInfoBarError( _( "Failed to paste cells" ), true );
                         return 0;
                     }
                 }
@@ -2187,7 +2187,7 @@ int PCB_CONTROL::AppendBoard( PCB_IO& pi, const wxString& fileName, DESIGN_BLOCK
     }
     catch( const IO_ERROR& ioe )
     {
-        DisplayErrorMessage( editFrame, _( "Error loading board." ), ioe.What() );
+        editFrame->ShowInfoBarError( _( "Error loading board." ) + wxS( " " ) + ioe.What(), true );
         clearSkipStructOnExistingItems();
 
         return 1;

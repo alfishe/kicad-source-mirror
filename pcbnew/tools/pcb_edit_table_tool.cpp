@@ -179,8 +179,7 @@ int PCB_EDIT_TABLE_TOOL::ExportTableToCSV( const TOOL_EVENT& aEvent )
 
     if( !outFile.is_open() )
     {
-        wxMessageBox( wxString::Format( _( "Failed to open file:\n%s" ), filePath ),
-                     _( "Export Error" ), wxOK | wxICON_ERROR, frame() );
+        frame()->ShowInfoBarError( wxString::Format( _( "Failed to open file: %s" ), filePath ), true );
 
         if( clearSelection )
             m_toolMgr->RunAction( ACTIONS::selectionClear );

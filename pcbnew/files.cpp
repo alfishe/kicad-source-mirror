@@ -318,10 +318,40 @@ int BOARD_EDITOR_CONTROL::Revert( const TOOL_EVENT& aEvent )
 {
     wxFileName fn = m_frame->Prj().AbsolutePath( m_frame->GetBoard()->GetFileName() );
 
-    if( !IsOK( m_frame, wxString::Format( _( "Revert '%s' to last version saved?" ), fn.GetFullPath() ) ) )
-        return false;
+    auto revert = [this, fn]()
+    {
+        if( !m_frame->ReloadCurrentDocument() )
+        {
+            m_frame->ShowInfoBarError( wxString::Format( _( "'%s' could not be reverted." ), fn.GetFullPath() ),
+                                       true );
+        }
+    };
 
-    return m_frame->ReloadCurrentDocument();
+    // nothing unsaved is lost
+    if( !m_frame->IsContentModified() )
+    {
+        revert();
+        return 0;
+    }
+
+    // the infobar asks, nothing waits for it
+    WX_INFOBAR* infobar = m_frame->GetInfoBar();
+    infobar->RemoveAllButtons();
+    infobar->AddLink( _( "Revert" ),
+                      [this, revert]( wxHyperlinkEvent& )
+                      {
+                          m_frame->CallAfter(
+                                  [this, revert]()
+                                  {
+                                      m_frame->GetInfoBar()->Dismiss();
+                                      revert();
+                                  } );
+                      } );
+    infobar->AddCloseButton();
+    infobar->ShowMessage( wxString::Format( _( "Revert '%s' to last version saved? The unsaved changes are lost." ),
+                                            fn.GetFullPath() ),
+                          wxICON_WARNING );
+    return 0;
 }
 
 

@@ -553,7 +553,7 @@ int FOOTPRINT_EDITOR_CONTROL::RenameFootprint( const TOOL_EVENT& aEvent )
             }
             catch( const IO_ERROR& ioe )
             {
-                DisplayErrorMessage( m_frame, _( "Error renaming footprint" ), ioe.What() );
+                m_frame->ShowInfoBarError( _( "Error renaming footprint:" ) + wxS( " " ) + ioe.What(), true );
             }
             catch( ... )
             {
@@ -637,7 +637,7 @@ int FOOTPRINT_EDITOR_CONTROL::ExportFootprintAsSVG( const TOOL_EVENT& aEvent )
 
     if( !fp )
     {
-        wxMessageBox( _( "No footprint to export" ) );
+        m_frame->ShowInfoBarError( _( "No footprint to export" ), true );
         return 0;
     }
 
@@ -814,7 +814,7 @@ int FOOTPRINT_EDITOR_CONTROL::OpenDirectory( const TOOL_EVENT& aEvent )
 
     if( !explorerCommand.EndsWith( "%F" ) )
     {
-        wxMessageBox( _( "Missing/malformed file explorer argument '%F' in common settings." ) );
+        m_frame->ShowInfoBarError( _( "Missing/malformed file explorer argument '%F' in common settings." ), true );
         return 0;
     }
 
@@ -839,7 +839,7 @@ int FOOTPRINT_EDITOR_CONTROL::OpenWithTextEditor( const TOOL_EVENT& aEvent )
 
     if( fullEditorName.IsEmpty() )
     {
-        wxMessageBox( _( "No text editor selected in KiCad. Please choose one." ) );
+        m_frame->ShowInfoBarError( _( "No text editor selected in KiCad. Please choose one." ), true );
         return 0;
     }
 
@@ -1015,7 +1015,7 @@ void FOOTPRINT_EDITOR_CONTROL::editFootprintPropertiesFromLibrary( const LIB_ID&
     catch( const IO_ERROR& ioe )
     {
         delete tempFootprint;
-        DisplayError( m_frame, ioe.What() );
+        m_frame->ShowInfoBarError( ioe.What(), true );
     }
 }
 
@@ -1133,11 +1133,13 @@ int FOOTPRINT_EDITOR_CONTROL::RepairFootprint( const TOOL_EVENT& aEvent )
         m_frame->OnModify();
 
         wxString msg = wxString::Format( _( "%d potential problems repaired." ), errors );
-        DisplayInfoMessage( m_frame, msg, details );
+        details.Trim();
+        details.Replace( wxS( "\n" ), wxS( " " ) );
+        m_frame->ShowInfoBarMsg( msg + wxS( " " ) + details, true );
     }
     else
     {
-        DisplayInfoMessage( m_frame, _( "No footprint problems found." ) );
+        m_frame->ShowInfoBarMsg( _( "No footprint problems found." ), true );
     }
 
     return 0;
@@ -1196,8 +1198,9 @@ int FOOTPRINT_EDITOR_CONTROL::ShowLibraryFieldsTable( const TOOL_EVENT& aEvent )
 
     if( m_frame->HasModifiedFootprintTabs() )
     {
-        DisplayInfoMessage( m_frame, _( "Save or discard the changes in all modified footprint tabs before opening "
-                                        "the Footprint Fields Table." ) );
+        m_frame->ShowInfoBarWarning( _( "Save or discard the changes in all modified footprint tabs before opening "
+                                        "the Footprint Fields Table." ),
+                                     true );
         return 0;
     }
 

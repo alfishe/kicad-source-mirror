@@ -1021,7 +1021,7 @@ int DRAWING_TOOL::PlaceReferenceImage( const TOOL_EVENT& aEvent )
 
                 if( !image || !image->GetReferenceImage().ReadImageFile( fullFilename ) )
                 {
-                    wxMessageBox( wxString::Format(_( "Could not load image from '%s'." ), fullFilename ) );
+                    m_frame->ShowInfoBarError( wxString::Format( _( "Could not load image from '%s'." ), fullFilename ), true );
                     delete image;
                     image = nullptr;
                     continue;
@@ -2283,7 +2283,7 @@ int DRAWING_TOOL::PlaceImportedGraphics( const TOOL_EVENT& aEvent )
     // Ensure the list is not empty:
     if( list.empty() )
     {
-        wxMessageBox( _( "No graphic items found in file.") );
+        m_frame->ShowInfoBarError( _( "No graphic items found in file." ), true );
         return 0;
     }
 

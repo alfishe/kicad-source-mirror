@@ -46,6 +46,7 @@
 #include <zone.h>
 #include <zone_merge.h>
 #include <board_recovery.h>
+#include <board_netlist_export.h>
 #include <widgets/wx_infobar.h>
 #include <pcb_marker.h>
 #include <confirm.h>
@@ -723,61 +724,12 @@ int BOARD_EDITOR_CONTROL::ExportNetlist( const TOOL_EVENT& aEvent )
     if( dlg.ShowModal() == wxID_CANCEL )
         return 0;
 
-    fn = dlg.GetPath();
-
-    if( !fn.IsDirWritable() )
-    {
-        DisplayErrorMessage( m_frame, wxString::Format( _( "Insufficient permissions to folder '%s'." ),
-                                                        fn.GetPath() ) );
-        return 0;
-    }
-
     const LEGACYFILEDLG_NETLIST_OPTIONS* noh =
             dynamic_cast<const LEGACYFILEDLG_NETLIST_OPTIONS*>( dlg.GetExtraControl() );
     wxCHECK( noh, 0 );
 
-    NETLIST netlist;
-
-    for( const FOOTPRINT* footprint : board()->Footprints() )
-    {
-        COMPONENT* component = new COMPONENT( footprint->GetFPID(), footprint->GetReference(),
-                                              footprint->GetValue(), footprint->GetPath(),
-                                              { footprint->m_Uuid } );
-
-        for( const PAD* pad : footprint->Pads() )
-        {
-            const wxString& netname = pad->GetShortNetname();
-
-            if( !netname.IsEmpty() )
-                component->AddNet( pad->GetNumber(), netname, pad->GetPinFunction(), pad->GetPinType() );
-        }
-
-        nlohmann::ordered_map<wxString, wxString> fields;
-
-        for( PCB_FIELD* field : footprint->GetFields() )
-        {
-            wxCHECK2( field, continue );
-
-            fields[field->GetUntranslatedName()] = field->GetText();
-        }
-
-        component->SetFields( fields );
-
-        netlist.AddComponent( component );
-    }
-
-    try
-    {
-        FILE_OUTPUTFORMATTER formatter( fn.GetFullPath() );
-
-        netlist.Format( "pcb_netlist", &formatter, 0, noh->GetNetlistOptions() );
-        formatter.Finish();
-    }
-    catch( const IO_ERROR& ioe )
-    {
-        DisplayErrorMessage( m_frame, wxString::Format( _( "Failed to export netlist to '%s': %s" ),
-                                                        fn.GetFullPath(), ioe.What() ) );
-    }
+    if( wxString error = ExportBoardNetlist( *board(), dlg.GetPath(), noh->GetNetlistOptions() ); !error.IsEmpty() )
+        m_frame->ShowInfoBarError( error, true );
 
     return 0;
 }
@@ -904,10 +856,11 @@ int BOARD_EDITOR_CONTROL::UpdateSchematicFromPCB( const TOOL_EVENT& aEvent )
 {
     if( Kiface().IsSingle() )
     {
-        DisplayErrorMessage( m_frame, _( "Cannot update schematic because Pcbnew is opened in "
-                                         "stand-alone mode. In order to create or update PCBs "
-                                         "from schematics, you must launch the KiCad project "
-                                         "manager and create a project." ) );
+        m_frame->ShowInfoBarError( _( "Cannot update schematic because Pcbnew is opened in "
+                                      "stand-alone mode. In order to create or update PCBs "
+                                      "from schematics, you must launch the KiCad project "
+                                      "manager and create a project." ),
+                                   true );
         return 0;
     }
 
@@ -949,7 +902,7 @@ int BOARD_EDITOR_CONTROL::ShowEeschema( const TOOL_EVENT& aEvent )
         else
         {
             msg.Printf( _( "Schematic file '%s' not found." ), schematic.GetFullPath() );
-            DisplayErrorMessage( m_frame, msg );
+            m_frame->ShowInfoBarError( msg, true );
             return 0;
         }
     }
@@ -981,8 +934,9 @@ int BOARD_EDITOR_CONTROL::ShowEeschema( const TOOL_EVENT& aEvent )
                         }
                         catch( const IO_ERROR& err )
                         {
-                            DisplayErrorMessage( boardFrame,
-                                                 _( "Eeschema failed to load." ) + wxS( "\n" ) + err.What() );
+                            boardFrame->ShowInfoBarError( _( "Eeschema failed to load." ) + wxS( " " )
+                                                                  + err.What(),
+                                                          true );
                             return;
                         }
                     }

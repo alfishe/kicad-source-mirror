@@ -406,7 +406,7 @@ int CONVERT_TOOL::CreatePolys( const TOOL_EVENT& aEvent )
             else
                 msg = _( "Objects must form a closed shape" );
 
-            DisplayErrorMessage( m_frame, _( "Could not convert selection" ), msg );
+            m_frame->ShowInfoBarError( _( "Could not convert selection:" ) + wxS( " " ) + msg, true );
 
             m_userSettings = previousSettings;
             return 0;
