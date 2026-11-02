@@ -49,6 +49,7 @@
 #include <router/router_tool.h>
 #include <dialogs/dialog_move_exact.h>
 #include <zone_filler.h>
+#include <net_swap.h>
 #include <drc/drc_engine.h>
 #include <drc/drc_interactive_courtyard_clearance.h>
 #include <tools/creepage_overlay.h>
@@ -104,50 +105,42 @@ static bool PromptConnectedPadDecision( PCB_BASE_EDIT_FRAME* aFrame, const std::
 }
 
 
-// Makes sure we don't try to assign two different new nets to an item. Assigning
-// the same net to the item multiples times is fine.
-static bool ScheduleNetSwap( BOARD_CONNECTED_ITEM* aItem, int aNewNet,
-                             std::unordered_map<BOARD_CONNECTED_ITEM*, int>& aItemNewNets,
-                             wxString& aError )
+// Make sure everything we're trying to swap is unlocked or we're overriding
+static bool ValidateNetSwapLocks( PCB_BASE_EDIT_FRAME* aFrame, const NET_SWAP_PLAN& aPlan,
+                                  bool aIncludeConnectedPads )
 {
-    auto [it, inserted] = aItemNewNets.emplace( aItem, aNewNet );
+    if( aFrame->GetOverrideLocks() || aPlan.LockedItems( aIncludeConnectedPads ).empty() )
+        return true;
 
-    if( !inserted && it->second != aNewNet )
-    {
-        aError = _( "Cannot swap nets: connected items would receive conflicting nets." );
-        return false;
-    }
-
-    return true;
+    aFrame->ShowInfoBarError( _( "Cannot swap nets of locked pads or connected copper unless "
+                                 "Override Locks is enabled." ) );
+    return false;
 }
 
 
-// Make sure everything we're trying to swap is unlocked or we're overriding
-static bool ValidateNetSwapLocks( PCB_BASE_EDIT_FRAME* aFrame,
-                                  const std::unordered_map<BOARD_CONNECTED_ITEM*, int>& aItemNewNets,
-                                  const std::unordered_set<PAD*>& aSwapPads, bool aIncludeConnectedPads )
+// Ask about the unselected pads the swapped nets reach, then apply the plan
+static void ApplyNetSwapPlan( EDIT_TOOL* aTool, PCB_BASE_EDIT_FRAME* aFrame, const TOOL_EVENT& aEvent,
+                              const NET_SWAP_PLAN& aPlan, const wxString& aTitle )
 {
-    if( aFrame->GetOverrideLocks() )
-        return true;
+    bool includeConnectedPads = true;
 
-    for( const auto& [item, newNet] : aItemNewNets )
-    {
-        if( item->GetNetCode() == newNet )
-            continue;
+    if( !PromptConnectedPadDecision( aFrame, aPlan.ConnectedPads, aTitle, includeConnectedPads ) )
+        return;
 
-        if( item->Type() == PCB_PAD_T && !aIncludeConnectedPads
-            && !aSwapPads.count( static_cast<PAD*>( item ) ) )
-            continue;
+    if( !ValidateNetSwapLocks( aFrame, aPlan, includeConnectedPads ) )
+        return;
 
-        if( item->IsLocked() )
-        {
-            aFrame->ShowInfoBarError( _( "Cannot swap nets of locked pads or connected copper unless "
-                                         "Override Locks is enabled." ) );
-            return false;
-        }
-    }
+    // Take an event commit since we will eventually support this while actively routing the board
+    BOARD_COMMIT  localCommit( aTool );
+    BOARD_COMMIT* commit = dynamic_cast<BOARD_COMMIT*>( aEvent.Commit() );
 
-    return true;
+    if( !commit )
+        commit = &localCommit;
+
+    aPlan.Apply( *commit, includeConnectedPads );
+
+    if( !localCommit.Empty() )
+        localCommit.Push( aTitle );
 }
 
 
@@ -285,148 +278,22 @@ int EDIT_TOOL::SwapPadNets( const TOOL_EVENT& aEvent )
 
     // Get selected pads in selection order, because swapping is cyclic and we let the user pick
     // the rotation order
-    std::vector<EDA_ITEM*> orderedPads = selection.GetItemsSortedBySelectionOrder();
-    std::vector<PAD*>      pads;
-    const size_t           padsCount = orderedPads.size();
+    std::vector<PAD*> pads;
 
-    for( EDA_ITEM* it : orderedPads )
+    for( EDA_ITEM* it : selection.GetItemsSortedBySelectionOrder() )
         pads.push_back( static_cast<PAD*>( static_cast<BOARD_ITEM*>( it ) ) );
 
-    // Record original nets and build selected set for quick membership tests
-    std::vector<int>         originalNets( padsCount );
-    std::unordered_set<PAD*> selectedPads;
+    NET_SWAP_PLAN plan;
 
-    for( size_t i = 0; i < padsCount; ++i )
+    if( !PlanPadNetSwap( board(), pads, plan ) )
     {
-        originalNets[i] = pads[i]->GetNetCode();
-        selectedPads.insert( pads[i] );
-    }
+        if( !plan.Error.IsEmpty() )
+            frame()->ShowInfoBarError( plan.Error );
 
-    if( std::ranges::all_of( originalNets,
-                             [&]( int net )
-                             {
-                                 return net == originalNets.front();
-                             } ) )
         return 0;
-
-    // Desired new nets are a cyclic rotation of original nets (like Swap positions)
-    auto newNetForIndex =
-            [&]( size_t i )
-            {
-                return originalNets[( i + 1 ) % padsCount];
-            };
-
-    // Take an event commit since we will eventually support this while actively routing the board
-    BOARD_COMMIT  localCommit( this );
-    BOARD_COMMIT* commit = dynamic_cast<BOARD_COMMIT*>( aEvent.Commit() );
-
-    if( !commit )
-        commit = &localCommit;
-
-    // Connectivity to find items connected to each pad
-    std::shared_ptr<CONNECTIVITY_DATA> connectivity = board()->GetConnectivity();
-
-    // Accumulate changes: for each item, assign the resulting new net
-    std::unordered_map<BOARD_CONNECTED_ITEM*, int> itemNewNets;
-    std::vector<PAD*>                              nonSelectedPadsToChange;
-    wxString                                       error;
-
-    // Include the direct pad changes so connectivity cannot assign them a conflicting net.
-    for( size_t i = 0; i < padsCount; ++i )
-    {
-        if( !ScheduleNetSwap( pads[i], newNetForIndex( i ), itemNewNets, error ) )
-        {
-            frame()->ShowInfoBarError( error );
-            return 0;
-        }
     }
 
-    for( size_t i = 0; i < padsCount; ++i )
-    {
-        PAD* pad = pads[i];
-        int  fromNet = originalNets[i];
-        int  toNet = newNetForIndex( i );
-
-        // For each connected item, if it matches fromNet, schedule it for toNet
-        // Exclude zones, user probably doesn't want to change zone nets
-        for( BOARD_CONNECTED_ITEM* ci : connectivity->GetConnectedItems( pad, EXCLUDE_ZONES ) )
-        {
-            switch( ci->Type() )
-            {
-            case PCB_TRACE_T:
-            case PCB_ARC_T:
-            case PCB_VIA_T:
-            case PCB_PAD_T:
-            case PCB_SHAPE_T:
-                break;
-            default:
-                continue;
-            }
-
-            if( ci->GetNetCode() != fromNet )
-                continue;
-
-            if( !ScheduleNetSwap( ci, toNet, itemNewNets, error ) )
-            {
-                frame()->ShowInfoBarError( error );
-                return 0;
-            }
-
-            if( ci->Type() == PCB_PAD_T )
-            {
-                PAD* otherPad = static_cast<PAD*>( ci );
-
-                if( !selectedPads.count( otherPad ) )
-                    nonSelectedPadsToChange.push_back( otherPad );
-            }
-        }
-    }
-
-    bool includeConnectedPads = true;
-
-    if( !PromptConnectedPadDecision( frame(), nonSelectedPadsToChange, _( "Swap Pad Nets" ), includeConnectedPads ) )
-        return 0;
-
-    if( !ValidateNetSwapLocks( frame(), itemNewNets, selectedPads, includeConnectedPads ) )
-        return 0;
-
-    // Apply changes
-    // 1) Selected pads get their new nets directly
-    for( size_t i = 0; i < padsCount; ++i )
-    {
-        if( pads[i]->GetNetCode() == newNetForIndex( i ) )
-            continue;
-
-        commit->Modify( pads[i] );
-        pads[i]->SetNetCode( newNetForIndex( i ) );
-    }
-
-    // 2) Connected items propagate, depending on user choice
-    for( const auto& itemNewNet : itemNewNets )
-    {
-        BOARD_CONNECTED_ITEM* item = itemNewNet.first;
-        int                   newNet = itemNewNet.second;
-
-        if( item->Type() == PCB_PAD_T )
-        {
-            PAD* p = static_cast<PAD*>( item );
-
-            if( selectedPads.count( p ) )
-                continue; // already changed above
-
-            if( !includeConnectedPads )
-                continue; // skip non-selected pads if requested
-        }
-
-        if( item->GetNetCode() == newNet )
-            continue;
-
-        commit->Modify( item );
-        item->SetNetCode( newNet );
-    }
-
-    if( !localCommit.Empty() )
-        localCommit.Push( _( "Swap Pad Nets" ) );
+    ApplyNetSwapPlan( this, frame(), aEvent, plan, _( "Swap Pad Nets" ) );
 
     // Ensure connectivity visuals update
     rebuildConnectivity();
@@ -444,316 +311,34 @@ int EDIT_TOOL::SwapGateNets( const TOOL_EVENT& aEvent )
         return 0;
     }
 
-    auto showError =
-            [this]()
-            {
-                frame()->ShowInfoBarError( _( "Gate swapping must be performed on pads within one multi-gate "
-                                              "footprint." ) );
-            };
+    PCB_SELECTION&    selection = m_selectionTool->RequestSelection( &EDIT_TOOL::PadFilter );
+    std::vector<PAD*> pads;
 
-    PCB_SELECTION& selection = m_selectionTool->RequestSelection( &EDIT_TOOL::PadFilter );
-
-    // Get our sanity checks out of the way to clean up later loops
-    FOOTPRINT* targetFp = nullptr;
-    bool       fail = false;
-
-    for( EDA_ITEM* it : selection )
+    for( EDA_ITEM* it : selection.GetItemsSortedBySelectionOrder() )
     {
         // This shouldn't happen due to the filter, but just in case
         if( it->Type() != PCB_PAD_T )
         {
-            fail = true;
-            break;
-        }
-
-        FOOTPRINT* fp = static_cast<PAD*>( static_cast<BOARD_ITEM*>( it ) )->GetParentFootprint();
-
-        if( !targetFp )
-        {
-            targetFp = fp;
-        }
-        else if( fp && targetFp != fp )
-        {
-            fail = true;
-            break;
-        }
-    }
-
-    if( fail || !targetFp || targetFp->GetUnitInfo().size() < 2 )
-    {
-        showError();
-        return 0;
-    }
-
-
-    const auto& units = targetFp->GetUnitInfo();
-
-    // Collect unit hits and ordered unit list based on selection order
-    std::vector<bool> unitHit( units.size(), false );
-    std::vector<int>  unitOrder;
-
-    std::vector<EDA_ITEM*> orderedPads = selection.GetItemsSortedBySelectionOrder();
-
-    for( EDA_ITEM* it : orderedPads )
-    {
-        PAD* pad = static_cast<PAD*>( static_cast<BOARD_ITEM*>( it ) );
-
-        const wxString& padNum = pad->GetNumber();
-        int             unitIdx = -1;
-
-        for( size_t i = 0; i < units.size(); ++i )
-        {
-            for( const auto& p : units[i].m_pins )
-            {
-                if( p == padNum )
-                {
-                    unitIdx = static_cast<int>( i );
-
-                    if( !unitHit[i] )
-                        unitOrder.push_back( unitIdx );
-
-                    unitHit[i] = true;
-                    break;
-                }
-            }
-
-            if( unitIdx >= 0 )
-                break;
-        }
-    }
-
-    // Determine active units from selection order: 0 -> bail, 1 -> single-unit flow, 2+ -> cycle
-    std::vector<int> activeUnitIdx;
-    int              sourceIdx = -1;
-
-    if( unitOrder.size() >= 2 )
-    {
-        activeUnitIdx = unitOrder;
-        sourceIdx = unitOrder.front();
-    }
-    // If we only have one gate selected, we must have a target unit name parameter to proceed
-    else if( unitOrder.size() == 1 && aEvent.HasParameter() )
-    {
-        sourceIdx = unitOrder.front();
-        wxString targetUnitByName = aEvent.Parameter<wxString>();
-
-        int targetIdx = -1;
-
-        for( size_t i = 0; i < units.size(); ++i )
-        {
-            if( static_cast<int>( i ) == sourceIdx )
-                continue;
-
-            if( units[i].m_pins.size() == units[sourceIdx].m_pins.size() && units[i].m_unitName == targetUnitByName )
-                targetIdx = static_cast<int>( i );
-        }
-
-        if( targetIdx < 0 )
-        {
-            showError();
+            frame()->ShowInfoBarError( _( "Gate swapping must be performed on pads within one multi-gate "
+                                          "footprint." ) );
             return 0;
         }
 
-        activeUnitIdx.push_back( sourceIdx );
-        activeUnitIdx.push_back( targetIdx );
+        pads.push_back( static_cast<PAD*>( static_cast<BOARD_ITEM*>( it ) ) );
     }
-    else
+
+    NET_SWAP_PLAN plan;
+
+    if( !PlanGateNetSwap( board(), pads, aEvent.HasParameter() ? aEvent.Parameter<wxString>() : wxString(),
+                          plan ) )
     {
-        showError();
+        if( !plan.Error.IsEmpty() )
+            frame()->ShowInfoBarError( plan.Error );
+
         return 0;
     }
 
-    // Verify equal pin counts across all active units
-    const size_t pinCount = units[activeUnitIdx.front()].m_pins.size();
-
-    for( int idx : activeUnitIdx )
-    {
-        if( units[idx].m_pins.size() != pinCount )
-        {
-            frame()->ShowInfoBarError( _( "Gate swapping must be performed on gates with equal pin counts." ) );
-            return 0;
-        }
-    }
-
-    // Build per-unit pad arrays and net vectors
-    const size_t                   unitCount = activeUnitIdx.size();
-    std::vector<std::vector<PAD*>> unitPads( unitCount );
-    std::vector<std::vector<int>>  unitNets( unitCount );
-
-    for( size_t ui = 0; ui < unitCount; ++ui )
-    {
-        int         uidx = activeUnitIdx[ui];
-        const auto& pins = units[uidx].m_pins;
-
-        for( size_t pi = 0; pi < pinCount; ++pi )
-        {
-            PAD* p = targetFp->FindPadByNumber( pins[pi] );
-
-            if( !p )
-            {
-                frame()->ShowInfoBarError( _( "Gate swapping failed: pad in unit missing from footprint." ) );
-                return 0;
-            }
-
-            unitPads[ui].push_back( p );
-            unitNets[ui].push_back( p->GetNetCode() );
-        }
-    }
-
-    if( std::ranges::all_of( unitNets,
-                             [&]( const auto& nets )
-                             {
-                                 return nets == unitNets.front();
-                             } ) )
-    {
-        frame()->ShowInfoBarError( _( "Gate swapping has no effect: all selected gates have identical nets." ) );
-        return 0;
-    }
-
-    // TODO: someday support swapping while routing and take that commit
-    BOARD_COMMIT  localCommit( this );
-    BOARD_COMMIT* commit = dynamic_cast<BOARD_COMMIT*>( aEvent.Commit() );
-
-    if( !commit )
-        commit = &localCommit;
-
-    std::shared_ptr<CONNECTIVITY_DATA> connectivity = board()->GetConnectivity();
-
-    // Accumulate changes: item -> new net
-    std::unordered_map<BOARD_CONNECTED_ITEM*, int> itemNewNets;
-    std::vector<PAD*>                              nonSelectedPadsToChange;
-    wxString                                       error;
-
-    // Selected pads in the swap (for suppressing re-adding in connected pad handling)
-    std::unordered_set<PAD*> swapPads;
-
-    for( const auto& v : unitPads )
-        swapPads.insert( v.begin(), v.end() );
-
-    for( size_t pi = 0; pi < pinCount; ++pi )
-    {
-        for( size_t ui = 0; ui < unitCount; ++ui )
-        {
-            size_t toIdx = ( ui + 1 ) % unitCount;
-
-            if( !ScheduleNetSwap( unitPads[ui][pi], unitNets[toIdx][pi], itemNewNets, error ) )
-            {
-                frame()->ShowInfoBarError( error );
-                return 0;
-            }
-        }
-    }
-
-    // Schedule net swaps for connectivity-attached items
-    auto scheduleForPad = [&]( PAD* pad, int fromNet, int toNet ) -> bool
-        {
-            for( BOARD_CONNECTED_ITEM* ci : connectivity->GetConnectedItems( pad, EXCLUDE_ZONES ) )
-            {
-                switch( ci->Type() )
-                {
-                case PCB_TRACE_T:
-                case PCB_ARC_T:
-                case PCB_VIA_T:
-                case PCB_PAD_T:
-                case PCB_SHAPE_T:
-                    break;
-
-                default:
-                    continue;
-                }
-
-                if( ci->GetNetCode() != fromNet )
-                    continue;
-
-                if( !ScheduleNetSwap( ci, toNet, itemNewNets, error ) )
-                    return false;
-
-                if( ci->Type() == PCB_PAD_T )
-                {
-                    PAD* other = static_cast<PAD*>( ci );
-
-                    if( !swapPads.count( other ) )
-                        nonSelectedPadsToChange.push_back( other );
-                }
-            }
-
-            return true;
-        };
-
-    // For each position, rotate nets among units forward
-    for( size_t pi = 0; pi < pinCount; ++pi )
-    {
-        for( size_t ui = 0; ui < unitCount; ++ui )
-        {
-            size_t fromIdx = ui;
-            size_t toIdx = ( ui + 1 ) % unitCount;
-
-            PAD* padFrom = unitPads[fromIdx][pi];
-            int  fromNet = unitNets[fromIdx][pi];
-            int  toNet = unitNets[toIdx][pi];
-
-            if( !scheduleForPad( padFrom, fromNet, toNet ) )
-            {
-                frame()->ShowInfoBarError( error );
-                return 0;
-            }
-        }
-    }
-
-    bool includeConnectedPads = true;
-
-    if( !PromptConnectedPadDecision( frame(), nonSelectedPadsToChange, _( "Swap Gate Nets" ), includeConnectedPads ) )
-    {
-        return 0;
-    }
-
-    if( !ValidateNetSwapLocks( frame(), itemNewNets, swapPads, includeConnectedPads ) )
-        return 0;
-
-    // Apply pad net swaps: rotate per position
-    for( size_t pi = 0; pi < pinCount; ++pi )
-    {
-        // First write back nets for each unit's pad at this position
-        for( size_t ui = 0; ui < unitCount; ++ui )
-        {
-            size_t toIdx = ( ui + 1 ) % unitCount;
-            PAD*   pad = unitPads[ui][pi];
-            int    newNet = unitNets[toIdx][pi];
-
-            if( pad->GetNetCode() == newNet )
-                continue;
-
-            commit->Modify( pad );
-            pad->SetNetCode( newNet );
-        }
-    }
-
-    // Apply connected items
-    for( const auto& kv : itemNewNets )
-    {
-        BOARD_CONNECTED_ITEM* item = kv.first;
-        int                   newNet = kv.second;
-
-        if( item->Type() == PCB_PAD_T )
-        {
-            PAD* p = static_cast<PAD*>( item );
-
-            if( swapPads.count( p ) )
-                continue;
-
-            if( !includeConnectedPads )
-                continue;
-        }
-
-        if( item->GetNetCode() == newNet )
-            continue;
-
-        commit->Modify( item );
-        item->SetNetCode( newNet );
-    }
-
-    if( !localCommit.Empty() )
-        localCommit.Push( _( "Swap Gate Nets" ) );
+    ApplyNetSwapPlan( this, frame(), aEvent, plan, _( "Swap Gate Nets" ) );
 
     rebuildConnectivity();
     m_toolMgr->ProcessEvent( EVENTS::SelectedItemsModified );

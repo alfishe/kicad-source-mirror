@@ -429,6 +429,7 @@ set( PCBNEW_CLASS_SRCS
     board_loader.cpp
     board_netlist_payload.cpp
     board_reannotate.cpp
+    net_swap.cpp
     constraints/board_constraint_adapter.cpp
     constraints/constraint_system_2d.cpp
     tools/constraint_edit_tool.cpp
