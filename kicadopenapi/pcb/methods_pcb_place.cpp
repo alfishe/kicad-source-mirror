@@ -2090,9 +2090,9 @@ std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOT
     {
         const size_t count = size_t( std::clamp( aOpen.get<int>(), 0, 4 ) );
 
-        for( const auto& [name, ports] : ranked )
+        for( const auto& [name, portCount] : ranked )
         {
-            if( ports > 0 && chosen.size() < count )
+            if( portCount > 0 && chosen.size() < count )
                 chosen.push_back( name );
         }
     }
@@ -2235,7 +2235,7 @@ struct NEAR_OPTIONS
     const std::map<int, int>* pairs = nullptr;   ///< a differential pair net's partner (the channel takes the pair)
     std::map<const FOOTPRINT*, int>* rooms = nullptr;   ///< parts placed: the half channel they leave their neighbours
     std::vector<VIA_SPOT>* ownVias = nullptr;   ///< the vias kept by the anchor and the parts placed (OWN_VIAS); the part's own added
-    double                escapeKeepMm = 2.0;   ///< the anchor's fine-pitch and pair pins' straight escapes kept free of the parts' vias
+    double                escapeKeepMm = -1;    ///< the anchor's fine-pitch and pair pins' straight escapes kept free of the parts' vias (-1: as pcb_stitch's default, past the courtyard by one via pitch)
     std::optional<double> partHeight;       ///< of the part (3D model): it may go under raised footprints with room
     const std::vector<CORRIDOR>* corridors = nullptr;   ///< kept free unless no other spot is found
     double                corridorYieldMm = -1;  ///< also enter one when only that brings the pad within this
@@ -2308,7 +2308,7 @@ public:
                 bare = area;
                 area.Inflate( room->second, CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, ARC_HIGH_DEF );
             }
-            else if( std::optional<double> room = roomUnder( fp ); room && aPartHeight && *aPartHeight <= *room )
+            else if( std::optional<double> headroom = roomUnder( fp ); headroom && aPartHeight && *aPartHeight <= *headroom )
             {
                 m_raised.emplace_back( fp, area );
                 area = raisedArea( fp );
@@ -2824,9 +2824,9 @@ public:
             if( !plane[net] )
                 continue;
 
-            const NETCLASS* nc = pad->GetEffectiveNetClass();
-            const int       via = std::max( nc && nc->HasViaDiameter() ? nc->GetViaDiameter() : 0, ds.m_ViasMinSize );
-            const int       clearance = std::max( nc && nc->HasClearance() ? nc->GetClearance() : 0, ds.m_MinClearance );
+            const KOPENAPI_RULE_VIA rule = KopenapiRuleVia( aBoard, net, pad->GetPosition(), pad->GetPrincipalLayer() );
+            const int               via = rule.dia;
+            const int               clearance = rule.clearance;
 
             m_pads.push_back( { pad, net, via / 2, clearance, stubWidth( aBoard, pad ) / 2 } );
             m_reach = std::max( m_reach, via + clearance );
@@ -2850,7 +2850,7 @@ public:
             }
         }
 
-        if( aEscapeKeep <= 0 || aHost->Pads().size() < 4 )
+        if( aEscapeKeep == 0 || aHost->Pads().size() < 4 )
             return;
 
         BOX2I centres( aHost->Pads().front()->GetPosition(), VECTOR2I( 0, 0 ) );
@@ -2858,12 +2858,13 @@ public:
         for( PAD* pad : aHost->Pads() )
             centres.Merge( pad->GetPosition() );
 
-        const bool fine = finePitch( aHost );
+        const SHAPE_POLY_SET& hostYard = aHost->GetCourtyard( aHost->IsFlipped() ? B_Cu : F_Cu );
+        const BOX2I           body = hostYard.OutlineCount() ? hostYard.BBox() : aHost->GetBoundingBox( false );
 
         for( PAD* pad : aHost->Pads() )
         {
             if( pad->GetNetCode() <= 0 || !( pad->GetLayerSet() & partLayers ).any()
-                || ( !fine && !( aPairs && aPairs->count( pad->GetNetCode() ) ) ) )
+                || ( !KopenapiPadFinePitch( aBoard, pad ) && !( aPairs && aPairs->count( pad->GetNetCode() ) ) ) )
             {
                 continue;
             }
@@ -2877,8 +2878,18 @@ public:
             const int      half = dir->x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
             const int      across = dir->x ? pb.GetHeight() : pb.GetWidth();
             const VECTOR2I tip = pad->GetPosition() + *dir * half;
+            int            keep = aEscapeKeep;
 
-            m_escapes.push_back( { pad->GetNetCode(), SHAPE_SEGMENT( tip, tip + *dir * aEscapeKeep, across + 2 * ds.m_MinClearance ) } );
+            if( keep < 0 )
+            {
+                const KOPENAPI_RULE_VIA rule = KopenapiRuleVia( aBoard, pad->GetNetCode(), VECTOR2I(), F_Cu );
+                const int toEdge = dir->x > 0 ? body.GetRight() - tip.x : dir->x < 0 ? tip.x - body.GetLeft()
+                                   : dir->y > 0 ? body.GetBottom() - tip.y : tip.y - body.GetTop();
+
+                keep = std::max( toEdge, 0 ) + rule.dia + rule.clearance;
+            }
+
+            m_escapes.push_back( { pad->GetNetCode(), SHAPE_SEGMENT( tip, tip + *dir * keep, across + 2 * ds.m_MinClearance ) } );
         }
     }
 
@@ -3089,7 +3100,7 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
     {
         BOX2I near( target, VECTOR2I( 0, 0 ) );
         near.Inflate( reach + aPart->GetBoundingBox().GetWidth() + aPart->GetBoundingBox().GetHeight() );
-        vias.emplace( aBoard, aPart, host, near, aOptions.ownVias, aOptions.pending, toIU( aOptions.escapeKeepMm ), aOptions.pairs );
+        vias.emplace( aBoard, aPart, host, near, aOptions.ownVias, aOptions.pending, aOptions.escapeKeepMm < 0 ? -1 : toIU( aOptions.escapeKeepMm ), aOptions.pairs );
 
         if( !vias->Needed() )
             vias.reset();
@@ -6072,7 +6083,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         options.pairs = &pairs;
         options.rooms = &rooms;
         options.ownVias = &ownVias;
-        options.escapeKeepMm = escapeKeep;
+        options.escapeKeepMm = group.contains( "escape_keep_mm" ) ? escapeKeep : -1;
 
         placeGroup( board, groupCommit, anchor, parts, options, group.value( "side", std::string( "same" ) ) == "opposite",
                     group.value( "decap_max_mm", 3.0 ), group.value( "bulk_max_mm", 10.0 ),
@@ -6316,7 +6327,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                 options.rooms = &rooms;
                 ownVias.clear();
                 options.ownVias = &ownVias;
-                options.escapeKeepMm = escapeKeep;
+                options.escapeKeepMm = spec.contains( "escape_keep_mm" ) ? escapeKeep : -1;
                 placeGroup( board, aCommit, anchor, parts, options, side == "opposite", decapMax, bulkMax,
                             spec.contains( "decap_bottom" ) ? std::optional<bool>( spec.value( "decap_bottom", false ) ) : std::nullopt,
                             aOut, aMoved, spec.value( "decap_vias", true ) );
@@ -6565,14 +6576,14 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "decoupling":{"type":"string","enum":["per_pin","schematic"],"description":"add the anchor's decoupling capacitors: per_pin - each supply pin group of the anchor (adjacent pins of a rail count once) one capacitor under 1 uF of its rail plus one bulk per rail, the rail's capacitors split among the parts on it by count, each to the part drawn nearest to it (schematic if open, else board); schematic - C parts across two of its rails drawn nearest to it on its sheet, one per supply pin group (a guess). The answer's decoupling.chosen lists them"},
     "decap_max_mm":{"type":"number","default":3,"description":"a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far"},
     "bulk_max_mm":{"type":"number","default":10,"description":"a bulk capacitor (10 uF or more, or electrolytic: a CP_ footprint; its row says bulk) serves the rail, not one pin: placed as near as the others, it is listed in decoupling_far only past this"},
-    "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off"},
+    "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off. Given, it is also the length of the anchor's fine-pitch and pair pins' escapes the parts' own vias keep clear of; by default those run as pcb_stitch's do, past the anchor's courtyard by one via pitch (the rules' via + clearance)"},
     "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach: each supply pin gets a via spot just beyond its inner end, under the body, clear of the other nets' copper and spots by the clearance (else beyond its outer end; a neighbour pin of the net within 1.2 mm shares it), and the cap's pad goes inward of the spot where there is room, else on any side of it, its other pads clear of every spot; the row gives via_spot_mm; default on for a fine-pitch anchor (0.65 mm or less), off otherwise; the row says side"},
     "ports_keep_mm":{"type":"number","minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter, and a series part - two pads, one signal net of the anchor's - the band of its pin's side). Default: each band as deep as its side's signal ports take fanning out side by side - each port's class track width + clearance summed, a differential pair once at 2 widths + its gap + a clearance; given: that many mm for every side; 0 off. No part yields to a band to come within reach (a decoupling capacitor goes to the other side or beside it); only a part with no spot at all outside the bands enters one (its row names it, in_corridor). Two alike series parts on neighbour pins the other way round than the pins trade places (swapped); corridors lists them as ports <side> (<far parts>), ports_bands gives their boxes"},
     "decap_vias":{"type":"boolean","default":true,"description":"decap_bottom: lay each bottom cap's via at its spot with a stub from the pin on the pin's layer (net class sizes, the stub no wider than the pin), in the same undo step, and the cap's pad joined to it on the cap's side where that track keeps clear; the rows say via_laid / via_joined, the answer vias_laid; the planes are refilled after"},
     "open_sides":{"description":"layout level 2 variants: which of the anchor's port sides ports_keep_mm keeps open (a named side without ports: as deep as the deepest): a count 0..4 - the sides with the most signal ports first; or a list of west / east / north / south - those, a side without ports along its whole courtyard edge; default every side with ports. corridors names the bands; block gives the outline each variant takes (bbox_mm, area_mm2)","oneOf":[{"type":"integer","minimum":0,"maximum":4},{"type":"array","items":{"type":"string","enum":["west","east","north","south"]}}]},
     "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
     "side":{"type":"string","enum":["same","opposite"],"default":"same"},
-    "gap_mm":{"type":"number","description":"between courtyards, fixed. Default: from the design rules, per spot: the courtyard clearance plus a channel for the anchor's signal pins the part stands in front of (each its class's track width + clearance; at least one default-class track). Each pad on a net with a plane also keeps a spot for its via beside it (its class's via, a clearance off the pad; clear of other nets' pads, of the anchor's planned rail vias and its fine-pitch pins' straight escapes, escape_keep_mm), where pcb_stitch lays it (row via_room_mm). A part with no room for that goes at the courtyard clearance (row channel_short)"},
+    "gap_mm":{"type":"number","description":"between courtyards, fixed. Default: from the design rules, per spot: the courtyard clearance plus a channel for the anchor's signal pins the part stands in front of (each its class's track width + clearance; at least one default-class track). Each pad on a net with a plane also keeps a spot for its via beside it (its class's via, a clearance off the pad; clear of other nets' pads, of the anchor's planned rail vias and its fine-pitch pins' straight escapes as pcb_stitch keeps them, see escape_keep_mm), where pcb_stitch lays it (row via_room_mm). A part with no room for that goes at the courtyard clearance (row channel_short)"},
     "fanout_ring_mm":{"type":"number","description":"keep this far from the anchor's courtyard (room for the tracks leaving its pins); default 1.0 for a fine-pitch anchor (pads 0.65 mm apart or closer), else 0; parts that find no place with it come as close as the courtyards allow"},
     "max_mm":{"type":"number","default":25,"description":"how far from the anchor's pad a part may end up"}})json";
 
