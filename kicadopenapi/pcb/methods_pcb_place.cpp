@@ -55,6 +55,9 @@
 #include <set>
 
 
+void refillPours( PCB_CONTEXT& aContext, BOARD* aBoard );   // methods_pcb_route.cpp
+
+
 namespace
 {
 
@@ -2059,6 +2062,42 @@ std::vector<CORRIDOR> portCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOT
 }
 
 
+/// A via to come with its stub from the pin: the part's pads keep off the via (its own net's may
+/// touch it), others by the clearance
+struct VIA_SPOT
+{
+    VECTOR2I at;
+    int      net = 0;
+    int      radius = 0;
+    int      clearance = 0;
+    VECTOR2I from;       // the pin the stub starts at
+    int      stub = 0;   // the stub's half width
+
+    bool Clear( const VECTOR2I& aAt, int aRadius, const SEG& aStub, int aStubHalf, int aClearance ) const
+    {
+        const double gap = std::max( clearance, aClearance );
+        const SEG    own( from, at );
+
+        return ( at - aAt ).EuclideanNorm() >= radius + aRadius + gap
+               && own.Distance( aAt ) >= stub + aRadius + gap
+               && aStub.Distance( at ) >= radius + aStubHalf + gap
+               && own.Distance( aStub ) >= stub + aStubHalf + gap;
+    }
+};
+
+
+/// The width of a stub from a pin: as wide as the net class allows, no wider than the pin
+int stubWidth( BOARD* aBoard, PAD* aPin )
+{
+    NETCLASS*      netclass = aPin->GetEffectiveNetClass();
+    const VECTOR2I size = aPin->GetSize( aPin->GetLayerSet().CuStack().front() );
+
+    return std::min( netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth()
+                                                           : aBoard->GetDesignSettings().GetCurrentTrackWidth(),
+                     std::min( size.x, size.y ) );
+}
+
+
 struct NEAR_OPTIONS
 {
     double                gapMm = 0.25;     ///< between courtyards
@@ -2071,6 +2110,8 @@ struct NEAR_OPTIONS
     std::optional<double> partHeight;       ///< of the part (3D model): it may go under raised footprints with room
     const std::vector<CORRIDOR>* corridors = nullptr;   ///< kept free unless no other spot is found
     double                corridorYieldMm = -1;  ///< also enter one when only that brings the pad within this
+    std::optional<VECTOR2I>      targetAt;           ///< the spot to bring the pad to, instead of the target pad's
+    const std::vector<VIA_SPOT>* viaSpots = nullptr;   ///< vias to come, the part's pads kept clear of them
 };
 
 struct NEAR_PLACEMENT
@@ -2094,9 +2135,11 @@ public:
     /// @param aHost a footprint kept aHostRing clear (fan-out room), or null
     /// @param aCorridors kept free (those of a net the part has a pad on aside), or null
     PLACE_SPACE( BOARD* aBoard, FOOTPRINT* aPart, const VECTOR2I& aAround, int aReach, FOOTPRINT* aHost, int aHostRing,
-                 std::optional<double> aPartHeight, const std::vector<CORRIDOR>* aCorridors = nullptr ) :
+                 std::optional<double> aPartHeight, const std::vector<CORRIDOR>* aCorridors = nullptr,
+                 const std::vector<VIA_SPOT>* aViaSpots = nullptr ) :
             m_outline( aBoard ),
-            m_part( aPart )
+            m_part( aPart ),
+            m_viaSpots( aViaSpots )
     {
         for( size_t i = 0; aCorridors && i < aCorridors->size(); ++i )
         {
@@ -2148,6 +2191,25 @@ public:
 
         if( m_edges.GetWidth() > 0 && m_edges.GetHeight() > 0 && !m_edges.Contains( box ) )
             return false;
+
+        for( size_t i = 0; m_viaSpots && i < m_viaSpots->size(); ++i )
+        {
+            const VIA_SPOT& spot = ( *m_viaSpots )[i];
+
+            BOX2I reach = box;
+            reach.Inflate( spot.radius + spot.clearance );
+
+            if( !reach.Contains( spot.at ) )
+                continue;
+
+            for( PAD* pad : m_part->Pads() )
+            {
+                const int need = spot.radius + ( pad->GetNetCode() == spot.net && spot.net > 0 ? 0 : spot.clearance );
+
+                if( pad->GetEffectiveShape( pad->GetLayerSet().CuStack().front() )->Collide( spot.at - aDelta, need ) )
+                    return false;
+            }
+        }
 
         for( const auto& [obstacle, obstacleBox] : m_obstacles )
         {
@@ -2218,6 +2280,7 @@ public:
 private:
     OUTLINE                                              m_outline;
     FOOTPRINT*                                           m_part;
+    const std::vector<VIA_SPOT>*                         m_viaSpots;
     std::vector<const CORRIDOR*>                         m_corridors;
     std::vector<std::pair<SHAPE_POLY_SET, BOX2I>>       m_obstacles;
     std::vector<std::pair<FOOTPRINT*, SHAPE_POLY_SET>>  m_raised;
@@ -2256,7 +2319,7 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
 {
     NEAR_PLACEMENT   result;
     FOOTPRINT*       host = aTarget->GetParentFootprint();
-    const VECTOR2I   target = aTarget->GetPosition();
+    const VECTOR2I   target = aOptions.targetAt.value_or( aTarget->GetPosition() );
     const EDA_ANGLE  originalAngle = aPart->GetOrientation();
     const VECTOR2I   originalPos = aPart->GetPosition();
 
@@ -2282,8 +2345,9 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
     const int         reach = toIU( aOptions.maxMm );
     const int         gap = toIU( aOptions.gapMm );
     const int         ring = toIU( std::max( 0.0, aOptions.hostRingMm ) );
-    const PLACE_SPACE space( aBoard, aPart, target, reach, host, ring, aOptions.partHeight );
-    const PLACE_SPACE kept( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, aOptions.corridors );
+    const PLACE_SPACE space( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, nullptr, aOptions.viaSpots );
+    const PLACE_SPACE kept( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, aOptions.corridors,
+                            aOptions.viaSpots );
 
     // directions: along the target footprint's axes, the side its pad is nearest to first
     const EDA_ANGLE base = host->GetOrientation();
@@ -2453,7 +2517,7 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
         }
     }
 
-    result.padDistanceMm = toMm( ( result.partPad->GetPosition() - target ).EuclideanNorm() );
+    result.padDistanceMm = toMm( ( result.partPad->GetPosition() - aTarget->GetPosition() ).EuclideanNorm() );
     result.under = space.Under();
 
     if( entered )
@@ -2561,6 +2625,157 @@ bool finePitch( FOOTPRINT* aFootprint )
 }
 
 
+/// @brief The spot for a via from aPin of a package to a part under it on the other side: on the line
+/// from the pin into the body (along the package axis, then straight to its middle), just past the
+/// pin's inner end, clear of other nets' copper (pads, tracks, vias, the spots in aTaken) by the
+/// clearance; else just past the pin's outer end.  A spot of the net within 1.2 mm of the pin is
+/// shared instead.  aDirection gets the board axis pointing into the body.
+std::optional<VECTOR2I> viaSpotUnder( BOARD* aBoard, PAD* aPin, int aViaDiameter, const std::vector<VIA_SPOT>& aTaken,
+                                      std::string& aDirection )
+{
+    FOOTPRINT*                   host = aPin->GetParentFootprint();
+    const BOARD_DESIGN_SETTINGS& ds = aBoard->GetDesignSettings();
+    const int                    radius = aViaDiameter / 2;
+    const int                    net = aPin->GetNetCode();
+    NETCLASS*                    netclass = aPin->GetEffectiveNetClass();
+    const int                    clearance = std::max( ds.m_MinClearance, netclass ? netclass->GetClearance() : 0 );
+    const VECTOR2I               pin = aPin->GetPosition();
+    const BOX2I                  body = courtyard( host ).BBox();
+    const VECTOR2I               middle = body.GetCenter();
+
+    BOX2I zone( pin, VECTOR2I( 0, 0 ) );
+    zone.Inflate( std::max( body.GetWidth(), body.GetHeight() ) + aViaDiameter );
+
+    std::vector<std::pair<std::shared_ptr<SHAPE>, int>> copper;   // other nets' shapes, their clearance
+
+    auto clearanceOf = [&]( BOARD_CONNECTED_ITEM* aItem )
+    {
+        NETCLASS* nc = aItem->GetEffectiveNetClass();
+        return std::max( clearance, nc ? nc->GetClearance() : 0 );
+    };
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        if( !fp->GetBoundingBox( false ).Intersects( zone ) )
+            continue;
+
+        for( PAD* pad : fp->Pads() )
+        {
+            if( pad == aPin || ( net > 0 && pad->GetNetCode() == net ) || !pad->GetBoundingBox().Intersects( zone ) )
+                continue;
+
+            for( PCB_LAYER_ID layer : pad->GetLayerSet().CuStack() )
+            {
+                copper.emplace_back( pad->GetEffectiveShape( layer ), clearanceOf( pad ) );
+                break;
+            }
+        }
+    }
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        if( track->GetNetCode() != net && track->GetBoundingBox().Intersects( zone ) )
+            copper.emplace_back( track->GetEffectiveShape( track->GetLayer() ), clearanceOf( track ) );
+    }
+
+    const std::shared_ptr<SHAPE> own = aPin->GetEffectiveShape( aPin->GetLayerSet().CuStack().front() );
+    const int                    stubHalf = stubWidth( aBoard, aPin ) / 2;
+
+    // the stub from the pin to a spot clear of other nets' spots, stubs and copper
+    auto stubClear = [&]( const VECTOR2I& aAt )
+    {
+        const SEG stub( pin, aAt );
+
+        for( const VIA_SPOT& taken : aTaken )
+        {
+            if( taken.net != net && !taken.Clear( aAt, radius, stub, stubHalf, clearance ) )
+                return false;
+        }
+
+        for( const auto& [shape, gap] : copper )
+        {
+            if( shape->Collide( stub, stubHalf + gap ) )
+                return false;
+        }
+
+        return true;
+    };
+
+    auto free = [&]( const VECTOR2I& aAt )
+    {
+        if( own->Collide( aAt, radius ) )
+            return false;
+
+        for( const VIA_SPOT& taken : aTaken )
+        {
+            if( taken.net == net && ( taken.at - aAt ).EuclideanNorm() < radius + taken.radius )
+                return false;
+        }
+
+        for( const auto& [shape, gap] : copper )
+        {
+            if( shape->Collide( aAt, radius + gap ) )
+                return false;
+        }
+
+        return stubClear( aAt );
+    };
+
+    // the package axis the pin points along, in the footprint's frame, then on the board
+    VECTOR2D local = VECTOR2D( pin - host->GetPosition() );
+    RotatePoint( local, -host->GetOrientation() );
+    VECTOR2D axis = std::abs( local.x ) >= std::abs( local.y ) ? VECTOR2D( local.x > 0 ? -1 : 1, 0 )
+                                                               : VECTOR2D( 0, local.y > 0 ? -1 : 1 );
+    RotatePoint( axis, host->GetOrientation() );
+
+    const VECTOR2D toMiddle = VECTOR2D( middle - pin );
+    const double   span = toMiddle.EuclideanNorm();
+
+    if( span < 1 )
+        return std::nullopt;
+
+    const int step = toIU( 0.05 );
+
+    aDirection = std::abs( axis.x ) >= std::abs( axis.y ) ? ( axis.x > 0 ? "right" : "left" ) : ( axis.y > 0 ? "down" : "up" );
+
+    // a neighbour pin of the net already has one close by: shared
+    const VIA_SPOT* shared = nullptr;
+
+    for( const VIA_SPOT& taken : aTaken )
+    {
+        if( net > 0 && taken.net == net && ( taken.at - pin ).EuclideanNorm() <= toIU( 1.2 ) && stubClear( taken.at )
+            && ( !shared || ( taken.at - pin ).EuclideanNorm() < ( shared->at - pin ).EuclideanNorm() ) )
+        {
+            shared = &taken;
+        }
+    }
+
+    if( shared )
+        return shared->at;
+
+    for( const VECTOR2D& ray : { axis, toMiddle / span } )
+    {
+        for( int along = step; along < span; along += step )
+        {
+            const VECTOR2I at = pin + VECTOR2I( KiROUND( ray.x * along ), KiROUND( ray.y * along ) );
+
+            if( free( at ) )
+                return at;
+        }
+    }
+
+    for( int along = step; along < toIU( 2.0 ); along += step )
+    {
+        const VECTOR2I at = pin - VECTOR2I( KiROUND( axis.x * along ), KiROUND( axis.y * along ) );
+
+        if( free( at ) )
+            return at;
+    }
+
+    return std::nullopt;
+}
+
+
 /// @brief Places the parts of a functional block around its main part: each next to the pad of the
 /// anchor it belongs to.  A part's pad goes to the anchor pad of its most specific shared net (the
 /// net with the fewest pads on the board); a part across two rails of the anchor (a decoupling
@@ -2570,7 +2785,7 @@ bool finePitch( FOOTPRINT* aFootprint )
 /// aOut gets placed / unplaced (and decoupling_far: capacitors over aDecapMaxMm from their pin).
 void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::vector<FOOTPRINT*> aParts,
                  const NEAR_OPTIONS& aOptions, bool aOpposite, double aDecapMaxMm, std::optional<bool> aDecapOtherSide,
-                 nlohmann::json& aOut, std::vector<KIID>& aMoved )
+                 nlohmann::json& aOut, std::vector<KIID>& aMoved, bool aDecapVias = true )
 {
     const bool decapOtherSide = aDecapOtherSide.value_or( finePitch( aAnchor ) )
                                 && aBoard->GetCopperLayerCount() >= 2;
@@ -2675,11 +2890,200 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
                           return a.area > b.area;
                       } );
 
-    std::set<PAD*>          taken;
+    std::map<PAD*, int>     taken;   // parts placed at the pad
     std::set<int>           takenGroups;
     nlohmann::json          placed = nlohmann::json::array();
     nlohmann::json          farAway = nlohmann::json::array();
     std::vector<FOOTPRINT*> done;
+    std::vector<VIA_SPOT>                 viaSpots;     // under the anchor, for the bottom caps
+    std::map<FOOTPRINT*, VECTOR2I>        viaSpotOf;
+
+    struct SPOT_AT
+    {
+        VIA_SPOT    spot;
+        std::string inward;
+    };
+
+    auto spotFor = [&]( PAD* aPin ) -> std::optional<SPOT_AT>
+    {
+        NETCLASS*   netclass = aPin->GetEffectiveNetClass();
+        const int   diameter = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter()
+                                                                      : aBoard->GetDesignSettings().GetCurrentViaSize();
+        std::string inward;
+
+        if( std::optional<VECTOR2I> at = viaSpotUnder( aBoard, aPin, diameter, viaSpots, inward ) )
+        {
+            return SPOT_AT{ { *at, aPin->GetNetCode(), diameter / 2,
+                              std::max( aBoard->GetDesignSettings().m_MinClearance, netclass ? netclass->GetClearance() : 0 ),
+                              aPin->GetPosition(), stubWidth( aBoard, aPin ) / 2 },
+                            inward };
+        }
+
+        return std::nullopt;
+    };
+
+    // a bottom cap's via at its spot, with a stub from the pin on the pin's layer; not laid when
+    // the via or the stub would come too close to another net's copper or spots
+    std::set<std::pair<int, int>> laid;
+    std::set<FOOTPRINT*>          joined;   // caps whose pad is joined to their via
+
+    auto layVia = [&]( PAD* aPin, const VIA_SPOT& aSpot )
+    {
+        NETCLASS*                    netclass = aPin->GetEffectiveNetClass();
+        const BOARD_DESIGN_SETTINGS& ds = aBoard->GetDesignSettings();
+        const PCB_LAYER_ID           layer = aPin->GetLayerSet().CuStack().front();
+        const int                    width = stubWidth( aBoard, aPin );
+        const SEG                    stub( aPin->GetPosition(), aSpot.at );
+
+        for( const VIA_SPOT& other : viaSpots )
+        {
+            if( other.net != aPin->GetNetCode() && !other.Clear( aSpot.at, aSpot.radius, stub, width / 2, aSpot.clearance ) )
+                return false;
+        }
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            for( PAD* pad : fp->Pads() )
+            {
+                if( pad->GetNetCode() == aPin->GetNetCode() || !pad->IsOnLayer( layer ) )
+                    continue;
+
+                if( pad->GetEffectiveShape( layer )->Collide( stub, aSpot.clearance + width / 2 ) )
+                    return false;
+            }
+        }
+
+        for( PCB_TRACK* track : aBoard->Tracks() )
+        {
+            if( track->GetNetCode() == aPin->GetNetCode() )
+                continue;
+
+            if( ( track->IsOnLayer( layer ) && track->GetEffectiveShape( layer )->Collide( stub, aSpot.clearance + width / 2 ) )
+                || track->GetEffectiveShape( track->GetLayer() )->Collide( aSpot.at, aSpot.clearance + aSpot.radius ) )
+            {
+                return false;
+            }
+        }
+
+        PCB_VIA* via = new PCB_VIA( aBoard );
+        via->SetPosition( aSpot.at );
+        via->SetLayerPair( F_Cu, B_Cu );
+        via->SetWidth( 2 * aSpot.radius );
+        via->SetDrill( netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : ds.GetCurrentViaDrill() );
+        via->SetNetCode( aPin->GetNetCode() );
+        aCommit.Add( via );
+
+        PCB_TRACK* track = new PCB_TRACK( aBoard );
+        track->SetStart( aPin->GetPosition() );
+        track->SetEnd( aSpot.at );
+        track->SetLayer( layer );
+        track->SetWidth( width );
+        track->SetNetCode( aPin->GetNetCode() );
+        aCommit.Add( track );
+        return true;
+    };
+
+    // the cap's pad joined to its via on the cap's side, when the via is not under the pad already
+    // and the track keeps clear of other nets' pads, tracks and vias to come
+    std::vector<std::tuple<SEG, int, int>> capStubs;   // segment, net, half width
+
+    auto joinCap = [&]( FOOTPRINT* aCap, const VIA_SPOT& aSpot )
+    {
+        PAD* pad = nullptr;
+
+        for( PAD* candidate : aCap->Pads() )
+        {
+            if( candidate->GetNetCode() == aSpot.net )
+                pad = candidate;
+        }
+
+        if( !pad )
+            return false;
+
+        const PCB_LAYER_ID layer = pad->GetLayerSet().CuStack().front();
+
+        if( pad->GetEffectiveShape( layer )->Collide( aSpot.at, 0 ) )
+            return true;
+
+        const int half = stubWidth( aBoard, pad ) / 2;
+        const int gap = aSpot.clearance + half;
+        const SEG stub( aSpot.at, pad->GetPosition() );
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            for( PAD* other : fp->Pads() )
+            {
+                if( other->GetNetCode() != aSpot.net && other->IsOnLayer( layer )
+                    && other->GetEffectiveShape( layer )->Collide( stub, gap ) )
+                {
+                    return false;
+                }
+            }
+        }
+
+        for( PCB_TRACK* track : aBoard->Tracks() )
+        {
+            if( track->GetNetCode() != aSpot.net && track->IsOnLayer( layer )
+                && track->GetEffectiveShape( layer )->Collide( stub, gap ) )
+            {
+                return false;
+            }
+        }
+
+        for( const VIA_SPOT& other : viaSpots )
+        {
+            if( other.net != aSpot.net && stub.Distance( other.at ) < other.radius + std::max( gap, other.clearance + half ) )
+                return false;
+        }
+
+        for( const auto& [seg, net, width] : capStubs )
+        {
+            if( net != aSpot.net && stub.Distance( seg ) < half + width + aSpot.clearance )
+                return false;
+        }
+
+        PCB_TRACK* track = new PCB_TRACK( aBoard );
+        track->SetStart( aSpot.at );
+        track->SetEnd( pad->GetPosition() );
+        track->SetLayer( layer );
+        track->SetWidth( 2 * half );
+        track->SetNetCode( aSpot.net );
+        aCommit.Add( track );
+        capStubs.emplace_back( stub, aSpot.net, half );
+        return true;
+    };
+
+    // every supply pin a bottom cap may take gets its spot first, so the caps keep off the spots of
+    // the pins after them
+    std::map<PAD*, SPOT_AT> spotOfPin;
+
+    if( decapOtherSide )
+    {
+        std::set<int> supplies;
+
+        for( const MEMBER& member : members )
+        {
+            if( member.decoupling && member.capacitor )
+                supplies.insert( member.nets.front() );
+        }
+
+        for( PAD* pad : aAnchor->Pads() )
+        {
+            if( !supplies.count( pad->GetNetCode() ) )
+                continue;
+
+            if( std::optional<SPOT_AT> spot = spotFor( pad ) )
+            {
+                spotOfPin.emplace( pad, *spot );
+
+                if( std::none_of( viaSpots.begin(), viaSpots.end(),
+                                  [&]( const VIA_SPOT& v ) { return v.at == spot->spot.at && v.from == spot->spot.from; } ) )
+                {
+                    viaSpots.push_back( spot->spot );
+                }
+            }
+        }
+    }
 
     auto heightOf = [&]( FOOTPRINT* aPart ) -> std::optional<double>
     {
@@ -2696,7 +3100,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         for( PAD* candidate : anchorPads[net] )
         {
             auto   group = groupOf.find( candidate );
-            double score = taken.count( candidate ) ? 1e6 : group != groupOf.end() && takenGroups.count( group->second ) ? 1e5 : 0;
+            double score = taken.count( candidate ) ? 1e6 * taken[candidate] : group != groupOf.end() && takenGroups.count( group->second ) ? 1e5 : 0;
 
             if( member.nets.size() > 1 )
             {
@@ -2740,7 +3144,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         if( viaPad )
             target = viaPad;
 
-        taken.insert( target );
+        taken[target]++;
 
         if( auto group = groupOf.find( target ); group != groupOf.end() )
             takenGroups.insert( group->second );
@@ -2803,15 +3207,54 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             NEAR_OPTIONS    under = options;
 
             under.hostRingMm = 0;
+
+            if( !under.gapGiven )
+                under.gapMm = std::min( under.gapMm, 0.25 );   // no tracks run between the caps under a package
+
             member.part->Flip( member.part->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );
 
-            if( NEAR_PLACEMENT flipped = placeNear( aBoard, member.part, target, under );
-                flipped.ok && flipped.padDistanceMm <= aDecapMaxMm )
+            auto                  reserved = spotOfPin.find( target );
+            std::optional<SPOT_AT> spot = reserved != spotOfPin.end() ? std::optional<SPOT_AT>( reserved->second )
+                                                                       : spotFor( target );
+            const size_t          count = viaSpots.size();
+
+            if( spot )
+            {
+                under.targetAt = spot->spot.at;
+                under.direction = spot->inward;
+
+                if( reserved == spotOfPin.end() )
+                    viaSpots.push_back( spot->spot );
+            }
+
+            under.viaSpots = &viaSpots;
+
+            NEAR_PLACEMENT flipped = placeNear( aBoard, member.part, target, under );
+
+            if( spot && ( !flipped.ok || flipped.padDistanceMm > aDecapMaxMm ) )
+            {
+                under.direction = "auto";   // no room inward of the spot: on any side of it
+                flipped = placeNear( aBoard, member.part, target, under );
+            }
+
+            if( flipped.ok && flipped.padDistanceMm <= aDecapMaxMm )
             {
                 placement = flipped;
+
+                if( spot )
+                {
+                    viaSpotOf[member.part] = spot->spot.at;
+
+                    if( aDecapVias && !laid.count( { spot->spot.at.x, spot->spot.at.y } ) && layVia( target, spot->spot ) )
+                        laid.insert( { spot->spot.at.x, spot->spot.at.y } );
+
+                    if( laid.count( { spot->spot.at.x, spot->spot.at.y } ) && joinCap( member.part, spot->spot ) )
+                        joined.insert( member.part );
+                }
             }
             else
             {
+                viaSpots.resize( count );
                 member.part->Flip( member.part->GetPosition(), FLIP_DIRECTION::LEFT_RIGHT );
                 member.part->SetOrientation( angle );
                 member.part->SetPosition( pos );
@@ -2837,6 +3280,13 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         row["y_mm"] = toMm( member.part->GetPosition().y );
         row["rotation_deg"] = member.part->GetOrientation().AsDegrees();
         row["side"] = member.part->IsFlipped() ? "bottom" : "top";
+
+        if( auto spot = viaSpotOf.find( member.part ); spot != viaSpotOf.end() )
+        {
+            row["via_spot_mm"] = { toMm( spot->second.x ), toMm( spot->second.y ) };
+            row["via_laid"] = laid.count( { spot->second.x, spot->second.y } ) > 0;
+            row["via_joined"] = joined.count( member.part ) > 0;
+        }
 
         if( member.decoupling )
         {
@@ -2987,6 +3437,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
                       { "area_mm2", round2( areaMm2( double( outline.GetWidth() ) * outline.GetHeight() ) ) },
                       { "courtyards_top_mm2", round2( areaMm2( front.Area() ) ) },
                       { "courtyards_bottom_mm2", round2( areaMm2( back.Area() ) ) } };
+
+    if( !laid.empty() )
+        aOut["vias_laid"] = laid.size();
 
     if( !farAway.empty() )
         aOut["decoupling_far"] = farAway;
@@ -4297,6 +4750,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
     // 4. Functional blocks: their parts go next to the pads of their main part
     nlohmann::json groups = nlohmann::json::array();
+    bool           viasLaid = false;
 
     for( const nlohmann::json& group : aArgs.value( "groups", nlohmann::json::array() ) )
     {
@@ -4323,14 +4777,19 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         placeGroup( board, groupCommit, anchor, parts, options, group.value( "side", std::string( "same" ) ) == "opposite",
                     group.value( "decap_max_mm", 3.0 ),
                     group.contains( "decap_bottom" ) ? std::optional<bool>( group.value( "decap_bottom", false ) ) : std::nullopt,
-                    row, placed );
+                    row, placed, group.value( "decap_vias", true ) );
 
         for( const CORRIDOR& corridor : corridors )
             row["corridors"].push_back( corridor.name );
 
         groupCommit.Push( _( "Place group (API)" ) );
+        viasLaid = viasLaid || row.contains( "vias_laid" );
         groups.push_back( row );
     }
+
+    // the planes give way to the bottom caps' vias
+    if( viasLaid )
+        refillPours( *context, board );
 
     // the placed parts' pads against other nets' copper
     std::set<const FOOTPRINT*> placedFps;
@@ -4545,7 +5004,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                 options.corridors = &corridors;
                 placeGroup( board, aCommit, anchor, parts, options, side == "opposite", decapMax,
                             spec.contains( "decap_bottom" ) ? std::optional<bool>( spec.value( "decap_bottom", false ) ) : std::nullopt,
-                            aOut, aMoved );
+                            aOut, aMoved, spec.value( "decap_vias", true ) );
             };
 
             std::optional<int>   turns;
@@ -4679,6 +5138,10 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
     const nlohmann::json conflictsBefore = copperConflicts( board, movedFps );
 
     commit.Push( batch ? _( "Place groups (API)" ) : _( "Place group (API)" ) );
+
+    if( std::any_of( rows.begin(), rows.end(), []( const nlohmann::json& aRow ) { return aRow.contains( "vias_laid" ); } ) )
+        refillPours( *context, board );   // the planes give way to the bottom caps' vias
+
     refreshGui( aCtx, board );
     glow( aCtx, moved );
 
@@ -4706,8 +5169,9 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "decoupling":{"type":"string","enum":["per_pin","schematic"],"description":"add the anchor's decoupling capacitors: per_pin - each supply pin group of the anchor (adjacent pins of a rail count once) one capacitor under 1 uF of its rail plus one bulk per rail, the rail's capacitors split among the parts on it by count, each to the part drawn nearest to it (schematic if open, else board); schematic - C parts across two of its rails drawn nearest to it on its sheet, one per supply pin group (a guess). The answer's decoupling.chosen lists them"},
     "decap_max_mm":{"type":"number","default":3,"description":"a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far"},
     "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off"},
-    "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach (its pin then takes a via); default on for a fine-pitch anchor (0.65 mm or less), off otherwise; the row says side"},
+    "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach: each supply pin gets a via spot just beyond its inner end, under the body, clear of the other nets' copper and spots by the clearance (else beyond its outer end; a neighbour pin of the net within 1.2 mm shares it), and the cap's pad goes inward of the spot where there is room, else on any side of it, its other pads clear of every spot; the row gives via_spot_mm; default on for a fine-pitch anchor (0.65 mm or less), off otherwise; the row says side"},
     "ports_keep_mm":{"type":"number","default":0,"minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard this far, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter; a decoupling capacitor only when that alone brings it within decap_max_mm); corridors lists them as ports <side> (<far parts>); 0 off"},
+    "decap_vias":{"type":"boolean","default":true,"description":"decap_bottom: lay each bottom cap's via at its spot with a stub from the pin on the pin's layer (net class sizes, the stub no wider than the pin), in the same undo step, and the cap's pad joined to it on the cap's side where that track keeps clear; the rows say via_laid / via_joined, the answer vias_laid; the planes are refilled after"},
     "open_sides":{"description":"layout level 2 variants: which of the anchor's port sides ports_keep_mm keeps open (default 3 mm when only this is given): a count 0..4 - the sides with the most signal ports first; or a list of west / east / north / south - those, a side without ports along its whole courtyard edge; default every side with ports. corridors names the bands; block gives the outline each variant takes (bbox_mm, area_mm2)","oneOf":[{"type":"integer","minimum":0,"maximum":4},{"type":"array","items":{"type":"string","enum":["west","east","north","south"]}}]},
     "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
     "side":{"type":"string","enum":["same","opposite"],"default":"same"},
