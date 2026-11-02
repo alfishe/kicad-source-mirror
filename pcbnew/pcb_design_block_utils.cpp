@@ -28,6 +28,7 @@
 #include <pcb_group.h>
 #include <widgets/pcb_design_block_pane.h>
 #include <pcb_edit_frame.h>
+#include <pcb_design_block_utils.h>
 #include <pcb_io/pcb_io.h>
 #include <pcb_io/pcb_io_mgr.h>
 #include <wx/choicdlg.h>
@@ -236,18 +237,17 @@ bool PCB_EDIT_FRAME::UpdateDesignBlockFromBoard( const LIB_ID& aLibId )
 }
 
 
-bool PCB_EDIT_FRAME::saveSelectionToDesignBlock( const wxString& aNickname, PCB_SELECTION& aSelection,
-                                                 DESIGN_BLOCK& aBlock )
+std::unique_ptr<BOARD> MakeDesignBlockBoard( BOARD& aSource, PROJECT* aProject, const std::vector<EDA_ITEM*>& aItems )
 {
     // Create a temporary board
-    BOARD* tempBoard = new BOARD();
-    tempBoard->SetDesignSettings( GetBoard()->GetDesignSettings() );
-    tempBoard->SetProject( &Prj(), true );
+    auto tempBoard = std::make_unique<BOARD>();
+    tempBoard->SetDesignSettings( aSource.GetDesignSettings() );
+    tempBoard->SetProject( aProject, true );
     tempBoard->SynchronizeProperties();
 
     // Layer names live on the BOARD, not in the design settings, so copy them over
-    for( PCB_LAYER_ID layer : GetBoard()->GetEnabledLayers().Seq() )
-        tempBoard->SetLayerName( layer, GetBoard()->GetLayerName( layer ) );
+    for( PCB_LAYER_ID layer : aSource.GetEnabledLayers().Seq() )
+        tempBoard->SetLayerName( layer, aSource.GetLayerName( layer ) );
 
     // For copying net info of selected items into the new board
     auto addNetIfNeeded =
@@ -268,7 +268,7 @@ bool PCB_EDIT_FRAME::saveSelectionToDesignBlock( const wxString& aNickname, PCB_
                             cItem->SetNet( existingInfo );
                         else
                         {
-                            NETINFO_ITEM* newNet = new NETINFO_ITEM( tempBoard, netinfo->GetNetname() );
+                            NETINFO_ITEM* newNet = new NETINFO_ITEM( tempBoard.get(), netinfo->GetNetname() );
                             tempBoard->Add( newNet );
                             cItem->SetNet( newNet );
                         }
@@ -288,7 +288,7 @@ bool PCB_EDIT_FRAME::saveSelectionToDesignBlock( const wxString& aNickname, PCB_
             };
 
     // Copy the selected items to the temporary board
-    for( EDA_ITEM* item : aSelection )
+    for( EDA_ITEM* item : aItems )
     {
         BOARD_ITEM* copy = cloneAndAdd( item );
 
@@ -332,6 +332,16 @@ bool PCB_EDIT_FRAME::saveSelectionToDesignBlock( const wxString& aNickname, PCB_
             addNetIfNeeded( copy );
     }
 
+    return tempBoard;
+}
+
+
+bool PCB_EDIT_FRAME::saveSelectionToDesignBlock( const wxString& aNickname, PCB_SELECTION& aSelection,
+                                                 DESIGN_BLOCK& aBlock )
+{
+    std::vector<EDA_ITEM*> items( aSelection.begin(), aSelection.end() );
+    std::unique_ptr<BOARD> tempBoard = MakeDesignBlockBoard( *GetBoard(), &Prj(), items );
+
     wxString tempFile = wxFileName::CreateTempFileName( "design_block" );
 
     if( !saveBoardAsFile( *tempBoard, tempFile, false ) )
@@ -357,7 +367,6 @@ bool PCB_EDIT_FRAME::saveSelectionToDesignBlock( const wxString& aNickname, PCB_
 
     // Clean up the temporary file
     wxRemoveFile( tempFile );
-    delete tempBoard;
 
     m_designBlocksPane->RefreshLibs();
     m_designBlocksPane->SelectLibId( aBlock.GetLibId() );
