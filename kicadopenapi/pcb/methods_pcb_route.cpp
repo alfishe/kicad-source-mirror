@@ -6296,7 +6296,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     }
 
     // a package's signal pins' ports from its plan (pcb_fanout_ports' ports): the way out on the pin's
-    // side to past the courtyard on the pad's layer, or to the other layer (its nets in aViaNets)
+    // side to past the courtyard on the pad's layer, or to the other layer (its nets in aViaNets); an
+    // edge connector's fingers (CONN pads) as its SMD pads, on the side away from the board edge
     auto goalsFrom = [&]( FOOTPRINT* fp, const nlohmann::json& aPorts, std::map<const PAD*, PORT_GOAL>& aGoals,
                           std::vector<std::string>& aViaNets )
     {
@@ -6322,7 +6323,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 for( PAD* pad : fp->Pads() )
                 {
-                    if( pad->GetNumber() != number || pad->GetNetCode() <= 0 || pad->GetAttribute() != PAD_ATTRIB::SMD )
+                    if( pad->GetNumber() != number || pad->GetNetCode() <= 0
+                        || ( pad->GetAttribute() != PAD_ATTRIB::SMD && pad->GetAttribute() != PAD_ATTRIB::CONN ) )
                         continue;
 
                     PORT_GOAL goal;
@@ -6829,6 +6831,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         VECTOR2I              start, end;
         double                lateral = 0;
         BOARD_CONNECTED_ITEM* item = nullptr;   ///< its first end (the class's pitch, the layer it starts on)
+        VECTOR2I              padStart, padEnd;   ///< its pads, when fanned out from them
+        bool                  fanStart = false, fanEnd = false;
     };
 
     const int bigIU = 1 << 30;
@@ -6983,6 +6987,55 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         const int margin = pitch;
         int       squeezed = 0, copperNarrowed = 0;
         std::vector<CROSSING> pts = c.points;
+
+        // an end's own boundary at or behind its members' fan-out tips: those crossings stay where the
+        // floorplan put them (the tips pass them; the copper there is the end's own pads)
+        std::vector<char> behindTips( pts.size(), 0 );
+
+        for( bool atStart : { true, false } )
+        {
+            VECTOR2D padMid( 0, 0 ), tipMid( 0, 0 );
+            int      fanned = 0;
+
+            for( const MEMBER& m : members )
+            {
+                if( !( atStart ? m.fanStart : m.fanEnd ) )
+                    continue;
+
+                padMid += VECTOR2D( atStart ? m.padStart : m.padEnd );
+                tipMid += VECTOR2D( atStart ? m.start : m.end );
+                fanned++;
+            }
+
+            if( !fanned )
+                continue;
+
+            padMid = padMid / fanned;
+            tipMid = tipMid / fanned;
+            const VECTOR2D way = tipMid - padMid;
+
+            if( way.EuclideanNorm() <= 0 )
+                continue;
+
+            // a portal across the way out (the end's side its tips leave by), not one along it
+            auto behind = [&]( const CROSSING& aX )
+            {
+                const bool across = aX.axis == 0 ? std::abs( way.y ) > std::abs( way.x )
+                                    : aX.axis == 1 && std::abs( way.x ) > std::abs( way.y );
+                return across && ( VECTOR2D( aX.at ) - tipMid ).Dot( way ) <= 0;
+            };
+
+            for( size_t k = 0; k < pts.size(); ++k )
+            {
+                const size_t at = atStart ? k : pts.size() - 1 - k;
+
+                if( !behind( pts[at] ) )
+                    break;
+
+                behindTips[at] = 1;
+            }
+        }
+
         BOARD_CONNECTED_ITEM* first = members.front().item;
         const PCB_LAYER_ID    startLayer = first->IsOnLayer( F_Cu ) ? F_Cu : first->IsOnLayer( B_Cu ) ? B_Cu
                                                                                                : first->GetLayerSet().CuStack().front();
@@ -6990,11 +7043,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         // copper on the members' layer: each crossing in the run of its stretch no copper is in that
         // is wide enough and nearest to where it was (the widest when none is)
-        for( CROSSING& x : pts )
+        for( size_t k = 0; k < pts.size(); ++k )
         {
-            auto runs = x.free.find( x.layer ? str( board->GetLayerName( *x.layer ) ) : startLayerName );
+            CROSSING& x = pts[k];
+            auto      runs = x.free.find( x.layer ? str( board->GetLayerName( *x.layer ) ) : startLayerName );
 
-            if( x.axis < 0 || runs == x.free.end() )
+            if( x.axis < 0 || runs == x.free.end() || behindTips[k] )
                 continue;
 
             const int u = x.axis == 0 ? x.at.x : x.at.y;
@@ -7628,6 +7682,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         if( copperNarrowed )
             out["copper_narrowed"] = copperNarrowed;
 
+        if( const int kept = (int) std::count( behindTips.begin(), behindTips.end(), 1 ) )
+            out["behind_tips"] = kept;
+
         if( runsMoved )
             out["runs_moved"] = runsMoved;
 
@@ -7792,7 +7849,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             return fp ? str( fp->GetReference() ) : std::string();
         };
 
-        // per package of 8 SMD pads or more its plan's ports, asked once; a pin's tip on its pad's layer
+        // per package of 8 SMD pads (or edge fingers) or more its plan's ports, asked once; a pin's tip on
+        // its pad's layer
         std::map<const FOOTPRINT*, std::map<const PAD*, PORT_GOAL>> fanPlans;
         std::optional<KOPENAPI_METHOD>                               fanPlanner = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" );
         int                                                          fannedOut = 0;
@@ -7813,7 +7871,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 plan = fanPlans.emplace( fp, std::map<const PAD*, PORT_GOAL>() ).first;
                 const size_t smd = std::count_if( fp->Pads().begin(), fp->Pads().end(),
-                                                  []( PAD* p ) { return p->GetAttribute() == PAD_ATTRIB::SMD; } );
+                                                  []( PAD* p ) { return p->GetAttribute() == PAD_ATTRIB::SMD
+                                                                        || p->GetAttribute() == PAD_ATTRIB::CONN; } );
 
                 if( smd >= 8 )
                 {
@@ -7948,6 +8007,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         continue;
 
                     const bool atStart = ( end == j.from ) == m.forward;
+                    ( atStart ? m.padStart : m.padEnd ) = atStart ? m.start : m.end;
+                    ( atStart ? m.fanStart : m.fanEnd ) = true;
                     ( atStart ? m.start : m.end ) = *tip;
                     ( atStart ? j.fanStart : j.fanEnd ) = *tip;
                     fannedOut++;
@@ -17085,7 +17146,8 @@ KOPENAPI_REGISTER( "pcb_route",
                    "after another; its line pulled tight inside the regions crossed, clear of copper and track keep-outs (a corner per "
                    "turn, corridor pulled_from; a turn or run and its legs blocked: the crossings moved along their stretches, "
                    "corridor crossings_moved), each member first out through its pin's port tip (pcb_fanout_ports, packages of 8 SMD "
-                   "pads or more: corridor fanned_out) (answer bus_paths: corridors, members, routed_along; row corridor: name, index, order (its place in the corridor's tries), corners, routed, failed; "
+                   "pads or more, edge fingers too, away from the board edge: corridor fanned_out; an end's own crossings at or "
+                   "behind its tips kept where they are, not moved off its pads' copper: behind_tips) (answer bus_paths: corridors, members, routed_along; row corridor: name, index, order (its place in the corridor's tries), corners, routed, failed; "
                    "a member the corridor does not route is routed as any other, one routed along it is left out of clean_up); "
                    "rip_up_scope unlocked lets the rip-up take out unlocked copper of earlier calls too (rip_up.earlier_routes_rerouted, "
                    "other_nets_moved); the first pass gives each connection first_pass_budget_s (row budget, profile budget); "
