@@ -86,6 +86,14 @@ KICOMMON_API int KopenapiListLimit( const nlohmann::json& aArgs, int aDefault, i
 KICOMMON_API nlohmann::json KopenapiArgAlias( const nlohmann::json& aArgs, const std::string& aAlias,
                                               const std::string& aName, std::string& aError );
 
+/// @brief Where a page starts: "cursor" (next_cursor of the page before) or "offset" (the same
+/// as a number); aError when both are given and differ
+KICOMMON_API size_t KopenapiPageStart( const nlohmann::json& aArgs, std::string& aError );
+
+/// @brief aOut's next_cursor (null on the last page) and next_offset (the same as a number, only
+/// while more follow) after aCount items from aStart of aTotal
+KICOMMON_API void KopenapiPageNext( nlohmann::json& aOut, size_t aStart, size_t aCount, size_t aTotal );
+
 /// @brief One page of aItems: args "limit" (default aDefaultLimit, max aMaxLimit) and "cursor" (opaque,
 /// from the previous page); "full": true gives every item from the cursor on.
 /// Returns { items, total, next_cursor (null on the last page) }.

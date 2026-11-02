@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <set>
 
 
@@ -356,6 +357,34 @@ nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json&
     return { { "items", page },
              { "total", aItems.size() },
              { "next_cursor", next < aItems.size() ? nlohmann::json( std::to_string( next ) ) : nlohmann::json() } };
+}
+
+
+size_t KopenapiPageStart( const nlohmann::json& aArgs, std::string& aError )
+{
+    std::optional<size_t> cursor;
+    std::optional<size_t> offset;
+
+    if( aArgs.contains( "cursor" ) && aArgs["cursor"].is_string() )
+        cursor = static_cast<size_t>( std::strtoull( aArgs["cursor"].get<std::string>().c_str(), nullptr, 10 ) );
+
+    if( aArgs.contains( "offset" ) && aArgs["offset"].is_number_integer() )
+        offset = static_cast<size_t>( std::max<long long>( 0, aArgs["offset"].get<long long>() ) );
+
+    if( cursor && offset && *cursor != *offset )
+        aError = "cursor and offset name different starts (offset is the same as cursor)";
+
+    return cursor ? *cursor : offset.value_or( 0 );
+}
+
+
+void KopenapiPageNext( nlohmann::json& aOut, size_t aStart, size_t aCount, size_t aTotal )
+{
+    const size_t next = aStart + aCount;
+    aOut["next_cursor"] = next < aTotal ? nlohmann::json( std::to_string( next ) ) : nlohmann::json();
+
+    if( next < aTotal )
+        aOut["next_offset"] = next;
 }
 
 

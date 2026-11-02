@@ -12744,7 +12744,12 @@ static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
     const bool     full = KopenapiFull( aArgs );
     const size_t   limit = full ? tracks.size() : size_t( std::clamp( aArgs.value( "limit", 500 ), 1, 5000 ) );
-    const size_t   offset = full ? 0 : size_t( std::max( 0, aArgs.value( "offset", 0 ) ) );
+    std::string    pageError;
+    const size_t   offset = full ? 0 : KopenapiPageStart( aArgs, pageError );
+
+    if( !pageError.empty() )
+        return KOPENAPI_RESULT::Error( 400, pageError );
+
     nlohmann::json items = nlohmann::json::array();
     double         length = 0;
     int            vias = 0;
@@ -12801,8 +12806,7 @@ static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     nlohmann::json out = { { "items", items }, { "total", tracks.size() }, { "vias", vias },
                            { "length_mm", toMm( length ) }, { "missing", missing } };
 
-    if( offset + items.size() < tracks.size() )
-        out["next_offset"] = offset + items.size();
+    KopenapiPageNext( out, offset, items.size(), tracks.size() );
 
     return KOPENAPI_RESULT::Ok( out );
 }
@@ -12852,7 +12856,12 @@ static KOPENAPI_RESULT h_pcb_via_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     const bool     full = KopenapiFull( aArgs );
     const size_t   limit = full ? std::numeric_limits<size_t>::max()
                                 : size_t( std::clamp( aArgs.value( "limit", 1000 ), 1, 100000 ) );
-    const size_t   offset = size_t( std::max( 0, aArgs.value( "offset", 0 ) ) );
+    std::string    pageError;
+    const size_t   offset = KopenapiPageStart( aArgs, pageError );
+
+    if( !pageError.empty() )
+        return KOPENAPI_RESULT::Error( 400, pageError );
+
     nlohmann::json items = nlohmann::json::array();
     std::map<std::string, int>                     byType;
     std::map<std::pair<double, double>, int>       bySize;
@@ -12904,8 +12913,7 @@ static KOPENAPI_RESULT h_pcb_via_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     nlohmann::json out = { { "items", items }, { "total", total }, { "by_type", byType }, { "sizes", sizes },
                            { "missing", missing } };
 
-    if( offset + items.size() < total )
-        out["next_offset"] = offset + items.size();
+    KopenapiPageNext( out, offset, items.size(), total );
 
     return KOPENAPI_RESULT::Ok( out );
 }
@@ -15364,7 +15372,8 @@ KOPENAPI_REGISTER( "pcb_track_list",
                    "Tracks and vias with their uuids: all, or of nets, in a region, on a layer, or the copper "
                    "joining two pads (between); per item kind, net, ends (start_mm / end_mm, also as from_mm / to_mm) / "
                    "position, layer(s), width, length (vias in detail: pcb_via_list); "
-                   "totals (count, vias, length); full: every item (no limit / offset) with net code, net class, "
+                   "totals (count, vias, length). Paged: limit / cursor (offset: the same as a number); "
+                   "full: every item (no limit / cursor) with net code, net class, "
                    "locked, dangling, a via's type and layer span, an arc's mid point",
                    R"json({"type":"object","properties":{
                         "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
@@ -15374,15 +15383,18 @@ KOPENAPI_REGISTER( "pcb_track_list",
                         "layer":{"type":"string"},
                         "kinds":{"type":"array","items":{"type":"string","enum":["track","via"]}},
                         "uuids":{"type":"array","items":{"type":"string"}},
-                        "limit":{"type":"integer","default":500,"description":"items per page, 1..5000 (ignored with full)"},"offset":{"type":"integer","default":0},
-                        "full":{"type":"boolean","default":false,"description":"everything: every item (no limit or offset) with all fields: net_code, netclass, locked, dangling; vias: via_type, layer_span; arcs: mid_mm; large on a big design"}}})json"_json,
+                        "limit":{"type":"integer","default":500,"description":"items per page, 1..5000 (ignored with full)"},
+                        "cursor":{"type":"string","description":"next_cursor of the previous page"},
+                        "offset":{"type":"integer","default":0,"description":"the same as cursor, as a number (next_offset)"},
+                        "full":{"type":"boolean","default":false,"description":"everything: every item (no limit or cursor) with all fields: net_code, netclass, locked, dangling; vias: via_type, layer_span; arcs: mid_mm; large on a big design"}}})json"_json,
                    false, h_pcb_track_list );
 
 KOPENAPI_REGISTER( "pcb_via_list",
                    "Vias of the board with their uuids: all, or of nets, in a region, through a layer, of a via type; "
                    "per via position (at_mm), net and net_code, diameter, drill, via_type (through / blind / buried / "
                    "micro), layer_span [top, bottom] and the copper layers it passes (layers), locked; totals by type "
-                   "and by size (diameter / drill: count). Paged: limit / offset, full: true for all",
+                   "and by size (diameter / drill: count). Paged: limit / cursor (offset: the same as a number), "
+                   "full: true for all",
                    R"json({"type":"object","properties":{
                         "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
                         "region":{"type":"array","items":{"type":"number"},"description":"[x0_mm, y0_mm, x1_mm, y1_mm]"},
@@ -15391,7 +15403,9 @@ KOPENAPI_REGISTER( "pcb_via_list",
                         "via_types":{"type":"array","items":{"type":"string","enum":["through","blind","buried","micro"]}},
                         "uuids":{"type":"array","items":{"type":"string"}},
                         "full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"},
-                        "limit":{"type":"integer","default":1000},"offset":{"type":"integer","default":0}}})json"_json,
+                        "limit":{"type":"integer","default":1000},
+                        "cursor":{"type":"string","description":"next_cursor of the previous page"},
+                        "offset":{"type":"integer","default":0,"description":"the same as cursor, as a number (next_offset)"}}})json"_json,
                    false, h_pcb_via_list );
 
 KOPENAPI_REGISTER( "pcb_tracks_delete",
