@@ -1278,10 +1278,33 @@ void Bridge::HandleLine(const std::string& line)
         {
             EmitRaw(payload);
         }
+        return;
     }
-    else if (!result->body.empty())
+
+    // a request must get its answer: an HTTP failure or a body that is not JSON-RPC becomes a
+    // JSON-RPC error that says what the server answered
+    const json answer = result->body.empty() ? json() : json::parse(result->body, nullptr, false);
+    const bool rpc = answer.is_array() || (answer.is_object() && answer.contains("jsonrpc"));
+
+    if (rpc || (result->body.empty() && result->status < 300))
     {
-        EmitRaw(result->body);
+        if (!result->body.empty())
+        {
+            EmitRaw(result->body);
+        }
+        return;
+    }
+
+    if (!id.is_null())
+    {
+        std::string detail = result->body.substr(0, 600);
+        if (answer.is_object() && answer.contains("error") && answer["error"].is_object()
+            && answer["error"].contains("message") && answer["error"]["message"].is_string())
+        {
+            detail = answer["error"]["message"].get<std::string>();
+        }
+        Emit(Error(id, -32603, "the server answered HTTP " + std::to_string(result->status)
+                                       + (detail.empty() ? std::string(" with no body") : ": " + detail)));
     }
 }
 
