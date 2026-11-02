@@ -1923,6 +1923,38 @@ nlohmann::json blockersAt( BOARD* aBoard, const VECTOR2I& aAt, const VECTOR2I& a
     for( PCB_TRACK* track : aBoard->Tracks() )
         consider( track, { { "type", track->Type() == PCB_VIA_T ? "via" : "track" }, { "uuid", str( track->m_Uuid.AsString() ) }, { "key", copperKey( track ) } } );
 
+    // rule areas barring tracks on the layer: no net, and the start point inside one fails the router at once
+    std::vector<ZONE*> ruleAreas( aBoard->Zones().begin(), aBoard->Zones().end() );
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+        ruleAreas.insert( ruleAreas.end(), fp->Zones().begin(), fp->Zones().end() );
+
+    for( ZONE* zone : ruleAreas )
+    {
+        if( !zone->GetIsRuleArea() || !zone->GetDoNotAllowTracks() || !zone->IsOnLayer( aLayer )
+            || !area.Intersects( zone->GetBoundingBox() ) )
+        {
+            continue;
+        }
+
+        std::shared_ptr<SHAPE> shape = zone->GetEffectiveShape( aLayer );
+        int                    actual = 0;
+
+        if( !shape->Collide( &path, 0 ) && !shape->Collide( &probe, nearby ) )
+            continue;
+
+        shape->Collide( &probe, std::numeric_limits<int>::max() / 2, &actual );
+
+        nlohmann::json what = { { "type", "rule_area" }, { "rule_area", str( zone->GetZoneName() ) },
+                                { "uuid", str( zone->m_Uuid.AsString() ) }, { "layer", str( aBoard->GetLayerName( aLayer ) ) },
+                                { "distance_mm", toMm( actual ) } };
+
+        if( const FOOTPRINT* owner = zone->GetParentFootprint() )
+            what["footprint"] = str( owner->GetReference() );
+
+        found.emplace_back( actual, what );
+    }
+
     std::stable_sort( found.begin(), found.end(), []( const auto& x, const auto& y ) { return x.first < y.first; } );
 
     nlohmann::json out = nlohmann::json::array();
@@ -2267,6 +2299,16 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
         const VECTOR2I at = point( aOut["stopped_at_mm"] );
         const VECTOR2I aim = aOut.contains( "toward_mm" ) ? point( aOut["toward_mm"] )
                              : aOut.contains( "target_mm" ) ? point( aOut["target_mm"] ) : at;
+        const int      half = pcbIUScale.mmToIU( aOut.value( "track_width_mm", 0.2 ) ) / 2
+                         + pcbIUScale.mmToIU( aOut.value( "clearance_mm", 0.2 ) );
+
+        aOut["blocked_by"] = blockersAt( aContext.GetBoard(), at, aim, aReq.layer, aReq.from->GetNetCode(), half );
+    }
+    else if( !ok && aReq.from && aOut.value( "reason", std::string() ).rfind( "could not start", 0 ) == 0 )
+    {
+        const VECTOR2I at = aReq.fromPos.value_or( aReq.from->GetPosition() );
+        const VECTOR2I aim = !aReq.vias.empty()             ? aReq.vias.front().first
+                             : aReq.to || aReq.toFreeLayer ? aReq.toPos : at;
         const int      half = pcbIUScale.mmToIU( aOut.value( "track_width_mm", 0.2 ) ) / 2
                          + pcbIUScale.mmToIU( aOut.value( "clearance_mm", 0.2 ) );
 
@@ -13799,6 +13841,8 @@ KOPENAPI_REGISTER( "pcb_route_connection",
                    "clearance from the board's rules; waypoints steer it (corners, vias with a layer change). A guard "
                    "rejects routes whose copper would touch another net. Undo one route: pcb_tracks_delete "
                    "(between its pads). "
+                   "A failed route names blocked_by (pads, other nets' copper, rule areas barring tracks: rule_area, uuid, layer) "
+                   "where it stopped or could not start. "
                    "dry_run: measure only (geometry, length, detour, vias, shoved items), nothing changes",
                    R"json({"type":"object","required":["from"],"properties":{
                         "from":{"description":"REF.PAD, or a spot on copper of a net: [x_mm, y_mm] or {at: [x_mm, y_mm], layer} (a track end, a via, a pad)"},
@@ -13839,7 +13883,9 @@ KOPENAPI_REGISTER( "pcb_route",
                    "(stubs_removed); copper of nets outside the call that shove pushed aside is listed "
                    "(other_nets_moved: pieces and length before / after); a row still routed at the end is "
                    "joined by copper; per connection "
-                   "routed / reason and ms (every try for it), totals (routed, length, vias, unrouted left) and "
+                   "routed / reason and ms (every try for it), a failed row's blocked_by (what stands where it stopped or "
+                   "could not start: pads, other nets' tracks / vias, rule areas barring tracks by rule_area name, uuid, layer), "
+                   "totals (routed, length, vias, unrouted left) and "
                    "profile (attempts; clearance_lookups / rule_evaluations: the router's clearances past its caches and the design "
                    "rule evaluations they took; dead_legs_skipped / via_spots_blocked / via_spots_in_escapes / rip_ups_skipped / rip_ups_walled: tries not made; "
                    "rip_ups_planned: rip-ups whose routes a plan chose; rip_ups_second: routes taken out that had no way back "
