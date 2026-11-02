@@ -11076,6 +11076,8 @@ nlohmann::json trackJson( BOARD* aBoard, PCB_TRACK* aTrack )
         row["kind"] = aTrack->Type() == PCB_ARC_T ? "arc" : "track";
         row["from_mm"] = { toMm( aTrack->GetStart().x ), toMm( aTrack->GetStart().y ) };
         row["to_mm"] = { toMm( aTrack->GetEnd().x ), toMm( aTrack->GetEnd().y ) };
+        row["start_mm"] = row["from_mm"];
+        row["end_mm"] = row["to_mm"];
         row["layer"] = str( aBoard->GetLayerName( aTrack->GetLayer() ) );
         row["width_mm"] = toMm( aTrack->GetWidth() );
         row["length_mm"] = toMm( aTrack->GetLength() );
@@ -13984,7 +13986,8 @@ KOPENAPI_REGISTER( "pcb_stitch",
 
 KOPENAPI_REGISTER( "pcb_track_list",
                    "Tracks and vias with their uuids: all, or of nets, in a region, on a layer, or the copper "
-                   "joining two pads (between); per item kind, net, ends / position, layer(s), width, length; "
+                   "joining two pads (between); per item kind, net, ends (start_mm / end_mm, also as from_mm / to_mm) / "
+                   "position, layer(s), width, length (vias in detail: pcb_via_list); "
                    "totals (count, vias, length)",
                    R"json({"type":"object","properties":{
                         "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
