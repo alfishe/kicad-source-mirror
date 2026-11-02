@@ -344,6 +344,10 @@ std::optional<double> faradsOf( const FOOTPRINT* aFootprint )
         number += "." + fraction;
     }
 
+    // another unit after the prefix: 3.3uH, 10mA
+    if( i < text.size() && std::isalpha( (unsigned char) text[i] ) && text[i] != 'F' && text[i] != 'f' )
+        return std::nullopt;
+
     return std::atof( number.c_str() ) * *prefix;
 }
 
