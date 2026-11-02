@@ -18,6 +18,12 @@ class PAD;
 /// (none for a pad inside the rows: an exposed pad, a ball inside an array)
 std::optional<VECTOR2I> outwardOf( const PAD* aPad, const BOX2I& aCentres );
 
+/// @brief The spots for a via beside a pad whose box is aPadBox (a capacitor's to its plane), as close
+/// as the rules allow: the via's edge aClearance past each side of the box, straight out from the
+/// pad's centre and level with either end of that side (pcb_place_group keeps one free per pad,
+/// pcb_stitch tries them first)
+std::vector<VECTOR2I> padViaSpots( const BOX2I& aPadBox, int aViaRadius, int aClearance );
+
 /// @brief Under a quad package's body (QFP / QFN / LGA, pads on four sides): the area inside its
 /// ring of pads on its side, where a track or via of another net walls its pins in.  With an
 /// exposed pad the area is the ring between the pad rows and the exposed pad (the exposed pad and

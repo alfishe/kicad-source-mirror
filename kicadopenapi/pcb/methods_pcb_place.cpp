@@ -9,6 +9,7 @@
 /// a placement matrix inside the outline, ratsnest cost).
 #include "kopenapi_pcb.h"
 #include "rail_plan.h"
+#include <geometry/shape_segment.h>
 #include "pcb_escape_estimate.h"
 
 #include <kicadopenapi_registry.h>
@@ -2168,6 +2169,8 @@ struct NEAR_OPTIONS
     bool                  channel = false;  ///< the gap from the routing channel need (CHANNEL_NEED), not gapMm
     const std::map<int, int>* pairs = nullptr;   ///< a differential pair net's partner (the channel takes the pair)
     std::map<const FOOTPRINT*, int>* rooms = nullptr;   ///< parts placed: the half channel they leave their neighbours
+    std::vector<VIA_SPOT>* ownVias = nullptr;   ///< the vias kept by the anchor and the parts placed (OWN_VIAS); the part's own added
+    double                escapeKeepMm = 2.0;   ///< the anchor's fine-pitch and pair pins' straight escapes kept free of the parts' vias
     std::optional<double> partHeight;       ///< of the part (3D model): it may go under raised footprints with room
     const std::vector<CORRIDOR>* corridors = nullptr;   ///< kept free unless no other spot is found
     double                corridorYieldMm = -1;  ///< also enter one when only that brings the pad within this
@@ -2186,6 +2189,7 @@ struct NEAR_PLACEMENT
     std::string under;   ///< the raised footprint the part went under
     std::string corridor;   ///< the corridors the part had to enter
     bool        channelShort = false;   ///< no room for its routing channel: at the courtyard clearance
+    std::vector<std::pair<VECTOR2I, PAD*>> ownVias;   ///< the spots kept for its pads' vias to their planes (OWN_VIAS)
 };
 
 
@@ -2592,21 +2596,6 @@ public:
 
         const std::set<int> rails = railNets( aBoard );
 
-        // the part's own pads whose nets go elsewhere leave it by a via (a rail, to its plane) or a track
-        for( PAD* pad : aPart->Pads() )
-        {
-            const int net = pad->GetNetCode();
-
-            if( net <= 0 || onHost[net] > 0 || padsOn[net] - onPart[net] <= 0 )
-                continue;
-
-            const NETCLASS* nc = pad->GetEffectiveNetClass();
-            const int       clearance = std::max( nc && nc->HasClearance() ? nc->GetClearance() : 0, ds.m_MinClearance );
-            const int       via = std::max( nc && nc->HasViaDiameter() ? nc->GetViaDiameter() : 0, ds.m_ViasMinSize );
-
-            m_ownWay = std::max( m_ownWay, rails.count( net ) ? via + clearance : pitchOf( nc ) );
-        }
-
         for( PAD* pad : aHost->Pads() )
         {
             const int net = pad->GetNetCode();
@@ -2697,7 +2686,10 @@ public:
 
     /// @brief The courtyard clearance, just past it: DRC counts touching courtyards as overlapping
     int Courtyard() const { return m_courtyard + toIU( 0.01 ); }
-    int Least() const { return m_courtyard + std::max( m_basePitch, m_ownWay ); }
+    int Least() const { return m_courtyard + m_basePitch; }
+
+    /// @brief The anchor's courtyard with its fan-out ring
+    const SHAPE_POLY_SET& HostArea() const { return m_hostArea; }
 
     /// @brief The parts on the other net of a pair the part is on: held to the courtyard clearance only
     const std::set<const FOOTPRINT*>& PairParts() const { return m_pairParts; }
@@ -2716,10 +2708,251 @@ private:
     BOX2I            m_hostBox;
     int              m_courtyard = 0;
     int              m_basePitch = 0;
-    int              m_ownWay = 0;   ///< the room the part's own pads' way out takes
     std::set<int>    m_partNets;
     std::vector<PIN> m_pins;
     std::set<const FOOTPRINT*> m_pairParts;
+};
+
+
+bool finePitch( FOOTPRINT* aFootprint );
+
+
+/// The vias a part's pads take to their planes (a net with a zone on another copper layer): a spot
+/// by each such pad, the net class's via (no smaller than the rules allow) a clearance off the pad,
+/// clear of the other nets' pads, of the vias kept already (the anchor's planned rail vias, the
+/// parts placed before), of the anchor's room (its courtyard and fan-out ring, the channel the part
+/// leaves it) and of the straight escapes of its fine-pitch and pair pins (escape_keep_mm, as
+/// pcb_stitch keeps them)
+class OWN_VIAS
+{
+public:
+    OWN_VIAS( BOARD* aBoard, FOOTPRINT* aPart, FOOTPRINT* aHost, const BOX2I& aNear, const std::vector<VIA_SPOT>* aTaken,
+              const std::set<const FOOTPRINT*>* aPending, int aEscapeKeep, const std::map<int, int>* aPairs ) :
+            m_part( aPart ),
+            m_taken( aTaken )
+    {
+        BOARD_DESIGN_SETTINGS& ds = aBoard->GetDesignSettings();
+        const LSET             partLayers = aPart->IsFlipped() ? LSET( { B_Cu } ) : LSET( { F_Cu } );
+        std::map<int, bool>    plane;
+
+        for( PAD* pad : aPart->Pads() )
+        {
+            const int net = pad->GetNetCode();
+
+            if( net <= 0 )
+                continue;
+
+            if( !plane.count( net ) )
+            {
+                plane[net] = false;
+
+                for( ZONE* zone : aBoard->Zones() )
+                {
+                    if( !zone->GetIsRuleArea() && !zone->IsTeardropArea() && zone->GetNetCode() == net
+                        && ( zone->GetLayerSet() & LSET::AllCuMask() & ~partLayers ).any() )
+                    {
+                        plane[net] = true;
+                    }
+                }
+            }
+
+            if( !plane[net] )
+                continue;
+
+            const NETCLASS* nc = pad->GetEffectiveNetClass();
+            const int       via = std::max( nc && nc->HasViaDiameter() ? nc->GetViaDiameter() : 0, ds.m_ViasMinSize );
+            const int       clearance = std::max( nc && nc->HasClearance() ? nc->GetClearance() : 0, ds.m_MinClearance );
+
+            m_pads.push_back( { pad, net, via / 2, clearance, stubWidth( aBoard, pad ) / 2 } );
+            m_reach = std::max( m_reach, via + clearance );
+        }
+
+        if( m_pads.empty() )
+            return;
+
+        BOX2I near = aNear;
+        near.Inflate( m_reach );
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            if( fp == aPart || ( aPending && aPending->count( fp ) ) || !fp->GetBoundingBox().Intersects( near ) )
+                continue;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( ( pad->GetLayerSet() & partLayers ).any() && pad->GetBoundingBox().Intersects( near ) )
+                    m_others.push_back( pad );
+            }
+        }
+
+        if( aEscapeKeep <= 0 || aHost->Pads().size() < 4 )
+            return;
+
+        BOX2I centres( aHost->Pads().front()->GetPosition(), VECTOR2I( 0, 0 ) );
+
+        for( PAD* pad : aHost->Pads() )
+            centres.Merge( pad->GetPosition() );
+
+        const bool fine = finePitch( aHost );
+
+        for( PAD* pad : aHost->Pads() )
+        {
+            if( pad->GetNetCode() <= 0 || !( pad->GetLayerSet() & partLayers ).any()
+                || ( !fine && !( aPairs && aPairs->count( pad->GetNetCode() ) ) ) )
+            {
+                continue;
+            }
+
+            const std::optional<VECTOR2I> dir = outwardOf( pad, centres );
+
+            if( !dir )
+                continue;
+
+            const BOX2I    pb = pad->GetBoundingBox();
+            const int      half = dir->x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
+            const int      across = dir->x ? pb.GetHeight() : pb.GetWidth();
+            const VECTOR2I tip = pad->GetPosition() + *dir * half;
+
+            m_escapes.push_back( { pad->GetNetCode(), SHAPE_SEGMENT( tip, tip + *dir * aEscapeKeep, across + 2 * ds.m_MinClearance ) } );
+        }
+    }
+
+    bool Needed() const { return !m_pads.empty(); }
+
+    /// @brief With the part moved by aDelta, a spot for each of its pads' vias, aHostRoom (with the
+    /// clearance) off aHostArea; the spots in aSpots, their pads in aPads
+    bool Room( const VECTOR2I& aDelta, const SHAPE_POLY_SET& aHostArea, int aHostRoom, std::vector<VIA_SPOT>* aSpots = nullptr,
+               std::vector<PAD*>* aPads = nullptr ) const
+    {
+        std::vector<VIA_SPOT> found;
+        const VECTOR2I        hostAt = aHostArea.BBox().GetCenter();
+
+        for( const OWN_PAD& own : m_pads )
+        {
+            BOX2I box = own.pad->GetBoundingBox();
+            box.Move( aDelta );
+
+            std::vector<VECTOR2I> spots = padViaSpots( box, own.radius, own.clearance );
+
+            // away from the anchor first
+            std::stable_sort( spots.begin(), spots.end(),
+                              [&]( const VECTOR2I& a, const VECTOR2I& b )
+                              { return ( a - hostAt ).SquaredEuclideanNorm() > ( b - hostAt ).SquaredEuclideanNorm(); } );
+
+            bool placed = false;
+
+            for( const VECTOR2I& spot : spots )
+            {
+                if( clear( spot, own, aDelta, aHostArea, aHostRoom, found ) )
+                {
+                    found.push_back( { spot, own.net, own.radius, own.clearance, stubStart( spot, own, aDelta ), own.stub } );
+                    placed = true;
+                    break;
+                }
+            }
+
+            if( !placed )
+                return false;
+        }
+
+        if( aSpots )
+            *aSpots = std::move( found );
+
+        for( size_t i = 0; aPads && i < m_pads.size(); ++i )
+            aPads->push_back( m_pads[i].pad );
+
+        return true;
+    }
+
+private:
+    struct OWN_PAD
+    {
+        PAD* pad;
+        int  net;
+        int  radius;
+        int  clearance;
+        int  stub;   ///< the half width of the stub from the pad to its via
+    };
+
+    /// @brief Where the stub to a via at aAt leaves aOwn's pad (the part moved by aDelta)
+    static VECTOR2I stubStart( const VECTOR2I& aAt, const OWN_PAD& aOwn, const VECTOR2I& aDelta )
+    {
+        const BOX2I    box = aOwn.pad->GetBoundingBox();
+        const VECTOR2I from = aOwn.pad->GetPosition() + aDelta;
+        const VECTOR2I d = aAt - from;
+        double         t = 1.0;
+
+        if( d.x != 0 )
+            t = std::min( t, box.GetWidth() / 2.0 / std::abs( (double) d.x ) );
+
+        if( d.y != 0 )
+            t = std::min( t, box.GetHeight() / 2.0 / std::abs( (double) d.y ) );
+
+        return from + VECTOR2I( KiROUND( d.x * t ), KiROUND( d.y * t ) );
+    }
+
+    bool clear( const VECTOR2I& aAt, const OWN_PAD& aOwn, const VECTOR2I& aDelta, const SHAPE_POLY_SET& aHostArea, int aHostRoom,
+                const std::vector<VIA_SPOT>& aFound ) const
+    {
+        const int r = aOwn.radius, c = aOwn.clearance;
+
+        if( aHostArea.Collide( aAt, r + std::max( c, aHostRoom ) ) )
+            return false;
+
+        const SEG stub( stubStart( aAt, aOwn, aDelta ), aAt );
+
+        for( const auto& [net, escape] : m_escapes )
+        {
+            if( net != aOwn.net && ( escape.Collide( aAt, r ) || escape.Collide( stub, aOwn.stub ) ) )
+                return false;
+        }
+
+        const SEG ownStub( stub.A - aDelta, stub.B - aDelta );
+
+        for( PAD* pad : m_part->Pads() )
+        {
+            std::shared_ptr<SHAPE> shape = pad->GetEffectiveShape( pad->GetLayerSet().CuStack().front() );
+
+            if( pad->GetNetCode() != aOwn.net && ( shape->Collide( aAt - aDelta, r + c ) || shape->Collide( ownStub, aOwn.stub + c ) ) )
+                return false;
+        }
+
+        BOX2I reach( aAt, VECTOR2I( 0, 0 ) );
+        reach.Merge( stub.A );
+        reach.Inflate( r + c );
+
+        for( PAD* pad : m_others )
+        {
+            if( pad->GetNetCode() == aOwn.net && aOwn.net > 0 )
+                continue;
+
+            BOX2I padBox = pad->GetBoundingBox();
+            padBox.Inflate( c );
+
+            if( !padBox.Intersects( reach ) )
+                continue;
+
+            std::shared_ptr<SHAPE> shape = pad->GetEffectiveShape( pad->GetLayerSet().CuStack().front() );
+
+            if( shape->Collide( aAt, r + c ) || shape->Collide( stub, aOwn.stub + c ) )
+                return false;
+        }
+
+        auto apart = [&]( const VIA_SPOT& aSpot )
+        {
+            return aSpot.net == aOwn.net || aSpot.Clear( aAt, r, stub, aOwn.stub, c );
+        };
+
+        return std::all_of( aFound.begin(), aFound.end(), apart )
+               && ( !m_taken || std::all_of( m_taken->begin(), m_taken->end(), apart ) );
+    }
+
+    FOOTPRINT*                   m_part;
+    const std::vector<VIA_SPOT>* m_taken;
+    std::vector<OWN_PAD>         m_pads;
+    std::vector<PAD*>            m_others;
+    std::vector<std::pair<int, SHAPE_SEGMENT>> m_escapes;   ///< the anchor's pins' straight escapes, by net
+    int                          m_reach = 0;
 };
 
 
@@ -2759,10 +2992,30 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
     const int         ring = toIU( std::max( 0.0, aOptions.hostRingMm ) );
     const std::optional<CHANNEL_NEED> need = aOptions.channel ? std::optional<CHANNEL_NEED>( std::in_place, aBoard, aPart, host, ring, aOptions.pairs )
                                                               : std::nullopt;
-    const PLACE_SPACE space( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, nullptr, aOptions.viaSpots,
-                             aOptions.pending, aOptions.rooms );
-    const PLACE_SPACE kept( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, aOptions.corridors,
-                            aOptions.viaSpots, aOptions.pending, aOptions.rooms );
+
+    // the part's pads keep off the vias to come: the bottom caps' spots and those kept (OWN_VIAS)
+    std::vector<VIA_SPOT> keepSpots = aOptions.viaSpots ? *aOptions.viaSpots : std::vector<VIA_SPOT>();
+
+    if( aOptions.ownVias )
+        keepSpots.insert( keepSpots.end(), aOptions.ownVias->begin(), aOptions.ownVias->end() );
+
+    const std::vector<VIA_SPOT>* spots = keepSpots.empty() ? nullptr : &keepSpots;
+    const PLACE_SPACE space( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, nullptr, spots, aOptions.pending,
+                             aOptions.rooms );
+    const PLACE_SPACE kept( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, aOptions.corridors, spots,
+                            aOptions.pending, aOptions.rooms );
+
+    std::optional<OWN_VIAS> vias;
+
+    if( need )
+    {
+        BOX2I near( target, VECTOR2I( 0, 0 ) );
+        near.Inflate( reach + aPart->GetBoundingBox().GetWidth() + aPart->GetBoundingBox().GetHeight() );
+        vias.emplace( aBoard, aPart, host, near, aOptions.ownVias, aOptions.pending, toIU( aOptions.escapeKeepMm ), aOptions.pairs );
+
+        if( !vias->Needed() )
+            vias.reset();
+    }
 
     // directions: along the target footprint's axes, the side its pad is nearest to first
     const EDA_ANGLE base = host->GetOrientation();
@@ -2855,20 +3108,23 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
 
                 const int side = need->ToSide( box );
 
-                if( side <= need->Least() )
-                    return true;
-
-                auto it = sides.find( side );
-
-                if( it == sides.end() )
+                if( side > need->Least() )
                 {
-                    SHAPE_POLY_SET grown = bare;
-                    grown.Inflate( side, CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, ARC_HIGH_DEF );
-                    const BOX2I grownBox = grown.BBox();
-                    it = sides.emplace( side, std::make_pair( std::move( grown ), grownBox ) ).first;
+                    auto it = sides.find( side );
+
+                    if( it == sides.end() )
+                    {
+                        SHAPE_POLY_SET grown = bare;
+                        grown.Inflate( side, CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, ARC_HIGH_DEF );
+                        const BOX2I grownBox = grown.BBox();
+                        it = sides.emplace( side, std::make_pair( std::move( grown ), grownBox ) ).first;
+                    }
+
+                    if( !aSpace.Free( it->second.first, it->second.second, aDelta, &need->PairParts(), &pairArea ) )
+                        return false;
                 }
 
-                return aSpace.Free( it->second.first, it->second.second, aDelta, &need->PairParts(), &pairArea );
+                return !vias || vias->Room( aDelta, need->HostArea(), need->Channel( box ) );
             };
 
             for( PAD* pad : aPart->Pads() )
@@ -2988,6 +3244,18 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
 
     if( need && aOptions.rooms )
         ( *aOptions.rooms )[aPart] = need->Channel( courtyard( aPart ).BBox() ) / 2;
+
+    std::vector<PAD*> ownPads;
+
+    if( std::vector<VIA_SPOT> own; vias && vias->Room( VECTOR2I( 0, 0 ), need->HostArea(), need->Channel( courtyard( aPart ).BBox() ),
+                                                       &own, &ownPads ) )
+    {
+        for( size_t i = 0; i < own.size(); ++i )
+            result.ownVias.emplace_back( own[i].at, ownPads[i] );
+
+        if( aOptions.ownVias )
+            aOptions.ownVias->insert( aOptions.ownVias->end(), own.begin(), own.end() );
+    }
     result.under = space.Under();
 
     if( entered )
@@ -3013,6 +3281,10 @@ nlohmann::json nearJson( const NEAR_PLACEMENT& aPlacement, PAD* aTarget )
 
     if( aPlacement.channelShort )
         row["channel_short"] = true;
+
+    for( const auto& [at, pad] : aPlacement.ownVias )
+        row["via_room_mm"].push_back( { { "pad", str( pad->GetNumber() ) },
+                                        { "at_mm", { std::round( toMm( at.x ) * 1000 ) / 1000, std::round( toMm( at.y ) * 1000 ) / 1000 } } } );
 
     return row;
 }
@@ -3691,6 +3963,20 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
                     viaSpots.push_back( spot->spot );
                 }
             }
+        }
+    }
+
+    // the anchor's planned rail vias (planRowRailVias) kept free for pcb_stitch: no part's pad on
+    // them, no part's own via near them
+    if( aOptions.ownVias )
+    {
+        for( PAD* pad : aAnchor->Pads() )
+        {
+            if( !rails.count( pad->GetNetCode() ) || !railPlanOf( pad ) )
+                continue;
+
+            if( std::optional<SPOT_AT> spot = spotFor( pad ) )
+                aOptions.ownVias->push_back( spot->spot );
         }
     }
 
@@ -5701,9 +5987,13 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         const std::map<int, int>        pairs = diffPairs( aCtx, board );
         std::map<const FOOTPRINT*, int> rooms;
 
+        std::vector<VIA_SPOT> ownVias;
+
         options.corridors = &corridors;
         options.pairs = &pairs;
         options.rooms = &rooms;
+        options.ownVias = &ownVias;
+        options.escapeKeepMm = escapeKeep;
 
         placeGroup( board, groupCommit, anchor, parts, options, group.value( "side", std::string( "same" ) ) == "opposite",
                     group.value( "decap_max_mm", 3.0 ), group.value( "bulk_max_mm", 10.0 ),
@@ -5927,6 +6217,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
             std::vector<CORRIDOR>       corridors;
             const std::map<int, int>    pairs = diffPairs( aCtx, board );
             std::map<const FOOTPRINT*, int> rooms;
+            std::vector<VIA_SPOT>       ownVias;
 
             auto place = [&]( BOARD_COMMIT& aCommit, nlohmann::json& aOut, std::vector<KIID>& aMoved )
             {
@@ -5939,6 +6230,9 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                 options.pairs = &pairs;
                 rooms.clear();
                 options.rooms = &rooms;
+                ownVias.clear();
+                options.ownVias = &ownVias;
+                options.escapeKeepMm = escapeKeep;
                 placeGroup( board, aCommit, anchor, parts, options, side == "opposite", decapMax, bulkMax,
                             spec.contains( "decap_bottom" ) ? std::optional<bool>( spec.value( "decap_bottom", false ) ) : std::nullopt,
                             aOut, aMoved, spec.value( "decap_vias", true ) );
@@ -6189,7 +6483,7 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "open_sides":{"description":"layout level 2 variants: which of the anchor's port sides ports_keep_mm keeps open (default 3 mm when only this is given): a count 0..4 - the sides with the most signal ports first; or a list of west / east / north / south - those, a side without ports along its whole courtyard edge; default every side with ports. corridors names the bands; block gives the outline each variant takes (bbox_mm, area_mm2)","oneOf":[{"type":"integer","minimum":0,"maximum":4},{"type":"array","items":{"type":"string","enum":["west","east","north","south"]}}]},
     "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
     "side":{"type":"string","enum":["same","opposite"],"default":"same"},
-    "gap_mm":{"type":"number","description":"between courtyards, fixed. Default: from the design rules, per spot: the courtyard clearance plus a channel for the anchor's signal pins the part stands in front of (each its class's track width + clearance; at least one default-class track). A part with no room for that goes at the courtyard clearance (row channel_short)"},
+    "gap_mm":{"type":"number","description":"between courtyards, fixed. Default: from the design rules, per spot: the courtyard clearance plus a channel for the anchor's signal pins the part stands in front of (each its class's track width + clearance; at least one default-class track). Each pad on a net with a plane also keeps a spot for its via beside it (its class's via, a clearance off the pad; clear of other nets' pads, of the anchor's planned rail vias and its fine-pitch pins' straight escapes, escape_keep_mm), where pcb_stitch lays it (row via_room_mm). A part with no room for that goes at the courtyard clearance (row channel_short)"},
     "fanout_ring_mm":{"type":"number","description":"keep this far from the anchor's courtyard (room for the tracks leaving its pins); default 1.0 for a fine-pitch anchor (pads 0.65 mm apart or closer), else 0; parts that find no place with it come as close as the courtyards allow"},
     "max_mm":{"type":"number","default":25,"description":"how far from the anchor's pad a part may end up"}})json";
 

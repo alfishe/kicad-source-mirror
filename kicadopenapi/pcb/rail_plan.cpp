@@ -23,6 +23,26 @@
 #include <tuple>
 
 
+std::vector<VECTOR2I> padViaSpots( const BOX2I& aPadBox, int aViaRadius, int aClearance )
+{
+    std::vector<VECTOR2I> spots;
+    const VECTOR2I        centre = aPadBox.GetCenter();
+    const int             hx = aPadBox.GetWidth() / 2, hy = aPadBox.GetHeight() / 2;
+    const int             off = aClearance + aViaRadius;
+
+    for( const VECTOR2I& dir : { VECTOR2I( 1, 0 ), VECTOR2I( -1, 0 ), VECTOR2I( 0, 1 ), VECTOR2I( 0, -1 ) } )
+    {
+        const int      ahead = dir.x ? hx : hy, across = dir.x ? hy : hx;
+        const VECTOR2I side( -dir.y, dir.x );
+
+        for( int shift : { 0, across, -across } )
+            spots.push_back( centre + dir * ( ahead + off ) + side * shift );
+    }
+
+    return spots;
+}
+
+
 std::optional<VECTOR2I> outwardOf( const PAD* aPad, const BOX2I& aCentres )
 {
     const VECTOR2I c = aPad->GetPosition();
