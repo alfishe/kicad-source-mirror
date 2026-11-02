@@ -951,6 +951,10 @@ struct ROUTE_REQUEST
     /// @brief A narrower track than the net's class gives (> 0): the connection meets a fine-pitch pad
     int neckWidth = 0;
 
+    /// @brief A net's tail from its pad to its pair's line split back: the pair's own way, not held to
+    /// other pads' ways out (as the pair is not)
+    bool pairTail = false;
+
     /// @brief The track width of this route instead of the net class's (> 0)
     int width = 0;
 
@@ -2092,7 +2096,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     const nlohmann::json violations = guard( board, changed, iface->m_removed );
     const auto           guardedAt = std::chrono::steady_clock::now();
 
-    if( aReq.fronts && !aReq.diffPair )
+    if( aReq.fronts && !aReq.diffPair && !aReq.pairTail )
     {
         for( BOARD_CONNECTED_ITEM* item : changed )
         {
@@ -3333,10 +3337,10 @@ struct ROUTE_BRANCH
 
 /// @brief Cut a pair's two lines back from their target ends to where each has room to turn to its own
 /// pad alone: by the farther line end's distance to its pad plus one pair pitch (width + gap), along each
-/// line on its layer (not past a via or an arc).  aTargets: each net's code and its target pad's position;
-/// aEnds gets each net's new open end.
-static void splitPairBack( PCB_CONTEXT& aContext, BOARD* aBoard, const std::vector<KIID>& aAdded, size_t aFrom,
-                           const std::vector<std::pair<int, VECTOR2I>>& aTargets, const nlohmann::json& aAttempt,
+/// line on its layer (not past a via or an arc).  aLines: each net's code, its start pad's and its target
+/// pad's positions; aEnds gets each net's new open end.
+static double splitPairBack( PCB_CONTEXT& aContext, BOARD* aBoard, const std::vector<KIID>& aAdded, size_t aFrom,
+                           const std::vector<std::tuple<int, VECTOR2I, VECTOR2I>>& aLines, const nlohmann::json& aAttempt,
                            std::map<int, std::pair<PCB_TRACK*, VECTOR2I>>& aEnds )
 {
     const nlohmann::json dp = aAttempt.value( "diff_pair", nlohmann::json::object() );
@@ -3346,9 +3350,10 @@ static void splitPairBack( PCB_CONTEXT& aContext, BOARD* aBoard, const std::vect
     std::map<int, std::pair<PCB_TRACK*, VECTOR2I>> ends;
     double                                      cut = pitch;
 
-    for( const auto& [net, target] : aTargets )
+    for( const auto& [net, start, target] : aLines )
     {
-        std::map<std::pair<int, int>, int> endsAt;   // how many of the line's tracks end at a point
+        VECTOR2I from;
+        bool     any = false;
 
         for( size_t i = aFrom; i < aAdded.size(); ++i )
         {
@@ -3356,22 +3361,44 @@ static void splitPairBack( PCB_CONTEXT& aContext, BOARD* aBoard, const std::vect
                 t && t->Type() == PCB_TRACE_T && t->GetNetCode() == net )
             {
                 lines[net].push_back( t );
-                endsAt[{ t->GetStart().x, t->GetStart().y }]++;
-                endsAt[{ t->GetEnd().x, t->GetEnd().y }]++;
+
+                for( const VECTOR2I& at : { t->GetStart(), t->GetEnd() } )
+                {
+                    if( !any || ( at - start ).SquaredEuclideanNorm() < ( from - start ).SquaredEuclideanNorm() )
+                        from = at;
+
+                    any = true;
+                }
             }
         }
 
-        // the line's open end nearest the target (a bend's corner is no end)
-        for( PCB_TRACK* t : lines[net] )
+        // the line's end: the point farthest along it from its start pad (a short stub off the line,
+        // a segment laid twice or a bend's corner is no end)
+        std::set<PCB_TRACK*>                     walked;
+        std::vector<std::pair<VECTOR2I, double>> open = { { from, 0.0 } };
+        double                                   farthest = -1.0;
+
+        while( !open.empty() )
         {
-            for( const VECTOR2I& at : { t->GetStart(), t->GetEnd() } )
+            const auto [at, along] = open.back();
+            open.pop_back();
+
+            for( PCB_TRACK* t : lines[net] )
             {
-                if( endsAt[{ at.x, at.y }] == 1
-                    && ( !ends.count( net )
-                         || ( at - target ).SquaredEuclideanNorm() < ( ends[net].second - target ).SquaredEuclideanNorm() ) )
+                if( walked.count( t ) || ( t->GetStart() != at && t->GetEnd() != at ) )
+                    continue;
+
+                walked.insert( t );
+                const VECTOR2I next = t->GetStart() == at ? t->GetEnd() : t->GetStart();
+                const double   reach = along + ( next - at ).EuclideanNorm();
+
+                if( reach > farthest )
                 {
-                    ends[net] = std::make_pair( t, at );
+                    farthest = reach;
+                    ends[net] = std::make_pair( t, next );
                 }
+
+                open.emplace_back( next, reach );
             }
         }
 
@@ -3380,7 +3407,7 @@ static void splitPairBack( PCB_CONTEXT& aContext, BOARD* aBoard, const std::vect
     }
 
     if( ends.size() != 2 )
-        return;
+        return 0.0;
 
     BOARD_COMMIT commit( aContext.GetToolManager() );
     std::set<PCB_TRACK*> removed;
@@ -3410,11 +3437,20 @@ static void splitPairBack( PCB_CONTEXT& aContext, BOARD* aBoard, const std::vect
 
             for( PCB_TRACK* t : lines[net] )
             {
-                if( t != track && !removed.count( t ) && t->GetLayer() == track->GetLayer()
-                    && ( t->GetStart() == other || t->GetEnd() == other ) )
+                if( t == track || removed.count( t ) || t->GetLayer() != track->GetLayer()
+                    || ( t->GetStart() != other && t->GetEnd() != other ) )
                 {
-                    next = t;
+                    continue;
                 }
+
+                if( t->GetStart() == at || t->GetEnd() == at )
+                {
+                    commit.Remove( t );   // the same segment laid twice
+                    removed.insert( t );
+                    continue;
+                }
+
+                next = t;
             }
 
             if( !next )
@@ -3431,6 +3467,7 @@ static void splitPairBack( PCB_CONTEXT& aContext, BOARD* aBoard, const std::vect
     }
 
     commit.Push( _( "Split a pair back to its pads (API)" ) );
+    return cut;
 }
 
 
@@ -4397,8 +4434,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                     ? board->GetDesignSettings().m_NetSettings->GetDefaultNetclass()->GetTrackWidth()
                                                     : 0 );
 
+    // a pair's lines split back to their pads end beside each other at the pair's pitch: a net's
+    // tail leaves its line no wider than the line
+    std::set<KIID> pairLineEnds;
+
     auto neckFor = [&]( PAD* aFrom, BOARD_CONNECTED_ITEM* aTo ) -> int
     {
+        if( aTo && aTo->Type() == PCB_TRACE_T && pairLineEnds.count( aTo->m_Uuid ) )
+            return static_cast<PCB_TRACK*>( aTo )->GetWidth();
+
         const double fine = pcbIUScale.mmToIU( 0.65 );
         auto         it = neckPerNet.find( aFrom->GetNetname() );
 
@@ -4420,6 +4464,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
 
         return cap == INT_MAX ? 0 : cap;
+    };
+
+    auto pairTail = [&]( BOARD_CONNECTED_ITEM* aTo )
+    {
+        return aTo && aTo->Type() == PCB_TRACE_T && pairLineEnds.count( aTo->m_Uuid ) > 0;
     };
 
     // A custom rule's track width where a pad is (a fine-pitch escape rule inside a courtyard): its
@@ -4952,7 +5001,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( const ESCAPE_FRONT& front : fronts )
         {
-            if( front.walls( aFrom->GetNetCode() ) )
+            if( front.walls( aFrom->GetNetCode() ) && !pairTail( aTo ) )
                 req.keepOut.emplace_back( front.layer, front.shape );
         }
 
@@ -5187,6 +5236,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 req.fronts = &fronts;
                 req.tried = keepTries ? &aJob.tried : nullptr;
                 req.neckWidth = neckFor( a, b );
+                req.pairTail = pairTail( b );
                 req.vias = p;
                 req.noDoubleBack = true;
                 req.exact = &p == legPlan;
@@ -5444,6 +5494,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 req.fronts = &fronts;
                 req.tried = keepTries ? &aJob.tried : nullptr;
                 req.neckWidth = neckFor( way.from, way.to );
+                req.pairTail = pairTail( way.to );
                 req.vias = plan.points;
                 req.planned = true;
                 aAttempt = nlohmann::json::object();
@@ -5466,6 +5517,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     req.fronts = &fronts;
                     req.tried = keepTries ? &aJob.tried : nullptr;
                     req.neckWidth = neckFor( way.from, way.to );
+                    req.pairTail = pairTail( way.to );
                     aAttempt = nlohmann::json::object();
                     aTries++;
                     ok = routeOne( *context, req, aAttempt, added );
@@ -5555,6 +5607,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 req.fronts = &fronts;
                 req.tried = keepTries ? &aJob.tried : nullptr;
                 req.neckWidth = neckFor( way.from, way.to );
+                req.pairTail = pairTail( way.to );
                 req.vias = { { corner, std::nullopt } };
                 req.noDoubleBack = true;
                 aAttempt = nlohmann::json::object();
@@ -5690,6 +5743,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         req.fronts = &fronts;
                         req.tried = keepTries ? &aJob.tried : nullptr;
                         req.neckWidth = neckFor( way.from, way.to );
+                        req.pairTail = pairTail( way.to );
                         req.vias = { { v, arrive } };
                         aAttempt = nlohmann::json::object();
                         aTries++;
@@ -5748,6 +5802,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         req.fronts = &fronts;
                         req.tried = keepTries ? &aJob.tried : nullptr;
                         req.neckWidth = neckFor( way.from, way.to );
+                        req.pairTail = pairTail( way.to );
                         req.vias = { { va, cross }, { vb, arrive } };
                         aAttempt = nlohmann::json::object();
                         aTries++;
@@ -8602,6 +8657,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
         req.fronts = &fronts;
         req.neckWidth = neckFor( job.from, job.to );
+        req.pairTail = pairTail( job.to );
 
         for( size_t k = 0; k < job.corridor.size(); ++k )
             req.vias.emplace_back( job.corridor[k], k < job.corridorVia.size() ? job.corridorVia[k] : std::nullopt );
@@ -8662,6 +8718,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         // nearest the old place, off the start's island
         if( job.from && !job.to && job.toPairEnd )
         {
+            const bool split = pairLineEnds.count( job.toId ) > 0;
             const auto joined = board->GetConnectivity()->GetConnectedItems( job.from );
             double     best = std::numeric_limits<double>::max();
 
@@ -8684,6 +8741,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     }
                 }
             }
+
+            if( split && job.to )
+                pairLineEnds.insert( job.toId );
         }
 
         if( !job.from || !job.to )
@@ -8820,10 +8880,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             // to two parts side by side the placer bends one line onto the pad it reaches and stops the
             // other short beside it, closer to its partner than a single route may come: both lines are cut
             // back to where each has room to turn to its own pad, and each net goes on alone from there
+            double pairSplit = 0.0;
+
             if( !pairEnds.empty() )
-                splitPairBack( *context, board, added, pairFrom,
-                               { { job.from->GetNetCode(), job.to->GetPosition() },
-                                 { other.from->GetNetCode(), other.to->GetPosition() } },
+                pairSplit = splitPairBack( *context, board, added, pairFrom,
+                               { { job.from->GetNetCode(), job.from->GetPosition(), job.to->GetPosition() },
+                                 { other.from->GetNetCode(), other.from->GetPosition(), other.to->GetPosition() } },
                                pairAttempt, pairEnds );
 
             if( !pairEnds.empty() )
@@ -8854,6 +8916,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     wire.toPos = at;
                     wire.length = (double) ( at - farPad->GetPosition() ).EuclideanNorm();
                     wire.toPairEnd = true;
+
+                    if( pairSplit > 0 )
+                        pairLineEnds.insert( track->m_Uuid );
                 }
             }
 
@@ -8885,6 +8950,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         const VECTOR2I at = pairEnds[mine->from->GetNetCode()].second;
                         row["diff_pair"]["ends_short_mm"] = { toMm( at.x ), toMm( at.y ) };
                     }
+
+                    if( pairSplit > 0 )
+                        row["diff_pair"]["split_back_mm"] = toMm( pairSplit );
 
                     done[k] = true;
                     rowOf[k] = (int) results.size();
@@ -8963,6 +9031,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
             req.fronts = &fronts;
             req.neckWidth = neckFor( job.from, job.to );
+            req.pairTail = pairTail( job.to );
             req.vias = { { *job.busVia, *busLayer } };
             attempt = nlohmann::json::object();
             tries++;
@@ -11736,6 +11805,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 ROUTE_REQUEST req{ job.from, job.to, job.toPos, viaPlan.startLayer, PNS::RM_Walkaround, false, {} };
                 req.fronts = &fronts;
                 req.neckWidth = neckFor( job.from, job.to );
+                req.pairTail = pairTail( job.to );
                 req.vias = viaPlan.points;
                 req.planned = true;
                 ok = routeOne( *context, req, attempt, added );
@@ -11762,6 +11832,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     ROUTE_REQUEST req{ from, to, toPos, layer, PNS::RM_Walkaround, false, {} };
                     req.fronts = &fronts;
                     req.neckWidth = neckFor( from, to );
+                    req.pairTail = pairTail( to );
                     attempt = nlohmann::json::object();
                     ok = routeOne( *context, req, attempt, added );
                 }
@@ -17241,7 +17312,8 @@ KOPENAPI_REGISTER( "pcb_route",
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
                    "rip_up, gaps); "
                    "nets a pcb_net_roles pair names (USB_DP_MCU / USB_DM_MCU too) are routed coupled as well (diff_pairs); a pair whose target pads lie apart is coupled up to where "
-                   "its line ends (row diff_pair.ends_short_mm), each net goes on alone from there; diff_pair_lengths: each pair's two "
+                   "its line ends (row diff_pair.ends_short_mm), each net goes on alone from there; to two parts side by side both lines are cut back first "
+                   "(diff_pair.split_back_mm) and each tail leaves its line at the line's width, the pair's own way (not held to other pads' ways out); diff_pair_lengths: each pair's two "
                    "net lengths and skew, against a custom skew rule (skew_max_mm, skew_rule, skew_ok); "
                    "bus routes a bundle's members one after another in pin order, bus_layer through a diagonal via fan (answer bus, row bus); "
                    "bus_paths routes a bus along a corridor, pcb_floorplan's path between two blocks or points given: its members side by "
