@@ -869,9 +869,11 @@ struct KICAD_OPENAPI_SERVICE::IMPL
     KOPENAPI_RESULT invokeParsed( const std::string& aName, const nlohmann::json& aArgs,
                                   const std::string& aCaller = {} ) const;
 
-    /// @brief The method exists, may run here, and its arguments match its schema; else the error
+    /// @brief The method exists, may run here, and its arguments match its schema; else the error.
+    /// aSpelt: the arguments with a net spelt the method's way (KopenapiNetSpelling) when they differ
     std::optional<KOPENAPI_RESULT> checkCall( const std::string& aName, const nlohmann::json& aArgs,
-                                              std::optional<KOPENAPI_METHOD>& aMethod ) const;
+                                              std::optional<KOPENAPI_METHOD>& aMethod,
+                                              std::optional<nlohmann::json>&  aSpelt ) const;
 
     /// @brief The call as it runs on the main thread (history marks, journal, busy state);
     /// aStarted (tracing) gets the time it started
@@ -1243,8 +1245,9 @@ static void addPoints( nlohmann::json& aJson, int aDepth )
 
 
 std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std::string&              aName,
-                                                                      const nlohmann::json&           aArgs,
-                                                                      std::optional<KOPENAPI_METHOD>& aMethod ) const
+                                                                      const nlohmann::json&           aRawArgs,
+                                                                      std::optional<KOPENAPI_METHOD>& aMethod,
+                                                                      std::optional<nlohmann::json>&  aSpelt ) const
 {
     std::optional<KOPENAPI_METHOD>& method = aMethod;
     method = KOPENAPI_REGISTRY::Get().Find( aName );
@@ -1283,15 +1286,23 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std
         return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI"
                                                     + std::string( aName == "app_quit" ? "; headless: POST /api/v1/shutdown" : "" ) );
 
+    std::string spellingError;
+    aSpelt = KopenapiNetSpelling( method->inputSchema, aRawArgs, spellingError );
+
+    if( !spellingError.empty() )
+        return KOPENAPI_RESULT::Error( 400, spellingError );
+
+    const nlohmann::json& args = aSpelt ? *aSpelt : aRawArgs;
+
     // unknown names first (a misspelt required name reads better as "did you mean"), then the
     // required ones and the plain top-level types (short messages), then the whole inputSchema
     // (nested types, enums, ranges)
     if( const std::vector<std::string> known = KopenapiKnownArgs( method->inputSchema ); !known.empty() )
     {
-        for( const auto& [key, value] : aArgs.items() )
+        for( const auto& [key, value] : args.items() )
         {
             if( std::find( known.begin(), known.end(), key ) == known.end() )
-                return KOPENAPI_RESULT::Error( 400, KopenapiValidateArgs( aName, method->inputSchema, aArgs ) );
+                return KOPENAPI_RESULT::Error( 400, KopenapiValidateArgs( aName, method->inputSchema, args ) );
         }
     }
 
@@ -1299,17 +1310,17 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std
     {
         for( const nlohmann::json& field : method->inputSchema["required"] )
         {
-            if( field.is_string() && !aArgs.contains( field.get<std::string>() ) )
+            if( field.is_string() && !args.contains( field.get<std::string>() ) )
                 return KOPENAPI_RESULT::Error( 400, "missing required field '"
                                                             + field.get<std::string>() + "'" );
         }
     }
 
-    if( const std::string bad = checkArgs( method->inputSchema, aArgs ); !bad.empty() )
+    if( const std::string bad = checkArgs( method->inputSchema, args ); !bad.empty() )
         return KOPENAPI_RESULT::Error( 400, bad );
 
     // unknown names, nested types, enums, ranges: the whole inputSchema
-    if( const std::string bad = KopenapiValidateArgs( aName, method->inputSchema, aArgs ); !bad.empty() )
+    if( const std::string bad = KopenapiValidateArgs( aName, method->inputSchema, args ); !bad.empty() )
         return KOPENAPI_RESULT::Error( 400, bad );
 
     return std::nullopt;
@@ -1386,7 +1397,7 @@ static bool servedByService( const std::string& aName )
 KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::startJob( const nlohmann::json& aArgs, const std::string& aCaller ) const
 {
     const std::string    name = aArgs.value( "method", std::string() );
-    const nlohmann::json args = aArgs.value( "arguments", nlohmann::json::object() );
+    nlohmann::json       args = aArgs.value( "arguments", nlohmann::json::object() );
 
     if( servedByService( name ) )
         return KOPENAPI_RESULT::Error( 400, "'" + name + "' answers at once: call it directly" );
@@ -1397,9 +1408,13 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::startJob( const nlohmann::json& aAr
     ensureKifaces();
 
     std::optional<KOPENAPI_METHOD> method;
+    std::optional<nlohmann::json>  spelt;
 
-    if( std::optional<KOPENAPI_RESULT> bad = checkCall( name, args, method ) )
+    if( std::optional<KOPENAPI_RESULT> bad = checkCall( name, args, method, spelt ) )
         return *bad;
+
+    if( spelt )
+        args = std::move( *spelt );
 
     KOPENAPI_RESULT   refused;
     const std::string id = queueJob( name, args, nullptr, refused );
@@ -1450,7 +1465,7 @@ std::string KICAD_OPENAPI_SERVICE::IMPL::queueJob( const std::string& aName, con
 
 
 KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&    aName,
-                                                           const nlohmann::json& aArgs,
+                                                           const nlohmann::json& aRawArgs,
                                                            const std::string&    aCaller ) const
 {
     ensureKifaces();
@@ -1460,40 +1475,43 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
         return *refused;
 
     if( aName == "remote_session" )
-        return KOPENAPI_REMOTE::Handle( aCaller, aArgs );
+        return KOPENAPI_REMOTE::Handle( aCaller, aRawArgs );
 
     std::optional<KOPENAPI_METHOD> method;
+    std::optional<nlohmann::json>  spelt;
 
-    if( std::optional<KOPENAPI_RESULT> bad = checkCall( aName, aArgs, method ) )
+    if( std::optional<KOPENAPI_RESULT> bad = checkCall( aName, aRawArgs, method, spelt ) )
         return *bad;
+
+    const nlohmann::json& args = spelt ? *spelt : aRawArgs;
 
     // answered on the HTTP thread: works while the main thread is busy
     if( aName == "api_trace" )
-        return KOPENAPI_RESULT::Ok( traceJson( aArgs ) );
+        return KOPENAPI_RESULT::Ok( traceJson( args ) );
 
     if( aName == "memory_summary" )
         return KOPENAPI_RESULT::Ok( KOPENAPI_MEMORY::Summary() );
 
     if( aName == "api_call_result" )
-        return lateCallResult( aArgs );
+        return lateCallResult( args );
 
     if( aName == "job_start" )
-        return startJob( aArgs, aCaller );
+        return startJob( args, aCaller );
 
     if( aName == "job_get" )
-        return KOPENAPI_JOBS::Get().Status( aArgs );
+        return KOPENAPI_JOBS::Get().Status( args );
 
     if( aName == "job_cancel" )
-        return KOPENAPI_JOBS::Get().Cancel( aArgs );
+        return KOPENAPI_JOBS::Get().Cancel( args );
 
     if( aName == "job_list" )
         return KOPENAPI_JOBS::Get().List();
 
     if( aName == "job_pause" || aName == "job_resume" )
-        return KOPENAPI_JOBS::Get().Pause( aArgs, aName == "job_pause" );
+        return KOPENAPI_JOBS::Get().Pause( args, aName == "job_pause" );
 
     if( aName == "job_step" )
-        return KOPENAPI_JOBS::Get().Step( aArgs );
+        return KOPENAPI_JOBS::Get().Step( args );
 
     if( KOPENAPI_REGISTRY::Get().IsEditing( aName ) )
     {
@@ -1508,10 +1526,10 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
 
     if( gate && KOPENAPI_REGISTRY::Get().IsConcurrentRead( aName ) )
     {
-        if( std::optional<KOPENAPI_RESULT> read = leaseRead( aName, aArgs ) )
+        if( std::optional<KOPENAPI_RESULT> read = leaseRead( aName, args ) )
         {
             if( tracing )
-                traceCall( aName, aArgs, *read, received, received );
+                traceCall( aName, args, *read, received, received );
 
             return *read;
         }
@@ -1525,7 +1543,7 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     if( timeout > syncJobWait() )
     {
         KOPENAPI_RESULT   refused;
-        const std::string id = queueJob( aName, aArgs, started, refused, true );
+        const std::string id = queueJob( aName, args, started, refused, true );
 
         if( !id.empty() )
             outcomeAsJob = awaitJob( alive, id, aName, syncJobWait() );
@@ -1534,12 +1552,12 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&   
     }
 
     KOPENAPI_RESULT outcome = outcomeAsJob ? std::move( *outcomeAsJob )
-                                           : runInMain( alive, waker, mainCall( aName, aArgs, started ), timeout, aName );
+                                           : runInMain( alive, waker, mainCall( aName, args, started ), timeout, aName );
 
     if( !tracing )
         return outcome;
 
-    traceCall( aName, aArgs, outcome, received, *started );
+    traceCall( aName, args, outcome, received, *started );
     return outcome;
 }
 

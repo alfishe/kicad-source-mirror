@@ -399,3 +399,68 @@ std::string KopenapiValidateArgs( const std::string& aMethod, const nlohmann::js
 
     return errors.Message();
 }
+
+
+std::optional<nlohmann::json> KopenapiNetSpelling( const nlohmann::json& aSchema, const nlohmann::json& aArgs,
+                                                   std::string& aError )
+{
+    if( !aArgs.is_object() || !aSchema.is_object() || !aSchema.contains( "properties" )
+        || !aSchema["properties"].is_object() )
+    {
+        return std::nullopt;
+    }
+
+    const nlohmann::json&         props = aSchema["properties"];
+    std::optional<nlohmann::json> out;
+
+    auto endsWith = []( const std::string& aKey, const std::string& aEnd )
+    {
+        return aKey.size() >= aEnd.size() && aKey.compare( aKey.size() - aEnd.size(), aEnd.size(), aEnd ) == 0
+               && ( aKey.size() == aEnd.size() || aKey[aKey.size() - aEnd.size() - 1] == '_' );
+    };
+
+    for( const auto& [key, value] : aArgs.items() )
+    {
+        if( props.contains( key ) )
+            continue;
+
+        std::string other;
+
+        if( endsWith( key, "net" ) )
+            other = key + "s";
+        else if( endsWith( key, "nets" ) )
+            other = key.substr( 0, key.size() - 1 );
+
+        if( other.empty() || !props.contains( other ) || aArgs.contains( other ) )
+            continue;
+
+        const nlohmann::json& otherSchema = props[other];
+        const bool            toList = otherSchema.is_object() && otherSchema.contains( "type" )
+                                       && otherSchema["type"].is_string() && otherSchema["type"] == "array";
+        nlohmann::json moved = value;
+
+        if( toList && value.is_string() )
+        {
+            moved = nlohmann::json::array( { value } );
+        }
+        else if( !toList && value.is_array() )
+        {
+            if( value.size() != 1 )
+            {
+                aError = "'" + key + "': this method takes one net, in '" + other + "' (" + std::to_string( value.size() )
+                         + " given)";
+                return std::nullopt;
+            }
+
+            moved = value[0];
+        }
+
+        if( !out )
+            out = aArgs;
+
+        out->erase( key );
+        ( *out )[other] = std::move( moved );
+    }
+
+    return out;
+}
