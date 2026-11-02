@@ -17305,17 +17305,46 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         // the stubs leave as a fan of rays from the pads' outer ends, in pin order (a bus leaves
         // uncrossed), spreading the vias to a pitch where they fit; with several via lines the
         // neighbours alternate lines and the spread only has to pass a stub between two vias. The fan spans
-        // the pins it fans (a net with a pad elsewhere), whatever nets were asked
+        // the pins that take a via (ports: the plan's rails and pins moved to the other layer; else a net with
+        // a pad elsewhere), whatever nets were asked, and spreads them by the gap between two of them
         std::vector<PAD*> fanned;
+
+        auto takesVia = [&]( PAD* aPad )
+        {
+            if( aPad->GetNetCode() <= 0 || !farEnd( aPad ) )
+                return false;
+
+            if( !withPorts )
+                return true;
+
+            const auto portOf = plan.find( str( aPad->GetNumber() ) );
+            return portOf != plan.end() && ( portOf->second.kind == "rail" || portOf->second.layer == "other" );
+        };
 
         for( PAD* pad : list )
         {
-            if( pad->GetNetCode() > 0 && farEnd( pad ) )
+            if( takesVia( pad ) )
                 fanned.push_back( pad );
         }
 
         if( fanned.empty() )
+        {
+            for( PAD* pad : list )
+            {
+                if( pad->GetNetCode() > 0 && farEnd( pad ) )
+                    fanned.push_back( pad );
+            }
+        }
+
+        if( fanned.empty() )
             fanned = list;
+
+        int fanPitch = std::numeric_limits<int>::max();
+
+        for( size_t i = 1; i < fanned.size(); ++i )
+            fanPitch = std::min<int>( fanPitch, (int) std::abs( along( fanned[i]->GetPosition() ) - along( fanned[i - 1]->GetPosition() ) ) );
+
+        fanPitch = std::max( pitch, fanPitch == std::numeric_limits<int>::max() ? pitch : fanPitch );
 
         const int64_t mid = ( along( fanned.front()->GetPosition() ) + along( fanned.back()->GetPosition() ) ) / 2;
         int64_t       tipLine = std::numeric_limits<int64_t>::min();
@@ -17346,9 +17375,9 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
                                                     : std::max( { viaDia / 2.0 + viaKeep, double( viaDrill + bds.m_HoleToHoleMin ) } ) )
                                        : double( width + clearance ) )
                             + pcbIUScale.mmToIU( 0.005 );
-        const double cosMax = std::min( 0.999, std::max( 0.2, double( width + clearance ) / pitch ) );
+        const double cosMax = std::min( 0.999, std::max( 0.2, double( width + clearance ) / fanPitch ) );
         // a neighbour's ray, at up to the fan's steepest angle, passes a via by the spread times its cosine
-        const double spread = need <= pitch ? 1.0 : withVias ? need / ( pitch * cosMax ) : need / pitch;
+        const double spread = need <= fanPitch ? 1.0 : withVias ? need / ( fanPitch * cosMax ) : need / fanPitch;
         const double tanMax = std::sqrt( 1.0 - cosMax * cosMax ) / cosMax;
         const int64_t rayLength = std::max<int64_t>( clearance, KiROUND( maxOffset * ( spread - 1.0 ) / tanMax ) );
         const int64_t rayEnd = tipLine + rayLength;
