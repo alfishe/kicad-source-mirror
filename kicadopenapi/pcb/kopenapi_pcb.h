@@ -13,6 +13,7 @@
 #include <optional>
 #include <set>
 #include <vector>
+#include <functional>
 #include <string>
 
 #include <math/box2.h>
@@ -119,6 +120,13 @@ nlohmann::json KopenapiPanelEdgeJson( FOOTPRINT* aFootprint, const std::string& 
 
 class BOARD;
 class BOARD_ITEM;
+
+/// @brief The N net of a differential pair whose P net is aNet, by name, as pcb_route and pcb_net_roles
+/// pair them: KiCad's rule (+ / -, P / N before trailing digits and '_'), DP / DM and _DP / _DN at the
+/// end, DP / DM before a '_' suffix (USB_DP_MCU / USB_DM_MCU); the case of the name kept.
+/// The first of these names aExists accepts; empty when none (aNet is not a P side).
+std::string KopenapiPairPartner( BOARD* aBoard, const std::string& aNet,
+                                 const std::function<bool( const std::string& )>& aExists );
 
 /// @brief A board item by uuid (or a unique uuid prefix), a footprint by reference, a pad as
 /// REF.NUMBER; nullptr if none

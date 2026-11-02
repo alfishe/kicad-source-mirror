@@ -50,6 +50,46 @@ static std::string netName( const wxString& aName )
 }
 
 
+std::string KopenapiPairPartner( BOARD* aBoard, const std::string& aNet,
+                                 const std::function<bool( const std::string& )>& aExists )
+{
+    std::vector<std::string> names;
+    wxString                 complement;
+
+    if( aBoard->MatchDpSuffix( wxString::FromUTF8( aNet ), complement ) == 1 )
+        names.push_back( complement.ToStdString( wxConvUTF8 ) );
+
+    const size_t len = aNet.size();
+
+    // the N letter in the P letter's case
+    if( len > 2 && ( aNet.compare( len - 2, 2, "DP" ) == 0 || aNet.compare( len - 2, 2, "dp" ) == 0 ) )
+    {
+        const bool        caps = aNet.back() == 'P';
+        const std::string head = aNet.substr( 0, len - 1 );
+
+        names.push_back( head + ( caps ? "M" : "m" ) );
+
+        if( len > 3 && aNet[len - 3] == '_' )
+            names.push_back( head + ( caps ? "N" : "n" ) );
+    }
+
+    // DP / DM with a suffix after it (USB_DP_MCU / USB_DM_MCU)
+    static const std::regex dpSuffixed( R"(^(.*[Dd])([Pp])(_[^/]*)$)" );
+    std::smatch             m;
+
+    if( std::regex_match( aNet, m, dpSuffixed ) )
+        names.push_back( m[1].str() + ( m[2].str() == "P" ? "M" : "m" ) + m[3].str() );
+
+    for( const std::string& name : names )
+    {
+        if( name != aNet && aExists( name ) )
+            return name;
+    }
+
+    return std::string();
+}
+
+
 static std::string upper( std::string aText )
 {
     for( char& c : aText )
@@ -431,7 +471,7 @@ static KOPENAPI_RESULT h_pcb_net_roles( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
-    // differential pairs: KiCad's suffix rule plus DP / DM and D+ / D-; a DRC diff-pair rule alone
+    // differential pairs by name (KopenapiPairPartner, as pcb_route); a DRC diff-pair rule alone
     // makes a pair too when the complement exists
     nlohmann::json        pairs = nlohmann::json::array();
     std::set<std::string> paired;
@@ -443,36 +483,10 @@ static KOPENAPI_RESULT h_pcb_net_roles( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( isPowerRole( f.role ) || paired.count( f.name ) || ( f.fixedRole && f.role != "pair" ) )
             continue;
 
-        std::string other;
-        wxString    complement;
+        const std::string other = KopenapiPairPartner( board, f.name,
+                [&]( const std::string& aName ) { return aName != f.name && byName.count( aName ) > 0; } );
 
-        if( board->MatchDpSuffix( wxString::FromUTF8( f.name ), complement ) == 1 && byName.count( str( complement ) ) )
-        {
-            other = str( complement );
-        }
-        else
-        {
-            for( const auto& [p, n] : std::vector<std::pair<std::string, std::string>>{
-                         { "DP", "DM" }, { "D+", "D-" }, { "_DP", "_DN" } } )
-            {
-                const std::string u = upper( f.name );
-
-                if( u.size() > p.size() && u.compare( u.size() - p.size(), p.size(), p ) == 0 )
-                {
-                    other = f.name.substr( 0, f.name.size() - p.size() ) + n;
-                    break;
-                }
-            }
-
-            // USB's DP / DM with a suffix after it (USB_DP_MCU / USB_DM_MCU), as pcb_route pairs them
-            static const std::regex dpSuffixed( R"(^(.*D)P(_[^/]*)$)" );
-            std::smatch             m;
-
-            if( other.empty() && std::regex_match( f.name, m, dpSuffixed ) )
-                other = m[1].str() + "M" + m[2].str();
-        }
-
-        if( other.empty() || !byName.count( other ) )
+        if( other.empty() )
             continue;
 
         NET_FACTS&            g = nets[byName[other]];

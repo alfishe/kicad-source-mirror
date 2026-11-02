@@ -5860,19 +5860,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( const std::string& netP : jobNets )
         {
-            wxString other;
+            const std::string netN = KopenapiPairPartner( board, netP,
+                    [&]( const std::string& aName ) { return jobNets.count( aName ) > 0; } );
 
-            if( board->MatchDpSuffix( wxString::FromUTF8( netP ), other ) == 1 && jobNets.count( str( other ) ) )
-            {
-                addPair( netP, str( other ) );
-                continue;
-            }
-
-            static const std::regex dp( R"(^(.*D)P((?:_[^/]*)?)$)" );
-            std::smatch             m;
-
-            if( std::regex_match( netP, m, dp ) )
-                addPair( netP, m[1].str() + "M" + m[2].str() );
+            if( !netN.empty() )
+                addPair( netP, netN );
         }
 
         if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
