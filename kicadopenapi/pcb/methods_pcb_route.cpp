@@ -13053,15 +13053,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
             for( PAD* pad : fp->Pads() )
             {
-                double nearest = std::numeric_limits<double>::max();
-
-                for( PAD* other : fp->Pads() )
-                {
-                    if( other != pad && other->GetPosition() != pad->GetPosition() )
-                        nearest = std::min( nearest, (double) ( other->GetPosition() - pad->GetPosition() ).EuclideanNorm() );
-                }
-
-                const bool fine = nearest <= pcbIUScale.mmToIU( 0.65 );
+                const bool fine = KopenapiPadFinePitch( board, pad );
 
                 if( fine )
                     finePads.insert( pad );

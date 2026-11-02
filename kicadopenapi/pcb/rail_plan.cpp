@@ -266,7 +266,7 @@ std::vector<RAIL_PIN_PLAN> planRowRailVias( BOARD* aBoard, FOOTPRINT* aFp, const
     const int                    holeToHole = bds.m_HoleToHoleMin;
     const int                    stubMin = bds.m_TrackMinWidth;
 
-    // the part's outer rows: fine-pitch pads (a neighbour within 0.65 mm) and their way out
+    // the part's outer rows: fine-pitch pads (KopenapiPadFinePitch) and their way out
     BOX2I centres( aFp->Pads().front()->GetPosition(), VECTOR2I( 0, 0 ) );
 
     for( PAD* pad : aFp->Pads() )
@@ -277,15 +277,7 @@ std::vector<RAIL_PIN_PLAN> planRowRailVias( BOARD* aBoard, FOOTPRINT* aFp, const
 
     for( PAD* pad : aFp->Pads() )
     {
-        double nearest = std::numeric_limits<double>::max();
-
-        for( PAD* other : aFp->Pads() )
-        {
-            if( other != pad && other->GetPosition() != pad->GetPosition() )
-                nearest = std::min( nearest, (double) ( other->GetPosition() - pad->GetPosition() ).EuclideanNorm() );
-        }
-
-        if( nearest <= pcbIUScale.mmToIU( 0.65 ) )
+        if( KopenapiPadFinePitch( aBoard, pad ) )
             fine.insert( pad );
 
         if( std::optional<VECTOR2I> dir = outwardOf( pad, centres ) )
@@ -450,12 +442,25 @@ std::vector<RAIL_PIN_PLAN> planRowRailVias( BOARD* aBoard, FOOTPRINT* aFp, const
 
         std::sort( row.begin(), row.end(), [&]( const PAD* x, const PAD* y ) { return along( x ) < along( y ); } );
 
+        // the row's pitch (the median step between its pins); a run ends where a pin position of that
+        // lattice is empty
+        std::vector<int64_t> steps;
+
+        for( size_t i = 1; i < row.size(); ++i )
+        {
+            if( int64_t step = along( row[i] ) - along( row[i - 1] ); step > 0 )
+                steps.push_back( step );
+        }
+
+        std::nth_element( steps.begin(), steps.begin() + steps.size() / 2, steps.end() );
+        const int64_t rowPitch = steps.empty() ? 1 : std::max<int64_t>( steps[steps.size() / 2], 1 );
+
         std::vector<std::vector<const PAD*>> runs( 1 );
 
         for( size_t i = 0; i < row.size(); ++i )
         {
             const PAD* p = row[i];
-            const bool apart = i > 0 && along( p ) - along( row[i - 1] ) > pcbIUScale.mmToIU( 0.65 );
+            const bool apart = i > 0 && std::llround( double( along( p ) - along( row[i - 1] ) ) / rowPitch ) > 1;
 
             if( !railOf( p ) || apart )
                 runs.emplace_back();
