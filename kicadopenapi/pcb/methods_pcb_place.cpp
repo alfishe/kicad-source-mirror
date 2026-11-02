@@ -2963,11 +2963,13 @@ std::string pinSide( FOOTPRINT* aPart, PAD* aPad )
 /// capacitor) takes a free supply pad (adjacent pads of one rail count as one) whose ground pad is
 /// nearest, the smallest value first.  Rails are told by role (railNets), not by pad count.  Order:
 /// parts on two nets of their own (a crystal), decoupling, the rest.  Parts are staged in aCommit;
-/// aOut gets placed / unplaced (and decoupling_far: capacitors over aDecapMaxMm from their pin).  Only
-/// filter parts (a capacitor, inductor, ferrite or resistor) across two rails decouple: a battery or a
-/// diode there is placed like the rest.
+/// aOut gets placed / unplaced (and decoupling_far: capacitors over aDecapMaxMm from their pin, bulk
+/// ones over aBulkMaxMm; both are placed as near as they go).  Only filter parts (a capacitor,
+/// inductor, ferrite or resistor) across two rails decouple: a battery or a diode there is placed like
+/// the rest.
 void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::vector<FOOTPRINT*> aParts,
-                 const NEAR_OPTIONS& aOptions, bool aOpposite, double aDecapMaxMm, std::optional<bool> aDecapOtherSide,
+                 const NEAR_OPTIONS& aOptions, bool aOpposite, double aDecapMaxMm, double aBulkMaxMm,
+                 std::optional<bool> aDecapOtherSide,
                  nlohmann::json& aOut, std::vector<KIID>& aMoved, bool aDecapVias = true )
 {
     const bool decapOtherSide = aDecapOtherSide.value_or( finePitch( aAnchor ) )
@@ -3001,6 +3003,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         bool             decoupling = false;   // across two rails of the anchor
         double           farads = 1.0;
         bool             capacitor = false;
+        bool             bulk = false;          // a capacitor of 10 uF or more, or electrolytic (CP_ footprint)
         bool             inductor = false;      // a regulator's inductor at its switching pin
     };
 
@@ -3038,6 +3041,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         member.capacitor = faradsOf( part ).has_value() || prefix == "C";
         member.farads = faradsOf( part ).value_or( 1.0 );
+        member.bulk = member.capacitor
+                      && ( ( faradsOf( part ) && *faradsOf( part ) >= 10e-6 * ( 1 - 1e-9 ) )
+                           || str( part->GetFPID().GetLibItemName().wx_str() ).rfind( "CP_", 0 ) == 0 );
         member.inductor = !member.capacitor && ( henryValue( part ) || prefix == "L" );
         member.decoupling = member.ownNets == 0
                             && ( member.capacitor || member.inductor || prefix == "R" || prefix == "FB" );
@@ -3799,10 +3805,13 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         {
             row["decoupling"] = true;
 
-            if( placement.padDistanceMm > aDecapMaxMm )
+            if( member.bulk )
+                row["bulk"] = true;
+
+            if( const double reach = member.bulk ? aBulkMaxMm : aDecapMaxMm; placement.padDistanceMm > reach )
             {
                 farAway.push_back( { { "ref", row["ref"] }, { "target", row["target"] }, { "pad_distance_mm", row["pad_distance_mm"] },
-                                 { "decap_max_mm", aDecapMaxMm } } );
+                                 { "decap_max_mm", reach } } );
             }
         }
 
@@ -5360,7 +5369,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         options.corridors = &corridors;
 
         placeGroup( board, groupCommit, anchor, parts, options, group.value( "side", std::string( "same" ) ) == "opposite",
-                    group.value( "decap_max_mm", 3.0 ),
+                    group.value( "decap_max_mm", 3.0 ), group.value( "bulk_max_mm", 10.0 ),
                     group.contains( "decap_bottom" ) ? std::optional<bool>( group.value( "decap_bottom", false ) ) : std::nullopt,
                     row, placed, group.value( "decap_vias", true ) );
 
@@ -5533,6 +5542,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
         const std::string side = spec.value( "side", std::string( "same" ) );
         const double      decapMax = spec.value( "decap_max_mm", 3.0 );
+        const double      bulkMax = spec.value( "bulk_max_mm", 10.0 );
 
         if( side != "same" && side != "opposite" )
             return fail( KOPENAPI_RESULT::Error( 400, "side: same (as the anchor) or opposite (under it, on the other side of the board)" ) );
@@ -5587,7 +5597,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                     corridors.push_back( std::move( c ) );
 
                 options.corridors = &corridors;
-                placeGroup( board, aCommit, anchor, parts, options, side == "opposite", decapMax,
+                placeGroup( board, aCommit, anchor, parts, options, side == "opposite", decapMax, bulkMax,
                             spec.contains( "decap_bottom" ) ? std::optional<bool>( spec.value( "decap_bottom", false ) ) : std::nullopt,
                             aOut, aMoved, spec.value( "decap_vias", true ) );
             };
@@ -5817,6 +5827,7 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "depth":{"type":"integer","description":"from_schematic: how far sch_subcircuit grows (default 2)"},
     "decoupling":{"type":"string","enum":["per_pin","schematic"],"description":"add the anchor's decoupling capacitors: per_pin - each supply pin group of the anchor (adjacent pins of a rail count once) one capacitor under 1 uF of its rail plus one bulk per rail, the rail's capacitors split among the parts on it by count, each to the part drawn nearest to it (schematic if open, else board); schematic - C parts across two of its rails drawn nearest to it on its sheet, one per supply pin group (a guess). The answer's decoupling.chosen lists them"},
     "decap_max_mm":{"type":"number","default":3,"description":"a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far"},
+    "bulk_max_mm":{"type":"number","default":10,"description":"a bulk capacitor (10 uF or more, or electrolytic: a CP_ footprint; its row says bulk) serves the rail, not one pin: placed as near as the others, it is listed in decoupling_far only past this"},
     "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off"},
     "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach: each supply pin gets a via spot just beyond its inner end, under the body, clear of the other nets' copper and spots by the clearance (else beyond its outer end; a neighbour pin of the net within 1.2 mm shares it), and the cap's pad goes inward of the spot where there is room, else on any side of it, its other pads clear of every spot; the row gives via_spot_mm; default on for a fine-pitch anchor (0.65 mm or less), off otherwise; the row says side"},
     "ports_keep_mm":{"type":"number","default":0,"minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard this far, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter, and a series part - two pads, one signal net of the anchor's - the band of its pin's side; a decoupling capacitor only when that alone brings it within decap_max_mm); two alike series parts on neighbour pins the other way round than the pins trade places (swapped); corridors lists them as ports <side> (<far parts>); 0 off"},
