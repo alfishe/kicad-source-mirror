@@ -4300,18 +4300,22 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     };
 
     // stop_on_plateau_s: no connection more routed for that long stops the call as job_cancel does
-    // (what is routed is kept)
+    // (what is routed is kept); in the retry / rip-up pass it ends that pass, the gaps and clean_up
+    // passes still run (each under its own budget) and the call stops after them
     const double plateauS = std::clamp( aArgs.value( "stop_on_plateau_s", 0.0 ), 0.0, 86400.0 );
     int          plateauBest = -1;
     auto         plateauSince = clockNow();
     bool         plateauStopped = false;
     size_t       plateauHeld = 0;   ///< connections still to have their turn (first pass, retry pass)
     bool         plateauTurnCut = false;
+    bool         plateauInRipUp = false;   ///< the retry / rip-up pass runs: a plateau ends that pass
+    bool         plateauPassCut = false;
+    bool         plateauOver = false;      ///< past the rip-up pass: no plateau any more
 
     // while connections still wait for their turn, a plateau ends the turn of the one routing, not the call
     auto plateauCheck = [&]( const std::chrono::steady_clock::time_point& aNow )
     {
-        if( plateauS > 0 && !plateauStopped && std::chrono::duration<double>( aNow - plateauSince ).count() > plateauS )
+        if( plateauS > 0 && !plateauStopped && !plateauOver && std::chrono::duration<double>( aNow - plateauSince ).count() > plateauS )
         {
             if( plateauHeld > 0 )
             {
@@ -4320,6 +4324,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             }
 
             plateauStopped = true;
+
+            if( plateauInRipUp )
+            {
+                plateauPassCut = true;
+                return;
+            }
+
             KopenapiJobStopSelf( "stop_on_plateau_s: no connection routed for " + mmText( plateauS ) + " s" );
         }
     };
@@ -4346,7 +4357,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             ++wallCaps;
         }
 
-        return KopenapiJobCancelled() || plateauTurnCut || ( tryDeadline && ( now > *tryDeadline || wallCapped ) );
+        return KopenapiJobCancelled() || plateauTurnCut || plateauPassCut || ( tryDeadline && ( now > *tryDeadline || wallCapped ) );
     };
 
     profile.stop = overTime;
@@ -6760,14 +6771,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         if( !ok && overTime() )
         {
             const std::string budget = plateauTurnCut ? std::string( "stop_on_plateau_s" ) : budgetName;
+            const bool        stopped = KopenapiJobCancelled() || plateauPassCut;
 
-            if( !KopenapiJobCancelled() )
+            if( !stopped )
             {
                 profile.budgetSpent[profile.pass]++;
                 aAttempt["budget"] = budget;
             }
 
-            aAttempt["reason"] = std::string( KopenapiJobCancelled() ? ( plateauStopped ? "stopped (stop_on_plateau_s)" : "stopped (job_cancel)" ) : "the connection's " + budget + " ran out" )
+            aAttempt["reason"] = std::string( stopped ? ( plateauStopped ? "stopped (stop_on_plateau_s)" : "stopped (job_cancel)" ) : "the connection's " + budget + " ran out" )
                                  + " after " + std::to_string( aTries ) + " tries; last: " + aAttempt.value( "reason", std::string( "-" ) );
         }
         else if( !ok && aTries >= maxTries )
@@ -12136,7 +12148,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return copperBetween( board, a, b );
     };
 
-    for( int round = 0; round < ripRounds && !KopenapiJobCancelled(); ++round )
+    plateauInRipUp = true;
+
+    for( int round = 0; round < ripRounds && !KopenapiJobCancelled() && !plateauPassCut; ++round )
     {
         bool progress = false;
 
@@ -12171,6 +12185,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         for( size_t index : order )
         {
             TURN turn{ plateauHeld, round == 0 };
+
+            if( plateauPassCut )
+                break;
 
             if( done[index] )
                 continue;
@@ -12448,7 +12465,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 for( size_t v : victims )
                 {
                     if( ok && overTime() )
-                        ok = false, failedAt = KopenapiJobCancelled() ? "stopped" : "time_budget";
+                        ok = false, failedAt = KopenapiJobCancelled() || plateauPassCut ? "stopped" : "time_budget";
 
                     if( !ok )
                         break;
@@ -12701,6 +12718,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             break;
     }
 
+    // a plateau that ran out with the pass's last turns (skipped ones try nothing) still counts
+    plateauCheck( clockNow() );
+    plateauInRipUp = false;
+    plateauPassCut = false;
+    plateauOver = true;
     tryDeadline.reset();
 
     // Gaps between two pieces of a net's copper: from the end of one piece to the other
@@ -13070,6 +13092,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             board->GetConnectivity()->RecalculateRatsnest();
         }
     }
+
+    if( plateauStopped && !KopenapiJobCancelled() )
+        KopenapiJobStopSelf( "stop_on_plateau_s: no connection routed for " + mmText( plateauS ) + " s (rip-up ended there; gaps and clean_up ran)" );
 
     if( !unfilled.empty() )
     {
@@ -19011,7 +19036,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
                         "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it); a detour over 1.6 x follows a plan through vias instead when that is a quarter shorter, a via counted as via_cost_mm (kept when a fifth shorter); clean_up: tried / skipped / kept / vias_removed / via_ways / vias_added / shortened_mm; rows cleaned"},
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
-                        "attempts":{"type":"boolean","default":false,"description":"pns: each row lists its tries (at most 40): kind, pass, layer, from, points (vias / corners), routed, ms; a failed one its reason, stopped_at_mm, toward_mm, walls_in, the nearest blocker"},"stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does; while connections still wait for their first-pass try (first_pass_budget_s bounding it) or, failed there, for their turn in the retry pass (fewest tries first), it ends the turn of the one routing instead (budget stop_on_plateau_s): what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
+                        "attempts":{"type":"boolean","default":false,"description":"pns: each row lists its tries (at most 40): kind, pass, layer, from, points (vias / corners), routed, ms; a failed one its reason, stopped_at_mm, toward_mm, walls_in, the nearest blocker"},"stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does; while connections still wait for their first-pass try (first_pass_budget_s bounding it) or, failed there, for their turn in the retry pass (fewest tries first), it ends the turn of the one routing instead (budget stop_on_plateau_s); in the rip-up pass it ends that pass, and the gaps and clean_up passes still run (each under its own budget) before the call stops: what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
                         "budgets":{"type":"string","enum":["time","work"],"default":"time","description":"time: first_pass_budget_s, rip_up_budget_s and stop_on_plateau_s on the wall clock; work: counted in the router's work (its stop checks: each walkaround / shove step and try) at work_per_s a second, so the same board routes the same under any load (A/B comparisons), the wall clock only a hard cap at wall_cap_x times a budget (profile budget: mode, work, work_per_s, wall_caps)"},
                         "trace_attempt":{"type":"integer","minimum":0,"default":0,"description":"debug: trace the router's try of this number (1 = the first; the segments' attempt): trace {attempt, from, to, layer, mode, vias, fronts, board_tracks (the board's track order), board_tracks_hash, pns {events: the router's steps as text without addresses, file:line first, total, capped, other_threads}, pns_hash, routed, out}; two runs' traces show where they part"},
                         "trace_last":{"type":"integer","minimum":0,"description":"debug: with trace_attempt, trace every try up to this one: traces [{attempt, from, to, ..., board_tracks_hash, pns_hash, pns_total, routed}] (no steps, no track list): the first try whose hashes differ between two runs is the one to trace alone"},
