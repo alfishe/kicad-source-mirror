@@ -60,6 +60,8 @@ struct GRID_PARAMS
 {
     std::vector<PCB_LAYER_ID> layers;          ///< routing layers
     int                       cell = 0;        ///< 0: from the finest class
+    bool                      coarse = false;  ///< cell 0: half the finest class's track pitch (rounded up), not a third (the global stage)
+    float                     raceWait = 0.25f; ///< once the first variant is done, the others' time left: this share of its time (2 s at least)
     int                       variants = 0;    ///< 0: half the cores, up to the built-ins, as many as the memory allows
     int64_t                   memoryBudget = 0; ///< bytes the lanes may take; 0: half the memory available now
     int                       maxRounds = 40;
@@ -221,6 +223,28 @@ struct GRID_RESULT
     std::vector<std::pair<int, int64_t>> costliest;   ///< the winner's nets that took the most search states
     std::shared_ptr<GRID_TIMELINE>    timeline;    ///< with GRID_PARAMS::record: every variant's steps
 };
+
+/// @brief The way one connection takes through its net's copper on the grid: runs of track per
+/// layer from end to end, a via where the layer changes
+struct GRID_CORRIDOR
+{
+    struct RUN
+    {
+        PCB_LAYER_ID          layer = UNDEFINED_LAYER;
+        std::vector<VECTOR2I> points;
+    };
+
+    bool                  found = false;
+    std::vector<RUN>      runs;
+    std::vector<VECTOR2I> vias;
+    double                length = 0;   ///< board units
+};
+
+/// @brief The path between two ends of a net in its grid copper (the net's tracks and vias as a
+/// graph, a run's end on another run of its layer joined there, each of aNet's ends joining the copper
+/// within aTolerance of it on its layers)
+GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper, const BOARD_CONNECTED_ITEM* aFrom,
+                            const BOARD_CONNECTED_ITEM* aTo, int aTolerance );
 
 /**
  * Join each net's ends over one grid of the board, all nets together: negotiated congestion
