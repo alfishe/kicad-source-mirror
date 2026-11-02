@@ -806,7 +806,7 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
         const PNS::ITEM* opposingItem = aLineIsFirst ? aItemB : aItemA;
         const bool       memo = aOpposingItem && opposingItem && opposingItem->BoardItem() == aOpposingItem;
 
-        auto evaluate = [&]( const VECTOR2I& aStart, const VECTOR2I& aEnd ) -> bool
+        auto evaluate = [&]( const VECTOR2I& aStart, const VECTOR2I& aEnd ) -> DRC_CONSTRAINT
         {
             SEGMENT_RULE_CACHE_KEY key{ aOpposingItem, aLineItem->Net(), aStart,   aEnd, 0,
                                         width,         board_layer,      hostType, aLineIsFirst };
@@ -822,7 +822,7 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
                 auto it = m_segmentRuleCache.find( key );
 
                 if( it != m_segmentRuleCache.end() )
-                    return pickSmallerConstraint( bestConstraint, it->second );
+                    return it->second;
             }
 
             dummyTrack.SetStart( aStart );
@@ -842,10 +842,11 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
                 m_segmentRuleCache.emplace( key, segConstraint );
             }
 
-            return pickSmallerConstraint( bestConstraint, segConstraint );
+            return segConstraint;
         };
 
-        bool evaluated = false;
+        std::vector<std::pair<SEG, DRC_CONSTRAINT>> pieces;
+        bool                                        mixed = false;
 
         for( int i = 0; i < tempTrackSegmentCount( aLineItem ); i++ )
         {
@@ -861,19 +862,69 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
                 seg = *inReach;
             }
 
-            evaluated = true;
+            DRC_CONSTRAINT c = evaluate( seg.A, seg.B );
 
-            if( evaluate( seg.A, seg.B ) )
-                break;
+            if( !pieces.empty() && !mixed )
+            {
+                const DRC_CONSTRAINT& first = pieces.front().second;
+                mixed = c.IsNull() != first.IsNull() || c.m_Value.HasMin() != first.m_Value.HasMin()
+                        || ( c.m_Value.HasMin() && c.m_Value.Min() != first.m_Value.Min() );
+            }
+
+            pieces.emplace_back( seg, c );
+
+            if( !useReach && pickSmallerConstraint( bestConstraint, c ) )
+                return bestConstraint;
         }
 
         // Nothing of the line within reach yet: a walkaround builds the item's hull from this value
         // and brings the line to it, so the line is probed where it will pass, at the item (one
         // evaluation instead of one per segment of a line that may have hundreds)
-        if( !evaluated && useReach )
+        if( pieces.empty() && useReach )
         {
             const VECTOR2I at = aOpposingItem->GetBoundingBox().Centre();
-            evaluate( at, at );
+            return evaluate( at, at );
+        }
+
+        const SHAPE* other = mixed && opposingItem ? opposingItem->Shape( aPNSLayer ) : nullptr;
+
+        // Pieces under different rules (one ends in a courtyard, one passes the item outside it): the
+        // one nearest to breaking its own clearance decides; the smallest clearance would let the
+        // piece that passes the item take the rule of a piece that does not come near it
+        if( other )
+        {
+            const DRC_CONSTRAINT* decide = nullptr;
+            int64_t               bestSlack = 0;
+
+            for( const auto& [seg, c] : pieces )
+            {
+                if( c.IsNull() )
+                    continue;
+
+                const int     clearance = c.m_Value.HasMin() ? c.m_Value.Min() : 0;
+                SHAPE_SEGMENT piece( seg, width );
+                int           actual = 0;
+
+                if( !piece.Collide( other, std::numeric_limits<int>::max() / 4, &actual ) )
+                    continue;
+
+                const int64_t slack = (int64_t) clearance - actual;
+
+                if( !decide || slack > bestSlack )
+                {
+                    decide = &c;
+                    bestSlack = slack;
+                }
+            }
+
+            if( decide )
+                return *decide;
+        }
+
+        for( const auto& [seg, c] : pieces )
+        {
+            if( pickSmallerConstraint( bestConstraint, c ) )
+                break;
         }
 
         return bestConstraint;
@@ -1197,6 +1248,7 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
         reach.Inflate( width / 2 + *m_biggestClearance );
 
         std::vector<size_t> seen;
+        std::vector<SEG>    pieces;
 
         for( int i = 0; i < segments; ++i )
         {
@@ -1206,6 +1258,7 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
             if( !inReach )
                 continue;
 
+            pieces.push_back( *inReach );
             size_t k = trackKey( inReach->A, inReach->B, width );
 
             if( std::find( seen.begin(), seen.end(), k ) == seen.end() )
@@ -1216,6 +1269,17 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
         }
 
         hash_combine( h, std::hash<size_t>()( seen.size() ) );
+
+        // pieces under different rules: which one decides depends on how near each comes
+        if( seen.size() > 1 )
+        {
+            for( const SEG& piece : pieces )
+            {
+                add( piece.A );
+                add( piece.B );
+            }
+        }
+
         return h;
     }
 
