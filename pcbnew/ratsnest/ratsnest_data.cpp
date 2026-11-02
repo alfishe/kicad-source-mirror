@@ -48,6 +48,7 @@ using namespace std::placeholders;
 #include <footprint.h>
 #include <map>
 #include <pad.h>
+#include <pcb_track.h>
 
 
 bool CnAnchorTieLess( const CN_ANCHOR& aA, const CN_ANCHOR& aB )
@@ -82,6 +83,23 @@ bool CnAnchorTieLess( const CN_ANCHOR& aA, const CN_ANCHOR& aB )
 
     if( a->GetLayer() != b->GetLayer() )
         return a->GetLayer() < b->GetLayer();
+
+    // copper laid in this session has random uuids: its geometry orders it first
+    if( a->Type() == PCB_TRACE_T || a->Type() == PCB_ARC_T || a->Type() == PCB_VIA_T )
+    {
+        const PCB_TRACK* ta = static_cast<const PCB_TRACK*>( a );
+        const PCB_TRACK* tb = static_cast<const PCB_TRACK*>( b );
+        const auto       key = []( const PCB_TRACK* t )
+        {
+            const VECTOR2I mid = t->Type() == PCB_ARC_T ? static_cast<const PCB_ARC*>( t )->GetMid() : VECTOR2I();
+
+            return std::make_tuple( t->GetStart().x, t->GetStart().y, t->GetEnd().x, t->GetEnd().y, mid.x, mid.y,
+                                    t->GetWidth() );
+        };
+
+        if( key( ta ) != key( tb ) )
+            return key( ta ) < key( tb );
+    }
 
     return a->m_Uuid < b->m_Uuid;
 }
