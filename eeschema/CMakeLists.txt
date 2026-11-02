@@ -487,6 +487,7 @@ set( EESCHEMA_SRCS
     sch_edit_frame.cpp
     sch_field.cpp
     sch_footprint_field_reconciler.cpp
+    sch_global_edit_text_and_graphics.cpp
     sch_group.cpp
     sch_item.cpp
     sch_item_alignment.cpp

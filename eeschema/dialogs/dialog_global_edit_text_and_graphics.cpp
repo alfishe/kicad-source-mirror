@@ -18,7 +18,6 @@
  */
 
 #include <dialog_global_edit_text_and_graphics_base.h>
-#include <connectivity/conn_facade.h>
 #include <string_utils.h>
 #include <sch_symbol.h>
 #include <sch_connection.h>
@@ -30,6 +29,7 @@
 #include <sch_sheet_pin.h>
 #include <schematic.h>
 #include <sch_commit.h>
+#include <sch_global_edit_text_and_graphics.h>
 #include <tool/tool_manager.h>
 #include <tools/sch_selection_tool.h>
 #include <tools/sch_edit_tool.h>
@@ -68,9 +68,6 @@ protected:
 
     bool TransferDataToWindow() override;
     bool TransferDataFromWindow() override;
-
-    void visitItem( SCH_COMMIT* aCommit, const SCH_SHEET_PATH& aSheetPath, SCH_ITEM* aItem );
-    void processItem( SCH_COMMIT* aCommit, const SCH_SHEET_PATH& aSheetPath, SCH_ITEM* aItem );
 
 private:
     SCH_EDIT_FRAME*        m_parent;
@@ -161,370 +158,105 @@ bool DIALOG_GLOBAL_EDIT_TEXT_AND_GRAPHICS::TransferDataToWindow()
 }
 
 
-void DIALOG_GLOBAL_EDIT_TEXT_AND_GRAPHICS::processItem( SCH_COMMIT* aCommit,
-                                                        const SCH_SHEET_PATH& aSheetPath,
-                                                        SCH_ITEM* aItem )
-{
-    if( m_selectedFilterOpt->GetValue() )
-    {
-        if( !aItem->IsSelected() && ( !aItem->GetParent() || !aItem->GetParent()->IsSelected() ) )
-            return;
-    }
-
-    aCommit->Modify( aItem, aSheetPath.LastScreen() );
-
-    if( EDA_TEXT* eda_text = dynamic_cast<EDA_TEXT*>( aItem ) )
-    {
-        if( !m_textSize.IsIndeterminate() )
-            eda_text->SetTextSize( VECTOR2I( m_textSize.GetIntValue(), m_textSize.GetIntValue() ) );
-
-        if( m_setTextColor->GetValue() )
-            eda_text->SetTextColor( m_textColorSwatch->GetSwatchColor() );
-
-        if( m_hAlign->GetStringSelection() != INDETERMINATE_ACTION )
-        {
-            GR_TEXT_H_ALIGN_T hAlign = EDA_TEXT::MapHorizJustify( m_hAlign->GetSelection() - 1 );
-            SCH_SYMBOL*       parentSymbol = dynamic_cast<SCH_SYMBOL*>( aItem->GetParent() );
-
-            if( parentSymbol && parentSymbol->GetTransform().x1 < 0 )
-            {
-                if( hAlign == GR_TEXT_H_ALIGN_LEFT )
-                    hAlign = GR_TEXT_H_ALIGN_RIGHT;
-                else if( hAlign == GR_TEXT_H_ALIGN_RIGHT )
-                    hAlign = GR_TEXT_H_ALIGN_LEFT;
-            }
-
-            eda_text->SetHorizJustify( hAlign );
-        }
-
-        if( m_vAlign->GetStringSelection() != INDETERMINATE_ACTION )
-        {
-            GR_TEXT_V_ALIGN_T vAlign = EDA_TEXT::MapVertJustify( m_vAlign->GetSelection() - 1 );
-            SCH_SYMBOL*       parentSymbol = dynamic_cast<SCH_SYMBOL*>( aItem->GetParent() );
-
-            if( parentSymbol && parentSymbol->GetTransform().y1 < 0 )
-            {
-                if( vAlign == GR_TEXT_V_ALIGN_TOP )
-                    vAlign = GR_TEXT_V_ALIGN_BOTTOM;
-                else if( vAlign == GR_TEXT_V_ALIGN_BOTTOM )
-                    vAlign = GR_TEXT_V_ALIGN_TOP;
-            }
-
-            eda_text->SetVertJustify( vAlign );
-        }
-
-        if( m_italic->Get3StateValue() != wxCHK_UNDETERMINED )
-            eda_text->SetItalic( m_italic->GetValue() );
-
-        // Must come after SetTextSize()
-        if( m_bold->Get3StateValue() != wxCHK_UNDETERMINED )
-            eda_text->SetBold( m_bold->GetValue() );
-
-        // Must come after SetBold() & SetItalic()
-        if( m_fontCtrl->GetStringSelection() != INDETERMINATE_ACTION )
-        {
-            eda_text->SetFont( m_fontCtrl->GetFontSelection( eda_text->IsBold(),
-                                                             eda_text->IsItalic() ) );
-        }
-        else if( m_italic->Get3StateValue() != wxCHK_UNDETERMINED
-                || m_bold->Get3StateValue() != wxCHK_UNDETERMINED )
-        {
-            if( !eda_text->GetFontName().IsEmpty() )
-            {
-                eda_text->SetFont( KIFONT::FONT::GetFont( eda_text->GetFontName(),
-                                                          eda_text->IsBold(),
-                                                          eda_text->IsItalic() ) );
-            }
-        }
-    }
-
-    if( SCH_LABEL_BASE* sch_label = dynamic_cast<SCH_LABEL_BASE*>( aItem ) )
-    {
-        if( m_orientation->GetStringSelection() != INDETERMINATE_ACTION )
-            sch_label->SetSpinStyle( (SPIN_STYLE::SPIN) m_orientation->GetSelection() );
-    }
-
-    if( SCH_FIELD* sch_field = dynamic_cast<SCH_FIELD*>( aItem ) )
-    {
-        if( m_visible->Get3StateValue() != wxCHK_UNDETERMINED )
-            sch_field->SetVisible( m_visible->GetValue() );
-
-        if( m_showFieldNames->Get3StateValue() != wxCHK_UNDETERMINED )
-            sch_field->SetNameShown( m_showFieldNames->GetValue() );
-    }
-
-    if( aItem->HasLineStroke() )
-    {
-        STROKE_PARAMS stroke = aItem->GetStroke();
-
-        if( !m_lineWidth.IsIndeterminate() )
-            stroke.SetWidth( m_lineWidth.GetIntValue() );
-
-        if( m_lineStyle->GetStringSelection() != INDETERMINATE_ACTION )
-            stroke.SetLineStyle( (LINE_STYLE) m_lineStyle->GetSelection() );
-
-        if( m_setColor->GetValue() )
-            stroke.SetColor( m_colorSwatch->GetSwatchColor() );
-
-        aItem->SetStroke( stroke );
-    }
-
-    if( SCH_SHAPE* shape = dynamic_cast<SCH_SHAPE*>( aItem ) )
-    {
-        if( m_setFillColor->GetValue() )
-        {
-            shape->SetFillColor( m_fillColorSwatch->GetSwatchColor() );
-
-            if( m_fillColorSwatch->GetSwatchColor() == COLOR4D::UNSPECIFIED )
-                shape->SetFillMode( FILL_T::NO_FILL );
-            else
-                shape->SetFillMode( FILL_T::FILLED_WITH_COLOR );
-        }
-    }
-
-    if( SCH_JUNCTION* junction = dynamic_cast<SCH_JUNCTION*>( aItem ) )
-    {
-        if( !m_junctionSize.IsIndeterminate() )
-            junction->SetDiameter( m_junctionSize.GetIntValue() );
-
-        if( m_setDotColor->GetValue() )
-            junction->SetColor( m_dotColorSwatch->GetSwatchColor() );
-    }
-}
-
-void DIALOG_GLOBAL_EDIT_TEXT_AND_GRAPHICS::visitItem( SCH_COMMIT* aCommit,
-                                                      const SCH_SHEET_PATH& aSheetPath,
-                                                      SCH_ITEM* aItem )
-{
-    if( m_netFilterOpt->GetValue() && !m_netFilter->GetValue().IsEmpty() )
-    {
-        const std::optional<wxString> netName = aItem->GetConnectionName( &aSheetPath );
-
-        if( !netName || !WildCompareString( m_netFilter->GetValue(), *netName, false ) )
-            return;
-    }
-
-    if( m_referenceFilterOpt->GetValue() && !m_referenceFilter->GetValue().IsEmpty() )
-    {
-        if( aItem->Type() == SCH_SYMBOL_T )
-        {
-            wxString ref = static_cast<SCH_SYMBOL*>( aItem )->GetRef( &aSheetPath );
-
-            if( !WildCompareString( m_referenceFilter->GetValue(), ref, false ) )
-                return;
-        }
-    }
-
-    if( m_symbolFilterOpt->GetValue() && !m_symbolFilter->GetValue().IsEmpty() )
-    {
-        if( aItem->Type() == SCH_SYMBOL_T )
-        {
-            wxString id = UnescapeString( static_cast<SCH_SYMBOL*>( aItem )->GetLibId().Format() );
-
-            if( !WildCompareString( m_symbolFilter->GetValue(), id, false ) )
-                return;
-        }
-    }
-
-    if( m_typeFilterOpt->GetValue() )
-    {
-        if( aItem->Type() == SCH_SYMBOL_T )
-        {
-            bool isPower = static_cast<SCH_SYMBOL*>( aItem )->IsPower();
-
-            if( isPower != ( m_typeFilter->GetSelection() == 1 ) )
-                return;
-        }
-    }
-
-    static const std::vector<KICAD_T> wireLabelTypes = { SCH_LABEL_LOCATE_WIRE_T };
-    static const std::vector<KICAD_T> busLabelTypes = { SCH_LABEL_LOCATE_BUS_T };
-
-    switch( aItem->Type() )
-    {
-    case SCH_SYMBOL_T:
-    {
-        SCH_SYMBOL* symbol = (SCH_SYMBOL*) aItem;
-
-        if( m_references->GetValue() )
-            processItem( aCommit, aSheetPath, symbol->GetField( FIELD_T::REFERENCE ) );
-
-        if( m_values->GetValue() )
-            processItem( aCommit, aSheetPath, symbol->GetField( FIELD_T::VALUE ) );
-
-        if( m_otherFields->GetValue() )
-        {
-            for( SCH_FIELD& field : symbol->GetFields() )
-            {
-                if( field.GetId() == FIELD_T::REFERENCE || field.GetId() == FIELD_T::VALUE )
-                    continue;
-
-                const wxString& fieldName = field.GetName();
-
-                if( !m_fieldnameFilterOpt->GetValue() || m_fieldnameFilter->GetValue().IsEmpty()
-                        || WildCompareString( m_fieldnameFilter->GetValue(), fieldName, false ) )
-                {
-                    processItem( aCommit, aSheetPath, &field );
-                }
-            }
-        }
-
-        break;
-    }
-
-    case SCH_SHEET_T:
-    {
-        SCH_SHEET* sheet = static_cast<SCH_SHEET*>( aItem );
-
-        if( m_sheetTitles->GetValue() )
-            processItem( aCommit, aSheetPath, sheet->GetField( FIELD_T::SHEET_NAME ) );
-
-        if( m_sheetFields->GetValue() )
-        {
-            for( SCH_FIELD& field : sheet->GetFields() )
-            {
-                if( field.GetId() == FIELD_T::SHEET_NAME )
-                    continue;
-
-                const wxString& fieldName = field.GetName();
-
-                if( !m_fieldnameFilterOpt->GetValue() || m_fieldnameFilter->GetValue().IsEmpty()
-                        || WildCompareString( m_fieldnameFilter->GetValue(), fieldName, false ) )
-                {
-                    processItem( aCommit, aSheetPath, &field );
-                }
-            }
-        }
-
-        if( m_sheetBorders->GetValue() )
-        {
-            if( !m_selectedFilterOpt->GetValue() || sheet->IsSelected() )
-            {
-                aCommit->Modify( sheet, aSheetPath.LastScreen() );
-
-                if( !m_lineWidth.IsIndeterminate() )
-                    sheet->SetBorderWidth( m_lineWidth.GetIntValue() );
-
-                if( m_setColor->GetValue() )
-                    sheet->SetBorderColor( m_colorSwatch->GetSwatchColor() );
-
-                if( m_setFillColor->GetValue() )
-                    sheet->SetBackgroundColor( m_fillColorSwatch->GetSwatchColor() );
-            }
-        }
-
-        if( m_sheetPins->GetValue() )
-        {
-            for( SCH_SHEET_PIN* pin : sheet->GetPins() )
-                processItem( aCommit, aSheetPath, pin );
-        }
-
-        break;
-    }
-
-    case SCH_LINE_T:
-        if( m_schTextAndGraphics->GetValue() && aItem->GetLayer() == LAYER_NOTES )
-            processItem( aCommit, aSheetPath, aItem );
-        else if( m_wires->GetValue() && aItem->GetLayer() == LAYER_WIRE )
-            processItem( aCommit, aSheetPath, aItem );
-        else if( m_buses->GetValue() && aItem->GetLayer() == LAYER_BUS )
-            processItem( aCommit, aSheetPath, aItem );
-
-        break;
-
-    case SCH_LABEL_T:
-    case SCH_GLOBAL_LABEL_T:
-    case SCH_HIER_LABEL_T:
-    case SCH_DIRECTIVE_LABEL_T:
-        if( m_wires->GetValue() && aItem->IsType( wireLabelTypes ) )
-            processItem( aCommit, aSheetPath, aItem );
-
-        if( m_buses->GetValue() && aItem->IsType( busLabelTypes ) )
-            processItem( aCommit, aSheetPath, aItem );
-
-        if( m_globalLabels->GetValue() && aItem->Type() == SCH_GLOBAL_LABEL_T )
-            processItem( aCommit, aSheetPath, aItem );
-
-        if( m_hierLabels->GetValue() && aItem->Type() == SCH_HIER_LABEL_T )
-            processItem( aCommit, aSheetPath, aItem );
-
-        if( m_labelFields->GetValue() )
-        {
-            for( SCH_FIELD& field : static_cast<SCH_LABEL_BASE*>( aItem )->GetFields() )
-            {
-                const wxString& fieldName = field.GetName();
-
-                if( !m_fieldnameFilterOpt->GetValue() || m_fieldnameFilter->GetValue().IsEmpty()
-                        || WildCompareString( m_fieldnameFilter->GetValue(), fieldName, false ) )
-                {
-                    processItem( aCommit, aSheetPath, &field );
-                }
-            }
-        }
-
-        break;
-
-    case SCH_JUNCTION_T:
-    {
-        SCH_JUNCTION* junction = static_cast<SCH_JUNCTION*>( aItem );
-
-        for( SCH_ITEM* item : junction->ConnectedItems( aSheetPath ) )
-        {
-            if( item->GetLayer() == LAYER_BUS && m_buses->GetValue() )
-            {
-                processItem( aCommit, aSheetPath, aItem );
-                break;
-            }
-            else if( item->GetLayer() == LAYER_WIRE && m_wires->GetValue() )
-            {
-                processItem( aCommit, aSheetPath, aItem );
-                break;
-            }
-        }
-
-        break;
-    }
-
-    case SCH_TEXT_T:
-    case SCH_TEXTBOX_T:
-    case SCH_SHAPE_T:
-        if( m_schTextAndGraphics->GetValue() )
-            processItem( aCommit, aSheetPath, aItem );
-
-        break;
-
-    default:
-        break;
-    }
-}
-
-
 bool DIALOG_GLOBAL_EDIT_TEXT_AND_GRAPHICS::TransferDataFromWindow()
 {
     if( !m_textSize.Validate( 1.0, 10000.0, EDA_UNITS::MILS ) )  // 1 mil .. 10 inches
         return false;
 
+    SCH_GLOBAL_EDIT_OPTIONS opt;
+
+    opt.references = m_references->GetValue();
+    opt.values = m_values->GetValue();
+    opt.otherFields = m_otherFields->GetValue();
+    opt.wires = m_wires->GetValue();
+    opt.buses = m_buses->GetValue();
+    opt.globalLabels = m_globalLabels->GetValue();
+    opt.hierLabels = m_hierLabels->GetValue();
+    opt.labelFields = m_labelFields->GetValue();
+    opt.sheetTitles = m_sheetTitles->GetValue();
+    opt.sheetFields = m_sheetFields->GetValue();
+    opt.sheetPins = m_sheetPins->GetValue();
+    opt.sheetBorders = m_sheetBorders->GetValue();
+    opt.textAndGraphics = m_schTextAndGraphics->GetValue();
+
+    opt.selectedOnly = m_selectedFilterOpt->GetValue();
+
+    if( m_fieldnameFilterOpt->GetValue() )
+        opt.fieldNameFilter = m_fieldnameFilter->GetValue();
+
+    if( m_referenceFilterOpt->GetValue() )
+        opt.referenceFilter = m_referenceFilter->GetValue();
+
+    if( m_symbolFilterOpt->GetValue() )
+        opt.symbolFilter = m_symbolFilter->GetValue();
+
+    if( m_netFilterOpt->GetValue() )
+        opt.netFilter = m_netFilter->GetValue();
+
+    if( m_typeFilterOpt->GetValue() )
+        opt.powerSymbols = m_typeFilter->GetSelection() == 1;
+
+    if( !m_textSize.IsIndeterminate() )
+        opt.textSize = m_textSize.GetIntValue();
+
+    if( m_setTextColor->GetValue() )
+        opt.textColor = m_textColorSwatch->GetSwatchColor();
+
+    if( m_hAlign->GetStringSelection() != INDETERMINATE_ACTION )
+        opt.hAlign = EDA_TEXT::MapHorizJustify( m_hAlign->GetSelection() - 1 );
+
+    if( m_vAlign->GetStringSelection() != INDETERMINATE_ACTION )
+        opt.vAlign = EDA_TEXT::MapVertJustify( m_vAlign->GetSelection() - 1 );
+
+    if( m_italic->Get3StateValue() != wxCHK_UNDETERMINED )
+        opt.italic = m_italic->GetValue();
+
+    if( m_bold->Get3StateValue() != wxCHK_UNDETERMINED )
+        opt.bold = m_bold->GetValue();
+
+    if( m_fontCtrl->GetStringSelection() != INDETERMINATE_ACTION )
+    {
+        opt.font = [this]( bool aBold, bool aItalic )
+        {
+            return m_fontCtrl->GetFontSelection( aBold, aItalic );
+        };
+    }
+
+    if( m_orientation->GetStringSelection() != INDETERMINATE_ACTION )
+        opt.labelOrientation = (SPIN_STYLE::SPIN) m_orientation->GetSelection();
+
+    if( m_visible->Get3StateValue() != wxCHK_UNDETERMINED )
+        opt.visible = m_visible->GetValue();
+
+    if( m_showFieldNames->Get3StateValue() != wxCHK_UNDETERMINED )
+        opt.showFieldNames = m_showFieldNames->GetValue();
+
+    if( !m_lineWidth.IsIndeterminate() )
+        opt.lineWidth = m_lineWidth.GetIntValue();
+
+    if( m_lineStyle->GetStringSelection() != INDETERMINATE_ACTION )
+        opt.lineStyle = (LINE_STYLE) m_lineStyle->GetSelection();
+
+    if( m_setColor->GetValue() )
+        opt.lineColor = m_colorSwatch->GetSwatchColor();
+
+    if( m_setFillColor->GetValue() )
+        opt.fillColor = m_fillColorSwatch->GetSwatchColor();
+
+    if( !m_junctionSize.IsIndeterminate() )
+        opt.junctionSize = m_junctionSize.GetIntValue();
+
+    if( m_setDotColor->GetValue() )
+        opt.junctionColor = m_dotColorSwatch->GetSwatchColor();
+
     SCH_SHEET_PATH currentSheet = m_parent->GetCurrentSheet();
     SCH_COMMIT     commit( m_parent );
 
-    // Each staged edit hides published nets on its screen; filter the rest by pre-edit nets
-    std::optional<SCH_CONNECTIVITY::PUBLICATION_HOLD> hold( std::in_place, m_parent->Schematic().Connectivity() );
-
-    // Go through sheets
-    for( const SCH_SHEET_PATH& sheetPath : m_parent->Schematic().Hierarchy() )
-    {
-        SCH_SCREEN* screen = sheetPath.LastScreen();
-
-        if( screen )
-        {
-            m_parent->SetCurrentSheet( sheetPath );
-
-            for( SCH_ITEM* item : screen->Items() )
-                visitItem( &commit, sheetPath, item );
-        }
-    }
-
-    hold.reset();
+    SchGlobalEditTextAndGraphics( m_parent->Schematic(), commit, opt,
+                                  [this]( const SCH_SHEET_PATH& aSheet )
+                                  {
+                                      m_parent->SetCurrentSheet( aSheet );
+                                  } );
 
     if( !commit.Empty() )
     {
