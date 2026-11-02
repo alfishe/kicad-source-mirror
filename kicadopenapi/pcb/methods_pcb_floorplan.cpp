@@ -36,7 +36,6 @@
 #include <limits>
 #include <map>
 #include <queue>
-#include <regex>
 #include <set>
 #include <tuple>
 
@@ -193,21 +192,6 @@ struct LINK
 
 
 const char* const SIDES[4] = { "west", "east", "north", "south" };
-
-
-/// @brief A net's name stem as pcb_net_roles takes it for a series ("/sheet/D12" -> "D"), upper case
-std::string nameStemOf( const std::string& aName )
-{
-    const size_t slash = aName.size() > 1 ? aName.find_last_of( '/', aName.size() - 2 ) : std::string::npos;
-    std::string  bare = slash == std::string::npos ? aName : aName.substr( slash + 1 );
-
-    for( char& c : bare )
-        c = (char) std::toupper( static_cast<unsigned char>( c ) );
-
-    static const std::regex re( R"(^(.*?[^0-9])\[?([0-9]+)\]?$)" );
-    std::smatch             m;
-    return std::regex_match( bare, m, re ) ? m[1].str() : bare;
-}
 
 
 int sideIndex( const std::string& aName )
@@ -374,14 +358,11 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
         for( const nlohmann::json& e : bus.value( "ends", nlohmann::json::array() ) )
         {
-            busEnds[name][e.value( "block", std::string() )] = { e.value( "part", std::string() ),
-                                                                 sideIndex( e.value( "side", std::string() ) ) };
+            busEnds[name][e.value( "block", std::string() )] = {
+                e.value( "part", std::string() ), sideIndex( e.value( "exit", e.value( "side", std::string() ) ) ) };
         }
 
-        const nlohmann::json sources = bus.value( "source", nlohmann::json::array() );
-        const bool           byTopology = std::any_of( sources.begin(), sources.end(), []( const nlohmann::json& v )
-                                                       { return v.is_string() && v.get<std::string>() == "topology"; } );
-        const std::string    key = nameStemOf( name.substr( 0, name.find( '@' ) ) + "0" );
+        const nlohmann::json netSource = bus.value( "net_source", nlohmann::json::object() );
 
         for( const nlohmann::json& n : bus.value( "nets", nlohmann::json::array() ) )
         {
@@ -390,7 +371,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             if( !net )
                 continue;
 
-            const bool alone = byTopology && nameStemOf( n.get<std::string>() ) != key;
+            const bool alone = netSource.is_object() && netSource.value( n.get<std::string>(), std::string() ) == "topology";
 
             if( alone )
                 topologyOnly.insert( net->GetNetCode() );
@@ -2173,10 +2154,10 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                    "channels (present overuse and history costs) and the best round kept. Answers channels by use, "
                    "overflows (demand over capacity, tracks over), links with their channel path, length, blocks "
                    "they must cross (boxes overlapping or no way round) and the box sides they leave and enter by (a bus by "
-                   "the side its end part's pads face, pcb_layout_graph ends); ports: per box side used its facing "
+                   "its end's exit side, pcb_layout_graph ends: an edge connector away from the board edge, else the pcb_fanout_ports side); ports: per box side used its facing "
                    "length (free or another box's, facing_boxes_mm) per layer as capacity against the bundles' width "
-                   "through it. A bus link names its topology-only members (in the bus by their end parts, their "
-                   "name stem another). show: channels in "
+                   "through it. A bus link names its topology-only members (pcb_layout_graph net_source topology: in the bus "
+                   "by their end parts only). show: channels in "
                    "the GUI coloured by use. "
                    "Read only",
                    R"json({"type":"object","properties":{
@@ -2198,8 +2179,8 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "max_boxes":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"boxes per block at most"},
                         "snap_mm":{"type":"number","minimum":0,"description":"obstacle edges closer than this share one grid line (default one Default track pitch; 0: exact). Gaps narrower close, obstacles thinner keep both edges"},
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
-                        "split_topology_only":{"type":"boolean","default":false,"description":"bus nets whose name stem is not the bus's (in it by their end parts only, pcb_net_roles topology) go with the single nets between the blocks"},
-                        "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by the side its end part's pads face (pcb_layout_graph ends); false: by any side"},
+                        "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
+                        "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
                         "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
                         "overflow_cost_mm":{"type":"number","default":5,"description":"detour worth one track over a channel's capacity, first round (doubles each round)"},
