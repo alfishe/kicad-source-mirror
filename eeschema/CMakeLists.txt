@@ -687,7 +687,7 @@ target_link_libraries( eeschema
 
 # the main Eeschema program, in DSO form.
 # kicadopenapi methods for schematics; registered when this kiface loads
-file( GLOB KOPENAPI_SCH_SRCS ${CMAKE_SOURCE_DIR}/kicadopenapi/sch/*.cpp )
+file( GLOB KOPENAPI_SCH_SRCS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/kicadopenapi/sch/*.cpp )
 
 add_library( eeschema_kiface_objects OBJECT
     ${EESCHEMA_SRCS}
