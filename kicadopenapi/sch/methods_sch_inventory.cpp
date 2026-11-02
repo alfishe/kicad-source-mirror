@@ -13,6 +13,10 @@
 #include <connectivity/conn_facade.h>
 #include <connection_graph.h>
 #include <kicadopenapi_util.h>
+#include <netclass.h>
+#include <project.h>
+#include <project/net_settings.h>
+#include <project/project_file.h>
 #include <sch_label.h>
 #include <sch_line.h>
 #include <sch_pin.h>
@@ -497,7 +501,7 @@ static KOPENAPI_RESULT h_sch_symbol_list( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
 
 /// @brief Summary of one net for lists
-static nlohmann::json netRow( const NET_ENTRY& aNet, PAD_RESOLVER* aPads )
+static nlohmann::json netRow( const NET_ENTRY& aNet, PAD_RESOLVER* aPads, NET_SETTINGS* aNetSettings )
 {
     int                   pins = 0, labels = 0;
     std::set<std::string> sheets;
@@ -539,6 +543,15 @@ static nlohmann::json netRow( const NET_ENTRY& aNet, PAD_RESOLVER* aPads )
     if( aPads )
         row["in_netlist"] = exported;
 
+    // the net class when not Default (patterns, directive labels)
+    if( aNetSettings )
+    {
+        const wxString cls = aNetSettings->GetEffectiveNetClass( wxString::FromUTF8( aNet.name ) )->GetName();
+
+        if( cls != NETCLASS::Default )
+            row["net_class"] = str( cls );
+    }
+
     return row;
 }
 
@@ -566,7 +579,8 @@ static KOPENAPI_RESULT h_sch_net_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
 
     for( const NET_ENTRY& net : collectNets( context->GetSchematic() ) )
     {
-        nlohmann::json row = netRow( net, aArgs.value( "resolve_pads", false ) ? &pads : nullptr );
+        nlohmann::json row = netRow( net, aArgs.value( "resolve_pads", false ) ? &pads : nullptr,
+                                     context->GetSchematic()->Project().GetProjectFile().NetSettings().get() );
 
         if( !KopenapiGlob( glob, row["name"] ) || row["pins"].get<int>() < minPins
             || ( hasPower && row["power"] != aArgs["power"] ) )
@@ -693,8 +707,24 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
             else if( const char* kind = labelKind( item->Type() ) )
             {
                 const std::string text = str( UnescapeString( static_cast<SCH_LABEL_BASE*>( item )->GetText() ) );
-                labels.push_back( { { "kind", kind }, { "text", text } } );
-                names.insert( text );
+                nlohmann::json    entry = { { "kind", kind }, { "text", text } };
+
+                if( item->Type() == SCH_DIRECTIVE_LABEL_T )
+                {
+                    for( const SCH_FIELD& field : static_cast<SCH_LABEL_BASE*>( item )->GetFields() )
+                    {
+                        if( field.GetUntranslatedName() == wxT( "Netclass" ) && !field.GetText().IsEmpty() )
+                            entry["netclass"] = str( field.GetText() );
+                        else if( field.GetUntranslatedName() == wxT( "Component Class" ) && !field.GetText().IsEmpty() )
+                            entry["component_class"] = str( field.GetText() );
+                    }
+                }
+                else
+                {
+                    names.insert( text );
+                }
+
+                labels.push_back( entry );
             }
             else if( item->Type() == SCH_SHEET_PIN_T )
             {
@@ -773,6 +803,8 @@ static KOPENAPI_RESULT h_sch_net_get( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     return KOPENAPI_RESULT::Ok( { { "name", found->name },
                                   { "code", found->code },
                                   { "names", nameList },
+                                  { "net_class", str( context->GetSchematic()->Project().GetProjectFile().NetSettings()
+                                                              ->GetEffectiveNetClass( wxString::FromUTF8( found->name ) )->GetName() ) },
                                   { "in_netlist", exported },
                                   { "pins", allPins },
                                   { "drivers", drivers },
@@ -891,7 +923,8 @@ KOPENAPI_REGISTER( "sch_symbol_list",
 
 KOPENAPI_REGISTER( "sch_net_list",
                    "List schematic nets: name, code, pin count (without power symbols), sheets spanned, "
-                   "labels, role (power/ground/clock/reset/signal/unconnected), power flag, optional "
+                   "labels, role (power/ground/clock/reset/signal/unconnected), power flag, net_class (when "
+                   "not Default), optional "
                    "in_netlist (has a pin with a footprint pad); filter by name glob, "
                    "min_pins, power; paginated",
                    KopenapiPagedSchema( R"json({

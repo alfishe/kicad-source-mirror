@@ -47,7 +47,10 @@
 #include <view/view_overlay.h>
 #include <gal/painter.h>
 #include <layer_ids.h>
+#include <netclass.h>
 #include <project.h>
+#include <project/net_settings.h>
+#include <project/project_file.h>
 #include <wildcards_and_files_ext.h>
 #include <wx_filename.h>
 
@@ -3745,15 +3748,58 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( !context )
         return KopenapiNoSchematic();
 
-    const std::string text = aArgs.value( "text", std::string() );
     const std::string kind = aArgs.value( "kind", std::string( "local" ) );
+    const bool        directive = kind == "directive";
+    const std::string netclass = aArgs.value( "netclass", std::string() );
+    const std::string componentClass = aArgs.value( "component_class", std::string() );
+    const std::string text = directive ? std::string() : aArgs.value( "text", std::string() );
 
-    if( text.empty() || ( !aArgs.contains( "pin" ) && ( !aArgs.contains( "x_mm" ) || !aArgs.contains( "y_mm" ) ) ) )
-        return KOPENAPI_RESULT::Error( 400, "give 'text' and either 'pin' (REF.PIN or SHEETNAME.PIN: names the net there) or 'x_mm' / 'y_mm' "
+    if( kind != "local" && kind != "global" && kind != "hierarchical" && !directive )
+        return KOPENAPI_RESULT::Error( 400, "kind must be local, global, hierarchical or directive" );
+
+    if( ( !directive && text.empty() ) || ( directive && netclass.empty() && componentClass.empty() )
+        || ( !aArgs.contains( "pin" ) && ( !aArgs.contains( "x_mm" ) || !aArgs.contains( "y_mm" ) ) ) )
+    {
+        return KOPENAPI_RESULT::Error( 400, "give 'text' (a directive label: 'netclass' and / or 'component_class') and either "
+                                            "'pin' (REF.PIN or SHEETNAME.PIN: names the net there) or 'x_mm' / 'y_mm' "
                                             "(a point on a wire or a pin end)" );
+    }
 
-    if( kind != "local" && kind != "global" && kind != "hierarchical" )
-        return KOPENAPI_RESULT::Error( 400, "kind must be local, global or hierarchical" );
+    static const std::map<std::string, LABEL_FLAG_SHAPE> flagShapes = { { "dot", LABEL_FLAG_SHAPE::F_DOT },
+                                                                        { "round", LABEL_FLAG_SHAPE::F_ROUND },
+                                                                        { "diamond", LABEL_FLAG_SHAPE::F_DIAMOND },
+                                                                        { "rectangle", LABEL_FLAG_SHAPE::F_RECTANGLE } };
+    auto flagShape = flagShapes.find( aArgs.value( "shape", std::string( "round" ) ) );
+
+    if( flagShape == flagShapes.end() )
+        return KOPENAPI_RESULT::Error( 400, "shape (directive labels) must be dot, round, diamond or rectangle" );
+
+    // A directive label is a flag on a stem: side is where the flag points, and the stem stands
+    // across the wire, not along it
+    static const std::map<std::string, SPIN_STYLE> flagSpins = { { "up", SPIN_STYLE::RIGHT },
+                                                                 { "down", SPIN_STYLE::LEFT },
+                                                                 { "left", SPIN_STYLE::UP },
+                                                                 { "right", SPIN_STYLE::BOTTOM } };
+
+    auto makeDirective = [&]( const VECTOR2I& aAt, const std::string& aSide ) -> SCH_DIRECTIVE_LABEL*
+    {
+        auto* flag = new SCH_DIRECTIVE_LABEL( aAt );
+        flag->SetShape( flagShape->second );
+        flag->SetSpinStyle( flagSpins.at( aSide ) );
+        flag->GetFields().emplace_back( flag, FIELD_T::USER, wxT( "Netclass" ) );
+        flag->GetFields().back().SetText( wxString::FromUTF8( netclass ) );
+        flag->GetFields().emplace_back( flag, FIELD_T::USER, wxT( "Component Class" ) );
+        flag->GetFields().back().SetText( wxString::FromUTF8( componentClass ) );
+        flag->GetFields().back().SetItalic( true );
+        flag->GetFields().back().SetVisible( true );
+        flag->AutoplaceFields( nullptr, AUTOPLACE_AUTO );
+        return flag;
+    };
+
+    auto across = []( const VECTOR2I& aAlong )
+    {
+        return aAlong.x != 0 ? std::string( "up" ) : std::string( "right" );
+    };
 
     std::optional<SCH_SHEET_PATH> sheet;
     VECTOR2I                      point;
@@ -3822,11 +3868,22 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 if( !freeAt( candidate, wire ) )
                     continue;
 
-                // the text must lie on no part and no other text
-                SCH_LABEL probe( candidate, wxString::FromUTF8( text ) );
-                probe.SetSpinStyle( away == "right" ? SPIN_STYLE::RIGHT : away == "left" ? SPIN_STYLE::LEFT
-                                    : away == "up"  ? SPIN_STYLE::UP    : SPIN_STYLE::BOTTOM );
-                const BOX2I box = probe.GetBoundingBox();
+                // the text (a directive label: the flag) must lie on no part and no other text
+                const std::string side_here = directive ? ( side == "auto" ? across( along ) : side ) : away;
+                BOX2I             box;
+
+                if( directive && flagSpins.count( side_here ) )
+                {
+                    std::unique_ptr<SCH_DIRECTIVE_LABEL> probe( makeDirective( candidate, side_here ) );
+                    box = probe->GetBoundingBox();
+                }
+                else
+                {
+                    SCH_LABEL probe( candidate, wxString::FromUTF8( text ) );
+                    probe.SetSpinStyle( away == "right" ? SPIN_STYLE::RIGHT : away == "left" ? SPIN_STYLE::LEFT
+                                        : away == "up"  ? SPIN_STYLE::UP    : SPIN_STYLE::BOTTOM );
+                    box = probe.GetBoundingBox();
+                }
                 bool        clear = true;
 
                 for( SCH_ITEM* other : screen->Items().Overlapping( box ) )
@@ -3843,7 +3900,7 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                     found = true;
 
                     if( side == "auto" )
-                        side = away;
+                        side = side_here;
                 }
             }
         }
@@ -3851,7 +3908,8 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( !found && side == "auto" )
         {
             const VECTOR2I out = at->out;
-            side = out.x > 0 ? "right" : out.x < 0 ? "left" : out.y < 0 ? "up" : "down";
+            side = directive ? across( out )
+                             : out.x > 0 ? "right" : out.x < 0 ? "left" : out.y < 0 ? "up" : "down";
         }
     }
     else
@@ -3880,9 +3938,25 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
             const VECTOR2I other = wire->GetStartPoint() == point ? wire->GetEndPoint() : wire->GetStartPoint();
             const VECTOR2I d = point - other;
-            side = std::abs( d.x ) >= std::abs( d.y ) ? ( d.x < 0 ? "left" : "right" ) : ( d.y < 0 ? "up" : "down" );
+            side = directive ? across( d )
+                             : std::abs( d.x ) >= std::abs( d.y ) ? ( d.x < 0 ? "left" : "right" ) : ( d.y < 0 ? "up" : "down" );
             break;
         }
+
+        // a directive label in the middle of a wire stands across it too
+        for( SCH_ITEM* item : screen->Items().Overlapping( SCH_LINE_T, point ) )
+        {
+            SCH_LINE* wire = static_cast<SCH_LINE*>( item );
+
+            if( directive && side == "right" && wire->IsWire() && wire->HitTest( point, 0 ) )
+            {
+                side = across( wire->GetEndPoint() - wire->GetStartPoint() );
+                break;
+            }
+        }
+
+        if( directive && side == "right" && screen->Items().Overlapping( SCH_LINE_T, point ).empty() )
+            side = "up";
     }
 
     static const std::map<std::string, SPIN_STYLE> spins = { { "left", SPIN_STYLE::LEFT },
@@ -3897,14 +3971,17 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const wxString  wxText = wxString::FromUTF8( text );
     SCH_LABEL_BASE* label = nullptr;
 
-    if( kind == "global" )
+    if( directive )
+        label = makeDirective( point, side );
+    else if( kind == "global" )
         label = new SCH_GLOBALLABEL( point, wxText );
     else if( kind == "hierarchical" )
         label = new SCH_HIERLABEL( point, wxText );
     else
         label = new SCH_LABEL( point, wxText );
 
-    label->SetSpinStyle( spin->second );
+    if( !directive )
+        label->SetSpinStyle( spin->second );
 
     SCH_COMMIT commit( context->GetToolManager() );
     commit.Add( label, screen );
@@ -3929,8 +4006,24 @@ static KOPENAPI_RESULT h_sch_label_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     nlohmann::json result = { { "uuid", str( label->m_Uuid.AsString() ) }, { "net", net }, { "pins_on_net", pins }, { "side", side },
                               { "at", { toMm( point.x ), toMm( point.y ) } } };
 
+    if( directive )
+    {
+        std::shared_ptr<NET_SETTINGS>& netSettings = context->GetSchematic()->Project().GetProjectFile().NetSettings();
+
+        result["netclass"] = netclass;
+        result["component_class"] = componentClass;
+
+        if( !net.empty() )
+            result["net_class"] = str( netSettings->GetEffectiveNetClass( wxString::FromUTF8( net ) )->GetName() );
+
+        if( !netclass.empty() && wxString::FromUTF8( netclass ) != NETCLASS::Default
+            && !netSettings->HasNetclass( wxString::FromUTF8( netclass ) ) )
+            result["warning_netclass"] = "net class " + netclass + " is not defined (sch_netclass_assign create: true, or Schematic Setup)";
+    }
+
     if( pins == 0 )
-        result["warning"] = "the label touches no wire end or pin: it connects nothing yet";
+        result["warning"] = directive ? "the directive label touches no wire or pin end: it classes no net yet"
+                                      : "the label touches no wire end or pin: it connects nothing yet";
 
     return KOPENAPI_RESULT::Ok( result );
 }
@@ -4998,11 +5091,18 @@ KOPENAPI_REGISTER( "sch_label_add",
                                 "the wire leaving that pin, text along the wire clear of parts, else on the pin "
                                 "end) - 'name this net'; text side auto or left/right/up/down; answers the net it "
                                 "joined and where, warns when it touches nothing. Labels on many pins at once: "
-                                "sch_connect." ) + EDIT_NOTE,
-                   R"json({"type":"object","required":["text"],"properties":{
-                        "text":{"type":"string"},"pin":{"type":"string","description":"REF.PIN or SHEETNAME.PIN (a sheet pin), instead of x_mm / y_mm"},
+                                "sch_connect. kind directive places a directive label (Place > Directive Label: a "
+                                "flag on a stem) carrying 'netclass' and / or 'component_class' fields: the net it "
+                                "touches gets that net class (answered as net_class), as in the editor; side is "
+                                "where the flag points (auto: across the wire); shape dot / round / diamond / "
+                                "rectangle. Net classes by net name pattern: sch_netclass_assign." ) + EDIT_NOTE,
+                   R"json({"type":"object","properties":{
+                        "text":{"type":"string","description":"the net name (all kinds but directive)"},
+                        "netclass":{"type":"string","description":"kind directive: the net class the flag gives its net"},
+                        "component_class":{"type":"string","description":"kind directive: the component class field"},
+                        "shape":{"type":"string","enum":["dot","round","diamond","rectangle"],"default":"round","description":"kind directive: the flag"},"pin":{"type":"string","description":"REF.PIN or SHEETNAME.PIN (a sheet pin), instead of x_mm / y_mm"},
                         "x_mm":{"type":"number"},"y_mm":{"type":"number"},
-                        "kind":{"type":"string","enum":["local","global","hierarchical"],"default":"local"},
+                        "kind":{"type":"string","enum":["local","global","hierarchical","directive"],"default":"local"},
                         "side":{"type":"string","enum":["auto","left","right","up","down"],"default":"auto"},
                         "sheet":{"type":"string"}}})json"_json,
                    false, h_sch_label_add );
