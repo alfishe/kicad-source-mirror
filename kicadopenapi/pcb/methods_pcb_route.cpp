@@ -1019,14 +1019,23 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
         }
     }
 
-    std::vector<PCB_TRACK*> pieces;
+    struct JOINT
+    {
+        PCB_TRACK*            before;
+        PCB_TRACK*            after;
+        const SHAPE_POLY_SET* courtyard;
+    };
+
+    std::vector<PCB_TRACK*>   pieces;
+    std::vector<JOINT>        joints;
+    std::map<PCB_TRACK*, int> routedWidth;
 
     for( PCB_TRACK* track : mine )
     {
-        const SEG             whole( track->GetStart(), track->GetEnd() );
-        std::vector<VECTOR2I> cuts = { whole.A, whole.B };
+        const SEG whole( track->GetStart(), track->GetEnd() );
+        std::vector<std::pair<VECTOR2I, const SHAPE_POLY_SET*>> cuts = { { whole.A, nullptr }, { whole.B, nullptr } };
 
-        auto cutAt = [&]( const SHAPE_POLY_SET& c )
+        auto cutAt = [&]( const SHAPE_POLY_SET& c, bool aCourtyard )
         {
             for( int o = 0; o < c.OutlineCount(); ++o )
             {
@@ -1034,34 +1043,43 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
                 c.COutline( o ).Intersect( whole, hits );
 
                 for( const SHAPE_LINE_CHAIN::INTERSECTION& hit : hits )
-                    cuts.push_back( hit.p );
+                    cuts.emplace_back( hit.p, aCourtyard ? &c : nullptr );
             }
         };
 
         for( const SHAPE_POLY_SET& c : courtyards )
-            cutAt( c );
+            cutAt( c, true );
 
         for( const auto& [layer, zone] : frontZones )
         {
             if( layer == track->GetLayer() )
-                cutAt( zone );
+                cutAt( zone, false );
         }
 
-        std::sort( cuts.begin(), cuts.end(),
-                   [&]( const VECTOR2I& a, const VECTOR2I& b )
-                   { return ( a - whole.A ).SquaredEuclideanNorm() < ( b - whole.A ).SquaredEuclideanNorm(); } );
-        cuts.erase( std::unique( cuts.begin(), cuts.end() ), cuts.end() );
+        std::stable_sort( cuts.begin(), cuts.end(),
+                          [&]( const auto& a, const auto& b )
+                          {
+                              return ( a.first - whole.A ).SquaredEuclideanNorm() < ( b.first - whole.A ).SquaredEuclideanNorm();
+                          } );
+        cuts.erase( std::unique( cuts.begin(), cuts.end(), []( const auto& a, const auto& b ) { return a.first == b.first; } ),
+                    cuts.end() );
 
-        track->SetEnd( cuts[1] );
+        routedWidth[track] = track->GetWidth();
+        track->SetEnd( cuts[1].first );
         pieces.push_back( track );
 
         for( size_t c = 2; c < cuts.size(); ++c )
         {
             PCB_TRACK* piece = static_cast<PCB_TRACK*>( track->Duplicate( false ) );
-            piece->SetStart( cuts[c - 1] );
-            piece->SetEnd( cuts[c] );
+            piece->SetStart( cuts[c - 1].first );
+            piece->SetEnd( cuts[c].first );
             aIface.Staged().Add( piece );
             aIface.m_added.push_back( piece );
+
+            if( cuts[c - 1].second )
+                joints.push_back( { pieces.back(), piece, cuts[c - 1].second } );
+
+            routedWidth[piece] = routedWidth[track];
             pieces.push_back( piece );
         }
     }
@@ -1122,8 +1140,61 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
             }
         }
 
-        widths.insert( piece->GetWidth() );
     }
+
+    // DRC tests a piece's whole shape against a courtyard: the piece outside one ends where its
+    // round end clears it, the piece inside takes the rest
+    for( const JOINT& joint : joints )
+    {
+        auto inside = [&]( PCB_TRACK* aPiece )
+        {
+            return joint.courtyard->Contains( ( aPiece->GetStart() + aPiece->GetEnd() ) / 2 );
+        };
+
+        const bool beforeIn = inside( joint.before );
+
+        if( beforeIn == inside( joint.after ) )
+            continue;
+
+        PCB_TRACK*     out = beforeIn ? joint.after : joint.before;
+        PCB_TRACK*     in = beforeIn ? joint.before : joint.after;
+        const VECTOR2I at = joint.before->GetEnd();
+        const VECTOR2I end = beforeIn ? out->GetEnd() : out->GetStart();
+        const VECTOR2I dir = end - at;
+        const int64_t  len = dir.EuclideanNorm();
+
+        auto pointAt = [&]( int64_t aT ) { return at + dir.Resize( aT ); };
+        auto clearAt = [&]( int64_t aT )
+        {
+            SHAPE_SEGMENT shape( SEG( pointAt( aT ), end ), out->GetWidth() );
+            return !joint.courtyard->Collide( &shape );
+        };
+
+        if( len <= 0 || clearAt( 0 ) || !clearAt( len - 1 ) )
+            continue;
+
+        int64_t lo = 0, hi = len - 1;
+
+        while( hi - lo > 1 )
+        {
+            const int64_t m = ( lo + hi ) / 2;
+            ( clearAt( m ) ? hi : lo ) = m;
+        }
+
+        const VECTOR2I cut = pointAt( hi );
+        joint.before->SetEnd( cut );
+        joint.after->SetStart( cut );
+
+        if( in->GetWidth() > routedWidth[in]
+            && ( overFront( in ) || !guard( aBoard, { in }, aIface.m_removed, false, &staged ).empty() ) )
+        {
+            in->SetWidth( routedWidth[in] );
+            narrowKept += in->GetLength();
+        }
+    }
+
+    for( PCB_TRACK* piece : pieces )
+        widths.insert( piece->GetWidth() );
 
     if( widths.size() > 1 )
     {
