@@ -182,6 +182,15 @@ wxLog* KOPENAPI_JOURNAL::ThreadTarget()
 }
 
 
+void KOPENAPI_JOURNAL::Record( bool aError, const std::string& aOperation, const std::string& aMessage )
+{
+    SCOPED_OPERATION      operation( aOperation );
+    const wxLogRecordInfo info( __FILE__, __LINE__, __WXFUNCTION__, nullptr );
+
+    ThreadTarget()->LogRecord( aError ? wxLOG_Error : wxLOG_Warning, wxString::FromUTF8( aMessage ), info );
+}
+
+
 void KOPENAPI_JOURNAL::SetOperation( const std::string& aOperation )
 {
     std::lock_guard<std::mutex> lock( state().mutex );

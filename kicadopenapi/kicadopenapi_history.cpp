@@ -334,8 +334,8 @@ void KOPENAPI_HISTORY::AfterEdit( KOPENAPI_CONTEXT& aCtx, const KOPENAPI_RESULT&
     if( aResult.status < 400 && d->unchangedSince( aCtx, entry.before ) )
         return;
 
-    if( aResult.status >= 400 && aResult.body.contains( "error" ) )
-        entry.error = aResult.body["error"].value( "message", std::string() );
+    if( aResult.status >= 400 )
+        entry.error = aResult.Message();
 
     d->log.push_back( std::move( entry ) );
     d->trim();

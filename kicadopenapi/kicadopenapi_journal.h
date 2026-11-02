@@ -29,6 +29,10 @@ public:
     /// deleted
     static wxLog* ThreadTarget();
 
+    /// @brief Records an error (or a warning) of aOperation at once, from any thread (wxLog on a
+    /// thread without its own target would hold it until the main loop flushes)
+    static void Record( bool aError, const std::string& aOperation, const std::string& aMessage );
+
     /// @brief Operation that log records are attributed to when their thread is in no SCOPED_OPERATION
     static void SetOperation( const std::string& aOperation );
 

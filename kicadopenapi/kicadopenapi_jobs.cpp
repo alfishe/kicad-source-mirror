@@ -1,6 +1,7 @@
 /// @file kicadopenapi_jobs.cpp
 /// @brief Long API calls as jobs (see kicadopenapi_jobs.h).
 #include <kicadopenapi_jobs.h>
+#include <kicadopenapi_journal.h>
 #include <kicadopenapi_keepalive.h>
 
 #include <wx/app.h>
@@ -742,13 +743,11 @@ void KOPENAPI_JOBS::Run( const std::string& aId, const std::function<KOPENAPI_RE
     {
         result = e.Result();
     }
-    catch( const std::exception& e )
-    {
-        result = KOPENAPI_RESULT::Error( 500, e.what() );
-    }
     catch( ... )
     {
-        result = KOPENAPI_RESULT::Error( 500, "unknown exception" );
+        result = KopenapiExceptionResult( job->method, std::current_exception() );
+        KOPENAPI_JOURNAL::Record( true, "api:" + job->method,
+                                  "api:" + job->method + " failed (500): " + result.Message() );
     }
 
     g_titles = nullptr;

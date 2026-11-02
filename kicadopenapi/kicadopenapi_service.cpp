@@ -281,6 +281,81 @@ static void reply( httplib::Response& aRes, const KOPENAPI_RESULT& aResult )
 }
 
 
+/// @brief Env KICAD_OPENAPI_TEST_FAULTS=1 registers debug_fault and debug_fault_read: they throw
+/// where asked, so tests can show that an exception anywhere in a call is answered and journaled
+static bool testFaults()
+{
+    static const bool on = []
+    {
+        const char* env = std::getenv( "KICAD_OPENAPI_TEST_FAULTS" );
+        return env && std::string( env ) == "1";
+    }();
+
+    return on;
+}
+
+
+[[noreturn]] static void throwTestFault( const std::string& aAt, const nlohmann::json& aArgs )
+{
+    if( aArgs.contains( "kind" ) && aArgs["kind"] == "other" )
+        throw 42;
+
+    throw std::runtime_error( "test fault at " + aAt );
+}
+
+
+static void testFaultAt( const std::string& aAt, const std::string& aName, const nlohmann::json& aArgs )
+{
+    if( testFaults() && aName.rfind( "debug_fault", 0 ) == 0 && aArgs.is_object() && aArgs.contains( "at" )
+        && aArgs["at"] == aAt )
+    {
+        throwTestFault( aAt, aArgs );
+    }
+}
+
+
+static KOPENAPI_RESULT h_debug_fault( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
+{
+    testFaultAt( "handler", "debug_fault", aArgs );
+    return KOPENAPI_RESULT::Ok( { { "faulted", false } } );
+}
+
+
+static nlohmann::json testFaultSchema()
+{
+    return { { "type", "object" },
+             { "properties",
+               { { "at", { { "type", "string" },
+                           { "enum", { "check", "handler", "none" } },
+                           { "description", "where it throws: argument checking, the handler, nowhere" } } },
+                 { "kind", { { "type", "string" },
+                             { "enum", { "std", "other" } },
+                             { "description", "std::runtime_error (default) or a non-std exception" } } } } },
+             { "required", { "at" } } };
+}
+
+
+static const bool s_testFaultsReg =
+        testFaults()
+        && KOPENAPI_REGISTRY::Add( { "debug_fault", "Test only: throws where asked (on the main thread)",
+                                     testFaultSchema(), false, h_debug_fault } )
+        && KOPENAPI_REGISTRY::Add( { "debug_fault_read", "Test only: throws where asked (a concurrent read)",
+                                     testFaultSchema(), false, h_debug_fault } )
+        && KOPENAPI_REGISTRY::MarkConcurrentReads( { "debug_fault_read" } );
+
+
+/// @brief KopenapiExceptionResult, recorded in the journal as the method's failure
+static KOPENAPI_RESULT failedByException( const std::string& aMethod, std::exception_ptr aError )
+{
+    KOPENAPI_RESULT result = KopenapiExceptionResult( aMethod, aError );
+
+    if( result.body["error"].contains( "exception" ) )
+        KOPENAPI_JOURNAL::Record( true, "api:" + aMethod, "api:" + aMethod + " failed (500): " + result.Message() );
+
+    return result;
+}
+
+
 /// @brief The main-thread end of the gate: API work arrives as thread events (category THREAD),
 /// so a call that keeps the UI alive (KopenapiKeepUiAlive: paint and timers only) never starts
 /// another call inside itself.
@@ -547,7 +622,7 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
     auto ticket = std::make_shared<KOPENAPI_CALL_TICKET>();
 
     auto job = std::make_shared<std::function<void()>>(
-            [aAlive, promise, ticket, fn = std::move( aFn )]()
+            [aAlive, promise, ticket, fn = std::move( aFn ), method = aMethod.empty() ? "kicadopenapi" : aMethod]()
             {
                 // The caller gave up before the call started: it must not run now
                 if( !ticket->Start() )
@@ -570,13 +645,9 @@ static KOPENAPI_RESULT runInMain( const std::shared_ptr<std::atomic<bool>>& aAli
                 {
                     promise->set_value( e.Result() );
                 }
-                catch( const std::exception& e )
-                {
-                    promise->set_value( KOPENAPI_RESULT::Error( 500, e.what() ) );
-                }
                 catch( ... )
                 {
-                    promise->set_value( KOPENAPI_RESULT::Error( 500, "unknown exception" ) );
+                    promise->set_value( failedByException( method, std::current_exception() ) );
                 }
             } );
 
@@ -864,7 +935,12 @@ struct KICAD_OPENAPI_SERVICE::IMPL
 
     KOPENAPI_RESULT invoke( const std::string& aName, const std::string& aBody, const std::string& aCaller = {} ) const;
 
-    /// @brief Same as invoke() with already parsed arguments (REST and MCP share this path)
+    /// @brief invokeParsed() without its exception guard
+    KOPENAPI_RESULT invokeChecked( const std::string& aName, const nlohmann::json& aArgs,
+                                   const std::string& aCaller ) const;
+
+    /// @brief Same as invoke() with already parsed arguments (REST and MCP share this path); an
+    /// exception anywhere in the call is a 500 naming the method, recorded in the journal
     /// @param aCaller the X-Kicad-Session header: the client's identity for remote control sessions
     KOPENAPI_RESULT invokeParsed( const std::string& aName, const nlohmann::json& aArgs,
                                   const std::string& aCaller = {} ) const;
@@ -1286,6 +1362,8 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::checkCall( const std
         return KOPENAPI_RESULT::Error( 501, "'" + aName + "' requires the GUI"
                                                     + std::string( aName == "app_quit" ? "; headless: POST /api/v1/shutdown" : "" ) );
 
+    testFaultAt( "check", aName, aRawArgs );
+
     std::string spellingError;
     aSpelt = KopenapiNetSpelling( method->inputSchema, aRawArgs, spellingError );
 
@@ -1410,8 +1488,19 @@ KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::startJob( const nlohmann::json& aAr
     std::optional<KOPENAPI_METHOD> method;
     std::optional<nlohmann::json>  spelt;
 
-    if( std::optional<KOPENAPI_RESULT> bad = checkCall( name, args, method, spelt ) )
-        return *bad;
+    try
+    {
+        if( std::optional<KOPENAPI_RESULT> bad = checkCall( name, args, method, spelt ) )
+            return *bad;
+    }
+    catch( const KOPENAPI_RETRY_LATER& e )
+    {
+        return e.Result();
+    }
+    catch( ... )
+    {
+        return failedByException( name, std::current_exception() );
+    }
 
     if( spelt )
         args = std::move( *spelt );
@@ -1465,8 +1554,27 @@ std::string KICAD_OPENAPI_SERVICE::IMPL::queueJob( const std::string& aName, con
 
 
 KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeParsed( const std::string&    aName,
-                                                           const nlohmann::json& aRawArgs,
+                                                           const nlohmann::json& aArgs,
                                                            const std::string&    aCaller ) const
+{
+    try
+    {
+        return invokeChecked( aName, aArgs, aCaller );
+    }
+    catch( const KOPENAPI_RETRY_LATER& e )
+    {
+        return e.Result();
+    }
+    catch( ... )
+    {
+        return failedByException( aName, std::current_exception() );
+    }
+}
+
+
+KOPENAPI_RESULT KICAD_OPENAPI_SERVICE::IMPL::invokeChecked( const std::string&    aName,
+                                                            const nlohmann::json& aRawArgs,
+                                                            const std::string&    aCaller ) const
 {
     ensureKifaces();
 
@@ -1608,11 +1716,8 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::leaseRead( const std
         }
         else
         {
-            const std::string message = result.body.contains( "error" ) && result.body["error"].is_object()
-                                                ? result.body["error"].value( "message", std::string() )
-                                                : std::string();
             wxLogWarning( "%s", wxString::FromUTF8( "api:" + aName + " failed (" + std::to_string( result.status )
-                                                    + "): " + message ) );
+                                                    + "): " + result.Message() ) );
         }
 
         return result;
@@ -1627,9 +1732,9 @@ std::optional<KOPENAPI_RESULT> KICAD_OPENAPI_SERVICE::IMPL::leaseRead( const std
         leaseReadsToOwner++;
         return std::nullopt;   // a read that would write: the owner answers it
     }
-    catch( const std::exception& e )
+    catch( ... )
     {
-        return KOPENAPI_RESULT::Error( 500, e.what() );
+        return failedByException( aName, std::current_exception() );
     }
 }
 
@@ -1753,6 +1858,10 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                           {
                               result = e.Result();
                           }
+                          catch( ... )
+                          {
+                              result = KopenapiExceptionResult( name, std::current_exception() );
+                          }
 
                           // a failure carries what KiCad logged during the call: the cause it would
                           // have shown in a dialog
@@ -1789,12 +1898,9 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                           // Failed operations are journaled too (4xx warning, 5xx error)
                           if( result.status >= 400 )
                           {
-                              const std::string message = result.body.contains( "error" )
-                                      ? result.body["error"].value( "message", std::string() )
-                                      : std::string();
                               const wxString text = wxString::FromUTF8(
                                       operation + " failed (" + std::to_string( result.status )
-                                      + "): " + message );
+                                      + "): " + result.Message() );
 
                               if( result.status >= 500 )
                                   wxLogError( "%s", text );
@@ -1815,14 +1921,14 @@ void KICAD_OPENAPI_SERVICE::IMPL::traceCall( const std::string& aName, const nlo
     auto       ms = []( auto d ) { return std::round( std::chrono::duration<double, std::milli>( d ).count() * 10 ) / 10; };
     TRACE      t;
     t.method = aName;
-    t.args = aArgs.dump();
+    t.args = aArgs.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
     t.argBytes = t.args.size();
 
     if( t.args.size() > 2048 )
         t.args = t.args.substr( 0, 2048 ) + "...";
 
-    if( aOutcome.status >= 400 && aOutcome.body.contains( "error" ) )
-        t.error = aOutcome.body["error"].value( "message", std::string() );
+    if( aOutcome.status >= 400 )
+        t.error = aOutcome.Message();
     t.queuedMs = ms( aStarted - aReceived );
     t.runMs = ms( finished - aStarted );
     t.status = aOutcome.status;
@@ -1831,7 +1937,7 @@ void KICAD_OPENAPI_SERVICE::IMPL::traceCall( const std::string& aName, const nlo
     {
         std::lock_guard<std::mutex> lock( traceMutex );
         t.seq = ++traceSeq;
-        const std::string line = t.Json().dump();
+        const std::string line = t.Json().dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
 
         traces.push_back( t );
         traceSizes.push_back( line.size() + 1 );
@@ -2259,6 +2365,33 @@ void KICAD_OPENAPI_SERVICE::IMPL::registerRoutes()
                   {
                       reply( res, invoke( req.matches[1], req.body, req.get_header_value( "X-Kicad-Session" ) ) );
                   } );
+
+    // the routes above answer their own failures; an exception that still escapes one is named
+    // and journaled like a method's (MCP: a JSON-RPC error for the request's id)
+    server->set_exception_handler(
+            []( const httplib::Request& req, httplib::Response& res, std::exception_ptr ep )
+            {
+                static const std::string methodPrefix = "/api/v1/";
+                const bool               isMethod = req.path.rfind( methodPrefix, 0 ) == 0;
+                const std::string        what = isMethod ? req.path.substr( methodPrefix.size() )
+                                                         : req.method + " " + req.path;
+                const KOPENAPI_RESULT    failed = failedByException( what, ep );
+
+                if( req.path == "/mcp" )
+                {
+                    const nlohmann::json msg = nlohmann::json::parse( req.body, nullptr, false );
+                    const nlohmann::json id = msg.is_object() && msg.contains( "id" ) ? msg["id"] : nlohmann::json();
+
+                    res.status = 200;
+                    res.set_content( toJson( { { "jsonrpc", "2.0" },
+                                               { "id", id },
+                                               { "error", { { "code", -32603 }, { "message", failed.Message() } } } } ),
+                                     "application/json" );
+                    return;
+                }
+
+                reply( res, failed );
+            } );
 
     server->set_error_handler(
             []( const httplib::Request&, httplib::Response& res )

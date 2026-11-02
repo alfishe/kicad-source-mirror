@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <initializer_list>
 #include <set>
@@ -58,7 +59,29 @@ struct KOPENAPI_RESULT
     {
         return { aStatus, { { "error", { { "code", aStatus }, { "message", aMessage } } } } };
     }
+
+    /// @brief error.message ("" when the body has none)
+    std::string Message() const
+    {
+        if( !body.is_object() || !body.contains( "error" ) )
+            return std::string();
+
+        const nlohmann::json& error = body["error"];
+
+        if( error.is_string() )
+            return error.get<std::string>();
+
+        if( error.is_object() && error.contains( "message" ) && error["message"].is_string() )
+            return error["message"].get<std::string>();
+
+        return std::string();
+    }
 };
+
+
+/// @brief The answer to an exception that escaped while serving aMethod: 500 whose message names
+/// the method and what() (error.method, error.exception); a KOPENAPI_RETRY_LATER keeps its 503
+KICOMMON_API KOPENAPI_RESULT KopenapiExceptionResult( const std::string& aMethod, std::exception_ptr aError );
 
 
 /// @brief Thrown by a handler that cannot answer from complete data right now.  The service

@@ -31,6 +31,34 @@ KOPENAPI_RESULT KOPENAPI_RETRY_LATER::Result() const
 }
 
 
+KOPENAPI_RESULT KopenapiExceptionResult( const std::string& aMethod, std::exception_ptr aError )
+{
+    std::string what;
+
+    try
+    {
+        std::rethrow_exception( aError );
+    }
+    catch( const KOPENAPI_RETRY_LATER& e )
+    {
+        return e.Result();
+    }
+    catch( const std::exception& e )
+    {
+        what = e.what();
+    }
+    catch( ... )
+    {
+        what = "unknown exception (not a std::exception)";
+    }
+
+    KOPENAPI_RESULT result = KOPENAPI_RESULT::Error( 500, aMethod + ": internal error: " + what );
+    result.body["error"]["method"] = aMethod;
+    result.body["error"]["exception"] = what;
+    return result;
+}
+
+
 KOPENAPI_REGISTRY& KOPENAPI_REGISTRY::Get()
 {
     static KOPENAPI_REGISTRY instance;
