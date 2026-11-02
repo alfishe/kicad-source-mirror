@@ -22,6 +22,7 @@ struct ROUTE_PLAN_REQUEST
     int                       trackWidth = 0;
     int                       viaDiameter = 0;     ///< 0: no layer changes
     int                       viaDrill = 0;
+    int                       viaCost = 0;         ///< a via costs as much as this length of track; 0: KopenapiViaCostMm's default
 
     /// @brief Copper the plan may cross at a cost: routes that can be taken out and routed again
     struct SOFT

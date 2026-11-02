@@ -82,6 +82,7 @@ struct GRID_PARAMS
     std::vector<KEEP_OPEN>    keepOpen;
     int                       viaAway = 0;     ///< a via nearer a chip's pads than this costs more, the nearer the more; 0 none
     int                       viaAwayCost = 0; ///< at the pads: as much as this length of track
+    int                       viaCost = 0;     ///< a via costs as much as this length of track (KopenapiViaCostMm); 0: 2 mm
     int                       viaNearHole = 0; ///< a via nearer a through hole of its own net than this costs more; 0 none
     int                       viaNearHoleCost = 0; ///< at the hole: as much as this length of track
     float                     rowsCost = 1.0f; ///< cost factor of a cell between the two pin rows of a connector; 1 none

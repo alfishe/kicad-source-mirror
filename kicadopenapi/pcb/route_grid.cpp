@@ -1665,7 +1665,7 @@ public:
             }
         }
 
-        m_viaCost = 10.0f * (float) ( pcbIUScale.mmToIU( 2.0 ) / c );
+        m_viaCost = 10.0f * (float) ( ( m_params.viaCost > 0 ? m_params.viaCost : pcbIUScale.mmToIU( 2.0 ) ) / c );
         m_fineCost = 10.0f * (float) ( pcbIUScale.mmToIU( 3.0 ) / c );
         m_awayCells = (float) ( m_params.viaAway / c );
         m_awayCost = 10.0f * (float) ( m_params.viaAwayCost / c );

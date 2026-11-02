@@ -261,6 +261,13 @@ struct KOPENAPI_RULE_VIA
 KOPENAPI_RULE_VIA KopenapiRuleVia( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer,
                                    BOARD_ITEM* aOther = nullptr );
 
+/// @brief The mm of track a via costs a route: aArgs' via_cost_mm when given (not below 0), else the
+/// routing room a via of aNetCode takes as the rules size it (KopenapiRuleTrack, KopenapiRuleVia), as
+/// track: on each signal layer of the stack-up, the disc a track's centre keeps out of (via / 2 +
+/// clearance + track / 2) over the band one mm of track keeps other tracks' centres out of
+/// (2 x (track + clearance))
+double KopenapiViaCostMm( BOARD* aBoard, const nlohmann::json& aArgs, int aNetCode = 0 );
+
 /// @brief A fine-pitch pad, by the rules' sizes for its net: no track as wide as the rules ask passes
 /// between it and its nearest neighbour (KopenapiPadNeighbours) at the clearance they ask, or two of
 /// its vias do not fit side by side at the pitch (via + clearance to that neighbour); false without one

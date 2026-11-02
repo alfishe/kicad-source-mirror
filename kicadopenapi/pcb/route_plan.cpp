@@ -685,8 +685,9 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         return finish();
 
     // A*: a straight step 10, a diagonal 14 (in cells), a turn 6, beside another net's pad 30 more,
-    // a via about 3 mm of track
-    const int            viaCost = std::max( 80, (int) ( (double) pcbIUScale.mmToIU( 3.0 ) * 10 / cell ) );
+    // a via as much as the track the request prices it at (at least a step)
+    const double         viaTrack = aReq.viaCost > 0 ? aReq.viaCost : pcbIUScale.mmToIU( KopenapiViaCostMm( board, {}, net ) );
+    const int            viaCost = std::max( 10, (int) ( viaTrack * 10 / cell ) );
     const size_t         states = cells * L;
     std::vector<int>     g( states, INT_MAX );
     std::vector<int>     parent( states, -1 );

@@ -781,6 +781,30 @@ KOPENAPI_RULE_VIA KopenapiRuleVia( BOARD* aBoard, int aNetCode, const VECTOR2I& 
 }
 
 
+double KopenapiViaCostMm( BOARD* aBoard, const nlohmann::json& aArgs, int aNetCode )
+{
+    if( aArgs.is_object() && aArgs.contains( "via_cost_mm" ) && aArgs["via_cost_mm"].is_number() )
+        return std::max( 0.0, aArgs["via_cost_mm"].get<double>() );
+
+    if( !aBoard )
+        return 0.0;
+
+    const BOX2I    edges = aBoard->GetBoardEdgesBoundingBox();
+    const VECTOR2I at = edges.GetWidth() > 0 ? edges.Centre() : VECTOR2I( 0, 0 );
+    const double   track = KopenapiRuleTrack( aBoard, aNetCode, at, F_Cu ).opt;
+    const KOPENAPI_RULE_VIA via = KopenapiRuleVia( aBoard, aNetCode, at, F_Cu );
+    int            layers = 0;
+
+    for( PCB_LAYER_ID layer : LSET::AllCuMask( aBoard->GetCopperLayerCount() ).Seq() )
+        layers += aBoard->GetLayerType( layer ) != LT_POWER;
+
+    const double r = via.dia / 2.0 + via.clearance + track / 2.0;
+    const double band = 2.0 * ( track + via.clearance );
+
+    return band > 0 ? pcbIUScale.IUTomm( M_PI * r * r / band ) * std::max( layers, 1 ) : 0.0;
+}
+
+
 bool KopenapiPadFinePitch( BOARD* aBoard, PAD* aPad )
 {
     if( !aPad || !aPad->GetParentFootprint() )
@@ -5786,6 +5810,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     const bool rail = style == "rail";
     const bool viasAllowed = aArgs.value( "vias", true ) && layers.size() >= 2;
     const bool planning = aArgs.value( "plan", true );
+    // a via's price in track, one for the plan, the grid and the clean-up
+    const double viaCostMm = KopenapiViaCostMm( board, aArgs );
     const bool keepTries = aArgs.value( "attempts", false );
 
     auto refreshFronts = [&]()
@@ -5815,6 +5841,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         ROUTE_PLAN_REQUEST req{ board, aFrom, aTo, aToPos, layers, width, viasAllowed ? dia : 0, drill, {}, {} };
         req.stop = overTime;
+        req.viaCost = pcbIUScale.mmToIU( viaCostMm );
 
         for( const ESCAPE_FRONT& front : fronts )
         {
@@ -10513,6 +10540,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
         params.viaAway = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_mm", 7.0 ), 0.0, 30.0 ) );
         params.viaAwayCost = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_cost_mm", 8.0 ), 0.0, 100.0 ) );
+        params.viaCost = pcbIUScale.mmToIU( viaCostMm );
         params.rowsCost = (float) std::clamp( aArgs.value( "rows_cost", 6.0 ), 1.0, 100.0 );
         params.bodyCost = (float) std::clamp( aArgs.value( "body_cost", 1.0 ), 1.0, 100.0 );
         params.viaNearHole = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_near_hole_mm", 2.5 ), 0.0, 30.0 ) );
@@ -12779,10 +12807,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // ends are on (walkaround: it moves nothing else); kept when it has fewer vias, or as many and
     // is 5 % shorter, and no connection of its net is left cut; else put back as it was.  A long
     // detour (over 1.6 x the straight line) follows a plan through vias instead when that plan is a
-    // quarter shorter (a via counted as 2 mm of track); kept when it is a fifth shorter so counted
+    // quarter shorter (a via counted as via_cost_mm of track); kept when it is a fifth shorter so counted
     int cleanTried = 0, cleanSkipped = 0, cleanKept = 0, viasRemoved = 0, viasAdded = 0, viaWays = 0;
     double shortenedIU = 0;
-    const double viaCost = pcbIUScale.mmToIU( 2.0 );
+    const double viaCost = pcbIUScale.mmToIU( viaCostMm );
 
     if( !dryRun && !rail && !grid && aArgs.value( "clean_up", true ) )
     {
@@ -13422,6 +13450,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                             { "earlier_routes_rerouted", foreignMoved } } },
                               { "clean_up", { { "tried", cleanTried }, { "skipped", cleanSkipped }, { "kept", cleanKept }, { "vias_removed", viasRemoved }, { "via_ways", viaWays }, { "vias_added", viasAdded },
                                               { "shortened_mm", std::round( pcbIUScale.IUTomm( shortenedIU ) * 1000.0 ) / 1000.0 } } },
+                              { "via_cost_mm", std::round( viaCostMm * 1000.0 ) / 1000.0 },
                               { "stubs_removed", stubs },
                               { "doubled_removed", twins },
                               { "kept_out_under", keptOut },
@@ -18980,7 +19009,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "layers":{"type":"array","items":{"type":"string"},"default":["F.Cu","B.Cu"]},
                         "order":{"type":"string","enum":["short_first","power_first","dense_first"],"default":"short_first","description":"dense_first: connections at fine-pitch pads first (no track of the net as wide as the rules ask passes between the pad and its neighbour at the rules' clearance, or two of its vias do not fit side by side at the pitch)"},
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
-                        "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it); a detour over 1.6 x follows a plan through vias instead when that is a quarter shorter, a via counted as 2 mm (kept when a fifth shorter); clean_up: tried / skipped / kept / vias_removed / via_ways / vias_added / shortened_mm; rows cleaned"},
+                        "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it); a detour over 1.6 x follows a plan through vias instead when that is a quarter shorter, a via counted as via_cost_mm (kept when a fifth shorter); clean_up: tried / skipped / kept / vias_removed / via_ways / vias_added / shortened_mm; rows cleaned"},
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
                         "attempts":{"type":"boolean","default":false,"description":"pns: each row lists its tries (at most 40): kind, pass, layer, from, points (vias / corners), routed, ms; a failed one its reason, stopped_at_mm, toward_mm, walls_in, the nearest blocker"},"stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does; while connections still wait for their first-pass try (first_pass_budget_s bounding it) or, failed there, for their turn in the retry pass (fewest tries first), it ends the turn of the one routing instead (budget stop_on_plateau_s): what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
                         "budgets":{"type":"string","enum":["time","work"],"default":"time","description":"time: first_pass_budget_s, rip_up_budget_s and stop_on_plateau_s on the wall clock; work: counted in the router's work (its stop checks: each walkaround / shove step and try) at work_per_s a second, so the same board routes the same under any load (A/B comparisons), the wall clock only a hard cap at wall_cap_x times a budget (profile budget: mode, work, work_per_s, wall_caps)"},
@@ -19027,6 +19056,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (as dense_first says) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
                         "inward_escapes":{"type":"array","items":{"type":"string"},"description":"footprint references of packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). 404 an unknown reference, 400 a part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},
+                        "via_cost_mm":{"type":"number","minimum":0,"description":"mm of track a via costs the plan, the grid and the clean-up; default from the rules: the routing room a via of the default class takes on each signal layer, as track (the answer's via_cost_mm)"},
                         "plan":{"type":"boolean","default":true,"description":"a connection the router does not find on a layer is planned over the free space (grid search with vias, the board's clearances), the router follows the plan; no plan found: no escape-spot tries either (row plan tells)"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
                         "style":{"type":"string","enum":["direct","rail"],"default":"direct","description":"rail (power nets): every connection leaves its pads through a via next to them and runs on the second layer"},
