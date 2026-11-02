@@ -2343,7 +2343,7 @@ int KICAD_OPENAPI_SERVICE::DefaultPort()
     {
         int port = std::atoi( env );
 
-        if( port > 0 && port < 65536 )
+        if( ( port > 0 || ( port == 0 && *env == '0' ) ) && port < 65536 )
             return port;
     }
 
@@ -2380,7 +2380,9 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
     auto poolReady = std::make_shared<std::promise<void>>();
     std::future<void> poolBuilt = poolReady->get_future();
 
-    for( int i = 0; i < PORT_PROBE_COUNT; ++i )
+    // port 0, or the last attempt after a taken range: a port the OS assigns, named in the
+    // discovery file
+    for( int i = basePort == 0 ? PORT_PROBE_COUNT : 0; i <= PORT_PROBE_COUNT && !m_impl->port; ++i )
     {
         // A fresh server per attempt: httplib decommissions a server after a failed bind
         m_impl->server = std::make_unique<httplib::Server>();
@@ -2395,18 +2397,33 @@ bool KICAD_OPENAPI_SERVICE::Start( int aPort )
         };
         m_impl->registerRoutes();
 
-        if( m_impl->server->bind_to_port( KOPENAPI_HOST_ADDR, basePort + i ) )
+        if( i < PORT_PROBE_COUNT )
         {
-            m_impl->port = basePort + i;
-            s_currentPort = m_impl->port;
-            break;
+            if( m_impl->server->bind_to_port( KOPENAPI_HOST_ADDR, basePort + i ) )
+                m_impl->port = basePort + i;
+        }
+        else
+        {
+            m_impl->port = std::max( 0, m_impl->server->bind_to_any_port( KOPENAPI_HOST_ADDR ) );
+
+            if( m_impl->port && basePort )
+            {
+                wxLogWarning( "kicadopenapi: ports %d..%d are taken; listening on port %d instead (see the "
+                              "discovery file)", basePort, basePort + PORT_PROBE_COUNT - 1, m_impl->port );
+            }
         }
     }
 
+    if( m_impl->port )
+        s_currentPort = m_impl->port;
+
     if( !m_impl->port )
     {
-        std::fprintf( stderr, "kicadopenapi: failed to bind 127.0.0.1:%d..%d\n", basePort,
-                      basePort + PORT_PROBE_COUNT - 1 );
+        if( basePort )
+            wxLogError( "kicadopenapi: failed to bind 127.0.0.1:%d..%d or any other port", basePort,
+                        basePort + PORT_PROBE_COUNT - 1 );
+        else
+            wxLogError( "kicadopenapi: failed to bind a port on 127.0.0.1" );
         m_impl->server.reset();
         return false;
     }

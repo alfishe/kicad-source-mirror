@@ -57,7 +57,7 @@ CLI::OPENAPI_RUN_COMMAND::OPENAPI_RUN_COMMAND() :
             .default_value( -1 )
             .scan<'i', int>()
             .help( UTF8STDSTR( _( "First port to try for the API while the batch runs (default: "
-                                  "KICAD_OPENAPI_PORT or 4242)" ) ) )
+                                  "KICAD_OPENAPI_PORT or 4242); 0: a port the OS assigns" ) ) )
             .metavar( "PORT" );
 
     m_argParser.add_argument( ARG_KEEP_GOING )

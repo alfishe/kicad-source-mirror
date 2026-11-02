@@ -163,7 +163,8 @@ CLI::OPENAPI_SERVER_COMMAND::OPENAPI_SERVER_COMMAND() :
     m_argParser.add_argument( ARG_PORT )
             .default_value( -1 )
             .scan<'i', int>()
-            .help( UTF8STDSTR( _( "First port to try (default: KICAD_OPENAPI_PORT or 4242)" ) ) )
+            .help( UTF8STDSTR( _( "First port to try (default: KICAD_OPENAPI_PORT or 4242); 0: a port the OS "
+                                  "assigns, named in the discovery file" ) ) )
             .metavar( "PORT" );
 
     m_argParser.add_argument( ARG_PARENT_PID )

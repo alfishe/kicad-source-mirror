@@ -37,8 +37,10 @@ public:
     KICAD_OPENAPI_SERVICE( KIWAY* aKiway, bool aHeadless );
     ~KICAD_OPENAPI_SERVICE();
 
-    /// @brief Bind and start serving.  Tries aPort, then the next PORT_PROBE_COUNT - 1 ports.
-    /// A negative aPort means DefaultPort().  Returns false if no port could be bound.
+    /// @brief Bind and start serving.  Tries aPort, then the next PORT_PROBE_COUNT - 1 ports, then
+    /// a port the OS assigns (journal warning; the discovery file names it).  aPort 0: only a port
+    /// the OS assigns.  A negative aPort means DefaultPort().  Returns false if no port could be
+    /// bound (journal error).
     bool Start( int aPort = -1 );
 
     /// @brief Stop serving; idempotent.  Must be called before the KIWAY/frames go away.
@@ -111,7 +113,7 @@ public:
     static void SetOverrideLock( bool aOverride );
     static bool OverrideLock();
 
-    /// @brief KICAD_OPENAPI_PORT env override, else DEFAULT_PORT.
+    /// @brief KICAD_OPENAPI_PORT env override (0: a port the OS assigns), else DEFAULT_PORT.
     static int DefaultPort();
 
 private:
