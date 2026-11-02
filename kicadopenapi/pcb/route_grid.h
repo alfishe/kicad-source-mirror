@@ -64,7 +64,8 @@ struct GRID_PARAMS
     std::vector<PCB_LAYER_ID> layers;          ///< routing layers
     int                       cell = 0;        ///< 0: from the finest class
     bool                      coarse = false;  ///< cell 0: half the finest class's track pitch (rounded up), not a third (the global stage)
-    float                     raceWait = 0.25f; ///< once the first variant is done, the others' time left: this share of its time (2 s at least)
+    float                     raceWait = 0.25f; ///< once the first variant is done, the others' time left: this share of its time (raceWaitMinS at least)
+    float                     raceWaitMinS = 2.0f; ///< the least time left the others once the first variant is done (seconds)
     int                       variants = 0;    ///< 0: half the cores, up to the built-ins, as many as the memory allows
     int64_t                   memoryBudget = 0; ///< bytes the lanes may take; 0: half the memory available now
     int                       maxRounds = 40;

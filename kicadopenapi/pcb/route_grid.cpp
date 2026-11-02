@@ -4552,7 +4552,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 
     // once one variant has joined everything, the variants still negotiating stop: those past
     // their rounds finish (they may still need fewer vias or less length).  Once the first has
-    // finished at all, the others get a share of its time again (raceWait, 2 s at least)
+    // finished at all, the others get a share of its time again (raceWait, raceWaitMinS at least)
     std::vector<bool>   finished( runs.size(), false );
     std::vector<double> finishedMs( runs.size(), 0 );
     bool                complete = false;
@@ -4604,7 +4604,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
             }
         }
 
-        if( firstMs >= 0 && left > 0 && activeMs() > firstMs + std::max( 2000.0, firstMs * aParams.raceWait ) )
+        if( firstMs >= 0 && left > 0 && activeMs() > firstMs + std::max( 1000.0 * aParams.raceWaitMinS, firstMs * aParams.raceWait ) )
         {
             for( size_t j = 0; j < runs.size(); ++j )
             {
