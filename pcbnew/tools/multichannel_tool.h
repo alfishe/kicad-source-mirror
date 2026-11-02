@@ -104,6 +104,12 @@ public:
                       wxString* aErrorOut = nullptr );
     int AutogenerateRuleAreas( const TOOL_EVENT& aEvent );
 
+    /**
+     * Create the placement rule areas of the entries of GetData() marked m_generateEnabled
+     * (after GeneratePotentialRuleAreas()), honouring m_replaceExisting and m_options.m_groupItems.
+     */
+    int GenerateRuleAreas();
+
     void UpdatePickedPoint( const std::optional<VECTOR2I>& aPoint ) override {};
     void UpdatePickedItem( const EDA_ITEM* aItem ) override;
 

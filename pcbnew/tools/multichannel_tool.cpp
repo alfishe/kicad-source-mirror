@@ -2348,6 +2348,12 @@ int MULTICHANNEL_TOOL::AutogenerateRuleAreas( const TOOL_EVENT& aEvent )
             return 0;
     }
 
+    return GenerateRuleAreas();
+}
+
+
+int MULTICHANNEL_TOOL::GenerateRuleAreas()
+{
     wxLogTrace( traceMultichannelTool, wxT( "%d placement areas found\n" ), (int) m_areas.m_areas.size() );
 
     BOARD_COMMIT commit( GetManager(), true, false );
