@@ -820,6 +820,11 @@ void BOARD_COMMIT::Push( const wxString& aMessage, int aCommitFlags )
             frame->SetMsgPanel( msg_list );
         }
     }
+    else if( !( aCommitFlags & SKIP_SET_DIRTY ) )
+    {
+        // the frame's OnModify does this: the board's caches drop what the change made stale
+        board->IncrementTimeStamp();
+    }
 
     if( containsDrillMap && frame )
         frame->RefreshDrillSymbols( KIGFX::LAYERS | KIGFX::GEOMETRY | KIGFX::REPAINT );
