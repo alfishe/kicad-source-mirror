@@ -11252,11 +11252,14 @@ static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( error )
         return *error;
 
-    const size_t   limit = size_t( std::clamp( aArgs.value( "limit", 500 ), 1, 5000 ) );
-    const size_t   offset = size_t( std::max( 0, aArgs.value( "offset", 0 ) ) );
+    const bool     full = aArgs.value( "full", false );
+    const size_t   limit = full ? tracks.size() : size_t( std::clamp( aArgs.value( "limit", 500 ), 1, 5000 ) );
+    const size_t   offset = full ? 0 : size_t( std::max( 0, aArgs.value( "offset", 0 ) ) );
     nlohmann::json items = nlohmann::json::array();
     double         length = 0;
     int            vias = 0;
+
+    std::shared_ptr<CONNECTIVITY_DATA> conn = full ? board->GetConnectivity() : nullptr;
 
     for( size_t i = 0; i < tracks.size(); i++ )
     {
@@ -11265,8 +11268,44 @@ static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         else
             length += tracks[i]->GetLength();
 
-        if( i >= offset && items.size() < limit )
-            items.push_back( trackJson( board, tracks[i] ) );
+        if( i < offset || items.size() >= limit )
+            continue;
+
+        nlohmann::json row = trackJson( board, tracks[i] );
+
+        if( full )
+        {
+            PCB_TRACK* t = tracks[i];
+            NETCLASS*  netclass = t->GetEffectiveNetClass();
+
+            row["net_code"] = t->GetNetCode();
+            row["netclass"] = netclass ? str( netclass->GetName() ) : std::string();
+            row["locked"] = t->IsLocked();
+            row["dangling"] = conn && conn->TestTrackEndpointDangling( t, true );
+
+            if( t->Type() == PCB_VIA_T )
+            {
+                PCB_VIA*       via = static_cast<PCB_VIA*>( t );
+                nlohmann::json span = nlohmann::json::array();
+
+                for( PCB_LAYER_ID l : via->GetLayerSet().CuStack() )
+                    span.push_back( str( board->GetLayerName( l ) ) );
+
+                row["layer_span"] = span;
+                row["via_type"] = via->GetViaType() == VIATYPE::THROUGH       ? "through"
+                                  : via->GetViaType() == VIATYPE::MICROVIA    ? "micro"
+                                  : via->GetViaType() == VIATYPE::BLIND       ? "blind"
+                                  : via->GetViaType() == VIATYPE::BURIED      ? "buried"
+                                                                              : "other";
+            }
+            else if( t->Type() == PCB_ARC_T )
+            {
+                const PCB_ARC* arc = static_cast<const PCB_ARC*>( t );
+                row["mid_mm"] = { toMm( arc->GetMid().x ), toMm( arc->GetMid().y ) };
+            }
+        }
+
+        items.push_back( std::move( row ) );
     }
 
     nlohmann::json out = { { "items", items }, { "total", tracks.size() }, { "vias", vias },
@@ -13822,7 +13861,8 @@ KOPENAPI_REGISTER( "pcb_track_list",
                    "Tracks and vias with their uuids: all, or of nets, in a region, on a layer, or the copper "
                    "joining two pads (between); per item kind, net, ends (start_mm / end_mm, also as from_mm / to_mm) / "
                    "position, layer(s), width, length (vias in detail: pcb_via_list); "
-                   "totals (count, vias, length)",
+                   "totals (count, vias, length); full: every item (no limit / offset) with net code, net class, "
+                   "locked, dangling, a via's type and layer span, an arc's mid point",
                    R"json({"type":"object","properties":{
                         "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
                         "between":{"type":"array","items":{"type":"string"},"description":"[\"REF.PAD\", \"REF.PAD\"]: the chain of tracks / vias joining these two pads of one net"},
@@ -13831,7 +13871,8 @@ KOPENAPI_REGISTER( "pcb_track_list",
                         "layer":{"type":"string"},
                         "kinds":{"type":"array","items":{"type":"string","enum":["track","via"]}},
                         "uuids":{"type":"array","items":{"type":"string"}},
-                        "limit":{"type":"integer","default":500},"offset":{"type":"integer","default":0}}})json"_json,
+                        "limit":{"type":"integer","default":500,"description":"items per page, 1..5000 (ignored with full)"},"offset":{"type":"integer","default":0},
+                        "full":{"type":"boolean","default":false,"description":"every item in one answer, no limit or offset, with all fields: net_code, netclass, locked, dangling; vias: via_type, layer_span; arcs: mid_mm"}}})json"_json,
                    false, h_pcb_track_list );
 
 KOPENAPI_REGISTER( "pcb_via_list",
