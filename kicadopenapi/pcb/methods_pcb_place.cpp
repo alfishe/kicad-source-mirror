@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <queue>
@@ -300,6 +301,31 @@ std::map<int, int> groupsPerNet( FOOTPRINT* aFootprint )
 
 /// @brief A capacitor's value in farads from its Value text ("100n", "0.1uF", "4u7", "10uF");
 /// none when it does not read
+/// @brief An inductance value (3.3uH, 10 uH, 4u7H)
+bool henryValue( const FOOTPRINT* aFootprint )
+{
+    const std::string text = str( aFootprint->GetValue() );
+    size_t            i = 0;
+
+    while( i < text.size() && ( std::isdigit( (unsigned char) text[i] ) || text[i] == '.' || text[i] == ',' ) )
+        ++i;
+
+    if( i == 0 )
+        return false;
+
+    while( i < text.size() && ( text[i] == ' ' || std::strchr( "pnum", text[i] ) || std::isdigit( (unsigned char) text[i] ) ) )
+        ++i;
+
+    if( text.compare( i, 2, "\xC2\xB5" ) == 0 )
+        i += 2;
+
+    while( i < text.size() && std::isdigit( (unsigned char) text[i] ) )
+        ++i;
+
+    return i < text.size() && ( text[i] == 'H' || text[i] == 'h' );
+}
+
+
 std::optional<double> faradsOf( const FOOTPRINT* aFootprint )
 {
     const std::string text = str( aFootprint->GetValue() );
@@ -2112,6 +2138,7 @@ struct NEAR_OPTIONS
     double                corridorYieldMm = -1;  ///< also enter one when only that brings the pad within this
     std::optional<VECTOR2I>      targetAt;           ///< the spot to bring the pad to, instead of the target pad's
     const std::vector<VIA_SPOT>* viaSpots = nullptr;   ///< vias to come, the part's pads kept clear of them
+    const std::set<const FOOTPRINT*>* pending = nullptr;   ///< parts placed after this one: no obstacles
 };
 
 struct NEAR_PLACEMENT
@@ -2136,7 +2163,8 @@ public:
     /// @param aCorridors kept free (those of a net the part has a pad on aside), or null
     PLACE_SPACE( BOARD* aBoard, FOOTPRINT* aPart, const VECTOR2I& aAround, int aReach, FOOTPRINT* aHost, int aHostRing,
                  std::optional<double> aPartHeight, const std::vector<CORRIDOR>* aCorridors = nullptr,
-                 const std::vector<VIA_SPOT>* aViaSpots = nullptr ) :
+                 const std::vector<VIA_SPOT>* aViaSpots = nullptr,
+                 const std::set<const FOOTPRINT*>* aPending = nullptr ) :
             m_outline( aBoard ),
             m_part( aPart ),
             m_viaSpots( aViaSpots )
@@ -2156,7 +2184,7 @@ public:
 
         for( FOOTPRINT* fp : aBoard->Footprints() )
         {
-            if( fp == aPart || fp->IsFlipped() != aPart->IsFlipped() )
+            if( fp == aPart || fp->IsFlipped() != aPart->IsFlipped() || ( aPending && aPending->count( fp ) ) )
                 continue;
 
             SHAPE_POLY_SET area = courtyard( fp );
@@ -2180,6 +2208,20 @@ public:
         }
 
         m_edges = aBoard->GetBoardEdgesBoundingBox();
+        m_layer = aPart->IsFlipped() ? B_Cu : F_Cu;
+
+        // rule areas on the part's side: no courtyard where footprints are kept out, no pad where
+        // tracks or pads are (a pad there can't be connected)
+        for( ZONE* zone : aBoard->Zones() )
+        {
+            if( !zone->GetIsRuleArea() || !zone->IsOnLayer( m_layer ) || !zone->GetBoundingBox().Intersects( around ) )
+                continue;
+
+            if( zone->GetDoNotAllowFootprints() )
+                m_obstacles.emplace_back( *zone->Outline(), zone->GetBoundingBox() );
+            else if( zone->GetDoNotAllowTracks() || zone->GetDoNotAllowPads() )
+                m_padKeepouts.emplace_back( *zone->Outline(), zone->GetBoundingBox() );
+        }
     }
 
     /// @brief aArea (the part's courtyard grown by the gap) moved by aDelta: clear of the others and
@@ -2207,6 +2249,32 @@ public:
                 const int need = spot.radius + ( pad->GetNetCode() == spot.net && spot.net > 0 ? 0 : spot.clearance );
 
                 if( pad->GetEffectiveShape( pad->GetLayerSet().CuStack().front() )->Collide( spot.at - aDelta, need ) )
+                    return false;
+            }
+        }
+
+        for( const auto& [keepout, keepoutBox] : m_padKeepouts )
+        {
+            if( !keepoutBox.Intersects( box ) )
+                continue;
+
+            for( PAD* pad : m_part->Pads() )
+            {
+                if( !pad->IsOnLayer( m_layer ) )
+                    continue;
+
+                BOX2I padBox = pad->GetBoundingBox();
+                padBox.Move( aDelta );
+
+                if( !keepoutBox.Intersects( padBox ) )
+                    continue;
+
+                SHAPE_POLY_SET copper;
+                pad->TransformShapeToPolygon( copper, m_layer, 0, ARC_HIGH_DEF, ERROR_OUTSIDE );
+                copper.Move( aDelta );
+                copper.BooleanIntersection( keepout );
+
+                if( !copper.IsEmpty() )
                     return false;
             }
         }
@@ -2283,8 +2351,10 @@ private:
     const std::vector<VIA_SPOT>*                         m_viaSpots;
     std::vector<const CORRIDOR*>                         m_corridors;
     std::vector<std::pair<SHAPE_POLY_SET, BOX2I>>       m_obstacles;
+    std::vector<std::pair<SHAPE_POLY_SET, BOX2I>>       m_padKeepouts;
     std::vector<std::pair<FOOTPRINT*, SHAPE_POLY_SET>>  m_raised;
     BOX2I                                                m_edges;
+    PCB_LAYER_ID                                         m_layer = F_Cu;
 };
 
 
@@ -2345,9 +2415,10 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
     const int         reach = toIU( aOptions.maxMm );
     const int         gap = toIU( aOptions.gapMm );
     const int         ring = toIU( std::max( 0.0, aOptions.hostRingMm ) );
-    const PLACE_SPACE space( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, nullptr, aOptions.viaSpots );
+    const PLACE_SPACE space( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, nullptr, aOptions.viaSpots,
+                             aOptions.pending );
     const PLACE_SPACE kept( aBoard, aPart, target, reach, host, ring, aOptions.partHeight, aOptions.corridors,
-                            aOptions.viaSpots );
+                            aOptions.viaSpots, aOptions.pending );
 
     // directions: along the target footprint's axes, the side its pad is nearest to first
     const EDA_ANGLE base = host->GetOrientation();
@@ -2630,8 +2701,32 @@ bool finePitch( FOOTPRINT* aFootprint )
 /// pin's inner end, clear of other nets' copper (pads, tracks, vias, the spots in aTaken) by the
 /// clearance; else just past the pin's outer end.  A spot of the net within 1.2 mm of the pin is
 /// shared instead.  aDirection gets the board axis pointing into the body.
+/// The way a pin of a quad row takes into its package: along the package axis, in the board's frame
+VECTOR2D inwardAxis( PAD* aPin )
+{
+    FOOTPRINT* host = aPin->GetParentFootprint();
+    VECTOR2D   local = VECTOR2D( aPin->GetPosition() - host->GetPosition() );
+    RotatePoint( local, -host->GetOrientation() );
+    VECTOR2D axis = std::abs( local.x ) >= std::abs( local.y ) ? VECTOR2D( local.x > 0 ? -1 : 1, 0 )
+                                                               : VECTOR2D( 0, local.y > 0 ? -1 : 1 );
+    RotatePoint( axis, host->GetOrientation() );
+    return axis;
+}
+
+
+/// A rail pin's way into its package that a spot of another net must leave open
+struct RAIL_WAY
+{
+    SEG way;
+    int net;
+    int half;
+};
+
+
+/// @param aWays other rail pins' ways inward: a spot keeps clear of them (with its stub), so no
+/// rail pin is shut in by a neighbour's via; at fine pitch no spot is taken outside the body
 std::optional<VECTOR2I> viaSpotUnder( BOARD* aBoard, PAD* aPin, int aViaDiameter, const std::vector<VIA_SPOT>& aTaken,
-                                      std::string& aDirection )
+                                      const std::vector<RAIL_WAY>& aWays, std::string& aDirection )
 {
     FOOTPRINT*                   host = aPin->GetParentFootprint();
     const BOARD_DESIGN_SETTINGS& ds = aBoard->GetDesignSettings();
@@ -2706,6 +2801,17 @@ std::optional<VECTOR2I> viaSpotUnder( BOARD* aBoard, PAD* aPin, int aViaDiameter
         if( own->Collide( aAt, radius ) )
             return false;
 
+        const SEG stub( pin, aAt );
+
+        for( const RAIL_WAY& way : aWays )
+        {
+            if( way.net != net
+                && ( way.way.Distance( aAt ) < radius + way.half + clearance || way.way.Distance( stub ) < stubHalf + way.half + clearance ) )
+            {
+                return false;
+            }
+        }
+
         for( const VIA_SPOT& taken : aTaken )
         {
             if( taken.net == net && ( taken.at - aAt ).EuclideanNorm() < radius + taken.radius )
@@ -2721,12 +2827,7 @@ std::optional<VECTOR2I> viaSpotUnder( BOARD* aBoard, PAD* aPin, int aViaDiameter
         return stubClear( aAt );
     };
 
-    // the package axis the pin points along, in the footprint's frame, then on the board
-    VECTOR2D local = VECTOR2D( pin - host->GetPosition() );
-    RotatePoint( local, -host->GetOrientation() );
-    VECTOR2D axis = std::abs( local.x ) >= std::abs( local.y ) ? VECTOR2D( local.x > 0 ? -1 : 1, 0 )
-                                                               : VECTOR2D( 0, local.y > 0 ? -1 : 1 );
-    RotatePoint( axis, host->GetOrientation() );
+    const VECTOR2D axis = inwardAxis( aPin );
 
     const VECTOR2D toMiddle = VECTOR2D( middle - pin );
     const double   span = toMiddle.EuclideanNorm();
@@ -2764,7 +2865,7 @@ std::optional<VECTOR2I> viaSpotUnder( BOARD* aBoard, PAD* aPin, int aViaDiameter
         }
     }
 
-    for( int along = step; along < toIU( 2.0 ); along += step )
+    for( int along = step; !finePitch( host ) && along < toIU( 2.0 ); along += step )
     {
         const VECTOR2I at = pin - VECTOR2I( KiROUND( axis.x * along ), KiROUND( axis.y * along ) );
 
@@ -2818,6 +2919,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         bool             decoupling = false;   // across two rails of the anchor
         double           farads = 1.0;
         bool             capacitor = false;
+        bool             inductor = false;      // a regulator's inductor at its switching pin
     };
 
     std::vector<MEMBER>     members;
@@ -2853,6 +2955,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         member.decoupling = member.ownNets == 0;
         member.capacitor = faradsOf( part ).has_value() || KopenapiRefPrefix( str( part->GetReference() ) ) == "C";
         member.farads = faradsOf( part ).value_or( 1.0 );
+        member.inductor = !member.capacitor && ( henryValue( part ) || KopenapiRefPrefix( str( part->GetReference() ) ) == "L" );
 
         // a decoupling capacitor belongs at its supply pin, its ground the nearest to that
         if( member.decoupling )
@@ -2872,14 +2975,17 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
     auto rank = []( const MEMBER& m ) { return m.ownNets >= 2 ? 0 : m.decoupling ? 1 : 2; };
 
-    // the most bound first: a crystal on two nets of its own, the decoupling capacitors (smallest
-    // value first: nearest its pin), then parts on one net of their own; among equals the most
-    // specific net, then big before small
+    // the most bound first: a crystal on two nets of its own, a regulator's inductor across two
+    // rails, the decoupling capacitors (smallest value first: nearest its pin), then parts on one
+    // net of their own; among equals the most specific net, then big before small
     std::stable_sort( members.begin(), members.end(),
                       [&]( const MEMBER& a, const MEMBER& b )
                       {
                           if( rank( a ) != rank( b ) )
                               return rank( a ) < rank( b );
+
+                          if( a.decoupling && b.decoupling && a.inductor != b.inductor )
+                              return a.inductor;   // the switching loop before the caps
 
                           if( a.decoupling && a.farads != b.farads )
                               return a.farads < b.farads;
@@ -2904,6 +3010,8 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         std::string inward;
     };
 
+    std::map<PAD*, SPOT_AT> spotOfPin;   // reserved before the caps go
+
     auto spotFor = [&]( PAD* aPin ) -> std::optional<SPOT_AT>
     {
         NETCLASS*   netclass = aPin->GetEffectiveNetClass();
@@ -2911,7 +3019,25 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
                                                                       : aBoard->GetDesignSettings().GetCurrentViaSize();
         std::string inward;
 
-        if( std::optional<VECTOR2I> at = viaSpotUnder( aBoard, aPin, diameter, viaSpots, inward ) )
+        // the other rail pins' ways inward: to their spot once they have one, else to the middle
+        std::vector<RAIL_WAY> ways;
+        const VECTOR2I        middle = courtyard( aAnchor ).BBox().GetCenter();
+
+        for( PAD* pad : aAnchor->Pads() )
+        {
+            if( pad == aPin || !rails.count( pad->GetNetCode() ) || pad->GetEffectiveShape( pad->GetLayerSet().CuStack().front() )->Collide( middle, 0 ) )
+                continue;
+
+            auto           reserved = spotOfPin.find( pad );
+            const VECTOR2D axis = inwardAxis( pad );
+            const double   depth = std::abs( VECTOR2D( middle - pad->GetPosition() ).Dot( axis ) );
+            const VECTOR2I end = reserved != spotOfPin.end() ? reserved->second.spot.at
+                                                             : pad->GetPosition() + VECTOR2I( KiROUND( axis.x * depth ), KiROUND( axis.y * depth ) );
+
+            ways.push_back( { SEG( pad->GetPosition(), end ), pad->GetNetCode(), stubWidth( aBoard, pad ) / 2 } );
+        }
+
+        if( std::optional<VECTOR2I> at = viaSpotUnder( aBoard, aPin, diameter, viaSpots, ways, inward ) )
         {
             return SPOT_AT{ { *at, aPin->GetNetCode(), diameter / 2,
                               std::max( aBoard->GetDesignSettings().m_MinClearance, netclass ? netclass->GetClearance() : 0 ),
@@ -3055,7 +3181,6 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
     // every supply pin a bottom cap may take gets its spot first, so the caps keep off the spots of
     // the pins after them
-    std::map<PAD*, SPOT_AT> spotOfPin;
 
     if( decapOtherSide )
     {
@@ -3198,8 +3323,62 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             }
         }
 
-        // still out of reach: under the anchor on the other side, when that brings it within reach
-        if( placement.ok && member.decoupling && member.capacitor && decapOtherSide && placement.padDistanceMm > aDecapMaxMm
+        // still out of reach (the inductor: always): in the old spots of the group's parts yet to go
+        // (they move anyway)
+        if( placement.ok && member.decoupling && ( placement.padDistanceMm > aDecapMaxMm || member.inductor ) && !viaPad )
+        {
+            const VECTOR2I             pos = member.part->GetPosition();
+            const EDA_ANGLE            angle = member.part->GetOrientation();
+            std::set<const FOOTPRINT*> pending;
+            NEAR_OPTIONS               free = options;
+
+            for( size_t i = size_t( &member - members.data() ) + 1; i < members.size(); ++i )
+                pending.insert( members[i].part );
+
+            free.pending = &pending;
+
+            NEAR_PLACEMENT closer = placeNear( aBoard, member.part, target, free );
+
+            // the inductor closes the switching loop: inside the ring and at the narrow gap whenever
+            // that is closer
+            if( closer.ok && ( closer.padDistanceMm > aDecapMaxMm || member.inductor )
+                && ( free.hostRingMm > 0 || ( member.inductor && !free.gapGiven && free.gapMm > 0.25 ) ) )
+            {
+                const VECTOR2I  ringPos = member.part->GetPosition();
+                const EDA_ANGLE ringAngle = member.part->GetOrientation();
+
+                free.hostRingMm = 0;
+
+                if( member.inductor && !free.gapGiven )
+                    free.gapMm = std::min( free.gapMm, 0.25 );
+
+                if( NEAR_PLACEMENT inside = placeNear( aBoard, member.part, target, free );
+                    inside.ok && inside.padDistanceMm < closer.padDistanceMm )
+                {
+                    closer = inside;
+                }
+                else
+                {
+                    member.part->SetOrientation( ringAngle );
+                    member.part->SetPosition( ringPos );
+                }
+            }
+
+            if( closer.ok && closer.padDistanceMm < placement.padDistanceMm )
+            {
+                placement = closer;
+            }
+            else
+            {
+                member.part->SetOrientation( angle );
+                member.part->SetPosition( pos );
+            }
+        }
+
+        // still out of reach: under the anchor on the other side, when that brings it within reach (a
+        // cap, or a filter resistor; the inductor stays on the regulator's side)
+        if( placement.ok && member.decoupling && ( member.capacitor || ( !member.inductor && member.part->Pads().size() == 2 ) )
+            && decapOtherSide && placement.padDistanceMm > aDecapMaxMm
             && !viaPad )
         {
             const VECTOR2I  pos = member.part->GetPosition();
@@ -3440,6 +3619,9 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
     if( !laid.empty() )
         aOut["vias_laid"] = laid.size();
+
+    if( !laid.empty() || std::any_of( done.begin(), done.end(), []( FOOTPRINT* fp ) { return fp->IsFlipped(); } ) )
+        aOut["pours_stale"] = true;   // the planes give way to the bottom caps and their vias
 
     if( !farAway.empty() )
         aOut["decoupling_far"] = farAway;
@@ -4750,7 +4932,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
     // 4. Functional blocks: their parts go next to the pads of their main part
     nlohmann::json groups = nlohmann::json::array();
-    bool           viasLaid = false;
+    bool           poursStale = false;   // the planes give way to the bottom caps and their vias
 
     for( const nlohmann::json& group : aArgs.value( "groups", nlohmann::json::array() ) )
     {
@@ -4783,12 +4965,12 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
             row["corridors"].push_back( corridor.name );
 
         groupCommit.Push( _( "Place group (API)" ) );
-        viasLaid = viasLaid || row.contains( "vias_laid" );
+        poursStale = poursStale || row.contains( "pours_stale" );
+        row.erase( "pours_stale" );
         groups.push_back( row );
     }
 
-    // the planes give way to the bottom caps' vias
-    if( viasLaid )
+    if( poursStale )
         refillPours( *context, board );
 
     // the placed parts' pads against other nets' copper
@@ -5110,6 +5292,14 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
         rows.push_back( out );
     }
 
+    bool stale = false;   // the planes give way to the bottom caps and their vias
+
+    for( nlohmann::json& row : rows )
+    {
+        stale = stale || row.contains( "pours_stale" );
+        row.erase( "pours_stale" );
+    }
+
     nlohmann::json out = batch ? nlohmann::json( { { "groups", rows } } ) : rows[0];
 
     if( moved.empty() )
@@ -5139,8 +5329,8 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     commit.Push( batch ? _( "Place groups (API)" ) : _( "Place group (API)" ) );
 
-    if( std::any_of( rows.begin(), rows.end(), []( const nlohmann::json& aRow ) { return aRow.contains( "vias_laid" ); } ) )
-        refillPours( *context, board );   // the planes give way to the bottom caps' vias
+    if( stale )
+        refillPours( *context, board );
 
     refreshGui( aCtx, board );
     glow( aCtx, moved );
