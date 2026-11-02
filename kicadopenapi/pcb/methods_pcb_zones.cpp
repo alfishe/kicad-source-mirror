@@ -350,9 +350,10 @@ nlohmann::json zoneJson( BOARD* aBoard, ZONE* aZone )
 }
 
 
-/// @brief Fill the zones, push, report per zone and what stays unconnected
+/// @brief Fill the zones, push, report per zone and what stays unconnected.  aAfterEdit: the fill
+/// joins the undo step the call's edit just pushed, as the editor's auto-fill does (APPEND_UNDO)
 nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::vector<ZONE*>& aZones,
-                    const KOPENAPI_LIST_CAP* aCap = nullptr )
+                    const KOPENAPI_LIST_CAP* aCap = nullptr, bool aAfterEdit = false )
 {
     BOARD*       board = aContext.GetBoard();
     BOARD_COMMIT commit( aContext.GetToolManager() );
@@ -372,7 +373,7 @@ nlohmann::json fill( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, const std::v
     KopenapiKeepUiAlive();
 
     if( ok )
-        commit.Push( _( "Fill zones (API)" ) );
+        commit.Push( _( "Fill zones (API)" ), ( aAfterEdit ? APPEND_UNDO : 0 ) | SKIP_CONNECTIVITY | ZONE_FILL_OP );
     else
         commit.Revert();
 
@@ -591,7 +592,7 @@ static KOPENAPI_RESULT h_pcb_zone_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     nlohmann::json result = { { "uuid", str( zone->m_Uuid.AsString() ) } };
 
     if( aArgs.value( "fill", true ) )
-        result.update( fill( aCtx, *context, { zone } ) );
+        result.update( fill( aCtx, *context, { zone }, nullptr, true ) );
 
     return KOPENAPI_RESULT::Ok( result );
 }
@@ -1211,7 +1212,7 @@ static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
     nlohmann::json result = { { "updated", zones.size() } };
 
     if( aArgs.value( "fill", true ) )
-        result.update( fill( aCtx, *context, zones ) );
+        result.update( fill( aCtx, *context, zones, nullptr, true ) );
 
     return KOPENAPI_RESULT::Ok( result );
 }
@@ -1359,7 +1360,7 @@ static KOPENAPI_RESULT h_pcb_zone_duplicate( KOPENAPI_CONTEXT& aCtx, const nlohm
                               { "offset_mm", { toMm( offset.x ), toMm( offset.y ) } }, { "keepout", zone->GetIsRuleArea() } };
 
     if( !zone->GetIsRuleArea() && zone->IsOnCopperLayer() && aArgs.value( "fill", true ) )
-        result.update( fill( aCtx, *context, { zone } ) );
+        result.update( fill( aCtx, *context, { zone }, nullptr, true ) );
     else if( !zone->GetIsRuleArea() )
         result["net"] = str( UnescapeString( zone->GetNetname() ) );
 
@@ -1515,7 +1516,7 @@ static KOPENAPI_RESULT h_pcb_zone_merge( KOPENAPI_CONTEXT& aCtx, const nlohmann:
                               { "dry_run", aArgs.value( "dry_run", false ) } };
 
     if( !aArgs.value( "dry_run", false ) && !first->GetIsRuleArea() && first->IsOnCopperLayer() && aArgs.value( "fill", true ) )
-        result.update( fill( aCtx, *context, { first } ) );
+        result.update( fill( aCtx, *context, { first }, nullptr, true ) );
 
     return KOPENAPI_RESULT::Ok( result );
 }
