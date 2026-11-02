@@ -2878,6 +2878,20 @@ std::optional<VECTOR2I> viaSpotUnder( BOARD* aBoard, PAD* aPin, int aViaDiameter
 }
 
 
+/// @brief The side of aPart's courtyard aPad is nearest to (north: the smaller y)
+std::string pinSide( FOOTPRINT* aPart, PAD* aPad )
+{
+    const BOX2I    box = courtyard( aPart ).BBox();
+    const VECTOR2I at = aPad->GetPosition();
+    const std::vector<std::pair<int, const char*>> sides = { { std::abs( at.x - box.GetLeft() ), "west" },
+                                                             { std::abs( box.GetRight() - at.x ), "east" },
+                                                             { std::abs( at.y - box.GetTop() ), "north" },
+                                                             { std::abs( box.GetBottom() - at.y ), "south" } };
+
+    return std::min_element( sides.begin(), sides.end(), []( const auto& a, const auto& b ) { return a.first < b.first; } )->second;
+}
+
+
 /// @brief Places the parts of a functional block around its main part: each next to the pad of the
 /// anchor it belongs to.  A part's pad goes to the anchor pad of its most specific shared net (the
 /// net with the fewest pads on the board); a part across two rails of the anchor (a decoupling
@@ -3012,6 +3026,15 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
     };
 
     std::map<PAD*, SPOT_AT> spotOfPin;   // reserved before the caps go
+
+    struct SERIES_AT
+    {
+        PAD*   pin;          // of the anchor
+        PAD*   pad;          // of the part, on the pin's net
+        double distanceMm;   // between the two
+    };
+
+    std::vector<SERIES_AT> seriesAt;   // series parts on signal pins, placed
 
     // the rail-run plan of a fine-pitch anchor (planRowRailVias, as pcb_stitch takes it for the
     // pin's net), made from the board as it is before any via goes in
@@ -3264,6 +3287,30 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         }
     }
 
+    // a series part on a signal pin (one net of its own, two pads) is on that signal's way out: it
+    // may stand in the ports band its pin leaves by
+    auto isSeries = []( const MEMBER& aMember )
+    {
+        return !aMember.decoupling && aMember.ownNets == 1 && aMember.part->Pads().size() == 2;
+    };
+
+    std::vector<CORRIDOR> corridors = aOptions.corridors ? *aOptions.corridors : std::vector<CORRIDOR>();
+
+    for( const MEMBER& member : members )
+    {
+        if( !isSeries( member ) )
+            continue;
+
+        for( PAD* pin : anchorPads[member.nets.front()] )
+        {
+            for( CORRIDOR& corridor : corridors )
+            {
+                if( corridor.name.rfind( "ports " + pinSide( aAnchor, pin ) + " ", 0 ) == 0 )
+                    corridor.nets.insert( member.nets.front() );
+            }
+        }
+    }
+
     auto heightOf = [&]( FOOTPRINT* aPart ) -> std::optional<double>
     {
         auto it = heights.find( aPart );
@@ -3335,6 +3382,10 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         NEAR_OPTIONS options = aOptions;
         options.partPad.clear();
+
+        if( aOptions.corridors )
+            options.corridors = &corridors;
+
         options.partHeight = heightOf( member.part );
         options.corridorYieldMm = member.decoupling ? aDecapMaxMm : -1;
 
@@ -3494,6 +3545,61 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             }
         }
 
+        // a series part on a signal pin across from the one on its neighbour pin (a pair's resistors
+        // the other way round than their pins): the two alike trade places, so their ways do not cross
+        const bool series = isSeries( member ) && !viaPad;
+
+        if( placement.ok && series )
+        {
+            const std::string side = pinSide( aAnchor, target );
+            SERIES_AT*        mate = nullptr;
+
+            for( SERIES_AT& other : seriesAt )
+            {
+                const double d = ( target->GetPosition() - other.pin->GetPosition() ).EuclideanNorm();
+
+                if( d <= toIU( 1.3 ) && side == pinSide( aAnchor, other.pin )
+                    && ( !mate || d < ( target->GetPosition() - mate->pin->GetPosition() ).EuclideanNorm() ) )
+                {
+                    mate = &other;
+                }
+            }
+
+            FOOTPRINT* other = mate ? mate->pad->GetParentFootprint() : nullptr;
+            const bool row = side == "north" || side == "south";
+            auto       along = [&]( const VECTOR2I& aAt ) { return row ? aAt.x : aAt.y; };
+
+            if( other && other->GetFPID() == member.part->GetFPID() && other->IsFlipped() == member.part->IsFlipped()
+                && mate->pad->GetNumber() == placement.partPad->GetNumber()
+                && ( along( target->GetPosition() ) < along( mate->pin->GetPosition() ) )
+                           != ( along( placement.partPad->GetPosition() ) < along( mate->pad->GetPosition() ) ) )
+            {
+                const VECTOR2I  pos = member.part->GetPosition();
+                const EDA_ANGLE angle = member.part->GetOrientation();
+
+                member.part->SetOrientation( other->GetOrientation() );
+                member.part->SetPosition( other->GetPosition() );
+                other->SetOrientation( angle );
+                other->SetPosition( pos );
+
+                placement.padDistanceMm = toMm( ( placement.partPad->GetPosition() - target->GetPosition() ).EuclideanNorm() );
+                mate->distanceMm = toMm( ( mate->pad->GetPosition() - mate->pin->GetPosition() ).EuclideanNorm() );
+
+                for( nlohmann::json& prior : placed )
+                {
+                    if( prior.value( "ref", std::string() ) == str( other->GetReference() ) )
+                    {
+                        prior["x_mm"] = toMm( pos.x );
+                        prior["y_mm"] = toMm( pos.y );
+                        prior["at_mm"] = { toMm( pos.x ), toMm( pos.y ) };
+                        prior["rotation_deg"] = angle.AsDegrees();
+                        prior["pad_distance_mm"] = std::round( mate->distanceMm * 100 ) / 100;
+                        prior["swapped"] = str( member.part->GetReference() );
+                    }
+                }
+            }
+        }
+
         if( !placement.ok )
         {
             unplaced.push_back( { { "ref", str( member.part->GetReference() ) }, { "reason", placement.reason } } );
@@ -3531,6 +3637,10 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
                                  { "decap_max_mm", aDecapMaxMm } } );
             }
         }
+
+        if( series )
+            seriesAt.push_back( { target, placement.partPad, placement.padDistanceMm } );
+
 
         placed.push_back( row );
     }
@@ -5415,7 +5525,7 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "decap_max_mm":{"type":"number","default":3,"description":"a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far"},
     "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off"},
     "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach: each supply pin gets a via spot just beyond its inner end, under the body, clear of the other nets' copper and spots by the clearance (else beyond its outer end; a neighbour pin of the net within 1.2 mm shares it), and the cap's pad goes inward of the spot where there is room, else on any side of it, its other pads clear of every spot; the row gives via_spot_mm; default on for a fine-pitch anchor (0.65 mm or less), off otherwise; the row says side"},
-    "ports_keep_mm":{"type":"number","default":0,"minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard this far, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter; a decoupling capacitor only when that alone brings it within decap_max_mm); corridors lists them as ports <side> (<far parts>); 0 off"},
+    "ports_keep_mm":{"type":"number","default":0,"minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard this far, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter, and a series part - two pads, one signal net of the anchor's - the band of its pin's side; a decoupling capacitor only when that alone brings it within decap_max_mm); two alike series parts on neighbour pins the other way round than the pins trade places (swapped); corridors lists them as ports <side> (<far parts>); 0 off"},
     "decap_vias":{"type":"boolean","default":true,"description":"decap_bottom: lay each bottom cap's via at its spot with a stub from the pin on the pin's layer (net class sizes, the stub no wider than the pin), in the same undo step, and the cap's pad joined to it on the cap's side where that track keeps clear; the rows say via_laid / via_joined, the answer vias_laid; the planes are refilled after"},
     "open_sides":{"description":"layout level 2 variants: which of the anchor's port sides ports_keep_mm keeps open (default 3 mm when only this is given): a count 0..4 - the sides with the most signal ports first; or a list of west / east / north / south - those, a side without ports along its whole courtyard edge; default every side with ports. corridors names the bands; block gives the outline each variant takes (bbox_mm, area_mm2)","oneOf":[{"type":"integer","minimum":0,"maximum":4},{"type":"array","items":{"type":"string","enum":["west","east","north","south"]}}]},
     "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
