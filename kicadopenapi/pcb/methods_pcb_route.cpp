@@ -17479,20 +17479,27 @@ static KOPENAPI_RESULT h_pcb_fanout( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
     const int      cols = KiROUND( double( span.GetWidth() ) / pitch );
     const int      rows = KiROUND( double( span.GetHeight() ) / pitch );
 
-    // an array: balls on most points of a grid of three or more rows and columns (DDR packages leave a
-    // corridor in the middle), and inside its outer ring too (a small QFN / QFP ring fills half its grid)
-    int inner = 0;
+    // an array: balls on the pitch lattice inside its outer ring, in two rows and two columns at least
+    // (a QFN / QFP ring holds at most its exposed pad inside; a DDR package's corridor still leaves rows)
+    const int          tolerance = std::max( board->GetDesignSettings().m_MaxError, 1 );
+    std::set<int>      innerRows, innerCols;
 
     for( PAD* b : balls )
     {
         const VECTOR2I d = b->GetPosition() - span.GetOrigin();
+        const int      i = KiROUND( double( d.x ) / pitch ), j = KiROUND( double( d.y ) / pitch );
 
-        if( d.x > pitch / 2 && d.y > pitch / 2 && span.GetWidth() - d.x > pitch / 2 && span.GetHeight() - d.y > pitch / 2 )
-            inner++;
+        if( std::abs( d.x - i * pitch ) > tolerance || std::abs( d.y - j * pitch ) > tolerance )
+            continue;
+
+        if( i > 0 && j > 0 && i < cols && j < rows )
+        {
+            innerCols.insert( i );
+            innerRows.insert( j );
+        }
     }
 
-    if( cols < 2 || rows < 2 || double( balls.size() ) / ( ( cols + 1 ) * ( rows + 1 ) ) < 0.4
-        || double( inner ) / ( ( cols - 1 ) * ( rows - 1 ) ) < 0.25 )
+    if( cols < 2 || rows < 2 || innerRows.size() < 2 || innerCols.size() < 2 )
         return peripheralFanout( aCtx, *context, board, fp, aArgs );
 
     // sizes from the pitch (the reference designs: 0.5 mm 0.28 / 0.15, 0.8 mm 0.4 - 0.5 / 0.2 - 0.25,
