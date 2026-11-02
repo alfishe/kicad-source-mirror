@@ -41,11 +41,15 @@ bool boardMinVia( BOARD* aBoard, NETINFO_ITEM* aNet, int aClassDia, int aClassDr
 
 struct RAIL_PLAN_OPTIONS
 {
-    int classViaDia = 0;     ///< the via the stitched net's class gives
+    int classViaDia = 0;     ///< the stitched net's via as the rules size it
     int classViaDrill = 0;
     int minViaDia = 0;       ///< the board's smallest (boardMinVia); 0: none
     int minViaDrill = 0;
 };
+
+/// @brief The plan's sizes for aNet at aFp: its via as KiCad's rules size it (KopenapiRuleVia) and the
+/// board's smallest (boardMinVia)
+RAIL_PLAN_OPTIONS railPlanOptions( BOARD* aBoard, NETINFO_ITEM* aNet, const FOOTPRINT* aFp );
 
 /// @brief One rail pin of a fine-pitch row of a quad package and its via inward
 struct RAIL_PIN_PLAN

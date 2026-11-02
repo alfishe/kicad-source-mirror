@@ -12879,13 +12879,14 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     const wxString netName = net->GetNetname();
 
-    NETCLASS*  netclass = net->GetNetClass();
-    const int  classViaDia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
-    const int  classViaDrill = netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
-    const int  width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : pcbIUScale.mmToIU( 0.3 );
+    // the net's via and track as KiCad's rules size them
+    const KOPENAPI_RULE_VIA ruleVia = KopenapiRuleVia( board, net->GetNetCode(), VECTOR2I(), F_Cu );
+    const int               classViaDia = ruleVia.dia;
+    const int               classViaDrill = ruleVia.drill;
+    const int               width = KopenapiRuleTrack( board, net->GetNetCode(), VECTOR2I(), F_Cu ).opt;
 
-    // the via being tried: the net class's, or the board's smallest at a fine-pitch row pin where the
-    // class's does not fit inward
+    // the via being tried: the rules', or the board's smallest at a fine-pitch row pin where the
+    // rules' does not fit inward
     int viaDia = classViaDia;
     int viaDrill = classViaDrill;
     int minViaDia = 0;
@@ -13420,7 +13421,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     // the pin whose planned way inward a via at aAt (aVia) or a stub from aFrom would shut
     auto inLane = [&]( const VECTOR2I& aAt, const std::optional<VECTOR2I>& aFrom, bool aVia ) -> const PAD*
     {
-        const int own = std::max( minClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0 );
+        const int own = std::max( minClearance, ruleVia.clearance );
 
         for( const LANE& l : lanes )
         {
@@ -13728,7 +13729,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
             viaDrill = classViaDrill;
 
             // a pin of a run takes its planned via (or none: left out of a tight run); another row pin
-            // the net class's via, the board's smallest where that does not fit
+            // the rules' via, the board's smallest where that does not fit
             const PAD*  rowPad = rowPin( item ) ? static_cast<const PAD*>( item ) : nullptr;
             const auto  plan = rowPad ? plannedVia.find( rowPad ) : plannedVia.end();
 
@@ -14612,11 +14613,7 @@ static KOPENAPI_RESULT h_pcb_rail_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( !net )
         return netError;
 
-    NETCLASS*         netclass = net->GetNetClass();
-    RAIL_PLAN_OPTIONS options;
-    options.classViaDia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
-    options.classViaDrill = netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
-    boardMinVia( board, net, options.classViaDia, options.classViaDrill, options.minViaDia, options.minViaDrill );
+    const RAIL_PLAN_OPTIONS options = railPlanOptions( board, net, fp );
 
     nlohmann::json pins = nlohmann::json::array();
     int            planned = 0, skipped = 0, fixed = 0;
@@ -16228,13 +16225,13 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     NETCLASS*  netclass = net->GetNetClass();
     const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+    const VECTOR2I          ruleAt = steps.empty() ? VECTOR2I() : steps.front().at;
+    const KOPENAPI_RULE_VIA ruleVia = KopenapiRuleVia( board, net->GetNetCode(), ruleAt, layer );
     const int  width = aArgs.contains( "width_mm" ) && aArgs["width_mm"].is_number()
                                ? pcbIUScale.mmToIU( aArgs["width_mm"].get<double>() )
-                               : netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : pcbIUScale.mmToIU( 0.25 );
-    const int  viaDia = aArgs.contains( "via_diameter_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", 0.0 ) )
-                        : netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
-    const int  viaDrill = aArgs.contains( "via_drill_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", 0.0 ) )
-                          : netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
+                               : KopenapiRuleTrack( board, net->GetNetCode(), ruleAt, layer ).opt;
+    const int  viaDia = aArgs.contains( "via_diameter_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", 0.0 ) ) : ruleVia.dia;
+    const int  viaDrill = aArgs.contains( "via_drill_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", 0.0 ) ) : ruleVia.drill;
 
     if( viaDia < bds.m_ViasMinSize || viaDrill < bds.m_MinThroughDrill || viaDrill >= viaDia )
         return KOPENAPI_RESULT::Error( 422, "via " + std::to_string( toMm( viaDia ) ).substr( 0, 5 ) + " / "
@@ -16682,14 +16679,13 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
     std::nth_element( gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end() );
     const int pitch = std::max( gaps[gaps.size() / 2], 1 );
 
-    NETCLASS* defaultClass = bds.m_NetSettings ? bds.m_NetSettings->GetDefaultNetclass().get() : nullptr;
-    const int clearance = std::max( { bds.m_MinClearance, defaultClass && defaultClass->HasClearance() ? defaultClass->GetClearance() : 0, 1 } );
-    const int classDia = defaultClass && defaultClass->HasViaDiameter() ? defaultClass->GetViaDiameter() : pcbIUScale.mmToIU( 0.6 );
-    const int classDrill = defaultClass && defaultClass->HasViaDrill() ? defaultClass->GetViaDrill() : pcbIUScale.mmToIU( 0.3 );
-    const int viaDia = aArgs.contains( "via_diameter_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", 0.6 ) )
-                                                           : std::max( bds.m_ViasMinSize, classDia );
-    const int viaDrill = aArgs.contains( "via_drill_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", 0.3 ) )
-                                                          : std::max( bds.m_MinThroughDrill, classDrill );
+    // the part's via as KiCad's rules size it (no net: the default class's and the rules for the part)
+    const KOPENAPI_RULE_VIA ruleVia = KopenapiRuleVia( aBoard, 0, aFp->GetPosition(), aFp->GetLayer() == B_Cu ? B_Cu : F_Cu );
+    const int clearance = std::max( ruleVia.clearance, 1 );
+    const int viaDia = aArgs.contains( "via_diameter_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", 0.0 ) )
+                                                           : std::max( bds.m_ViasMinSize, ruleVia.dia );
+    const int viaDrill = aArgs.contains( "via_drill_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", 0.0 ) )
+                                                          : std::max( bds.m_MinThroughDrill, ruleVia.drill );
     // two via lines take half the spread one line needs, when a via plus clearance is wider than the pitch
     const int autoRows = viaDia + clearance > pitch ? 2 : 1;
     const int rows = aArgs.contains( "stagger" ) ? std::clamp( aArgs.value( "stagger", autoRows ), 1, 4 ) : autoRows;
@@ -16791,10 +16787,11 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         const int64_t mid = ( along( list.front()->GetPosition() ) + along( list.back()->GetPosition() ) ) / 2;
         int64_t       tipLine = std::numeric_limits<int64_t>::min();
         int64_t       maxOffset = 0;
-        NETCLASS*     netclass = todo.front()->GetEffectiveNetClass();
-        const int     classWidth = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : bds.m_TrackMinWidth;
-        int           width = aArgs.contains( "width_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "width_mm", 0.15 ) )
-                                                           : std::min( classWidth, (int) ( 0.95 * pitch ) - clearance );
+        // the rules' track, narrowed so two side by side keep the clearance at the pitch
+        const int     ruleWidth = KopenapiRuleTrack( aBoard, todo.front()->GetNetCode(), todo.front()->GetPosition(),
+                                                     todo.front()->IsOnLayer( F_Cu ) ? F_Cu : B_Cu ).opt;
+        int           width = aArgs.contains( "width_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "width_mm", 0.0 ) )
+                                                           : std::min( ruleWidth, pitch - clearance );
 
         width = std::max( width, std::max( bds.m_TrackMinWidth, 1 ) );
 
@@ -17025,7 +17022,9 @@ static std::optional<VECTOR2I> edgeInward( BOARD* aBoard, const std::vector<PAD*
     if( aPads.empty() || !aBoard->GetBoardPolygonOutlines( outline, false ) || !outline.OutlineCount() )
         return std::nullopt;
 
-    const int                  nearby = pcbIUScale.mmToIU( 1.0 );
+    // at the edge: no track of the board's narrowest fits between the pad and the edge at the rules' clearances
+    const BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
+    const int nearby = std::max( bds.m_CopperEdgeClearance, 0 ) + std::max( bds.m_TrackMinWidth, 1 ) + std::max( bds.m_MinClearance, 0 );
     std::map<std::pair<int, int>, int> votes;
     int                        touching = 0, connectorPads = 0;
 
@@ -17127,16 +17126,16 @@ static KOPENAPI_RESULT edgeFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
         }
     }
 
-    std::nth_element( gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end() );
-    const int pitch = gaps.empty() ? pcbIUScale.mmToIU( 2.54 ) : (int) std::max<int64_t>( gaps[gaps.size() / 2], 1 );
+    // the part's via as KiCad's rules size it (no net: the default class's and the rules for the part)
+    const KOPENAPI_RULE_VIA ruleVia = KopenapiRuleVia( aBoard, 0, aFp->GetPosition(), aFp->GetLayer() == B_Cu ? B_Cu : F_Cu );
+    const int viaDia = aArgs.contains( "via_diameter_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", 0.0 ) )
+                                                           : std::max( bds.m_ViasMinSize, ruleVia.dia );
+    const int viaDrill = aArgs.contains( "via_drill_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", 0.0 ) )
+                                                          : std::max( bds.m_MinThroughDrill, ruleVia.drill );
 
-    NETCLASS* defaultClass = bds.m_NetSettings ? bds.m_NetSettings->GetDefaultNetclass().get() : nullptr;
-    const int classDia = defaultClass && defaultClass->HasViaDiameter() ? defaultClass->GetViaDiameter() : pcbIUScale.mmToIU( 0.6 );
-    const int classDrill = defaultClass && defaultClass->HasViaDrill() ? defaultClass->GetViaDrill() : pcbIUScale.mmToIU( 0.3 );
-    const int viaDia = aArgs.contains( "via_diameter_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", 0.6 ) )
-                                                           : std::max( bds.m_ViasMinSize, classDia );
-    const int viaDrill = aArgs.contains( "via_drill_mm" ) ? pcbIUScale.mmToIU( aArgs.value( "via_drill_mm", 0.3 ) )
-                                                          : std::max( bds.m_MinThroughDrill, classDrill );
+    // without a neighbour on its layer a pin's jog aside is half a via pitch
+    std::nth_element( gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end() );
+    const int pitch = gaps.empty() ? viaDia + ruleVia.clearance : (int) std::max<int64_t>( gaps[gaps.size() / 2], 1 );
     const std::optional<int> stubGiven = aArgs.contains( "stub_mm" )
                                                  ? std::optional<int>( pcbIUScale.mmToIU( aArgs.value( "stub_mm", 0.0 ) ) )
                                                  : std::nullopt;
@@ -17975,7 +17974,7 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "sliver after the refill (not the zone's largest piece on the layer, no other pad or via of the net on it) is taken out; footprint and board keep-outs are honoured; spots_off_plane) and the "
                    "connections still open (unrouted); a pad of a quad package's row first joins the package's exposed pad of its net by a stub "
                    "(joined: for, to), else its via goes inward first (under its own package, between the pad row and the exposed pad, "
-                   "straight in or slanted from the pad's inner end; the row says inward; where the net class's via does not fit there, the "
+                   "straight in or slanted from the pad's inner end; the row says inward; where the rules' via for the net does not fit there, the "
                    "board's smallest via within its rules: board_min_via, via_mm, count board_min_vias), an exposed pad's via goes in the pad, an island's "
                    "beside a coarse-pitch pad (a cap) before a fine-pitch pin; a net without a plane gets vias only at the fine-pitch pins of "
                    "quad packages, inward, kept as their way to the other layers for the router (port: true; the other ends are left "
@@ -17997,10 +17996,10 @@ KOPENAPI_REGISTER( "pcb_rail_plan",
                    "poured nets first; fixed: a via joined to the pin already, kept, its neighbours planned around it) and why; "
                    "skipped pins are left to the router (a tight run, a spot too near a fixed via, a spot or stub in a rule area that "
                    "forbids it). A pin beside one of its own net joins that one's via (planned false). Sizes as pcb_stitch of net takes "
-                   "them: the net class's via first, the board's smallest within its rules where it does not fit. Read only",
+                   "them: the via KiCad's rules size for the net first (a via_diameter / hole_size rule's opt, else the net class's), the board's smallest within its rules where it does not fit. Read only",
                    R"json({"type":"object","required":["ref"],"properties":{
                         "ref":{"type":"string","description":"the package"},
-                        "net":{"type":"string","description":"the net whose class gives the via sizes (as pcb_stitch net; default the one net pcb_net_roles calls ground)"}}})json"_json,
+                        "net":{"type":"string","description":"the net the rules size the vias for (as pcb_stitch net; default the one net pcb_net_roles calls ground)"}}})json"_json,
                    false, h_pcb_rail_plan, 60 );
 
 KOPENAPI_REGISTER( "pcb_track_list",
@@ -18120,7 +18119,7 @@ KOPENAPI_REGISTER( "pcb_tracks_cleanup",
 KOPENAPI_REGISTER( "pcb_track_add",
                    "Lay a track by hand along given points (no router): from a pad and / or to a pad (their "
                    "centres) through points in mm; a point with via continues on that layer through a via. "
-                   "Width and via size from the net's class unless width_mm is given; without width_mm the "
+                   "Width and via size as KiCad's rules size them for the net (a track_width / via_diameter / hole_size rule's opt, else the net class's) unless given; without width_mm the "
                    "segments at the from / to pads are necked as in pcb_via_add (answer necked). The same guard as the "
                    "router: copper that would touch another net or enter a keep-out is refused (422 with the "
                    "violations), nothing is added then. One undo step; dry_run checks only",
@@ -18131,7 +18130,7 @@ KOPENAPI_REGISTER( "pcb_track_add",
                         "points":{"type":"array","description":"[x_mm, y_mm] (a corner), or {at: [x_mm, y_mm], via: 'B.Cu'}: a through via there and the track continues on that layer ('layer' is the same key, as in pcb_route waypoints)","items":{"oneOf":[{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},{"type":"object","required":["at"],"properties":{"at":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"via":{"description":"copper layer to continue on, e.g. B.Cu"},"layer":{"description":"the same as via"}}}]}},
                         "layer":{"type":"string","description":"start layer; default F.Cu (B.Cu from a bottom SMD pad)"},
                         "width_mm":{"type":"number"},
-                        "via_diameter_mm":{"type":"number","description":"via size of this call (default the net class's)"},"via_drill_mm":{"type":"number"},
+                        "via_diameter_mm":{"type":"number","description":"via size of this call (default the rules' for the net)"},"via_drill_mm":{"type":"number"},
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills of other nets give way (the guard does not count them) and are refilled around the track; keep: the track must clear the fills"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_track_add );

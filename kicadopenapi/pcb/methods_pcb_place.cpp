@@ -3122,15 +3122,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         if( it == planOfNet.end() )
         {
-            NETINFO_ITEM*     net = aPin->GetNet();
-            NETCLASS*         netclass = net ? net->GetNetClass() : nullptr;
-            RAIL_PLAN_OPTIONS options;
-
-            options.classViaDia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
-            options.classViaDrill = netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
-
-            if( net )
-                boardMinVia( aBoard, net, options.classViaDia, options.classViaDrill, options.minViaDia, options.minViaDrill );
+            const RAIL_PLAN_OPTIONS options = railPlanOptions( aBoard, aPin->GetNet(), aAnchor );
 
             it = planOfNet.emplace( aPin->GetNetCode(), planRowRailVias( aBoard, aAnchor, options ) ).first;
         }

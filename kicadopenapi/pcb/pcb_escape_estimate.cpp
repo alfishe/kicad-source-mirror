@@ -364,12 +364,7 @@ ESCAPE_ESTIMATE EstimateEscape( BOARD* aBoard, FOOTPRINT* aPart, const std::set<
         if( !aRails.count( pad->GetNetCode() ) )
             continue;
 
-        NETINFO_ITEM*     net = pad->GetNet();
-        NETCLASS*         nc = net ? net->GetNetClass() : nullptr;
-        RAIL_PLAN_OPTIONS options;
-        options.classViaDia = nc && nc->HasViaDiameter() ? nc->GetViaDiameter() : pcbIUScale.mmToIU( 0.8 );
-        options.classViaDrill = nc && nc->HasViaDrill() ? nc->GetViaDrill() : pcbIUScale.mmToIU( 0.4 );
-        boardMinVia( aBoard, net, options.classViaDia, options.classViaDrill, options.minViaDia, options.minViaDrill );
+        const RAIL_PLAN_OPTIONS options = railPlanOptions( aBoard, pad->GetNet(), aPart );
 
         for( const RAIL_PIN_PLAN& plan : planRowRailVias( aBoard, aPart, options ) )
         {

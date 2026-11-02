@@ -1,4 +1,5 @@
 #include "rail_plan.h"
+#include "kopenapi_pcb.h"
 
 #include <base_units.h>
 #include <board.h>
@@ -201,6 +202,22 @@ bool boardMinVia( BOARD* aBoard, NETINFO_ITEM* aNet, int aClassDia, int aClassDr
     }
 
     return false;
+}
+
+
+RAIL_PLAN_OPTIONS railPlanOptions( BOARD* aBoard, NETINFO_ITEM* aNet, const FOOTPRINT* aFp )
+{
+    RAIL_PLAN_OPTIONS       options;
+    const KOPENAPI_RULE_VIA via = KopenapiRuleVia( aBoard, aNet ? aNet->GetNetCode() : 0, aFp ? aFp->GetPosition() : VECTOR2I(),
+                                                   aFp && aFp->GetLayer() == B_Cu ? B_Cu : F_Cu );
+
+    options.classViaDia = via.dia;
+    options.classViaDrill = via.drill;
+
+    if( aNet )
+        boardMinVia( aBoard, aNet, options.classViaDia, options.classViaDrill, options.minViaDia, options.minViaDrill );
+
+    return options;
 }
 
 
