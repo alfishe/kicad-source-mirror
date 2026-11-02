@@ -4266,6 +4266,407 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     }
 
+    // lanes along the inner rings pcb_floorplan lays out (bus_paths floorplan with ports and lanes): a ring's
+    // bus goes down by its row of vias at one side of the part, round it on the ring's layer inside the band,
+    // up by the row at the other side. Lane r runs r track pitches out of the rows, nested round the part: the
+    // down spot nearest the side it turns to first is the innermost, so is the up spot nearest the side it
+    // comes from; the pins take the down spots in their order along the row. All laid, innermost first, before
+    // any route, so no route takes an inner lane's way and the connections left are a pin to its down via and
+    // the up via to the far pin
+    const nlohmann::json busPathsArg = aArgs.contains( "bus_paths" ) ? aArgs["bus_paths"] : nlohmann::json( "off" );
+    const bool           floorplanPaths = ( busPathsArg.is_string() && busPathsArg.get<std::string>() == "floorplan" )
+                                          || ( busPathsArg.is_object() && busPathsArg.contains( "floorplan" ) );
+    std::optional<nlohmann::json>              floorplanBody;
+    std::set<std::string>                      ringLinks;   // bus|a|b of the links whose ring is laid
+    std::set<std::pair<const FOOTPRINT*, int>> ringPins;    // (ring part, net code): no port goal at that end
+    nlohmann::json                             ringLanesOut = nlohmann::json::array();
+    std::set<const BOARD_ITEM*>                 ringItems;   // the lanes' tracks and vias
+    std::map<int, std::vector<PCB_VIA*>>       ringVias;    // by net: the lanes' vias
+
+    if( floorplanPaths && aArgs.value( "lanes", false ) && aArgs.contains( "ports" )
+        && !( aArgs["ports"].is_boolean() && !aArgs["ports"].get<bool>() ) && !dryRun )
+    {
+        std::optional<KOPENAPI_METHOD> fpMethod = KOPENAPI_REGISTRY::Get().Find( "pcb_floorplan" );
+        nlohmann::json fpArgs = busPathsArg.is_object() ? busPathsArg["floorplan"] : nlohmann::json::object();
+
+        if( fpMethod && fpArgs.is_object() )
+        {
+            fpArgs["list_limit"] = 100000;
+
+            if( !fpArgs.contains( "copper_stretches" ) )
+                fpArgs["copper_stretches"] = true;
+
+            KOPENAPI_RESULT r = fpMethod->handler( aCtx, fpArgs );
+
+            if( r.status < 400 )
+                floorplanBody = std::move( r.body );
+        }
+
+        static const std::map<std::string, VECTOR2I> outwardOf = { { "west", { -1, 0 } }, { "north", { 0, -1 } },
+                                                                    { "east", { 1, 0 } }, { "south", { 0, 1 } } };
+        auto boxOf = []( const nlohmann::json& aBox ) -> std::optional<BOX2I>
+        {
+            if( !aBox.is_array() || aBox.size() != 4 )
+                return std::nullopt;
+
+            const VECTOR2I lo( pcbIUScale.mmToIU( aBox[0].get<double>() ), pcbIUScale.mmToIU( aBox[1].get<double>() ) );
+            const VECTOR2I hi( pcbIUScale.mmToIU( aBox[2].get<double>() ), pcbIUScale.mmToIU( aBox[3].get<double>() ) );
+            return BOX2I( lo, hi - lo );
+        };
+
+        std::vector<BOARD_CONNECTED_ITEM*>                 staged;
+        std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> made;
+        const nlohmann::json                               noLinks = nlohmann::json::array();
+        const nlohmann::json& links = floorplanBody && floorplanBody->contains( "links" ) && ( *floorplanBody )["links"].is_array()
+                                              ? ( *floorplanBody )["links"] : noLinks;
+
+        for( const nlohmann::json& l : links )
+        {
+            if( !l.contains( "rings" ) || !l["rings"].is_array() || !l.contains( "net_names" ) || !l["net_names"].is_array() )
+                continue;
+
+            const std::string linkKey = l.value( "bus", std::string() ) + "|" + l.value( "a", std::string() ) + "|" + l.value( "b", std::string() );
+            std::set<std::string> linkNets;
+
+            for( const nlohmann::json& n : l["net_names"] )
+            {
+                if( n.is_string() )
+                    linkNets.insert( n.get<std::string>() );
+            }
+
+            for( const nlohmann::json& rg : l["rings"] )
+            {
+                nlohmann::json out = { { "link", l.value( "bus", std::string() ) }, { "part", rg.value( "part", std::string() ) },
+                                       { "layer", rg.value( "layer", std::string() ) } };
+                FOOTPRINT*     part = nullptr;
+
+                for( FOOTPRINT* f : board->Footprints() )
+                {
+                    if( str( f->GetReference() ) == rg.value( "part", std::string() ) )
+                        part = f;
+                }
+
+                const PCB_LAYER_ID layer = board->GetLayerID( wxString::FromUTF8( rg.value( "layer", std::string() ) ) );
+                const nlohmann::json sidesJson = rg.value( "sides", nlohmann::json::array() );
+                std::vector<std::string> sides;
+
+                for( const nlohmann::json& sd : sidesJson )
+                {
+                    if( sd.is_string() && outwardOf.count( sd.get<std::string>() ) )
+                        sides.push_back( sd.get<std::string>() );
+                }
+
+                const std::optional<BOX2I> rowDown = boxOf( rg.contains( "down" ) ? rg["down"].value( "row_mm", nlohmann::json() ) : nlohmann::json() );
+                const std::optional<BOX2I> rowUp = boxOf( rg.contains( "up" ) ? rg["up"].value( "row_mm", nlohmann::json() ) : nlohmann::json() );
+                const int n = rg.value( "vias", 0 );
+                const int viaPitch = pcbIUScale.mmToIU( rg.value( "via_pitch_mm", 0.0 ) );
+
+                std::vector<PAD*> pins;
+
+                if( part )
+                {
+                    std::set<int> seen;
+
+                    for( PAD* pad : part->Pads() )
+                    {
+                        if( linkNets.count( str( UnescapeString( pad->GetNetname() ) ) ) && seen.insert( pad->GetNetCode() ).second
+                            && ( nets.empty() || nets.count( str( UnescapeString( pad->GetNetname() ) ) ) ) )
+                        {
+                            pins.push_back( pad );
+                        }
+                    }
+                }
+
+                if( !part || !IsCopperLayer( layer ) || sides.size() < 2 || !rowDown || !rowUp || n <= 0 || viaPitch <= 0
+                    || (int) pins.size() != n )
+                {
+                    out["why"] = "not laid: the ring's part, layer, sides, rows or vias do not match its link's pins here ("
+                                 + std::to_string( pins.size() ) + " pins, " + std::to_string( n ) + " vias)";
+                    ringLanesOut.push_back( out );
+                    continue;
+                }
+
+                auto dot = []( const VECTOR2I& a, const VECTOR2I& b ) { return (int64_t) a.x * b.x + (int64_t) a.y * b.y; };
+                auto edgeOf = []( const BOX2I& aBox, const VECTOR2I& aOut ) -> int64_t
+                {
+                    return aOut.x < 0 ? -(int64_t) aBox.GetLeft() : aOut.x > 0 ? (int64_t) aBox.GetRight()
+                           : aOut.y < 0 ? -(int64_t) aBox.GetTop() : (int64_t) aBox.GetBottom();
+                };
+
+                // the pins' side of the part takes the row there: the ring is walked from it
+                const PCB_LAYER_ID crtYd = part->GetLayer() == B_Cu ? B_CrtYd : F_CrtYd;
+                BOX2I              inner = part->GetCourtyard( crtYd ).OutlineCount() ? part->GetCourtyard( crtYd ).BBox() : part->GetBoundingBox( false );
+                VECTOR2L           pinsAt( 0, 0 );
+
+                for( PAD* pad : pins )
+                    pinsAt += VECTOR2L( pad->GetPosition() - inner.Centre() );
+
+                BOX2I rowD = *rowDown, rowU = *rowUp;
+
+                if( dot( VECTOR2I( pinsAt / n ), outwardOf.at( sides.back() ) ) > dot( VECTOR2I( pinsAt / n ), outwardOf.at( sides.front() ) ) )
+                {
+                    std::reverse( sides.begin(), sides.end() );
+                    std::swap( rowD, rowU );
+                }
+
+                const std::string down = sides.front(), up = sides.back();
+                const VECTOR2I    outDown = outwardOf.at( down ), outUp = outwardOf.at( up );
+                const VECTOR2I    toNext = outwardOf.at( sides[1] ), fromPrev = outwardOf.at( sides[sides.size() - 2] );
+
+                // sizes: the widest track and via and the largest clearance the rules ask of the bus's nets there
+                int width = 0, clearance = 0, viaDia = 0, viaDrill = 0;
+
+                for( PAD* pad : pins )
+                {
+                    const KOPENAPI_RULE_TRACK tr = KopenapiRuleTrack( board, pad->GetNetCode(), pad->GetPosition(), layer );
+                    const KOPENAPI_RULE_VIA   vr = KopenapiRuleVia( board, pad->GetNetCode(), pad->GetPosition(), layer );
+                    width = std::max( width, tr.opt );
+                    clearance = std::max( clearance, vr.clearance );
+                    viaDia = std::max( viaDia, vr.dia );
+                    viaDrill = std::max( viaDrill, vr.drill );
+                }
+
+                // the n spots of a row, at the ring's via pitch along it, centred on it
+                auto spotsOf = [&]( const BOX2I& aRow, const VECTOR2I& aOut )
+                {
+                    const VECTOR2I along( aOut.y != 0 ? 1 : 0, aOut.x != 0 ? 1 : 0 );
+                    std::vector<VECTOR2I> spots;
+
+                    for( int k = 0; k < n; ++k )
+                        spots.push_back( aRow.Centre() + along * KiROUND( ( k - ( n - 1 ) / 2.0 ) * viaPitch ) );
+
+                    return spots;
+                };
+
+                const VECTOR2I alongDown( outDown.y != 0 ? 1 : 0, outDown.x != 0 ? 1 : 0 );
+
+                std::vector<VECTOR2I> downSpots = spotsOf( rowD, outDown ), upSpots = spotsOf( rowU, outUp );
+                std::sort( pins.begin(), pins.end(), [&]( PAD* a, PAD* b ) { return dot( a->GetPosition(), alongDown ) < dot( b->GetPosition(), alongDown ); } );
+
+                // the pins' fan to the down spots, pin k to spot k: out of the pad to a knee, 45 degrees to the spot's
+                // line, out to the spot. The pins going the same way turn the farther out the nearer they are to the
+                // middle, by what keeps two legs a track and a clearance apart; the spots go out (past the row if need
+                // be) till the farthest diagonal ends a via, a clearance and half a track short of them
+                int64_t tip = std::numeric_limits<int64_t>::min();
+                int     pinPitch = std::numeric_limits<int>::max();
+
+                for( int k = 0; k < n; ++k )
+                {
+                    tip = std::max( tip, edgeOf( pins[k]->GetBoundingBox(), outDown ) );
+
+                    if( k )
+                        pinPitch = std::min<int>( pinPitch, dot( pins[k]->GetPosition() - pins[k - 1]->GetPosition(), alongDown ) );
+                }
+
+                const int        kneeStep = std::max( 0, KiROUND( ( width + clearance ) * M_SQRT2 ) - ( n > 1 ? pinPitch : 0 ) ) + pcbIUScale.mmToIU( 0.005 );
+                std::vector<int> knee( n, clearance + width / 2 ), shift( n, 0 );
+
+                for( int k = 0; k < n; ++k )
+                    shift[k] = (int) ( dot( downSpots[k], alongDown ) - dot( pins[k]->GetPosition(), alongDown ) );
+
+                for( int k = 1; k < n; ++k )
+                {
+                    if( shift[k] < 0 && shift[k - 1] < 0 )
+                        knee[k] = knee[k - 1] + kneeStep;
+                }
+
+                for( int k = n - 2; k >= 0; --k )
+                {
+                    if( shift[k] > 0 && shift[k + 1] > 0 )
+                        knee[k] = knee[k + 1] + kneeStep;
+                }
+
+                int64_t reach = 0;
+
+                for( int k = 0; k < n; ++k )
+                    reach = std::max<int64_t>( reach, knee[k] + std::abs( shift[k] ) );
+
+                const int64_t spotOut = std::max<int64_t>( dot( rowD.Centre(), outDown ), tip + reach + viaDia / 2 + clearance + width / 2 );
+
+                for( VECTOR2I& spot : downSpots )
+                    spot += outDown * (int) ( spotOut - dot( spot, outDown ) );
+
+                std::vector<std::vector<VECTOR2I>> legs( n );
+
+                for( int k = 0; k < n; ++k )
+                {
+                    const VECTOR2I perp = outDown * (int) ( tip + knee[k] - dot( pins[k]->GetPosition(), outDown ) );
+                    const VECTOR2I kneeAt = pins[k]->GetPosition() + perp;
+                    const VECTOR2I diagEnd = kneeAt + outDown * std::abs( shift[k] ) + alongDown * shift[k];
+
+                    legs[k] = { pins[k]->GetPosition(), kneeAt, diagEnd, downSpots[k] };
+                }
+
+                // rank: innermost first, the down spot nearest the side turned to first, the up spot nearest the side come from
+                std::vector<int> downRank( n ), upByRank( n );
+                std::vector<int> order( n );
+
+                for( int k = 0; k < n; ++k )
+                    order[k] = k;
+
+                std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return dot( downSpots[a], toNext ) > dot( downSpots[b], toNext ); } );
+
+                for( int r = 0; r < n; ++r )
+                    downRank[order[r]] = r;
+
+                std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return dot( upSpots[a], fromPrev ) > dot( upSpots[b], fromPrev ); } );
+
+                for( int r = 0; r < n; ++r )
+                    upByRank[r] = order[r];
+
+                // the first lane's offset from the part's box: past both rows' vias by a clearance
+                const int64_t depth = std::max<int64_t>( { 0, spotOut + viaDia / 2 - edgeOf( inner, outDown ),
+                                                           edgeOf( rowU, outUp ) - edgeOf( inner, outUp ),
+                                                           dot( upSpots[0], outUp ) + viaDia / 2 - edgeOf( inner, outUp ) } );
+                const int64_t base = depth + clearance + width / 2;
+                const int     lanePitch = width + clearance;
+
+                auto onSide = [&]( const BOX2I& aRing, const std::string& aSide, const VECTOR2I& aFrom ) -> VECTOR2I
+                {
+                    if( aSide == "west" )
+                        return { aRing.GetLeft(), aFrom.y };
+                    if( aSide == "east" )
+                        return { aRing.GetRight(), aFrom.y };
+                    if( aSide == "north" )
+                        return { aFrom.x, aRing.GetTop() };
+
+                    return { aFrom.x, aRing.GetBottom() };
+                };
+
+                auto corner = [&]( const BOX2I& aRing, const std::string& a, const std::string& b ) -> VECTOR2I
+                {
+                    const bool west = a == "west" || b == "west", north = a == "north" || b == "north";
+                    return { west ? aRing.GetLeft() : aRing.GetRight(), north ? aRing.GetTop() : aRing.GetBottom() };
+                };
+
+                std::vector<int> byRank( n );
+
+                for( int k = 0; k < n; ++k )
+                    byRank[downRank[k]] = k;
+
+                int laid = 0, refused = 0;
+                nlohmann::json lanesJson = nlohmann::json::array();
+
+                for( int r = 0; r < n; ++r )
+                {
+                    const int      k = byRank[r];
+                    PAD*           pin = pins[k];
+                    const VECTOR2I from = downSpots[k], to = upSpots[upByRank[r]];
+                    BOX2I          ring = inner;
+                    ring.Inflate( (int) ( base + (int64_t) r * lanePitch ) );
+
+                    std::vector<VECTOR2I> pts = { from, onSide( ring, down, from ) };
+
+                    for( size_t i = 0; i + 1 < sides.size(); ++i )
+                        pts.push_back( corner( ring, sides[i], sides[i + 1] ) );
+
+                    pts.push_back( onSide( ring, up, to ) );
+                    pts.push_back( to );
+
+                    std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> items;
+
+                    for( const VECTOR2I& at : { from, to } )
+                    {
+                        auto via = std::make_unique<PCB_VIA>( board );
+                        via->SetViaType( VIATYPE::THROUGH );
+                        via->SetPosition( at );
+                        via->SetWidth( PADSTACK::ALL_LAYERS, viaDia );
+                        via->SetDrill( viaDrill );
+                        via->SetLayerPair( F_Cu, B_Cu );
+                        via->SetNet( pin->GetNet() );
+                        items.push_back( std::move( via ) );
+                    }
+
+                    for( size_t i = 1; i < pts.size(); ++i )
+                    {
+                        if( pts[i] == pts[i - 1] )
+                            continue;
+
+                        auto track = std::make_unique<PCB_TRACK>( board );
+                        track->SetStart( pts[i - 1] );
+                        track->SetEnd( pts[i] );
+                        track->SetWidth( width );
+                        track->SetLayer( layer );
+                        track->SetNet( pin->GetNet() );
+                        items.push_back( std::move( track ) );
+                    }
+
+                    for( size_t i = 1; i < legs[k].size(); ++i )
+                    {
+                        if( legs[k][i] == legs[k][i - 1] )
+                            continue;
+
+                        auto track = std::make_unique<PCB_TRACK>( board );
+                        track->SetStart( legs[k][i - 1] );
+                        track->SetEnd( legs[k][i] );
+                        track->SetWidth( width );
+                        track->SetLayer( pin->GetPrincipalLayer() );
+                        track->SetNet( pin->GetNet() );
+                        items.push_back( std::move( track ) );
+                    }
+
+                    std::vector<BOARD_CONNECTED_ITEM*> mine;
+
+                    for( const auto& item : items )
+                        mine.push_back( item.get() );
+
+                    nlohmann::json poly = nlohmann::json::array();
+
+                    for( const VECTOR2I& pt : pts )
+                        poly.push_back( { toMm( pt.x ), toMm( pt.y ) } );
+
+                    const nlohmann::json violations = guard( board, mine, {}, zoneMode == "refill", &staged );
+                    nlohmann::json       lane = { { "net", str( UnescapeString( pin->GetNetname() ) ) }, { "pad", str( pin->GetNumber() ) },
+                                                  { "rank", r }, { "polyline_mm", poly }, { "leg_mm", nlohmann::json::array() } };
+
+                    for( const VECTOR2I& pt : legs[k] )
+                        lane["leg_mm"].push_back( { toMm( pt.x ), toMm( pt.y ) } );
+
+                    if( !violations.empty() )
+                    {
+                        refused++;
+                        lane["refused"] = violations[0];
+                        lanesJson.push_back( lane );
+                        continue;
+                    }
+
+                    staged.insert( staged.end(), mine.begin(), mine.end() );
+
+                    for( BOARD_CONNECTED_ITEM* item : mine )
+                        ringItems.insert( item );
+
+                    ringVias[pin->GetNetCode()].push_back( static_cast<PCB_VIA*>( mine[0] ) );
+                    ringVias[pin->GetNetCode()].push_back( static_cast<PCB_VIA*>( mine[1] ) );
+
+                    for( auto& item : items )
+                        made.push_back( std::move( item ) );
+
+                    ringPins.insert( { part, pin->GetNetCode() } );
+                    laid++;
+                    lanesJson.push_back( lane );
+                }
+
+                if( laid )
+                    ringLinks.insert( linkKey );
+
+                out["laid"] = laid;
+                out["refused"] = refused;
+                out["lanes"] = lanesJson;
+                ringLanesOut.push_back( out );
+            }
+        }
+
+        if( !made.empty() )
+        {
+            BOARD_COMMIT commit( context->GetToolManager() );
+
+            for( auto& item : made )
+                commit.Add( item.release() );
+
+            commit.Push( _( "Ring lanes (API)" ) );
+        }
+    }
+
     // The airwires to route: pad-to-pad (or pad-to-track) connections of the ratsnest
     board->BuildConnectivity();
     std::shared_ptr<CONNECTIVITY_DATA> connectivity = board->GetConnectivity();
@@ -4514,6 +4915,21 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( pa->Type() != PCB_PAD_T )
                 std::swap( pa, pb ), std::swap( posA, posB );
+
+            // a ring lane is reached by the via of its two nearer the pad: its tracks lie on the ring's layer
+            if( pa->Type() == PCB_PAD_T && ringItems.count( pb ) && ringVias.count( code ) )
+            {
+                PCB_VIA* best = nullptr;
+
+                for( PCB_VIA* v : ringVias[code] )
+                {
+                    if( !best || ( v->GetPosition() - posA ).EuclideanNorm() < ( best->GetPosition() - posA ).EuclideanNorm() )
+                        best = v;
+                }
+
+                pb = best;
+                posB = best->GetPosition();
+            }
 
             if( pa->Type() != PCB_PAD_T )
             {
@@ -6795,6 +7211,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             std::vector<std::string> viaNets;
             const int                planned = goalsFrom( fp, plan.body["ports"], portGoals, viaNets );
 
+            for( auto it = portGoals.begin(); it != portGoals.end(); )
+                it = ringPins.count( { it->first->GetParentFootprint(), it->first->GetNetCode() } ) ? portGoals.erase( it ) : std::next( it );
+
+            viaNets.erase( std::remove_if( viaNets.begin(), viaNets.end(),
+                                           [&]( const std::string& aNet )
+                                           {
+                                               const NETINFO_ITEM* ni = board->FindNet( wxString::FromUTF8( aNet ) );
+                                               return ni && ringPins.count( { fp, ni->GetNetCode() } );
+                                           } ),
+                           viaNets.end() );
+
             // the via spots of the package's fan-out (pcb_fanout ports, dry run: via_spots): the spot of each moved pin
             int fanSpots = 0;
 
@@ -8104,7 +8531,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( !fpArgs.contains( "copper_stretches" ) )
                 fpArgs["copper_stretches"] = true;
 
-            const KOPENAPI_RESULT r = fp->handler( aCtx, fpArgs );
+            KOPENAPI_RESULT r = KOPENAPI_RESULT::Ok( nlohmann::json::object() );
+
+            if( floorplanBody )
+                r.body = *floorplanBody;
+            else
+                r = fp->handler( aCtx, fpArgs );
 
             if( r.status >= 400 )
                 return KOPENAPI_RESULT::Error( r.status, "bus_paths: pcb_floorplan: " + r.body.value( "error", nlohmann::json() ).dump() );
@@ -8122,7 +8554,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             for( const nlohmann::json& l : r.body.value( "links", nlohmann::json::array() ) )
             {
-                if( !l.contains( "bus" ) || !l["bus"].is_string() || !l.value( "found", false ) )
+                if( !l.contains( "bus" ) || !l["bus"].is_string() || !l.value( "found", false )
+                    || ringLinks.count( l["bus"].get<std::string>() + "|" + l.value( "a", std::string() ) + "|" + l.value( "b", std::string() ) ) )
                     continue;
 
                 CORRIDOR c;
@@ -12723,7 +13156,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "vias", vias },
                               { "bus", busOut },
                               { "bus_paths", { { "corridors", corridorOut }, { "members", corridorMembers },
-                                               { "routed_along", corridorRoutedCount } } },
+                                               { "routed_along", corridorRoutedCount }, { "ring_lanes", ringLanesOut } } },
                               { "rip_up", { { "tried", rippedTried }, { "won", rippedOk }, { "scope", ripScope },
                                             { "earlier_routes_movable", foreignJobs },
                                             { "earlier_routes_rerouted", foreignMoved } } },
@@ -18147,7 +18580,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
                         "ports":{"oneOf":[{"type":"boolean"},{"type":"array","items":{"type":"string"}}],"description":"layout level 1 goals: the signal pins of these packages (true: every package with 8 SMD pads or more) follow their port from pcb_fanout_ports: the way out on the pin's side is kept open to past the courtyard on the pad's layer (a pin planned round_the_part: to the courtyard's edge, it turns right past it; layer other: to the via spot the plan's fan-out would lay, the spot kept free on every layer), and the pin's routes leave through it first (the tip as a corner, or the via), arriving through the far pin's port when the layers allow; a connection that does not route that way is routed as any other. Rows routed so name port (round_the_part when planned so); ports answers per package the pins and vias planned, tries, won and ms"},
                         "lanes":{"type":"boolean","default":false,"description":"with ports: each pin kept on its pad's layer runs its lane from pcb_fanout_ports lanes. The lanes round a package are laid as tracks before any route (where the guard lets them, at both ends of a connection); the leg between two lanes whose ends face each other is a straight run, one 45 degree jog and a straight run, the jogs of a bus staggered so its legs keep their pitch, laid as computed where it is clean, else routed from lane end to lane end. A lane its route did not use is taken out again. Routes so made are left as they are by clean_up. Rows routed so name port.lane (the rank), ring_laid, far_ring_laid; ports.lanes counts laid_tracks, refused, taken_out"},
-                        "bus_paths":{"description":"pns: \"off\", \"floorplan\" (or {floorplan: {pcb_floorplan arguments}}): every bus link pcb_floorplan finds, along its corridor, the connections of its nets between the two blocks' parts; or [{name, nets, points_mm: [[x_mm, y_mm] (a free point) or {at_mm, along: x | y, lo_mm, hi_mm, into_mm: [x0, y0, x1, y1]} (a portal crossed into that region: the ribbon inside lo..hi, joined to the next portal by axis-parallel runs inside the region; rooms_mm: [[x0, y0, x1, y1], ...] the regions to the next gate, more than one: joined by the straight run, which lies inside them (docs corridor.md))]}]: the connections of those nets, from the end nearer the first point. A corridor is a soft goal: at the turn of its first connection each member gets one try along it, across it in order, in a tenth of first_pass_budget_s; the members it does not route keep their turn and their usual tries with their whole budget. The answer's corridors give the centre line (line_mm) the members run beside at their pitch","default":"off"},
+                        "bus_paths":{"description":"pns: \"off\", \"floorplan\" (or {floorplan: {pcb_floorplan arguments}}): every bus link pcb_floorplan finds, along its corridor, the connections of its nets between the two blocks' parts; or [{name, nets, points_mm: [[x_mm, y_mm] (a free point) or {at_mm, along: x | y, lo_mm, hi_mm, into_mm: [x0, y0, x1, y1]} (a portal crossed into that region: the ribbon inside lo..hi, joined to the next portal by axis-parallel runs inside the region; rooms_mm: [[x0, y0, x1, y1], ...] the regions to the next gate, more than one: joined by the straight run, which lies inside them (docs corridor.md))]}]: the connections of those nets, from the end nearer the first point. A corridor is a soft goal: at the turn of its first connection each member gets one try along it, across it in order, in a tenth of first_pass_budget_s; the members it does not route keep their turn and their usual tries with their whole budget. The answer's corridors give the centre line (line_mm) the members run beside at their pitch. With floorplan, ports and lanes: a link whose ring pcb_floorplan gives (links rings) is laid first along it, one lane per net on the ring's layer from its row of vias at the pins' side round the part to the other row, nested innermost first, the pins taking those spots in their order by a 45 degree fan (the spots pushed out past the row when the fan needs it); that link's corridor is not used and the answer's ring_lanes give each lane (net, rank, polyline_mm, leg_mm, refused)","default":"off"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again, up to 3 choices of them per connection and round; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
