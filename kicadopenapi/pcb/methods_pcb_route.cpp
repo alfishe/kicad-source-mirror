@@ -14230,11 +14230,30 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     // the net's planes per layer with priorities resolved (a higher-priority pour of another net
     // over them is not theirs), shrunk so a via's copper lies wholly on the plane
     std::map<PCB_LAYER_ID, SHAPE_POLY_SET> planes;
+    std::map<PCB_LAYER_ID, SHAPE_POLY_SET> givenWay;   // the net's own pours where another net's higher-priority one takes over
+    std::map<const FOOTPRINT*, std::vector<std::pair<SEG, int>>> partWays;   // per part: its other nets' pins' ways, the room each keeps
 
     for( PCB_LAYER_ID l : board->GetEnabledLayers().CuStack() )
     {
         SHAPE_POLY_SET domain;
         KopenapiNetDomain( board, net->GetNetCode(), l, domain );
+
+        SHAPE_POLY_SET mine;
+
+        for( ZONE* zone : board->Zones() )
+        {
+            if( !zone->GetIsRuleArea() && !zone->IsTeardropArea() && zone->GetNetCode() == net->GetNetCode() && zone->IsOnLayer( l ) )
+                mine.Append( zone->GetBoardOutline() );
+        }
+
+        if( mine.OutlineCount() )
+        {
+            mine.Simplify();
+            mine.BooleanSubtract( domain );
+
+            if( mine.OutlineCount() )
+                givenWay[l] = std::move( mine );
+        }
 
         if( !domain.OutlineCount() )
             continue;
@@ -14675,6 +14694,19 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                             }
                         }
 
+                        // beside a pad of coarse pitch (a cap) first as close as the rules allow: the spots
+                        // pcb_place_group keeps free for it (padViaSpots)
+                        if( basePad && base == pos && !exposedPads.count( basePad ) && !finePads.count( basePad ) )
+                        {
+                            const KOPENAPI_RULE_VIA rule = KopenapiRuleVia( board, net->GetNetCode(), base, layer );
+
+                            for( const VECTOR2I& at : padViaSpots( basePad->GetBoundingBox(), viaDia / 2, rule.clearance ) )
+                            {
+                                candidates.push_back( at );
+                                stubFrom[{ at.x, at.y }] = base;
+                            }
+                        }
+
                         for( int ring = 0; ring < 6; ++ring )
                         {
                             const int reach = half + viaDia / 2 + pcbIUScale.mmToIU( 0.4 ) + ring * pcbIUScale.mmToIU( 0.5 );
@@ -14719,11 +14751,88 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
                 std::map<std::pair<int, int>, bool> planeAt;
 
-                // the 400 best spots (on the plane first, then the shortest stub; ties in candidate
-                // order), keys computed once: a zone island yields tens of thousands of spots
+                // a via by a pad of coarse pitch (not a package row's) on the way of another pin of its part: that
+                // pin's straight line to the nearest item of its net off the part, as near as a via, the clearance
+                // and half a track of that net
+                auto onWayOfPart = [&]( const VECTOR2I& at, PAD* aFrom )
+                {
+                    if( !aFrom || !aFrom->GetParentFootprint() || outward.count( aFrom ) || finePads.count( aFrom ) )
+                        return false;
+
+                    const FOOTPRINT* fp = aFrom->GetParentFootprint();
+                    auto             it = partWays.find( fp );
+
+                    if( it == partWays.end() )
+                    {
+                        std::vector<std::pair<SEG, int>> ways;
+
+                        for( PAD* q : fp->Pads() )
+                        {
+                            if( q->GetNetCode() <= 0 || q->GetNetCode() == net->GetNetCode() )
+                                continue;
+
+                            std::optional<VECTOR2I> to;
+                            double                  best = std::numeric_limits<double>::max();
+
+                            auto consider = [&]( const VECTOR2I& aAt )
+                            {
+                                const double d = ( aAt - q->GetPosition() ).EuclideanNorm();
+
+                                if( d > 0 && d < best )
+                                {
+                                    best = d;
+                                    to = aAt;
+                                }
+                            };
+
+                            for( BOARD_CONNECTED_ITEM* other : board->GetConnectivity()->GetNetItems( q->GetNetCode(), { PCB_PAD_T, PCB_VIA_T } ) )
+                            {
+                                if( other->Type() == PCB_PAD_T && static_cast<PAD*>( other )->GetParentFootprint() == fp )
+                                    continue;
+
+                                consider( other->GetPosition() );
+                            }
+
+                            if( !to )
+                                continue;
+
+                            const KOPENAPI_RULE_TRACK tr = KopenapiRuleTrack( board, q->GetNetCode(), q->GetPosition(), layer );
+                            const KOPENAPI_RULE_VIA   vr = KopenapiRuleVia( board, net->GetNetCode(), q->GetPosition(), layer, q );
+                            ways.emplace_back( SEG( q->GetPosition(), *to ), vr.clearance + tr.opt / 2 );
+                        }
+
+                        it = partWays.emplace( fp, std::move( ways ) ).first;
+                    }
+
+                    for( const auto& [way, keep] : it->second )
+                    {
+                        if( way.Distance( at ) < viaDia / 2 + keep )
+                            return true;
+                    }
+
+                    return false;
+                };
+
+                // a via whose copper enters another net's higher-priority pour over the net's own
+                auto intoOther = [&]( const VECTOR2I& at )
+                {
+                    for( const auto& [l, given] : givenWay )
+                    {
+                        if( given.Collide( at, viaDia / 2 ) )
+                            return true;
+                    }
+
+                    return false;
+                };
+
+                // the 400 best spots (on the plane first, clear of other nets' higher-priority pours, off the
+                // ways of the part's other pins, then the shortest stub; ties in candidate order), keys computed once: a zone island yields tens
+                // of thousands of spots
                 struct SPOT_KEY
                 {
                     bool   plane;
+                    bool   into;
+                    bool   way;
                     int    rank;
                     double stub;
                     size_t index;
@@ -14782,7 +14891,9 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                     const VECTOR2I& at = candidates[i];
                     const bool      plane = planeAt.emplace( std::make_pair( at.x, at.y ), onPlane( at ) ).first->second
                                             || joinAt.count( { at.x, at.y } );
-                    keys.push_back( { plane, item->Type() == PCB_ZONE_T ? 1 : rankOf( at ), static_cast<double>( stubLength( at ) ), i } );
+                    keys.push_back( { plane, intoOther( at ), item->Type() != PCB_ZONE_T && onWayOfPart( at, stubPadOf( at ) ),
+                                      item->Type() == PCB_ZONE_T ? 1 : rankOf( at ),
+                                      static_cast<double>( stubLength( at ) ), i } );
                 }
 
                 const size_t keep = std::min<size_t>( keys.size(), 400 );
@@ -14791,6 +14902,12 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                    {
                                        if( x.plane != y.plane )
                                            return x.plane;
+
+                                       if( x.into != y.into )
+                                           return y.into;
+
+                                       if( x.way != y.way )
+                                           return y.way;
 
                                        if( x.rank != y.rank )
                                            return x.rank < y.rank;
