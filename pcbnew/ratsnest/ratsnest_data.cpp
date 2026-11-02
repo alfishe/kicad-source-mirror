@@ -45,6 +45,46 @@ using namespace std::placeholders;
 #include <core/union_find.h>
 
 #include <delaunator.hpp>
+#include <footprint.h>
+#include <map>
+#include <pad.h>
+
+
+bool CnAnchorTieLess( const CN_ANCHOR& aA, const CN_ANCHOR& aB )
+{
+    const BOARD_CONNECTED_ITEM* a = aA.Parent();
+    const BOARD_CONNECTED_ITEM* b = aB.Parent();
+
+    if( a == b || !a || !b )
+        return !a && b;
+
+    const PAD* padA = a->Type() == PCB_PAD_T ? static_cast<const PAD*>( a ) : nullptr;
+    const PAD* padB = b->Type() == PCB_PAD_T ? static_cast<const PAD*>( b ) : nullptr;
+
+    if( !padA != !padB )
+        return !padA;
+
+    if( padA && padB )
+    {
+        const FOOTPRINT* fa = padA->GetParentFootprint();
+        const FOOTPRINT* fb = padB->GetParentFootprint();
+        const int        ref = fa && fb ? fa->GetReference().Cmp( fb->GetReference() ) : 0;
+
+        if( ref != 0 )
+            return ref < 0;
+
+        if( const int num = padA->GetNumber().Cmp( padB->GetNumber() ); num != 0 )
+            return num < 0;
+    }
+
+    if( a->Type() != b->Type() )
+        return a->Type() < b->Type();
+
+    if( a->GetLayer() != b->GetLayer() )
+        return a->GetLayer() < b->GetLayer();
+
+    return a->m_Uuid < b->m_Uuid;
+}
 
 void RN_NET::kruskalMST( std::vector<CN_EDGE>& aEdges )
 {
@@ -250,10 +290,27 @@ public:
             if( chain.size() < 2 )
                 continue;
 
+            // grouped by cluster, the clusters by their first anchor
+            std::map<const CN_CLUSTER*, const CN_ANCHOR*> first;
+
+            for( const std::shared_ptr<CN_ANCHOR>& n : chain )
+            {
+                const CN_ANCHOR*& f = first[n->GetCluster().get()];
+
+                if( !f || CnAnchorTieLess( *n, *f ) )
+                    f = n.get();
+            }
+
             std::sort( chain.begin(), chain.end(),
-                    [] ( const std::shared_ptr<CN_ANCHOR>& a, const std::shared_ptr<CN_ANCHOR>& b )
+                    [&] ( const std::shared_ptr<CN_ANCHOR>& a, const std::shared_ptr<CN_ANCHOR>& b )
                     {
-                        return a->GetCluster().get() < b->GetCluster().get();
+                        const CN_ANCHOR* fa = first[a->GetCluster().get()];
+                        const CN_ANCHOR* fb = first[b->GetCluster().get()];
+
+                        if( fa != fb )
+                            return CnAnchorTieLess( *fa, *fb );
+
+                        return CnAnchorTieLess( *a, *b );
                     } );
 
             for( unsigned int j = 1; j < chain.size(); j++ )

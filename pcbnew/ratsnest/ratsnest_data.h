@@ -41,15 +41,25 @@ class BOARD_ITEM;
 class BOARD_CONNECTED_ITEM;
 class CN_CLUSTER;
 
+/**
+ * Anchors at one position in an order that does not follow the board's item order or memory
+ * addresses: copper laid (tracks, vias) before pads, pads by footprint reference and number, then
+ * item type, layer and uuid.
+ */
+bool CnAnchorTieLess( const CN_ANCHOR& aA, const CN_ANCHOR& aB );
+
 struct CN_PTR_CMP
 {
     bool operator()( const std::shared_ptr<CN_ANCHOR>& aItem,
                      const std::shared_ptr<CN_ANCHOR>& bItem ) const
     {
-        if( aItem->Pos().x == bItem->Pos().x )
-            return aItem->Pos().y < bItem->Pos().y;
-        else
+        if( aItem->Pos().x != bItem->Pos().x )
             return aItem->Pos().x < bItem->Pos().x;
+
+        if( aItem->Pos().y != bItem->Pos().y )
+            return aItem->Pos().y < bItem->Pos().y;
+
+        return CnAnchorTieLess( *aItem, *bItem );
     }
 };
 
