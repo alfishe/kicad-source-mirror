@@ -11446,6 +11446,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 // every route taken out by this rip-up, the second level's too
                 std::vector<size_t> allTaken = victims;
                 std::vector<size_t> secondTaken;
+                std::vector<nlohmann::json> secondAttempts;
 
                 for( size_t v : victims )
                 {
@@ -11518,6 +11519,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                                 ok = moved.from && moved.to && tryRoute( moved, movedAttempt, movedTries, false, true );
                                 secondTaken.push_back( other );
+                                secondAttempts.push_back( std::move( movedAttempt ) );
                             }
                         }
                     }
@@ -11648,12 +11650,19 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                             results[rowOf[k]]["rerouted"] = true;
                     }
 
-                    for( size_t k : secondTaken )
+                    for( size_t k = 0; k < secondTaken.size(); ++k )
                     {
-                        if( rowOf[k] < 0 )
-                            earlier( k, nullptr );
-                        else
-                            results[rowOf[k]]["rerouted"] = true;
+                        if( rowOf[secondTaken[k]] < 0 )
+                        {
+                            earlier( secondTaken[k], &secondAttempts[k] );
+                            continue;
+                        }
+
+                        nlohmann::json& vrow = results[rowOf[secondTaken[k]]];
+                        vrow["rerouted"] = true;
+                        vrow["length_mm"] = secondAttempts[k]["metrics"]["length_mm"];
+                        vrow["vias"] = secondAttempts[k]["metrics"].value( "vias", 0 );
+                        vrow["layer"] = secondAttempts[k]["layer"];
                     }
 
                     break;
