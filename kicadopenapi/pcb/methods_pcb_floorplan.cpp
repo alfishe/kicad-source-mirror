@@ -2213,6 +2213,9 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     // order, inside it less the ribbon's half width and a pitch. The run's ends are moved along their
     // portals to fit the ribbon there too, the far end in line with the near one where it can be.
     const bool corridorMerge = aArgs.value( "corridor_merge", true );
+    const double detourK = std::max( 0.0, aArgs.value( "detour_k", 3.0 ) );
+    const int    corridorMinNets = std::max( 0, aArgs.value( "corridor_min_nets", 3 ) );
+    int          corridorsDropped = 0;
     int        gatesMerged = 0;
     using AT = std::array<double, 2>;
 
@@ -2372,6 +2375,31 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         if( l.cluster >= 0 )
             j["cluster"] = l.cluster;
 
+        // a bus whose way is many times longer than the way straight across between its ends: no corridor
+        // (a ribbon that far round would take the space of the routes it passes)
+        if( !l.bus.empty() && (int) l.nets.size() < corridorMinNets && !j["corridor"].empty() )
+        {
+            j["corridor"] = nlohmann::json::array();
+            j["corridor_dropped"] = "fewer nets than corridor_min_nets";
+            corridorsDropped++;
+        }
+
+        if( detourK > 0 && !l.bus.empty() && j["corridor"].size() >= 2 )
+        {
+            const nlohmann::json& first = j["corridor"].front()["at_mm"];
+            const nlohmann::json& last = j["corridor"].back()["at_mm"];
+            const double          across = std::abs( first[0].get<double>() - last[0].get<double>() )
+                                         + std::abs( first[1].get<double>() - last[1].get<double>() );
+
+            if( l.length > detourK * std::max( across, 1.0 ) )
+            {
+                j["corridor"] = nlohmann::json::array();
+                j["detour"] = r2( l.length / std::max( across, 1.0 ) );
+                j["corridor_dropped"] = "detour";
+                corridorsDropped++;
+            }
+        }
+
         linksOver += over;
         linksMissing += !l.found;
         linksThrough += !l.crosses.empty();
@@ -2519,6 +2547,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
               { "summary", { { "links", links.size() },
                              { "buses_split", busesSplit },
                              { "gates_merged", gatesMerged },
+                             { "corridors_dropped", corridorsDropped },
                              { "overflowing_links", linksOver },
                              { "links_without_path", linksMissing },
                              { "links_through_blocks", linksThrough },
@@ -2585,6 +2614,8 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
                         "bus_spread_k":{"type":"number","default":4,"minimum":0,"description":"a bus link is a ribbon only where its pins lie within this many times its ribbon's width (its lines at their pitch) across each end; a bus spread wider is cut, in the order of its pins at a, into clusters that fit, each its own link (link cluster: its index; summary buses_split), a pin alone goes with the single nets; at an end whose boxes reach farther than that (an edge connector's row) a link's way starts by its pins' middle there; 0: never cut nor anchored"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
+                        "corridor_min_nets":{"type":"integer","default":3,"minimum":0,"description":"a bus link of fewer nets gets no corridor (corridor [], corridor_dropped)"},
+                        "detour_k":{"type":"number","default":3,"minimum":0,"description":"a bus link whose way is longer than this many times the Manhattan distance between its first and last gates gets no corridor (corridor [], corridor_dropped detour, detour: the ratio; summary corridors_dropped); 0: never dropped"},
                         "corridor_merge":{"type":"boolean","default":true,"description":"a corridor's gates (portals crossed) that a straight run from an earlier gate to a later one passes, inside each portal less the ribbon's half width and a pitch, are dropped; the earlier gate's rooms_mm lists the regions the run goes through (corridor.md); summary gates_merged"},
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
