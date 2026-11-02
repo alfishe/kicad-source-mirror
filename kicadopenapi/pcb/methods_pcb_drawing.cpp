@@ -17,12 +17,14 @@
 #include <pcb_edit_frame.h>
 #include <pcb_shape.h>
 #include <pcb_text.h>
+#include <pcb_track.h>
 #include <geometry/shape_compound.h>
 #include <stroke_params.h>
 #include <tool/tool_manager.h>
 
 #include <cmath>
 #include <optional>
+#include <set>
 
 
 namespace
@@ -288,11 +290,15 @@ nlohmann::json rectMm( const BOX2I& aBox )
 
 
 /// @brief Board-level drawings (texts, shapes) by uuid; footprints' own items are not included
-std::vector<BOARD_ITEM*> drawingsByUuid( BOARD* aBoard, const nlohmann::json& aUuids, nlohmann::json& aMissing )
+std::vector<BOARD_ITEM*> drawingsByUuid( BOARD* aBoard, const nlohmann::json& aUuids, nlohmann::json& aMissing,
+                                         bool aCopper = false )
 {
     std::vector<BOARD_ITEM*> out;
 
-    const std::vector<BOARD_ITEM*> drawings( aBoard->Drawings().begin(), aBoard->Drawings().end() );
+    std::vector<BOARD_ITEM*> drawings( aBoard->Drawings().begin(), aBoard->Drawings().end() );
+
+    if( aCopper )
+        drawings.insert( drawings.end(), aBoard->Tracks().begin(), aBoard->Tracks().end() );
 
     for( const nlohmann::json& u : aUuids )
     {
@@ -448,13 +454,13 @@ static KOPENAPI_RESULT h_pcb_items_move( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         return KopenapiNoBoard();
 
     if( !aArgs.contains( "uuids" ) || !aArgs["uuids"].is_array() || aArgs["uuids"].empty() )
-        return KOPENAPI_RESULT::Error( 400, "uuids: the drawings to move (pcb_drawing_list)" );
+        return KOPENAPI_RESULT::Error( 400, "uuids: the drawings, tracks and vias to move (pcb_drawing_list, pcb_track_list)" );
 
     nlohmann::json           missing = nlohmann::json::array();
-    std::vector<BOARD_ITEM*> items = drawingsByUuid( context->GetBoard(), aArgs["uuids"], missing );
+    std::vector<BOARD_ITEM*> items = drawingsByUuid( context->GetBoard(), aArgs["uuids"], missing, true );
 
     if( items.empty() )
-        return KOPENAPI_RESULT::Error( 404, "no board drawing with these uuids" );
+        return KOPENAPI_RESULT::Error( 404, "no board drawing, track or via with these uuids" );
 
     if( std::optional<KOPENAPI_RESULT> refused = lockedRefusal( items, aArgs ) )
         return *refused;
@@ -463,17 +469,34 @@ static KOPENAPI_RESULT h_pcb_items_move( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     BOARD_COMMIT   commit( context->GetToolManager() );
     std::vector<KIID> ids;
     BOX2I          box;
+    std::set<BOARD_ITEM*> seen;
+    int            drawings = 0, tracks = 0, vias = 0;
 
     for( BOARD_ITEM* item : items )
     {
+        if( !seen.insert( item ).second )
+            continue;
+
+        if( item->Type() == PCB_VIA_T )
+            ++vias;
+        else if( item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T )
+            ++tracks;
+        else
+            ++drawings;
+
         commit.Modify( item );
         item->Move( delta );
         ids.push_back( item->m_Uuid );
         box.Merge( item->GetBoundingBox() );
     }
 
-    finish( aCtx, *context, commit, ids, _( "Move drawings (API)" ) );
-    return KOPENAPI_RESULT::Ok( { { "moved", items.size() }, { "missing", missing }, { "bbox_mm", rectMm( box ) } } );
+    finish( aCtx, *context, commit, ids, _( "Move items (API)" ) );
+    return KOPENAPI_RESULT::Ok( { { "moved", ids.size() },
+                                  { "drawings", drawings },
+                                  { "tracks", tracks },
+                                  { "vias", vias },
+                                  { "missing", missing },
+                                  { "bbox_mm", rectMm( box ) } } );
 }
 
 
@@ -596,8 +619,9 @@ KOPENAPI_REGISTER( "pcb_item_delete",
                    false, h_pcb_item_delete );
 
 KOPENAPI_REGISTER( "pcb_items_move",
-                   "Move board drawings (texts, shapes; e.g. a logo made of several) together by dx / dy mm; "
-                   "one undo step; answers their box",
+                   "Move board drawings (texts, shapes; e.g. a logo made of several), tracks and vias "
+                   "(pcb_track_list uuids) together by dx / dy mm; only the items given move (connected copper "
+                   "is not dragged; pcb_drc shows what came apart); one undo step; answers counts per kind and their box",
                    R"json({"type":"object","required":["uuids"],"properties":{
                         "uuids":{"type":"array","items":{"type":"string"}},
                         "dx_mm":{"type":"number","default":0},"dy_mm":{"type":"number","default":0},
