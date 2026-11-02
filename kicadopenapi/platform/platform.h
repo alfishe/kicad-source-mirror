@@ -92,7 +92,7 @@ int WaitProcess(long pid, int timeoutMs);
 /// @brief Finds an executable on PATH and in the OS's usual tool directories (GUI apps on macOS
 /// do not get the shell's PATH: /opt/homebrew/bin, /usr/local/bin are searched too).
 /// @return the full path, or empty
-std::filesystem::path FindExecutable(const std::string& name);
+std::filesystem::path FindProgram(const std::string& name);
 
 /// @brief Memory the OS charges this process for, in bytes; -1 where the OS does not report a field
 struct ProcessMemoryInfo

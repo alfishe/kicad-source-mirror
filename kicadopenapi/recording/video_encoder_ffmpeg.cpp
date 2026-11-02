@@ -169,7 +169,7 @@ private:
 
 std::unique_ptr<KOPENAPI_VIDEO_ENCODER> KopenapiFfmpegVideoEncoder( std::string& aError )
 {
-    const std::filesystem::path exe = kp::FindExecutable( "ffmpeg" );
+    const std::filesystem::path exe = kp::FindProgram( "ffmpeg" );
 
     if( exe.empty() )
     {

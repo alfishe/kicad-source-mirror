@@ -217,7 +217,7 @@ int WaitProcess(long pid, int timeoutMs)
 #endif
 }
 
-fs::path FindExecutable(const std::string& name)
+fs::path FindProgram(const std::string& name)
 {
     std::vector<fs::path> dirs;
 #if defined(_WIN32)

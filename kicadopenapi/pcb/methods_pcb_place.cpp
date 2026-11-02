@@ -4453,12 +4453,12 @@ std::optional<KOPENAPI_RESULT> groupParts( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard
             netPads[pad->GetNetCode()]++;
     }
 
-    std::set<int> small;
+    std::set<int> smallNets;
 
     for( PAD* pad : aAnchor->Pads() )
     {
         if( pad->GetNetCode() > 0 && netPads[pad->GetNetCode()] <= limit )
-            small.insert( pad->GetNetCode() );
+            smallNets.insert( pad->GetNetCode() );
     }
 
     for( FOOTPRINT* fp : aBoard->Footprints() )
@@ -4469,7 +4469,7 @@ std::optional<KOPENAPI_RESULT> groupParts( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard
 
         for( PAD* pad : fp->Pads() )
         {
-            if( small.count( pad->GetNetCode() ) )
+            if( smallNets.count( pad->GetNetCode() ) )
             {
                 aParts.push_back( fp );
                 break;

@@ -2562,12 +2562,12 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         for( size_t k : order )
         {
             LANE&     l = lanes[k];
-            const int far = lineAt( l.to, front[{ l.turn == 2 ? l.next : l.own, l.to }] + 2 * pitch );
+            const int farLine = lineAt( l.to, front[{ l.turn == 2 ? l.next : l.own, l.to }] + 2 * pitch );
 
             if( l.to % 2 == 0 )
-                l.pts.back().x = far;
+                l.pts.back().x = farLine;
             else
-                l.pts.back().y = far;
+                l.pts.back().y = farLine;
         }
 
         // a straight one: out past the lanes running by its pin

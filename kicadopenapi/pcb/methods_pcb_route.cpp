@@ -6693,13 +6693,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 for( size_t k : list )
                 {
                     const PORT_GOAL& g = portGoals[portEnd[k]];
-                    const PAD*       far = static_cast<const PAD*>( portEnd[k] == jobs[k].from ? nullptr : jobs[k].from );
+                    const PAD*       farPad = static_cast<const PAD*>( portEnd[k] == jobs[k].from ? nullptr : jobs[k].from );
                     VECTOR2I         farAt = portEnd[k] == jobs[k].from ? jobs[k].toPos : jobs[k].from->GetPosition();
 
                     if( portEnd[k] == jobs[k].from && jobs[k].to && jobs[k].to->Type() == PCB_PAD_T )
-                        far = static_cast<const PAD*>( jobs[k].to );
+                        farPad = static_cast<const PAD*>( jobs[k].to );
 
-                    if( auto it = far ? portGoals.find( far ) : portGoals.end(); it != portGoals.end() && !it->second.lane.empty() )
+                    if( auto it = farPad ? portGoals.find( farPad ) : portGoals.end(); it != portGoals.end() && !it->second.lane.empty() )
                         farAt = it->second.lane.back();
 
                     const VECTOR2I inward = laneInward( portEnd[k], g );
@@ -6827,7 +6827,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         {
             PORT_GOAL* goal;
             PAD*       pad;
-            VECTOR2I   far;
+            VECTOR2I   farEnd;
             VECTOR2D   u, n;
             double     across, along, shift;
         };
@@ -6916,7 +6916,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                     std::vector<VECTOR2I> pts = { l.goal->lane.back() };
                     pts.insert( pts.end(), c.begin(), c.end() );
-                    pts.push_back( l.far );
+                    pts.push_back( l.farEnd );
 
                     for( size_t i = 1; i < pts.size(); ++i )
                     {
@@ -13178,13 +13178,13 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
             for( int attempt = 0; attempt < 2 && !ok; ++attempt )
             {
-                const bool small = attempt == 1;
+                const bool smallVia = attempt == 1;
 
-                if( small && ( !minViaDia || !rowPad || plan != plannedVia.end() ) )
+                if( smallVia && ( !minViaDia || !rowPad || plan != plannedVia.end() ) )
                     break;
 
-                viaDia = plan != plannedVia.end() ? plan->second.dia : small ? minViaDia : classViaDia;
-                viaDrill = plan != plannedVia.end() ? plan->second.drill : small ? minViaDrill : classViaDrill;
+                viaDia = plan != plannedVia.end() ? plan->second.dia : smallVia ? minViaDia : classViaDia;
+                viaDrill = plan != plannedVia.end() ? plan->second.drill : smallVia ? minViaDrill : classViaDrill;
 
                 // Candidate spots, nearest first: around a pad; inside a zone island (on a grid over the
                 // island, the via's copper fully in it)
@@ -13391,7 +13391,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                 if( planeless )
                     std::erase_if( candidates, [&]( const VECTOR2I& at ) { return !inwardAt.count( { at.x, at.y } ) && !joinAt.count( { at.x, at.y } ); } );
 
-                if( small )
+                if( smallVia )
                     std::erase_if( candidates, [&]( const VECTOR2I& at ) { return !inwardAt.count( { at.x, at.y } ); } );
 
                 // nearest to the anchor first; for an island the stub length decides (a spot near any of its pads)
