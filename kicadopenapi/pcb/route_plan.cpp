@@ -69,6 +69,58 @@ struct OWNERS
 };
 
 
+/// @brief The A* open list: entries leave in the order of ( f, state ), one bucket of states per f
+class OPEN_LIST
+{
+public:
+    bool Empty() const { return m_count == 0; }
+
+    void Push( int aF, int aState )
+    {
+        if( m_buckets.empty() )
+            m_base = aF;
+
+        if( aF < m_base )
+        {
+            m_buckets.insert( m_buckets.begin(), (size_t) ( m_base - aF ), {} );
+            m_first += (size_t) ( m_base - aF );
+            m_base = aF;
+        }
+
+        const size_t i = (size_t) ( aF - m_base );
+
+        if( i >= m_buckets.size() )
+            m_buckets.resize( i + 1 );
+
+        std::vector<int>& bucket = m_buckets[i];
+        bucket.push_back( aState );
+        std::push_heap( bucket.begin(), bucket.end(), std::greater<int>() );
+        m_first = std::min( m_first, i );
+        m_count++;
+    }
+
+    /// @brief The least entry, taken off the list; the list must not be empty
+    std::pair<int, int> Pop()
+    {
+        while( m_buckets[m_first].empty() )
+            m_first++;
+
+        std::vector<int>& bucket = m_buckets[m_first];
+        std::pop_heap( bucket.begin(), bucket.end(), std::greater<int>() );
+        const int state = bucket.back();
+        bucket.pop_back();
+        m_count--;
+        return { m_base + (int) m_first, state };
+    }
+
+private:
+    std::vector<std::vector<int>> m_buckets;   ///< a min-heap of states per f, from m_base on
+    int                           m_base = 0;
+    size_t                        m_first = 0;   ///< no entry below this bucket
+    size_t                        m_count = 0;
+};
+
+
 constexpr int DX[8] = { 1, 1, 0, -1, -1, -1, 0, 1 };
 constexpr int DY[8] = { 0, 1, 1, 1, 0, -1, -1, -1 };
 
@@ -630,14 +682,12 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         return 10 * std::max( dx, dy ) + 4 * std::min( dx, dy );
     };
 
-    // f in the high half, the state in the low: one compare orders entries as the pair ( f, state )
-    auto entry = []( int aF, int aState ) { return ( (uint64_t) (uint32_t) aF << 32 ) | (uint32_t) aState; };
-    std::priority_queue<uint64_t, std::vector<uint64_t>, std::greater<uint64_t>> open;
+    OPEN_LIST open;
 
     for( int s : starts )
     {
         g[s] = 0;
-        open.push( entry( heuristic( s ), s ) );
+        open.Push( heuristic( s ), s );
     }
 
     for( const auto& [s, esc] : startEscapes )
@@ -645,14 +695,14 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         if( esc.cost < g[s] )
         {
             g[s] = esc.cost;
-            open.push( entry( g[s] + heuristic( s ), s ) );
+            open.Push( g[s] + heuristic( s ), s );
         }
     }
 
     int       reached = -1;
     const long limit = (long) states * 4;
 
-    while( !open.empty() && plan.expanded < limit )
+    while( !open.Empty() && plan.expanded < limit )
     {
         if( aReq.stop && ( plan.expanded & 4095 ) == 0 && aReq.stop() )
         {
@@ -660,10 +710,9 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             break;
         }
 
-        const uint64_t top = open.top();
-        const int      f = (int) ( top >> 32 );
-        const int      s = (int) (uint32_t) top;
-        open.pop();
+        const std::pair<int, int> top = open.Pop();
+        const int                 f = top.first;
+        const int                 s = top.second;
 
         if( f - heuristic( s ) > g[s] )
             continue;   // a stale entry
@@ -694,7 +743,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                 g[aNext] = g[s] + aCost;
                 parent[aNext] = s;
                 dirIn[aNext] = aDir;
-                open.push( entry( g[aNext] + heuristic( aNext ), aNext ) );
+                open.Push( g[aNext] + heuristic( aNext ), aNext );
             }
         };
 
@@ -737,7 +786,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     if( reached < 0 )
     {
         // the start's room goes on past the box: once more over the whole board
-        if( open.empty() && reachedCut && !aReq.wholeBoard )
+        if( open.Empty() && reachedCut && !aReq.wholeBoard )
         {
             ROUTE_PLAN_REQUEST wide = aReq;
             wide.wholeBoard = true;
@@ -748,7 +797,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         }
 
         // all the start reaches searched: is it the start's room or the target's that is shut
-        if( open.empty() )
+        if( open.Empty() )
         {
             constexpr size_t ROOM = 20000;
             std::vector<uint8_t> seen( states, 0 );
