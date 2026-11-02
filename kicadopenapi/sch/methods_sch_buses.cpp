@@ -494,7 +494,7 @@ static KOPENAPI_RESULT h_sch_bus_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     const std::string sheetGlob = aArgs.value( "sheet", std::string() );
     const std::string nameGlob = aArgs.value( "name", std::string() );
     const std::string memberGlob = aArgs.value( "member", std::string() );
-    const int         listLimit = std::clamp( aArgs.value( "list_limit", 16 ), 0, 10000 );
+    const int         listLimit = KopenapiListLimit( aArgs, 16, 0, 10000 );
 
     std::vector<nlohmann::json> rows;
 

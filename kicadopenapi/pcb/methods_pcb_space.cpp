@@ -1688,7 +1688,7 @@ static KOPENAPI_RESULT h_pcb_layout_graph( KOPENAPI_CONTEXT& aCtx, const nlohman
         }
     }
 
-    const int      listLimit = std::max( 1, aArgs.value( "list_limit", 16 ) );
+    const int      listLimit = KopenapiListLimit( aArgs, 16, 1 );
     nlohmann::json edges = nlohmann::json::array();
     std::vector<std::pair<std::pair<int, int>, std::set<int>>> sortedPairs( pairNets.begin(), pairNets.end() );
     std::stable_sort( sortedPairs.begin(), sortedPairs.end(),
@@ -2676,7 +2676,7 @@ KOPENAPI_REGISTER( "pcb_layout_graph",
                         "depth":{"type":"integer","default":2,"minimum":1,"maximum":6},
                         "max_fanout":{"type":"integer","default":30},
                         "min_bus":{"type":"integer","default":3,"minimum":2,"description":"lines a bundle needs (pcb_net_roles min_bundle)"},
-                        "list_limit":{"type":"integer","default":16,"description":"single nets listed per edge"}}})json"_json,
+                        "list_limit":{"type":"integer","default":16,"description":"single nets listed per edge"},"full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"}}})json"_json,
                    false, h_pcb_layout_graph, 120 );
 
 KOPENAPI_REGISTER( "pcb_fanout_ports",

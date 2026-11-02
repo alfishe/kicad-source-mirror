@@ -11298,7 +11298,7 @@ static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( error )
         return *error;
 
-    const bool     full = aArgs.value( "full", false );
+    const bool     full = KopenapiFull( aArgs );
     const size_t   limit = full ? tracks.size() : size_t( std::clamp( aArgs.value( "limit", 500 ), 1, 5000 ) );
     const size_t   offset = full ? 0 : size_t( std::max( 0, aArgs.value( "offset", 0 ) ) );
     nlohmann::json items = nlohmann::json::array();
@@ -11405,7 +11405,7 @@ static KOPENAPI_RESULT h_pcb_via_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     if( error )
         return *error;
 
-    const bool     full = aArgs.value( "full", false );
+    const bool     full = KopenapiFull( aArgs );
     const size_t   limit = full ? std::numeric_limits<size_t>::max()
                                 : size_t( std::clamp( aArgs.value( "limit", 1000 ), 1, 100000 ) );
     const size_t   offset = size_t( std::max( 0, aArgs.value( "offset", 0 ) ) );
@@ -13921,7 +13921,7 @@ KOPENAPI_REGISTER( "pcb_track_list",
                         "kinds":{"type":"array","items":{"type":"string","enum":["track","via"]}},
                         "uuids":{"type":"array","items":{"type":"string"}},
                         "limit":{"type":"integer","default":500,"description":"items per page, 1..5000 (ignored with full)"},"offset":{"type":"integer","default":0},
-                        "full":{"type":"boolean","default":false,"description":"every item in one answer, no limit or offset, with all fields: net_code, netclass, locked, dangling; vias: via_type, layer_span; arcs: mid_mm"}}})json"_json,
+                        "full":{"type":"boolean","default":false,"description":"everything: every item (no limit or offset) with all fields: net_code, netclass, locked, dangling; vias: via_type, layer_span; arcs: mid_mm; large on a big design"}}})json"_json,
                    false, h_pcb_track_list );
 
 KOPENAPI_REGISTER( "pcb_via_list",
@@ -13936,7 +13936,7 @@ KOPENAPI_REGISTER( "pcb_via_list",
                         "layer":{"type":"string","description":"vias passing this copper layer"},
                         "via_types":{"type":"array","items":{"type":"string","enum":["through","blind","buried","micro"]}},
                         "uuids":{"type":"array","items":{"type":"string"}},
-                        "full":{"type":"boolean","default":false,"description":"every via, no limit"},
+                        "full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"},
                         "limit":{"type":"integer","default":1000},"offset":{"type":"integer","default":0}}})json"_json,
                    false, h_pcb_via_list );
 

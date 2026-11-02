@@ -50,7 +50,7 @@ nlohmann::json KopenapiCheckSchema( nlohmann::json aExtra )
     for( const auto& [key, value] : aExtra.items() )
         properties[key] = value;
 
-    return KopenapiPagedSchema( properties, 100, CHECK_PAGE_MAX, true );
+    return KopenapiPagedSchema( properties, 100, CHECK_PAGE_MAX );
 }
 
 
@@ -96,7 +96,7 @@ nlohmann::json KopenapiCheckResult( const std::vector<nlohmann::json>& aViolatio
     for( size_t i = 0; i < aUnconnected.size() && i < limit; ++i )
         unconnected.push_back( aUnconnected[i] );
 
-    nlohmann::json result = KopenapiPage( rows, aArgs, 100, CHECK_PAGE_MAX, true );
+    nlohmann::json result = KopenapiPage( rows, aArgs, 100, CHECK_PAGE_MAX );
     result["summary"] = { { "errors", errors },
                           { "warnings", warnings },
                           { "excluded", excluded },

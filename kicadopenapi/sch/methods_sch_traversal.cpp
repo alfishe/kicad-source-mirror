@@ -503,7 +503,7 @@ static KOPENAPI_RESULT h_sch_power_tree( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         return KopenapiNoSchematic();
 
     const GRAPH g = buildGraph( context->GetSchematic() );
-    const int   listLimit = std::clamp( aArgs.value( "list_limit", 50 ), 0, 1000 );
+    const int   listLimit = KopenapiListLimit( aArgs, 50, 0, 1000 );
 
     nlohmann::json rails = nlohmann::json::array();
 
@@ -559,7 +559,7 @@ static KOPENAPI_RESULT h_sch_interface_map( KOPENAPI_CONTEXT& aCtx, const nlohma
 
     const GRAPH       g = buildGraph( context->GetSchematic() );
     const std::string refGlob = aArgs.value( "ref", std::string() );
-    const int         listLimit = std::clamp( aArgs.value( "list_limit", 10 ), 0, 1000 );
+    const int         listLimit = KopenapiListLimit( aArgs, 10, 0, 1000 );
 
     std::vector<std::string> refs;
 
@@ -632,7 +632,7 @@ static KOPENAPI_RESULT h_sch_net_search( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
     const GRAPH g = buildGraph( context->GetSchematic() );
     const bool  all = by == "any";
-    const int   listLimit = std::clamp( aArgs.value( "list_limit", 10 ), 1, 1000 );
+    const int   listLimit = KopenapiListLimit( aArgs, 10, 1, 1000 );
 
     std::vector<nlohmann::json> rows;
 
@@ -890,7 +890,7 @@ KOPENAPI_REGISTER( "sch_power_tree",
                    "Power and ground rails: per rail the sources (power output pins), connectors feeding "
                    "it, consumers (power input pins) and other pins",
                    R"json({"type":"object","properties":{
-                        "list_limit":{"type":"integer","default":50,"description":"max listed pins per group"}}})json"_json,
+                        "list_limit":{"type":"integer","default":50,"description":"max listed pins per group"},"full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"}}})json"_json,
                    false, h_sch_power_tree );
 
 KOPENAPI_REGISTER( "sch_interface_map",
@@ -898,7 +898,7 @@ KOPENAPI_REGISTER( "sch_interface_map",
                    "net reaches; filter connectors by ref glob",
                    R"json({"type":"object","properties":{
                         "ref":{"type":"string","description":"connector ref glob"},
-                        "list_limit":{"type":"integer","default":10}}})json"_json,
+                        "list_limit":{"type":"integer","default":10},"full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"}}})json"_json,
                    false, h_sch_interface_map );
 
 KOPENAPI_REGISTER( "sch_net_search",

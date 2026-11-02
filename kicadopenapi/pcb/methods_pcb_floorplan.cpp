@@ -270,7 +270,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const bool negotiate = aArgs.value( "negotiate", true );
     const double overflowCost = std::max( 0.0, aArgs.value( "overflow_cost_mm", 5.0 ) );
     const double foreignPenalty = std::max( 1.0, aArgs.value( "through_block_factor", 10.0 ) );
-    const int listLimit = std::max( 1, aArgs.value( "list_limit", 40 ) );
+    const int listLimit = KopenapiListLimit( aArgs, 40, 1 );
     const bool allChannels = aArgs.value( "all_channels", false );
     const std::string reroute = aArgs.value( "reroute", std::string( "overflowed" ) );
 
@@ -2186,6 +2186,6 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "overflow_cost_mm":{"type":"number","default":5,"description":"detour worth one track over a channel's capacity, first round (doubles each round)"},
                         "through_block_factor":{"type":"number","default":10,"minimum":1,"description":"cost of a path through another block's box per mm, against free space"},
                         "all_channels":{"type":"boolean","default":false,"description":"list every channel, not only the used ones"},
-                        "list_limit":{"type":"integer","default":40,"description":"channels listed, net names and links per entry"},
+                        "list_limit":{"type":"integer","default":40,"description":"channels listed, net names and links per entry"},"full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"},
                         "show":{"type":"boolean","default":false,"description":"GUI: overlay group 'floorplan'"}}})json"_json,
                    false, h_pcb_floorplan, 120 );

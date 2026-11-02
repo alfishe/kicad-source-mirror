@@ -275,15 +275,44 @@ bool KopenapiNaturalLess( const std::string& aA, const std::string& aB )
 }
 
 
+nlohmann::json KopenapiFullSchema()
+{
+    return { { "type", "boolean" },
+             { "default", false },
+             { "description", "everything: every item (no page limit) and every entry of every list in the answer "
+                              "(no list_limit); large on a big design" } };
+}
+
+
+bool KopenapiFull( const nlohmann::json& aArgs )
+{
+    return aArgs.is_object() && aArgs.contains( "full" ) && aArgs["full"].is_boolean() && aArgs["full"].get<bool>();
+}
+
+
+int KopenapiListLimit( const nlohmann::json& aArgs, int aDefault, int aMin, int aMax )
+{
+    if( KopenapiFull( aArgs ) )
+        return std::numeric_limits<int>::max();
+
+    int limit = aDefault;
+
+    if( aArgs.is_object() && aArgs.contains( "list_limit" ) && aArgs["list_limit"].is_number_integer() )
+        limit = static_cast<int>( std::clamp<long long>( aArgs["list_limit"].get<long long>(), aMin, aMax ) );
+
+    return std::clamp( limit, aMin, aMax );
+}
+
+
 nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json& aArgs, size_t aDefaultLimit,
-                             size_t aMaxLimit, bool aAllowFull )
+                             size_t aMaxLimit )
 {
     size_t limit = aDefaultLimit;
 
     if( aArgs.contains( "limit" ) && aArgs["limit"].is_number_integer() )
         limit = static_cast<size_t>( std::clamp( aArgs["limit"].get<long long>(), 1LL, static_cast<long long>( aMaxLimit ) ) );
 
-    if( aAllowFull && aArgs.is_object() && aArgs.value( "full", false ) )
+    if( KopenapiFull( aArgs ) )
         limit = std::numeric_limits<size_t>::max();
 
     size_t offset = 0;
@@ -304,15 +333,11 @@ nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json&
 }
 
 
-nlohmann::json KopenapiPageSchema( int aDefaultLimit, int aMaxLimit, bool aAllowFull )
+nlohmann::json KopenapiPageSchema( int aDefaultLimit, int aMaxLimit )
 {
-    nlohmann::json page = { { "limit", { { "type", "integer" }, { "minimum", 1 }, { "maximum", aMaxLimit }, { "default", aDefaultLimit } } },
-                            { "cursor", { { "type", "string" }, { "description", "next_cursor of the previous page" } } } };
-
-    if( aAllowFull )
-        page["full"] = { { "type", "boolean" }, { "default", false }, { "description", "every item from the cursor on, no limit" } };
-
-    return page;
+    return { { "limit", { { "type", "integer" }, { "minimum", 1 }, { "maximum", aMaxLimit }, { "default", aDefaultLimit } } },
+             { "cursor", { { "type", "string" }, { "description", "next_cursor of the previous page" } } },
+             { "full", KopenapiFullSchema() } };
 }
 
 
@@ -356,10 +381,10 @@ nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName )
 }
 
 
-nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit, int aMaxLimit, bool aAllowFull )
+nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit, int aMaxLimit )
 {
     // a named object: a range-for over items() of a temporary iterates a destroyed object
-    const nlohmann::json page = KopenapiPageSchema( aDefaultLimit, aMaxLimit, aAllowFull );
+    const nlohmann::json page = KopenapiPageSchema( aDefaultLimit, aMaxLimit );
 
     for( const auto& [key, value] : page.items() )
         aProperties[key] = value;
@@ -610,7 +635,7 @@ wxString KopenapiCanonicalPath( const wxString& aPath )
 
 KOPENAPI_LIST_CAP::KOPENAPI_LIST_CAP( const nlohmann::json& aArgs, size_t aDefault ) :
         m_limit( aDefault ),
-        m_full( aArgs.is_object() && aArgs.value( "full", false ) )
+        m_full( KopenapiFull( aArgs ) )
 {
     if( aArgs.is_object() && aArgs.contains( "list_limit" ) && aArgs["list_limit"].is_number() )
         m_limit = (size_t) std::max( 0.0, aArgs["list_limit"].get<double>() );
@@ -714,9 +739,7 @@ nlohmann::json KOPENAPI_LIST_CAP::Schema( nlohmann::json aSchema, size_t aDefaul
                                             { "minimum", 0 },
                                             { "description", "entries listed per list of the answer (uuids, items, rows); "
                                                              "counts stay whole; a cut list has <key>_total and is named in truncated; 0 = counts only" } };
-    aSchema["properties"]["full"] = { { "type", "boolean" },
-                                      { "default", false },
-                                      { "description", "every entry of every list (large on a big board)" } };
+    aSchema["properties"]["full"] = KopenapiFullSchema();
     return aSchema;
 }
 

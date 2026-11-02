@@ -62,6 +62,7 @@ KOPENAPI_REGISTER( "pcb_query",
                         "order_by":{"type":"array","items":{"type":"string"},"description":"fields, '-' prefix for descending; references sort naturally"},
                         "limit":{"type":"integer","default":1000},
                         "cursor":{"type":"string"},
+                        "full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"},
                         "explain":{"oneOf":[{"type":"boolean"},{"type":"string","enum":["misses"]}],"default":false},
                         "deadline_ms":{"type":"number","description":"stop the scan after this time (answer 504)"}}})json"_json,
                    false, h_pcb_query );

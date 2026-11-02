@@ -4,6 +4,7 @@
 #define KICADOPENAPI_UTIL_H
 
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 #include <wx/string.h>
@@ -62,12 +63,25 @@ KICOMMON_API wxString KopenapiCanonicalPath( const wxString& aPath );
 /// @brief Natural order: "R2" < "R10", case-insensitive
 KICOMMON_API bool KopenapiNaturalLess( const std::string& aA, const std::string& aB );
 
+/// @brief "full": true asks for everything, the same in every list method: every item (no page
+/// limit, from the cursor on) and every entry of every list in the answer (no list_limit).  Its
+/// schema property, shared by the paged schemas, KOPENAPI_LIST_CAP::Schema and methods with
+/// their own caps
+KICOMMON_API nlohmann::json KopenapiFullSchema();
+
+/// @brief True when aArgs asks for everything ("full": true)
+KICOMMON_API bool KopenapiFull( const nlohmann::json& aArgs );
+
+/// @brief A method's own cap of the lists in its answer: "list_limit" (default aDefault) within
+/// aMin..aMax; no cap with "full": true
+KICOMMON_API int KopenapiListLimit( const nlohmann::json& aArgs, int aDefault, int aMin = 0,
+                                    int aMax = std::numeric_limits<int>::max() );
+
 /// @brief One page of aItems: args "limit" (default aDefaultLimit, max aMaxLimit) and "cursor" (opaque,
-/// from the previous page); aAllowFull: "full": true gives every item from the cursor on.
+/// from the previous page); "full": true gives every item from the cursor on.
 /// Returns { items, total, next_cursor (null on the last page) }.
 KICOMMON_API nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json& aArgs,
-                                          size_t aDefaultLimit = 100, size_t aMaxLimit = 1000,
-                                          bool aAllowFull = false );
+                                          size_t aDefaultLimit = 100, size_t aMaxLimit = 1000 );
 
 /// @brief Role of a net guessed from its name only: { role: ground|power|clock|reset|signal|unconnected,
 /// basis: [...] }.  Hierarchical prefixes ("/CPU/") are ignored, a trailing '/' (active-low,
@@ -147,13 +161,12 @@ private:
     bool   m_full;
 };
 
-/// @brief JSON schema properties shared by all paginated methods (limit up to aMaxLimit, cursor;
-/// full with aAllowFull)
-KICOMMON_API nlohmann::json KopenapiPageSchema( int aDefaultLimit = 100, int aMaxLimit = 1000, bool aAllowFull = false );
+/// @brief JSON schema properties shared by all paginated methods (limit up to aMaxLimit, cursor, full)
+KICOMMON_API nlohmann::json KopenapiPageSchema( int aDefaultLimit = 100, int aMaxLimit = 1000 );
 
-/// @brief Object schema with aProperties plus limit/cursor (and full)
+/// @brief Object schema with aProperties plus limit / cursor / full
 KICOMMON_API nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit = 100,
-                                                 int aMaxLimit = 1000, bool aAllowFull = false );
+                                                 int aMaxLimit = 1000 );
 
 /// @brief Default page size of ranked searches (KopenapiRankedPage)
 constexpr int KOPENAPI_RANKED_PAGE = 20;

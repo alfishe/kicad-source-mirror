@@ -70,7 +70,7 @@ static KOPENAPI_RESULT h_design_parity( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                                             "(sch_open + pcb_open of one project)" );
     }
 
-    const int limit = std::clamp( aArgs.value( "list_limit", 50 ), 0, 100000 );
+    const int limit = KopenapiListLimit( aArgs, 50, 0, 100000 );
     auto      list = [limit]() { LIST l; l.limit = limit; return l; };
 
     // ---- components ----
@@ -281,8 +281,10 @@ static KOPENAPI_RESULT h_design_parity( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         for( const auto& [ref, pins] : pinsWithoutPad )
             placed.add( { { "ref", ref }, { "pins", pins }, { "footprint", pcbComps[ref]["footprint"] } } );
 
-        KOPENAPI_RESULT symbols = callMethod( aCtx, "sch_footprint_check", { { "problems_only", true }, { "limit", std::max( limit, 1 ) } } );
-        KOPENAPI_RESULT boardParts = callMethod( aCtx, "pcb_parts_check", { { "problems_only", true }, { "limit", std::max( limit, 1 ) } } );
+        const nlohmann::json checkArgs = KopenapiFull( aArgs ) ? nlohmann::json{ { "problems_only", true }, { "full", true } }
+                                                               : nlohmann::json{ { "problems_only", true }, { "limit", std::clamp( limit, 1, 1000 ) } };
+        KOPENAPI_RESULT symbols = callMethod( aCtx, "sch_footprint_check", checkArgs );
+        KOPENAPI_RESULT boardParts = callMethod( aCtx, "pcb_parts_check", checkArgs );
 
         const int symbolProblems = symbols.status == 200 ? symbols.body.value( "problems", 0 ) : 0;
         const int boardProblems = boardParts.status == 200 ? boardParts.body.value( "with_problems", 0 ) : 0;
@@ -606,7 +608,7 @@ KOPENAPI_REGISTER( "design_parity",
                    "placed lib_id, symbol pins vs the library footprint (sch_footprint_check), placed footprint vs "
                    "its library copy incl. 3D models, model files and metadata (pcb_parts_check); libraries as on disk now",
                    R"json({"type":"object","properties":{
-                        "list_limit":{"type":"integer","default":50,"description":"max listed items per finding"},
+                        "list_limit":{"type":"integer","default":50,"description":"max listed items per finding"},"full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"},
                         "parts":{"type":"boolean","default":true,"description":"include the parts cross-check"}}})json"_json,
                    false, h_design_parity, 120 );
 

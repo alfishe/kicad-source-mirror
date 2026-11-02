@@ -7,6 +7,7 @@
 #include <board.h>
 #include <footprint.h>
 #include <kicadopenapi_keepalive.h>
+#include <kicadopenapi_util.h>
 #include <pad.h>
 #include <pcb_group.h>
 #include <pcb_shape.h>
@@ -2015,7 +2016,7 @@ KOPENAPI_RESULT KopenapiPcbQuery( BOARD* aBoard, const nlohmann::json& aArgs )
                               } );
         }
 
-        const size_t limit = std::min<size_t>( aArgs.value( "limit", 1000 ), 100000 );
+        const size_t limit = KopenapiFull( aArgs ) ? idx.size() : std::min<size_t>( aArgs.value( "limit", 1000 ), 100000 );
         size_t       offset = 0;
 
         if( aArgs.contains( "cursor" ) && aArgs["cursor"].is_string() )
