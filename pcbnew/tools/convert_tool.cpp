@@ -357,44 +357,9 @@ int CONVERT_TOOL::CreatePolys( const TOOL_EVENT& aEvent )
         return 0;
 
     auto getPolys =
-            [&]( CONVERT_SETTINGS cfg )
+            [&]( const CONVERT_SETTINGS& cfg )
             {
-                polys.clear();
-
-                for( EDA_ITEM* item : selection )
-                    item->ClearTempFlags();
-
-                SHAPE_POLY_SET polySet;
-
-                polySet.Append( makePolysFromClosedGraphics( selection.GetItems(), cfg.m_Strategy ) );
-
-                if( cfg.m_Strategy == BOUNDING_HULL )
-                {
-                    polySet.Append( makePolysFromOpenGraphics( selection.GetItems(), 0 ) );
-
-                    polySet.ClearArcs();
-                    polySet.Simplify();
-
-                    // Now inflate the bounding hull by cfg.m_Gap
-                    polySet.Inflate( cfg.m_Gap, CORNER_STRATEGY::ROUND_ALL_CORNERS, bds.m_MaxError, ERROR_OUTSIDE );
-                }
-                else
-                {
-                    polySet.Append( makePolysFromChainedSegs( selection.GetItems(), cfg.m_Strategy ) );
-                }
-
-                if( polySet.IsEmpty() )
-                    return false;
-
-                for( int ii = 0; ii < polySet.OutlineCount(); ++ii )
-                {
-                    polys.emplace_back( SHAPE_POLY_SET( polySet.COutline( ii ) ) );
-
-                    for( int jj = 0; jj < polySet.HoleCount( ii ); ++jj )
-                        polys.back().AddHole( polySet.Hole( ii, jj ) );
-                }
-
-                return true;
+                return MakePolys( selection.GetItems(), cfg, bds.m_MaxError, polys );
             };
 
     // Pre-flight getPolys() to see if there's anything to convert.
@@ -430,19 +395,7 @@ int CONVERT_TOOL::CreatePolys( const TOOL_EVENT& aEvent )
         if( dlg.ShowModal() != wxID_OK )
             return 0;
 
-        CONVERT_SETTINGS resolvedSettings = m_userSettings;
-
-        if( resolvedSettings.m_Strategy != CENTERLINE )
-        {
-            if( resolvedSettings.m_LineWidth == 0 )
-                resolvedSettings.m_LineWidth = bds.m_LineThickness[ bds.GetLayerClass( layer ) ];
-        }
-
-        if( resolvedSettings.m_Strategy == BOUNDING_HULL )
-        {
-            if( resolvedSettings.m_Gap > 0 )
-                resolvedSettings.m_Gap += KiROUND( (double) resolvedSettings.m_LineWidth / 2.0 );
-        }
+        CONVERT_SETTINGS resolvedSettings = ResolvePolySettings( m_userSettings, bds, layer );
 
         if( !getPolys( resolvedSettings ) )
         {
@@ -459,47 +412,7 @@ int CONVERT_TOOL::CreatePolys( const TOOL_EVENT& aEvent )
             return 0;
         }
 
-        for( const SHAPE_POLY_SET& poly : polys )
-        {
-            PCB_SHAPE* graphic = new PCB_SHAPE( parentFootprint );
-
-            if( resolvedSettings.m_Strategy == COPY_LINEWIDTH )
-            {
-                BOARD_ITEM* topLeftItem = nullptr;
-                VECTOR2I    pos;
-
-                for( EDA_ITEM* item : selection )
-                {
-                    if( !item->IsBOARD_ITEM() )
-                        continue;
-
-                    BOARD_ITEM* candidate = static_cast<BOARD_ITEM*>( item );
-
-                    if( candidate->HasLineStroke() )
-                    {
-                        pos = candidate->GetPosition();
-
-                        if( !topLeftItem
-                            || ( pos.x < topLeftItem->GetPosition().x )
-                            || ( topLeftItem->GetPosition().x == pos.x
-                                    && pos.y < topLeftItem->GetPosition().y ) )
-                        {
-                            topLeftItem = candidate;
-                            resolvedSettings.m_LineWidth = topLeftItem->GetStroke().GetWidth();
-                        }
-                    }
-                }
-            }
-
-            graphic->SetShape( SHAPE_T::POLY );
-            graphic->SetStroke( STROKE_PARAMS( resolvedSettings.m_LineWidth, LINE_STYLE::SOLID,
-                                               COLOR4D::UNSPECIFIED ) );
-            graphic->SetFilled( resolvedSettings.m_Strategy == CENTERLINE );
-            graphic->SetLayer( destLayer );
-            graphic->SetPolyShape( poly );
-
-            commit.Add( graphic );
-        }
+        AddPolyShapes( commit, selection.GetItems(), polys, resolvedSettings, parentFootprint, destLayer );
     }
     else
     {
@@ -540,17 +453,7 @@ int CONVERT_TOOL::CreatePolys( const TOOL_EVENT& aEvent )
         if( !getPolys( m_userSettings ) )
             return 0;
 
-        for( const SHAPE_POLY_SET& poly : polys )
-        {
-            ZONE* zone = new ZONE( parent );
-
-            *zone->Outline() = poly;
-            zone->HatchBorder();
-
-            zoneInfo.ExportSetting( *zone );
-
-            commit.Add( zone );
-        }
+        AddZones( commit, parent, polys, zoneInfo );
     }
 
     if( m_userSettings.m_DeleteOriginals )
@@ -581,6 +484,147 @@ int CONVERT_TOOL::CreatePolys( const TOOL_EVENT& aEvent )
     }
 
     return 0;
+}
+
+
+bool CONVERT_TOOL::MakePolys( const std::deque<EDA_ITEM*>& aItems, const CONVERT_SETTINGS& aSettings,
+                              int aMaxError, std::vector<SHAPE_POLY_SET>& aPolys )
+{
+    aPolys.clear();
+
+    for( EDA_ITEM* item : aItems )
+        item->ClearTempFlags();
+
+    SHAPE_POLY_SET polySet;
+
+    polySet.Append( makePolysFromClosedGraphics( aItems, aSettings.m_Strategy ) );
+
+    if( aSettings.m_Strategy == BOUNDING_HULL )
+    {
+        polySet.Append( makePolysFromOpenGraphics( aItems, 0 ) );
+
+        polySet.ClearArcs();
+        polySet.Simplify();
+
+        // Now inflate the bounding hull by aSettings.m_Gap
+        polySet.Inflate( aSettings.m_Gap, CORNER_STRATEGY::ROUND_ALL_CORNERS, aMaxError, ERROR_OUTSIDE );
+    }
+    else
+    {
+        polySet.Append( makePolysFromChainedSegs( aItems, aSettings.m_Strategy ) );
+    }
+
+    if( polySet.IsEmpty() )
+        return false;
+
+    for( int ii = 0; ii < polySet.OutlineCount(); ++ii )
+    {
+        aPolys.emplace_back( SHAPE_POLY_SET( polySet.COutline( ii ) ) );
+
+        for( int jj = 0; jj < polySet.HoleCount( ii ); ++jj )
+            aPolys.back().AddHole( polySet.Hole( ii, jj ) );
+    }
+
+    return true;
+}
+
+
+CONVERT_SETTINGS CONVERT_TOOL::ResolvePolySettings( const CONVERT_SETTINGS& aSettings,
+                                                    const BOARD_DESIGN_SETTINGS& aBds, PCB_LAYER_ID aLayer )
+{
+    CONVERT_SETTINGS resolved = aSettings;
+
+    if( resolved.m_Strategy != CENTERLINE )
+    {
+        if( resolved.m_LineWidth == 0 )
+            resolved.m_LineWidth = aBds.m_LineThickness[ aBds.GetLayerClass( aLayer ) ];
+    }
+
+    if( resolved.m_Strategy == BOUNDING_HULL )
+    {
+        if( resolved.m_Gap > 0 )
+            resolved.m_Gap += KiROUND( (double) resolved.m_LineWidth / 2.0 );
+    }
+
+    return resolved;
+}
+
+
+std::vector<PCB_SHAPE*> CONVERT_TOOL::AddPolyShapes( BOARD_COMMIT& aCommit, const std::deque<EDA_ITEM*>& aItems,
+                                                     const std::vector<SHAPE_POLY_SET>& aPolys,
+                                                     const CONVERT_SETTINGS& aResolved, FOOTPRINT* aParent,
+                                                     PCB_LAYER_ID aLayer )
+{
+    CONVERT_SETTINGS        resolvedSettings = aResolved;
+    std::vector<PCB_SHAPE*> added;
+
+    for( const SHAPE_POLY_SET& poly : aPolys )
+    {
+        PCB_SHAPE* graphic = new PCB_SHAPE( aParent );
+
+        if( resolvedSettings.m_Strategy == COPY_LINEWIDTH )
+        {
+            BOARD_ITEM* topLeftItem = nullptr;
+            VECTOR2I    pos;
+
+            for( EDA_ITEM* item : aItems )
+            {
+                if( !item->IsBOARD_ITEM() )
+                    continue;
+
+                BOARD_ITEM* candidate = static_cast<BOARD_ITEM*>( item );
+
+                if( candidate->HasLineStroke() )
+                {
+                    pos = candidate->GetPosition();
+
+                    if( !topLeftItem
+                        || ( pos.x < topLeftItem->GetPosition().x )
+                        || ( topLeftItem->GetPosition().x == pos.x
+                                && pos.y < topLeftItem->GetPosition().y ) )
+                    {
+                        topLeftItem = candidate;
+                        resolvedSettings.m_LineWidth = topLeftItem->GetStroke().GetWidth();
+                    }
+                }
+            }
+        }
+
+        graphic->SetShape( SHAPE_T::POLY );
+        graphic->SetStroke( STROKE_PARAMS( resolvedSettings.m_LineWidth, LINE_STYLE::SOLID,
+                                           COLOR4D::UNSPECIFIED ) );
+        graphic->SetFilled( resolvedSettings.m_Strategy == CENTERLINE );
+        graphic->SetLayer( aLayer );
+        graphic->SetPolyShape( poly );
+
+        aCommit.Add( graphic );
+        added.push_back( graphic );
+    }
+
+    return added;
+}
+
+
+std::vector<ZONE*> CONVERT_TOOL::AddZones( BOARD_COMMIT& aCommit, BOARD_ITEM_CONTAINER* aParent,
+                                           const std::vector<SHAPE_POLY_SET>& aPolys,
+                                           const ZONE_SETTINGS& aZoneSettings )
+{
+    std::vector<ZONE*> added;
+
+    for( const SHAPE_POLY_SET& poly : aPolys )
+    {
+        ZONE* zone = new ZONE( aParent );
+
+        *zone->Outline() = poly;
+        zone->HatchBorder();
+
+        aZoneSettings.ExportSetting( *zone );
+
+        aCommit.Add( zone );
+        added.push_back( zone );
+    }
+
+    return added;
 }
 
 
@@ -1003,6 +1047,55 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
     if( fpEditor )
         footprint = fpEditor->GetBoard()->GetFirstFootprint();
 
+    if( aEvent.IsAction( &PCB_ACTIONS::convertToTracks ) )
+    {
+        if( !IsCopperLayer( targetLayer ) )
+        {
+            targetLayer = frame->SelectOneLayer( F_Cu, LSET::AllNonCuMask() );
+
+            if( targetLayer == UNDEFINED_LAYER )    // User canceled
+                return true;
+        }
+    }
+    else
+    {
+        CONVERT_SETTINGS_DIALOG dlg( m_frame, &m_userSettings, false, false, false );
+
+        if( dlg.ShowModal() != wxID_OK )
+            return true;
+    }
+
+    AddLines( commit, selection.GetItems(), aEvent.IsAction( &PCB_ACTIONS::convertToLines ) || fpEditor,
+              targetLayer, parent, footprint );
+
+    if( m_userSettings.m_DeleteOriginals )
+    {
+        PCB_SELECTION selectionCopy = selection;
+        m_selectionTool->ClearSelection();
+
+        for( EDA_ITEM* item : selectionCopy )
+            commit.Remove( item );
+    }
+
+    commit.Push( _( "Create Lines" ) );
+
+    return 0;
+}
+
+
+std::vector<BOARD_ITEM*> CONVERT_TOOL::AddLines( BOARD_COMMIT& aCommit, const std::deque<EDA_ITEM*>& aItems,
+                                                 bool aGraphics, PCB_LAYER_ID aLayer,
+                                                 BOARD_ITEM_CONTAINER* aTrackParent, FOOTPRINT* aGraphicParent )
+{
+    std::vector<BOARD_ITEM*> added;
+
+    auto add =
+            [&]( BOARD_ITEM* aItem )
+            {
+                aCommit.Add( aItem );
+                added.push_back( aItem );
+            };
+
     auto handleGraphicSeg = [&]( EDA_ITEM* aItem, NETINFO_ITEM* aNet )
     {
         if( aItem->Type() != PCB_SHAPE_T )
@@ -1012,9 +1105,9 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
 
         if( graphic->GetShape() == SHAPE_T::SEGMENT )
         {
-            PCB_TRACK* track = new PCB_TRACK( parent );
+            PCB_TRACK* track = new PCB_TRACK( aTrackParent );
 
-            track->SetLayer( targetLayer );
+            track->SetLayer( aLayer );
             track->SetStart( graphic->GetStart() );
             track->SetEnd( graphic->GetEnd() );
             track->SetWidth( graphic->GetWidth() );
@@ -1022,15 +1115,15 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
             if( aNet )
                 track->SetNet( aNet );
 
-            commit.Add( track );
+            add( track );
 
             return true;
         }
         else if( graphic->GetShape() == SHAPE_T::ARC )
         {
-            PCB_ARC* arc = new PCB_ARC( parent );
+            PCB_ARC* arc = new PCB_ARC( aTrackParent );
 
-            arc->SetLayer( targetLayer );
+            arc->SetLayer( aLayer );
             arc->SetStart( graphic->GetStart() );
             arc->SetEnd( graphic->GetEnd() );
             arc->SetMid( graphic->GetArcMid() );
@@ -1039,7 +1132,7 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
             if( aNet )
                 arc->SetNet( aNet );
 
-            commit.Add( arc );
+            add( arc );
 
             return true;
         }
@@ -1060,16 +1153,16 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
                     if( aChain.IsArcSegment( si ) )
                         continue;
 
-                    PCB_SHAPE* graphic = new PCB_SHAPE( footprint, SHAPE_T::SEGMENT );
+                    PCB_SHAPE* graphic = new PCB_SHAPE( aGraphicParent, SHAPE_T::SEGMENT );
 
-                    graphic->SetLayer( targetLayer );
+                    graphic->SetLayer( aLayer );
                     graphic->SetStart( seg.A );
                     graphic->SetEnd( seg.B );
 
                     if( aWidth && *aWidth > 0 )
                         graphic->SetWidth( *aWidth );
 
-                    commit.Add( graphic );
+                    add( graphic );
                 }
 
                 for( size_t ai = 0; ai < aChain.ArcCount(); ++ai )
@@ -1079,16 +1172,16 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
                     if( arc.GetP0() == arc.GetP1() )
                         continue;
 
-                    PCB_SHAPE* graphic = new PCB_SHAPE( footprint, SHAPE_T::ARC );
+                    PCB_SHAPE* graphic = new PCB_SHAPE( aGraphicParent, SHAPE_T::ARC );
 
-                    graphic->SetLayer( targetLayer );
+                    graphic->SetLayer( aLayer );
                     graphic->SetFilled( false );
                     graphic->SetArcGeometry( arc.GetP0(), arc.GetArcMid(), arc.GetP1() );
 
                     if( aWidth && *aWidth > 0 )
                         graphic->SetWidth( *aWidth );
 
-                    commit.Add( graphic );
+                    add( graphic );
                 }
             };
 
@@ -1104,9 +1197,9 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
             if( aChain.IsArcSegment( si ) )
                 continue;
 
-            PCB_TRACK* track = new PCB_TRACK( parent );
+            PCB_TRACK* track = new PCB_TRACK( aTrackParent );
 
-            track->SetLayer( targetLayer );
+            track->SetLayer( aLayer );
             track->SetStart( seg.A );
             track->SetEnd( seg.B );
 
@@ -1116,7 +1209,7 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
             if( aNet )
                 track->SetNet( aNet );
 
-            commit.Add( track );
+            add( track );
         }
 
         for( size_t ai = 0; ai < aChain.ArcCount(); ++ai )
@@ -1126,9 +1219,9 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
             if( arc.GetP0() == arc.GetP1() )
                 continue;
 
-            PCB_ARC* trackArc = new PCB_ARC( parent );
+            PCB_ARC* trackArc = new PCB_ARC( aTrackParent );
 
-            trackArc->SetLayer( targetLayer );
+            trackArc->SetLayer( aLayer );
             trackArc->SetStart( arc.GetP0() );
             trackArc->SetEnd( arc.GetP1() );
             trackArc->SetMid( arc.GetArcMid() );
@@ -1139,7 +1232,7 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
             if( aNet )
                 trackArc->SetNet( aNet );
 
-            commit.Add( trackArc );
+            add( trackArc );
         }
     };
 
@@ -1148,18 +1241,10 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
         if( aChain.GetSegmentCount() == 0 && aChain.ArcCount() == 0 )
             return;
 
-        if( aEvent.IsAction( &PCB_ACTIONS::convertToLines ) )
-        {
+        if( aGraphics )
             addGraphicChain( aChain, aWidth );
-        }
-        else if( fpEditor )
-        {
-            addGraphicChain( aChain, aWidth );
-        }
         else
-        {
             addTrackChain( aChain, aWidth, aNet );
-        }
     };
 
     auto processPolySet = [&]( const SHAPE_POLY_SET& aPoly, std::optional<int> aWidth, NETINFO_ITEM* aNet )
@@ -1173,25 +1258,7 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
         }
     };
 
-    if( aEvent.IsAction( &PCB_ACTIONS::convertToTracks ) )
-    {
-        if( !IsCopperLayer( targetLayer ) )
-        {
-            targetLayer = frame->SelectOneLayer( F_Cu, LSET::AllNonCuMask() );
-
-            if( targetLayer == UNDEFINED_LAYER )    // User canceled
-                return true;
-        }
-    }
-    else
-    {
-        CONVERT_SETTINGS_DIALOG dlg( m_frame, &m_userSettings, false, false, false );
-
-        if( dlg.ShowModal() != wxID_OK )
-            return true;
-    }
-
-    for( EDA_ITEM* item : selection )
+    for( EDA_ITEM* item : aItems )
     {
         if( !item->IsBOARD_ITEM() )
             continue;
@@ -1258,18 +1325,7 @@ int CONVERT_TOOL::CreateLines( const TOOL_EVENT& aEvent )
         }
     }
 
-    if( m_userSettings.m_DeleteOriginals )
-    {
-        PCB_SELECTION selectionCopy = selection;
-        m_selectionTool->ClearSelection();
-
-        for( EDA_ITEM* item : selectionCopy )
-            commit.Remove( item );
-    }
-
-    commit.Push( _( "Create Lines" ) );
-
-    return 0;
+    return added;
 }
 
 
@@ -1290,7 +1346,22 @@ int CONVERT_TOOL::SegmentToArc( const TOOL_EVENT& aEvent )
     if( selection.Empty() || !selection.Front()->IsBOARD_ITEM() )
         return -1;
 
-    BOARD_ITEM* source = static_cast<BOARD_ITEM*>( selection.Front() );
+    BOARD_ITEM*          source = static_cast<BOARD_ITEM*>( selection.Front() );
+    PCB_BASE_EDIT_FRAME* frame  = getEditFrame<PCB_BASE_EDIT_FRAME>();
+    BOARD_COMMIT         commit( m_frame );
+
+    if( !AddArc( commit, source, frame->GetModel() ) )
+        return -1;
+
+    commit.Push( _( "Create Arc" ) );
+
+    return 0;
+}
+
+
+BOARD_ITEM* CONVERT_TOOL::AddArc( BOARD_COMMIT& aCommit, BOARD_ITEM* aSource, BOARD_ITEM_CONTAINER* aParent )
+{
+    BOARD_ITEM* source = aSource;
     VECTOR2I    start, end, mid;
 
     // Offset the midpoint along the normal a little bit so that it's more obviously an arc
@@ -1306,13 +1377,12 @@ int CONVERT_TOOL::SegmentToArc( const TOOL_EVENT& aEvent )
     }
     else
     {
-        return -1;
+        return nullptr;
     }
 
-    PCB_BASE_EDIT_FRAME*  frame  = getEditFrame<PCB_BASE_EDIT_FRAME>();
-    BOARD_ITEM_CONTAINER* parent = frame->GetModel();
+    BOARD_ITEM_CONTAINER* parent = aParent;
     PCB_LAYER_ID          layer = source->GetLayer();
-    BOARD_COMMIT          commit( m_frame );
+    BOARD_ITEM*           added = nullptr;
 
     if( source->Type() == PCB_SHAPE_T && static_cast<PCB_SHAPE*>( source )->GetShape() == SHAPE_T::SEGMENT )
     {
@@ -1329,7 +1399,8 @@ int CONVERT_TOOL::SegmentToArc( const TOOL_EVENT& aEvent )
         arc->SetStart( start );
         arc->SetEnd( end );
 
-        commit.Add( arc );
+        aCommit.Add( arc );
+        added = arc;
     }
     else if( source->Type() == PCB_SHAPE_T && static_cast<PCB_SHAPE*>( source )->GetShape() == SHAPE_T::ARC )
     {
@@ -1342,7 +1413,8 @@ int CONVERT_TOOL::SegmentToArc( const TOOL_EVENT& aEvent )
         arc->SetMid( source_arc->GetArcMid() );
         arc->SetEnd( end );
 
-        commit.Add( arc );
+        aCommit.Add( arc );
+        added = arc;
     }
     else if( source->Type() == PCB_TRACE_T )
     {
@@ -1356,7 +1428,8 @@ int CONVERT_TOOL::SegmentToArc( const TOOL_EVENT& aEvent )
         arc->SetMid( mid );
         arc->SetEnd( end );
 
-        commit.Add( arc );
+        aCommit.Add( arc );
+        added = arc;
     }
     else if( source->Type() == PCB_ARC_T )
     {
@@ -1368,12 +1441,11 @@ int CONVERT_TOOL::SegmentToArc( const TOOL_EVENT& aEvent )
         arc->SetWidth( source_arc->GetWidth() );
 
         arc->SetArcGeometry( source_arc->GetStart(), source_arc->GetMid(), source_arc->GetEnd() );
-        commit.Add( arc );
+        aCommit.Add( arc );
+        added = arc;
     }
 
-    commit.Push( _( "Create Arc" ) );
-
-    return 0;
+    return added;
 }
 
 

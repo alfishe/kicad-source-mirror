@@ -25,9 +25,16 @@
 #include <tools/pcb_tool_base.h>
 #include <pcbnew_settings.h>
 
+class BOARD_COMMIT;
+class BOARD_DESIGN_SETTINGS;
+class BOARD_ITEM_CONTAINER;
 class CONDITIONAL_MENU;
+class FOOTPRINT;
 class PCB_SELECTION_TOOL;
+class PCB_SHAPE;
 class PCB_BASE_FRAME;
+class ZONE;
+class ZONE_SETTINGS;
 
 
 class CONVERT_TOOL : public PCB_TOOL_BASE
@@ -67,6 +74,55 @@ public:
     /// @copydoc TOOL_INTERACTIVE::setTransitions()
     void setTransitions() override;
 
+    /**
+     * Build the polygons Create Polygon / Zone / Rule Area makes from @a aItems.  The items
+     * that went into a polygon get SKIP_STRUCT (the ones "delete originals" removes).
+     *
+     * @return false when there is no polygon
+     */
+    static bool MakePolys( const std::deque<EDA_ITEM*>& aItems, const CONVERT_SETTINGS& aSettings,
+                           int aMaxError, std::vector<SHAPE_POLY_SET>& aPolys );
+
+    /**
+     * The settings Create Polygon builds with: a line width of 0 takes the layer class default
+     * (except centerline), and a bounding hull gap grows by half the line width.
+     */
+    static CONVERT_SETTINGS ResolvePolySettings( const CONVERT_SETTINGS& aSettings,
+                                                 const BOARD_DESIGN_SETTINGS& aBds, PCB_LAYER_ID aLayer );
+
+    /**
+     * Add one graphic polygon per entry of @a aPolys (Create Polygon).  Copy-line-width takes
+     * the stroke of the top-left stroked item of @a aItems.
+     */
+    static std::vector<PCB_SHAPE*> AddPolyShapes( BOARD_COMMIT& aCommit, const std::deque<EDA_ITEM*>& aItems,
+                                                  const std::vector<SHAPE_POLY_SET>& aPolys,
+                                                  const CONVERT_SETTINGS& aResolved, FOOTPRINT* aParent,
+                                                  PCB_LAYER_ID aLayer );
+
+    /**
+     * Add one zone (or rule area) per entry of @a aPolys with @a aZoneSettings (Create Zone /
+     * Create Rule Area).
+     */
+    static std::vector<ZONE*> AddZones( BOARD_COMMIT& aCommit, BOARD_ITEM_CONTAINER* aParent,
+                                        const std::vector<SHAPE_POLY_SET>& aPolys,
+                                        const ZONE_SETTINGS& aZoneSettings );
+
+    /**
+     * Create Lines / Create Tracks from the outlines of @a aItems (polygons, rectangles, ellipses,
+     * zones; graphic segments and arcs become tracks).  @a aGraphics true makes graphic lines
+     * owned by @a aGraphicParent, else tracks owned by @a aTrackParent keeping the source's net.
+     */
+    static std::vector<BOARD_ITEM*> AddLines( BOARD_COMMIT& aCommit, const std::deque<EDA_ITEM*>& aItems,
+                                              bool aGraphics, PCB_LAYER_ID aLayer,
+                                              BOARD_ITEM_CONTAINER* aTrackParent, FOOTPRINT* aGraphicParent );
+
+    /**
+     * Create Arc from a segment (graphic or track) or swap an arc's kind (graphic <-> track).
+     *
+     * @return the new item, nullptr for an unsupported or zero-length source
+     */
+    static BOARD_ITEM* AddArc( BOARD_COMMIT& aCommit, BOARD_ITEM* aSource, BOARD_ITEM_CONTAINER* aParent );
+
 private:
     /**
      * Retrieve the start and end points for a generic item.
@@ -87,8 +143,8 @@ private:
      * @param aStrategy is the conversion strategy.
      * @return a #SHAPE_POLY_SET containing any polygons that were created.
      */
-    SHAPE_POLY_SET makePolysFromChainedSegs( const std::deque<EDA_ITEM*>& aItems,
-                                             CONVERT_STRATEGY aStrategy );
+    static SHAPE_POLY_SET makePolysFromChainedSegs( const std::deque<EDA_ITEM*>& aItems,
+                                                    CONVERT_STRATEGY aStrategy );
 
     /**
      * Make polygons from graphic shapes and zones.
@@ -97,9 +153,9 @@ private:
      * @param aGap
      * @return a #SHAPE_POLY_SET containing any polygons that were created.
      */
-    SHAPE_POLY_SET makePolysFromOpenGraphics( const std::deque<EDA_ITEM*>& aItems, int aGap );
-    SHAPE_POLY_SET makePolysFromClosedGraphics( const std::deque<EDA_ITEM*>& aItems,
-                                                CONVERT_STRATEGY aStrategy );
+    static SHAPE_POLY_SET makePolysFromOpenGraphics( const std::deque<EDA_ITEM*>& aItems, int aGap );
+    static SHAPE_POLY_SET makePolysFromClosedGraphics( const std::deque<EDA_ITEM*>& aItems,
+                                                       CONVERT_STRATEGY aStrategy );
 
     /**
      * Initialize the user settings for the tool.
