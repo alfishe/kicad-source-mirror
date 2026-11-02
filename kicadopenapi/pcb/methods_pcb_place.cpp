@@ -2243,6 +2243,7 @@ struct VIA_SPOT
     int      clearance = 0;
     VECTOR2I from;       // the pin the stub starts at
     int      stub = 0;   // the stub's half width
+    PCB_LAYER_ID layer = UNDEFINED_LAYER;   // the stub's layer, when the parts' pads keep off the stub too
 
     bool Clear( const VECTOR2I& aAt, int aRadius, const SEG& aStub, int aStubHalf, int aClearance ) const
     {
@@ -2266,6 +2267,75 @@ int stubWidth( BOARD* aBoard, PAD* aPin )
     return std::min( netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth()
                                                            : aBoard->GetDesignSettings().GetCurrentTrackWidth(),
                      std::min( size.x, size.y ) );
+}
+
+
+/// @brief The anchor's signal pins' vias as pcb_fanout ports lays them (the pins its plan moves to the
+/// other layer), each with its fan's path from the pin: the parts' pads and their own vias keep clear
+/// of them. Rail pins (railNets) are left out: the rail plan keeps theirs. The planes give way to
+/// the spots, as a via through them clears its own hole in the fill.
+std::vector<VIA_SPOT> fanoutViaSpots( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnchor )
+{
+    std::vector<VIA_SPOT>          out;
+    std::optional<KOPENAPI_METHOD> fanout = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout" );
+
+    if( !fanout )
+        return out;
+
+    const KOPENAPI_RESULT fan = fanout->handler( aCtx, { { "ref", str( aAnchor->GetReference() ) }, { "ports", true }, { "dry_run", true },
+                                                         { "full", true }, { "zones", "refill" } } );
+
+    if( fan.status != 200 || !fan.body.contains( "via_spots" ) || !fan.body["via_spots"].is_array() )
+        return out;
+
+    const int           dia = fan.body.contains( "via" ) ? pcbIUScale.mmToIU( fan.body["via"].value( "diameter_mm", 0.0 ) ) : 0;
+    const std::set<int> rails = railNets( aBoard );
+
+    auto at = []( const nlohmann::json& aXy )
+    {
+        return VECTOR2I( pcbIUScale.mmToIU( aXy[0].get<double>() ), pcbIUScale.mmToIU( aXy[1].get<double>() ) );
+    };
+
+    for( const nlohmann::json& row : fan.body["via_spots"] )
+    {
+        const std::string name = row.value( "pad", std::string() );
+        PAD*              pad = nullptr;
+
+        for( PAD* q : aAnchor->Pads() )
+        {
+            if( str( aAnchor->GetReference() ) + "." + str( q->GetNumber() ) == name )
+                pad = q;
+        }
+
+        if( !pad || pad->GetNetCode() <= 0 || rails.count( pad->GetNetCode() ) || !row.contains( "at_mm" ) || !row.value( "laid", false ) )
+            continue;
+
+        const int               net = pad->GetNetCode();
+        const VECTOR2I          spot = at( row["at_mm"] );
+        const KOPENAPI_RULE_VIA rule = KopenapiRuleVia( aBoard, net, spot, F_Cu );
+        const int               stub = stubWidth( aBoard, pad ) / 2;
+        std::vector<VECTOR2I>   path;
+
+        for( const nlohmann::json& pt : row.value( "path_mm", nlohmann::json::array() ) )
+            path.push_back( at( pt ) );
+
+        if( path.empty() || path.front() != pad->GetPosition() )
+            path.insert( path.begin(), pad->GetPosition() );
+
+        if( path.back() != spot )
+            path.push_back( spot );
+
+        // the bends as a stub's width, the spot as the via
+        for( size_t i = 1; i < path.size(); ++i )
+        {
+            const bool last = i + 1 == path.size();
+
+            out.push_back( { path[i], net, last ? std::max( dia, rule.dia ) / 2 : stub, rule.clearance, path[i - 1], stub,
+                             pad->GetPrincipalLayer() } );
+        }
+    }
+
+    return out;
 }
 
 
@@ -2450,16 +2520,23 @@ public:
             const VIA_SPOT& spot = ( *m_viaSpots )[i];
 
             BOX2I reach = box;
-            reach.Inflate( spot.radius + spot.clearance );
+            reach.Inflate( std::max( spot.radius, spot.stub ) + spot.clearance );
 
-            if( !reach.Contains( spot.at ) )
+            const SEG stub( spot.from - aDelta, spot.at - aDelta );
+            const bool withStub = spot.layer != UNDEFINED_LAYER && spot.stub > 0 && spot.from != spot.at
+                                  && reach.Intersects( BOX2I( spot.from, spot.at - spot.from ).Normalize() );
+
+            if( !reach.Contains( spot.at ) && !withStub )
                 continue;
 
             for( PAD* pad : m_part->Pads() )
             {
-                const int need = spot.radius + ( pad->GetNetCode() == spot.net && spot.net > 0 ? 0 : spot.clearance );
+                const bool                   same = pad->GetNetCode() == spot.net && spot.net > 0;
+                const int                    need = spot.radius + ( same ? 0 : spot.clearance );
+                const std::shared_ptr<SHAPE> shape = pad->GetEffectiveShape( pad->GetLayerSet().CuStack().front() );
 
-                if( pad->GetEffectiveShape( pad->GetLayerSet().CuStack().front() )->Collide( spot.at - aDelta, need ) )
+                if( shape->Collide( spot.at - aDelta, need )
+                    || ( withStub && !same && pad->IsOnLayer( spot.layer ) && shape->Collide( stub, spot.stub + spot.clearance ) ) )
                     return false;
             }
         }
@@ -6385,7 +6462,7 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
         std::map<const FOOTPRINT*, int> rooms;
 
-        std::vector<VIA_SPOT> ownVias;
+        std::vector<VIA_SPOT> ownVias = fanoutViaSpots( aCtx, board, anchor );
 
         options.corridors = &corridors;
         options.pairs = &pairs;
@@ -6633,7 +6710,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                 options.pairs = &pairs;
                 rooms.clear();
                 options.rooms = &rooms;
-                ownVias.clear();
+                ownVias = fanoutViaSpots( aCtx, board, anchor );
                 options.ownVias = &ownVias;
                 options.escapeKeepMm = spec.contains( "escape_keep_mm" ) ? escapeKeep : -1;
                 placeGroup( board, aCommit, anchor, parts, options, side == "opposite", decapMax, bulkMax,
@@ -6891,7 +6968,7 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "open_sides":{"description":"layout level 2 variants: which of the anchor's port sides ports_keep_mm keeps open (a named side without ports: as deep as the deepest): a count 0..4 - the sides with the most signal ports first; or a list of west / east / north / south - those, a side without ports along its whole courtyard edge; default every side with ports. corridors names the bands; block gives the outline each variant takes (bbox_mm, area_mm2)","oneOf":[{"type":"integer","minimum":0,"maximum":4},{"type":"array","items":{"type":"string","enum":["west","east","north","south"]}}]},
     "max_net_pads":{"type":"integer","default":4,"description":"without parts: nets of the anchor with at most this many pads on the board select the parts"},
     "side":{"type":"string","enum":["same","opposite"],"default":"same"},
-    "gap_mm":{"type":"number","description":"between courtyards, fixed. Default: from the design rules, per spot: the courtyard clearance plus a channel for the anchor's signal pins the part stands in front of (each its class's track width + clearance; at least one default-class track). Each pad on a net with a plane also keeps a spot for its via beside it (its class's via, a clearance off the pad; clear of other nets' pads, of the anchor's planned rail vias and its fine-pitch pins' straight escapes as pcb_stitch keeps them, see escape_keep_mm), where pcb_stitch lays it (row via_room_mm). A part with no room for that goes at the courtyard clearance (row channel_short)"},
+    "gap_mm":{"type":"number","description":"between courtyards, fixed. Default: from the design rules, per spot: the courtyard clearance plus a channel for the anchor's signal pins the part stands in front of (each its class's track width + clearance; at least one default-class track). Each pad on a net with a plane also keeps a spot for its via beside it (its class's via, a clearance off the pad; clear of other nets' pads, of the anchor's planned rail vias and its fine-pitch pins' straight escapes as pcb_stitch keeps them, see escape_keep_mm), where pcb_stitch lays it (row via_room_mm). No part's pad comes on the anchor's signal fans pcb_fanout ports lays (the pins its plan moves to the other layer: path and via, with the clearance), nor its own vias near them. A part with no room for that goes at the courtyard clearance (row channel_short)"},
     "fanout_ring_mm":{"type":"number","description":"keep this far from the anchor's courtyard (room for the tracks leaving its pins); default 1.0 for a fine-pitch anchor (pads 0.65 mm apart or closer), else 0; parts that find no place with it come as close as the courtyards allow"},
     "max_mm":{"type":"number","default":25,"description":"how far from the anchor's pad a part may end up"}})json";
 
