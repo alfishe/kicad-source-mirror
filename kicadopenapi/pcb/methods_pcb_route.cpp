@@ -3787,6 +3787,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         int                   bus = -1;        ///< its bus (index in busOut), its place in the bus's order
         int                   busIndex = -1;
         std::optional<VECTOR2I> busVia = std::nullopt;   ///< its spot in the bus's via fan (bus_layer)
+        std::vector<VECTOR2I> corridor = {};   ///< bus_paths: its corners along the bus's corridor
+        int                   corridorOf = -1; ///< the corridor (index in corridorOut), its place across it
+        int                   corridorRank = -1;   ///< the order it is routed in
+        int                   corridorPlace = -1;  ///< from the left of the way
+        bool                  corridorRouted = false;
         double                ms = 0;          ///< time of every try for it, rip-up re-routes too
         nlohmann::json        tried = nlohmann::json::array();   ///< its tries (attempts: true)
     };
@@ -6181,6 +6186,534 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     }
 
+    // bus_paths: a bus along a corridor (pcb_floorplan's path for the bus between two blocks, or points
+    // given): its members side by side at their pitch across every portal of the path, in the order
+    // their pads lie across the way in at the start, as fixed corners; a member routed so is left as it
+    // is by clean_up, one the corridor does not route is routed as any other connection (row corridor)
+    nlohmann::json corridorOut = nlohmann::json::array();
+    int            corridorRoutedCount = 0, corridorMembers = 0;
+    {
+        struct CROSSING
+        {
+            VECTOR2I at;
+            int      axis = -1;   ///< the portal along x (0) or y (1); -1 a free point
+            int      lo = 0, hi = 0;
+            std::optional<BOX2I> into;   ///< the region the path enters there
+        };
+
+        struct CORRIDOR
+        {
+            std::string              name;
+            std::vector<std::string> nets;
+            std::vector<CROSSING>    points;
+            std::set<std::string>    aParts, bParts;   ///< floorplan: the parts of the blocks it joins
+            std::string              a, b;
+        };
+
+        std::vector<CORRIDOR> corridors;
+        const nlohmann::json  pathsArg = aArgs.contains( "bus_paths" ) ? aArgs["bus_paths"] : nlohmann::json( "off" );
+        const int             bigIU = 1 << 30;
+
+        auto crossingOf = [&]( const nlohmann::json& aPoint, CROSSING& aOut )
+        {
+            const nlohmann::json at = aPoint.is_array() ? aPoint : aPoint.is_object() ? aPoint.value( "at_mm", nlohmann::json() )
+                                                                                      : nlohmann::json();
+
+            if( !at.is_array() || at.size() != 2 || !at[0].is_number() || !at[1].is_number() )
+                return false;
+
+            aOut.at = VECTOR2I( pcbIUScale.mmToIU( at[0].get<double>() ), pcbIUScale.mmToIU( at[1].get<double>() ) );
+            aOut.lo = -bigIU;
+            aOut.hi = bigIU;
+
+            if( aPoint.is_object() && aPoint.contains( "along" ) )
+            {
+                const std::string along = aPoint["along"].is_string() ? aPoint["along"].get<std::string>() : std::string();
+
+                if( along != "x" && along != "y" )
+                    return false;
+
+                aOut.axis = along == "x" ? 0 : 1;
+                aOut.lo = aPoint.contains( "lo_mm" ) ? pcbIUScale.mmToIU( aPoint.value( "lo_mm", 0.0 ) ) : -bigIU;
+                aOut.hi = aPoint.contains( "hi_mm" ) ? pcbIUScale.mmToIU( aPoint.value( "hi_mm", 0.0 ) ) : bigIU;
+                const nlohmann::json r = aPoint.value( "into_mm", nlohmann::json() );
+
+                if( r.is_array() && r.size() == 4 && std::all_of( r.begin(), r.end(), []( const nlohmann::json& v ) { return v.is_number(); } ) )
+                {
+                    const VECTOR2I p0( pcbIUScale.mmToIU( r[0].get<double>() ), pcbIUScale.mmToIU( r[1].get<double>() ) );
+                    const VECTOR2I p1( pcbIUScale.mmToIU( r[2].get<double>() ), pcbIUScale.mmToIU( r[3].get<double>() ) );
+                    aOut.into = BOX2I( p0, p1 - p0 );
+                }
+            }
+
+            return true;
+        };
+
+        if( ( pathsArg.is_string() && pathsArg.get<std::string>() == "floorplan" )
+            || ( pathsArg.is_object() && pathsArg.contains( "floorplan" ) ) )
+        {
+            std::optional<KOPENAPI_METHOD> fp = KOPENAPI_REGISTRY::Get().Find( "pcb_floorplan" );
+
+            if( !fp )
+                return KOPENAPI_RESULT::Error( 500, "pcb_floorplan is not registered" );
+
+            nlohmann::json fpArgs = pathsArg.is_object() ? pathsArg["floorplan"] : nlohmann::json::object();
+
+            if( !fpArgs.is_object() )
+                return KOPENAPI_RESULT::Error( 400, "bus_paths: {floorplan: {pcb_floorplan arguments}}" );
+
+            fpArgs["list_limit"] = 100000;
+            const KOPENAPI_RESULT r = fp->handler( aCtx, fpArgs );
+
+            if( r.status >= 400 )
+                return KOPENAPI_RESULT::Error( r.status, "bus_paths: pcb_floorplan: " + r.body.value( "error", nlohmann::json() ).dump() );
+
+            std::map<std::string, std::set<std::string>> partsOf;
+
+            for( const nlohmann::json& blk : r.body.value( "blocks", nlohmann::json::array() ) )
+            {
+                for( const nlohmann::json& ref : blk.value( "parts", nlohmann::json::array() ) )
+                {
+                    if( ref.is_string() )
+                        partsOf[blk.value( "name", std::string() )].insert( ref.get<std::string>() );
+                }
+            }
+
+            for( const nlohmann::json& l : r.body.value( "links", nlohmann::json::array() ) )
+            {
+                if( !l.contains( "bus" ) || !l["bus"].is_string() || !l.value( "found", false ) )
+                    continue;
+
+                CORRIDOR c;
+                c.name = l["bus"].get<std::string>();
+                c.a = l.value( "a", std::string() );
+                c.b = l.value( "b", std::string() );
+                c.aParts = partsOf[c.a];
+                c.bParts = partsOf[c.b];
+
+                for( const nlohmann::json& n : l.value( "net_names", nlohmann::json::array() ) )
+                {
+                    if( n.is_string() )
+                        c.nets.push_back( n.get<std::string>() );
+                }
+
+                for( const nlohmann::json& pt : l.value( "corridor", nlohmann::json::array() ) )
+                {
+                    CROSSING x;
+
+                    if( crossingOf( pt, x ) )
+                        c.points.push_back( x );
+                }
+
+                if( !c.points.empty() && !c.nets.empty() )
+                    corridors.push_back( std::move( c ) );
+            }
+        }
+        else if( pathsArg.is_array() )
+        {
+            for( const nlohmann::json& b : pathsArg )
+            {
+                CORRIDOR c;
+                c.name = b.is_object() ? b.value( "name", std::string( "bus" ) + std::to_string( corridors.size() + 1 ) ) : std::string();
+
+                if( !b.is_object() || !b.contains( "nets" ) || !b["nets"].is_array() || !b.contains( "points_mm" ) || !b["points_mm"].is_array() )
+                    return KOPENAPI_RESULT::Error( 400, "bus_paths: [{name, nets: [net names], points_mm: [[x, y] or {at_mm, along, lo_mm, hi_mm}]}]" );
+
+                for( const nlohmann::json& n : b["nets"] )
+                {
+                    if( !n.is_string() )
+                        return KOPENAPI_RESULT::Error( 400, "bus_paths: nets are net names" );
+
+                    if( !KopenapiFindNet( board, n.get<std::string>() ) )
+                        return KopenapiNoSuchNet( board, n.get<std::string>(), "bus_paths: " );
+
+                    c.nets.push_back( n.get<std::string>() );
+                }
+
+                for( const nlohmann::json& pt : b["points_mm"] )
+                {
+                    CROSSING x;
+
+                    if( !crossingOf( pt, x ) )
+                        return KOPENAPI_RESULT::Error( 400, "bus_paths: a point is [x_mm, y_mm] or {at_mm: [x, y], along: \"x\" | \"y\", lo_mm, hi_mm}" );
+
+                    c.points.push_back( x );
+                }
+
+                if( c.points.empty() )
+                    return KOPENAPI_RESULT::Error( 400, "bus_paths: points_mm: one point at least" );
+
+                corridors.push_back( std::move( c ) );
+            }
+        }
+        else if( !( pathsArg.is_string() && pathsArg.get<std::string>() == "off" ) )
+        {
+            return KOPENAPI_RESULT::Error( 400, "bus_paths: \"off\", \"floorplan\" (or {floorplan: {its arguments}}) or "
+                                                "[{name, nets, points_mm}]" );
+        }
+
+        if( grid && !corridors.empty() )
+        {
+            corridorOut.push_back( { { "skipped", "engine grid: its bundles route the members side by side" } } );
+            corridors.clear();
+        }
+
+        auto refOf = []( BOARD_CONNECTED_ITEM* aItem )
+        {
+            FOOTPRINT* fp = aItem && aItem->Type() == PCB_PAD_T ? static_cast<PAD*>( aItem )->GetParentFootprint() : nullptr;
+            return fp ? str( fp->GetReference() ) : std::string();
+        };
+
+        auto pitchOfNet = [&]( PAD* aPad )
+        {
+            NETCLASS* netclass = aPad->GetEffectiveNetClass();
+            const int width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : ds.GetCurrentTrackWidth();
+            const int clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
+            return width + clearance;
+        };
+
+        for( CORRIDOR& c : corridors )
+        {
+            std::set<int> codes;
+
+            for( const std::string& n : c.nets )
+            {
+                if( NETINFO_ITEM* info = KopenapiFindNet( board, n ) )
+                    codes.insert( info->GetNetCode() );
+            }
+
+            // its connections, each put the corridor's way round (from its a end)
+            struct MEMBER
+            {
+                size_t   job;
+                bool     forward;
+                VECTOR2I start, end;
+                double   lateral = 0;
+            };
+
+            std::vector<MEMBER> members;
+            const VECTOR2I      front = c.points.front().at, back = c.points.back().at;
+
+            for( size_t k = 0; k < jobs.size(); ++k )
+            {
+                const JOB& j = jobs[k];
+
+                if( j.trunk || j.foreign || j.busVia || j.corridorOf >= 0 || !codes.count( j.from->GetNetCode() ) )
+                    continue;
+
+                bool forward = true;
+
+                if( !c.aParts.empty() || !c.bParts.empty() )
+                {
+                    const std::string from = refOf( j.from ), to = refOf( j.to );
+
+                    if( c.aParts.count( from ) && c.bParts.count( to ) )
+                        forward = true;
+                    else if( c.bParts.count( from ) && c.aParts.count( to ) )
+                        forward = false;
+                    else
+                        continue;
+                }
+                else
+                {
+                    const double fwd = ( j.from->GetPosition() - front ).EuclideanNorm() + ( j.toPos - back ).EuclideanNorm();
+                    const double rev = ( j.from->GetPosition() - back ).EuclideanNorm() + ( j.toPos - front ).EuclideanNorm();
+                    forward = fwd <= rev;
+                }
+
+                members.push_back( { k, forward, forward ? j.from->GetPosition() : j.toPos, forward ? j.toPos : j.from->GetPosition() } );
+            }
+
+            nlohmann::json out = { { "name", c.name }, { "points", c.points.size() } };
+
+            if( !c.a.empty() )
+            {
+                out["a"] = c.a;
+                out["b"] = c.b;
+            }
+
+            if( members.size() < 2 )
+            {
+                out["skipped"] = members.empty() ? "no connection of its nets runs between its ends"
+                                                 : "one connection of its nets runs between its ends";
+                corridorOut.push_back( out );
+                continue;
+            }
+
+            int pitch = 0;
+            VECTOR2I startMid( 0, 0 ), endMid( 0, 0 );
+
+            for( const MEMBER& m : members )
+            {
+                pitch = std::max( pitch, pitchOfNet( jobs[m.job].from ) );
+                startMid += m.start / (int) members.size();
+                endMid += m.end / (int) members.size();
+            }
+
+            const int n = (int) members.size();
+            const int half = KiROUND( ( n - 1 ) / 2.0 * pitch );
+            const int margin = pitch;
+            int       squeezed = 0;
+            std::vector<CROSSING> pts = c.points;
+
+            // the ribbon inside each portal's free stretch, a pitch off its ends, straight on from the
+            // portal before where that is in line
+            for( size_t k = 0; k < pts.size(); ++k )
+            {
+                CROSSING& x = pts[k];
+
+                if( x.axis < 0 )
+                    continue;
+
+                int&      u = x.axis == 0 ? x.at.x : x.at.y;
+                const int lo = x.lo + margin + half, hi = x.hi - margin - half;
+
+                if( k > 0 && pts[k - 1].axis == x.axis )
+                    u = x.axis == 0 ? pts[k - 1].at.x : pts[k - 1].at.y;
+
+                if( lo <= hi )
+                {
+                    u = std::clamp( u, lo, hi );
+                }
+                else
+                {
+                    u = int( ( int64_t( x.lo ) + x.hi ) / 2 );
+                    squeezed++;
+                }
+            }
+
+            // the way across a crossing, into the region it enters
+            auto travelAt = [&]( size_t aIndex ) -> VECTOR2D
+            {
+                const CROSSING& x = pts[aIndex];
+
+                if( x.axis >= 0 && x.into )
+                {
+                    return x.axis == 1 ? VECTOR2D( x.into->Centre().x > x.at.x ? 1.0 : -1.0, 0.0 )
+                                       : VECTOR2D( 0.0, x.into->Centre().y > x.at.y ? 1.0 : -1.0 );
+                }
+
+                const VECTOR2D way( ( aIndex + 1 < pts.size() ? pts[aIndex + 1].at : endMid )
+                                    - ( aIndex > 0 ? pts[aIndex - 1].at : startMid ) );
+                return way.EuclideanNorm() > 0 ? way.Resize( 1.0 ) : VECTOR2D( 1.0, 0.0 );
+            };
+
+            // the centre line: the crossings, joined inside each region by axis-parallel runs (a turn's
+            // corner where the two crossings' lines meet; a jog half way; a way back out through the same
+            // side as deep as the ribbon needs), the ribbon a pitch off the region's sides where it fits
+            std::vector<VECTOR2I> line;
+
+            auto keep = [&]( const VECTOR2I& aAt )
+            {
+                if( line.empty() || line.back() != aAt )
+                    line.push_back( aAt );
+            };
+
+            for( size_t k = 0; k < pts.size(); ++k )
+            {
+                const CROSSING& x = pts[k];
+                keep( x.at );
+
+                if( k + 1 == pts.size() || x.axis < 0 || pts[k + 1].axis < 0 || !x.into )
+                    continue;
+
+                const CROSSING& y = pts[k + 1];
+
+                if( x.axis != y.axis )
+                {
+                    keep( x.axis == 1 ? VECTOR2I( y.at.x, x.at.y ) : VECTOR2I( x.at.x, y.at.y ) );
+                    continue;
+                }
+
+                const bool inX = x.axis == 1;
+                const int  a0 = inX ? x.at.x : x.at.y, a1 = inX ? y.at.x : y.at.y;
+                const int  b0 = inX ? x.at.y : x.at.x, b1 = inX ? y.at.y : y.at.x;
+
+                if( b0 == b1 )
+                    continue;
+
+                const VECTOR2D way = travelAt( k );
+                int            mid = std::abs( a1 - a0 ) < pitch ? a0 + KiROUND( ( inX ? way.x : way.y ) * ( margin + half ) )
+                                                                 : int( ( int64_t( a0 ) + a1 ) / 2 );
+                const int      rlo = ( inX ? x.into->GetLeft() : x.into->GetTop() ) + margin + half;
+                const int      rhi = ( inX ? x.into->GetRight() : x.into->GetBottom() ) - margin - half;
+
+                if( rlo <= rhi )
+                    mid = std::clamp( mid, rlo, rhi );
+
+                keep( inX ? VECTOR2I( mid, b0 ) : VECTOR2I( b0, mid ) );
+                keep( inX ? VECTOR2I( mid, b1 ) : VECTOR2I( b1, mid ) );
+            }
+
+            auto unit = []( const VECTOR2I& aD )
+            {
+                const VECTOR2D v( aD );
+                return v.EuclideanNorm() > 0 ? v.Resize( 1.0 ) : VECTOR2D( 0.0, 0.0 );
+            };
+
+            const VECTOR2D firstWay = travelAt( 0 );
+            const VECTOR2D lastWay = pts.back().axis >= 0 && pts.back().into ? travelAt( pts.size() - 1 ) : unit( endMid - line.back() );
+            const VECTOR2D left0( firstWay.y, -firstWay.x );
+
+            // per vertex the way a ribbon line one unit to the left is moved (mitred at the turns)
+            std::vector<VECTOR2D> shift( line.size() );
+
+            for( size_t k = 0; k < line.size(); ++k )
+            {
+                VECTOR2D a = k == 0 ? firstWay : unit( line[k] - line[k - 1] );
+                VECTOR2D b = k + 1 == line.size() ? lastWay : unit( line[k + 1] - line[k] );
+
+                if( a.EuclideanNorm() == 0 )
+                    a = b;
+
+                if( b.EuclideanNorm() == 0 )
+                    b = a;
+
+                const VECTOR2D na( a.y, -a.x ), nb( b.y, -b.x );
+                const double   denom = 1.0 + a.Dot( b );
+                shift[k] = denom > 0.2 ? ( na + nb ) * ( 1.0 / denom ) : na;
+            }
+
+            for( MEMBER& m : members )
+                m.lateral = VECTOR2D( m.start - line.front() ).Dot( left0 );
+
+            std::stable_sort( members.begin(), members.end(), []( const MEMBER& x, const MEMBER& y ) { return x.lateral > y.lateral; } );
+
+            // the corners: the line's vertices but its ends on the end blocks' sides (the members leave
+            // their pads for the first turn, so their pitch closes up over the way there)
+            // the corners: the line's vertices but those near the end pads, where the members still close
+            // up from their pads' pitch to the ribbon's (as far as that takes at 45 degrees, plus two pitches)
+            std::vector<std::vector<VECTOR2I>> corners( n );
+
+            auto closeUp = [&]( bool aStart )
+            {
+                const VECTOR2D left = aStart ? left0 : VECTOR2D( lastWay.y, -lastWay.x );
+                double         lo = std::numeric_limits<double>::max(), hi = -lo;
+
+                for( const MEMBER& m : members )
+                {
+                    const double u = VECTOR2D( aStart ? m.start : m.end ).Dot( left );
+                    lo = std::min( lo, u );
+                    hi = std::max( hi, u );
+                }
+
+                return std::max( 0.0, ( hi - lo - 2.0 * half ) / 2.0 ) + 2.0 * pitch + half;
+            };
+
+            const double reachStart = closeUp( true ), reachEnd = closeUp( false );
+
+            auto nearEnd = [&]( const VECTOR2I& aAt )
+            {
+                for( const MEMBER& m : members )
+                {
+                    if( ( m.start - aAt ).EuclideanNorm() < reachStart || ( m.end - aAt ).EuclideanNorm() < reachEnd )
+                        return true;
+                }
+
+                return false;
+            };
+
+            std::vector<size_t> kept;
+
+            for( size_t v = 0; v < line.size(); ++v )
+            {
+                if( !nearEnd( line[v] ) )
+                    kept.push_back( v );
+            }
+
+            for( int k = 0; k < n; ++k )
+            {
+                const double offset = half - double( k ) * pitch;
+
+                for( size_t v : kept )
+                    corners[k].push_back( line[v] + VECTOR2I( KiROUND( shift[v].x * offset ), KiROUND( shift[v].y * offset ) ) );
+            }
+
+            // routed from the inside of the first turn out (y down: a clockwise turn has its inside on
+            // the right, the last of the order)
+            bool insideLast = false;
+
+            for( size_t v = 0; v < line.size(); ++v )
+            {
+                const VECTOR2D a = v == 0 ? firstWay : unit( line[v] - line[v - 1] );
+                const VECTOR2D b = v + 1 == line.size() ? lastWay : unit( line[v + 1] - line[v] );
+                const double   turn = a.x * b.y - a.y * b.x;
+
+                if( std::abs( turn ) > 0.1 )
+                {
+                    insideLast = turn > 0;
+                    break;
+                }
+            }
+
+            const int      corridorIndex = (int) corridorOut.size();
+            nlohmann::json across = nlohmann::json::array();
+
+            for( int k = 0; k < n; ++k )
+            {
+                JOB& j = jobs[members[k].job];
+                j.corridor = corners[k];
+
+                if( !members[k].forward )
+                    std::reverse( j.corridor.begin(), j.corridor.end() );
+
+                j.corridorOf = corridorIndex;
+                j.corridorRank = insideLast ? n - 1 - k : k;
+                j.corridorPlace = k;
+                across.push_back( j.net );
+            }
+
+            corridorMembers += n;
+            out["nets"] = across;
+            out["routed_from"] = insideLast ? "the last (inside of the first turn)" : "the first";
+            out["corners"] = kept.size();
+            out["pitch_mm"] = toMm( pitch );
+            out["line_mm"] = nlohmann::json::array();
+
+            for( const VECTOR2I& v : line )
+                out["line_mm"].push_back( { toMm( v.x ), toMm( v.y ) } );
+
+            if( squeezed )
+                out["portals_narrower"] = squeezed;
+
+            corridorOut.push_back( out );
+        }
+
+        // a corridor's members one after another, across it in order, where the first of them was
+        if( corridorMembers > 0 )
+        {
+            std::vector<JOB> ordered;
+            std::set<int>    emitted;
+
+            for( size_t k = 0; k < jobs.size(); ++k )
+            {
+                if( jobs[k].corridorOf < 0 )
+                {
+                    ordered.push_back( jobs[k] );
+                    continue;
+                }
+
+                if( !emitted.insert( jobs[k].corridorOf ).second )
+                    continue;
+
+                std::vector<const JOB*> members;
+
+                for( const JOB& j : jobs )
+                {
+                    if( j.corridorOf == jobs[k].corridorOf )
+                        members.push_back( &j );
+                }
+
+                std::sort( members.begin(), members.end(), []( const JOB* x, const JOB* y ) { return x->corridorRank < y->corridorRank; } );
+
+                for( const JOB* j : members )
+                    ordered.push_back( *j );
+            }
+
+            jobs = std::move( ordered );
+        }
+    }
+
     jobs.insert( jobs.begin(), trunks.begin(), trunks.end() );
 
     std::vector<int> partner( jobs.size(), -1 );
@@ -6793,6 +7326,40 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 busRow["fan_failed"] = attempt.value( "reason", std::string() );
         }
 
+        nlohmann::json corridorRow;
+
+        if( !ok && !job.corridor.empty() && !( job.busVia && busLayer ) )
+        {
+            const PCB_LAYER_ID padLayer = job.from->IsOnLayer( F_Cu ) ? F_Cu : job.from->IsOnLayer( B_Cu ) ? B_Cu
+                                                                                                         : job.from->GetLayerSet().CuStack().front();
+            const auto alongStarted = std::chrono::steady_clock::now();
+            const long outer = profile.job;
+            profile.job = (long) index;
+
+            if( doneOf )
+                refreshFronts();
+
+            ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
+            req.fronts = &fronts;
+            req.neckWidth = neckFor( job.from, job.to );
+
+            for( const VECTOR2I& corner : job.corridor )
+                req.vias.emplace_back( corner, std::nullopt );
+
+            attempt = nlohmann::json::object();
+            tries++;
+            ok = routeOne( *context, req, attempt, added );
+            job.ms += msSince( alongStarted );
+            profile.job = outer;
+            job.corridorRouted = ok;
+            corridorRoutedCount += ok;
+            corridorRow = { { "name", corridorOut[job.corridorOf].value( "name", std::string() ) },
+                            { "index", job.corridorPlace }, { "corners", job.corridor.size() }, { "routed", ok } };
+
+            if( !ok )
+                corridorRow["failed"] = attempt.value( "reason", std::string() );
+        }
+
         if( !ok )
             ok = tryRoute( job, attempt, tries, true, false );
 
@@ -6816,6 +7383,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         if( busRow.is_object() )
             row["bus"] = busRow;
+
+        if( corridorRow.is_object() )
+            row["corridor"] = corridorRow;
 
         // GUI, for watching: each accepted route is drawn before the next one starts
         if( ok && stepMs > 0 && !aQuiet && !aCtx.headless && aCtx.kiway )
@@ -8906,7 +9476,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( size_t k = 0; k < jobs.size(); ++k )
         {
-            if( !done[k] || jobs[k].trunk || jobs[k].busVia || partner[k] >= 0 || rowOf[k] < 0 || jobs[k].to->Type() != PCB_PAD_T
+            if( !done[k] || jobs[k].trunk || jobs[k].busVia || jobs[k].corridorRouted || partner[k] >= 0 || rowOf[k] < 0 || jobs[k].to->Type() != PCB_PAD_T
                 || !results[rowOf[k]].value( "routed", false ) || results[rowOf[k]].value( "joined_by_earlier_route", false ) )
             {
                 continue;
@@ -9438,6 +10008,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "length_mm", std::round( length * 1000.0 ) / 1000.0 },
                               { "vias", vias },
                               { "bus", busOut },
+                              { "bus_paths", { { "corridors", corridorOut }, { "members", corridorMembers },
+                                               { "routed_along", corridorRoutedCount } } },
                               { "rip_up", { { "tried", rippedTried }, { "won", rippedOk }, { "scope", ripScope },
                                             { "earlier_routes_movable", foreignJobs },
                                             { "earlier_routes_rerouted", foreignMoved } } },
@@ -14158,6 +14730,10 @@ KOPENAPI_REGISTER( "pcb_route",
                    "rip_up, gaps); "
                    "nets a pcb_net_roles pair names (USB_DP_MCU / USB_DM_MCU too) are routed coupled as well (diff_pairs); "
                    "bus routes a bundle's members one after another in pin order, bus_layer through a diagonal via fan (answer bus, row bus); "
+                   "bus_paths routes a bus along a corridor, pcb_floorplan's path between two blocks or points given: its members side by "
+                   "side at their pitch across each portal of the path as fixed corners, in the order they lie across the way in, one "
+                   "after another (answer bus_paths: corridors, members, routed_along; row corridor: name, index, corners, routed, failed; "
+                   "a member the corridor does not route is routed as any other, one routed along it is left out of clean_up); "
                    "rip_up_scope unlocked lets the rip-up take out unlocked copper of earlier calls too (rip_up.earlier_routes_rerouted, "
                    "other_nets_moved); the first pass gives each connection first_pass_budget_s (row budget, profile budget); "
                    "dry_run (pns) routes the whole call on the board and takes it back: its rows are what applying gives (simulated says so); "
@@ -14178,6 +14754,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
                         "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
                         "ports":{"oneOf":[{"type":"boolean"},{"type":"array","items":{"type":"string"}}],"description":"layout level 1 goals: the signal pins of these packages (true: every package with 8 SMD pads or more) follow their port from pcb_fanout_ports: the way out on the pin's side is kept open to past the courtyard on the pad's layer (a pin planned round_the_part: to the courtyard's edge, it turns right past it; layer other: to the via spot the plan's fan-out would lay, the spot kept free on every layer), and the pin's routes leave through it first (the tip as a corner, or the via), arriving through the far pin's port when the layers allow; a connection that does not route that way is routed as any other. Rows routed so name port (round_the_part when planned so); ports answers per package the pins and vias planned, tries, won and ms"},
+                        "bus_paths":{"description":"pns: \"off\", \"floorplan\" (or {floorplan: {pcb_floorplan arguments}}): every bus link pcb_floorplan finds, along its corridor, the connections of its nets between the two blocks' parts; or [{name, nets, points_mm: [[x_mm, y_mm] (a free point) or {at_mm, along: x | y, lo_mm, hi_mm, into_mm: [x0, y0, x1, y1]} (a portal crossed into that region: the ribbon inside lo..hi, joined to the next portal by axis-parallel runs inside the region)]}]: the connections of those nets, from the end nearer the first point. The answer's corridors give the centre line (line_mm) the members run beside at their pitch","default":"off"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again, up to 3 choices of them per connection and round; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},

@@ -186,6 +186,7 @@ struct LINK
     std::vector<int> cuts;
     std::set<int>    crosses;
     std::vector<int> topologyOnly;   ///< nets in the bus by their ends only, not by their name
+    std::vector<std::array<double, 4>> corridor;   ///< portal crossings in path order: x, y (mm), portal, region entered
     double           length = 0;
     bool             found = false;
 };
@@ -1413,6 +1414,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         };
 
         aLink.cuts.clear();
+        aLink.corridor.clear();
         aLink.crosses.clear();
         aLink.length = 0;
         aLink.found = false;
@@ -1558,6 +1560,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         for( size_t k = 0; k < path.size(); ++k )
         {
             const PORTAL& to = portals[path[k] >> 1];
+            aLink.corridor.push_back( { pointX[path[k]], pointY[path[k]], double( path[k] >> 1 ), double( entered( path[k] ) ) } );
 
             if( k > 0 )
             {
@@ -1933,6 +1936,67 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     std::stable_sort( byDemand.begin(), byDemand.end(), [&]( int x, int y ) { return links[x].demand > links[y].demand; } );
 
+    // where a link crosses each portal of its path: the point, the portal's line and its stretch free
+    // on both sides (portals in line with it between alike regions), the region the path enters: a
+    // bus's corridor (pcb_route bus_paths)
+    std::map<std::pair<bool, double>, std::vector<int>> portalsOnLine;
+
+    for( size_t q = 0; q < portals.size(); ++q )
+        portalsOnLine[{ portals[q].vertical, portals[q].at }].push_back( (int) q );
+
+    auto freeStretch = [&]( int aPortal )
+    {
+        const PORTAL& p = portals[aPortal];
+        double        lo = p.lo, hi = p.hi;
+        const std::vector<int>& line = portalsOnLine[{ p.vertical, p.at }];
+
+        for( bool grew = true; grew; )
+        {
+            grew = false;
+
+            for( int q : line )
+            {
+                const PORTAL& o = portals[q];
+
+                if( !alike( cells[regions[o.r0].cell], cells[regions[p.r0].cell] )
+                    || !alike( cells[regions[o.r1].cell], cells[regions[p.r1].cell] ) )
+                {
+                    continue;
+                }
+
+                if( std::abs( o.hi - lo ) < 1e-6 && o.lo < lo )
+                {
+                    lo = o.lo;
+                    grew = true;
+                }
+                else if( std::abs( o.lo - hi ) < 1e-6 && o.hi > hi )
+                {
+                    hi = o.hi;
+                    grew = true;
+                }
+            }
+        }
+
+        return std::make_pair( lo, hi );
+    };
+
+    auto corridorJson = [&]( const LINK& aLink )
+    {
+        nlohmann::json list = nlohmann::json::array();
+
+        for( const std::array<double, 4>& c : aLink.corridor )
+        {
+            const PORTAL& p = portals[(size_t) c[2]];
+            const REGION& r = regions[(size_t) c[3]];
+            const auto [lo, hi] = freeStretch( (int) c[2] );
+            list.push_back( { { "at_mm", { r2( c[0] ), r2( c[1] ) } }, { "along", p.vertical ? "y" : "x" },
+                              { "lo_mm", r2( lo ) }, { "hi_mm", r2( hi ) },
+                              { "into_mm", { r2( toMm( xs[r.i0] ) ), r2( toMm( ys[r.j0] ) ), r2( toMm( xs[r.i1] ) ), r2( toMm( ys[r.j1] ) ) } } } );
+        }
+
+        return list;
+    };
+
     for( int li : byDemand )
     {
         const LINK&    l = links[li];
@@ -1971,6 +2035,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                              { "named_nets", l.bus.empty() ? 0 : l.nets.size() - l.topologyOnly.size() },
                              { "topology_only_nets", alone },
                              { "classes", l.classes }, { "found", l.found }, { "path", path },
+                             { "corridor", corridorJson( l ) },
                              { "length_mm", r2( l.length ) }, { "through_blocks", through }, { "overflow", over } };
         linksOver += over;
         linksMissing += !l.found;
@@ -2041,7 +2106,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         for( int k : b.boxes )
             list.push_back( boxMm( boxes[k].box ) );
 
-        blockList.push_back( { { "name", b.name }, { "box_mm", boxMm( b.box ) }, { "boxes_mm", list } } );
+        blockList.push_back( { { "name", b.name }, { "box_mm", boxMm( b.box ) }, { "boxes_mm", list }, { "parts", b.parts } } );
     }
 
     int       slivers = 0, sliversUsed = 0, zeroLength = 0;
@@ -2152,7 +2217,8 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                    "the single nets between two blocks, as one bundle with its width (track + clearance of each "
                    "net's class), taking one shortest path through the channels; overflows negotiated over the "
                    "channels (present overuse and history costs) and the best round kept. Answers channels by use, "
-                   "overflows (demand over capacity, tracks over), links with their channel path, length, blocks "
+                   "overflows (demand over capacity, tracks over), links with their channel path, corridor (per portal crossed: the point, the "
+                   "portal's axis, its stretch free on both sides and the region entered; pcb_route bus_paths floorplan routes a bus along it), length, blocks "
                    "they must cross (boxes overlapping or no way round) and the box sides they leave and enter by (a bus by "
                    "its end's exit side, pcb_layout_graph ends: an edge connector away from the board edge, else the pcb_fanout_ports side); ports: per box side used its facing "
                    "length (free or another box's, facing_boxes_mm) per layer as capacity against the bundles' width "
