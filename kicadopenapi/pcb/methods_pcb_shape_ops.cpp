@@ -611,8 +611,13 @@ static KOPENAPI_RESULT h_pcb_array( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
     nlohmann::json renamed = nlohmann::json::array();
     std::vector<KIID> ids;
 
-    // The originals stay as cell 0; each further cell is a copy of them all
-    for( int n = 1; n < count; ++n )
+    // The originals stay as cell 0 and each further cell is a copy of them all; original_last
+    // (the GUI's way) fills cells 0 .. n-2 with copies and moves the originals to the last cell
+    const bool originalLast = aArgs.value( "original_last", false );
+    const int  first = originalLast ? 0 : 1;
+    const int  last = originalLast ? count - 1 : count;
+
+    for( int n = first; n < last; ++n )
     {
         nlohmann::json cell = nlohmann::json::array();
 
@@ -628,7 +633,7 @@ static KOPENAPI_RESULT h_pcb_array( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
                 renumber( dupe, refs, renamed );
 
             if( step )
-                increment( dupe, step * n );
+                increment( dupe, step * ( n - first + 1 ) );
 
             cell.push_back( describe( dupe ) );
             ids.push_back( dupe->m_Uuid );
@@ -637,10 +642,31 @@ static KOPENAPI_RESULT h_pcb_array( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         cells.push_back( cell );
     }
 
+    nlohmann::json moved = nlohmann::json::array();
+
+    if( originalLast )
+    {
+        for( BOARD_ITEM* item : items )
+        {
+            const ARRAY_OPTIONS::TRANSFORM t = opts->GetTransform( count - 1, item->GetPosition() );
+
+            commit.Modify( item, nullptr, RECURSE_MODE::RECURSE );
+            item->Move( t.m_offset );
+            item->Rotate( item->GetPosition(), t.m_rotation );
+            moved.push_back( describe( item ) );
+            ids.push_back( item->m_Uuid );
+        }
+    }
+
     commit.Push( _( "Create Array (API)" ) );
     glow( aCtx, ids );
 
-    return KOPENAPI_RESULT::Ok( { { "cells", count }, { "copies", cells }, { "renamed", renamed } } );
+    nlohmann::json out = { { "cells", count }, { "copies", cells }, { "renamed", renamed } };
+
+    if( originalLast )
+        out["originals"] = moved;
+
+    return KOPENAPI_RESULT::Ok( out );
 }
 
 
@@ -721,7 +747,8 @@ KOPENAPI_REGISTER( "pcb_shapes_edit",
 KOPENAPI_REGISTER( "pcb_array",
                    "Create Array: copies of footprints, drawings, tracks, vias, zones or groups (items: refs "
                    "or uuids) on a grid (nx x ny, dx_mm / dy_mm pitch, stagger) or a circle (centre, count, "
-                   "angle_deg step or 0 for an even spread, rotate_items); the originals are the first cell; "
+                   "angle_deg step or 0 for an even spread, rotate_items); the originals are the first cell "
+                   "(original_last: the GUI's way, copies first and the originals moved to the last cell); "
                    "copied footprints get the next free references (reannotate) and free texts can count up "
                    "(increment per cell); one undo step; answers each cell's copies",
                    R"json({"type":"object","required":["items"],"properties":{
@@ -739,6 +766,7 @@ KOPENAPI_REGISTER( "pcb_array",
                             "angle_deg":{"type":"number","default":0},
                             "clockwise":{"type":"boolean","default":false},
                             "rotate_items":{"type":"boolean","default":true}}},
+                        "original_last":{"type":"boolean","default":false},
                         "reannotate":{"type":"boolean","default":true},
                         "increment":{"type":"integer","default":0,"description":"free texts count up by this per cell"}}})json"_json,
                    false, h_pcb_array );
