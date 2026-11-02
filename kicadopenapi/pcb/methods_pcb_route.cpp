@@ -13918,7 +13918,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
                 const BOX2I    pb = pad->GetBoundingBox();
                 const int      padHalf = dir.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
-                const VECTOR2I spot = pad->GetPosition() - dir * ( padHalf + signalDia / 2 + minClearance );
+                const VECTOR2I spot = pad->GetPosition() - dir * ( padHalf + signalDia / 2 + std::max( minClearance, KopenapiRuleVia( board, pad->GetNetCode(), pad->GetPosition(), F_Cu ).clearance ) );
                 lanes.push_back( { pad, SEG( pad->GetPosition(), spot ), spot, signalDia, signalDrill } );
             }
         }
