@@ -2186,18 +2186,35 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         }
     }
 
-    // the way round the part per side and far part: from the far pins' offsets off the centre line (each
-    // pin's nearest far pin of its net), else the pins' own offsets
-    std::map<std::pair<int, int>, std::pair<int64_t, int64_t>> roundLean;   // (own side, far part) -> far, own sums
-    std::map<std::pair<int, int>, int>                         roundCount;
+    // the ring's geometry: lines a given offset past the courtyard, per side (0 west, 1 north, 2 east, 3 south)
+    const BOX2I           court = courtyardOf( a.fp ).BBox();
+    static const VECTOR2I outward[4] = { { -1, 0 }, { 0, -1 }, { 1, 0 }, { 0, 1 } };
 
-    for( const PORT& p : ports )
+    auto lineAt = [&]( int aSide, int aOff ) -> int
     {
-        const int own = sideIndex( p.side ), to = sideIndex( p.toSide );
+        switch( aSide )
+        {
+        case 0: return court.GetLeft() - aOff;
+        case 1: return court.GetTop() - aOff;
+        case 2: return court.GetRight() + aOff;
+        default: return court.GetBottom() + aOff;
+        }
+    };
 
-        if( p.to < 0 || own < 0 || to < 0 || turnOf( own, to ) != 2 )
-            continue;
+    auto onSide = [&]( int aSide, int aOff, const VECTOR2I& aAt )
+    {
+        return aSide % 2 == 0 ? VECTOR2I( lineAt( aSide, aOff ), aAt.y ) : VECTOR2I( aAt.x, lineAt( aSide, aOff ) );
+    };
 
+    auto cornerOf = [&]( int aSide1, int aSide2, int aOff )
+    {
+        const int across = aSide1 % 2 == 0 ? aSide1 : aSide2, along = aSide1 % 2 == 0 ? aSide2 : aSide1;
+        return VECTOR2I( lineAt( across, aOff ), lineAt( along, aOff ) );
+    };
+
+    // each pin's nearest far pin of its net
+    auto farPinOf = [&]( const PORT& p )
+    {
         VECTOR2I farPin = b.parts[p.to].centre;
         double   nearest = std::numeric_limits<double>::max();
 
@@ -2210,23 +2227,134 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             }
         }
 
-        const bool     across = own == 0 || own == 2;
-        const VECTOR2I off = farPin - centre;
-        const VECTOR2I at = p.pad->GetPosition() - centre;
-        auto&          sums = roundLean[{ own, p.to }];
-        sums.first += across ? off.y : off.x;
-        sums.second += across ? at.y : at.x;
-        roundCount[{ own, p.to }]++;
+        return farPin;
+    };
+
+    // the way round the part per side and far part, from geometry: each pin's path modelled as its lane would
+    // lie (out to its offset, the pin nearest the corner it turns at innermost, a track and a clearance apart,
+    // round both corners, then straight to its far pin), against the straight ways out of the package's other
+    // pins on its layer. The way whose paths cross fewer (each other or those ways out) is taken, then the one
+    // whose paths are shorter in total
+    struct WAY_PATH
+    {
+        PCB_LAYER_ID          layer;
+        std::vector<VECTOR2I> pts;
+    };
+
+    std::map<std::pair<int, int>, std::vector<const PORT*>> roundGroups;   // (own side, far part) -> its pins
+    std::vector<WAY_PATH>                                   waysOut;      // the other pins' straight ways out
+
+    for( const PORT& p : ports )
+    {
+        const int own = sideIndex( p.side ), to = sideIndex( p.toSide );
+
+        if( own < 0 || p.pad->GetAttribute() != PAD_ATTRIB::SMD )
+            continue;
+
+        if( p.to >= 0 && to >= 0 && turnOf( own, to ) == 2 )
+        {
+            roundGroups[{ own, p.to }].push_back( &p );
+        }
+        else if( p.kind != "rail" && !p.via && ( p.to < 0 || to < 0 || turnOf( own, to ) == 0 ) )
+        {
+            const VECTOR2I at = p.pad->GetPosition();
+            waysOut.push_back( { p.pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu, { at, onSide( own, 0, at ) + outward[own] * ( court.GetWidth() + court.GetHeight() ) } } );
+        }
+    }
+
+    std::map<std::pair<int, int>, int> roundWay;   // (own side, far part) -> the side it passes first
+    nlohmann::json                     roundChoice = nlohmann::json::array();
+
+    for( const auto& [key, pins] : roundGroups )
+    {
+        const int own = key.first, to = ( own + 2 ) % 4;
+        int       bestNext = -1;
+        int       bestCross = std::numeric_limits<int>::max();
+        double    bestLength = std::numeric_limits<double>::max();
+        nlohmann::json ways = nlohmann::json::array();
+
+        for( int next : { ( own + 1 ) % 4, ( own + 3 ) % 4 } )
+        {
+            const VECTOR2I        corner = cornerOf( own, next, 0 );
+            std::vector<WAY_PATH> paths;
+            std::vector<std::pair<int64_t, const PORT*>> byCorner;
+
+            for( const PORT* p : pins )
+                byCorner.emplace_back( ( p->pad->GetPosition() - corner ).EuclideanNorm(), p );
+
+            std::sort( byCorner.begin(), byCorner.end(),
+                       []( const auto& x, const auto& y ) { return x.first < y.first; } );
+
+            double length = 0;
+
+            for( size_t rank = 0; rank < byCorner.size(); ++rank )
+            {
+                const PORT*  p = byCorner[rank].second;
+                NETCLASS*    netclass = p->pad->GetEffectiveNetClass();
+                const BOARD_DESIGN_SETTINGS& ds = board->GetDesignSettings();
+                const int    clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
+                const int    width = netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : ds.GetCurrentTrackWidth();
+                const int    off = clearance + width / 2 + (int) rank * ( width + clearance );
+                const VECTOR2I at = p->pad->GetPosition();
+                WAY_PATH     path{ p->pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu,
+                                   { at, onSide( own, off, at ), cornerOf( own, next, off ), cornerOf( next, to, off ), farPinOf( *p ) } };
+
+                for( size_t i = 0; i + 1 < path.pts.size(); ++i )
+                    length += ( path.pts[i + 1] - path.pts[i] ).EuclideanNorm();
+
+                paths.push_back( std::move( path ) );
+            }
+
+            auto crossCount = [&]( const WAY_PATH& x, const WAY_PATH& y )
+            {
+                int n = 0;
+
+                for( size_t i = 0; x.layer == y.layer && i + 1 < x.pts.size(); ++i )
+                {
+                    for( size_t k = 0; k + 1 < y.pts.size(); ++k )
+                    {
+                        // the first run of each leaves its own pad: two pins' ways out never meet there
+                        if( i == 0 && k == 0 )
+                            continue;
+
+                        n += SEG( x.pts[i], x.pts[i + 1] ).Intersects( SEG( y.pts[k], y.pts[k + 1] ) ) ? 1 : 0;
+                    }
+                }
+
+                return n;
+            };
+
+            int cross = 0;
+
+            for( size_t x = 0; x < paths.size(); ++x )
+            {
+                for( size_t y = x + 1; y < paths.size(); ++y )
+                    cross += crossCount( paths[x], paths[y] );
+
+                for( const WAY_PATH& w : waysOut )
+                    cross += crossCount( paths[x], w );
+            }
+
+            ways.push_back( { { "sides", { sides[own], sides[next], sides[to] } }, { "crossings", cross },
+                              { "length_mm", std::round( length / pcbIUScale.IU_PER_MM * 100 ) / 100 } } );
+
+            if( cross < bestCross || ( cross == bestCross && length < bestLength ) )
+            {
+                bestCross = cross;
+                bestLength = length;
+                bestNext = next;
+            }
+        }
+
+        roundWay[key] = bestNext;
+        roundChoice.push_back( { { "side", sides[own] }, { "to", b.parts[key.second].ref }, { "pins", pins.size() },
+                                 { "round", bestNext == ( own + 1 ) % 4 ? "cw" : "ccw" }, { "ways", ways } } );
     }
 
     auto roundNext = [&]( int aOwn, int aTo ) -> int
     {
-        const bool    across = aOwn == 0 || aOwn == 2;
-        const auto&   sums = roundLean[{ aOwn, aTo }];
-        const int64_t n = std::max( 1, roundCount[{ aOwn, aTo }] );
-        const int64_t tol = ( across ? extent.GetHeight() : extent.GetWidth() ) / 4;
-        const int64_t lean = std::abs( sums.first / n ) > tol ? sums.first : sums.second;
-        return across ? ( lean <= 0 ? 1 : 3 ) : ( lean <= 0 ? 0 : 2 );
+        auto it = roundWay.find( { aOwn, aTo } );
+        return it != roundWay.end() ? it->second : ( aOwn + 1 ) % 4;
     };
 
     static const char* turnName[3] = { "straight", "corner", "round_the_part" };
@@ -2291,34 +2419,10 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
     if( aArgs.value( "lanes", false ) )
     {
-        const BOX2I                  court = courtyardOf( a.fp ).BBox();
         const BOX2I                  edges = board->GetBoardEdgesBoundingBox();
         const BOARD_DESIGN_SETTINGS& ds = board->GetDesignSettings();
-        static const VECTOR2I        outward[4] = { { -1, 0 }, { 0, -1 }, { 1, 0 }, { 0, 1 } };
         const int64_t                wide = court.GetWidth(), high = court.GetHeight(), loop = 2 * ( wide + high );
         const int64_t                sideStart[5] = { 0, high, high + wide, 2 * high + wide, loop };   // clockwise from the south-west corner
-
-        auto lineAt = [&]( int aSide, int aOff ) -> int
-        {
-            switch( aSide )
-            {
-            case 0: return court.GetLeft() - aOff;
-            case 1: return court.GetTop() - aOff;
-            case 2: return court.GetRight() + aOff;
-            default: return court.GetBottom() + aOff;
-            }
-        };
-
-        auto onSide = [&]( int aSide, int aOff, const VECTOR2I& aAt )
-        {
-            return aSide % 2 == 0 ? VECTOR2I( lineAt( aSide, aOff ), aAt.y ) : VECTOR2I( aAt.x, lineAt( aSide, aOff ) );
-        };
-
-        auto cornerOf = [&]( int aSide1, int aSide2, int aOff )
-        {
-            const int across = aSide1 % 2 == 0 ? aSide1 : aSide2, along = aSide1 % 2 == 0 ? aSide2 : aSide1;
-            return VECTOR2I( lineAt( across, aOff ), lineAt( along, aOff ) );
-        };
 
         auto perimeter = [&]( int aSide, const VECTOR2I& aAt ) -> int64_t
         {
@@ -2934,6 +3038,9 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
     if( !lanesOut.is_null() )
         out["lanes"] = lanesOut;
 
+    if( !roundChoice.empty() )
+        out["round_ways"] = roundChoice;
+
     return KOPENAPI_RESULT::Ok( out );
 }
 
@@ -3459,7 +3566,10 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "moved out a pitch at a time, the lanes outside it with it), blocked_by (still in the way after "
                    "16 pitches), outside the vias its package's other connected SMD pins on its layer take by their pads when it runs past them (a "
                    "rail pin at the end of a row: also round that corner), off_board, crossings with other lanes on its layer; straight ones run out past the "
-                   "lanes going by their pin. The pins of one side going round the part to one far part all go one way round. dropped: the "
+                   "lanes going by their pin. The pins of one side going round the part to one far part all go one way round: the way whose "
+                   "modelled paths (out to their offsets, round both corners, straight on to their far pins) cross fewer of each other and of "
+                   "the package's straight ways out on their layer, then the shorter in total (round_ways: per side and far part both ways' "
+                   "crossings and length_mm, the one taken). dropped: the "
                    "lanes not planned, with walls_in (the pins whose straight way out the lane would run in front of) or crosses (the lanes "
                    "it would cross; the one crossing most dropped first); their pins keep their ports. Also each port's lane (rank, offset_mm, polyline_mm) and each lane as a corridor (corridor.md: its corners the gates, its slot the rooms). pitch_mm, "
                    "base_mm, counts and the crossings (pads, at_mm). Read only",
