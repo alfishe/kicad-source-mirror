@@ -22,6 +22,7 @@
 #include <design_block.h>
 #include <design_block_library_adapter.h>
 #include <sch_design_block_pane.h>
+#include <sch_design_block_utils.h>
 #include <sch_edit_frame.h>
 #include <sch_group.h>
 #include <wx/choicdlg.h>
@@ -67,6 +68,49 @@ bool checkOverwriteDbSchematic( wxWindow* aFrame, const LIB_ID& aLibId )
     }
 
     return true;
+}
+
+
+std::unique_ptr<SCH_SHEET> MakeDesignBlockSheet( SCHEMATIC* aSchematic, const std::vector<EDA_ITEM*>& aItems )
+{
+    SCH_SCREEN* tempScreen = new SCH_SCREEN( aSchematic );
+
+    for( EDA_ITEM* item : aItems )
+    {
+        // We need to deep copy since selections of groups will not have the children
+        if( item->Type() == SCH_GROUP_T )
+        {
+            SCH_GROUP* clonedGroup = static_cast<SCH_GROUP*>( item )->DeepClone();
+
+            tempScreen->Append( clonedGroup );
+
+            clonedGroup->RunOnChildren(
+                                        [&]( EDA_ITEM* aItem )
+                                        {
+                                            tempScreen->Append( static_cast<SCH_ITEM*>( aItem ) );
+                                        },
+                                        RECURSE_MODE::RECURSE );
+        }
+        else if( item->Type() == SCH_SYMBOL_T )
+        {
+            SCH_SYMBOL* clonedSymbol = static_cast<SCH_SYMBOL*>( item->Clone() );
+            tempScreen->Append( clonedSymbol );
+        }
+        else if( item->Type() == SCH_PIN_T || item->Type() == SCH_FIELD_T )
+        {
+            // Handled as symbol children
+            continue;
+        }
+        else
+        {
+            EDA_ITEM* copy = item->Clone();
+            tempScreen->Append( static_cast<SCH_ITEM*>( copy ) );
+        }
+    }
+
+    std::unique_ptr<SCH_SHEET> tempSheet = std::make_unique<SCH_SHEET>( aSchematic );
+    tempSheet->SetScreen( tempScreen );
+    return tempSheet;
 }
 
 
@@ -295,9 +339,6 @@ bool SCH_EDIT_FRAME::SaveSelectionAsDesignBlock( const wxString& aLibraryName )
     if( Prj().DesignBlockLibs()->DesignBlockExists( libName, newName ) && !checkOverwriteDb( this, libName, newName ) )
         return false;
 
-    // Create a temporary screen
-    SCH_SCREEN* tempScreen = new SCH_SCREEN( m_schematic );
-
     // If we have a single group, we want to strip the group and select the children
     if( group )
     {
@@ -312,43 +353,8 @@ bool SCH_EDIT_FRAME::SaveSelectionAsDesignBlock( const wxString& aLibraryName )
                 RECURSE_MODE::NO_RECURSE );
     }
 
-    // Copy the selected items to the temporary screen
-    for( EDA_ITEM* item : selection )
-    {
-        // We need to deep copy since selections of groups will not have the children
-        if( item->Type() == SCH_GROUP_T )
-        {
-            SCH_GROUP* clonedGroup = static_cast<SCH_GROUP*>( item )->DeepClone();
-
-            tempScreen->Append( clonedGroup );
-
-            clonedGroup->RunOnChildren(
-                                        [&]( EDA_ITEM* aItem )
-                                        {
-                                            tempScreen->Append( static_cast<SCH_ITEM*>( aItem ) );
-                                        },
-                                        RECURSE_MODE::RECURSE );
-        }
-        else if( item->Type() == SCH_SYMBOL_T )
-        {
-            SCH_SYMBOL* clonedSymbol = static_cast<SCH_SYMBOL*>( item->Clone() );
-            tempScreen->Append( clonedSymbol );
-        }
-        else if( item->Type() == SCH_PIN_T || item->Type() == SCH_FIELD_T )
-        {
-            // Handled as symbol children
-            continue;
-        }
-        else
-        {
-            EDA_ITEM* copy = item->Clone();
-            tempScreen->Append( static_cast<SCH_ITEM*>( copy ) );
-        }
-    }
-
-    // Create a sheet for the temporary screen
-    std::unique_ptr<SCH_SHEET> tempSheet = std::make_unique<SCH_SHEET>( m_schematic );
-    tempSheet->SetScreen( tempScreen );
+    std::vector<EDA_ITEM*>     items( selection.begin(), selection.end() );
+    std::unique_ptr<SCH_SHEET> tempSheet = MakeDesignBlockSheet( m_schematic, items );
 
     // Save a temporary copy of the schematic file, as the plugin is just going to move it
     wxString tempFile = wxFileName::CreateTempFileName( "design_block" );

@@ -50,6 +50,15 @@ std::vector<SCH_ITEM*> FlattenGroups( const EDA_ITEMS& aItems );
 std::vector<SCH_ITEM*> FlattenGroups( const std::deque<EDA_ITEM*>& aItems );
 
 /**
+ * Pick the point a placed design block hangs from.
+ *
+ * A connection point keeps the pins on grid. Text does not, because it sits wherever it was
+ * dragged. Taking the topmost leftmost one rather than the nearest to the mouse gives the
+ * same anchor on every placement.
+ */
+std::optional<VECTOR2I> DesignBlockAnchor( const std::vector<SCH_ITEM*>& aItems );
+
+/**
  * Get a list of unplaced (i.e. not in schamtic) unit numbers for a symbol.
  */
 std::set<int> GetUnplacedUnitsForSymbol( const SCH_SYMBOL& aSym );

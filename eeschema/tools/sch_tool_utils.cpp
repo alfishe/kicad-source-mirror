@@ -176,6 +176,33 @@ std::vector<SCH_ITEM*> FlattenGroups( const std::deque<EDA_ITEM*>& aItems )
 }
 
 
+std::optional<VECTOR2I> DesignBlockAnchor( const std::vector<SCH_ITEM*>& aItems )
+{
+    std::optional<VECTOR2I> connectionAnchor;
+    std::optional<VECTOR2I> positionAnchor;
+
+    auto keepTopLeft =
+            []( std::optional<VECTOR2I>& aBest, const VECTOR2I& aCandidate )
+            {
+                if( !aBest || aCandidate.y < aBest->y || ( aCandidate.y == aBest->y && aCandidate.x < aBest->x ) )
+                    aBest = aCandidate;
+            };
+
+    for( SCH_ITEM* item : aItems )
+    {
+        if( item->Type() == SCH_GROUP_T )
+            continue;
+
+        for( const VECTOR2I& pt : item->GetConnectionPoints() )
+            keepTopLeft( connectionAnchor, pt );
+
+        keepTopLeft( positionAnchor, item->GetPosition() );
+    }
+
+    return connectionAnchor ? connectionAnchor : positionAnchor;
+}
+
+
 bool IsUnannotatedUnitOccupied( const SCH_REFERENCE_LIST& aRefs, const wxString& aRef,
                                 const LIB_ID& aLibId, int aUnit )
 {

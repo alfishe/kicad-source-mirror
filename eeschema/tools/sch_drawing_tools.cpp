@@ -735,40 +735,6 @@ int SCH_DRAWING_TOOLS::PlaceNextSymbolUnit( const TOOL_EVENT& aEvent )
 }
 
 
-/**
- * Pick the point a placed design block hangs from.
- *
- * A connection point keeps the pins on grid. Text does not, because it sits wherever it was
- * dragged. Taking the topmost leftmost one rather than the nearest to the mouse gives the
- * same anchor on every placement.
- */
-static std::optional<VECTOR2I> designBlockAnchor( const std::vector<SCH_ITEM*>& aItems )
-{
-    std::optional<VECTOR2I> connectionAnchor;
-    std::optional<VECTOR2I> positionAnchor;
-
-    auto keepTopLeft =
-            []( std::optional<VECTOR2I>& aBest, const VECTOR2I& aCandidate )
-            {
-                if( !aBest || aCandidate.y < aBest->y || ( aCandidate.y == aBest->y && aCandidate.x < aBest->x ) )
-                    aBest = aCandidate;
-            };
-
-    for( SCH_ITEM* item : aItems )
-    {
-        if( item->Type() == SCH_GROUP_T )
-            continue;
-
-        for( const VECTOR2I& pt : item->GetConnectionPoints() )
-            keepTopLeft( connectionAnchor, pt );
-
-        keepTopLeft( positionAnchor, item->GetPosition() );
-    }
-
-    return connectionAnchor ? connectionAnchor : positionAnchor;
-}
-
-
 int SCH_DRAWING_TOOLS::ImportSheet( const TOOL_EVENT& aEvent )
 {
     if( m_inDrawingTool )
@@ -939,7 +905,7 @@ int SCH_DRAWING_TOOLS::ImportSheet( const TOOL_EVENT& aEvent )
                 controls->ForceCursorPosition( true, cursorPos );
 
                 std::vector<SCH_ITEM*>  blockItems = FlattenGroups( newItems );
-                std::optional<VECTOR2I> anchorPos = designBlockAnchor( blockItems );
+                std::optional<VECTOR2I> anchorPos = DesignBlockAnchor( blockItems );
                 VECTOR2I                delta = anchorPos ? cursorPos - *anchorPos : VECTOR2I( 0, 0 );
 
                 // Will all be SCH_ITEMs as these were pulled from the screen->Items()

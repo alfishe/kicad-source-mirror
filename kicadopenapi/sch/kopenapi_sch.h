@@ -7,6 +7,7 @@
 #define KOPENAPI_SCH_H
 
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -36,5 +37,24 @@ SCH_ITEM* KopenapiSchMatchUuid( const std::vector<SCH_ITEM*>& aScope, const std:
 /// that item's uuid; entries naming none are kept as given (for the caller's "not found").  False
 /// and aError when an entry is an ambiguous prefix
 bool KopenapiSchExpandUuids( const std::vector<SCH_ITEM*>& aScope, std::set<std::string>& aWanted, std::string& aError );
+
+class KIID;
+class KIWAY;
+class SCH_COMMIT;
+class SCH_SHEET_PATH;
+class SCHEMATIC;
+class wxString;
+
+/// @brief Target sheet instance: args "sheet" (the path sch_sheet_list lists), else the editor's
+/// current sheet, else the root
+std::optional<SCH_SHEET_PATH> KopenapiSchTargetSheet( SCH_CONTEXT& aContext, const nlohmann::json& aArgs );
+
+/// @brief First free reference number for a prefix ("C" -> "C4") over all sheet instances and aTaken
+/// (the references handed out before, extended with the one returned)
+wxString KopenapiSchNextFreeRef( SCHEMATIC* aSchematic, const wxString& aPrefix, std::set<wxString>& aTaken );
+
+/// @brief Push an edit as one undo step, rebuild connectivity, and let the GUI glow aGlow
+void KopenapiSchPushEdit( SCH_COMMIT& aCommit, SCHEMATIC* aSchematic, const wxString& aMessage, KIWAY* aKiway,
+                          const std::vector<KIID>& aGlow );
 
 #endif

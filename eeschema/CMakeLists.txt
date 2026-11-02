@@ -506,6 +506,7 @@ set( EESCHEMA_SRCS
     sch_shape.cpp
     sch_rule_area.cpp
     sch_sheet.cpp
+    sch_sheet_loader.cpp
     sch_sheet_path.cpp
     sch_sheet_pin.cpp
     sch_symbol.cpp

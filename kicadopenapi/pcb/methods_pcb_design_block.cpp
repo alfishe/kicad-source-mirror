@@ -10,11 +10,9 @@
 #include <board_commit.h>
 #include <board_design_settings.h>
 #include <design_block.h>
-#include <design_block_io.h>
-#include <design_block_library_adapter.h>
 #include <footprint.h>
 #include <io/io_mgr.h>
-#include <kicadopenapi_keepalive.h>
+#include <kicadopenapi_design_blocks.h>
 #include <kicadopenapi_util.h>
 #include <locale_io.h>
 #include <netinfo.h>
@@ -51,175 +49,7 @@ wxString wx( const std::string& aText )
 }
 
 
-double toMm( double aIU )
-{
-    return std::round( ( aIU / pcbIUScale.IU_PER_MM ) * 1000.0 ) / 1000.0;
-}
-
-
-/// @brief A design block library: a nickname of the project's / global table, or a .kicad_blocks
-/// directory by its absolute path
-struct LIBRARY
-{
-    wxString nickname;   ///< the table's name, or the directory's name without extension
-    wxString path;       ///< the directory (path form only)
-
-    bool IsPath() const { return !path.IsEmpty(); }
-};
-
-
-DESIGN_BLOCK_LIBRARY_ADAPTER* tableLibraries( PROJECT* aProject )
-{
-    DESIGN_BLOCK_LIBRARY_ADAPTER* adapter = aProject ? aProject->DesignBlockLibs() : nullptr;
-
-    if( adapter )
-    {
-        adapter->AsyncLoad();
-        KopenapiWaitLibraries( adapter );
-    }
-
-    return adapter;
-}
-
-
-IO_RELEASER<DESIGN_BLOCK_IO> blockIo()
-{
-    return IO_RELEASER<DESIGN_BLOCK_IO>( DESIGN_BLOCK_IO_MGR::FindPlugin( DESIGN_BLOCK_IO_MGR::KICAD_SEXP ) );
-}
-
-
-/// @brief The library of aArgs["library"]; an error text when it names neither a table library nor
-/// an absolute .kicad_blocks path (aMustExist: the directory is there)
-std::optional<LIBRARY> resolveLibrary( PROJECT* aProject, const nlohmann::json& aArgs, bool aMustExist,
-                                       std::string& aError, int& aStatus )
-{
-    const std::string spec = aArgs.value( "library", std::string() );
-    aStatus = 400;
-
-    if( spec.empty() )
-    {
-        aError = "library: a design block library nickname (pcb_design_block_list) or the absolute path of a ."
-                 + FILEEXT::KiCadDesignBlockLibPathExtension + " directory";
-        return std::nullopt;
-    }
-
-    wxFileName     dir = wxFileName::DirName( wx( spec ) );
-    const wxString ext = wxS( "." ) + wxString( FILEEXT::KiCadDesignBlockLibPathExtension );
-
-    if( wx( spec ).EndsWith( ext ) || spec.find_first_of( "/\\" ) != std::string::npos )
-    {
-        if( !dir.IsAbsolute() || !wx( spec ).EndsWith( ext ) )
-        {
-            aError = "library: an absolute path ending in ." + FILEEXT::KiCadDesignBlockLibPathExtension;
-            return std::nullopt;
-        }
-
-        if( aMustExist && !dir.DirExists() )
-        {
-            aStatus = 404;
-            aError = "library: no design block library at " + spec;
-            return std::nullopt;
-        }
-
-        wxString path = dir.GetPath();
-        return LIBRARY{ wxFileName( path ).GetName(), path };
-    }
-
-    DESIGN_BLOCK_LIBRARY_ADAPTER* adapter = tableLibraries( aProject );
-
-    if( !adapter || !adapter->HasLibrary( wx( spec ) ) )
-    {
-        std::string names;
-
-        if( adapter )
-        {
-            for( const wxString& name : adapter->GetLibraryNames() )
-                names += ( names.empty() ? "" : ", " ) + str( name );
-        }
-
-        aStatus = 404;
-        aError = "library: no design block library '" + spec + "' in the library tables ("
-                 + ( names.empty() ? std::string( "none" ) : names ) + "); or give the absolute path of a ."
-                 + FILEEXT::KiCadDesignBlockLibPathExtension + " directory";
-        return std::nullopt;
-    }
-
-    return LIBRARY{ wx( spec ), wxString() };
-}
-
-
-bool blockExists( PROJECT* aProject, const LIBRARY& aLib, const wxString& aName )
-{
-    if( aLib.IsPath() )
-        return wxFileName::DirExists( aLib.path + wxFileName::GetPathSeparator() + aName + wxS( "." )
-                                      + wxString( FILEEXT::KiCadDesignBlockPathExtension ) );
-
-    return tableLibraries( aProject )->DesignBlockExists( aLib.nickname, aName );
-}
-
-
-/// @brief The block, loaded (its files' paths in the library); nullptr with aError set
-std::unique_ptr<DESIGN_BLOCK> loadBlock( PROJECT* aProject, const LIBRARY& aLib, const wxString& aName,
-                                         std::string& aError )
-{
-    std::unique_ptr<DESIGN_BLOCK> block;
-
-    try
-    {
-        if( aLib.IsPath() )
-            block.reset( blockIo()->DesignBlockLoad( aLib.path, aName ) );
-        else
-        {
-            wxString error;
-            block.reset( tableLibraries( aProject )->LoadDesignBlock( aLib.nickname, aName, false, &error ) );
-
-            if( !block )
-                aError = str( error );
-        }
-    }
-    catch( const IO_ERROR& error )
-    {
-        aError = str( error.What() );
-    }
-
-    if( block )
-        block->SetLibId( LIB_ID( aLib.nickname, aName ) );
-    else if( aError.empty() )
-        aError = "could not read the design block";
-
-    return block;
-}
-
-
-/// @brief Write aBlock (its board / schematic files are read from where they are) into the library
-void saveBlock( PROJECT* aProject, const LIBRARY& aLib, const DESIGN_BLOCK& aBlock )
-{
-    if( aLib.IsPath() )
-    {
-        IO_RELEASER<DESIGN_BLOCK_IO> io = blockIo();
-
-        if( !wxFileName::DirExists( aLib.path ) )
-            io->CreateLibrary( aLib.path );
-
-        io->DesignBlockSave( aLib.path, &aBlock );
-        return;
-    }
-
-    if( tableLibraries( aProject )->SaveDesignBlock( aLib.nickname, &aBlock ) != DESIGN_BLOCK_LIBRARY_ADAPTER::SAVE_OK )
-        THROW_IO_ERROR( wxString::Format( wxS( "the library '%s' did not save the design block" ), aLib.nickname ) );
-}
-
-
-nlohmann::json blockJson( const DESIGN_BLOCK& aBlock )
-{
-    return { { "name", str( aBlock.GetLibId().GetLibItemName() ) },
-             { "lib_id", str( aBlock.GetLibId().Format() ) },
-             { "description", str( aBlock.GetLibDescription() ) },
-             { "keywords", str( aBlock.GetKeywords() ) },
-             { "has_layout", !aBlock.GetBoardFile().IsEmpty() && wxFileName::FileExists( aBlock.GetBoardFile() ) },
-             { "has_schematic",
-               !aBlock.GetSchematicFile().IsEmpty() && wxFileName::FileExists( aBlock.GetSchematicFile() ) } };
-}
+const std::string LIST = "pcb_design_block_list";
 
 
 KOPENAPI_RESULT h_pcb_design_block_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
@@ -229,70 +59,13 @@ KOPENAPI_RESULT h_pcb_design_block_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( !context )
         return KopenapiNoBoard();
 
-    PROJECT* project = context->GetBoard()->GetProject();
+    return KopenapiDesignBlockList( context->GetBoard()->GetProject(), aArgs, LIST );
+}
 
-    if( !aArgs.contains( "library" ) )
-    {
-        DESIGN_BLOCK_LIBRARY_ADAPTER* adapter = tableLibraries( project );
-        nlohmann::json                libs = nlohmann::json::array();
 
-        if( adapter )
-        {
-            for( const wxString& name : adapter->GetLibraryNames() )
-            {
-                nlohmann::json lib = { { "nickname", str( name ) },
-                                       { "blocks", adapter->GetDesignBlockNames( name ).size() } };
-
-                if( std::optional<wxString> desc = adapter->GetLibraryDescription( name ) )
-                    lib["description"] = str( *desc );
-
-                libs.push_back( lib );
-            }
-        }
-
-        return KOPENAPI_RESULT::Ok( { { "libraries", libs } } );
-    }
-
-    std::string           error;
-    int                   status = 400;
-    std::optional<LIBRARY> lib = resolveLibrary( project, aArgs, true, error, status );
-
-    if( !lib )
-        return KOPENAPI_RESULT::Error( status, error );
-
-    wxArrayString names;
-
-    try
-    {
-        if( lib->IsPath() )
-            blockIo()->DesignBlockEnumerate( names, lib->path, true );
-        else
-        {
-            for( const wxString& name : tableLibraries( project )->GetDesignBlockNames( lib->nickname ) )
-                names.Add( name );
-        }
-    }
-    catch( const IO_ERROR& ioe )
-    {
-        return KOPENAPI_RESULT::Error( 422, "library: " + str( ioe.What() ) );
-    }
-
-    names.Sort();
-    nlohmann::json blocks = nlohmann::json::array();
-
-    for( const wxString& name : names )
-    {
-        std::string                   loadError;
-        std::unique_ptr<DESIGN_BLOCK> block = loadBlock( project, *lib, name, loadError );
-
-        if( block )
-            blocks.push_back( blockJson( *block ) );
-        else
-            blocks.push_back( { { "name", str( name ) }, { "error", loadError } } );
-    }
-
-    return KOPENAPI_RESULT::Ok(
-            { { "library", str( lib->IsPath() ? lib->path : lib->nickname ) }, { "blocks", blocks } } );
+double toMm( double aIU )
+{
+    return std::round( ( aIU / pcbIUScale.IU_PER_MM ) * 1000.0 ) / 1000.0;
 }
 
 
@@ -320,14 +93,14 @@ KOPENAPI_RESULT h_pcb_design_block_save( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     BOARD*   board = context->GetBoard();
     PROJECT* project = board->GetProject();
 
-    std::string            error;
-    int                    status = 400;
-    std::optional<LIBRARY> lib = resolveLibrary( project, aArgs, false, error, status );
+    std::string                        error;
+    int                                status = 400;
+    std::optional<KOPENAPI_DB_LIBRARY> lib = KopenapiDesignBlockLibrary( project, aArgs, false, LIST, error, status );
 
     if( !lib )
         return KOPENAPI_RESULT::Error( status, error );
 
-    if( !lib->IsPath() && !tableLibraries( project )->IsDesignBlockLibWritable( lib->nickname ) )
+    if( !KopenapiDesignBlockLibraryWritable( project, *lib ) )
         return KOPENAPI_RESULT::Error( 409, "library: '" + str( lib->nickname ) + "' is read-only" );
 
     // what to save: the whole board, one group (its members; the group gets the link) or items
@@ -379,11 +152,11 @@ KOPENAPI_RESULT h_pcb_design_block_save( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( name.IsEmpty() || name.find_first_of( wxS( "/\\:" ) ) != wxString::npos )
         return KOPENAPI_RESULT::Error( 400, "name: the design block's name (no / \\ :)" );
 
-    const bool exists = blockExists( project, *lib, name );
+    const bool exists = KopenapiDesignBlockExists( project, *lib, name );
 
     if( exists && !aArgs.value( "overwrite", false ) )
         return KOPENAPI_RESULT::Error( 409, "design block '" + str( name ) + "' already exists in "
-                                                    + str( lib->IsPath() ? lib->path : lib->nickname )
+                                                    + lib->Name()
                                                     + ": overwrite: true replaces its layout" );
 
     // overwriting keeps the block's description, keywords, fields and schematic, as Update Design
@@ -393,7 +166,7 @@ KOPENAPI_RESULT h_pcb_design_block_save( KOPENAPI_CONTEXT& aCtx, const nlohmann:
     if( exists )
     {
         std::string                   loadError;
-        std::unique_ptr<DESIGN_BLOCK> old = loadBlock( project, *lib, name, loadError );
+        std::unique_ptr<DESIGN_BLOCK> old = KopenapiLoadDesignBlock( project, *lib, name, loadError );
 
         if( old )
         {
@@ -425,7 +198,7 @@ KOPENAPI_RESULT h_pcb_design_block_save( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
         pi->SaveBoard( tempFile, wholeBoard ? *board : *blockBoard, nullptr );
         block.SetBoardFile( tempFile );
-        saveBlock( project, *lib, block );
+        KopenapiSaveDesignBlock( project, *lib, block );
     }
     catch( const IO_ERROR& ioe )
     {
@@ -516,9 +289,9 @@ KOPENAPI_RESULT h_pcb_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
     BOARD*   brd = context->GetBoard();
     PROJECT* project = brd->GetProject();
 
-    std::string            error;
-    int                    status = 400;
-    std::optional<LIBRARY> lib = resolveLibrary( project, aArgs, true, error, status );
+    std::string                        error;
+    int                                status = 400;
+    std::optional<KOPENAPI_DB_LIBRARY> lib = KopenapiDesignBlockLibrary( project, aArgs, true, LIST, error, status );
 
     if( !lib )
         return KOPENAPI_RESULT::Error( status, error );
@@ -540,11 +313,11 @@ KOPENAPI_RESULT h_pcb_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
         at = VECTOR2I( pcbIUScale.mmToIU( a[0].get<double>() ), pcbIUScale.mmToIU( a[1].get<double>() ) );
     }
 
-    if( !blockExists( project, *lib, name ) )
+    if( !KopenapiDesignBlockExists( project, *lib, name ) )
         return KOPENAPI_RESULT::Error( 404, "name: no design block '" + str( name ) + "' in "
-                                                    + str( lib->IsPath() ? lib->path : lib->nickname ) );
+                                                    + lib->Name() );
 
-    std::unique_ptr<DESIGN_BLOCK> block = loadBlock( project, *lib, name, error );
+    std::unique_ptr<DESIGN_BLOCK> block = KopenapiLoadDesignBlock( project, *lib, name, error );
 
     if( !block )
         return KOPENAPI_RESULT::Error( 422, "name: " + error );
@@ -787,8 +560,7 @@ KOPENAPI_REGISTER( "pcb_design_block_list",
                    "the libraries of the global and project tables (nickname, description, blocks); with library "
                    "(a nickname, or the absolute path of a .kicad_blocks directory) its blocks: name, lib_id, "
                    "description, keywords, has_layout, has_schematic",
-                   R"json({"type":"object","properties":{"library":{"type":"string"}}})json"_json,
-                   false, h_pcb_design_block_list );
+                   KopenapiDesignBlockListSchema(), false, h_pcb_design_block_list );
 
 KOPENAPI_REGISTER( "pcb_design_block_save",
                    "Save as Design Block, as the editor's: without items / group the whole board (Save Board as "

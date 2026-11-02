@@ -1278,6 +1278,25 @@ std::optional<VECTOR2I> wireEnd( SCHEMATIC* aSchematic, const nlohmann::json& aE
 } // namespace
 
 
+std::optional<SCH_SHEET_PATH> KopenapiSchTargetSheet( SCH_CONTEXT& aContext, const nlohmann::json& aArgs )
+{
+    return targetSheet( aContext, aArgs );
+}
+
+
+wxString KopenapiSchNextFreeRef( SCHEMATIC* aSchematic, const wxString& aPrefix, std::set<wxString>& aTaken )
+{
+    return nextFreeRef( aSchematic, aPrefix, aTaken );
+}
+
+
+void KopenapiSchPushEdit( SCH_COMMIT& aCommit, SCHEMATIC* aSchematic, const wxString& aMessage, KIWAY* aKiway,
+                          const std::vector<KIID>& aGlow )
+{
+    pushEdit( aCommit, aSchematic, aMessage, aKiway, aGlow );
+}
+
+
 static KOPENAPI_RESULT h_sch_wire( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
