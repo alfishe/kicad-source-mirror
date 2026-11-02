@@ -23,6 +23,7 @@
 #include <tools/zone_create_helper.h>
 #include <tool/tool_manager.h>
 #include <zone.h>
+#include <zone_cutout.h>
 #include <pcb_shape.h>
 #include <footprint.h>
 #include <board_commit.h>
@@ -175,46 +176,13 @@ std::unique_ptr<ZONE> ZONE_CREATE_HELPER::createZoneFromExisting( const ZONE& aS
 void ZONE_CREATE_HELPER::performZoneCutout( ZONE& aZone, const ZONE& aCutout )
 {
     BOARD_COMMIT commit( &m_tool );
-    std::vector<ZONE*> newZones;
 
-    // Clear the selection before removing the old zone
+    // Clear the selection before the zone changes
     TOOL_MANAGER* toolMgr = m_tool.GetManager();
     toolMgr->RunAction( ACTIONS::selectionClear );
 
-    SHAPE_POLY_SET originalOutline( *aZone.Outline() );
-    SHAPE_POLY_SET cutoutOutline( *aCutout.Outline() );
+    std::vector<ZONE*> newZones = ZoneCutout( commit, aZone, *aCutout.Outline() );
 
-    // Clipper2 cannot carry arcs through boolean operations when either operand has holes or
-    // the clip side has outlines, so strip arc metadata first. Without this, zones built from
-    // circles (or any arc-bearing outline) get corrupt arc endpoints written to disk and
-    // render as garbage after reload. See SHAPE_POLY_SET::booleanOp.
-    originalOutline.ClearArcs();
-    cutoutOutline.ClearArcs();
-
-    originalOutline.BooleanSubtract( cutoutOutline );
-
-    // After substracting the hole, originalOutline can have more than one main outline.
-    // But a zone can have only one main outline, so create as many zones as originalOutline
-    // contains main outlines:
-    for( int outline = 0; outline < originalOutline.OutlineCount(); outline++ )
-    {
-        SHAPE_POLY_SET* newZoneOutline = new SHAPE_POLY_SET;
-        newZoneOutline->AddOutline( originalOutline.Outline( outline ) );
-
-        // Add holes (if any) to the new zone outline:
-        for (int hole = 0; hole < originalOutline.HoleCount( outline ) ; hole++ )
-            newZoneOutline->AddHole( originalOutline.CHole( outline, hole ) );
-
-        ZONE* newZone = new ZONE( aZone );
-        newZone->SetOutline( newZoneOutline );  // zone takes ownership
-        newZone->SetLocalFlags( 1 );
-        newZone->HatchBorder();
-        newZone->UnFill();
-        newZones.push_back( newZone );
-        commit.Add( newZone );
-    }
-
-    commit.Remove( &aZone );
     commit.Push( _( "Add Zone Cutout" ) );
 
     // Select the new zone and set it as the source for the next cutout

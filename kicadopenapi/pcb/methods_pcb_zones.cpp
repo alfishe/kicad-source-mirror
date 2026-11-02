@@ -31,6 +31,7 @@
 #include <string_utils.h>
 #include <tool/tool_manager.h>
 #include <zone.h>
+#include <zone_cutout.h>
 #include <zone_filler.h>
 
 #include <algorithm>
@@ -938,9 +939,9 @@ std::vector<ZONE*> poursUnder( BOARD* aBoard, ZONE* aKeepout, const BOX2I& aArea
 
 
 /// @brief The answer of a keep-out edit, pushed as one undo step: the pours under it refilled into
-/// aCommit (when aRefill), the keep-out and what it now bars
+/// aCommit (when aRefill), the keep-out and what it now bars (nothing of a removed one)
 nlohmann::json pushKeepout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, BOARD_COMMIT& aCommit, ZONE* aZone,
-                            const BOX2I& aArea, bool aRefill, const wxString& aMessage )
+                            const BOX2I& aArea, bool aRefill, const wxString& aMessage, bool aRemoved = false )
 {
     BOARD*             board = aContext.GetBoard();
     std::vector<ZONE*> pours = poursUnder( board, aZone, aArea );
@@ -967,12 +968,17 @@ nlohmann::json pushKeepout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, BOARD
     board->BuildConnectivity();
     board->GetConnectivity()->RecalculateRatsnest();
 
-    nlohmann::json       answer = keepoutJson( board, aZone );
-    const nlohmann::json bad = keepoutViolations( board, aZone );
-    constexpr size_t     shown = 200;
+    nlohmann::json answer = aRemoved ? nlohmann::json::object() : keepoutJson( board, aZone );
 
-    answer["violations"] = bad.size() > shown ? nlohmann::json( std::vector<nlohmann::json>( bad.begin(), bad.begin() + shown ) ) : bad;
-    answer["violations_total"] = bad.size();
+    if( !aRemoved )
+    {
+        const nlohmann::json bad = keepoutViolations( board, aZone );
+        constexpr size_t     shown = 200;
+
+        answer["violations"] = bad.size() > shown ? nlohmann::json( std::vector<nlohmann::json>( bad.begin(), bad.begin() + shown ) ) : bad;
+        answer["violations_total"] = bad.size();
+    }
+
     answer["zones_refilled"] = pours.size();
 
     if( !filled )
@@ -985,7 +991,8 @@ nlohmann::json pushKeepout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, BOARD
         if( auto* frame = ZONE_GLOW_TRAITS::Frame( aCtx.kiway ) )
             frame->GetCanvas()->Refresh();
 
-        KopenapiGlow<ZONE_GLOW_TRAITS>( aCtx.kiway, { aZone->m_Uuid }, 0 );
+        if( !aRemoved )
+            KopenapiGlow<ZONE_GLOW_TRAITS>( aCtx.kiway, { aZone->m_Uuid }, 0 );
     }
 
     return answer;
@@ -1011,6 +1018,9 @@ static KOPENAPI_RESULT h_pcb_zone_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             continue;
 
         items.push_back( zoneJson( board, zone ) );
+
+        if( aArgs.value( "geometry", false ) )
+            items.back()["contours_mm"] = KopenapiContoursMm( *zone->Outline() );
     }
 
     return KOPENAPI_RESULT::Ok( { { "items", items }, { "total", items.size() } } );
@@ -1092,6 +1102,86 @@ static KOPENAPI_RESULT updateKeepout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aCont
 }
 
 
+/// @brief pcb_zone_update op cutout (Add Zone Cutout, core ZoneCutout): the polygon cut from one
+/// zone or keep-out; the zone keeps the first piece left, further pieces become zones of their own,
+/// nothing left removes it.  One undo step with the refill
+static KOPENAPI_RESULT cutoutZone( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, ZONE* aZone, const nlohmann::json& aArgs )
+{
+    BOARD* board = aContext.GetBoard();
+
+    for( const auto& [key, value] : aArgs.items() )
+    {
+        if( key != "op" && key != "uuid" && key != "points" && key != "rect" && key != "fill" && key != "override_locks" )
+            return KOPENAPI_RESULT::Error( 400, key + ": op cutout takes uuid, points or rect (the cutout), fill and override_locks" );
+    }
+
+    if( !aArgs.contains( "points" ) && !aArgs.contains( "rect" ) )
+        return KOPENAPI_RESULT::Error( 400, "op cutout: the cutout as points [[x_mm, y_mm], ...] or rect [x0, y0, x1, y1]" );
+
+    std::string            error;
+    const SHAPE_LINE_CHAIN chain = outlineArg( aArgs, error );
+
+    if( !error.empty() )
+        return KOPENAPI_RESULT::Error( 400, error );
+
+    if( aZone->IsLocked() && !aArgs.value( "override_locks", false ) )
+        return KOPENAPI_RESULT::Error( 409, "zone " + str( aZone->m_Uuid.AsString() ) + " is locked (pcb_unlock, or override_locks)" );
+
+    SHAPE_POLY_SET cutout;
+    cutout.AddOutline( chain );
+
+    SHAPE_POLY_SET common = aZone->Outline()->CloneDropTriangulation();
+    common.ClearArcs();
+    common.BooleanIntersection( cutout );
+
+    if( common.IsEmpty() )
+        return KOPENAPI_RESULT::Error( 422, "the cutout does not overlap the zone's area (outside it or inside a hole)" );
+
+    const bool         keepout = aZone->GetIsRuleArea();
+    const wxString     message = _( "Add Zone Cutout" );
+    BOX2I              area = aZone->GetBoundingBox();
+    BOARD_COMMIT       commit( aContext.GetToolManager() );
+    std::vector<ZONE*> zones = ZoneCutout( commit, *aZone, cutout );
+    nlohmann::json     uuids = nlohmann::json::array();
+
+    for( ZONE* zone : zones )
+        uuids.push_back( str( zone->m_Uuid.AsString() ) );
+
+    nlohmann::json answer;
+
+    if( keepout )
+    {
+        answer = pushKeepout( aCtx, aContext, commit, zones.empty() ? aZone : zones.front(), area, aArgs.value( "fill", true ),
+                              message, zones.empty() );
+    }
+    else
+    {
+        commit.Push( message );
+
+        if( zones.empty() )
+        {
+            board->BuildConnectivity();
+            board->GetConnectivity()->RecalculateRatsnest();
+            answer = KopenapiUnroutedJson( board );
+        }
+        else if( aArgs.value( "fill", true ) )
+        {
+            answer = fill( aCtx, aContext, zones, nullptr, true );
+        }
+        else
+        {
+            answer["needs_refill"] = true;
+        }
+    }
+
+    answer["uuids"] = uuids;
+    answer["removed"] = zones.empty();
+    answer["split"] = zones.size() > 1;
+    answer["description"] = str( message );
+    return KOPENAPI_RESULT::Ok( answer );
+}
+
+
 static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -1104,10 +1194,21 @@ static KOPENAPI_RESULT h_pcb_zone_update( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( std::optional<KOPENAPI_RESULT> refused = footprintZoneRefusal( board, aArgs ) )
         return *refused;
 
+    const std::string op = aArgs.value( "op", std::string( "set" ) );
+
+    if( op != "set" && op != "cutout" )
+        return KOPENAPI_RESULT::Error( 400, "op: set (the default) or cutout" );
+
+    if( op == "cutout" && !aArgs.contains( "uuid" ) )
+        return KOPENAPI_RESULT::Error( 400, "op cutout: one zone or keep-out by uuid" );
+
     std::vector<ZONE*> zones = namedZones( board, aArgs, error );
 
     if( zones.empty() )
         return KOPENAPI_RESULT::Error( 404, error );
+
+    if( op == "cutout" )
+        return cutoutZone( aCtx, *context, zones.front(), aArgs );
 
     if( zones.front()->GetIsRuleArea() )
         return updateKeepout( aCtx, *context, zones.front(), aArgs );
@@ -1740,8 +1841,9 @@ KOPENAPI_REGISTER( "pcb_zone_list",
                    "Copper zones (pours; keep-outs: pcb_keepout_list) with uuid, net, layers, outline (outline_mm, bbox_mm), priority, pad connection, clearance, minimum "
                    "width, thermal gap / spoke, filled area and islands; a fill in more than one piece on a "
                    "layer lists each (island_list: box, area, pads / vias / tracks of the net on it - one with "
-                   "pads and no via is cut off and needs one)",
-                   R"json({"type":"object","properties":{"net":{"type":"string"}}})json"_json,
+                   "pads and no via is cut off and needs one); geometry: every contour (contours_mm: each outline, then its holes)",
+                   R"json({"type":"object","properties":{"net":{"type":"string"},
+                        "geometry":{"type":"boolean","default":false,"description":"contours_mm: the outline's contours (outline, then holes)"}}})json"_json,
                    false, h_pcb_zone_list );
 
 KOPENAPI_REGISTER( "pcb_zone_update",
@@ -1750,8 +1852,11 @@ KOPENAPI_REGISTER( "pcb_zone_update",
                    "false to skip); one undo step.  A keep-out (by uuid): points / rect, layers, name and its no_* flags, the "
                    "pours under it refilled; answers what it now bars (violations).  A rule area inside a footprint "
                    "(pcb_keepout_list footprint_owned): 409 naming the footprint; change it in the library footprint and "
-                   "pcb_footprint_lib_update",
+                   "pcb_footprint_lib_update.  op cutout (Add Zone Cutout): points / rect cut from one zone or keep-out (by "
+                   "uuid); the zone keeps the first piece left, each further piece becomes a zone of its own (uuids), "
+                   "nothing left removes it; 422 when the cutout misses the zone's area",
                    R"json({"type":"object","properties":{
+                        "op":{"type":"string","enum":["set","cutout"],"default":"set","description":"cutout: points / rect are cut from the zone"},
                         "uuid":{"type":"string"},"net":{"type":"string","description":"every zone of this net (instead of uuid)"},
                         "set_net":{"type":"string","description":"new net of the zones"},
                         "points":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"new outline [[x_mm, y_mm], ...] (one zone; or rect)"},
@@ -1765,7 +1870,7 @@ KOPENAPI_REGISTER( "pcb_zone_update",
                         "layers":{"type":"array","items":{"type":"string"},"description":"keep-out: copper layers, \"*.Cu\" for all"},
                         "no_tracks":{"type":"boolean"},"no_vias":{"type":"boolean"},"no_pads":{"type":"boolean"},
                         "no_copper_pour":{"type":"boolean"},"no_footprints":{"type":"boolean"},
-                        "override_locks":{"type":"boolean","default":false,"description":"keep-out: change a locked one"},
+                        "override_locks":{"type":"boolean","default":false,"description":"keep-out or cutout: change a locked one"},
                         "fill":{"type":"boolean","default":true}}})json"_json,
                    false, h_pcb_zone_update, 300 );
 
