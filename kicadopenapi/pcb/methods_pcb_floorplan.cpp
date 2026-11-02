@@ -10,7 +10,8 @@
 /// one path portal to portal from its pads' boxes in one block to those in the other; each channel it
 /// crosses (portals, and the inner grid lines of the free regions it goes through) carries its width
 /// (track + clearance of each net's class).  Overflows are negotiated over channels (PathFinder costs:
-/// present overuse and history).
+/// present overuse and history).  A bus leaves and enters its end parts' boxes by the side their pads
+/// face (pcb_layout_graph); a box side's free facing length per layer is its port capacity.
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -29,6 +30,7 @@
 #include <zone.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -176,11 +178,31 @@ struct LINK
     double           demand = 0;   ///< mm
     std::set<std::string> classes;
     std::set<int>    aBoxes, bBoxes;   ///< the boxes its nets leave from at a and at b
+    int              aPort = -1, bPort = -1;           ///< pcb_layout_graph: the end part's box ...
+    int              aSide = -1, bSide = -1;           ///< ... and the side its pads face (SIDES)
+    bool             sidesKept = true;                 ///< false: no way out by those sides
+    int              aExit = -1, bExit = -1;           ///< the boxes and sides its path leaves and enters by
+    int              aExitSide = -1, bExitSide = -1;
     std::vector<int> cuts;
     std::set<int>    crosses;
     double           length = 0;
     bool             found = false;
 };
+
+
+const char* const SIDES[4] = { "west", "east", "north", "south" };
+
+
+int sideIndex( const std::string& aName )
+{
+    for( int k = 0; k < 4; ++k )
+    {
+        if( aName == SIDES[k] )
+            return k;
+    }
+
+    return -1;
+}
 
 
 std::string obstacleName( const CELL& aCell, const std::vector<FP_BLOCK>& aBlocks, const std::vector<FP_KEEPOUT>& aKeepouts )
@@ -325,10 +347,17 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     std::map<int, std::string> busOfNet;
+    std::map<std::string, std::map<std::string, std::pair<std::string, int>>> busEnds;   ///< bus -> block -> part, side
 
     for( const nlohmann::json& bus : graphResult.body.value( "buses", nlohmann::json::array() ) )
     {
         const std::string name = bus.value( "name", std::string() );
+
+        for( const nlohmann::json& e : bus.value( "ends", nlohmann::json::array() ) )
+        {
+            busEnds[name][e.value( "block", std::string() )] = { e.value( "part", std::string() ),
+                                                                 sideIndex( e.value( "side", std::string() ) ) };
+        }
 
         for( const nlohmann::json& n : bus.value( "nets", nlohmann::json::array() ) )
         {
@@ -737,6 +766,33 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     for( auto& [key, l] : linkMap )
         links.push_back( std::move( l ) );
 
+    // a bus leaves (enters) a block by the side of its end part that its pads face
+    const bool portSides = aArgs.value( "port_sides", true );
+
+    for( LINK& l : links )
+    {
+        auto be = portSides && !l.bus.empty() ? busEnds.find( l.bus ) : busEnds.end();
+
+        if( be == busEnds.end() )
+            continue;
+
+        for( auto [blk, port, side] : { std::tie( l.a, l.aPort, l.aSide ), std::tie( l.b, l.bPort, l.bSide ) } )
+        {
+            auto e = be->second.find( blocks[blk].name );
+
+            if( e == be->second.end() || e->second.second < 0 )
+                continue;
+
+            auto bx = boxOfRef.find( e->second.first );
+
+            if( bx != boxOfRef.end() && boxes[bx->second].block == blk )
+            {
+                port = bx->second;
+                side = e->second.second;
+            }
+        }
+    }
+
     // the grid: lines at the obstacles' edges
     BOX2I extent = usable.BBox();
 
@@ -890,12 +946,14 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     std::vector<std::vector<int>> boxCells( boxes.size() );
+    std::vector<std::array<int, 4>> boxSpan( boxes.size() );   ///< cells i0, i1, j0, j1 (ends exclusive)
 
     for( size_t k = 0; k < boxes.size(); ++k )
     {
         const auto [i0, i1] = spanX( boxes[k].box );
         const auto [j0, j1] = spanY( boxes[k].box );
         const int  b = boxes[k].block;
+        boxSpan[k] = { i0, i1, j0, j1 };
 
         for( int j = j0; j < j1; ++j )
         {
@@ -1200,7 +1258,12 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     std::vector<double>   cost( nodes ), cutCostAt( cuts.size() ), pointX( nodes ), pointY( nodes );
     std::vector<int>      prev( nodes );
     std::vector<unsigned> seenAt( nodes, 0 ), doneAt( nodes, 0 ), targetAt( regions.size(), 0 ),
-            preAt( regions.size(), 0 ), cutAt( cuts.size(), 0 );
+            preAt( regions.size(), 0 ), cutAt( cuts.size(), 0 ), factorAt( regions.size(), 0 );
+    std::vector<double>   regionFactor( regions.size(), 1.0 );
+    std::vector<char>     regionFree( regions.size() );
+
+    for( size_t r = 0; r < regions.size(); ++r )
+        regionFree[r] = cells[regions[r].cell].kind == CELL_FREE;
     unsigned              epoch = 0;
 
     auto has = []( const CELL& aCell, int aBlock )
@@ -1224,12 +1287,28 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return std::make_pair( aOff + int( std::upper_bound( b, e, lo ) - b ), aOff + int( std::lower_bound( b, e, hi ) - b ) );
     };
 
-    auto routeLink = [&]( LINK& aLink, double aPresent )
+    // the side of a box a portal lies on, -1: none
+    auto portalSide = [&]( const PORTAL& aP, int aBox )
     {
-        const std::set<int> fromBoxes = aLink.aBoxes.empty() ? std::set<int>( blocks[aLink.a].boxes.begin(), blocks[aLink.a].boxes.end() )
-                                                             : aLink.aBoxes;
-        const std::set<int> toBoxes = aLink.bBoxes.empty() ? std::set<int>( blocks[aLink.b].boxes.begin(), blocks[aLink.b].boxes.end() )
-                                                           : aLink.bBoxes;
+        const std::array<int, 4>& sp = boxSpan[aBox];
+
+        if( aP.vertical )
+            return aP.at == toMm( xs[sp[0]] ) ? 0 : aP.at == toMm( xs[sp[1]] ) ? 1 : -1;
+
+        return aP.at == toMm( ys[sp[2]] ) ? 2 : aP.at == toMm( ys[sp[3]] ) ? 3 : -1;
+    };
+
+    bool anyHistory = false;
+
+    auto routeLink = [&]( LINK& aLink, double aPresent, bool aSides )
+    {
+        const bool   aOn = aSides && aLink.aPort >= 0, bOn = aSides && aLink.bPort >= 0;
+        const std::set<int> fromBoxes = aOn                   ? std::set<int>{ aLink.aPort }
+                                        : aLink.aBoxes.empty() ? std::set<int>( blocks[aLink.a].boxes.begin(), blocks[aLink.a].boxes.end() )
+                                                               : aLink.aBoxes;
+        const std::set<int> toBoxes = bOn                   ? std::set<int>{ aLink.bPort }
+                                      : aLink.bBoxes.empty() ? std::set<int>( blocks[aLink.b].boxes.begin(), blocks[aLink.b].boxes.end() )
+                                                             : aLink.bBoxes;
         BOX2I target = boxes[*toBoxes.begin()].box;
 
         for( int k : toBoxes )
@@ -1291,7 +1370,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         {
             const REGION& r = regions[aRegion];
 
-            if( r.vCount <= 0 && r.hCount <= 0 )
+            if( ( r.vCount <= 0 && r.hCount <= 0 ) || ( aPresent <= 0 && !anyHistory ) )
                 return 0.0;
 
             prefix( aRegion );
@@ -1303,18 +1382,35 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         // 0: no way in; else the cost factor per mm inside
         auto factorOf = [&]( int aRegion )
         {
-            const CELL& c = cells[regions[aRegion].cell];
+            if( factorAt[aRegion] != epoch )
+            {
+                const CELL& c = cells[regions[aRegion].cell];
+                factorAt[aRegion] = epoch;
+                regionFactor[aRegion] = c.kind != CELL_BLOCK || has( c, aLink.a ) || has( c, aLink.b ) ? 1.0
+                                        : c.inside                                                  ? foreignPenalty
+                                                                                                    : 0.0;
+            }
 
-            if( c.kind != CELL_BLOCK || has( c, aLink.a ) || has( c, aLink.b ) )
-                return 1.0;
-
-            return c.inside ? foreignPenalty : 0.0;
+            return regionFactor[aRegion];
         };
 
         aLink.cuts.clear();
         aLink.crosses.clear();
         aLink.length = 0;
         aLink.found = false;
+        aLink.aExit = aLink.bExit = aLink.aExitSide = aLink.bExitSide = -1;
+
+        // a node into the target by its side only
+        auto intoTarget = [&]( int aNode )
+        {
+            return targetAt[entered( aNode )] == epoch
+                   && ( !bOn || portalSide( portals[aNode >> 1], aLink.bPort ) == aLink.bSide );
+        };
+
+        auto barred = [&]( int aNode )
+        {
+            return factorOf( entered( aNode ) ) <= 0 || ( targetAt[entered( aNode )] == epoch && !intoTarget( aNode ) );
+        };
 
         std::vector<int> starts;
 
@@ -1350,7 +1446,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 prev[aNode] = aPrev;
                 pointX[aNode] = aAt.first;
                 pointY[aNode] = aAt.second;
-                open.emplace( aCost + h( aAt.first, aAt.second ), aNode );
+                open.emplace( aCost + h( aAt.first, aAt.second ) * ( 1 + 1e-6 ), aNode );   // ties: nearer the target first
             }
         };
 
@@ -1362,7 +1458,10 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             {
                 const int node = 2 * p + ( portals[p].r0 == r ? 1 : 0 );
 
-                if( factorOf( entered( node ) ) > 0 )
+                if( aOn && portalSide( portals[p], aLink.aPort ) != aLink.aSide )
+                    continue;
+
+                if( !barred( node ) )
                     relax( node, cutCost( portals[p].cut ), -1, nearest( portals[p], cx, cy ) );
             }
         }
@@ -1380,7 +1479,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             doneAt[node] = epoch;
             const int r = entered( node );
 
-            if( targetAt[r] == epoch )
+            if( intoTarget( node ) )
             {
                 reached = node;
                 break;
@@ -1388,7 +1487,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
             const double  x = pointX[node], y = pointY[node];
             const double  factor = factorOf( r );
-            const bool    inFree = cells[regions[r].cell].kind == CELL_FREE;
+            const bool    inFree = regionFree[r];
 
             for( int q : regions[r].portals )
             {
@@ -1398,7 +1497,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 const PORTAL& to = portals[q];
                 const int     next = 2 * q + ( to.r0 == r ? 1 : 0 );
 
-                if( doneAt[next] == epoch || factorOf( entered( next ) ) <= 0 )
+                if( doneAt[next] == epoch || barred( next ) )
                     continue;
 
                 const auto   at = nearest( to, x, y );
@@ -1418,6 +1517,25 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             path.push_back( k );
 
         std::reverse( path.begin(), path.end() );
+
+        // the boxes and sides it leaves and enters by
+        auto boxOf = [&]( const std::set<int>& aBoxes, int aRegion )
+        {
+            for( int k : aBoxes )
+            {
+                if( std::binary_search( boxRegions[k].begin(), boxRegions[k].end(), aRegion ) )
+                    return k;
+            }
+
+            return -1;
+        };
+
+        const PORTAL& first = portals[path.front() >> 1];
+        const PORTAL& last = portals[path.back() >> 1];
+        aLink.aExit = boxOf( fromBoxes, path.front() & 1 ? first.r0 : first.r1 );
+        aLink.bExit = boxOf( toBoxes, entered( path.back() ) );
+        aLink.aExitSide = aLink.aExit >= 0 ? portalSide( first, aLink.aExit ) : -1;
+        aLink.bExitSide = aLink.bExit >= 0 ? portalSide( last, aLink.bExit ) : -1;
 
         for( size_t k = 0; k < path.size(); ++k )
         {
@@ -1542,7 +1660,15 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             }
 
             apply( links[k], -1 );
-            routeLink( links[k], present );
+            const bool sided = links[k].sidesKept && ( links[k].aPort >= 0 || links[k].bPort >= 0 );
+            routeLink( links[k], present, links[k].sidesKept );
+
+            if( sided && !links[k].found )
+            {
+                routeLink( links[k], present, false );
+                links[k].sidesKept = false;
+            }
+
             apply( links[k], +1 );
             ++rerouted;
         }
@@ -1568,7 +1694,10 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             const double over = c.use - capacity( c );
 
             if( over > 1e-6 )
+            {
                 c.hist += over / defaultPitch;
+                anyHistory = true;
+            }
         }
     }
 
@@ -1591,6 +1720,71 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                 cuts[c].links.push_back( (int) k );
         }
     }
+
+    // ports: a box side the bundles leave or enter by, its facing free length per layer the capacity
+    struct PORT
+    {
+        double           demand = 0;
+        int              nets = 0;
+        bool             given = false;
+        std::vector<int> links;
+    };
+
+    std::map<std::pair<int, int>, PORT> ports;
+
+    for( size_t k = 0; k < links.size(); ++k )
+    {
+        const LINK& l = links[k];
+
+        for( auto [box, side, port] : { std::make_tuple( l.aExit, l.aExitSide, l.aPort ),
+                                        std::make_tuple( l.bExit, l.bExitSide, l.bPort ) } )
+        {
+            if( !l.found || box < 0 || side < 0 )
+                continue;
+
+            PORT& pt = ports[{ box, side }];
+            pt.demand += l.demand;
+            pt.nets += (int) l.nets.size();
+            pt.given |= l.sidesKept && port == box;
+            pt.links.push_back( (int) k );
+        }
+    }
+
+    // the facing length a side may be left by (free, or another box: tracks over it), per layer
+    auto portFree = [&]( int aBox, int aSide, int& aLength, int& aBoxes )
+    {
+        const std::array<int, 4>& sp = boxSpan[aBox];
+        std::vector<int>          facing( nl, 0 );
+        aLength = 0;
+        aBoxes = 0;
+        const bool across = aSide < 2;   // west / east: along y
+        const int  line = aSide == 0 ? sp[0] - 1 : aSide == 1 ? sp[1] : aSide == 2 ? sp[2] - 1 : sp[3];
+
+        if( line < 0 || line >= ( across ? nx : ny ) )
+            return facing;
+
+        for( int t = across ? sp[2] : sp[0]; t < ( across ? sp[3] : sp[1] ); ++t )
+        {
+            const CELL& c = across ? at( line, t ) : at( t, line );
+
+            if( c.kind != CELL_FREE && c.kind != CELL_BLOCK )
+                continue;
+
+            const int len = across ? ys[t + 1] - ys[t] : xs[t + 1] - xs[t];
+            aLength += len;
+
+            if( c.kind == CELL_BLOCK )
+                aBoxes += len;
+
+            for( int k = 0; k < nl; ++k )
+            {
+                if( !( c.blocked & ( uint64_t( 1 ) << k ) ) )
+                    facing[k] += len;
+            }
+        }
+
+        return facing;
+    };
 
     // answer
     auto netName = [&]( int aCode )
@@ -1743,7 +1937,11 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         for( int b : l.crosses )
             through.push_back( blocks[b].name );
 
+        auto sideJson = [&]( int aSide ) { return aSide >= 0 ? nlohmann::json( SIDES[aSide] ) : nlohmann::json(); };
+
         nlohmann::json j = { { "a", blocks[l.a].name }, { "b", blocks[l.b].name }, { "bus", l.bus.empty() ? nlohmann::json() : nlohmann::json( l.bus ) },
+                             { "a_side", sideJson( l.aExitSide ) }, { "b_side", sideJson( l.bExitSide ) },
+                             { "sides_from", l.aPort >= 0 || l.bPort >= 0 ? ( l.sidesKept ? "pcb_layout_graph" : "path (no way by the graph's sides)" ) : "path" },
                              { "nets", l.nets.size() }, { "net_names", names }, { "demand_mm", r2( l.demand ) },
                              { "classes", l.classes }, { "found", l.found }, { "path", path },
                              { "length_mm", r2( l.length ) }, { "through_blocks", through }, { "overflow", over } };
@@ -1751,6 +1949,60 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         linksMissing += !l.found;
         linksThrough += !l.crosses.empty();
         linkList.push_back( j );
+    }
+
+    nlohmann::json portList = nlohmann::json::array();
+    int            portsOver = 0;
+    std::vector<std::pair<double, nlohmann::json>> portRows;
+
+    for( const auto& [key, pt] : ports )
+    {
+        const auto [box, side] = key;
+        int        length = 0, intoBoxes = 0;
+        const std::vector<int> facing = portFree( box, side, length, intoBoxes );
+        nlohmann::json         perLayer = nlohmann::json::object();
+        long long              total = 0;
+        int                    tracks = 0;
+
+        for( int k = 0; k < nl; ++k )
+        {
+            perLayer[str( board->GetLayerName( routing[k] ) )] = r2( toMm( facing[k] ) );
+            total += facing[k];
+            tracks += facing[k] / std::max( 1, defaults.width + defaults.clearance );
+        }
+
+        const double   cap = toMm( double( total ) );
+        const double   use = cap > 0 ? pt.demand / cap : 1e9;
+        nlohmann::json names = nlohmann::json::array();
+
+        for( int k : pt.links )
+        {
+            if( (int) names.size() < listLimit )
+                names.push_back( linkName( links[k] ) );
+        }
+
+        nlohmann::json row = { { "block", blocks[boxes[box].block].name }, { "box_mm", boxMm( boxes[box].box ) },
+                               { "side", SIDES[side] }, { "from", pt.given ? "pcb_layout_graph" : "path" },
+                               { "length_mm", r2( toMm( length ) ) }, { "facing_boxes_mm", r2( toMm( intoBoxes ) ) },
+                               { "free_mm", perLayer }, { "capacity_mm", r2( cap ) },
+                               { "default_tracks", tracks }, { "demand_mm", r2( pt.demand ) }, { "demand_nets", pt.nets },
+                               { "use", r2( use ) }, { "links", names } };
+
+        if( pt.demand - cap > 1e-6 )
+        {
+            ++portsOver;
+            row["over_tracks"] = (int) std::ceil( ( pt.demand - cap ) / defaultPitch - 1e-9 );
+        }
+
+        portRows.emplace_back( use, std::move( row ) );
+    }
+
+    std::stable_sort( portRows.begin(), portRows.end(), []( const auto& x, const auto& y ) { return x.first > y.first; } );
+
+    for( auto& [use, row] : portRows )
+    {
+        if( (int) portList.size() < listLimit )
+            portList.push_back( std::move( row ) );
     }
 
     nlohmann::json blockList = nlohmann::json::array();
@@ -1836,6 +2088,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
               { "channels", channels },
               { "overflows", overflows },
               { "links", linkList },
+              { "ports", portList },
               { "summary", { { "links", links.size() },
                              { "overflowing_links", linksOver },
                              { "links_without_path", linksMissing },
@@ -1845,6 +2098,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                              { "sliver_channels", slivers },
                              { "sliver_channels_used", sliversUsed },
                              { "overflows", overflows.size() },
+                             { "ports_used", ports.size() },
+                             { "port_overflows", portsOver },
                              { "over_mm", r2( bestTotal ) } } },
               { "negotiation", { { "enabled", negotiate }, { "iterations", ran }, { "best_iteration", bestIteration },
                                  { "history", history } } },
@@ -1869,7 +2124,11 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                    "net's class), taking one shortest path through the channels; overflows negotiated over the "
                    "channels (present overuse and history costs) and the best round kept. Answers channels by use, "
                    "overflows (demand over capacity, tracks over), links with their channel path, length, blocks "
-                   "they must cross (boxes overlapping or no way round). show: channels in the GUI coloured by use. "
+                   "they must cross (boxes overlapping or no way round) and the box sides they leave and enter by (a bus by "
+                   "the side its end part's pads face, pcb_layout_graph ends); ports: per box side used its facing "
+                   "length (free or another box's, facing_boxes_mm) per layer as capacity against the bundles' width "
+                   "through it. show: channels in "
+                   "the GUI coloured by use. "
                    "Read only",
                    R"json({"type":"object","properties":{
                         "by":{"type":"string","enum":["auto","sheet"],"default":"auto","description":"blocks as pcb_blocks: auto around ICs and connectors, sheet one per schematic sheet"},
@@ -1890,6 +2149,7 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "max_boxes":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"boxes per block at most"},
                         "snap_mm":{"type":"number","minimum":0,"description":"obstacle edges closer than this share one grid line (default one Default track pitch; 0: exact). Gaps narrower close, obstacles thinner keep both edges"},
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
+                        "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by the side its end part's pads face (pcb_layout_graph ends); false: by any side"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
                         "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
                         "overflow_cost_mm":{"type":"number","default":5,"description":"detour worth one track over a channel's capacity, first round (doubles each round)"},
