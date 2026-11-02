@@ -13523,10 +13523,9 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         PCB_LAYER_ID          layer;   ///< the end's own layer
     };
 
-    // a via stitches when the refilled plane of another layer holds it in a piece that is a plane,
-    // not a sliver left between other nets' pours
-    const double kMinPlanePiece = pcbIUScale.mmToIU( 1.0 ) * (double) pcbIUScale.mmToIU( 1.0 ) * 2.0;
-
+    // a via stitches when the refilled plane of another layer holds it in a piece that is a plane, not
+    // a sliver left between other nets' pours: the zone's largest piece on that layer, or one that
+    // holds another pad or via of the net
     auto onPlanePiece = [&]( PCB_VIA* aVia, PCB_LAYER_ID aOwn )
     {
         for( ZONE* zone : board->Zones() )
@@ -13540,20 +13539,57 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                     continue;
 
                 const std::shared_ptr<SHAPE_POLY_SET>& fill = zone->GetFilledPolysList( l );
+                int                                    main = -1;
+                double                                 mainArea = -1;
+
+                for( int o = 0; o < fill->OutlineCount(); ++o )
+                {
+                    if( const double a = std::abs( fill->COutline( o ).Area() ); a > mainArea )
+                    {
+                        mainArea = a;
+                        main = o;
+                    }
+                }
 
                 for( int o = 0; o < fill->OutlineCount(); ++o )
                 {
                     if( !fill->COutline( o ).PointInside( aVia->GetPosition() ) )
                         continue;
 
-                    SHAPE_POLY_SET piece;
-                    piece.AddOutline( fill->COutline( o ) );
-
-                    for( int h = 0; h < fill->HoleCount( o ); ++h )
-                        piece.AddHole( fill->CHole( o, h ) );
-
-                    if( piece.Area() >= kMinPlanePiece )
+                    if( o == main )
                         return true;
+
+                    auto inPiece = [&]( BOARD_CONNECTED_ITEM* aItem, const VECTOR2I& aAt )
+                    {
+                        if( aItem == aVia || aItem->GetNetCode() != net->GetNetCode() || !aItem->IsOnLayer( l )
+                            || !fill->COutline( o ).PointInside( aAt ) )
+                        {
+                            return false;
+                        }
+
+                        for( int h = 0; h < fill->HoleCount( o ); ++h )
+                        {
+                            if( fill->CHole( o, h ).PointInside( aAt ) )
+                                return false;
+                        }
+
+                        return true;
+                    };
+
+                    for( PCB_TRACK* t : board->Tracks() )
+                    {
+                        if( t->Type() == PCB_VIA_T && inPiece( t, t->GetPosition() ) )
+                            return true;
+                    }
+
+                    for( FOOTPRINT* fp : board->Footprints() )
+                    {
+                        for( PAD* pad : fp->Pads() )
+                        {
+                            if( inPiece( pad, pad->GetPosition() ) )
+                                return true;
+                        }
+                    }
                 }
             }
         }
@@ -14315,7 +14351,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
             misses[st.item] = { { "for", stitchedFor( st.item ) },
                                 { "at_mm", { toMm( st.at.x ), toMm( st.at.y ) } },
                                 { "reason", "the via there was off the plane after the refill (an island too small to keep, "
-                                            "or a sliver of it under 2 mm2)" } };
+                                            "or a sliver: not the zone's largest piece on that layer and no other pad or via of the net on it)" } };
             for( auto it = placed.begin(); it != placed.end(); ++it )
             {
                 if( ( *it )["via"] == str( st.via.AsString() ) )
@@ -17912,7 +17948,7 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "dangling_vias_removed, not_reached (pads / islands left without a via, and why), islands_left (pieces of the "
                    "net's pours beside the main one per zone and layer, as island_list shows them: kind cut_off (no via) or sliver; "
                    "vias go only where the net's plane is on another layer with zone priorities resolved, and a via left on a "
-                   "piece under 2 mm2 after the refill is taken out; footprint and board keep-outs are honoured; spots_off_plane) and the "
+                   "sliver after the refill (not the zone's largest piece on the layer, no other pad or via of the net on it) is taken out; footprint and board keep-outs are honoured; spots_off_plane) and the "
                    "connections still open (unrouted); a pad of a quad package's row first joins the package's exposed pad of its net by a stub "
                    "(joined: for, to), else its via goes inward first (under its own package, between the pad row and the exposed pad, "
                    "straight in or slanted from the pad's inner end; the row says inward; where the net class's via does not fit there, the "
