@@ -34,10 +34,14 @@
 #include <pcbnew_settings.h>
 #include <pgm_base.h>
 #include <project.h>
+#include <project/project_file.h>
+#include <project/project_local_settings.h>
 #include <settings/settings_manager.h>
 #include <wildcards_and_files_ext.h>
 
 #include <wx/filename.h>
+
+#include <memory>
 
 
 /// @brief Headless board; GUI hosts use the editor frame instead
@@ -226,6 +230,7 @@ static nlohmann::json documentStatus( KOPENAPI_CONTEXT& aCtx )
              { "path", context->GetCurrentFileName().ToStdString() },
              { "project", context->Prj().GetProjectFullName().ToStdString() },
              { "unsaved", context->IsContentModified() },
+             { "project_read_only", context->Prj().IsReadOnly() },
              { "mode", aCtx.headless ? "headless" : "gui" } };
 }
 
@@ -594,6 +599,80 @@ static KOPENAPI_RESULT saveVersionCopy( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aCo
 }
 
 
+/// @brief The project beside a saved board: KiCad does not write a project it opened read-only
+/// (another process held its lock at open, e.g. a second instance on the same board), so a board
+/// saved under a new name would go without its rules and net classes.  aOwn: the board's project
+/// is this file (a save, or a headless save as).  A free file is written (an own one is locked
+/// and made writable first); one held by another process is not, and the answer says why
+static nlohmann::json saveProjectBeside( PROJECT* aProject, const wxFileName& aBoard, bool aOwn )
+{
+    wxFileName pro( aBoard );
+    pro.SetExt( FILEEXT::ProjectFileExtension );
+    pro.MakeAbsolute();
+
+    nlohmann::json out = { { "path", std::string( pro.GetFullPath().ToUTF8() ) }, { "written", false } };
+
+    if( !aProject || aProject->IsNullProject() )
+    {
+        out["reason"] = "the board has no project";
+        return out;
+    }
+
+    // KiCad saved its own writable project with the board
+    if( aOwn && !aProject->IsReadOnly() && pro.FileExists() )
+    {
+        out["written"] = true;
+        return out;
+    }
+
+    auto lockedBy = []( LOCKFILE& aLock )
+    {
+        return ( aLock.GetUsername() + wxS( "@" ) + aLock.GetHostname() ).ToStdString( wxConvUTF8 );
+    };
+
+    if( aOwn && aProject->IsReadOnly() )
+    {
+        auto lock = std::make_unique<LOCKFILE>( pro.GetFullPath() );
+
+        if( !lock->Valid() )
+        {
+            out["reason"] = "the project is open read-only and " + std::string( pro.GetFullName().ToUTF8() )
+                            + " is held by another KiCad process (" + lockedBy( *lock ) + "): close it there";
+            wxLogWarning( "%s", wxString::FromUTF8( "pcb_save: project not written: " + out["reason"].get<std::string>() ) );
+            return out;
+        }
+
+        aProject->SetProjectLock( lock.release() );
+        aProject->SetReadOnly( false );
+        aProject->GetProjectFile().SetReadOnly( false );
+        aProject->GetLocalSettings().SetReadOnly( false );
+        out["was_read_only"] = true;
+    }
+    else if( !aOwn )
+    {
+        LOCKFILE probe = LOCKFILE::Inspect( pro.GetFullPath() );
+
+        if( !probe.Valid() )
+        {
+            out["reason"] = std::string( pro.GetFullName().ToUTF8() ) + " is held by another KiCad process ("
+                            + lockedBy( probe ) + ")";
+            wxLogWarning( "%s", wxString::FromUTF8( "pcb_save: project not written: " + out["reason"].get<std::string>() ) );
+            return out;
+        }
+    }
+
+    if( !Pgm().GetSettingsManager().SaveProjectCopy( pro.GetFullPath(), aProject ) || !pro.FileExists() )
+    {
+        out["reason"] = "writing " + std::string( pro.GetFullPath().ToUTF8() ) + " failed";
+        wxLogError( "%s", wxString::FromUTF8( "pcb_save: " + out["reason"].get<std::string>() ) );
+        return out;
+    }
+
+    out["written"] = true;
+    return out;
+}
+
+
 static KOPENAPI_RESULT h_pcb_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -621,7 +700,9 @@ static KOPENAPI_RESULT h_pcb_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         return saveVersionCopy( aCtx, *context, target, version );
     }
 
-    bool ok = false;
+    bool       ok = false;
+    bool       own = true;
+    wxFileName saved( context->GetCurrentFileName() );
 
     if( aArgs.contains( "path" ) && aArgs["path"].is_string() )
     {
@@ -651,6 +732,8 @@ static KOPENAPI_RESULT h_pcb_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         // Save As switches the document (headless); GUI hosts write a copy and keep editing
         ok = aCtx.headless ? context->SaveBoardAs( target.GetFullPath() )
                            : context->SavePcbCopy( target.GetFullPath(), false, false );
+        own = aCtx.headless;
+        saved = target;
     }
     else
     {
@@ -660,7 +743,11 @@ static KOPENAPI_RESULT h_pcb_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     if( !ok )
         return KOPENAPI_RESULT::Error( 500, "saving the board failed" );
 
-    return KOPENAPI_RESULT::Ok( documentStatus( aCtx ) );
+    BOARD*         board = context->GetBoard();
+    nlohmann::json status = documentStatus( aCtx );
+    status["saved_project"] = saveProjectBeside( board ? board->GetProject() : nullptr, saved, own );
+    status["project_read_only"] = context->Prj().IsReadOnly();   // saveProjectBeside may have taken it over
+    return KOPENAPI_RESULT::Ok( status );
 }
 
 
@@ -918,6 +1005,8 @@ KOPENAPI_REGISTER( "pcb_close", "Close the open board: refuses with unsaved chan
 
 KOPENAPI_REGISTER( "pcb_save",
                    "Save the open board; with 'path' save as (headless switches to it, GUI writes a copy). "
+                   "The project (rules, net classes) is written beside it; saved_project says where, or why "
+                   "not (held open by another KiCad process). "
                    "With 'version' (e.g. \"10.0\") write a copy at 'path' that an earlier KiCad opens, with its "
                    "project and rules; the open board stays as it is. The result lists what the earlier format "
                    "cannot hold (dropped or approximated)",
