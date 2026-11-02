@@ -65,6 +65,11 @@ endif()
 
 set( KICAD_3D_IMPORT_OCC_LIBRARIES )
 
+# Static archives: the linker takes only the objects the importer needs from the full set
+if( KICAD_OCC STREQUAL "vendored" )
+    set( KICAD_3D_IMPORT_OCC_LIBRARIES ${OCC_LIBRARIES} )
+endif()
+
 foreach( OCC_LIBRARY IN LISTS OCC_LIBRARIES )
     get_filename_component( OCC_LIBRARY_NAME "${OCC_LIBRARY}" NAME_WE )
     string( REGEX REPLACE "^lib" "" OCC_LIBRARY_NAME "${OCC_LIBRARY_NAME}" )

@@ -203,6 +203,16 @@ set( KICAD_ALLOCATOR "auto" CACHE STRING
     "Process allocator: auto (jemalloc on Linux without sanitizers, else system), system, jemalloc (Linux only, linked statically)" )
 set_property( CACHE KICAD_ALLOCATOR PROPERTY STRINGS auto system jemalloc )
 
+if( MSVC )
+    set( KICAD_OCC_DEFAULT "system" )
+else()
+    set( KICAD_OCC_DEFAULT "vendored" )
+endif()
+
+set( KICAD_OCC "${KICAD_OCC_DEFAULT}" CACHE STRING
+    "OpenCASCADE: vendored (thirdparty/opencascade, built and linked statically) or system (FindOCC)" )
+set_property( CACHE KICAD_OCC PROPERTY STRINGS vendored system )
+
 # Not supported by all platforms (for instance mingw)
 option( KICAD_SANITIZE_ADDRESS
     "Build KiCad with address sanitizer options. WARNING: Not compatible with gold linker"
@@ -868,8 +878,16 @@ include( MinGWResourceCompiler )
 # Find ngspice library, required for integrated circuit simulator
 find_package( ngspice REQUIRED )
 
-# Find OpenCascade, required for STEP plugin and tools
-find_package(OCC)
+# OpenCascade, required for STEP plugin and tools
+if( KICAD_OCC STREQUAL "vendored" )
+    include( BuildOpenCascade )
+    message( STATUS "OpenCASCADE: ${OCC_VERSION_STRING} (vendored, static)" )
+elseif( KICAD_OCC STREQUAL "system" )
+    find_package( OCC )
+else()
+    message( FATAL_ERROR "KICAD_OCC must be vendored or system" )
+endif()
+
 if( NOT OCC_FOUND )
     MESSAGE( FATAL_ERROR "================================================================\n"
                          " OpenCASCADE was not found!\n"
