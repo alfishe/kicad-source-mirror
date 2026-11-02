@@ -364,6 +364,7 @@ private:
     /// @brief Hash of the courtyards and zones a track (aSeg, aWidth) lies inside or crosses (courtyards
     /// only), 0 when outside all of them; nullopt when that does not tell (it touches an outline)
     std::optional<size_t> regionState( const SEG& aSeg, int aWidth );
+    std::optional<size_t> regionStateOf( const SEG& aSeg, int aWidth );
 
     /// @brief An explicit pair's other net and the polarity of aNet in it (1 P, -1 N); 0 when none
     int explicitPair( PNS::NET_HANDLE aNet, NETINFO_ITEM** aOther ) const;
@@ -403,6 +404,31 @@ private:
 
     // Cached for the routing session: the courtyards and zones geometry-dependent rules test
     std::optional<std::vector<RULE_REGION>> m_ruleRegions;
+
+    struct REGION_STATE_KEY
+    {
+        SEG seg;
+        int width;
+
+        bool operator==( const REGION_STATE_KEY& aOther ) const
+        {
+            return seg.A == aOther.seg.A && seg.B == aOther.seg.B && width == aOther.width;
+        }
+    };
+
+    struct REGION_STATE_HASH
+    {
+        size_t operator()( const REGION_STATE_KEY& aKey ) const
+        {
+            size_t h = 0;
+            hash_combine( h, aKey.seg.A.x, aKey.seg.A.y, aKey.seg.B.x, aKey.seg.B.y, aKey.width );
+            return h;
+        }
+    };
+
+    /// regionState per track, with m_ruleRegions; emptied when it reaches REGION_STATES_MAX
+    std::unordered_map<REGION_STATE_KEY, std::optional<size_t>, REGION_STATE_HASH> m_regionStates;
+    static constexpr size_t REGION_STATES_MAX = 1 << 16;
 
     int64_t m_clearanceLookups = 0;
     int64_t m_ruleEvaluations = 0;
@@ -1139,6 +1165,7 @@ void PNS_PCBNEW_RULE_RESOLVER::ClearCaches()
     m_biggestClearance.reset();
     m_geometryRules.reset();
     m_ruleRegions.reset();
+    m_regionStates.clear();
 }
 
 
@@ -1375,6 +1402,22 @@ std::optional<size_t> PNS_PCBNEW_RULE_RESOLVER::regionState( const SEG& aSeg, in
             addRegion( zone->GetBoardOutline(), zoneMargin, false );
     }
 
+    const REGION_STATE_KEY key{ aSeg, aWidth };
+
+    if( auto it = m_regionStates.find( key ); it != m_regionStates.end() )
+        return it->second;
+
+    if( m_regionStates.size() >= REGION_STATES_MAX )
+        m_regionStates.clear();
+
+    std::optional<size_t> state = regionStateOf( aSeg, aWidth );
+    m_regionStates.emplace( key, state );
+    return state;
+}
+
+
+std::optional<size_t> PNS_PCBNEW_RULE_RESOLVER::regionStateOf( const SEG& aSeg, int aWidth )
+{
     BOX2I track( aSeg.A, VECTOR2I( 0, 0 ) );
     track.Merge( aSeg.B );
     track.Inflate( aWidth / 2 + 1 );
