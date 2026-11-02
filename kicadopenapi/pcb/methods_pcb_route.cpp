@@ -686,20 +686,13 @@ int stubMinWidth( BOARD* aBoard, PAD* aPad, int aNetCode, PCB_LAYER_ID aLayer )
 }
 
 
-/// @brief A track of aNetCode at aAt on aLayer as KiCad's rules size it: the narrowest width they allow
-/// (a track_width min, the board minimum) and the width they ask (opt, else the net class's, else the
-/// board's current)
-struct RULE_TRACK
-{
-    int min;
-    int opt;
-};
+} // namespace
 
 
-RULE_TRACK ruleTrackAt( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer )
+KOPENAPI_RULE_TRACK KopenapiRuleTrack( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer )
 {
     const BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
-    RULE_TRACK                   out{ std::max( bds.m_TrackMinWidth, 0 ), bds.GetCurrentTrackWidth() };
+    KOPENAPI_RULE_TRACK          out{ std::max( bds.m_TrackMinWidth, 0 ), bds.GetCurrentTrackWidth() };
 
     if( NETINFO_ITEM* net = aBoard->FindNet( aNetCode ) )
     {
@@ -730,20 +723,10 @@ RULE_TRACK ruleTrackAt( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LA
 }
 
 
-/// @brief A via of aNetCode at aAt as KiCad's rules size it (via_diameter opt, else the net class's
-/// or the board's current, not below the rule's min) and the clearance it keeps to aOther (nullptr:
-/// the net's own clearance), not below the board minimum
-struct RULE_VIA
-{
-    int dia;
-    int clearance;
-};
-
-
-RULE_VIA ruleViaAt( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer, BOARD_ITEM* aOther )
+KOPENAPI_RULE_VIA KopenapiRuleVia( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer, BOARD_ITEM* aOther )
 {
     const BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
-    RULE_VIA                     out{ bds.GetCurrentViaSize(), std::max( bds.m_MinClearance, 0 ) };
+    KOPENAPI_RULE_VIA            out{ bds.GetCurrentViaSize(), bds.GetCurrentViaDrill(), std::max( bds.m_MinClearance, 0 ) };
     NETCLASS*                    nc = nullptr;
 
     if( NETINFO_ITEM* net = aBoard->FindNet( aNetCode ) )
@@ -751,6 +734,9 @@ RULE_VIA ruleViaAt( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_
 
     if( nc && nc->HasViaDiameter() )
         out.dia = nc->GetViaDiameter();
+
+    if( nc && nc->HasViaDrill() )
+        out.drill = nc->GetViaDrill();
 
     if( nc && nc->HasClearance() )
         out.clearance = std::max( out.clearance, nc->GetClearance() );
@@ -774,6 +760,16 @@ RULE_VIA ruleViaAt( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_
 
         probe.SetWidth( PADSTACK::ALL_LAYERS, out.dia );
 
+        const DRC_CONSTRAINT h = drc->EvalRules( HOLE_SIZE_CONSTRAINT, &probe, nullptr, aLayer );
+
+        if( h.GetValue().HasOpt() )
+            out.drill = h.GetValue().Opt();
+
+        if( h.GetValue().HasMin() )
+            out.drill = std::max( out.drill, h.GetValue().Min() );
+
+        probe.SetDrill( out.drill );
+
         const DRC_CONSTRAINT c = drc->EvalRules( CLEARANCE_CONSTRAINT, &probe, aOther, aLayer );
 
         if( c.GetValue().HasMin() )
@@ -783,6 +779,41 @@ RULE_VIA ruleViaAt( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_
     return out;
 }
 
+
+bool KopenapiPadFinePitch( BOARD* aBoard, PAD* aPad )
+{
+    if( !aPad || !aPad->GetParentFootprint() )
+        return false;
+
+    PAD*   nearest = nullptr;
+    double pitch = std::numeric_limits<double>::max();
+
+    for( PAD* other : aPad->GetParentFootprint()->Pads() )
+    {
+        const double d = ( other->GetPosition() - aPad->GetPosition() ).EuclideanNorm();
+
+        if( KopenapiPadNeighbours( other, aPad ) && d < pitch )
+        {
+            pitch = d;
+            nearest = other;
+        }
+    }
+
+    if( !nearest )
+        return false;
+
+    const PCB_LAYER_ID        layer = aPad->GetPrincipalLayer();
+    const KOPENAPI_RULE_TRACK track = KopenapiRuleTrack( aBoard, aPad->GetNetCode(), aPad->GetPosition(), layer );
+    const KOPENAPI_RULE_VIA   via = KopenapiRuleVia( aBoard, aPad->GetNetCode(), aPad->GetPosition(), layer, nearest );
+    int                       gap = 0;
+
+    aPad->GetEffectiveShape( layer )->Collide( nearest->GetEffectiveShape( layer ).get(), KiROUND( pitch ), &gap );
+    return gap < track.opt + 2 * via.clearance || pitch < via.dia + via.clearance;
+}
+
+
+namespace
+{
 
 /// @brief The widest track of aNetCode, centred on aPad, that leaves it between its row neighbours of
 /// other nets at the clearance DRC asks to each (5 µm steps); INT_MAX when no neighbour bounds it
@@ -829,48 +860,45 @@ int padEntryFit( BOARD* aBoard, PAD* aPad, int aNetCode )
 }
 
 
-/// @brief The router's neck-down for a stub leaving aPad: a pad 0.65 mm or closer to the next one of
-/// its part takes a track no wider than its narrow side, not below the Default class width or the
-/// board minimum; a custom track_width rule at the pad sets it lower (its opt, else min) (neck_down
-/// auto of pcb_route)
+/// @brief The router's neck-down for a stub leaving aPad (neck_down auto of pcb_route): at a fine-pitch
+/// pad (KopenapiPadFinePitch) no wider than leaves its neighbours the clearance the rules ask
+/// (padEntryFit), not below the narrowest the rules allow there (stubMinWidth); a custom track_width
+/// rule at the pad sets it lower (its opt, else min)
 STUB_NECK padNeck( BOARD* aBoard, PAD* aPad, int aWidth, PCB_LAYER_ID aLayer )
 {
     STUB_NECK out{ aWidth, std::string() };
 
-    if( !aPad || !aPad->GetParentFootprint() )
-        return out;
-
-    double pitch = std::numeric_limits<double>::max();
-
-    for( PAD* other : aPad->GetParentFootprint()->Pads() )
-    {
-        if( KopenapiPadNeighbours( other, aPad ) )
-            pitch = std::min( pitch, double( ( other->GetPosition() - aPad->GetPosition() ).EuclideanNorm() ) );
-    }
-
-    if( pitch > pcbIUScale.mmToIU( 0.65 ) )
+    if( !aPad || !KopenapiPadFinePitch( aBoard, aPad ) )
         return out;
 
     const BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
-    std::shared_ptr<NETCLASS>    def = bds.m_NetSettings ? bds.m_NetSettings->GetDefaultNetclass() : nullptr;
-    const int floor = std::max( bds.m_TrackMinWidth, def && def->HasTrackWidth() ? def->GetTrackWidth() : 0 );
-    const VECTOR2I size = aPad->GetSize( PADSTACK::ALL_LAYERS );
-    int            cap = std::max( floor, std::min( size.x, size.y ) );
+    int                          cap = INT_MAX;
+    bool                         byFit = false;
 
-    if( const int rule = ruleTrackWidthAt( aBoard, aPad, aPad->GetNetCode(), aLayer ).first; rule > 0 )
-        cap = std::max( bds.m_TrackMinWidth, std::min( cap, rule ) );
-
-    bool byFit = false;
-
-    if( const int fit = padEntryFit( aBoard, aPad, aPad->GetNetCode() ); fit < cap )
+    if( const int fit = padEntryFit( aBoard, aPad, aPad->GetNetCode() ); fit < INT_MAX )
     {
-        cap = std::max( bds.m_TrackMinWidth, fit );
+        cap = std::max( stubMinWidth( aBoard, aPad, aPad->GetNetCode(), aLayer ), fit );
         byFit = true;
+    }
+
+    if( const int rule = ruleTrackWidthAt( aBoard, aPad, aPad->GetNetCode(), aLayer ).first; rule > 0 && rule < cap )
+    {
+        cap = std::max( bds.m_TrackMinWidth, rule );
+        byFit = false;
     }
 
     if( cap < aWidth )
     {
-        char text[200];
+        double pitch = std::numeric_limits<double>::max();
+
+        for( PAD* other : aPad->GetParentFootprint()->Pads() )
+        {
+            if( KopenapiPadNeighbours( other, aPad ) )
+                pitch = std::min( pitch, double( ( other->GetPosition() - aPad->GetPosition() ).EuclideanNorm() ) );
+        }
+
+        const VECTOR2I size = aPad->GetSize( PADSTACK::ALL_LAYERS );
+        char           text[200];
         std::snprintf( text, sizeof( text ), "fine-pitch pad %s.%s (pitch %.3g mm, pad %.3g mm wide)%s",
                        str( aPad->GetParentFootprint()->GetReference() ).c_str(), str( aPad->GetNumber() ).c_str(),
                        toMm( pitch ), toMm( std::min( size.x, size.y ) ),
@@ -3309,7 +3337,7 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
                 const VECTOR2I last = req.vias.empty() ? req.from->GetPosition() : req.vias.back().first;
                 const VECTOR2I dir = last - req.toPos;
                 const VECTOR2I size = static_cast<PAD*>( req.to )->GetSize( *padLayer );
-                RULE_VIA       rule = ruleViaAt( board, req.to->GetNetCode(), req.toPos, *padLayer, nullptr );
+                KOPENAPI_RULE_VIA rule = KopenapiRuleVia( board, req.to->GetNetCode(), req.toPos, *padLayer, nullptr );
 
                 if( aArgs.contains( "via_diameter_mm" ) )
                     rule.dia = pcbIUScale.mmToIU( aArgs.value( "via_diameter_mm", 0.0 ) );
@@ -4522,7 +4550,6 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                           return byPlace( x, y );
                       } );
 
-    // dense_first: connections at fine-pitch pads (0.65 mm or less to the next pad) before the rest
     auto pitchOf = [&]( PAD* aPad )
     {
         double best = std::numeric_limits<double>::max();
@@ -4536,8 +4563,16 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return best;
     };
 
-    // Neck-down: a connection with an end on a fine-pitch pad (0.65 mm or closer to the next) is
-    // routed no wider than leaves the pad's neighbours the clearance the rules ask (padEntryFit), not
+    // fine-pitch pads (KopenapiPadFinePitch), once per pad in this call
+    std::map<PAD*, bool> fineOf;
+
+    auto finePad = [&]( PAD* aPad ) -> bool
+    {
+        auto it = fineOf.find( aPad );
+        return it != fineOf.end() ? it->second : ( fineOf[aPad] = KopenapiPadFinePitch( board, aPad ) );
+    };
+
+    // Neck-down: a connection with an end on a fine-pitch pad (finePad) is routed no wider than leaves the pad's neighbours the clearance the rules ask (padEntryFit), not
     // below the narrowest track the rules allow the net there; the rest of the net keeps its width
     // a pair's lines split back to their pads end beside each other at the pair's pitch: a net's
     // tail leaves its line no wider than the line
@@ -4548,8 +4583,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         if( aTo && aTo->Type() == PCB_TRACE_T && pairLineEnds.count( aTo->m_Uuid ) )
             return static_cast<PCB_TRACK*>( aTo )->GetWidth();
 
-        const double fine = pcbIUScale.mmToIU( 0.65 );
-        auto         it = neckPerNet.find( aFrom->GetNetname() );
+        auto it = neckPerNet.find( aFrom->GetNetname() );
 
         if( !( it == neckPerNet.end() ? neckDefault : it->second ) )
             return 0;
@@ -4560,7 +4594,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         // narrowest the rules allow the net there
         for( BOARD_CONNECTED_ITEM* end : { aFrom, aTo } )
         {
-            if( end && end->Type() == PCB_PAD_T && pitchOf( static_cast<PAD*>( end ) ) <= fine )
+            if( end && end->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( end ) ) )
             {
                 PAD* pad = static_cast<PAD*>( end );
 
@@ -4673,17 +4707,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                + " (pitch " + mm( dist ) + "): a clearance / track_width rule inside the courtyard is needed";
     };
 
+    // dense_first: connections at fine-pitch pads (finePad) before the rest
     if( order == "dense_first" )
     {
-        const double fine = pcbIUScale.mmToIU( 0.65 );
-
         std::stable_sort( jobs.begin(), jobs.end(),
                           [&]( const JOB& x, const JOB& y )
                           {
-                              const bool fx = pitchOf( x.from ) <= fine
-                                              || ( x.to->Type() == PCB_PAD_T && pitchOf( static_cast<PAD*>( x.to ) ) <= fine );
-                              const bool fy = pitchOf( y.from ) <= fine
-                                              || ( y.to->Type() == PCB_PAD_T && pitchOf( static_cast<PAD*>( y.to ) ) <= fine );
+                              const bool fx = finePad( x.from ) || ( x.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( x.to ) ) );
+                              const bool fy = finePad( y.from ) || ( y.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( y.to ) ) );
 
                               if( fx != fy )
                                   return fx;
@@ -5532,7 +5563,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 std::string cause;
                 std::string causeKind;
 
-                if( end->Type() == PCB_PAD_T && pitchOf( static_cast<PAD*>( end ) ) <= pcbIUScale.mmToIU( 0.65 ) )
+                if( end->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( end ) ) )
                 {
                     if( const int fit = padEntryFit( board, static_cast<PAD*>( end ), way.from->GetNetCode() );
                         fit < ds.m_TrackMinWidth )
@@ -8470,7 +8501,6 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     if( ( escapesOn || !portGoals.empty() ) && !rail )
     {
-        const double         fine = pcbIUScale.mmToIU( 0.65 );
         std::map<PAD*, std::vector<size_t>> frontsOf;
 
         // A signal pad of a fine-pitch row next to a rail pin whose via sits inward of the row: the row
@@ -8487,10 +8517,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         auto inwardFront = [&]( PAD* aPad, std::optional<size_t> aJob, std::vector<size_t>& aOf )
         {
-            const double pitch = pitchOf( aPad );
-
-            if( pitch > fine || !aPad->GetParentFootprint() )
+            if( !aPad->GetParentFootprint() || !finePad( aPad ) )
                 return;
+
+            const double pitch = pitchOf( aPad );
 
             FOOTPRINT* fp = aPad->GetParentFootprint();
             BOX2I      ring = fp->Pads().front()->GetBoundingBox();
@@ -8637,22 +8667,22 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( !escapesOn )
                 return;
 
-            const double pitch = pitchOf( aPad );
-
-            if( pitch > fine )
+            if( !finePad( aPad ) )
                 return;
+
+            const double pitch = pitchOf( aPad );
 
             // a via of the pad's net with the clearance the rules ask to its row neighbours on both
             // sides; where two vias do not fit side by side at the pitch, room for the neighbours' vias on
             // a second, staggered line
             FOOTPRINT*   owner = aPad->GetParentFootprint();
             const PCB_LAYER_ID padLayer = aPad->GetPrincipalLayer();
-            RULE_VIA     rule = ruleViaAt( board, aPad->GetNetCode(), aPad->GetPosition(), padLayer, nullptr );
+            KOPENAPI_RULE_VIA rule = KopenapiRuleVia( board, aPad->GetNetCode(), aPad->GetPosition(), padLayer, nullptr );
 
             for( PAD* q : owner->Pads() )
             {
                 if( q != aPad && q->GetNetCode() != aPad->GetNetCode() && KopenapiPadNeighbours( q, aPad ) )
-                    rule.clearance = std::max( rule.clearance, ruleViaAt( board, aPad->GetNetCode(), aPad->GetPosition(), padLayer, q ).clearance );
+                    rule.clearance = std::max( rule.clearance, KopenapiRuleVia( board, aPad->GetNetCode(), aPad->GetPosition(), padLayer, q ).clearance );
             }
 
             const int    clearance = rule.clearance;
@@ -8681,7 +8711,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             const VECTOR2I tip = box.Centre() + dir * half;
 
             // as wide as the net's track, not the pad: the neighbours' tracks leave between the rooms
-            const int width = std::min( across, ruleTrackAt( board, aPad->GetNetCode(), tip, padLayer ).opt );
+            const int width = std::min( across, KopenapiRuleTrack( board, aPad->GetNetCode(), tip, padLayer ).opt );
 
             for( PCB_LAYER_ID layer : layers )
             {
@@ -9571,7 +9601,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( job.from ), job.to } )
                 {
-                    if( end && end->Type() == PCB_PAD_T && pitchOf( static_cast<PAD*>( end ) ) <= pcbIUScale.mmToIU( 0.65 ) )
+                    if( end && end->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( end ) ) )
                     {
                         if( const int w = ruleWidthAt( static_cast<PAD*>( end ), code ); w > 0 )
                             n.width = std::min( n.width, std::max( w, ds.m_TrackMinWidth ) );
@@ -10591,7 +10621,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ), jobs[index].to } )
                 {
-                    if( !end || end->Type() != PCB_PAD_T || pitchOf( static_cast<PAD*>( end ) ) > pcbIUScale.mmToIU( 0.65 ) )
+                    if( !end || end->Type() != PCB_PAD_T || !finePad( static_cast<PAD*>( end ) ) )
                         continue;
 
                     FOOTPRINT* fp = static_cast<PAD*>( end )->GetParentFootprint();
@@ -10996,7 +11026,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     {
                         for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ), jobs[index].to } )
                         {
-                            if( !end || end->Type() != PCB_PAD_T || pitchOf( static_cast<PAD*>( end ) ) > pcbIUScale.mmToIU( 0.65 ) )
+                            if( !end || end->Type() != PCB_PAD_T || !finePad( static_cast<PAD*>( end ) ) )
                                 continue;
 
                             if( const std::string why = padEntryProblem( static_cast<PAD*>( end ), gridNets[k].netCode, gridNets[k].width );
@@ -17812,7 +17842,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{
                         "nets":{"type":"array","items":{"type":"string"}},
                         "layers":{"type":"array","items":{"type":"string"},"default":["F.Cu","B.Cu"]},
-                        "order":{"type":"string","enum":["short_first","power_first","dense_first"],"default":"short_first","description":"dense_first: connections at fine-pitch pads (<= 0.65 mm) first"},
+                        "order":{"type":"string","enum":["short_first","power_first","dense_first"],"default":"short_first","description":"dense_first: connections at fine-pitch pads first (no track of the net as wide as the rules ask passes between the pad and its neighbour at the rules' clearance, or two of its vias do not fit side by side at the pitch)"},
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
                         "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it); a detour over 1.6 x follows a plan through vias instead when that is a quarter shorter, a via counted as 2 mm (kept when a fifth shorter); clean_up: tried / skipped / kept / vias_removed / via_ways / vias_added / shortened_mm; rows cleaned"},
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
@@ -17859,8 +17889,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "variants":{"type":"integer","default":0,"description":"grid: how many of the built-in variants (pcb_route_strategies) run in parallel; 0 one per two cores, as many as half the available memory holds (grid.lane_mb, grid.lanes_memory_allows)"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
-                        "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (0.65 mm or closer) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
-                        "inward_escapes":{"type":"array","items":{"type":"string"},"description":"footprint references of packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). 404 an unknown reference, 400 a part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (0.65 mm or closer) on the edge of its package is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},
+                        "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (as dense_first says) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
+                        "inward_escapes":{"type":"array","items":{"type":"string"},"description":"footprint references of packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). 404 an unknown reference, 400 a part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},
                         "plan":{"type":"boolean","default":true,"description":"a connection the router does not find on a layer is planned over the free space (grid search with vias, the board's clearances), the router follows the plan; no plan found: no escape-spot tries either (row plan tells)"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
                         "style":{"type":"string","enum":["direct","rail"],"default":"direct","description":"rail (power nets): every connection leaves its pads through a via next to them and runs on the second layer"},
@@ -17873,7 +17903,7 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "Stitch a net (default: the one net pcb_net_roles calls ground; 400 when none or several) to its pours and planes: every open end on one side only (SMD "
                    "pad, zone island, the track end of pads joined by tracks) gets a through via at a free spot "
                    "next to it (with a short track from a pad or track end), guarded against touching other nets (other nets' fills give way: they are refilled), "
-                   "the stub necked as the router does at a fine-pitch pad (no wider than the pad's narrow side) and further "
+                   "the stub necked as the router does at a fine-pitch pad (no wider than leaves its neighbours the rules' clearance) and further "
                    "to what the clearances there leave (a via row's stub_width_mm / necked_from_mm / necked_why; necked_stubs counts them), "
                    "inside the board; after the refill a via the fill does not reach is taken out and its pad "
                    "tried at another spot (up to 3 passes); unlocked vias of the net left touching one layer "
@@ -18049,7 +18079,7 @@ KOPENAPI_REGISTER( "pcb_track_add",
 KOPENAPI_REGISTER( "pcb_via_add",
                    "Add a via: alone on a net at a point, or with a short track from a pad (from: REF.PAD); "
                    "size from the net class unless diameter_mm / drill_mm; the track at the class width unless "
-                   "width_mm, necked at a fine-pitch pad as the router does (no wider than the pad's narrow side, "
+                   "width_mm, necked at a fine-pitch pad as the router does (no wider than leaves its neighbours the rules' clearance, "
                    "a custom track_width rule there sets it lower) and further to what the clearances to the "
                    "neighbouring copper leave (not below the board / rule minimum): the answer's necked [{pad, "
                    "width_mm, necked_from_mm, why}] and note say so; the router's guard applies (422 with "

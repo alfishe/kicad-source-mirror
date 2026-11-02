@@ -16,6 +16,7 @@
 #include <functional>
 #include <string>
 
+#include <layer_ids.h>
 #include <math/box2.h>
 #include <wx/string.h>
 
@@ -213,6 +214,37 @@ KOPENAPI_RESULT KopenapiNoSuchNet( BOARD* aBoard, const std::string& aName, cons
 /// @brief Two pads of a part that count for its pitch: on a copper layer both have, apart (the two
 /// sides of an edge connector's finger, or a pad stacked on another, are not neighbours)
 bool KopenapiPadNeighbours( const PAD* aA, const PAD* aB );
+
+/// @brief A track as KiCad's rules size it: the narrowest they allow (a track_width min, the board
+/// minimum) and the width they ask (opt, else the net class's, else the board's current), in IU
+struct KOPENAPI_RULE_TRACK
+{
+    int min;
+    int opt;
+};
+
+/// @brief A track of aNetCode at aAt on aLayer as KiCad's rules size it (DRC_ENGINE::EvalRules on a
+/// probe track)
+KOPENAPI_RULE_TRACK KopenapiRuleTrack( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer );
+
+/// @brief A via as KiCad's rules size it, in IU: diameter and drill (the rule's opt, not below its
+/// min; else the net class's; else the board's current) and the clearance it keeps to an item
+struct KOPENAPI_RULE_VIA
+{
+    int dia;
+    int drill;
+    int clearance;
+};
+
+/// @brief A via of aNetCode at aAt as KiCad's rules size it (EvalRules VIA_DIAMETER, HOLE_SIZE on a
+/// probe via) and the clearance it keeps to aOther (nullptr: the net's own), not below the board minimum
+KOPENAPI_RULE_VIA KopenapiRuleVia( BOARD* aBoard, int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer,
+                                   BOARD_ITEM* aOther = nullptr );
+
+/// @brief A fine-pitch pad, by the rules' sizes for its net: no track as wide as the rules ask passes
+/// between it and its nearest neighbour (KopenapiPadNeighbours) at the clearance they ask, or two of
+/// its vias do not fit side by side at the pitch (via + clearance to that neighbour); false without one
+bool KopenapiPadFinePitch( BOARD* aBoard, PAD* aPad );
 
 /// @brief The letters a reference starts with, upper case ("C" for c12): the part's kind by convention
 std::string KopenapiRefPrefix( const std::string& aRef );
