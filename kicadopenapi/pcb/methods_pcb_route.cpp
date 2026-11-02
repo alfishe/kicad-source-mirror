@@ -2704,16 +2704,21 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
 {
     const auto   started = std::chrono::steady_clock::now();
     const size_t before = aAdded.size();
+    // the router may replace a track the request names (a route going on from it): what is read of the
+    // request's items is read before
     const PAD*   fromPad = aReq.tried ? dynamic_cast<const PAD*>( aReq.from ) : nullptr;
     const std::string fromName = fromPad && fromPad->GetParentFootprint()
                                          ? str( fromPad->GetParentFootprint()->GetReference() ) + "." + str( fromPad->GetNumber() )
                                          : std::string( "copper" );
+    const bool     padToPad = aReq.from && aReq.from->Type() == PCB_PAD_T && aReq.to && aReq.to->Type() == PCB_PAD_T;
+    const int      fromNet = aReq.from ? aReq.from->GetNetCode() : 0;
+    const VECTOR2I fromAt = aReq.from ? aReq.fromPos.value_or( aReq.from->GetPosition() ) : VECTOR2I();
     const bool   ok = aReq.exact ? layExact( aContext, aReq, aOut, aAdded ) : routeOneImpl( aContext, aReq, aOut, aAdded );
     ROUTE_PROFILE  scratch;
     ROUTE_PROFILE& profile = ROUTE_PROFILES::Of( aContext.GetBoard(), scratch );
 
     if( !ok && profile.wallRefused && !*profile.wallRefused && aReq.fronts && !aReq.frontsInWorld && !aReq.diffPair
-        && aReq.from && aReq.from->Type() == PCB_PAD_T && aReq.to && aReq.to->Type() == PCB_PAD_T
+        && padToPad
         && aOut.contains( "walls_in" ) && aOut["walls_in"].value( "port", false ) )
     {
         ROUTE_REQUEST again = aReq;
@@ -2767,17 +2772,17 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
         const int      half = pcbIUScale.mmToIU( aOut.value( "track_width_mm", 0.2 ) ) / 2
                          + pcbIUScale.mmToIU( aOut.value( "clearance_mm", 0.2 ) );
 
-        aOut["blocked_by"] = blockersAt( aContext.GetBoard(), at, aim, aReq.layer, aReq.from->GetNetCode(), half );
+        aOut["blocked_by"] = blockersAt( aContext.GetBoard(), at, aim, aReq.layer, fromNet, half );
     }
     else if( !ok && aReq.from && aOut.value( "reason", std::string() ).rfind( "could not start", 0 ) == 0 )
     {
-        const VECTOR2I at = aReq.fromPos.value_or( aReq.from->GetPosition() );
+        const VECTOR2I at = fromAt;
         const VECTOR2I aim = !aReq.vias.empty()             ? aReq.vias.front().first
                              : aReq.to || aReq.toFreeLayer ? aReq.toPos : at;
         const int      half = pcbIUScale.mmToIU( aOut.value( "track_width_mm", 0.2 ) ) / 2
                          + pcbIUScale.mmToIU( aOut.value( "clearance_mm", 0.2 ) );
 
-        aOut["blocked_by"] = blockersAt( aContext.GetBoard(), at, aim, aReq.layer, aReq.from->GetNetCode(), half );
+        aOut["blocked_by"] = blockersAt( aContext.GetBoard(), at, aim, aReq.layer, fromNet, half );
     }
 
     if( aReq.tried && aReq.tried->size() < 40 )
@@ -4439,7 +4444,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // tail leaves its line no wider than the line
     std::set<KIID> pairLineEnds;
 
-    auto neckFor = [&]( PAD* aFrom, BOARD_CONNECTED_ITEM* aTo ) -> int
+    auto neckFor = [&]( BOARD_CONNECTED_ITEM* aFrom, BOARD_CONNECTED_ITEM* aTo ) -> int
     {
         if( aTo && aTo->Type() == PCB_TRACE_T && pairLineEnds.count( aTo->m_Uuid ) )
             return static_cast<PCB_TRACK*>( aTo )->GetWidth();
@@ -4452,7 +4457,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         int cap = INT_MAX;
 
-        for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( aFrom ), aTo } )
+        for( BOARD_CONNECTED_ITEM* end : { aFrom, aTo } )
         {
             if( end && end->Type() == PCB_PAD_T && pitchOf( static_cast<PAD*>( end ) ) <= fine )
             {
@@ -11979,13 +11984,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     if( ok )
                         break;
 
-                    PAD*                  from = job.from;
+                    BOARD_CONNECTED_ITEM* from = job.from;
                     BOARD_CONNECTED_ITEM* to = job.to;
                     VECTOR2I              toPos = job.toPos;
 
                     if( reverse )
                     {
-                        from = static_cast<PAD*>( job.to );
+                        from = job.to;
                         to = job.from;
                         toPos = job.from->GetPosition();
                     }
