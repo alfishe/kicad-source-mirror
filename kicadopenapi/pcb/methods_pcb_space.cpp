@@ -2241,6 +2241,30 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         std::vector<VECTOR2I> pts;
     };
 
+    // the pins that change layer at their fan-out via: out of order with their far end, or a far end only on the
+    // other side's copper
+    for( PORT& p : ports )
+    {
+        if( viaNets.count( p.code ) )
+        {
+            p.via = true;
+            p.why = "out of order with its far end: a via to the other layer";
+        }
+        else if( p.to >= 0 && p.kind != "rail" && padLayer( p.pad ) != "THT" )
+        {
+            // a far end only on the other side's copper: the pin changes layer at its fan-out via
+            for( PAD* far : b.parts[p.to].fp->Pads() )
+            {
+                if( far->GetNetCode() == p.code && padLayer( far ) != "THT" && padLayer( far ) != padLayer( p.pad ) )
+                {
+                    p.via = true;
+                    p.why = "its far end is on the other layer: a via to it";
+                    break;
+                }
+            }
+        }
+    }
+
     std::map<std::pair<int, int>, std::vector<const PORT*>> roundGroups;   // (own side, far part) -> its pins
     std::vector<WAY_PATH>                                   waysOut;      // the other pins' straight ways out
 
@@ -2363,12 +2387,6 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
     for( PORT& p : ports )
     {
-        if( viaNets.count( p.code ) )
-        {
-            p.via = true;
-            p.why = "out of order with its far end: a via to the other layer";
-        }
-
         nlohmann::json j = { { "pad", str( p.pad->GetNumber() ) }, { "net", p.net }, { "kind", p.kind },
                              { "layer", p.via ? "other" : "pad" } };
 
