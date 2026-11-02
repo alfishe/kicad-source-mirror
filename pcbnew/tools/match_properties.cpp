@@ -20,6 +20,7 @@
 #include <tools/match_properties.h>
 
 #include <board.h>
+#include <commit.h>
 #include <eda_item.h>
 #include <footprint.h>
 #include <i18n_utility.h>
@@ -196,6 +197,39 @@ struct PENDING_PROPERTY
     wxAny          m_Value;
     bool           m_Optional;
 };
+
+
+MATCH_PROPERTIES_RESULT MATCH_PROPERTIES_CATALOG::Apply( const EDA_ITEM& aSource, const std::vector<EDA_ITEM*>& aTargets,
+                                                         const std::set<wxString>& aEnabledKeys, COMMIT& aCommit,
+                                                         std::vector<int>* aChangedPerTarget )
+{
+    MATCH_PROPERTIES_RESULT result;
+    PROPERTY_COMMIT_HANDLER handler( &aCommit );
+
+    for( EDA_ITEM* target : aTargets )
+    {
+        wxCHECK2( target->IsBOARD_ITEM(), continue );
+
+        aCommit.Modify( target );
+
+        // Copy() stages on a clone and writes only if every value validates.  A refusal leaves
+        // this target untouched; reverting the commit undoes the earlier ones.
+        MATCH_PROPERTIES_RESULT one = Copy( aSource, *target, aEnabledKeys );
+
+        if( !one )
+        {
+            result.m_Error = one.m_Error;
+            break;
+        }
+
+        result.m_Changed += one.m_Changed;
+
+        if( aChangedPerTarget )
+            aChangedPerTarget->push_back( one.m_Changed );
+    }
+
+    return result;
+}
 
 
 /// Empty if the item has no family.  Never matches a key.

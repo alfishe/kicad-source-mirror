@@ -195,31 +195,12 @@ bool MATCH_PROPERTIES_TOOL::applyToTargets( const EDA_ITEM& aSource, const std::
     if( aTargets.empty() )
         return false;
 
-    const std::set<wxString>& enabled = enabledKeys();
-    BOARD_COMMIT              commit( this );
-    PROPERTY_COMMIT_HANDLER   handler( &commit );
-    wxString                  error;
-    int                       changed = 0;
+    BOARD_COMMIT commit( this );
 
     // CompatibleTargets() already reduced this to board items of the source family.
-    for( EDA_ITEM* target : aTargets )
-    {
-        wxCHECK2( target->IsBOARD_ITEM(), continue );
-
-        commit.Modify( static_cast<BOARD_ITEM*>( target ) );
-
-        // Copy() stages on a clone and writes only if every value validates.  A refusal leaves
-        // this target untouched.  Revert() undoes the earlier ones.
-        MATCH_PROPERTIES_RESULT result = MATCH_PROPERTIES_CATALOG::Copy( aSource, *target, enabled );
-
-        if( !result )
-        {
-            error = result.m_Error;
-            break;
-        }
-
-        changed += result.m_Changed;
-    }
+    MATCH_PROPERTIES_RESULT result = MATCH_PROPERTIES_CATALOG::Apply( aSource, aTargets, enabledKeys(), commit );
+    const wxString&         error = result.m_Error;
+    const int               changed = result.m_Changed;
 
     if( !error.IsEmpty() )
         frame()->ShowInfoBarError( error );

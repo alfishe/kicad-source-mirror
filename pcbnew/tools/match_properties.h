@@ -25,6 +25,7 @@
 
 #include <wx/string.h>
 
+class COMMIT;
 class EDA_ITEM;
 
 
@@ -73,6 +74,17 @@ const std::set<wxString>& DefaultKeys();
 
 MATCH_PROPERTIES_RESULT Copy( const EDA_ITEM& aSource, EDA_ITEM& aTarget,
                               const std::set<wxString>& aEnabledKeys );
+
+/**
+ * Match Properties: Copy() onto each board item of \a aTargets, staged in \a aCommit.  Stops at
+ * the first target that refuses (the error set); the caller pushes the commit, or reverts it on
+ * an error or when nothing changed.
+ *
+ * @param aChangedPerTarget when given, the properties changed on each target in order.
+ */
+MATCH_PROPERTIES_RESULT Apply( const EDA_ITEM& aSource, const std::vector<EDA_ITEM*>& aTargets,
+                               const std::set<wxString>& aEnabledKeys, COMMIT& aCommit,
+                               std::vector<int>* aChangedPerTarget = nullptr );
 
 }
 
