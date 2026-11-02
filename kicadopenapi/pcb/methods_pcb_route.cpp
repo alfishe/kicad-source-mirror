@@ -8241,19 +8241,19 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( laneEnds[atStart ? 0 : 1] != (int) members.size() || pts.size() < 2 )
                     continue;
 
-                VECTOR2D mid( 0, 0 ), far( 0, 0 );
+                VECTOR2D mid( 0, 0 ), farMid( 0, 0 );
 
                 for( const MEMBER& m : members )
                 {
                     mid += VECTOR2D( atStart ? m.start : m.end ) / (double) members.size();
-                    far += VECTOR2D( atStart ? m.end : m.start ) / (double) members.size();
+                    farMid += VECTOR2D( atStart ? m.end : m.start ) / (double) members.size();
                 }
 
                 const size_t        count = pts.size();
                 std::vector<double> rest( count, 0 );
                 auto                at = [&]( size_t k ) { return VECTOR2D( pts[atStart ? k : count - 1 - k].at ); };
 
-                rest[count - 1] = ( far - at( count - 1 ) ).EuclideanNorm();
+                rest[count - 1] = ( farMid - at( count - 1 ) ).EuclideanNorm();
 
                 for( size_t k = count - 1; k-- > 0; )
                     rest[k] = rest[k + 1] + ( at( k + 1 ) - at( k ) ).EuclideanNorm();
