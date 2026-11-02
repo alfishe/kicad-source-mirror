@@ -9098,56 +9098,6 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             pairLineEnds.insert( aJob.toId );
     };
 
-    // a pair's tail the grid did not join, by pns from its far pad to its line's end: its row when it
-    // routes
-    std::map<size_t, std::string> pairTailWhy;   // the tails pns did not route either: why
-
-    auto tailByPns = [&]( size_t aIndex ) -> bool
-    {
-        JOB& wire = jobs[aIndex];
-        wire.from = dynamic_cast<PAD*>( board->ResolveItem( wire.fromId, true ) );
-        wire.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( wire.toId, true ) );
-
-        if( dryRun || !wire.toPairEnd || done[aIndex] || !wire.from )
-            return false;
-
-        if( !wire.to )
-            pairEndAgain( wire );
-
-        if( !wire.to || wire.to->Type() != PCB_TRACE_T )
-        {
-            pairTailWhy[aIndex] = "no track of the net ends where the pair's line ended";
-            return false;
-        }
-
-        if( const auto joined = board->GetConnectivity()->GetConnectedItems( wire.from );
-            std::find( joined.begin(), joined.end(), wire.to ) != joined.end() )
-        {
-            return false;
-        }
-
-        ROUTE_REQUEST tail{ wire.from, wire.to, wire.toPos, static_cast<PCB_TRACK*>( wire.to )->GetLayer(), PNS::RM_Walkaround,
-                            dryRun, {} };
-        tail.fronts = &fronts;
-        tail.neckWidth = neckFor( wire.from, wire.to );
-        tail.pairTail = pairTail( wire.to );
-        nlohmann::json attempt = nlohmann::json::object();
-
-        if( !routeOne( *context, tail, attempt, added ) )
-        {
-            pairTailWhy[aIndex] = attempt.value( "reason", std::string() );
-            return false;
-        }
-
-        const nlohmann::json metrics = attempt.value( "metrics", nlohmann::json::object() );
-        done[aIndex] = true;
-        rowOf[aIndex] = (int) results.size();
-        results.push_back( { { "net", wire.net }, { "from", endName( wire.from ) }, { "to", endName( wire.to ) }, { "routed", true },
-                             { "tries", 1 }, { "engine", "pns" }, { "pair_tail", true }, { "layer", attempt["layer"] },
-                             { "length_mm", metrics.value( "length_mm", 0.0 ) }, { "vias", metrics.value( "vias", 0 ) } } );
-        return true;
-    };
-
     // a first pass bounded per connection: the plateau waits until each connection has had its try
     plateauHeld = firstBudgetS > 0 ? 1 : 0;
 
@@ -10926,17 +10876,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( detailOf[index] == 1 )
                     continue;
 
-                if( detailStage && jobs[index].toPairEnd && tailByPns( index ) )
-                    continue;
-
                 const auto [a, b] = endsOfJob[index];
                 const bool reached = r && a < r->reached.size() && b < r->reached.size() && r->reached[a] && r->reached[b];
                 const bool ok = detailStage ? netOk[k] && joinedNow( index ) : netOk[k] && reached;
                 nlohmann::json row = { { "net", jobs[index].net }, { "from", endName( jobs[index].from ) }, { "to", endName( jobs[index].to ) },
                                        { "routed", ok }, { "tries", 1 }, { "engine", "grid" } };
-
-                if( pairTailWhy.count( index ) )
-                    row["pair_tail_failed"] = pairTailWhy[index];
 
                 if( ok )
                 {
