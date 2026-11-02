@@ -1139,7 +1139,7 @@ static int minDimensionForPrimitive( const ITEM* aPrim )
 
 int DP_PRIMITIVE_PAIR::GetMinDimension() const
 {
-    if( !m_primN || !m_primN )
+    if( !m_primP || !m_primN )
         return 0;
 
     return std::min( minDimensionForPrimitive( m_primN ), minDimensionForPrimitive( m_primP ) );
@@ -1157,12 +1157,20 @@ DP_PRIMITIVE_PAIR DIFF_PAIR::EndingPrimitives()
         const LINE lP( PLine() );
         const LINE lN( NLine() );
 
+        // a line with no segment (nothing laid on it yet) has no ending primitive: its ends only
+        if( lP.SegmentCount() < 1 || lN.SegmentCount() < 1 )
+        {
+            const VECTOR2I endP = lP.PointCount() ? lP.CPoint( -1 ) : lN.PointCount() ? lN.CPoint( -1 ) : VECTOR2I();
+            const VECTOR2I endN = lN.PointCount() ? lN.CPoint( -1 ) : endP;
+            return DP_PRIMITIVE_PAIR( endP, endN );
+        }
+
         SEGMENT sP( lP, lP.CSegment( -1 ) );
         SEGMENT sN( lN, lN.CSegment( -1 ) );
 
         DP_PRIMITIVE_PAIR dpair( &sP, &sN );
 
-        if( PLine().IsLinked() )
+        if( PLine().IsLinked() && NLine().IsLinked() )
         {
             auto lp = PLine().GetLink( PLine().LinkCount() - 1 );
             auto ln = NLine().GetLink( NLine().LinkCount() - 1 );
