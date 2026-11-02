@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -342,14 +343,20 @@ public:
     static bool IsNetADiffPair( BOARD* aBoard, const NETINFO_ITEM* aNet, int& aNetP, int& aNetN );
 
     /**
-     * Check if the given net is a diff pair, returning its polarity and complement if so
+     * Check if the given net is a diff pair, returning its polarity and complement if so.
+     * Suffixes: + / -, P / N (before trailing digits and '_'), and DP / DM where the D starts the
+     * name or follows a non-alphanumeric character, optionally followed by a '_' tail
+     * (USB_DP / USB_DM, USB_DP_MCU / USB_DM_MCU).
      * @param aNetName is the input net name, like DIFF_P
      * @param aComplementNet will be filled with the complement, like DIFF_N
      * @param aBaseDpName will be filled with the base name, like DIFF
+     * @param aNetExists when given, the complement that names an existing net is chosen
+     *                   (P / N first, then DP / DM)
      * @return 1 if aNetName is the positive half of a pair, -1 if negative, 0 if not a diff pair
      */
     static int MatchDpSuffix( const wxString& aNetName, wxString& aComplementNet,
-                              wxString& aBaseDpName );
+                              wxString& aBaseDpName,
+                              const std::function<bool( const wxString& )>& aNetExists = nullptr );
 
     /**
      * Check if the given collision between a track and another item occurs during the track's

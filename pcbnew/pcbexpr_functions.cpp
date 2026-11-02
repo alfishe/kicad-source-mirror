@@ -1437,8 +1437,14 @@ static void isCoupledDiffPairFunc( LIBEVAL::CONTEXT* aCtx, void* self )
                 wxString coupledNet;
                 wxString dummy;
 
-                if( !DRC_ENGINE::MatchDpSuffix( netinfo->GetNetname(), coupledNet, dummy ) )
+                BOARD* netBoard = a->GetBoard();
+
+                if( !DRC_ENGINE::MatchDpSuffix( netinfo->GetNetname(), coupledNet, dummy,
+                                                [netBoard]( const wxString& aName )
+                                                { return netBoard && netBoard->FindNet( aName ); } ) )
+                {
                     return 0.0;
+                }
 
                 if( context->GetConstraint() == DRC_CONSTRAINT_T::DIFF_PAIR_GAP_CONSTRAINT
                         || context->GetConstraint() == DRC_CONSTRAINT_T::LENGTH_CONSTRAINT
@@ -1499,7 +1505,10 @@ static void inDiffPairFunc( LIBEVAL::CONTEXT* aCtx, void* self )
                     wxString refName = netinfo->GetNetname();
                     wxString arg = argv->AsString();
                     wxString baseName, coupledNet;
-                    int      polarity = DRC_ENGINE::MatchDpSuffix( refName, coupledNet, baseName );
+                    BOARD*   board = item->GetBoard();
+                    int      polarity = DRC_ENGINE::MatchDpSuffix( refName, coupledNet, baseName,
+                                                                   [board]( const wxString& aName )
+                                                                   { return board->FindNet( aName ) != nullptr; } );
 
                     if( polarity != 0 && item->GetBoard()->FindNet( coupledNet ) )
                     {

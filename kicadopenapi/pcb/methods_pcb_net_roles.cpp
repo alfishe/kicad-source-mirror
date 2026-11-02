@@ -53,38 +53,15 @@ static std::string netName( const wxString& aName )
 std::string KopenapiPairPartner( BOARD* aBoard, const std::string& aNet,
                                  const std::function<bool( const std::string& )>& aExists )
 {
-    std::vector<std::string> names;
-    wxString                 complement;
-
-    if( aBoard->MatchDpSuffix( wxString::FromUTF8( aNet ), complement ) == 1 )
-        names.push_back( complement.ToStdString( wxConvUTF8 ) );
-
-    const size_t len = aNet.size();
-
-    // the N letter in the P letter's case
-    if( len > 2 && ( aNet.compare( len - 2, 2, "DP" ) == 0 || aNet.compare( len - 2, 2, "dp" ) == 0 ) )
+    wxString complement, base;
+    auto     exists = [&]( const wxString& aName )
     {
-        const bool        caps = aNet.back() == 'P';
-        const std::string head = aNet.substr( 0, len - 1 );
+        const std::string name = aName.ToStdString( wxConvUTF8 );
+        return name != aNet && aExists( name );
+    };
 
-        names.push_back( head + ( caps ? "M" : "m" ) );
-
-        if( len > 3 && aNet[len - 3] == '_' )
-            names.push_back( head + ( caps ? "N" : "n" ) );
-    }
-
-    // DP / DM with a suffix after it (USB_DP_MCU / USB_DM_MCU)
-    static const std::regex dpSuffixed( R"(^(.*[Dd])([Pp])(_[^/]*)$)" );
-    std::smatch             m;
-
-    if( std::regex_match( aNet, m, dpSuffixed ) )
-        names.push_back( m[1].str() + ( m[2].str() == "P" ? "M" : "m" ) + m[3].str() );
-
-    for( const std::string& name : names )
-    {
-        if( name != aNet && aExists( name ) )
-            return name;
-    }
+    if( DRC_ENGINE::MatchDpSuffix( wxString::FromUTF8( aNet ), complement, base, exists ) == 1 && exists( complement ) )
+        return complement.ToStdString( wxConvUTF8 );
 
     return std::string();
 }

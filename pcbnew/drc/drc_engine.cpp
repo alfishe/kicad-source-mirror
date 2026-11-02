@@ -2555,7 +2555,7 @@ std::set<int> DRC_ENGINE::QueryDistinctConstraints( DRC_CONSTRAINT_T aConstraint
 
 
 // fixme: move two functions below to pcbcommon?
-int DRC_ENGINE::MatchDpSuffix( const wxString& aNetName, wxString& aComplementNet, wxString& aBaseDpName )
+static int matchPnSuffix( const wxString& aNetName, wxString& aComplementNet, wxString& aBaseDpName )
 {
     int rv = 0;
     int count = 0;
@@ -2604,12 +2604,79 @@ int DRC_ENGINE::MatchDpSuffix( const wxString& aNetName, wxString& aComplementNe
 }
 
 
+// DP / DM: the D at the start or after a non-alphanumeric character (not ADP / ADM), then P or M,
+// then nothing or a '_' tail without a hierarchy separator
+static int matchDpDmSuffix( const wxString& aNetName, wxString& aComplementNet, wxString& aBaseDpName )
+{
+    auto dpAt = [&]( size_t aEnd )
+    {
+        return aEnd >= 2 && aNetName[aEnd - 2] == 'D' && ( aNetName[aEnd - 1] == 'P' || aNetName[aEnd - 1] == 'M' )
+               && ( aEnd == 2 || !wxIsalnum( aNetName[aEnd - 3] ) );
+    };
+
+    // the name's end, else a '_' whose tail holds no hierarchy separator, the last one first
+    size_t end = aNetName.length();
+
+    if( !dpAt( end ) )
+    {
+        end = wxString::npos;
+
+        for( size_t at = aNetName.length(); at-- > 0; )
+        {
+            if( aNetName[at] == '/' )
+                break;
+
+            if( aNetName[at] == '_' && dpAt( at ) )
+            {
+                end = at;
+                break;
+            }
+        }
+
+        if( end == wxString::npos )
+            return 0;
+    }
+
+    const bool positive = aNetName[end - 1] == 'P';
+    aBaseDpName = aNetName.Left( end - 1 );
+    aComplementNet = wxString( aBaseDpName ) << ( positive ? wxT( "M" ) : wxT( "P" ) ) << aNetName.Mid( end );
+    return positive ? 1 : -1;
+}
+
+
+int DRC_ENGINE::MatchDpSuffix( const wxString& aNetName, wxString& aComplementNet, wxString& aBaseDpName,
+                               const std::function<bool( const wxString& )>& aNetExists )
+{
+    wxString pnComplement, pnBase, dpComplement, dpBase;
+    const int pn = matchPnSuffix( aNetName, pnComplement, pnBase );
+    const int dp = matchDpDmSuffix( aNetName, dpComplement, dpBase );
+
+    const bool useDp = dp != 0 && ( pn == 0 || ( aNetExists && !aNetExists( pnComplement ) && aNetExists( dpComplement ) ) );
+
+    if( useDp )
+    {
+        aComplementNet = dpComplement;
+        aBaseDpName = dpBase;
+        return dp;
+    }
+
+    if( pn != 0 )
+    {
+        aComplementNet = pnComplement;
+        aBaseDpName = pnBase;
+    }
+
+    return pn;
+}
+
+
 bool DRC_ENGINE::IsNetADiffPair( BOARD* aBoard, const NETINFO_ITEM* aNet, int& aNetP, int& aNetN )
 {
     const wxString& refName = aNet->GetNetname();
     wxString        dummy, coupledNetName;
 
-    if( int polarity = MatchDpSuffix( refName, coupledNetName, dummy ) )
+    if( int polarity = MatchDpSuffix( refName, coupledNetName, dummy,
+                                      [&]( const wxString& aName ) { return aBoard->FindNet( aName ) != nullptr; } ) )
     {
         NETINFO_ITEM* net = aBoard->FindNet( coupledNetName );
 

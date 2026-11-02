@@ -1317,7 +1317,8 @@ void BOARD_INSPECTION_TOOL::reportClearance( BOARD_ITEM* aItemA, BOARD_ITEM* aIt
         wxString      coupledNet;
         wxString      dummy;
 
-        if( DRC_ENGINE::MatchDpSuffix( refNet->GetNetname(), coupledNet, dummy )
+        if( DRC_ENGINE::MatchDpSuffix( refNet->GetNetname(), coupledNet, dummy,
+                                       [&]( const wxString& aName ) { return board()->FindNet( aName ) != nullptr; } )
                 && bc->GetNetname() == coupledNet )
         {
             LSET         dpIntersection = ac->GetLayerSet() & bc->GetLayerSet() & LSET::AllCuMask();
