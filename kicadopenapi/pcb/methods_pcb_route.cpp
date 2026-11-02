@@ -65,6 +65,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <tuple>
 #include <thread>
 #include <cmath>
@@ -9411,16 +9412,76 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                [&]( const UNDER_PART& u ) { return u.fp == pad->GetParentFootprint(); } );
     };
 
-    // the way inward of a rail pin of another net in a fine-pitch row (a power pin, or a pin of a net
-    // with a pour), not yet on another layer: kept free while a spot elsewhere fits, so that each
-    // rail of a run of them gets its via
-    struct LANE
+    // a via joined to a pin of a quad package's row (directly or by its stub; laid here, at the
+    // decaps' placement or by hand): the pin's way to the other layers, kept and used as it is
+    auto viaOfRowPin = [&]( const PAD* aPad ) -> PCB_TRACK*
     {
-        const PAD*    pad;
-        SHAPE_SEGMENT shape;   // a stub of the board's narrowest track straight in, 1 mm past the pad
+        std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
+
+        for( BOARD_CONNECTED_ITEM* c : conn->GetConnectedItems( aPad ) )
+        {
+            if( c->Type() == PCB_VIA_T )
+                return static_cast<PCB_TRACK*>( c );
+
+            if( c->Type() == PCB_TRACE_T || c->Type() == PCB_ARC_T )
+            {
+                for( BOARD_CONNECTED_ITEM* o : conn->GetConnectedItems( c ) )
+                {
+                    if( o->Type() == PCB_VIA_T )
+                        return static_cast<PCB_TRACK*>( o );
+                }
+            }
+        }
+
+        return nullptr;
     };
 
-    std::vector<LANE> lanes;
+    // Rail pins of a fine-pitch row (power pins, pins of a poured net or of the exposed pad's net):
+    // each run of them side by side gets its via pattern once, from the board alone, so every call
+    // sees the same plan: one depth, alternating depths, or where the pitch and the hole clearance
+    // leave no stub between two vias a pin apart, a via at every other pin (poured nets first). A
+    // planned spot of another net not yet on another layer is kept free, as is the way inward of a
+    // signal pin pcb_fanout_ports moves to the other layer
+    struct PLANNED
+    {
+        VECTOR2I spot;
+        int      dia;
+        int      drill;
+    };
+
+    struct LANE
+    {
+        const PAD* pad;
+        SEG        stub;
+        VECTOR2I   spot;
+        int        dia;
+        int        drill;
+    };
+
+    std::map<const PAD*, PLANNED> plannedVia;
+    std::set<const PAD*>          runSkipped;
+    std::vector<LANE>             lanes;
+    const int                     holeClearance = board->GetDesignSettings().m_HoleClearance;
+    const int                     holeToHole = board->GetDesignSettings().m_HoleToHoleMin;
+    const int                     stubMin = board->GetDesignSettings().m_TrackMinWidth;
+
+    auto clearOf = [&]( const PAD* aPad )
+    {
+        NETCLASS* nc = aPad->GetNet() ? aPad->GetNet()->GetNetClass() : nullptr;
+        return std::max( minClearance, nc && nc->HasClearance() ? nc->GetClearance() : 0 );
+    };
+
+    // the centre distance two vias of other nets keep; a via's centre to a stub's axis
+    auto viaApart = [&]( int aDia, int aDrill, int bDia, int bDrill, int aClear )
+    {
+        return std::max( { ( aDia + bDia ) / 2 + aClear, aDrill / 2 + holeClearance + bDia / 2, bDrill / 2 + holeClearance + aDia / 2,
+                           ( aDrill + bDrill ) / 2 + holeToHole } );
+    };
+
+    auto stubApart = [&]( int aDia, int aDrill, int aClear )
+    {
+        return stubMin / 2 + std::max( aDia / 2 + aClear, aDrill / 2 + holeClearance );
+    };
 
     {
         std::set<int> poured;
@@ -9431,56 +9492,292 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                 poured.insert( z->GetNetCode() );
         }
 
-        const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
         std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
 
-        for( const auto& [pad, dir] : outward )
+        auto reached = [&]( const PAD* aPad )
         {
-            if( pad->GetNetCode() == net->GetNetCode() || pad->GetNetCode() <= 0 || !rowPin( pad ) )
-                continue;
-
-            if( !poured.count( pad->GetNetCode() ) && !pad->GetPinType().Contains( wxT( "power" ) ) )
-                continue;
-
-            bool reached = false;
-
-            for( BOARD_CONNECTED_ITEM* c : conn->GetConnectedItems( pad ) )
+            for( BOARD_CONNECTED_ITEM* c : conn->GetConnectedItems( aPad ) )
             {
-                reached |= c->Type() == PCB_VIA_T || c->Type() == PCB_ZONE_T;
+                if( c->Type() == PCB_VIA_T || c->Type() == PCB_ZONE_T )
+                    return true;
 
                 if( c->Type() == PCB_TRACE_T || c->Type() == PCB_ARC_T )
                 {
                     for( BOARD_CONNECTED_ITEM* o : conn->GetConnectedItems( c ) )
-                        reached |= o->Type() == PCB_VIA_T;
+                    {
+                        if( o->Type() == PCB_VIA_T )
+                            return true;
+                    }
                 }
             }
 
-            if( reached )
-                continue;
+            return false;
+        };
 
-            const BOX2I pb = pad->GetBoundingBox();
-            const int   padHalf = dir.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
-            const VECTOR2I end = pad->GetPosition() - dir * ( padHalf + pcbIUScale.mmToIU( 1.0 ) );
-            lanes.push_back( { pad, SHAPE_SEGMENT( pad->GetPosition(), end, bds.m_TrackMinWidth ) } );
+        auto epOf = [&]( const PAD* aPad ) -> const PAD*
+        {
+            for( const PAD* ep : exposedPads )
+            {
+                if( ep->GetParentFootprint() == aPad->GetParentFootprint() )
+                    return ep;
+            }
+
+            return nullptr;
+        };
+
+        auto firstClass = [&]( const PAD* aPad )
+        {
+            const PAD* ep = epOf( aPad );
+            return poured.count( aPad->GetNetCode() ) || ( ep && ep->GetNetCode() == aPad->GetNetCode() );
+        };
+
+        auto railOf = [&]( const PAD* aPad )
+        {
+            return aPad->GetNetCode() > 0 && ( firstClass( aPad ) || aPad->GetPinType().Contains( wxT( "power" ) ) );
+        };
+
+        std::map<std::tuple<const FOOTPRINT*, int, int>, std::vector<const PAD*>> rows;
+
+        for( const auto& [pad, dir] : outward )
+        {
+            if( rowPin( pad ) )
+                rows[{ pad->GetParentFootprint(), dir.x, dir.y }].push_back( pad );
+        }
+
+        for( auto& [key, row] : rows )
+        {
+            const VECTOR2I dir( std::get<1>( key ), std::get<2>( key ) );
+            const VECTOR2I across( -dir.y, dir.x );
+            auto           along = [&]( const PAD* aPad ) { return (int64_t) aPad->GetPosition().x * across.x + (int64_t) aPad->GetPosition().y * across.y; };
+
+            std::sort( row.begin(), row.end(), [&]( const PAD* x, const PAD* y ) { return along( x ) < along( y ); } );
+
+            std::vector<std::vector<const PAD*>> runs( 1 );
+
+            for( size_t i = 0; i < row.size(); ++i )
+            {
+                const PAD* p = row[i];
+                const bool apart = i > 0 && along( p ) - along( row[i - 1] ) > pcbIUScale.mmToIU( 0.65 );
+
+                if( !railOf( p ) || apart )
+                    runs.emplace_back();
+
+                if( !railOf( p ) )
+                    continue;
+
+                if( !runs.back().empty() && runs.back().back()->GetNetCode() == p->GetNetCode() )
+                    continue;   // beside a pin of its own net: joined to that one's via
+
+                runs.back().push_back( p );
+            }
+
+            for( const std::vector<const PAD*>& run : runs )
+            {
+                if( run.size() < 2 )
+                    continue;
+
+                int clear = 0;
+
+                for( const PAD* p : run )
+                    clear = std::max( clear, clearOf( p ) );
+
+                const BOX2I pb = run.front()->GetBoundingBox();
+                const int   padHalf = dir.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
+                int         room = padHalf + pcbIUScale.mmToIU( 2.0 );
+
+                if( const PAD* ep = epOf( run.front() ) )
+                {
+                    const BOX2I    eb = ep->GetBoundingBox();
+                    const VECTOR2I c = run.front()->GetPosition();
+                    room = dir.x > 0 ? c.x - eb.GetRight() : dir.x < 0 ? eb.GetLeft() - c.x : dir.y > 0 ? c.y - eb.GetBottom()
+                                                                                                       : eb.GetTop() - c.y;
+                }
+
+                std::vector<int> gaps;
+
+                for( size_t i = 0; i + 1 < run.size(); ++i )
+                    gaps.push_back( (int) ( along( run[i + 1] ) - along( run[i] ) ) );
+
+                std::vector<std::pair<int, int>> sizes = { { classViaDia, classViaDrill } };
+
+                if( minViaDia )
+                    sizes.emplace_back( minViaDia, minViaDrill );
+
+                auto place = [&]( const PAD* aPad, int aDepth, int aDia, int aDrill )
+                { plannedVia[aPad] = { aPad->GetPosition() - dir * aDepth, aDia, aDrill }; };
+
+                bool planned = false;
+
+                for( const auto& [dia, drill] : sizes )
+                {
+                    const int depth = padHalf + dia / 2 + minClearance;
+                    const int pair = viaApart( dia, drill, dia, drill, clear );
+                    const int pass = stubApart( dia, drill, clear );
+
+                    if( depth + dia / 2 + clear > room )
+                        continue;
+
+                    if( std::all_of( gaps.begin(), gaps.end(), [&]( int g ) { return g >= pair; } ) )
+                    {
+                        for( const PAD* p : run )
+                            place( p, depth, dia, drill );
+
+                        planned = true;
+                        break;
+                    }
+
+                    bool alternate = true;
+                    int  rise = 0;
+
+                    for( size_t i = 0; i < gaps.size(); ++i )
+                    {
+                        alternate &= gaps[i] >= pass && ( i + 1 >= gaps.size() || gaps[i] + gaps[i + 1] >= pair );
+
+                        if( gaps[i] < pair )
+                            rise = std::max( rise, (int) std::ceil( std::sqrt( (double) pair * pair - (double) gaps[i] * gaps[i] ) ) );
+                    }
+
+                    if( alternate && depth + rise + dia / 2 + clear <= room )
+                    {
+                        for( size_t i = 0; i < run.size(); ++i )
+                            place( run[i], depth + ( i % 2 ? rise : 0 ), dia, drill );
+
+                        planned = true;
+                        break;
+                    }
+                }
+
+                if( planned )
+                    continue;
+
+                // every other pin: poured nets first, each pin as far from the chosen as one via
+                // from the next
+                const auto [dia, drill] = sizes.back();
+                const int  depth = padHalf + dia / 2 + minClearance;
+                const int  pair = viaApart( dia, drill, dia, drill, clear );
+
+                if( depth + dia / 2 + clear > room )
+                    continue;
+
+                std::vector<size_t> order( run.size() );
+                std::iota( order.begin(), order.end(), 0 );
+                std::stable_sort( order.begin(), order.end(),
+                                  [&]( size_t x, size_t y ) { return firstClass( run[x] ) && !firstClass( run[y] ); } );
+                std::vector<size_t> chosen;
+
+                for( size_t i : order )
+                {
+                    if( std::all_of( chosen.begin(), chosen.end(),
+                                     [&]( size_t j ) { return std::abs( along( run[i] ) - along( run[j] ) ) >= pair; } ) )
+                    {
+                        chosen.push_back( i );
+                    }
+                }
+
+                // the class's via where the chosen leave room for it
+                const int classPair = viaApart( classViaDia, classViaDrill, classViaDia, classViaDrill, clear );
+                const bool roomy = std::all_of( chosen.begin(), chosen.end(),
+                                                [&]( size_t i )
+                                                {
+                                                    return std::all_of( chosen.begin(), chosen.end(),
+                                                                        [&]( size_t j )
+                                                                        { return i == j || std::abs( along( run[i] ) - along( run[j] ) ) >= classPair; } );
+                                                } )
+                                   && padHalf + classViaDia + minClearance + clear <= room;
+
+                for( size_t i = 0; i < run.size(); ++i )
+                {
+                    if( std::find( chosen.begin(), chosen.end(), i ) == chosen.end() )
+                        runSkipped.insert( run[i] );
+                    else if( roomy )
+                        place( run[i], padHalf + classViaDia / 2 + minClearance, classViaDia, classViaDrill );
+                    else
+                        place( run[i], depth, dia, drill );
+                }
+            }
+        }
+
+        for( const auto& [pad, plan] : plannedVia )
+        {
+            if( !reached( pad ) )
+                lanes.push_back( { pad, SEG( pad->GetPosition(), plan.spot ), plan.spot, plan.dia, plan.drill } );
+        }
+
+        // signal pins that leave by a via (pcb_fanout_ports layer other; without its plan, every
+        // fine-pitch row pin with an open connection): their straight way in and a via there
+        std::set<const FOOTPRINT*> packages;
+
+        for( const auto& [key, row] : rows )
+            packages.insert( std::get<0>( key ) );
+
+        const int signalDia = minViaDia ? minViaDia : classViaDia;
+        const int signalDrill = minViaDia ? minViaDrill : classViaDrill;
+
+        for( const FOOTPRINT* fp : packages )
+        {
+            std::set<std::string> moved;
+            bool                  havePlan = false;
+
+            if( std::optional<KOPENAPI_METHOD> ports = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" ) )
+            {
+                const KOPENAPI_RESULT r = ports->handler( aCtx, { { "ref", str( fp->GetReference() ) } } );
+
+                if( r.status == 200 && r.body.contains( "ports" ) && r.body["ports"].is_object() )
+                {
+                    havePlan = true;
+
+                    for( const auto& [side, list] : r.body["ports"].items() )
+                    {
+                        for( const nlohmann::json& port : list )
+                        {
+                            if( port.value( "kind", std::string() ) != "rail" && port.value( "layer", std::string() ) == "other" )
+                                moved.insert( port.value( "pad", std::string() ) );
+                        }
+                    }
+                }
+            }
+
+            for( const auto& [pad, dir] : outward )
+            {
+                if( pad->GetParentFootprint() != fp || !rowPin( pad ) || railOf( pad ) || pad->GetNetCode() <= 0 || reached( pad ) )
+                    continue;
+
+                if( havePlan && !moved.count( str( pad->GetNumber() ) ) )
+                    continue;
+
+                const BOX2I    pb = pad->GetBoundingBox();
+                const int      padHalf = dir.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
+                const VECTOR2I spot = pad->GetPosition() - dir * ( padHalf + signalDia / 2 + minClearance );
+                lanes.push_back( { pad, SEG( pad->GetPosition(), spot ), spot, signalDia, signalDrill } );
+            }
         }
     }
 
-    const int laneClearance = std::max( minClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0 );
-    const int holeClearance = board->GetDesignSettings().m_HoleClearance;
-
-    // the rail neighbour whose way inward a via at aAt (its stub from aFrom) would shut
-    auto inLane = [&]( const VECTOR2I& aAt, const std::optional<VECTOR2I>& aFrom ) -> const PAD*
+    // the pin whose planned way inward a via at aAt (aVia) or a stub from aFrom would shut
+    auto inLane = [&]( const VECTOR2I& aAt, const std::optional<VECTOR2I>& aFrom, bool aVia ) -> const PAD*
     {
-        const int reach = std::max( viaDia / 2 + laneClearance, viaDrill / 2 + holeClearance );
-        const int stubHalf = board->GetDesignSettings().m_TrackMinWidth / 2;
+        const int own = std::max( minClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0 );
 
         for( const LANE& l : lanes )
         {
-            if( l.shape.Collide( aAt, reach ) )
-                return l.pad;
+            if( l.pad->GetNetCode() == net->GetNetCode() )
+                continue;
 
-            if( aFrom && l.shape.Collide( SEG( *aFrom, aAt ), stubHalf + laneClearance ) )
+            const int clear = std::max( own, clearOf( l.pad ) );
+
+            if( aVia && ( ( aAt - l.spot ).EuclideanNorm() < viaApart( viaDia, viaDrill, l.dia, l.drill, clear )
+                          || l.stub.Distance( aAt ) < stubApart( viaDia, viaDrill, clear ) ) )
+            {
                 return l.pad;
+            }
+
+            if( aFrom )
+            {
+                const SEG stub( *aFrom, aAt );
+
+                if( stub.Distance( l.spot ) < stubApart( l.dia, l.drill, clear ) || stub.Distance( l.stub ) < stubMin + clear )
+                    return l.pad;
+            }
         }
 
         return nullptr;
@@ -9544,6 +9841,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     std::vector<KIID> added;
     nlohmann::json    placed = nlohmann::json::array();
     nlohmann::json    joined = nlohmann::json::array();   // pins joined to their exposed pad by a stub
+    nlohmann::json    reused = nlohmann::json::array();   // row pins whose via was there already
     std::set<BOARD_CONNECTED_ITEM*> done;
     int               offPlaneSkipped = 0;
     int               neckedStubs = 0;
@@ -9619,6 +9917,22 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     std::set<std::pair<int, int>> bad;
     std::map<BOARD_CONNECTED_ITEM*, nlohmann::json> misses;   // ends still without a via, and why
 
+    std::set<const PAD*> reusedPins;
+
+    for( const auto& [pad, dir] : outward )
+    {
+        if( pad->GetNetCode() != net->GetNetCode() || ( !only.empty() && !only.count( pad ) ) )
+            continue;
+
+        if( PCB_TRACK* via = viaOfRowPin( pad ) )
+        {
+            reusedPins.insert( pad );
+            reused.push_back( { { "for", stitchedFor( const_cast<PAD*>( pad ) ) },
+                                { "via", str( via->m_Uuid.AsString() ) },
+                                { "at_mm", { toMm( via->GetPosition().x ), toMm( via->GetPosition().y ) } } } );
+        }
+    }
+
     for( int pass = 0; pass < 3; ++pass )
     {
         std::vector<STITCHED> fresh_vias;
@@ -9681,6 +9995,21 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                     continue;
             }
 
+            if( item->Type() == PCB_PAD_T && reusedPins.count( static_cast<PAD*>( item ) ) )
+            {
+                done.insert( item );
+                continue;
+            }
+
+            if( item->Type() == PCB_PAD_T && runSkipped.count( static_cast<PAD*>( item ) ) && planeless )
+            {
+                misses[item] = { { "for", stitchedFor( item ) },
+                                 { "at_mm", { toMm( pos.x ), toMm( pos.y ) } },
+                                 { "reason", "a pin of a run of rail pins too tight for a via at each (pitch, via and hole "
+                                             "clearance): its neighbours of poured nets got them, it is left to the router" } };
+                continue;
+            }
+
             if( planeless && !rowPin( item ) )
             {
                 misses[item] = { { "for", stitchedFor( item ) },
@@ -9698,43 +10027,20 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
             viaDia = classViaDia;
             viaDrill = classViaDrill;
 
-            // the net class's via, then the board's smallest at a fine-pitch row pin; first keeping the
-            // ways inward of rail neighbours free, then (when that was what refused spots) without. In
-            // a run of rail pins the smallest goes first where the class's leaves no stub between two
-            // vias a pin apart (the vias of the run alternate in depth)
-            int  laneRefused = 0;
-            bool smallFirst = false;
+            // a pin of a run takes its planned via (or none: left out of a tight run); another row pin
+            // the net class's via, the board's smallest where that does not fit
+            const PAD*  rowPad = rowPin( item ) ? static_cast<const PAD*>( item ) : nullptr;
+            const auto  plan = rowPad ? plannedVia.find( rowPad ) : plannedVia.end();
 
-            if( minViaDia && rowPin( item ) )
+            for( int attempt = 0; attempt < 2 && !ok; ++attempt )
             {
-                const PAD* own = static_cast<const PAD*>( item );
-                const int  stubMin = board->GetDesignSettings().m_TrackMinWidth;
+                const bool small = attempt == 1;
 
-                for( const LANE& l : lanes )
-                {
-                    const int pitch = ( l.pad->GetPosition() - own->GetPosition() ).EuclideanNorm();
-
-                    if( l.pad->GetParentFootprint() != own->GetParentFootprint() || pitch > pcbIUScale.mmToIU( 0.65 ) )
-                        continue;
-
-                    smallFirst |= 2 * pitch - classViaDia < 2 * laneClearance + stubMin
-                                  || 2 * pitch - classViaDrill - 2 * holeClearance < stubMin;
-                }
-            }
-
-            for( int attempt = 0; attempt < 4 && !ok; ++attempt )
-            {
-                const bool small = ( attempt % 2 == 1 ) != smallFirst;
-                const bool keepLanes = attempt < 2;
-
-                if( small && ( !minViaDia || !rowPin( item ) ) )
-                    continue;
-
-                if( !keepLanes && !laneRefused )
+                if( small && ( !minViaDia || !rowPad || plan != plannedVia.end() ) )
                     break;
 
-                viaDia = small ? minViaDia : classViaDia;
-                viaDrill = small ? minViaDrill : classViaDrill;
+                viaDia = plan != plannedVia.end() ? plan->second.dia : small ? minViaDia : classViaDia;
+                viaDrill = plan != plannedVia.end() ? plan->second.drill : small ? minViaDrill : classViaDrill;
 
                 // Candidate spots, nearest first: around a pad; inside a zone island (on a grid over the
                 // island, the via's copper fully in it)
@@ -9745,6 +10051,17 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                 std::set<std::pair<int, int>>                 inPad;      // spots in an exposed pad: no stub
                 std::map<std::pair<int, int>, BOARD_CONNECTED_ITEM*> joinAt;   // a stub into the exposed pad or a via of the net: no via
                 std::set<std::pair<int, int>>                 slantAt;    // inward spots off the pad's axis
+                std::set<std::pair<int, int>>                 plannedAt;  // the run's planned spot of the pin
+
+                if( plan != plannedVia.end() )
+                {
+                    const VECTOR2I at = plan->second.spot;
+                    candidates.push_back( at );
+                    stubFrom[{ at.x, at.y }] = rowPad->GetPosition();
+                    stubPadAt[{ at.x, at.y }] = const_cast<PAD*>( rowPad );
+                    inwardAt.insert( { at.x, at.y } );
+                    plannedAt.insert( { at.x, at.y } );
+                }
 
                 if( item->Type() == PCB_ZONE_T )
                 {
@@ -9993,6 +10310,9 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                         return 1;
 
                     if( joinAt.count( { at.x, at.y } ) )
+                        return -3;
+
+                    if( plannedAt.count( { at.x, at.y } ) )
                         return -2;
 
                     if( inPad.count( { at.x, at.y } ) || ( inwardAt.count( { at.x, at.y } ) && !slantAt.count( { at.x, at.y } ) ) )
@@ -10045,6 +10365,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                 const int offPlaneBefore = offPlaneSkipped;
                 std::map<std::string, int> underSkipped;   // spots under a part's body, per part
                 std::map<std::string, int> escapeOf;       // spots in a pin's escape, per pin
+                std::map<std::string, int> laneOf;         // spots in a planned way inward of another pin
 
                 {
                     for( const VECTOR2I& at : candidates )
@@ -10086,14 +10407,10 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                 continue;
                             }
 
-                            if( keepLanes && join == joinAt.end() && rowPin( item ) )
+                            if( const PAD* pin = inLane( at, start, join == joinAt.end() ) )
                             {
-                                if( const PAD* pin = inLane( at, start ) )
-                                {
-                                    escapeOf[str( pin->GetParentFootprint()->GetReference() ) + "." + str( pin->GetNumber() )]++;
-                                    laneRefused++;
-                                    continue;
-                                }
+                                laneOf[str( pin->GetParentFootprint()->GetReference() ) + "." + str( pin->GetNumber() )]++;
+                                continue;
                             }
 
                             if( const PAD* pin = inEscape( at, start, layer, own ) )
@@ -10303,6 +10620,16 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                                            "higher-priority pour of another net or a keep-out covers it there)"
                                                          : "no free spot within reach: every spot near it touches "
                                                            "other copper, a hole, a keep-out, the board edge or lies off the net's plane" } };
+
+                    if( !laneOf.empty() )
+                    {
+                        nlohmann::json kept = nlohmann::json::array();
+
+                        for( const auto& [pin, n] : laneOf )
+                            kept.push_back( pin );
+
+                        misses[item]["kept_free_for"] = kept;
+                    }
                 }
             }
         }
@@ -10376,18 +10703,21 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         BOARD_COMMIT                       tidy( context->GetToolManager() );
 
         // a via an earlier call left as a row pin's port: joined to the pin by its stub
+        auto ofRowPin = [&]( const BOARD_CONNECTED_ITEM* aItem )
+        { return aItem->Type() == PCB_PAD_T && outward.count( static_cast<const PAD*>( aItem ) ); };
+
         auto portOfRowPin = [&]( const std::shared_ptr<CONNECTIVITY_DATA>& aConn, PCB_TRACK* aVia )
         {
             for( BOARD_CONNECTED_ITEM* item : aConn->GetConnectedItems( aVia ) )
             {
-                if( rowPin( item ) )
+                if( ofRowPin( item ) )
                     return true;
 
                 if( item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T )
                 {
                     for( BOARD_CONNECTED_ITEM* other : aConn->GetConnectedItems( item ) )
                     {
-                        if( rowPin( other ) )
+                        if( ofRowPin( other ) )
                             return true;
                     }
                 }
@@ -10400,7 +10730,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         for( PCB_TRACK* t : board->Tracks() )
         {
             if( t->Type() == PCB_VIA_T && t->GetNetCode() == net->GetNetCode() && !t->IsLocked() && !ports.count( t->m_Uuid )
-                && !( planeless && portOfRowPin( conn, t ) ) && conn->TestTrackEndpointDangling( t, true ) )
+                && !portOfRowPin( conn, t ) && conn->TestTrackEndpointDangling( t, true ) )
             {
                 tidy.Remove( t );
                 gone.insert( { t->GetPosition().x, t->GetPosition().y } );
@@ -10439,6 +10769,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     nlohmann::json answer = { { "net", str( netName ) },
                                   { "vias", placed },
                                   { "joined", joined },
+                                  { "reused", reused },
                                   { "necked_stubs", neckedStubs },
                                   { "board_min_vias", minVias },
                                   { "dangling_vias_removed", danglingRemoved },
@@ -10499,6 +10830,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     nlohmann::json          out = { { "net", answer["net"] },
                                     { "vias_added", answer["vias"].size() },
                                     { "joined_count", answer["joined"].size() },
+                                    { "reused_count", answer["reused"].size() },
                                     { "necked_stubs", neckedStubs },
                                     { "board_min_vias", minVias },
                                     { "dangling_vias_removed", danglingRemoved },
@@ -10511,7 +10843,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     if( !only.empty() )
         out["pads"] = aArgs["pads"];
 
-    for( const char* key : { "vias", "joined", "not_reached", "islands_left" } )
+    for( const char* key : { "vias", "joined", "reused", "not_reached", "islands_left" } )
         cap.Put( out, key, answer[key] );
 
     KopenapiKeepUiAlive();
