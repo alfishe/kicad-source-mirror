@@ -2132,6 +2132,32 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             {
                 j["turn"] = turnName[turnOf( own, to )];
                 counts[turnName[turnOf( own, to )]] += p.kind == "signal";
+
+                // round the part: by the side the far pin lies off the line through the centre, else by the
+                // pin's half of its side
+                if( turnOf( own, to ) == 2 )
+                {
+                    VECTOR2I far = b.parts[p.to].centre;
+                    double   nearest = std::numeric_limits<double>::max();
+
+                    for( PAD* fp : b.parts[p.to].fp->Pads() )
+                    {
+                        if( fp->GetNetCode() == p.code && ( fp->GetPosition() - p.pad->GetPosition() ).EuclideanNorm() < nearest )
+                        {
+                            nearest = ( fp->GetPosition() - p.pad->GetPosition() ).EuclideanNorm();
+                            far = fp->GetPosition();
+                        }
+                    }
+
+                    const bool     across = own == 0 || own == 2;
+                    const VECTOR2I off = far - centre;
+                    const VECTOR2I at = p.pad->GetPosition() - centre;
+                    const int      tol = ( across ? extent.GetHeight() : extent.GetWidth() ) / 4;
+                    const int      lean = across ? ( std::abs( off.y ) > tol ? off.y : at.y ) : ( std::abs( off.x ) > tol ? off.x : at.x );
+                    const int      next = across ? ( lean <= 0 ? 1 : 3 ) : ( lean <= 0 ? 0 : 2 );
+                    j["round"] = next == ( own + 1 ) % 4 ? "cw" : "ccw";
+                    j["sides"] = { sides[own], sides[next], sides[to] };
+                }
             }
         }
 
@@ -2683,7 +2709,9 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "The second level of laying a board out: where each pin of a large package must leave it, "
                    "before anything is placed round it. Per pad a port: the side it is on, the part its net goes "
                    "to (the nearest in another block, else in its own: local) and the side that part lies, the "
-                   "turn between them (straight, corner, round_the_part), and the layer: pins whose order "
+                   "turn between them (straight, corner, round_the_part; round the part also round: cw / ccw in the board view "
+                   "and sides: the sides it passes, by the side the far pin lies off the centre line, else the pin's "
+                   "half of its side), and the layer: pins whose order "
                    "matches their far end's stay on the pad's layer, the rest of a group (two or more nets to "
                    "one part; the longest run in order kept) change layer by a via; rails go to their plane. "
                    "groups: per far part, side of the package and side and layer the nets arrive on (F, B, THT), the order "
