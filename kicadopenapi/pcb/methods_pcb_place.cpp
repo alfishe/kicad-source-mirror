@@ -2870,6 +2870,28 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
     aOut["placed"] = placed;
     aOut["unplaced"] = unplaced;
 
+    // the block's outline: the bounding box of the anchor's and the placed parts' courtyards, both sides
+    BOX2I          outline = courtyard( aAnchor ).BBox();
+    SHAPE_POLY_SET front, back;
+
+    for( FOOTPRINT* fp : done )
+        outline.Merge( courtyard( fp ).BBox() );
+
+    for( FOOTPRINT* fp : done )
+        ( fp->IsFlipped() ? back : front ).BooleanAdd( courtyard( fp ) );
+
+    ( aAnchor->IsFlipped() ? back : front ).BooleanAdd( courtyard( aAnchor ) );
+
+    auto round2 = []( double aValue ) { return std::round( aValue * 100.0 ) / 100.0; };
+
+    aOut["block"] = { { "bbox_mm", { round2( toMm( outline.GetLeft() ) ), round2( toMm( outline.GetTop() ) ),
+                                     round2( toMm( outline.GetRight() ) ), round2( toMm( outline.GetBottom() ) ) } },
+                      { "width_mm", round2( toMm( outline.GetWidth() ) ) },
+                      { "height_mm", round2( toMm( outline.GetHeight() ) ) },
+                      { "area_mm2", round2( areaMm2( double( outline.GetWidth() ) * outline.GetHeight() ) ) },
+                      { "courtyards_top_mm2", round2( areaMm2( front.Area() ) ) },
+                      { "courtyards_bottom_mm2", round2( areaMm2( back.Area() ) ) } };
+
     if( !farAway.empty() )
         aOut["decoupling_far"] = farAway;
 }
