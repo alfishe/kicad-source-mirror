@@ -1336,7 +1336,13 @@ public:
 
     PAD* FindPadByUuid( const KIID& aUuid ) const;
 
-    void ReplaceNetChainTerminalPad( const wxString& aNetChain, const KIID& aPrev, const KIID& aNew );
+    /**
+     * Set terminal \a aIndex (0: A, 1: B) of every net of \a aNetChain to \a aPad; nullptr
+     * clears it.
+     *
+     * @return the number of nets changed.
+     */
+    int SetNetChainTerminalPad( const wxString& aNetChain, int aIndex, PAD* aPad );
 
     /// Per-net-chain colour override (empty COLOR4D::UNSPECIFIED = no override).
     /// Populated from the netlist at update-from-schematic time and consumed by

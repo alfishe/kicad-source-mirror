@@ -2015,7 +2015,7 @@ TOOL_ACTION PCB_ACTIONS::highlightNetChain( TOOL_ACTION_ARGS()
 TOOL_ACTION PCB_ACTIONS::setTerminalPad( TOOL_ACTION_ARGS()
         .Name( "pcbnew.EditorControl.setTerminalPad" )
         .Scope( AS_GLOBAL )
-        .Parameter<std::pair<KIID, KIID>>( { niluuid, niluuid } )
+        .Parameter<std::pair<int, KIID>>( { 0, niluuid } )
         .FriendlyName( _( "Set Terminal Pad" ) ) );
 
 TOOL_ACTION PCB_ACTIONS::highlightItem( TOOL_ACTION_ARGS()

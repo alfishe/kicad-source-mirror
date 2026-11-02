@@ -96,7 +96,7 @@ void NETINFO_ITEM::ResolveTerminalPads( BOARD* aBoard )
 {
     for( int i = 0; i < 2; ++i )
     {
-        if( m_terminalPads[i] )
+        if( m_terminalPads[i] || m_terminalPadUuids[i] == niluuid )
             continue;
 
         if( aBoard )

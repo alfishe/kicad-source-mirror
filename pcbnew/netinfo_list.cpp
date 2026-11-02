@@ -219,6 +219,8 @@ void NETINFO_LIST::buildListOfNets()
         auto ip1 = preservedPad1.find( net->GetNetCode() );
         if( ip1 != preservedPad1.end() )
             net->SetTerminalPadUuid( 1, ip1->second );
+
+        net->ResolveTerminalPads( m_parent );
     }
 
     m_parent->SynchronizeNetsAndNetClasses( false );

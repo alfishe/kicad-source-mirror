@@ -3148,23 +3148,23 @@ PAD* BOARD::FindPadByUuid( const KIID& aUuid ) const
 }
 
 
-void BOARD::ReplaceNetChainTerminalPad( const wxString& aNetChain, const KIID& aPrev, const KIID& aNew )
+int BOARD::SetNetChainTerminalPad( const wxString& aNetChain, int aIndex, PAD* aPad )
 {
-    PAD* newPad = FindPadByUuid( aNew );
+    if( aNetChain.IsEmpty() || aIndex < 0 || aIndex > 1 )
+        return 0;
+
+    int changed = 0;
 
     for( NETINFO_ITEM* net : m_NetInfo )
     {
-        if( net->GetNetChain() == aNetChain )
+        if( net->GetNetChain() == aNetChain && net->GetTerminalPad( aIndex ) != aPad )
         {
-            for( int i = 0; i < 2; ++i )
-            {
-                PAD* pad = net->GetTerminalPad( i );
-
-                if( pad && pad->m_Uuid == aPrev )
-                    net->SetTerminalPad( i, newPad );
-            }
+            net->SetTerminal( aIndex, aPad );
+            changed++;
         }
     }
+
+    return changed;
 }
 
 

@@ -2940,14 +2940,27 @@ int BOARD_INSPECTION_TOOL::HighlightNetChain( const TOOL_EVENT& aEvent )
 
 int BOARD_INSPECTION_TOOL::ReplaceTerminalPad( const TOOL_EVENT& aEvent )
 {
-    if( m_highlightedNetChain.IsEmpty() )
+    // the terminal (0: A, 1: B) and the pad that becomes it, in the chain of the pad's net
+    const auto [index, padId] = aEvent.Parameter<std::pair<int, KIID>>();
+    BOARD*     board = m_frame->GetBoard();
+    PAD*       pad = board->FindPadByUuid( padId );
+
+    if( !pad || !pad->GetNet() || pad->GetNet()->GetNetChain().IsEmpty() || index < 0 || index > 1 )
         return 0;
 
-    // Parameters are passed as a single pair<old,new>
-    std::pair<wxString, wxString> ids = aEvent.Parameter<std::pair<wxString, wxString>>();
-    KIID oldId( ids.first );
-    KIID newId( ids.second );
-    m_frame->GetBoard()->ReplaceNetChainTerminalPad( m_highlightedNetChain, oldId, newId );
+    PAD* previous = pad->GetNet()->GetTerminalPad( index );
+
+    if( board->SetNetChainTerminalPad( pad->GetNet()->GetNetChain(), index, pad ) == 0 )
+        return 0;
+
+    for( PAD* changed : { previous, pad } )
+    {
+        if( changed )
+            getView()->Update( changed, KIGFX::REPAINT );
+    }
+
+    m_frame->OnModify();
+    m_frame->GetCanvas()->Refresh();
     return 0;
 }
 

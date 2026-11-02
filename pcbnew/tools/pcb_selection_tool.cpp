@@ -166,8 +166,6 @@ protected:
         if( oldB && oldB->m_Uuid == newId )
             itemB->Enable( false );
 
-        m_oldA = oldA ? oldA->m_Uuid : niluuid;
-        m_oldB = oldB ? oldB->m_Uuid : niluuid;
         m_new = newId;
     }
 
@@ -176,13 +174,13 @@ protected:
         if( aEvent.GetId() == ID_REPLACE_TERMINAL_PAD_A )
         {
             TOOL_EVENT te = PCB_ACTIONS::setTerminalPad.MakeEvent();
-            te.SetParameter( std::make_pair( m_oldA.AsString(), m_new.AsString() ) );
+            te.SetParameter( std::make_pair( 0, m_new ) );
             return te;
         }
         else if( aEvent.GetId() == ID_REPLACE_TERMINAL_PAD_B )
         {
             TOOL_EVENT te = PCB_ACTIONS::setTerminalPad.MakeEvent();
-            te.SetParameter( std::make_pair( m_oldB.AsString(), m_new.AsString() ) );
+            te.SetParameter( std::make_pair( 1, m_new ) );
             return te;
         }
 
@@ -190,8 +188,6 @@ protected:
     }
 
 private:
-    KIID m_oldA;
-    KIID m_oldB;
     KIID m_new;
 };
 
