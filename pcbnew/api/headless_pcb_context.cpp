@@ -20,6 +20,7 @@
 
 #include <api/headless_pcb_context.h>
 #include <board.h>
+#include <board_design_settings.h>
 #include <board_loader.h>
 #include <common.h>
 #include <component_classes/component_class_manager.h>
@@ -279,14 +280,27 @@ void HEADLESS_PCB_CONTEXT::OnNetlistChanged( BOARD_NETLIST_UPDATER& aUpdater )
 
 bool HEADLESS_PCB_CONTEXT::RevertToSaved()
 {
+    wxCHECK( m_board, false );
+    return reload( m_board->GetFileName(), false );
+}
+
+
+bool HEADLESS_PCB_CONTEXT::LoadContentFrom( const wxString& aPath )
+{
+    return reload( aPath, true );
+}
+
+
+bool HEADLESS_PCB_CONTEXT::reload( const wxString& aPath, bool aModified )
+{
     wxCHECK( m_board && m_project, false );
 
-    wxString fileName = m_board->GetFileName();
+    const wxString fileName = m_board->GetFileName();
 
-    if( fileName.IsEmpty() || !wxFileExists( fileName ) )
+    if( fileName.IsEmpty() || aPath.IsEmpty() || !wxFileExists( aPath ) )
         return false;
 
-    PCB_IO_MGR::PCB_FILE_T pluginType = PCB_IO_MGR::FindPluginTypeFromBoardPath( fileName, KICTL_KICAD_ONLY );
+    PCB_IO_MGR::PCB_FILE_T pluginType = PCB_IO_MGR::FindPluginTypeFromBoardPath( aPath, KICTL_KICAD_ONLY );
 
     if( pluginType == PCB_IO_MGR::FILE_TYPE_NONE )
         return false;
@@ -295,7 +309,7 @@ bool HEADLESS_PCB_CONTEXT::RevertToSaved()
 
     try
     {
-        reloaded = BOARD_LOADER::Load( fileName, pluginType, m_project );
+        reloaded = BOARD_LOADER::Load( aPath, pluginType, m_project );
     }
     catch( ... )
     {
@@ -309,10 +323,27 @@ bool HEADLESS_PCB_CONTEXT::RevertToSaved()
         m_kiway->LocalHistory().UnregisterSaver( m_board.get() );
 
     m_board = std::move( reloaded );
+    m_board->SetFileName( fileName );
     m_board->SetProject( m_project );
+
+    // the loader looked for the custom rules beside the other file
+    if( aPath != fileName )
+    {
+        if( std::shared_ptr<DRC_ENGINE> engine = m_board->GetDesignSettings().m_DRCEngine )
+        {
+            try
+            {
+                engine->InitEngine( m_board->GetDesignRulesPath() );
+            }
+            catch( ... )
+            {
+                // a broken custom rules file: reported by DRC
+            }
+        }
+    }
     m_toolManager->SetEnvironment( m_board.get(), nullptr, nullptr, GetAppSettings<PCBNEW_SETTINGS>( "pcbnew" ),
                                    nullptr );
-    m_contentModified = false;
+    m_contentModified = aModified;
 
     if( m_kiway )
         m_board->RegisterHistorySaver( m_kiway->LocalHistory(), [this]() { return m_contentModified; } );

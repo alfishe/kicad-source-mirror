@@ -696,6 +696,43 @@ findAutosaveFilePairs( const wxString& aProjectPath )
 }
 
 
+std::vector<AUTOSAVE_FILE_INFO>
+LOCAL_HISTORY::ListAutosaveFiles( const wxString& aProjectPath, const std::vector<wxString>& aExtensions ) const
+{
+    std::vector<AUTOSAVE_FILE_INFO> results;
+
+    for( auto& [autosavePath, srcPath] : findAutosaveFilePairs( aProjectPath ) )
+    {
+        wxFileName srcFn( srcPath );
+
+        if( !aExtensions.empty()
+            && std::none_of( aExtensions.begin(), aExtensions.end(),
+                             [&]( const wxString& aExt ) { return srcFn.GetExt().IsSameAs( aExt, false ); } ) )
+        {
+            continue;
+        }
+
+        AUTOSAVE_FILE_INFO info;
+        info.autosavePath = autosavePath;
+        info.sourcePath = srcPath;
+        info.autosaveTime = wxFileName( autosavePath ).GetModificationTime();
+
+        if( srcFn.FileExists() )
+            info.sourceTime = srcFn.GetModificationTime();
+
+        // mtime is only a pre-filter; cloud-sync clients bump the byte-identical autosave's
+        // mtime past the source, so confirm the content actually diverges (issue 24126).
+        info.newer = !info.sourceTime.IsValid()
+                     || ( info.autosaveTime.IsLaterThan( info.sourceTime )
+                          && !filesContentEqual( autosavePath, srcPath ) );
+
+        results.push_back( std::move( info ) );
+    }
+
+    return results;
+}
+
+
 std::vector<std::pair<wxString, wxString>>
 LOCAL_HISTORY::FindStaleAutosaveFiles( const wxString& aProjectPath, const std::vector<wxString>& aExtensions ) const
 {
@@ -704,41 +741,90 @@ LOCAL_HISTORY::FindStaleAutosaveFiles( const wxString& aProjectPath, const std::
     if( aExtensions.empty() )
         return results;
 
-    for( auto& pair : findAutosaveFilePairs( aProjectPath ) )
+    for( const AUTOSAVE_FILE_INFO& info : ListAutosaveFiles( aProjectPath, aExtensions ) )
     {
-        wxFileName srcFn( pair.second );
-        bool       match = false;
-
-        for( const wxString& ext : aExtensions )
-        {
-            if( srcFn.GetExt().IsSameAs( ext, false ) )
-            {
-                match = true;
-                break;
-            }
-        }
-
-        if( !match )
-            continue;
-
-        wxDateTime srcTime;
-
-        if( srcFn.FileExists() )
-            srcTime = srcFn.GetModificationTime();
-
-        wxDateTime autosaveTime = wxFileName( pair.first ).GetModificationTime();
-
-        // mtime is only a pre-filter; cloud-sync clients bump the byte-identical autosave's
-        // mtime past the source, so confirm the content actually diverges (issue 24126).
-        bool stale = !srcTime.IsValid()
-                     || ( autosaveTime.IsLaterThan( srcTime )
-                          && !filesContentEqual( pair.first, pair.second ) );
-
-        if( stale )
-            results.emplace_back( std::move( pair ) );
+        if( info.newer )
+            results.emplace_back( info.autosavePath, info.sourcePath );
     }
 
     return results;
+}
+
+
+static wxString buildRecoveredFileName( const wxFileName& aSrcFn, const wxDateTime& aStamp )
+{
+    wxString stamp = aStamp.IsValid() ? aStamp.Format( wxS( "%Y-%m-%d_%H%M%S" ) ) : wxString( wxS( "unknown-time" ) );
+
+    wxFileName recovered( aSrcFn );
+    recovered.SetName( aSrcFn.GetName() + wxS( ".recovered." ) + stamp );
+
+    int seq = 1;
+
+    while( recovered.FileExists() )
+        recovered.SetName( aSrcFn.GetName() + wxS( ".recovered." ) + stamp + wxString::Format( wxS( ".%d" ), seq++ ) );
+
+    return recovered.GetFullPath();
+}
+
+
+wxString LOCAL_HISTORY::ResolveAutosaveFiles( const std::vector<std::pair<wxString, wxString>>& aFiles,
+                                              AUTOSAVE_RECOVERY_CHOICE aChoice, std::vector<wxString>* aWritten )
+{
+    wxString errors;
+
+    auto fail = [&]( const wxString& aMsg )
+    {
+        errors += ( errors.IsEmpty() ? wxString() : wxString( wxS( "\n" ) ) ) + aMsg;
+    };
+
+    for( const auto& [autosavePath, srcPath] : aFiles )
+    {
+        switch( aChoice )
+        {
+        case AUTOSAVE_RECOVERY_CHOICE::RESTORE:
+            if( !wxCopyFile( autosavePath, srcPath, true ) )
+            {
+                fail( wxString::Format( _( "Failed to recover auto-saved file '%s'." ), srcPath ) );
+                continue;
+            }
+
+            if( aWritten )
+                aWritten->push_back( srcPath );
+
+            wxRemoveFile( autosavePath );
+            break;
+
+        case AUTOSAVE_RECOVERY_CHOICE::KEEP_CURRENT:
+            if( wxFileExists( autosavePath ) )
+                wxRemoveFile( autosavePath );
+
+            break;
+
+        case AUTOSAVE_RECOVERY_CHOICE::KEEP_BOTH:
+        {
+            wxFileName autosaveFn( autosavePath );
+            wxDateTime stamp = autosaveFn.FileExists() ? autosaveFn.GetModificationTime() : wxDateTime::Now();
+            wxString   target = buildRecoveredFileName( wxFileName( srcPath ), stamp );
+
+            if( !wxCopyFile( autosavePath, target, true ) )
+            {
+                fail( wxString::Format( _( "Failed to write recovered file '%s'." ), target ) );
+                continue;
+            }
+
+            if( aWritten )
+                aWritten->push_back( target );
+
+            wxRemoveFile( autosavePath );
+            break;
+        }
+
+        case AUTOSAVE_RECOVERY_CHOICE::CANCEL:
+            break;
+        }
+    }
+
+    return errors;
 }
 
 

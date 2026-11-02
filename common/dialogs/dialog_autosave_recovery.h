@@ -26,15 +26,7 @@
 #include <wx/string.h>
 
 #include "dialog_autosave_recovery_base.h"
-
-
-enum class AUTOSAVE_RECOVERY_CHOICE
-{
-    RESTORE,
-    KEEP_CURRENT,
-    KEEP_BOTH,
-    CANCEL
-};
+#include <local_history.h>
 
 
 class DIALOG_AUTOSAVE_RECOVERY : public DIALOG_AUTOSAVE_RECOVERY_BASE

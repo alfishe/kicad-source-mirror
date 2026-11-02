@@ -109,14 +109,12 @@ public:
 
     bool RevertToSaved() override
     {
-        wxFileName fn = m_frame->Prj().AbsolutePath( m_frame->GetBoard()->GetFileName() );
+        return m_frame->ReloadCurrentDocument();
+    }
 
-        if( fn.GetFullPath().IsEmpty() || !wxFileExists( fn.GetFullPath() ) )
-            return false;
-
-        m_frame->GetScreen()->SetContentModified( false );
-        m_frame->ReleaseFile();
-        return m_frame->OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+    bool LoadContentFrom( const wxString& aPath ) override
+    {
+        return m_frame->LoadBoardContentFrom( aPath );
     }
 
 private:

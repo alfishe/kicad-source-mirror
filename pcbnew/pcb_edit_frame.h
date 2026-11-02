@@ -660,6 +660,14 @@ public:
 
     wxString GetCurrentFileName() const override;
 
+    bool ReloadCurrentDocument() override;
+
+    /**
+     * Replace the board by the content of another board file (an auto-saved copy), kept under
+     * the board's own file name and marked unsaved; unsaved changes are dropped without asking.
+     */
+    bool LoadBoardContentFrom( const wxString& aContentPath );
+
     SELECTION& GetCurrentSelection() override;
 
     TOOL_ACTION* GetExportNetlistAction() { return m_exportNetlistAction; }
@@ -868,6 +876,7 @@ private:
     WX_INFOBAR*            m_loadNoticeInfoBar = nullptr;
 
     const std::map<std::string, UTF8>* m_importProperties; // Properties used for non-KiCad import.
+    wxString                           m_loadContentFrom;  // OpenProjectFiles reads this file instead
 
     /**
      * Keep track of viewport so that track net labels can be adjusted when it changes.

@@ -88,34 +88,7 @@ public:
 
     bool RevertToSaved() override
     {
-        wxFileName fn = m_frame->Prj().AbsolutePath( m_frame->Schematic().GetFileName() );
-
-        if( fn.GetFullPath().IsEmpty() || !wxFileExists( fn.GetFullPath() ) )
-            return false;
-
-        if( m_frame->GetCurrentSheet().Last() != &m_frame->Schematic().Root() )
-        {
-            SCH_SHEET_PATH rootSheetPath = m_frame->Schematic().Hierarchy().at( 0 );
-
-            // on that sheet already: no change of sheet, whose redraw the reload repeats
-            if( m_frame->GetCurrentSheet() != rootSheetPath )
-            {
-                m_frame->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &rootSheetPath );
-            }
-            else
-            {
-                m_frame->GetToolManager()->RunAction( ACTIONS::cancelInteractive );
-                m_frame->GetToolManager()->RunAction( ACTIONS::selectionClear );
-            }
-        }
-
-        SCH_SCREENS screenList( m_frame->Schematic().Root() );
-
-        for( SCH_SCREEN* screen = screenList.GetFirst(); screen; screen = screenList.GetNext() )
-            screen->SetContentModified( false );
-
-        m_frame->ReleaseFile();
-        return m_frame->OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+        return m_frame->ReloadCurrentDocument();
     }
 
 private:

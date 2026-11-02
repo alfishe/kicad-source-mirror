@@ -45,6 +45,8 @@
 #include <pcb_track.h>
 #include <zone.h>
 #include <zone_merge.h>
+#include <board_recovery.h>
+#include <widgets/wx_infobar.h>
 #include <pcb_marker.h>
 #include <confirm.h>
 #include <dialogs/dialog_page_settings.h>
@@ -56,6 +58,7 @@
 #include <dialogs/dialog_find_by_properties.h>
 #include <kiface_base.h>
 #include <kiway.h>
+#include <wx/filename.h>
 #include <netlist_reader/pcb_netlist.h>
 #include <origin_viewitem.h>
 #include <pcb_edit_frame.h>
@@ -797,81 +800,81 @@ int BOARD_EDITOR_CONTROL::GenerateGerbers( const TOOL_EVENT& aEvent )
 
 int BOARD_EDITOR_CONTROL::RepairBoard( const TOOL_EVENT& aEvent )
 {
-    int      errors = 0;
-    wxString details;
-    bool     quiet = aEvent.Parameter<bool>();
+    bool                quiet = aEvent.Parameter<bool>();
+    BOARD_REPAIR_RESULT result = ::RepairBoard( *board() );
 
-    int duplicates = board()->RepairDuplicateItemUuids();
-
-    if( duplicates )
-    {
-        errors += duplicates;
-        details += wxString::Format( _( "%d duplicate IDs replaced.\n" ), duplicates );
-    }
-
-    for( FOOTPRINT* footprint : board()->Footprints() )
-    {
-        for( PAD* pad : footprint->Pads() )
-        {
-            BOARD_CONNECTED_ITEM* cItem = pad;
-
-            if( cItem->GetNetCode() )
-            {
-                NETINFO_ITEM* netinfo = cItem->GetNet();
-
-                if( netinfo && !board()->FindNet( netinfo->GetNetname() ) )
-                {
-                    board()->Add( netinfo );
-
-                    details += wxString::Format( _( "Orphaned net %s re-parented.\n" ),
-                                                 netinfo->GetNetname() );
-                    errors++;
-                }
-            }
-        }
-    }
-
-    for( PCB_TRACK* track : board()->Tracks() )
-    {
-        BOARD_CONNECTED_ITEM* cItem = track;
-
-        if( cItem->GetNetCode() )
-        {
-            NETINFO_ITEM* netinfo = cItem->GetNet();
-
-            if( netinfo && !board()->FindNet( netinfo->GetNetname() ) )
-            {
-                board()->Add( netinfo );
-
-                details += wxString::Format( _( "Orphaned net %s re-parented.\n" ),
-                                             netinfo->GetNetname() );
-                errors++;
-            }
-        }
-    }
-
-    /*******************************
-     * Your test here
-     */
-
-    /*******************************
-     * Inform the user
-     */
-
-    if( errors )
-    {
+    if( result.Count() )
         m_frame->OnModify();
 
-        wxString msg = wxString::Format( _( "%d potential problems repaired." ), errors );
+    if( quiet )
+        return 0;
 
-        if( !quiet )
-            DisplayInfoMessage( m_frame, msg, details );
-    }
-    else if( !quiet )
+    wxString msg = result.Summary();
+
+    for( const wxString& line : result.Details() )
+        msg << wxS( " " ) << line;
+
+    m_frame->ShowInfoBarMsg( msg, true );
+    return 0;
+}
+
+
+int BOARD_EDITOR_CONTROL::RescueAutosave( const TOOL_EVENT& aEvent )
+{
+    std::vector<AUTOSAVE_FILE_INFO> autosaves = FindBoardAutosaves( m_frame->Kiway().LocalHistory(), *board() );
+
+    if( autosaves.empty() )
     {
-        DisplayInfoMessage( m_frame, _( "No board problems found." ) );
+        m_frame->ShowInfoBarWarning( wxString::Format( _( "No auto-saved copy of '%s' was found." ),
+                                                       wxFileName( board()->GetFileName() ).GetFullName() ),
+                                     true );
+        return 0;
     }
 
+    const AUTOSAVE_FILE_INFO autosave = autosaves.front();
+    const wxString           stamp = autosave.autosaveTime.Format( wxS( "%Y-%m-%d %H:%M:%S" ) );
+
+    auto rescue = [this, autosave, stamp]()
+    {
+        if( m_frame->LoadBoardContentFrom( autosave.autosavePath ) )
+        {
+            m_frame->ShowInfoBarMsg( wxString::Format( _( "Board rescued from the copy auto-saved at %s; "
+                                                          "save it to keep it." ),
+                                                       stamp ),
+                                     true );
+        }
+        else
+        {
+            m_frame->ShowInfoBarError( wxString::Format( _( "The auto-saved copy '%s' could not be loaded." ),
+                                                         autosave.autosavePath ),
+                                       true );
+        }
+    };
+
+    if( !m_frame->IsContentModified() )
+    {
+        rescue();
+        return 0;
+    }
+
+    // unsaved changes are dropped by a rescue: the infobar asks, nothing waits for it
+    WX_INFOBAR* infobar = m_frame->GetInfoBar();
+    infobar->RemoveAllButtons();
+    infobar->AddLink( _( "Rescue" ),
+                      [this, rescue]( wxHyperlinkEvent& )
+                      {
+                          m_frame->CallAfter(
+                                  [this, rescue]()
+                                  {
+                                      m_frame->GetInfoBar()->Dismiss();
+                                      rescue();
+                                  } );
+                      } );
+    infobar->AddCloseButton();
+    infobar->ShowMessage( wxString::Format( _( "Rescue replaces the unsaved changes with the copy auto-saved "
+                                               "at %s." ),
+                                            stamp ),
+                          wxICON_WARNING );
     return 0;
 }
 
@@ -2372,6 +2375,7 @@ void BOARD_EDITOR_CONTROL::setTransitions()
     Go( &BOARD_EDITOR_CONTROL::ToggleSearch,           PCB_ACTIONS::showSearch.MakeEvent() );
     Go( &BOARD_EDITOR_CONTROL::ToggleConstraintsPanel, PCB_ACTIONS::showConstraintsPanel.MakeEvent() );
     Go( &BOARD_EDITOR_CONTROL::RepairBoard,            PCB_ACTIONS::repairBoard.MakeEvent() );
+    Go( &BOARD_EDITOR_CONTROL::RescueAutosave,         PCB_ACTIONS::rescueAutosave.MakeEvent() );
     // Line modes: explicit, next, and notification
     Go( &BOARD_EDITOR_CONTROL::ChangeLineMode,        PCB_ACTIONS::lineModeFree.MakeEvent() );
     Go( &BOARD_EDITOR_CONTROL::ChangeLineMode,        PCB_ACTIONS::lineMode90.MakeEvent() );

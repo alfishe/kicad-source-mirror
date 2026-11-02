@@ -18,6 +18,8 @@
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 #include <richio.h>
 #include <board_loader.h>
+#include <board_recovery.h>
+#include <footprint.h>
 #include <board_design_settings.h>
 #include <api/board/board_rules.pb.h>
 #include <drc/drc_engine.h>
@@ -235,6 +237,78 @@ static nlohmann::json documentStatus( KOPENAPI_CONTEXT& aCtx )
 }
 
 
+static std::string utf8( const wxString& aText )
+{
+    return aText.ToStdString( wxConvUTF8 );
+}
+
+
+static nlohmann::json repairJson( const BOARD_REPAIR_RESULT& aResult, bool aDryRun )
+{
+    nlohmann::json ids = nlohmann::json::array();
+
+    for( const BOARD_REPAIR_RESULT::REPLACED_ID& r : aResult.duplicateIds )
+    {
+        nlohmann::json row = { { "type", utf8( r.item->GetTypeDesc() ) }, { "old_uuid", r.oldId.AsStdString() } };
+
+        if( !aDryRun )
+            row["uuid"] = r.newId.AsStdString();
+
+        if( const FOOTPRINT* fp = r.item->GetParentFootprint() )
+            row["footprint"] = utf8( fp->GetReference() );
+        else if( r.item->Type() == PCB_FOOTPRINT_T )
+            row["footprint"] = utf8( static_cast<const FOOTPRINT*>( r.item )->GetReference() );
+
+        ids.push_back( row );
+    }
+
+    nlohmann::json nets = nlohmann::json::array();
+
+    for( const wxString& net : aResult.orphanedNets )
+        nets.push_back( utf8( net ) );
+
+    nlohmann::json details = nlohmann::json::array();
+
+    for( const wxString& line : aResult.Details() )
+        details.push_back( utf8( line ) );
+
+    return { { "count", aResult.Count() }, { "duplicate_ids", ids }, { "orphaned_nets", nets },
+             { "summary", utf8( aResult.Summary() ) }, { "details", details } };
+}
+
+
+static nlohmann::json autosaveJson( const AUTOSAVE_FILE_INFO& aInfo )
+{
+    auto stamp = []( const wxDateTime& aTime ) -> nlohmann::json
+    {
+        return aTime.IsValid() ? nlohmann::json( utf8( aTime.FormatISOCombined( ' ' ) ) ) : nlohmann::json();
+    };
+
+    return { { "path", utf8( aInfo.autosavePath ) }, { "source", utf8( aInfo.sourcePath ) },
+             { "time", stamp( aInfo.autosaveTime ) }, { "source_time", stamp( aInfo.sourceTime ) },
+             { "newer", aInfo.newer } };
+}
+
+
+/// @brief The board's auto-saved copies newer than its file (the ones the editor offers on open)
+static nlohmann::json newerAutosaves( KOPENAPI_CONTEXT& aCtx )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+    nlohmann::json               out = nlohmann::json::array();
+
+    if( !context || !aCtx.kiway )
+        return out;
+
+    for( const AUTOSAVE_FILE_INFO& info : FindBoardAutosaves( aCtx.kiway->LocalHistory(), *context->GetBoard() ) )
+    {
+        if( info.newer )
+            out.push_back( autosaveJson( info ) );
+    }
+
+    return out;
+}
+
+
 /// @brief Another open document of this process belongs to a different project
 static std::string projectConflict( KOPENAPI_CONTEXT& aCtx, const wxFileName& aProject )
 {
@@ -345,13 +419,24 @@ static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& a
         board->SetFileName( current.GetFullPath() );
     }
 
+    // the editor's load runs Repair Board quietly, and a repair leaves the board unsaved
+    std::optional<BOARD_REPAIR_RESULT> repaired;
+
+    if( aArgs.value( "repair", true ) )
+        repaired = RepairBoard( *board );
+
     s_headless = std::make_shared<HEADLESS_PCB_CONTEXT>(
             std::move( board ), project, GetAppSettings<PCBNEW_SETTINGS>( "pcbnew" ), aCtx.kiway );
 
-    if( legacy )
+    if( legacy || ( repaired && repaired->Count() ) )
         s_headless->SetContentModified( true );
 
-    return KOPENAPI_RESULT::Ok( documentStatus( aCtx ) );
+    nlohmann::json status = documentStatus( aCtx );
+
+    if( repaired && repaired->Count() )
+        status["repaired"] = repairJson( *repaired, false );
+
+    return KOPENAPI_RESULT::Ok( status );
 }
 
 
@@ -430,16 +515,29 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         }
     }
 
+    KOPENAPI_RESULT result;
+
     if( aCtx.headless )
-        return openHeadless( aCtx, board, aArgs );
+    {
+        result = openHeadless( aCtx, board, aArgs );
+    }
+    else
+    {
+        // a file another process has open: opened only when asked (no modal question)
+        KICAD_OPENAPI_SERVICE::SetOverrideLock( aArgs.value( "override_lock", false ) );
+        result = openGui( aCtx, board );
+        KICAD_OPENAPI_SERVICE::SetOverrideLock( false );
 
-    // a file another process has open: opened only when asked (no modal question)
-    KICAD_OPENAPI_SERVICE::SetOverrideLock( aArgs.value( "override_lock", false ) );
-    KOPENAPI_RESULT result = openGui( aCtx, board );
-    KICAD_OPENAPI_SERVICE::SetOverrideLock( false );
+        if( result.status != 200 )
+            result.body["hint"] = "another process may have the file open (errors: journal); override_lock: true opens it anyway";
+    }
 
-    if( result.status != 200 )
-        result.body["hint"] = "another process may have the file open (errors: journal); override_lock: true opens it anyway";
+    // the editor offers these in its infobar
+    if( result.status == 200 )
+    {
+        if( nlohmann::json newer = newerAutosaves( aCtx ); !newer.empty() )
+            result.body["autosaves"] = newer;
+    }
 
     return result;
 }
@@ -767,6 +865,179 @@ static KOPENAPI_RESULT h_pcb_revert( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 }
 
 
+/// Repair Board (BOARD_EDITOR_CONTROL::RepairBoard through RepairBoard): duplicate ids replaced,
+/// orphaned nets re-added
+static KOPENAPI_RESULT h_pcb_repair( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    const bool          dryRun = aArgs.value( "dry_run", false );
+    BOARD_REPAIR_RESULT result = RepairBoard( *context->GetBoard(), dryRun );
+
+    if( result.Count() && !dryRun )
+        context->SetContentModified( true );
+
+    nlohmann::json out = repairJson( result, dryRun );
+    out["dry_run"] = dryRun;
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
+static KOPENAPI_RESULT h_pcb_autosave_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    if( !aCtx.kiway )
+        return KOPENAPI_RESULT::Error( 409, "autosave files are not available in this host" );
+
+    nlohmann::json list = nlohmann::json::array();
+
+    for( const AUTOSAVE_FILE_INFO& info : FindBoardAutosaves( aCtx.kiway->LocalHistory(), *context->GetBoard() ) )
+        list.push_back( autosaveJson( info ) );
+
+    const COMMON_SETTINGS* cs = Pgm().GetCommonSettings();
+
+    return KOPENAPI_RESULT::Ok(
+            { { "autosaves", list },
+              { "enabled", cs->m_Backup.enabled },
+              { "format", cs->m_Backup.format == BACKUP_FORMAT::ZIP ? "zip" : "incremental" },
+              { "location", cs->m_Backup.location == BACKUP_LOCATION::USER_DIR ? "user_dir" : "project_dir" },
+              { "writes_autosave_files", cs->m_Backup.enabled && !cs->AutosaveUsesLocalHistory() } } );
+}
+
+
+/// Rescue (the File menu's, BOARD_EDITOR_CONTROL::RescueAutosave) and the choices of the editor's
+/// autosave infobar on open (EDA_BASE_FRAME::RecoverAutosaveFiles), on the board's auto-saved copies
+static KOPENAPI_RESULT h_pcb_autosave( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    if( !aCtx.kiway )
+        return KOPENAPI_RESULT::Error( 409, "autosave files are not available in this host" );
+
+    const std::string action = aArgs.value( "action", std::string() );
+    std::vector<AUTOSAVE_FILE_INFO> all = FindBoardAutosaves( aCtx.kiway->LocalHistory(), *context->GetBoard() );
+    std::vector<AUTOSAVE_FILE_INFO> chosen;
+
+    if( aArgs.contains( "path" ) )
+    {
+        const wxFileName want( wxString::FromUTF8( aArgs.value( "path", std::string() ) ) );
+
+        for( const AUTOSAVE_FILE_INFO& info : all )
+        {
+            if( wxFileName( info.autosavePath ).SameAs( want ) )
+                chosen.push_back( info );
+        }
+
+        if( chosen.empty() )
+            return KOPENAPI_RESULT::Error( 404, "path: not an auto-saved copy of this board (pcb_autosave_list)" );
+    }
+    else if( action == "rescue" || action == "discard" )
+    {
+        chosen = action == "rescue" && !all.empty() ? std::vector<AUTOSAVE_FILE_INFO>{ all.front() } : all;
+    }
+    else
+    {
+        for( const AUTOSAVE_FILE_INFO& info : all )
+        {
+            if( info.newer )
+                chosen.push_back( info );
+        }
+    }
+
+    if( chosen.empty() )
+        return KOPENAPI_RESULT::Error( 404, "no auto-saved copy of this board" + std::string( action == "rescue" || action == "discard" ? "" : " newer than its file" ) + " (pcb_autosave_list)" );
+
+    const bool replaces = action == "rescue" || action == "restore";
+
+    if( replaces && context->IsContentModified() && !aArgs.value( "discard", false ) )
+        return KOPENAPI_RESULT::Error( 409, "the board has unsaved changes, which " + action + " drops; pcb_save, or pass discard: true" );
+
+    nlohmann::json used = nlohmann::json::array();
+
+    for( const AUTOSAVE_FILE_INFO& info : chosen )
+        used.push_back( autosaveJson( info ) );
+
+    if( action == "rescue" )
+    {
+        KOPENAPI_HISTORY::Get().Reset( "pcb", "pcb_autosave" );   // another document state
+
+        if( !context->LoadContentFrom( chosen.front().autosavePath ) )
+            return KOPENAPI_RESULT::Error( 422, "the auto-saved copy could not be loaded" );
+
+        nlohmann::json out = documentStatus( aCtx );
+        out["action"] = action;
+        out["autosaves"] = used;
+        return KOPENAPI_RESULT::Ok( out );
+    }
+
+    AUTOSAVE_RECOVERY_CHOICE choice;
+
+    if( action == "restore" )
+        choice = AUTOSAVE_RECOVERY_CHOICE::RESTORE;
+    else if( action == "keep_both" )
+        choice = AUTOSAVE_RECOVERY_CHOICE::KEEP_BOTH;
+    else if( action == "discard" )
+        choice = AUTOSAVE_RECOVERY_CHOICE::KEEP_CURRENT;
+    else
+        return KOPENAPI_RESULT::Error( 400, "action: rescue, restore, keep_both or discard" );
+
+    std::vector<std::pair<wxString, wxString>> pairs;
+
+    for( const AUTOSAVE_FILE_INFO& info : chosen )
+        pairs.emplace_back( info.autosavePath, info.sourcePath );
+
+    std::vector<wxString> written;
+    const wxString        errors = LOCAL_HISTORY::ResolveAutosaveFiles( pairs, choice, &written );
+    bool                  reloaded = false;
+
+    if( choice == AUTOSAVE_RECOVERY_CHOICE::RESTORE && !written.empty() )
+    {
+        KOPENAPI_HISTORY::Get().Reset( "pcb", "pcb_autosave" );
+        context->SetContentModified( false );
+        reloaded = context->RevertToSaved();
+    }
+
+    nlohmann::json files = nlohmann::json::array();
+
+    for( const wxString& file : written )
+        files.push_back( utf8( file ) );
+
+    nlohmann::json out = documentStatus( aCtx );
+    out["action"] = action;
+    out["autosaves"] = used;
+    out["written"] = files;
+
+    if( choice == AUTOSAVE_RECOVERY_CHOICE::RESTORE )
+        out["reloaded"] = reloaded;
+
+    if( !errors.IsEmpty() )
+    {
+        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 500, utf8( errors ) );
+        r.body.update( out );
+        return r;
+    }
+
+    if( choice == AUTOSAVE_RECOVERY_CHOICE::RESTORE && !reloaded )
+    {
+        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 422, "the board file was restored but could not be reloaded" );
+        r.body.update( out );
+        return r;
+    }
+
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
 // ---- edit history (kicadopenapi_history.h) --------------------------------------------------
 
 /// @brief The internal board copy, not prettified but broken into lines before the lists of the first
@@ -997,7 +1268,8 @@ KOPENAPI_REGISTER_DOCUMENTS( "pcb", documentStatus,
                              } );
 
 KOPENAPI_REGISTER( "pcb_open",
-                   "Open a board (.kicad_pcb, a KiCad 4 .brd, or its .kicad_pro / .pro; a .brd is saved as .kicad_pcb): editor window in the GUI, in memory headless",
+                   "Open a board (.kicad_pcb, a KiCad 4 .brd, or its .kicad_pro / .pro; a .brd is saved as .kicad_pcb): editor window in the GUI, in memory headless. "
+                   "autosaves lists auto-saved copies newer than the file (the editor offers them in its infobar; pcb_autosave)",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
@@ -1005,7 +1277,9 @@ KOPENAPI_REGISTER( "pcb_open",
                         "switch_project":{"type":"boolean","default":false,
                                    "description":"Headless: when the open schematic belongs to another project, close it first (refused with its unsaved changes unless discard: true)"},
                         "override_lock":{"type":"boolean","default":false,
-                                   "description":"GUI: open even when another process has the file open (never asked in a dialog; refused with a journal error otherwise)"}}})json"_json,
+                                   "description":"GUI: open even when another process has the file open (never asked in a dialog; refused with a journal error otherwise)"},
+                        "repair":{"type":"boolean","default":true,
+                                   "description":"Headless: run Repair Board after the load as the editor does (repaired: what it fixed; the board is then unsaved)"}}})json"_json,
                    false, h_pcb_open, 120 );
 
 KOPENAPI_REGISTER( "pcb_close", "Close the open board: refuses with unsaved changes unless discard: true, which drops "
@@ -1031,3 +1305,36 @@ KOPENAPI_REGISTER( "pcb_save",
 
 KOPENAPI_REGISTER( "pcb_revert", "Reload the open board from disk, dropping unsaved changes",
                    R"json({"type":"object","properties":{}})json"_json, false, h_pcb_revert, 120 );
+
+KOPENAPI_REGISTER( "pcb_repair",
+                   "Repair Board (Tools menu; the editor also runs it quietly after every load, as pcb_open does "
+                   "headless): items whose uuid another item claimed first get a new one (footprints first, then "
+                   "pads, tracks, footprint children, the rest), nets of pads and tracks missing from the board's "
+                   "net list are added back. Answers count, duplicate_ids (type, old_uuid, uuid, footprint), "
+                   "orphaned_nets, the editor's summary and details. Not undoable (as in the editor); the board is "
+                   "left unsaved when something was repaired; dry_run only finds",
+                   R"json({"type":"object","properties":{"dry_run":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_repair, 120 );
+
+KOPENAPI_REGISTER( "pcb_autosave_list",
+                   "The auto-saved copies of the open board (the autosave files KiCad writes while the backup "
+                   "format is Zip; left-over ones are offered in any format), newest first: path, source, time, "
+                   "source_time, newer (newer than the board file and different: offered on open). Also the "
+                   "autosave settings (enabled, format, location, writes_autosave_files)",
+                   R"json({"type":"object","properties":{}})json"_json, false, h_pcb_autosave_list );
+
+KOPENAPI_REGISTER( "pcb_autosave",
+                   "Recover from the open board's auto-saved copies. action: rescue (the File menu's Rescue: the "
+                   "newest copy, or path, replaces the open board under its own file name, unsaved; the board file "
+                   "is not touched), or the choices the editor's infobar offers on open for the copies newer than "
+                   "the board file (or path): restore (the copy replaces the board file, which is reloaded), "
+                   "keep_both (the copy is moved beside it as <name>.recovered.<time>.kicad_pcb), discard (deleted; "
+                   "every copy of the board unless path). rescue and restore refuse unsaved changes unless discard: "
+                   "true",
+                   R"json({"type":"object","required":["action"],"properties":{
+                        "action":{"type":"string","enum":["rescue","restore","keep_both","discard"]},
+                        "path":{"type":"string","description":"one copy (pcb_autosave_list)"},
+                        "discard":{"type":"boolean","default":false,"description":"drop unsaved changes (rescue, restore)"}}})json"_json,
+                   false, h_pcb_autosave, 120 );
+
+KOPENAPI_MARK_EDITING( "pcb_repair" );

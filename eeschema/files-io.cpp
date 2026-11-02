@@ -69,6 +69,7 @@
 #include <symbol_import_reconciler.h>
 #include <tool/actions.h>
 #include <tool/tool_manager.h>
+#include <tools/sch_actions.h>
 #include <tools/sch_editor_control.h>
 #include <tools/sch_navigate_tool.h>
 #include <trace_helpers.h>
@@ -96,6 +97,39 @@
 #include "widgets/filedlg_hook_save_project.h"
 #include "widgets/panel_remote_symbol.h"
 #include "save_project_utils.h"
+
+bool SCH_EDIT_FRAME::ReloadCurrentDocument()
+{
+    wxFileName fn = Prj().AbsolutePath( Schematic().GetFileName() );
+
+    if( fn.GetFullPath().IsEmpty() || !wxFileExists( fn.GetFullPath() ) )
+        return false;
+
+    if( GetCurrentSheet().Last() != &Schematic().Root() )
+    {
+        SCH_SHEET_PATH rootSheetPath = Schematic().Hierarchy().at( 0 );
+
+        // on that sheet already: no change of sheet, whose redraw the reload repeats
+        if( GetCurrentSheet() != rootSheetPath )
+        {
+            GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &rootSheetPath );
+        }
+        else
+        {
+            GetToolManager()->RunAction( ACTIONS::cancelInteractive );
+            GetToolManager()->RunAction( ACTIONS::selectionClear );
+        }
+    }
+
+    SCH_SCREENS screenList( Schematic().Root() );
+
+    for( SCH_SCREEN* screen = screenList.GetFirst(); screen; screen = screenList.GetNext() )
+        screen->SetContentModified( false );
+
+    ReleaseFile();
+    return OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+}
+
 
 bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, int aCtl )
 {

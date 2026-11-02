@@ -751,9 +751,12 @@ public:
      *
      * Traversal order is stable and earlier items keep their existing UUIDs.
      *
+     * @param aReplaced receives each item given a new id, with its old id.
+     * @param aDryRun finds them without changing any id.
      * @return number of duplicate IDs repaired.
      */
-    int RepairDuplicateItemUuids();
+    int RepairDuplicateItemUuids( std::vector<std::pair<BOARD_ITEM*, KIID>>* aReplaced = nullptr,
+                                  bool aDryRun = false );
 
     void FillItemMap( std::map<KIID, EDA_ITEM*>& aMap );
 

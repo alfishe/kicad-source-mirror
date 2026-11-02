@@ -83,6 +83,7 @@ class PANEL_HOTKEYS_EDITOR;
 class FILE_HISTORY;
 class SETTINGS_MANAGER;
 class SEARCH_STACK;
+enum class AUTOSAVE_RECOVERY_CHOICE;
 class APP_SETTINGS_BASE;
 class APPEARANCE_CONTROLS_3D;
 struct WINDOW_SETTINGS;
@@ -448,6 +449,20 @@ public:
      */
     virtual wxString GetCurrentFileName() const { return wxEmptyString; }
 
+    /**
+     * Reload the open document from its saved file, dropping unsaved changes, without asking.
+     * @return false when the frame cannot reload (no document, no saved file, load failed).
+     */
+    virtual bool ReloadCurrentDocument() { return false; }
+
+    /**
+     * Apply a recovery choice to auto-saved copies (LOCAL_HISTORY::ResolveAutosaveFiles); after
+     * RESTORE the open document is reloaded from the restored files.
+     * @return the failures, one per line; empty on success.
+     */
+    wxString RecoverAutosaveFiles( const std::vector<std::pair<wxString, wxString>>& aFiles,
+                                   AUTOSAVE_RECOVERY_CHOICE aChoice );
+
     virtual void RecreateToolbars();
 
     /**
@@ -715,11 +730,9 @@ protected:
     virtual bool canRunAutoSave() const { return true; }
 
     /**
-     * Check for autosave files newer than their source files for the given project.
-     * If found, present the user with the recovery dialog so they can pick what to
-     * do with each file (restore, keep current, or keep both as a sibling copy).
-     * Cancel leaves every autosave on disk so the dialog can offer it again next
-     * open.  The open always proceeds either way.
+     * Check for autosave files newer than their source files for the given project.  If found,
+     * the infobar offers them once the document is loaded (Restore, Keep Both, Discard; closing
+     * it leaves them to be offered on the next open).  Nothing waits for an answer.
      *
      * Recovery files are only written while the backup format is Zip, but any left over
      * from a prior session are always offered here regardless of the current format.  In

@@ -321,11 +321,42 @@ int BOARD_EDITOR_CONTROL::Revert( const TOOL_EVENT& aEvent )
     if( !IsOK( m_frame, wxString::Format( _( "Revert '%s' to last version saved?" ), fn.GetFullPath() ) ) )
         return false;
 
-    m_frame->GetScreen()->SetContentModified( false );    // do not prompt the user for changes
+    return m_frame->ReloadCurrentDocument();
+}
 
-    m_frame->ReleaseFile();
 
-    return m_frame->OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+bool PCB_EDIT_FRAME::ReloadCurrentDocument()
+{
+    wxFileName fn = Prj().AbsolutePath( GetBoard()->GetFileName() );
+
+    if( fn.GetFullPath().IsEmpty() || !wxFileExists( fn.GetFullPath() ) )
+        return false;
+
+    GetScreen()->SetContentModified( false );    // do not prompt the user for changes
+    ReleaseFile();
+    return OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+}
+
+
+bool PCB_EDIT_FRAME::LoadBoardContentFrom( const wxString& aContentPath )
+{
+    wxFileName fn = Prj().AbsolutePath( GetBoard()->GetFileName() );
+
+    if( fn.GetFullPath().IsEmpty() || !wxFileExists( aContentPath ) )
+        return false;
+
+    GetScreen()->SetContentModified( false );
+    ReleaseFile();
+
+    m_loadContentFrom = aContentPath;
+    bool ok = OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+    m_loadContentFrom.clear();
+
+    if( !ok )
+        return false;
+
+    OnModify();
+    return true;
 }
 
 
@@ -489,6 +520,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     wxString   fullFileName( aFileSet[0] );
     wxFileName wx_filename( fullFileName );
     wxString   msg;
+    wxString   contentFileName = m_loadContentFrom.IsEmpty() ? fullFileName : m_loadContentFrom;
 
     KopenapiStopWarmModels( true );   // the earlier board's models: their project may go
 
@@ -539,7 +571,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     wxFileName pro = fullFileName;
     pro.SetExt( FILEEXT::ProjectFileExtension );
 
-    bool is_new = !wxFileName::IsFileReadable( fullFileName );
+    bool is_new = !wxFileName::IsFileReadable( contentFileName );
 
     wxString previousBoardFileName = GetBoard() ? GetBoard()->GetFileName() : wxString();
 
@@ -581,7 +613,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     PCB_IO_MGR::PCB_FILE_T pluginType = PCB_IO_MGR::KICAD_SEXP;
 
     if( !is_new )
-        pluginType = PCB_IO_MGR::FindPluginTypeFromBoardPath( fullFileName, aCtl );
+        pluginType = PCB_IO_MGR::FindPluginTypeFromBoardPath( contentFileName, aCtl );
 
     if( pluginType == PCB_IO_MGR::FILE_TYPE_NONE )
     {
@@ -632,7 +664,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
 
     // Crash-recovery: when zip-format autosave is active, look for autosave files newer than
     // the saved board and offer to recover them before the load happens.
-    if( !is_new )
+    if( !is_new && m_loadContentFrom.IsEmpty() )
         CheckForAutosaveFiles( wx_filename.GetPath(), { FILEEXT::KiCadPcbFileExtension } );
 
     if( is_new )
@@ -739,7 +771,7 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
                     };
 
             std::unique_ptr<BOARD> loaded =
-                    KopenapiLoadBoard( fullFileName, pluginType, &Prj(), loaderOptions );
+                    KopenapiLoadBoard( contentFileName, pluginType, &Prj(), loaderOptions );
 
             if( loaded && props.count( IMPORT_PROJ_PROPS::NET_NAME_MAP ) )
             {

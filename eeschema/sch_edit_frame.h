@@ -505,6 +505,8 @@ public:
 
     wxString GetCurrentFileName() const override;
 
+    bool ReloadCurrentDocument() override;
+
     bool CanAcceptApiCommands() override;
 
     /**

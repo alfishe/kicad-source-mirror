@@ -70,6 +70,10 @@ public:
     // Reload the board from disk, discarding unsaved changes; returns false if there is no
     // saved file to revert to or the reload failed
     virtual bool RevertToSaved() = 0;
+
+    // Replace the board by the content of another board file, kept under the board's own file
+    // name and marked unsaved (an auto-saved copy rescued); unsaved changes are dropped
+    virtual bool LoadContentFrom( const wxString& aPath ) = 0;
 };
 
 

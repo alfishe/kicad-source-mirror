@@ -61,6 +61,25 @@ struct KICOMMON_API HISTORY_FILE_DATA
     KICAD_FORMAT::FORMAT_MODE formatMode = KICAD_FORMAT::FORMAT_MODE::NORMAL;
 };
 
+/// What to do with auto-saved copies newer than their saved files
+enum class AUTOSAVE_RECOVERY_CHOICE
+{
+    RESTORE,        ///< the copy replaces the saved file
+    KEEP_CURRENT,   ///< the copy is deleted
+    KEEP_BOTH,      ///< the copy is moved beside the saved file as "<name>.recovered.<time>"
+    CANCEL          ///< nothing changes; the copies are offered again on the next open
+};
+
+/// An auto-saved copy of a project file and the file it shadows
+struct KICOMMON_API AUTOSAVE_FILE_INFO
+{
+    wxString   autosavePath;
+    wxString   sourcePath;
+    wxDateTime autosaveTime;
+    wxDateTime sourceTime;     ///< invalid when the source file does not exist
+    bool       newer = false;  ///< newer than the source and different from it: a recovery candidate
+};
+
 struct KICOMMON_API LOCAL_HISTORY_SNAPSHOT_INFO
 {
     wxString      hash;
@@ -148,6 +167,25 @@ public:
      */
     std::vector<std::pair<wxString, wxString>> FindStaleAutosaveFiles( const wxString&              aProjectPath,
                                                                        const std::vector<wxString>& aExtensions ) const;
+
+    /**
+     * Every autosave file of the project whose source has an extension in @p aExtensions (all
+     * when empty), with both modification times and whether it is a recovery candidate (the
+     * test of FindStaleAutosaveFiles).
+     */
+    std::vector<AUTOSAVE_FILE_INFO> ListAutosaveFiles( const wxString&              aProjectPath,
+                                                       const std::vector<wxString>& aExtensions ) const;
+
+    /**
+     * Apply a recovery choice to (autosave, source) pairs: RESTORE copies each autosave over its
+     * source, KEEP_BOTH writes it beside the source as "<name>.recovered.<time>.<ext>",
+     * KEEP_CURRENT deletes it; the autosave file is gone afterwards unless its step failed.
+     * @param aWritten receives the files written (restored sources, recovered copies).
+     * @return the failures, one per line; empty when every pair was handled.
+     */
+    static wxString ResolveAutosaveFiles( const std::vector<std::pair<wxString, wxString>>& aFiles,
+                                          AUTOSAVE_RECOVERY_CHOICE aChoice,
+                                          std::vector<wxString>* aWritten = nullptr );
 
     /**
      * Enumerate every (autosave, source) pair found under @p aAutosaveRoot for the project

@@ -2498,7 +2498,7 @@ void BOARD::RebindItemUuid( BOARD_ITEM* aItem, const KIID& aNewId )
 }
 
 
-int BOARD::RepairDuplicateItemUuids()
+int BOARD::RepairDuplicateItemUuids( std::vector<std::pair<BOARD_ITEM*, KIID>>* aReplaced, bool aDryRun )
 {
     std::set<KIID> ids;
     int            duplicates = 0;
@@ -2511,6 +2511,13 @@ int BOARD::RepairDuplicateItemUuids()
                 if( ids.count( aItem->m_Uuid ) )
                 {
                     duplicates++;
+
+                    if( aReplaced )
+                        aReplaced->emplace_back( aItem, aItem->m_Uuid );
+
+                    if( aDryRun )
+                        return;
+
                     RebindItemUuid( aItem, KIID() );
                 }
 

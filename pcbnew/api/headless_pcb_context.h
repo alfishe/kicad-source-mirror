@@ -72,7 +72,11 @@ public:
 
     bool RevertToSaved() override;
 
+    bool LoadContentFrom( const wxString& aPath ) override;
+
 private:
+    bool reload( const wxString& aPath, bool aModified );
+
     std::unique_ptr<BOARD> m_board;
     PROJECT* m_project;
     KIWAY* m_kiway;
