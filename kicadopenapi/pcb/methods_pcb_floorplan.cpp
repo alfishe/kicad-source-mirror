@@ -275,7 +275,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( usable.OutlineCount() == 0 )
         return KOPENAPI_RESULT::Error( 409, "nothing of the board is left inside its edge clearance" );
 
-    const int maxIterations = std::clamp( aArgs.value( "iterations", 8 ), 1, 64 );
+    const int maxIterations = std::clamp( aArgs.value( "iterations", 64 ), 1, 64 );
     const bool negotiate = aArgs.value( "negotiate", true );
     const int listLimit = KopenapiListLimit( aArgs, 40, 1 );
     const bool allChannels = aArgs.value( "all_channels", false );
@@ -2126,6 +2126,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     nlohmann::json    history = nlohmann::json::array();
     const int         iterations = negotiate ? maxIterations : 1;
     int               ran = 0;
+    std::string       stopped = negotiate ? "cap" : "not negotiated";
 
     for( int it = 0; it < iterations; ++it )
     {
@@ -2180,7 +2181,28 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
 
         if( count == 0 )
+        {
+            stopped = "no overflow";
             break;
+        }
+
+        // a pitch over every channel still over already cost more than any way could: no later round
+        // finds a way round them
+        double cheapest = std::numeric_limits<double>::max();
+
+        for( const CUT& c : cuts )
+        {
+            const double over = c.use - capacity( c );
+
+            if( over > 1e-6 )
+                cheapest = std::min( cheapest, over / defaultPitch * ( c.detour >= 0 ? c.detour : longestWay ) );
+        }
+
+        if( present * cheapest >= longestWay )
+        {
+            stopped = "no way round the channels over";
+            break;
+        }
 
         for( CUT& c : cuts )
         {
@@ -2920,7 +2942,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                              { "topology_only_split", splitTopology },
                              { "port_overflows", portsOver },
                              { "over_mm", r2( bestTotal ) } } },
-              { "negotiation", { { "enabled", negotiate }, { "iterations", ran }, { "best_iteration", bestIteration },
+              { "negotiation", { { "enabled", negotiate }, { "iterations", ran }, { "best_iteration", bestIteration }, { "stopped", stopped },
                                  { "history", history } } },
               { "ms", r2( ms ) },
               { "floorplan_ms", r2( floorplanMs ) },
@@ -2983,7 +3005,7 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "corridor_merge":{"type":"boolean","default":true,"description":"a corridor's gates (portals crossed) that a straight run from an earlier gate to a later one passes, inside each portal less the ribbon's half width and a pitch, are dropped; the earlier gate's rooms_mm lists the regions the run goes through (corridor.md); summary gates_merged"},
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
-                        "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
+                        "iterations":{"type":"integer","default":64,"minimum":1,"maximum":64,"description":"negotiation rounds at most (a cap only: it stops with no overflow left, or once a pitch over every channel still over costs more than any way could; negotiation stopped)"},
                         "all_channels":{"type":"boolean","default":false,"description":"list every channel, not only the used ones"},
                         "list_limit":{"type":"integer","default":40,"description":"channels listed, net names and links per entry"},"full":{"type":"boolean","default":false,"description":"everything: every item (no page limit) and every entry of every list in the answer (no list_limit); large on a big design"},
                         "show":{"type":"boolean","default":false,"description":"GUI: overlay group 'floorplan'"}}})json"_json,
