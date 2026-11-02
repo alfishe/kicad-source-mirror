@@ -11,6 +11,8 @@
 #include <board.h>
 #include <board_commit.h>
 #include <board_design_settings.h>
+#include <exporters/export_footprint_associations.h>
+#include <exporters/export_hyperlynx.h>
 #include <frame_type.h>
 #include <gal/graphics_abstraction_layer.h>
 #include <geometry/shape_poly_set.h>
@@ -68,8 +70,25 @@ struct BOARD_OVERRIDE
 };
 
 
-const std::vector<std::string> EXPORT_FORMATS = { "gerbers", "drill", "pos",  "ipc2581", "odb",
-                                                  "ipcd356", "step",  "glb", "gencad",  "idf" };
+const std::vector<std::string> EXPORT_FORMATS = { "gerbers", "drill", "pos",    "ipc2581", "odb",  "ipcd356",
+                                                  "step",    "stepz", "glb",    "brep",    "xao",  "ply",
+                                                  "stl",     "u3d",   "pdf_3d", "vrml",    "gencad", "idf",
+                                                  "hyperlynx", "cmp" };
+
+
+/// 3D formats of the STEP / VRML exporters: job format, file extension
+const std::map<std::string, std::pair<JOB_EXPORT_PCB_3D::FORMAT, std::string>> FORMATS_3D = {
+    { "step", { JOB_EXPORT_PCB_3D::FORMAT::STEP, "step" } },
+    { "stepz", { JOB_EXPORT_PCB_3D::FORMAT::STEPZ, "stpz" } },
+    { "glb", { JOB_EXPORT_PCB_3D::FORMAT::GLB, "glb" } },
+    { "brep", { JOB_EXPORT_PCB_3D::FORMAT::BREP, "brep" } },
+    { "xao", { JOB_EXPORT_PCB_3D::FORMAT::XAO, "xao" } },
+    { "ply", { JOB_EXPORT_PCB_3D::FORMAT::PLY, "ply" } },
+    { "stl", { JOB_EXPORT_PCB_3D::FORMAT::STL, "stl" } },
+    { "u3d", { JOB_EXPORT_PCB_3D::FORMAT::U3D, "u3d" } },
+    { "pdf_3d", { JOB_EXPORT_PCB_3D::FORMAT::PDF, "pdf" } },
+    { "vrml", { JOB_EXPORT_PCB_3D::FORMAT::VRML, "wrl" } }
+};
 
 
 /// @brief The copper pours filled again (unfilled ones too) in one undo step
@@ -197,17 +216,70 @@ std::unique_ptr<JOB> makeJob( const std::string& aFormat, const nlohmann::json& 
         return job;
     }
 
-    if( aFormat == "step" || aFormat == "glb" )
+    if( auto it3d = FORMATS_3D.find( aFormat ); it3d != FORMATS_3D.end() )
     {
         auto job = std::make_unique<JOB_EXPORT_PCB_3D>();
-        job->m_format = aFormat == "glb" ? JOB_EXPORT_PCB_3D::FORMAT::GLB : JOB_EXPORT_PCB_3D::FORMAT::STEP;
-        job->m_3dparams.m_Format = aFormat == "glb" ? EXPORTER_STEP_PARAMS::FORMAT::GLB : EXPORTER_STEP_PARAMS::FORMAT::STEP;
+        job->m_format = it3d->second.first;
         job->m_3dparams.m_Overwrite = true;
         job->m_3dparams.m_UseDrillOrigin = drillOrigin;
         job->m_3dparams.m_ExportComponents = aArgs.value( "step_components", true );
         job->m_3dparams.m_IncludeDNP = aArgs.value( "step_include_dnp", false );
-        job->SetConfiguredOutputPath( file + "." + ( aFormat == "glb" ? FILEEXT::GltfBinaryFileExtension
-                                                                       : FILEEXT::StepFileExtension ) );
+        job->m_3dparams.m_IncludeUnspecified = aArgs.value( "include_unspecified", true );
+
+        if( aFormat == "vrml" )
+        {
+            static const std::map<std::string, JOB_EXPORT_PCB_3D::VRML_UNITS> units = {
+                { "mm", JOB_EXPORT_PCB_3D::VRML_UNITS::MM },
+                { "m", JOB_EXPORT_PCB_3D::VRML_UNITS::METERS },
+                { "in", JOB_EXPORT_PCB_3D::VRML_UNITS::INCH },
+                { "tenths", JOB_EXPORT_PCB_3D::VRML_UNITS::TENTHS }
+            };
+
+            auto unit = units.find( aArgs.value( "vrml_units", std::string( "m" ) ) );
+
+            if( unit == units.end() )
+            {
+                aError = "vrml_units: mm, m, in or tenths";
+                return nullptr;
+            }
+
+            job->m_vrmlUnits = unit->second;
+            job->m_vrmlRelativePaths = aArgs.value( "vrml_relative_paths", false );
+
+            if( aArgs.contains( "vrml_models_dir" ) )
+            {
+                wxFileName models = wxFileName::DirName( wxString::FromUTF8( aArgs.value( "vrml_models_dir",
+                                                                                          std::string() ) ) );
+
+                if( !models.IsAbsolute() )
+                    models.MakeAbsolute( aDir );
+
+                job->m_vrmlModelDir = models.GetPath();
+            }
+
+            // the dialog's origin: the board's centre, the drill / place file origin, or a point
+            if( aArgs.contains( "vrml_origin_mm" ) )
+            {
+                const nlohmann::json& o = aArgs["vrml_origin_mm"];
+
+                if( !o.is_array() || o.size() != 2 || !o[0].is_number() || !o[1].is_number() )
+                {
+                    aError = "vrml_origin_mm: [x, y]";
+                    return nullptr;
+                }
+
+                job->m_hasUserOrigin = true;
+                job->m_3dparams.m_Origin = VECTOR2D( pcbIUScale.mmToIU( o[0].get<double>() ),
+                                                     pcbIUScale.mmToIU( o[1].get<double>() ) );
+            }
+            else if( drillOrigin )
+            {
+                job->m_hasUserOrigin = true;
+                job->m_3dparams.m_Origin = VECTOR2D( aBoard->GetDesignSettings().GetAuxOrigin() );
+            }
+        }
+
+        job->SetConfiguredOutputPath( file + "." + wxString::FromUTF8( it3d->second.second ) );
         return job;
     }
 
@@ -349,6 +421,28 @@ KOPENAPI_RESULT h_pcb_export( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArg
 
     for( const std::string& format : formats )
     {
+        if( format == "hyperlynx" || format == "cmp" )
+        {
+            // File > Export > Hyperlynx / Footprint Association (.cmp): the editor's exporters
+            wxFileName fn( outDir, boardFile.GetName(),
+                           format == "cmp" ? wxString( FILEEXT::FootprintAssignmentFileExtension ) : wxString( wxS( "hyp" ) ) );
+            const bool done = format == "cmp" ? RecreateCmpFile( board, fn.GetFullPath() )
+                                              : ExportBoardToHyperlynxFile( board, fn.GetFullPath() );
+            nlohmann::json files = nlohmann::json::array();
+
+            if( fn.FileExists() )
+                files.push_back( { { "path", str( fn.GetFullPath() ) }, { "bytes", (long long) fn.GetSize().GetValue() } } );
+
+            const bool ok = done && !files.empty();
+            fileCount += files.size();
+            results[format] = { { "ok", ok }, { "files", files } };
+
+            if( !ok )
+                failed.push_back( format );
+
+            continue;
+        }
+
         std::string          error;
         std::unique_ptr<JOB> job = makeJob( format, aArgs, outDir, boardFile.GetName(), board, error );
 
@@ -501,13 +595,16 @@ KOPENAPI_REGISTER( "pcb_export",
                    "File > Fabrication Outputs / Export and `kicad-cli pcb export ...`: formats gerbers (every "
                    "enabled layer, or layers; with the job file), drill (excellon or gerber, drill_map PDF), pos "
                    "(component placement: csv / ascii / gerber, pos_side, pos_smd_only, pos_exclude_dnp), ipc2581, "
-                   "odb (ODB++ zip), ipcd356, step, glb, gencad, idf; \"fab\" = gerbers + drill + pos. Into dir "
+                   "odb (ODB++ zip), ipcd356, the 3D exports step, stepz, glb, brep, xao, ply, stl, u3d, pdf_3d "
+                   "and vrml (vrml_units, default m; vrml_models_dir: copy the models there, vrml_relative_paths; "
+                   "origin the board centre, use_drill_origin or vrml_origin_mm), gencad, idf, hyperlynx (.hyp), "
+                   "cmp (footprint associations); \"fab\" = gerbers + drill + pos. Into dir "
                    "(default 'fab' beside the board; relative to the board's folder), files named after the board. "
                    "use_drill_origin: coordinates from the drill / place file origin (pcb_origin_set). Stale or "
                    "unfilled pours are refilled first (refill_zones: false refuses, 409). Answers per format ok, "
                    "the files with their size and KiCad's messages; 422 when a format failed (the others are written)",
                    R"json({"type":"object","required":["formats"],"properties":{
-                        "formats":{"type":["string","array"],"items":{"type":"string"},"description":"a format or a list: gerbers, drill, pos, ipc2581, odb, ipcd356, step, glb, gencad, idf, fab"},
+                        "formats":{"type":["string","array"],"items":{"type":"string"},"description":"a format or a list: gerbers, drill, pos, ipc2581, odb, ipcd356, step, stepz, glb, brep, xao, ply, stl, u3d, pdf_3d, vrml, gencad, idf, hyperlynx, cmp, fab"},
                         "dir":{"type":"string","default":"fab"},
                         "use_drill_origin":{"type":"boolean","default":false},
                         "layers":{"type":"array","items":{"type":"string"},"description":"gerbers: these layers only (F.Cu, F.Mask, Edge.Cuts...)"},
@@ -522,6 +619,11 @@ KOPENAPI_REGISTER( "pcb_export",
                         "pos_exclude_dnp":{"type":"boolean","default":false},
                         "step_components":{"type":"boolean","default":true},
                         "step_include_dnp":{"type":"boolean","default":false},
+                        "include_unspecified":{"type":"boolean","default":true,"description":"3D: footprints of unspecified type"},
+                        "vrml_units":{"type":"string","enum":["mm","m","in","tenths"],"default":"m"},
+                        "vrml_models_dir":{"type":"string","description":"copy the 3D models into this folder (relative to dir)"},
+                        "vrml_relative_paths":{"type":"boolean","default":false},
+                        "vrml_origin_mm":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},
                         "refill_zones":{"type":"boolean","default":true}}})json"_json,
                    false, h_pcb_export, 600 );
 
