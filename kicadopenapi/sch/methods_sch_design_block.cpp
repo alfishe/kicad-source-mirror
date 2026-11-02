@@ -412,65 +412,43 @@ wxString refPrefix( const wxString& aRef )
 }
 
 
-KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+/// @brief The annotate and at_mm arguments of the placing methods; an error message when bad
+std::string placeArgs( const nlohmann::json& aArgs, std::string& aAnnotate, std::optional<VECTOR2I>& aAt )
 {
-    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+    aAnnotate = aArgs.value( "annotate", std::string( "auto" ) );
 
-    if( !context )
-        return KopenapiNoSchematic();
-
-    SCHEMATIC* schematic = context->GetSchematic();
-    PROJECT*   project = &schematic->Project();
-
-    std::string                        error;
-    int                                status = 400;
-    std::optional<KOPENAPI_DB_LIBRARY> lib = KopenapiDesignBlockLibrary( project, aArgs, true, LIST, error, status );
-
-    if( !lib )
-        return KOPENAPI_RESULT::Error( status, error );
-
-    const wxString name = wx( aArgs.value( "name", std::string() ) );
-
-    if( name.IsEmpty() )
-        return KOPENAPI_RESULT::Error( 400, "name: the design block (" + LIST + ")" );
-
-    const std::string annotate = aArgs.value( "annotate", std::string( "auto" ) );
-
-    if( annotate != "auto" && annotate != "keep" && annotate != "clear" )
-        return KOPENAPI_RESULT::Error( 400, "annotate: auto (first free references), keep or clear" );
-
-    std::optional<VECTOR2I> at;
+    if( aAnnotate != "auto" && aAnnotate != "keep" && aAnnotate != "clear" )
+        return "annotate: auto (first free references), keep or clear";
 
     if( aArgs.contains( "at_mm" ) )
     {
         const nlohmann::json& a = aArgs["at_mm"];
 
         if( !a.is_array() || a.size() != 2 || !a[0].is_number() || !a[1].is_number() )
-            return KOPENAPI_RESULT::Error( 400, "at_mm: [x, y]" );
+            return "at_mm: [x, y]";
 
         // on the connection grid, as the editor's cursor
-        at = VECTOR2I( schIUScale.mmToIU( std::round( a[0].get<double>() / GRID_MM ) * GRID_MM ),
-                       schIUScale.mmToIU( std::round( a[1].get<double>() / GRID_MM ) * GRID_MM ) );
+        aAt = VECTOR2I( schIUScale.mmToIU( std::round( a[0].get<double>() / GRID_MM ) * GRID_MM ),
+                        schIUScale.mmToIU( std::round( a[1].get<double>() / GRID_MM ) * GRID_MM ) );
     }
 
-    std::optional<SCH_SHEET_PATH> path = KopenapiSchTargetSheet( *context, aArgs );
+    return std::string();
+}
 
-    if( !path )
-        return KOPENAPI_RESULT::Error( 404, "sheet: not found (sch_sheet_list)" );
 
-    if( !KopenapiDesignBlockExists( project, *lib, name ) )
-        return KOPENAPI_RESULT::Error( 404, "name: no design block '" + str( name ) + "' in " + lib->Name() );
-
-    std::unique_ptr<DESIGN_BLOCK> block = KopenapiLoadDesignBlock( project, *lib, name, error );
-
-    if( !block )
-        return KOPENAPI_RESULT::Error( 422, "name: " + error );
-
-    if( block->GetSchematicFile().IsEmpty() || !wxFileName::FileExists( block->GetSchematicFile() ) )
-        return KOPENAPI_RESULT::Error( 422, "design block '" + str( name ) + "' has no schematic to place" );
-
-    // As the editor's Place Design Block: the block's schematic loaded into the sheet, the items
-    // it brings marked by what was there before
+/**
+ * Load a schematic file's content into a sheet as the editor's Place Design Block and Import Sheet
+ * do: the items it brings annotated (aAnnotate), moved so its anchor is at aAt, grouped (args
+ * "group") under aGroupName and linked to aLibId when given; one undo step aUndo.
+ */
+KOPENAPI_RESULT placeSchematicFile( KOPENAPI_CONTEXT& aCtx, SCH_CONTEXT& aContext, const nlohmann::json& aArgs,
+                                    const SCH_SHEET_PATH& aSheet, const wxString& aFile, const std::string& aWhat,
+                                    const std::string& aAnnotate, const std::optional<VECTOR2I>& aAt,
+                                    bool aSkipLibCheck, const wxString& aGroupName, const LIB_ID* aLibId,
+                                    const wxString& aUndo, nlohmann::json aOut )
+{
+    SCHEMATIC*                    schematic = aContext.GetSchematic();
+    std::optional<SCH_SHEET_PATH> path = aSheet;
     SCH_SCREEN*                   screen = path->LastScreen();
     std::unordered_set<EDA_ITEM*> existing;
 
@@ -479,14 +457,14 @@ KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
     API_SHEET_LOAD_HANDLER handler;
 
-    if( !SchLoadSheetFromFile( *schematic, path->Last(), &*path, block->GetSchematicFile(), true, true, handler ) )
+    if( !SchLoadSheetFromFile( *schematic, path->Last(), &*path, aFile, true, aSkipLibCheck, handler ) )
     {
         std::string why;
 
         for( const std::string& e : handler.m_errors )
             why += ( why.empty() ? "" : "; " ) + e;
 
-        return KOPENAPI_RESULT::Error( 422, "the design block's schematic could not be loaded"
+        return KOPENAPI_RESULT::Error( 422, aWhat + ": the schematic could not be loaded"
                                                     + ( why.empty() ? std::string() : ": " + why ) );
     }
 
@@ -505,9 +483,9 @@ KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
     }
 
     if( added.empty() )
-        return KOPENAPI_RESULT::Error( 422, "design block '" + str( name ) + "' has an empty schematic" );
+        return KOPENAPI_RESULT::Error( 422, aWhat + " has an empty schematic" );
 
-    SCH_COMMIT commit( context->GetToolManager() );
+    SCH_COMMIT commit( aContext.GetToolManager() );
 
     for( SCH_ITEM* item : added )
         commit.Added( item, screen );
@@ -527,13 +505,13 @@ KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
     for( SCH_SYMBOL* symbol : symbols )
         was[symbol] = symbol->GetRef( &*path, false );
 
-    if( annotate != "keep" )
+    if( aAnnotate != "keep" )
     {
         for( SCH_SYMBOL* symbol : symbols )
             symbol->ClearAnnotation( &*path, false );
     }
 
-    if( annotate == "auto" )
+    if( aAnnotate == "auto" )
     {
         std::set<wxString>           taken;
         std::map<wxString, wxString> renamed;
@@ -560,7 +538,7 @@ KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
     // the block's anchor (its top-left connection point) at at_mm
     std::vector<SCH_ITEM*> flat = FlattenGroups( EDA_ITEMS( top.begin(), top.end() ) );
     std::optional<VECTOR2I> anchor = DesignBlockAnchor( flat );
-    const VECTOR2I          delta = at && anchor ? *at - *anchor : VECTOR2I( 0, 0 );
+    const VECTOR2I          delta = aAt && anchor ? *aAt - *anchor : VECTOR2I( 0, 0 );
 
     if( delta != VECTOR2I( 0, 0 ) )
     {
@@ -568,10 +546,10 @@ KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
             item->Move( delta );
     }
 
-    nlohmann::json out = { { "lib_id", str( block->GetLibId().Format() ) },
-                           { "sheet", sheetPath( *path ) },
-                           { "items", added.size() },
-                           { "moved_by_mm", { toMm( delta.x ), toMm( delta.y ) } } };
+    nlohmann::json& out = aOut;
+    out["sheet"] = sheetPath( *path );
+    out["items"] = added.size();
+    out["moved_by_mm"] = { toMm( delta.x ), toMm( delta.y ) };
 
     if( anchor )
         out["anchor_mm"] = { toMm( anchor->x + delta.x ), toMm( anchor->y + delta.y ) };
@@ -582,8 +560,10 @@ KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
     if( aArgs.value( "group", true ) )
     {
         SCH_GROUP* group = new SCH_GROUP( screen );
-        group->SetName( UniqueGroupName( screen, block->GetLibId().GetLibItemName().wx_str() ) );
-        group->SetDesignBlockLibId( block->GetLibId() );
+        group->SetName( UniqueGroupName( screen, aGroupName ) );
+
+        if( aLibId )
+            group->SetDesignBlockLibId( *aLibId );
 
         for( SCH_ITEM* item : top )
             group->AddItem( item );
@@ -598,7 +578,7 @@ KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
             glow.push_back( item->m_Uuid );
     }
 
-    KopenapiSchPushEdit( commit, schematic, _( "Add Design Block" ), aCtx.kiway, glow );
+    KopenapiSchPushEdit( commit, schematic, aUndo, aCtx.kiway, glow );
 
     nlohmann::json refs = nlohmann::json::array();
     std::map<wxString, std::set<SCH_SYMBOL*>> byRef;
@@ -651,6 +631,91 @@ KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann
     return KOPENAPI_RESULT::Ok( out );
 }
 
+
+KOPENAPI_RESULT h_sch_design_block_place( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    SCHEMATIC* schematic = context->GetSchematic();
+    PROJECT*   project = &schematic->Project();
+
+    std::string                        error;
+    int                                status = 400;
+    std::optional<KOPENAPI_DB_LIBRARY> lib = KopenapiDesignBlockLibrary( project, aArgs, true, LIST, error, status );
+
+    if( !lib )
+        return KOPENAPI_RESULT::Error( status, error );
+
+    const wxString name = wx( aArgs.value( "name", std::string() ) );
+
+    if( name.IsEmpty() )
+        return KOPENAPI_RESULT::Error( 400, "name: the design block (" + LIST + ")" );
+
+    std::optional<SCH_SHEET_PATH> path = KopenapiSchTargetSheet( *context, aArgs );
+
+    if( !path )
+        return KOPENAPI_RESULT::Error( 404, "sheet: not found (sch_sheet_list)" );
+
+    if( !KopenapiDesignBlockExists( project, *lib, name ) )
+        return KOPENAPI_RESULT::Error( 404, "name: no design block '" + str( name ) + "' in " + lib->Name() );
+
+    std::unique_ptr<DESIGN_BLOCK> block = KopenapiLoadDesignBlock( project, *lib, name, error );
+
+    if( !block )
+        return KOPENAPI_RESULT::Error( 422, "name: " + error );
+
+    if( block->GetSchematicFile().IsEmpty() || !wxFileName::FileExists( block->GetSchematicFile() ) )
+        return KOPENAPI_RESULT::Error( 422, "design block '" + str( name ) + "' has no schematic to place" );
+
+    std::string             annotate;
+    std::optional<VECTOR2I> at;
+
+    if( std::string bad = placeArgs( aArgs, annotate, at ); !bad.empty() )
+        return KOPENAPI_RESULT::Error( 400, bad );
+
+    const LIB_ID libId = block->GetLibId();
+
+    return placeSchematicFile( aCtx, *context, aArgs, *path, block->GetSchematicFile(),
+                               "design block '" + str( name ) + "'", annotate, at, true,
+                               libId.GetLibItemName().wx_str(), &libId, _( "Add Design Block" ),
+                               { { "lib_id", str( libId.Format() ) } } );
+}
+
+
+KOPENAPI_RESULT h_sch_sheet_import( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context )
+        return KopenapiNoSchematic();
+
+    const wxString file = wx( aArgs.value( "file", std::string() ) );
+
+    if( file.IsEmpty() || !wxFileName( file ).IsAbsolute() )
+        return KOPENAPI_RESULT::Error( 400, "file: the absolute path of a .kicad_sch" );
+
+    if( !wxFileName::FileExists( file ) )
+        return KOPENAPI_RESULT::Error( 404, "file: not found: " + str( file ) );
+
+    std::string             annotate;
+    std::optional<VECTOR2I> at;
+
+    if( std::string bad = placeArgs( aArgs, annotate, at ); !bad.empty() )
+        return KOPENAPI_RESULT::Error( 400, bad );
+
+    std::optional<SCH_SHEET_PATH> path = KopenapiSchTargetSheet( *context, aArgs );
+
+    if( !path )
+        return KOPENAPI_RESULT::Error( 404, "sheet: not found (sch_sheet_list)" );
+
+    return placeSchematicFile( aCtx, *context, aArgs, *path, file, "file '" + str( file ) + "'", annotate, at,
+                               false, wxFileName( file ).GetName(), nullptr,
+                               _( "Import Schematic Sheet Content" ), { { "file", str( file ) } } );
+}
+
 } // namespace
 
 
@@ -695,4 +760,20 @@ KOPENAPI_REGISTER( "sch_design_block_place",
                         "group":{"type":"boolean","default":true}}})json"_json,
                    false, h_sch_design_block_place );
 
-KOPENAPI_MARK_EDITING( "sch_design_block_save", "sch_design_block_place" );
+KOPENAPI_REGISTER( "sch_sheet_import",
+                   "Import Sheet (Place > Import Sheet), as the schematic editor's: the content of another "
+                   "schematic file (file: absolute path of a .kicad_sch) loaded into the sheet (default the "
+                   "current one, or sheet: a path of sch_sheet_list). Like "
+                   "sch_design_block_place: its anchor (the top-left connection point) at at_mm on the 1.27 mm "
+                   "grid (default where the file has it), group (default true) one group named after the file, "
+                   "annotate auto (default) / keep / clear. Answers file, sheet, items, symbols (ref, was, unit), "
+                   "duplicate_refs, warnings (what the editor would have asked: symbol library links, old "
+                   "format). One undo step",
+                   R"json({"type":"object","required":["file"],"properties":{
+                        "file":{"type":"string"},"sheet":{"type":"string"},
+                        "at_mm":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},
+                        "annotate":{"type":"string","enum":["auto","keep","clear"],"default":"auto"},
+                        "group":{"type":"boolean","default":true}}})json"_json,
+                   false, h_sch_sheet_import );
+
+KOPENAPI_MARK_EDITING( "sch_design_block_save", "sch_design_block_place", "sch_sheet_import" );
