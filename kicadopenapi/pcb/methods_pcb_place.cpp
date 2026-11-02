@@ -3390,12 +3390,29 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
     };
 
     // a part placed before (a board laid out already, the block placed again) stays where it was when
-    // that is clear of the other courtyards and the kept corridors and no farther from its target
+    // that is clear of the other courtyards and the kept corridors and no farther from its target (or
+    // no new spot was found)
     auto keepIfNearer = [&]( FOOTPRINT* aPart, PAD* aTarget, const POSE& aWas, NEAR_PLACEMENT& aPlacement,
                              const NEAR_OPTIONS& aPlaceOptions )
     {
-        if( !aPlacement.ok || !aPlacement.partPad || viaSpotOf.count( aPart ) )
+        if( viaSpotOf.count( aPart ) )
             return;
+
+        const NEAR_PLACEMENT found = aPlacement;
+
+        if( !aPlacement.ok )
+        {
+            for( PAD* pad : aPart->Pads() )
+                aPlacement.partPad = pad->GetNetCode() == aTarget->GetNetCode() ? pad : aPlacement.partPad;
+
+            aPlacement.padDistanceMm = std::numeric_limits<double>::max();
+        }
+
+        if( !aPlacement.partPad )
+        {
+            aPlacement = found;
+            return;
+        }
 
         const POSE now{ aPart->GetPosition(), aPart->GetOrientation(), aPart->IsFlipped() };
 
@@ -3423,6 +3440,8 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         if( keep )
         {
+            aPlacement.ok = true;
+            aPlacement.reason.clear();
             aPlacement.padDistanceMm = was;
             aPlacement.direction = "kept";
             aPlacement.corridor.clear();
@@ -3431,6 +3450,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         else
         {
             pose( now );
+            aPlacement = found;
         }
     };
 
