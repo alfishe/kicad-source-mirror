@@ -10359,7 +10359,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     c.points.push_back( x );
                 }
 
-                around.Inflate( pcbIUScale.mmToIU( 2.0 ) );
+                // what can touch the lane: copper within a track and the board's largest clearance of its rooms
+                {
+                    const BOARD_DESIGN_SETTINGS& ds = board->GetDesignSettings();
+                    NETCLASS*                    nc = from->GetEffectiveNetClass();
+                    const int width = nc && nc->HasTrackWidth() ? nc->GetTrackWidth() : ds.GetCurrentTrackWidth();
+                    around.Inflate( width + std::max( { ds.GetBiggestClearanceValue(), ds.m_MinClearance, 1 } ) );
+                }
+
                 std::vector<MEMBER> lane = { { 0, true, start, toPos, 0, from } };
                 const LANES         lanes = c.points.empty() ? LANES() : laneAlong( c, { n.netCode }, lane, around );
 
