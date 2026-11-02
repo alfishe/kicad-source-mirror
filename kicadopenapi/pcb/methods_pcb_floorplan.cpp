@@ -561,7 +561,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         return KOPENAPI_RESULT::Error( 400, "obstacles: parts or bbox" );
 
     const int    mergeGap = iu( std::max( 0.0, aArgs.value( "merge_gap_mm", toMm( defaults.width + defaults.clearance ) ) ) );
-    const int    maxBoxes = std::clamp( aArgs.value( "max_boxes", 8 ), 1, 64 );
 
     std::map<std::string, FOOTPRINT*> fpOfRef;
 
@@ -576,8 +575,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     std::vector<FP_BOX>        boxes;
     std::map<std::string, int> boxOfRef;
-
-    auto boxArea = []( const BOX2I& aB ) { return double( aB.GetWidth() ) * aB.GetHeight(); };
 
     for( size_t b = 0; b < blocks.size(); ++b )
     {
@@ -599,16 +596,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             own[i].box.Merge( own[j].box );
             own[i].parts.insert( own[i].parts.end(), own[j].parts.begin(), own[j].parts.end() );
             own.erase( own.begin() + (long) j );
-        };
-
-        // the fill of two boxes' union: their areas (overlap once) over the union's
-        auto fillOf = [&]( size_t i, size_t j )
-        {
-            BOX2I u = own[i].box;
-            u.Merge( own[j].box );
-            const BOX2I  o = own[i].box.Intersect( own[j].box );
-            const double overlap = o.GetWidth() > 0 && o.GetHeight() > 0 ? boxArea( o ) : 0;
-            return boxArea( u ) > 0 ? ( boxArea( own[i].box ) + boxArea( own[j].box ) - overlap ) / boxArea( u ) : 1.0;
         };
 
         if( obstacles == "bbox" )
@@ -636,27 +623,6 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                         }
                     }
                 }
-            }
-
-            while( (int) own.size() > maxBoxes )
-            {
-                size_t bi = 0, bj = 1;
-                double best = -1;
-
-                for( size_t i = 0; i < own.size(); ++i )
-                {
-                    for( size_t j = i + 1; j < own.size(); ++j )
-                    {
-                        if( const double f = fillOf( i, j ); f > best )
-                        {
-                            best = f;
-                            bi = i;
-                            bj = j;
-                        }
-                    }
-                }
-
-                join( bi, bj );
             }
         }
 
@@ -2988,7 +2954,6 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "edge_clearance_mm":{"type":"number","description":"default: the board's copper-to-edge clearance"},
                         "obstacles":{"type":"string","enum":["parts","bbox"],"default":"parts","description":"parts: each block's member courtyards, merged into boxes where no track passes between them (closer than merge_gap_mm); bbox: one box per block (pcb_blocks bbox)"},
                         "merge_gap_mm":{"type":"number","description":"courtyards closer than this merge (default one Default track pitch: no track between them)"},
-                        "max_boxes":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"boxes per block at most"},
                         "snap_mm":{"type":"number","minimum":0,"description":"obstacle edges closer than this share one grid line (default one Default track pitch; 0: exact). Gaps narrower close, obstacles thinner keep both edges"},
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
