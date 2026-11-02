@@ -3792,6 +3792,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         int                   corridorRank = -1;   ///< the order it is routed in
         int                   corridorPlace = -1;  ///< from the left of the way
         bool                  corridorRouted = false;
+        std::optional<VECTOR2I> fanStart, fanEnd;   ///< bus_paths: the fan-out tips at its corridor's ends
         double                ms = 0;          ///< time of every try for it, rip-up re-routes too
         nlohmann::json        tried = nlohmann::json::array();   ///< its tries (attempts: true)
     };
@@ -5972,6 +5973,84 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     }
 
+    // a package's signal pins' ports from its plan (pcb_fanout_ports' ports): the way out on the pin's
+    // side to past the courtyard on the pad's layer, or to the other layer (its nets in aViaNets)
+    auto goalsFrom = [&]( FOOTPRINT* fp, const nlohmann::json& aPorts, std::map<const PAD*, PORT_GOAL>& aGoals,
+                          std::vector<std::string>& aViaNets )
+    {
+        const BOX2I courtyard = fp->GetCourtyard( fp->GetLayer() == B_Cu ? B_CrtYd : F_CrtYd ).OutlineCount()
+                                        ? fp->GetCourtyard( fp->GetLayer() == B_Cu ? B_CrtYd : F_CrtYd ).BBox()
+                                        : fp->GetBoundingBox( false );
+        int         planned = 0;
+
+        for( const auto& [side, list] : aPorts.items() )
+        {
+            const VECTOR2I dir = side == "west" ? VECTOR2I( -1, 0 ) : side == "east" ? VECTOR2I( 1, 0 )
+                                 : side == "north" ? VECTOR2I( 0, -1 ) : side == "south" ? VECTOR2I( 0, 1 ) : VECTOR2I( 0, 0 );
+
+            if( dir == VECTOR2I( 0, 0 ) || !list.is_array() )
+                continue;
+
+            for( const nlohmann::json& port : list )
+            {
+                if( port.value( "kind", std::string() ) != "signal" )
+                    continue;
+
+                const wxString number = wxString::FromUTF8( port.value( "pad", std::string() ) );
+
+                for( PAD* pad : fp->Pads() )
+                {
+                    if( pad->GetNumber() != number || pad->GetNetCode() <= 0 || pad->GetAttribute() != PAD_ATTRIB::SMD )
+                        continue;
+
+                    PORT_GOAL goal;
+                    goal.layer = pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
+                    goal.dir = dir;
+                    goal.side = side;
+                    goal.to = port.value( "to", std::string() );
+                    goal.other = port.value( "layer", std::string() ) == "other";
+                    goal.round = port.value( "turn", std::string() ) == "round_the_part";
+
+                    for( PCB_LAYER_ID l : layers )
+                    {
+                        if( l != goal.layer )
+                        {
+                            goal.otherLayer = l;
+                            break;
+                        }
+                    }
+
+                    if( goal.other && !( viasAllowed && goal.otherLayer ) )
+                        goal.other = false;
+
+                    NETCLASS*      netclass = pad->GetEffectiveNetClass();
+                    const int      clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
+                    const BOX2I    box = pad->GetBoundingBox();
+                    const int      half = dir.x != 0 ? box.GetWidth() / 2 : box.GetHeight() / 2;
+                    const int      across = dir.x != 0 ? box.GetHeight() : box.GetWidth();
+                    const int      width = std::min( across, netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : ds.GetCurrentTrackWidth() );
+                    const VECTOR2I end = box.Centre() + dir * half;
+                    const int64_t  edge = dir.x != 0 ? ( dir.x > 0 ? courtyard.GetRight() : -(int64_t) courtyard.GetLeft() )
+                                                     : ( dir.y > 0 ? courtyard.GetBottom() : -(int64_t) courtyard.GetTop() );
+                    const int64_t  at = (int64_t) end.x * dir.x + (int64_t) end.y * dir.y;
+                    // round the part: kept open only to the courtyard, the neighbours turn right past it
+                    const int      reach = (int) std::max<int64_t>( width, goal.round ? edge - at : edge - at + clearance + width / 2 );
+
+                    goal.width = width;
+                    goal.start = end + dir * ( width / 2 );
+                    goal.tip = end + dir * reach;
+                    aGoals[pad] = goal;
+                    planned++;
+
+                    if( goal.other )
+                        aViaNets.push_back( str( UnescapeString( pad->GetNetname() ) ) );
+                }
+            }
+        }
+
+        return planned;
+    };
+
     // ports: the layout's plan for the signal pins of the packages asked (pcb_fanout_ports): each pin's
     // way out runs on its side to past the courtyard on the pad's layer, or to the via spot the plan
     // gives (layer other, as pcb_fanout ports would lay it); its routes leave through it
@@ -6002,76 +6081,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 continue;
             }
 
-            const BOX2I courtyard = fp->GetCourtyard( fp->GetLayer() == B_Cu ? B_CrtYd : F_CrtYd ).OutlineCount()
-                                            ? fp->GetCourtyard( fp->GetLayer() == B_Cu ? B_CrtYd : F_CrtYd ).BBox()
-                                            : fp->GetBoundingBox( false );
             std::vector<std::string> viaNets;
-            int                      planned = 0;
-
-            for( const auto& [side, list] : plan.body["ports"].items() )
-            {
-                const VECTOR2I dir = side == "west" ? VECTOR2I( -1, 0 ) : side == "east" ? VECTOR2I( 1, 0 )
-                                     : side == "north" ? VECTOR2I( 0, -1 ) : side == "south" ? VECTOR2I( 0, 1 ) : VECTOR2I( 0, 0 );
-
-                if( dir == VECTOR2I( 0, 0 ) || !list.is_array() )
-                    continue;
-
-                for( const nlohmann::json& port : list )
-                {
-                    if( port.value( "kind", std::string() ) != "signal" )
-                        continue;
-
-                    const wxString number = wxString::FromUTF8( port.value( "pad", std::string() ) );
-
-                    for( PAD* pad : fp->Pads() )
-                    {
-                        if( pad->GetNumber() != number || pad->GetNetCode() <= 0 || pad->GetAttribute() != PAD_ATTRIB::SMD )
-                            continue;
-
-                        PORT_GOAL goal;
-                        goal.layer = pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
-                        goal.dir = dir;
-                        goal.side = side;
-                        goal.to = port.value( "to", std::string() );
-                        goal.other = port.value( "layer", std::string() ) == "other";
-                        goal.round = port.value( "turn", std::string() ) == "round_the_part";
-
-                        for( PCB_LAYER_ID l : layers )
-                        {
-                            if( l != goal.layer )
-                            {
-                                goal.otherLayer = l;
-                                break;
-                            }
-                        }
-
-                        if( goal.other && !( viasAllowed && goal.otherLayer ) )
-                            goal.other = false;
-
-                        NETCLASS*      netclass = pad->GetEffectiveNetClass();
-                        const int      clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
-                        const BOX2I    box = pad->GetBoundingBox();
-                        const int      half = dir.x != 0 ? box.GetWidth() / 2 : box.GetHeight() / 2;
-                        const int      across = dir.x != 0 ? box.GetHeight() : box.GetWidth();
-                        const int      width = std::min( across, netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth() : ds.GetCurrentTrackWidth() );
-                        const VECTOR2I end = box.Centre() + dir * half;
-                        const int64_t  edge = dir.x != 0 ? ( dir.x > 0 ? courtyard.GetRight() : -(int64_t) courtyard.GetLeft() )
-                                                         : ( dir.y > 0 ? courtyard.GetBottom() : -(int64_t) courtyard.GetTop() );
-                        const int64_t  at = (int64_t) end.x * dir.x + (int64_t) end.y * dir.y;
-                        // round the part: kept open only to the courtyard, the neighbours turn right past it
-                        const int      reach = (int) std::max<int64_t>( width, goal.round ? edge - at : edge - at + clearance + width / 2 );
-
-                        goal.width = width;
-                        goal.start = end + dir * ( width / 2 );
-                        goal.tip = end + dir * reach;
-                        portGoals[pad] = goal;
-                        planned++;
-
-                        if( goal.other )
-                            viaNets.push_back( str( UnescapeString( pad->GetNetname() ) ) );
-                    }
-                }
-            }
+            const int                planned = goalsFrom( fp, plan.body["ports"], portGoals, viaNets );
 
             // the via spots the plan's fan-out would lay (dry run): the spot of each moved pin
             int fanSpots = 0;
@@ -6390,6 +6401,43 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             return fp ? str( fp->GetReference() ) : std::string();
         };
 
+        // per package of 8 SMD pads or more its plan's ports, asked once; a pin's tip on its pad's layer
+        std::map<const FOOTPRINT*, std::map<const PAD*, PORT_GOAL>> fanPlans;
+        std::optional<KOPENAPI_METHOD>                               fanPlanner = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" );
+        int                                                          fannedOut = 0;
+
+        auto fanTip = [&]( const PAD* aPad ) -> std::optional<VECTOR2I>
+        {
+            if( auto it = portGoals.find( aPad ); it != portGoals.end() )
+                return it->second.other ? std::nullopt : std::optional<VECTOR2I>( it->second.tip );
+
+            FOOTPRINT* fp = aPad->GetParentFootprint();
+
+            if( !fp || !fanPlanner )
+                return std::nullopt;
+
+            auto plan = fanPlans.find( fp );
+
+            if( plan == fanPlans.end() )
+            {
+                plan = fanPlans.emplace( fp, std::map<const PAD*, PORT_GOAL>() ).first;
+                const size_t smd = std::count_if( fp->Pads().begin(), fp->Pads().end(),
+                                                  []( PAD* p ) { return p->GetAttribute() == PAD_ATTRIB::SMD; } );
+
+                if( smd >= 8 )
+                {
+                    const KOPENAPI_RESULT r = fanPlanner->handler( aCtx, { { "ref", str( fp->GetReference() ) } } );
+                    std::vector<std::string> viaNets;
+
+                    if( r.status == 200 && r.body.contains( "ports" ) && r.body["ports"].is_object() )
+                        goalsFrom( fp, r.body["ports"], plan->second, viaNets );
+                }
+            }
+
+            auto it = plan->second.find( aPad );
+            return it == plan->second.end() || it->second.other ? std::nullopt : std::optional<VECTOR2I>( it->second.tip );
+        };
+
         auto pitchOfNet = [&]( PAD* aPad )
         {
             NETCLASS* netclass = aPad->GetEffectiveNetClass();
@@ -6484,6 +6532,27 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
 
                 members.push_back( { k, forward, forward ? j.from->GetPosition() : j.toPos, forward ? j.toPos : j.from->GetPosition() } );
+            }
+
+            // the fan-out from packages of 8 SMD pads or more, the plan's (pcb_fanout_ports): a member leaves
+            // its pin straight out on the pin's side to past the courtyard, then closes up to the ribbon
+            for( MEMBER& m : members )
+            {
+                JOB& j = jobs[m.job];
+
+                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to } )
+                {
+                    const PAD* pad = end && end->Type() == PCB_PAD_T ? static_cast<const PAD*>( end ) : nullptr;
+                    const auto tip = pad ? fanTip( pad ) : std::nullopt;
+
+                    if( !tip )
+                        continue;
+
+                    const bool atStart = ( end == j.from ) == m.forward;
+                    ( atStart ? m.start : m.end ) = *tip;
+                    ( atStart ? j.fanStart : j.fanEnd ) = *tip;
+                    fannedOut++;
+                }
             }
 
             nlohmann::json out = { { "name", c.name }, { "points", c.points.size() } };
@@ -6966,6 +7035,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 JOB& j = jobs[members[k].job];
                 j.corridor = corners[k];
 
+                if( j.fanStart )
+                    j.corridor.insert( j.corridor.begin(), *j.fanStart );
+
+                if( j.fanEnd )
+                    j.corridor.push_back( *j.fanEnd );
+
                 if( !members[k].forward )
                     std::reverse( j.corridor.begin(), j.corridor.end() );
 
@@ -6999,6 +7074,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( partEnds )
                 out["ends_on_copper"] = partEnds;
+
+            if( fannedOut )
+                out["fanned_out"] = fannedOut;
+
+            fannedOut = 0;
 
             corridorOut.push_back( out );
         }
@@ -15070,7 +15150,9 @@ KOPENAPI_REGISTER( "pcb_route",
                    "bus routes a bundle's members one after another in pin order, bus_layer through a diagonal via fan (answer bus, row bus); "
                    "bus_paths routes a bus along a corridor, pcb_floorplan's path between two blocks or points given: its members side by "
                    "side at their pitch across each portal of the path as fixed corners, in the order they lie across the way in, one "
-                   "after another (answer bus_paths: corridors, members, routed_along; row corridor: name, index, order (its place in the corridor's tries), corners, routed, failed; "
+                   "after another; its line pulled tight inside the regions crossed, clear of copper and track keep-outs (a corner per "
+                   "turn, corridor pulled_from), each member first out through its pin's port tip (pcb_fanout_ports, packages of 8 SMD "
+                   "pads or more: corridor fanned_out) (answer bus_paths: corridors, members, routed_along; row corridor: name, index, order (its place in the corridor's tries), corners, routed, failed; "
                    "a member the corridor does not route is routed as any other, one routed along it is left out of clean_up); "
                    "rip_up_scope unlocked lets the rip-up take out unlocked copper of earlier calls too (rip_up.earlier_routes_rerouted, "
                    "other_nets_moved); the first pass gives each connection first_pass_budget_s (row budget, profile budget); "
