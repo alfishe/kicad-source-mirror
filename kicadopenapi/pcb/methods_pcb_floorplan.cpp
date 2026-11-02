@@ -36,6 +36,7 @@
 #include <limits>
 #include <map>
 #include <queue>
+#include <regex>
 #include <set>
 #include <tuple>
 
@@ -185,12 +186,28 @@ struct LINK
     int              aExitSide = -1, bExitSide = -1;
     std::vector<int> cuts;
     std::set<int>    crosses;
+    std::vector<int> topologyOnly;   ///< nets in the bus by their ends only, not by their name
     double           length = 0;
     bool             found = false;
 };
 
 
 const char* const SIDES[4] = { "west", "east", "north", "south" };
+
+
+/// @brief A net's name stem as pcb_net_roles takes it for a series ("/sheet/D12" -> "D"), upper case
+std::string nameStemOf( const std::string& aName )
+{
+    const size_t slash = aName.size() > 1 ? aName.find_last_of( '/', aName.size() - 2 ) : std::string::npos;
+    std::string  bare = slash == std::string::npos ? aName : aName.substr( slash + 1 );
+
+    for( char& c : bare )
+        c = (char) std::toupper( static_cast<unsigned char>( c ) );
+
+    static const std::regex re( R"(^(.*?[^0-9])\[?([0-9]+)\]?$)" );
+    std::smatch             m;
+    return std::regex_match( bare, m, re ) ? m[1].str() : bare;
+}
 
 
 int sideIndex( const std::string& aName )
@@ -347,6 +364,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     std::map<int, std::string> busOfNet;
+    std::set<int>              topologyOnly;   ///< bus nets whose name stem is not the bus's (topology bundles)
+    const bool                 splitTopology = aArgs.value( "split_topology_only", false );
     std::map<std::string, std::map<std::string, std::pair<std::string, int>>> busEnds;   ///< bus -> block -> part, side
 
     for( const nlohmann::json& bus : graphResult.body.value( "buses", nlohmann::json::array() ) )
@@ -359,9 +378,24 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                                                                  sideIndex( e.value( "side", std::string() ) ) };
         }
 
+        const nlohmann::json sources = bus.value( "source", nlohmann::json::array() );
+        const bool           byTopology = std::any_of( sources.begin(), sources.end(), []( const nlohmann::json& v )
+                                                       { return v.is_string() && v.get<std::string>() == "topology"; } );
+        const std::string    key = nameStemOf( name.substr( 0, name.find( '@' ) ) + "0" );
+
         for( const nlohmann::json& n : bus.value( "nets", nlohmann::json::array() ) )
         {
-            if( NETINFO_ITEM* net = n.is_string() ? KopenapiFindNet( board, n.get<std::string>() ) : nullptr )
+            NETINFO_ITEM* net = n.is_string() ? KopenapiFindNet( board, n.get<std::string>() ) : nullptr;
+
+            if( !net )
+                continue;
+
+            const bool alone = byTopology && nameStemOf( n.get<std::string>() ) != key;
+
+            if( alone )
+                topologyOnly.insert( net->GetNetCode() );
+
+            if( !alone || !splitTopology )
                 busOfNet.emplace( net->GetNetCode(), name );
         }
     }
@@ -751,6 +785,9 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             l.bus = bus == busOfNet.end() ? std::string() : bus->second;
             l.nets.push_back( net );
             l.demand += width;
+
+            if( topologyOnly.count( net ) && !l.bus.empty() )
+                l.topologyOnly.push_back( net );
 
             for( int x : netBoxes[net][a] )
                 l.aBoxes.insert( x );
@@ -1906,7 +1943,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     }
 
     nlohmann::json linkList = nlohmann::json::array();
-    int            linksOver = 0, linksMissing = 0, linksThrough = 0;
+    int            linksOver = 0, linksMissing = 0, linksThrough = 0, topologyMembers = 0;
 
     std::vector<int> byDemand( links.size() );
 
@@ -1932,6 +1969,13 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         for( size_t k = 0; k < l.nets.size() && (int) k < listLimit; ++k )
             names.push_back( netName( l.nets[k] ) );
 
+        nlohmann::json alone = nlohmann::json::array();
+
+        for( int code : l.topologyOnly )
+            alone.push_back( netName( code ) );
+
+        topologyMembers += (int) l.topologyOnly.size();
+
         nlohmann::json through = nlohmann::json::array();
 
         for( int b : l.crosses )
@@ -1943,6 +1987,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                              { "a_side", sideJson( l.aExitSide ) }, { "b_side", sideJson( l.bExitSide ) },
                              { "sides_from", l.aPort >= 0 || l.bPort >= 0 ? ( l.sidesKept ? "pcb_layout_graph" : "path (no way by the graph's sides)" ) : "path" },
                              { "nets", l.nets.size() }, { "net_names", names }, { "demand_mm", r2( l.demand ) },
+                             { "named_nets", l.bus.empty() ? 0 : l.nets.size() - l.topologyOnly.size() },
+                             { "topology_only_nets", alone },
                              { "classes", l.classes }, { "found", l.found }, { "path", path },
                              { "length_mm", r2( l.length ) }, { "through_blocks", through }, { "overflow", over } };
         linksOver += over;
@@ -2099,6 +2145,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                              { "sliver_channels_used", sliversUsed },
                              { "overflows", overflows.size() },
                              { "ports_used", ports.size() },
+                             { "topology_only_members", topologyMembers },
+                             { "topology_only_split", splitTopology },
                              { "port_overflows", portsOver },
                              { "over_mm", r2( bestTotal ) } } },
               { "negotiation", { { "enabled", negotiate }, { "iterations", ran }, { "best_iteration", bestIteration },
@@ -2127,7 +2175,8 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                    "they must cross (boxes overlapping or no way round) and the box sides they leave and enter by (a bus by "
                    "the side its end part's pads face, pcb_layout_graph ends); ports: per box side used its facing "
                    "length (free or another box's, facing_boxes_mm) per layer as capacity against the bundles' width "
-                   "through it. show: channels in "
+                   "through it. A bus link names its topology-only members (in the bus by their end parts, their "
+                   "name stem another). show: channels in "
                    "the GUI coloured by use. "
                    "Read only",
                    R"json({"type":"object","properties":{
@@ -2149,6 +2198,7 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "max_boxes":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"boxes per block at most"},
                         "snap_mm":{"type":"number","minimum":0,"description":"obstacle edges closer than this share one grid line (default one Default track pitch; 0: exact). Gaps narrower close, obstacles thinner keep both edges"},
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
+                        "split_topology_only":{"type":"boolean","default":false,"description":"bus nets whose name stem is not the bus's (in it by their end parts only, pcb_net_roles topology) go with the single nets between the blocks"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by the side its end part's pads face (pcb_layout_graph ends); false: by any side"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
                         "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
