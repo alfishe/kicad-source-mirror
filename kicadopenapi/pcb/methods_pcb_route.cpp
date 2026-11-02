@@ -13585,7 +13585,8 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                     continue;
                 }
 
-                pairLanes.push_back( { { "pin", pin }, { "to", str( partner->GetParentFootprint()->GetReference() ) + "." + str( partner->GetNumber() ) } } );
+                pairLanes.push_back( { { "pin", pin }, { "to", str( partner->GetParentFootprint()->GetReference() ) + "." + str( partner->GetNumber() ) },
+                                       { "from_mm", { toMm( end.x ), toMm( end.y ) } } } );
 
                 NETCLASS* nc = pad->GetNet() ? pad->GetNet()->GetNetClass() : nullptr;
                 const int line = nc && nc->HasDiffPairWidth() ? nc->GetDiffPairWidth()
@@ -18645,7 +18646,7 @@ KOPENAPI_REGISTER( "pcb_stitch",
                    "quad packages, inward, kept as their way to the other layers for the router (port: true; the other ends are left "
                    "to the router, not_reached says so); no via or stub in the "
                    "straight escape of another net's fine-pitch, pair or clock pin (escape_keep_mm; spots_in_escapes), nor in a pair pin's lane on to "
-                   "the nearest pad of its net on another part of its block (pcb_blocks; pair_lanes: pin, to; pair_lanes_none: pin, why); pads picks the ends; "
+                   "the nearest pad of its net on another part of its block (pcb_blocks; pair_lanes: pin, to, from_mm where the lane leaves the pin's straight escape; pair_lanes_none: pin, why); pads picks the ends; "
                    "dry_run stitches and takes it back; lists capped at list_limit (counts whole), full: true for all",
                    KOPENAPI_LIST_CAP::Schema( R"json({"type":"object","properties":{"net":{"type":"string","description":"default: the one net pcb_net_roles calls ground (400 when none or several)"},
                         "pads":{"type":"array","items":{"type":"string"},"description":"only these ends: REF.PAD of the net (and the islands of tracks they are on); 400 for a pad not found or on another net"},
