@@ -4134,6 +4134,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         bool                  corridorRouted = false;
         bool                  laneRouted = false;   ///< lanes: along its laid lane, a planned detour clean_up leaves as it is
         std::optional<VECTOR2I> fanStart, fanEnd;   ///< bus_paths: the fan-out tips at its corridor's ends
+        bool                  laneFrom = false, laneTo = false;   ///< bus_paths with lanes: its corridor from / to its laid lane's end
         double                ms = 0;          ///< time of every try for it, rip-up re-routes too
         nlohmann::json        tried = nlohmann::json::array();   ///< its tries (attempts: true)
     };
@@ -8004,6 +8005,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         std::optional<KOPENAPI_METHOD>                               fanPlanner = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" );
         int                                                          fannedOut = 0;
 
+        // lanes: the last track of a pin's laid lane (its end the lane's front), when its lane is laid
+        auto laneEndOf = [&]( BOARD_CONNECTED_ITEM* aEnd ) -> PCB_TRACK*
+        {
+            const PAD* pad = lanesOn && aEnd && aEnd->Type() == PCB_PAD_T ? static_cast<const PAD*>( aEnd ) : nullptr;
+            auto       it = pad ? portGoals.find( pad ) : portGoals.end();
+
+            if( it == portGoals.end() || it->second.via || it->second.ring.empty() )
+                return nullptr;
+
+            return dynamic_cast<PCB_TRACK*>( board->ResolveItem( it->second.ring.back(), true ) );
+        };
+
         auto fanTip = [&]( const PAD* aPad ) -> std::optional<VECTOR2I>
         {
             if( auto it = portGoals.find( aPad ); it != portGoals.end() )
@@ -8164,6 +8177,42 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
             }
 
+            // lanes: at an end where every member's pin has its lane laid, the members start (end) at the lanes'
+            // ends; the rings are their way round the package
+            int laneEnds[2] = { 0, 0 };
+
+            for( const MEMBER& m : members )
+            {
+                const JOB& j = jobs[m.job];
+
+                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to } )
+                {
+                    if( laneEndOf( end ) )
+                        laneEnds[( ( end == j.from ) == m.forward ) ? 0 : 1]++;
+                }
+            }
+
+            for( int side = 0; side < 2; ++side )
+            {
+                if( laneEnds[side] != (int) members.size() )
+                {
+                    laneEnds[side] = 0;
+                    continue;
+                }
+
+                for( MEMBER& m : members )
+                {
+                    JOB&                  j = jobs[m.job];
+                    BOARD_CONNECTED_ITEM* end = ( side == 0 ) == m.forward ? static_cast<BOARD_CONNECTED_ITEM*>( j.from ) : j.to;
+                    const PCB_TRACK*      last = laneEndOf( end );
+
+                    ( side == 0 ? m.start : m.end ) = last->GetEnd();
+                    ( side == 0 ? m.fanStart : m.fanEnd ) = false;
+                    ( end == j.from ? j.fanStart : j.fanEnd ) = std::nullopt;
+                    ( end == j.from ? j.laneFrom : j.laneTo ) = true;
+                }
+            }
+
             nlohmann::json out = { { "name", c.name }, { "points", c.points.size() } };
 
             if( !c.a.empty() )
@@ -8180,7 +8229,64 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 continue;
             }
 
-            LANES          lanes = laneAlong( c, codes, members, std::nullopt );
+            // every member leaving (reaching) by its lane: the way starts at the gate that makes the way from
+            // the lane ends shortest, the gates round the package (the ring's part) dropped
+            CORRIDOR along = c;
+            int      laneTrimmed = 0;
+
+            for( bool atStart : { true, false } )
+            {
+                std::vector<CROSSING>& pts = along.points;
+
+                if( laneEnds[atStart ? 0 : 1] != (int) members.size() || pts.size() < 2 )
+                    continue;
+
+                VECTOR2D mid( 0, 0 ), far( 0, 0 );
+
+                for( const MEMBER& m : members )
+                {
+                    mid += VECTOR2D( atStart ? m.start : m.end ) / (double) members.size();
+                    far += VECTOR2D( atStart ? m.end : m.start ) / (double) members.size();
+                }
+
+                const size_t        count = pts.size();
+                std::vector<double> rest( count, 0 );
+                auto                at = [&]( size_t k ) { return VECTOR2D( pts[atStart ? k : count - 1 - k].at ); };
+
+                rest[count - 1] = ( far - at( count - 1 ) ).EuclideanNorm();
+
+                for( size_t k = count - 1; k-- > 0; )
+                    rest[k] = rest[k + 1] + ( at( k + 1 ) - at( k ) ).EuclideanNorm();
+
+                size_t best = 0;
+
+                for( size_t k = 1; k < count; ++k )
+                {
+                    if( pts[atStart ? k : count - 1 - k].viaTo )
+                        break;
+
+                    if( ( at( k ) - mid ).EuclideanNorm() + rest[k] < ( at( best ) - mid ).EuclideanNorm() + rest[best] - 1 )
+                        best = k;
+                }
+
+                if( best == 0 )
+                    continue;
+
+                if( atStart )
+                    pts.erase( pts.begin(), pts.begin() + best );
+                else
+                    pts.erase( pts.end() - best, pts.end() );
+
+                laneTrimmed += (int) best;
+            }
+
+            if( laneEnds[0] + laneEnds[1] )
+            {
+                out["lane_ends"] = laneEnds[0] + laneEnds[1];
+                out["lane_gates_dropped"] = laneTrimmed;
+            }
+
+            LANES          lanes = laneAlong( along, codes, members, std::nullopt );
             const int      n = (int) members.size();
             const bool     insideLast = lanes.insideLast;
             const int      corridorIndex = (int) corridorOut.size();
@@ -8662,9 +8768,55 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         for( size_t k = 0; k < job.corridor.size(); ++k )
             req.vias.emplace_back( job.corridor[k], k < job.corridorVia.size() ? job.corridorVia[k] : std::nullopt );
 
+        // its corridor runs from / to its laid lanes' ends: the route goes on from that copper
+        PORT_GOAL* laneGoal[2] = { nullptr, nullptr };
+
+        for( int side = 0; side < 2; ++side )
+        {
+            BOARD_CONNECTED_ITEM* end = side == 0 ? static_cast<BOARD_CONNECTED_ITEM*>( job.from ) : job.to;
+            auto                  it = ( side == 0 ? job.laneFrom : job.laneTo ) && end && end->Type() == PCB_PAD_T
+                                               ? portGoals.find( static_cast<PAD*>( end ) ) : portGoals.end();
+            PCB_TRACK*            last = it != portGoals.end() && !it->second.ring.empty()
+                                                 ? dynamic_cast<PCB_TRACK*>( board->ResolveItem( it->second.ring.back(), true ) )
+                                                 : nullptr;
+
+            if( !last )
+                continue;
+
+            laneGoal[side] = &it->second;
+
+            if( side == 0 )
+            {
+                req.from = last;
+                req.fromPos = last->GetEnd();
+                req.layer = last->GetLayer();
+            }
+            else
+            {
+                req.to = last;
+                req.toPos = last->GetEnd();
+            }
+        }
+
         setDeadline( ( firstBudgetS > 0 ? firstBudgetS : 30.0 ) / 10 );
         nlohmann::json attempt = nlohmann::json::object();
         const bool     ok = routeOne( *context, req, attempt, added );
+
+        // the lanes it went on from are its copper now: ripped up with it
+        for( PORT_GOAL* g : laneGoal )
+        {
+            if( !ok || !g )
+                continue;
+
+            for( const KIID& id : g->ring )
+            {
+                profile.laid[id] = { profile.pass, profile.job, profile.attempts };
+                added.push_back( id );
+            }
+
+            g->ring.clear();
+            job.laneRouted = true;
+        }
         tryDeadline.reset();
         job.ms += msSince( alongStarted );
         profile.job = outer;
