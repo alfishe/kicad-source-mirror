@@ -14502,8 +14502,6 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
             }
         }
 
-        const int step = pcbIUScale.mmToIU( 0.25 );
-
         for( size_t endIndex = 0; endIndex < ends.size(); ++endIndex )
         {
             const auto& [item, pos] = ends[endIndex];
@@ -14571,6 +14569,9 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
             bool        ok = false;
             viaDia = classViaDia;
             viaDrill = classViaDrill;
+
+            // the spots' grid: the net's clearance, the finest gap the rules tell apart
+            const int step = std::max( KopenapiRuleVia( board, net->GetNetCode(), pos, layer ).clearance, 1 );
 
             // a pin of a run takes its planned via (or none: left out of a tight run); another row pin
             // the rules' via, the board's smallest where that does not fit
@@ -14684,6 +14685,17 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                             const int      padHalf = dir->second.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
                             const int      narrow = dir->second.x ? pb.GetHeight() : pb.GetWidth();
                             const VECTOR2I across( -dir->second.y, dir->second.x );
+                            const int      clear = KopenapiRuleVia( board, net->GetNetCode(), base, layer ).clearance;
+                            int            pitch = std::numeric_limits<int>::max();
+
+                            for( PAD* q : basePad->GetParentFootprint()->Pads() )
+                            {
+                                if( q != basePad && KopenapiPadNeighbours( q, basePad ) )
+                                    pitch = std::min( pitch, KiROUND( ( q->GetPosition() - base ).EuclideanNorm() ) );
+                            }
+
+                            if( pitch == std::numeric_limits<int>::max() )
+                                pitch = narrow + clear;
 
                             // straight in from the pad's centre, or slanted from its inner end past the
                             // vias of its row neighbours
@@ -14718,7 +14730,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                 const VECTOR2I at = t->GetPosition();
                                 const VECTOR2I d = at - tip;
 
-                                if( (double) d.EuclideanNorm() > pcbIUScale.mmToIU( 1.2 ) || d.Dot( dir->second ) >= 0
+                                if( d.EuclideanNorm() > pitch + padHalf + viaDia + clear || d.Dot( dir->second ) >= 0
                                     || !std::any_of( ringAreas.begin(), ringAreas.end(),
                                                      [&]( const UNDER_PART& u )
                                                      { return u.fp == basePad->GetParentFootprint() && u.area.Contains( at ); } ) )
@@ -14732,12 +14744,32 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                                 joinAt[{ at.x, at.y }] = t;
                             }
 
-                            for( int k = 0; quad && k < 20; ++k )
+                            // inward from the pad's inner end a clearance step at a time, up to where the via
+                            // would meet the exposed pad or pass the package's middle; across within half a pitch
+                            const FOOTPRINT* part = basePad->GetParentFootprint();
+                            int              room = std::abs( ( part->GetPosition() - base ).Dot( dir->second ) );
+
+                            for( PAD* ep : exposedPads )
                             {
-                                for( int side : { 0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5 } )
+                                if( ep->GetParentFootprint() != part )
+                                    continue;
+
+                                const BOX2I    eb = ep->GetBoundingBox();
+                                const VECTOR2I in = -dir->second;
+                                const int      edge = in.x > 0 ? eb.GetLeft() - base.x : in.x < 0 ? base.x - eb.GetRight()
+                                                      : in.y > 0 ? eb.GetTop() - base.y : base.y - eb.GetBottom();
+                                room = std::min( room, edge - viaDia / 2 - clear );
+                            }
+
+                            const int first = padHalf + viaDia / 2 + clear;
+                            const int sides = clear > 0 ? pitch / 2 / clear : 0;
+
+                            for( int depth = first; quad && ( depth == first || depth <= room ); depth += clear )
+                            {
+                                for( int k = 0; k <= 2 * sides; ++k )
                                 {
-                                    const VECTOR2I at = base - dir->second * ( padHalf + viaDia / 2 + minClearance + k * pcbIUScale.mmToIU( 0.1 ) )
-                                                        + across * ( side * pcbIUScale.mmToIU( 0.2 ) );
+                                    const int      side = ( k + 1 ) / 2 * ( k % 2 ? 1 : -1 );
+                                    const VECTOR2I at = base - dir->second * depth + across * ( side * clear );
                                     candidates.push_back( at );
                                     stubFrom[{ at.x, at.y }] = side ? tip : base;
                                     stubPadAt[{ at.x, at.y }] = basePad;
@@ -14786,13 +14818,48 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                             }
                         }
 
-                        for( int ring = 0; ring < 6; ++ring )
-                        {
-                            const int reach = half + viaDia / 2 + pcbIUScale.mmToIU( 0.4 ) + ring * pcbIUScale.mmToIU( 0.5 );
+                        // rings a via pitch apart, out a via pitch past the nearest other pad or via of the net
+                        // (the stub to it is the way past whatever lies between), and not short of the part's
+                        // courtyard; round each the spots a clearance apart
+                        const int ringClear = KopenapiRuleVia( board, net->GetNetCode(), base, layer ).clearance;
+                        double    ringsEnd = std::numeric_limits<double>::max();
+                        double    partEnd = 0;
 
-                            for( int k = 0; k < 16; ++k )
+                        if( const FOOTPRINT* fp = item->GetParentFootprint() )
+                        {
+                            const SHAPE_POLY_SET& cy = fp->GetCourtyard( fp->GetLayer() == B_Cu ? B_Cu : F_Cu );
+                            const BOX2I           body = cy.OutlineCount() ? cy.BBox() : fp->GetBoundingBox( false );
+
+                            for( const VECTOR2I& c : { body.GetOrigin(), body.GetEnd(), VECTOR2I( body.GetLeft(), body.GetBottom() ),
+                                                       VECTOR2I( body.GetRight(), body.GetTop() ) } )
                             {
-                                const double a = k * M_PI / 8;
+                                partEnd = std::max( partEnd, (double) ( c - base ).EuclideanNorm() );
+                            }
+                        }
+
+                        for( BOARD_CONNECTED_ITEM* other : board->GetConnectivity()->GetNetItems( net->GetNetCode(), { PCB_PAD_T, PCB_VIA_T } ) )
+                        {
+                            if( other != item && !( other->Type() == PCB_PAD_T && other->GetParentFootprint() == item->GetParentFootprint()
+                                                    && item->Type() == PCB_PAD_T ) )
+                            {
+                                ringsEnd = std::min( ringsEnd, (double) ( other->GetPosition() - base ).EuclideanNorm() );
+                            }
+                        }
+
+                        ringsEnd = std::max( ringsEnd == std::numeric_limits<double>::max() ? 0.0 : ringsEnd, partEnd ) + viaDia + ringClear;
+
+                        for( int ring = 0;; ++ring )
+                        {
+                            const int reach = half + viaDia / 2 + ringClear + ring * ( viaDia + ringClear );
+
+                            if( ring > 0 && reach > ringsEnd )
+                                break;
+
+                            const int count = std::max( 4, (int) std::ceil( 2 * M_PI * reach / std::max( ringClear, 1 ) ) );
+
+                            for( int k = 0; k < count; ++k )
+                            {
+                                const double a = k * 2 * M_PI / count;
                                 VECTOR2I     at = base + VECTOR2I( KiROUND( reach * std::cos( a ) ), KiROUND( reach * std::sin( a ) ) );
                                 at = VECTOR2I( KiROUND( (double) at.x / step ) * step, KiROUND( (double) at.y / step ) * step );
                                 candidates.push_back( at );
