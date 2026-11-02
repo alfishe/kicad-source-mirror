@@ -16870,8 +16870,20 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
 
         // the stubs leave as a fan of rays from the pads' outer ends, in pin order (a bus leaves
         // uncrossed), spreading the vias to a pitch where they fit; with several via lines the
-        // neighbours alternate lines and the spread only has to pass a stub between two vias
-        const int64_t mid = ( along( list.front()->GetPosition() ) + along( list.back()->GetPosition() ) ) / 2;
+        // neighbours alternate lines and the spread only has to pass a stub between two vias. The fan spans
+        // the pins it fans (a net with a pad elsewhere), whatever nets were asked
+        std::vector<PAD*> fanned;
+
+        for( PAD* pad : list )
+        {
+            if( pad->GetNetCode() > 0 && farEnd( pad ) )
+                fanned.push_back( pad );
+        }
+
+        if( fanned.empty() )
+            fanned = list;
+
+        const int64_t mid = ( along( fanned.front()->GetPosition() ) + along( fanned.back()->GetPosition() ) ) / 2;
         int64_t       tipLine = std::numeric_limits<int64_t>::min();
         int64_t       maxOffset = 0;
         // the rules' track, narrowed so two side by side keep the clearance at the pitch
@@ -16888,13 +16900,21 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         {
             const BOX2I pb = pad->GetBoundingBox();
             tipLine = std::max( tipLine, across( pad->GetPosition() ) + ( dir.x != 0 ? pb.GetWidth() : pb.GetHeight() ) / 2 );
-            maxOffset = std::max( maxOffset, std::abs( along( pad->GetPosition() ) - mid ) );
         }
 
-        const double need = withVias ? ( rows > 1 ? viaDia / 2.0 + clearance + width / 2.0 : double( viaDia + clearance ) )
-                                     : double( width + clearance );
-        const double spread = std::max( 1.0, need / pitch );
+        for( PAD* pad : fanned )
+            maxOffset = std::max( maxOffset, std::abs( along( pad->GetPosition() ) - mid ) );
+
+        // a via keeps the copper clearance from its ring and the hole clearance from its hole, whichever
+        // reaches further; the spread keeps a grid step over what the pitch must hold (rounding at the limit)
+        const double viaKeep = std::max( viaDia / 2.0 + clearance, viaDrill / 2.0 + bds.m_HoleClearance );
+        const double need = ( withVias ? ( rows > 1 ? viaKeep + width / 2.0
+                                                    : std::max( { viaDia / 2.0 + viaKeep, double( viaDrill + bds.m_HoleToHoleMin ) } ) )
+                                       : double( width + clearance ) )
+                            + pcbIUScale.mmToIU( 0.005 );
         const double cosMax = std::min( 0.999, std::max( 0.2, double( width + clearance ) / pitch ) );
+        // a neighbour's ray, at up to the fan's steepest angle, passes a via by the spread times its cosine
+        const double spread = need <= pitch ? 1.0 : withVias ? need / ( pitch * cosMax ) : need / pitch;
         const double tanMax = std::sqrt( 1.0 - cosMax * cosMax ) / cosMax;
         const int64_t rayLength = std::max<int64_t>( clearance, KiROUND( maxOffset * ( spread - 1.0 ) / tanMax ) );
         const int64_t rayEnd = tipLine + rayLength;
