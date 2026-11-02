@@ -479,7 +479,10 @@ std::vector<RAIL_PIN_PLAN> planRowRailVias( BOARD* aBoard, FOOTPRINT* aFp, const
 
             const BOX2I pb = run.front()->GetBoundingBox();
             const int   padHalf = dir.x ? pb.GetWidth() / 2 : pb.GetHeight() / 2;
-            int         room = padHalf + pcbIUScale.mmToIU( 2.0 );
+            // inward to the exposed pad, or without one to the package's middle (the opposite row's
+            // vias come from the other side)
+            const VECTOR2I mid = centres.Centre();
+            int            room = dir.x ? std::abs( run.front()->GetPosition().x - mid.x ) : std::abs( run.front()->GetPosition().y - mid.y );
 
             if( ep )
             {
@@ -579,7 +582,7 @@ std::vector<RAIL_PIN_PLAN> planRowRailVias( BOARD* aBoard, FOOTPRINT* aFp, const
                     for( const PAD* p : run )
                     {
                         if( plans[p].pattern != "fixed" )
-                            plans[p].reason = "no room inward of the row for a via (the exposed pad is too near)";
+                            plans[p].reason = "no room inward of the row for a via (the exposed pad, or without one the package's middle, is too near)";
                     }
 
                     continue;
