@@ -11414,6 +11414,109 @@ static KOPENAPI_RESULT h_pcb_track_list( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 }
 
 
+static const char* viaTypeName( VIATYPE aType )
+{
+    switch( aType )
+    {
+    case VIATYPE::THROUGH:  return "through";
+    case VIATYPE::BLIND:    return "blind";
+    case VIATYPE::BURIED:   return "buried";
+    case VIATYPE::MICROVIA: return "micro";
+    default:                return "undefined";
+    }
+}
+
+
+static KOPENAPI_RESULT h_pcb_via_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
+
+    if( !context )
+        return KopenapiNoBoard();
+
+    std::set<std::string> types;
+
+    for( const nlohmann::json& t : aArgs.value( "via_types", nlohmann::json::array() ) )
+    {
+        if( !t.is_string() || !std::set<std::string>{ "through", "blind", "buried", "micro" }.count( t.get<std::string>() ) )
+            return KOPENAPI_RESULT::Error( 400, "via_types: through, blind, buried, micro" );
+
+        types.insert( t.get<std::string>() );
+    }
+
+    BOARD*                         board = context->GetBoard();
+    nlohmann::json                 select = aArgs;
+    nlohmann::json                 missing = nlohmann::json::array();
+    std::optional<KOPENAPI_RESULT> error;
+
+    select["kinds"] = nlohmann::json::array( { "via" } );
+    std::vector<PCB_TRACK*> tracks = selectTracks( board, select, false, missing, error );
+
+    if( error )
+        return *error;
+
+    const bool     full = aArgs.value( "full", false );
+    const size_t   limit = full ? std::numeric_limits<size_t>::max()
+                                : size_t( std::clamp( aArgs.value( "limit", 1000 ), 1, 100000 ) );
+    const size_t   offset = size_t( std::max( 0, aArgs.value( "offset", 0 ) ) );
+    nlohmann::json items = nlohmann::json::array();
+    std::map<std::string, int>                     byType;
+    std::map<std::pair<double, double>, int>       bySize;
+    size_t                                         total = 0;
+
+    for( PCB_TRACK* track : tracks )
+    {
+        if( track->Type() != PCB_VIA_T )
+            continue;
+
+        PCB_VIA*          via = static_cast<PCB_VIA*>( track );
+        const std::string type = viaTypeName( via->GetViaType() );
+
+        if( !types.empty() && !types.count( type ) )
+            continue;
+
+        const double dia = toMm( via->GetWidth( via->TopLayer() ) );
+        const double drill = toMm( via->GetDrillValue() );
+
+        byType[type]++;
+        bySize[{ dia, drill }]++;
+
+        if( total++ < offset || items.size() >= limit )
+            continue;
+
+        nlohmann::json span = nlohmann::json::array();
+
+        for( PCB_LAYER_ID layer : LSET( via->GetLayerSet() & board->GetEnabledLayers() & LSET::AllCuMask() ).CuStack() )
+            span.push_back( str( board->GetLayerName( layer ) ) );
+
+        items.push_back( { { "uuid", str( via->m_Uuid.AsString() ) },
+                           { "at_mm", { toMm( via->GetPosition().x ), toMm( via->GetPosition().y ) } },
+                           { "net", str( UnescapeString( via->GetNetname() ) ) },
+                           { "net_code", via->GetNetCode() },
+                           { "diameter_mm", dia },
+                           { "drill_mm", drill },
+                           { "via_type", type },
+                           { "layer_span", { str( board->GetLayerName( via->TopLayer() ) ),
+                                             str( board->GetLayerName( via->BottomLayer() ) ) } },
+                           { "layers", span },
+                           { "locked", via->IsLocked() } } );
+    }
+
+    nlohmann::json sizes = nlohmann::json::array();
+
+    for( const auto& [size, count] : bySize )
+        sizes.push_back( { { "diameter_mm", size.first }, { "drill_mm", size.second }, { "count", count } } );
+
+    nlohmann::json out = { { "items", items }, { "total", total }, { "by_type", byType }, { "sizes", sizes },
+                           { "missing", missing } };
+
+    if( offset + items.size() < total )
+        out["next_offset"] = offset + items.size();
+
+    return KOPENAPI_RESULT::Ok( out );
+}
+
+
 /// @brief Copper of one net as a graph of board items (pads, tracks, vias, zones) by what
 /// connectivity says touches what
 class NET_COPPER_GRAPH
@@ -13848,6 +13951,22 @@ KOPENAPI_REGISTER( "pcb_track_list",
                         "limit":{"type":"integer","default":500},"offset":{"type":"integer","default":0}}})json"_json,
                    false, h_pcb_track_list );
 
+KOPENAPI_REGISTER( "pcb_via_list",
+                   "Vias of the board with their uuids: all, or of nets, in a region, through a layer, of a via type; "
+                   "per via position (at_mm), net and net_code, diameter, drill, via_type (through / blind / buried / "
+                   "micro), layer_span [top, bottom] and the copper layers it passes (layers), locked; totals by type "
+                   "and by size (diameter / drill: count). Paged: limit / offset, full: true for all",
+                   R"json({"type":"object","properties":{
+                        "net":{"type":"string"},"nets":{"type":"array","items":{"type":"string"}},
+                        "region":{"type":"array","items":{"type":"number"},"description":"[x0_mm, y0_mm, x1_mm, y1_mm]"},
+                        "region_mode":{"type":"string","enum":["inside","touching"],"default":"inside"},
+                        "layer":{"type":"string","description":"vias passing this copper layer"},
+                        "via_types":{"type":"array","items":{"type":"string","enum":["through","blind","buried","micro"]}},
+                        "uuids":{"type":"array","items":{"type":"string"}},
+                        "full":{"type":"boolean","default":false,"description":"every via, no limit"},
+                        "limit":{"type":"integer","default":1000},"offset":{"type":"integer","default":0}}})json"_json,
+                   false, h_pcb_via_list );
+
 KOPENAPI_REGISTER( "pcb_tracks_delete",
                    "Remove tracks and vias in one undo step: by uuids, or the ones passing every filter given - "
                    "net / nets (unroute them), between two pads (undo one connection: the copper joining them that "
@@ -14014,4 +14133,4 @@ KOPENAPI_REGISTER( "pcb_route_strategies",
                    false, h_pcb_route_strategies );
 
 KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_tracks_cleanup", "pcb_track_add", "pcb_via_add", "pcb_fanout" );
-KOPENAPI_MARK_CONCURRENT_READS( "pcb_track_list" );
+KOPENAPI_MARK_CONCURRENT_READS( "pcb_track_list", "pcb_via_list" );
