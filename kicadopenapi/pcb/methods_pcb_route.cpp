@@ -10154,11 +10154,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                   return x.branch.way.length < y.branch.way.length;
                               } );
 
-            // the net's copper nearest a junction point: what a branch onto it ends on
+            // the net's copper nearest a junction point, within a grid cell and the copper's width of it (the
+            // junction is a cell's centre on the grid's way, the copper laid along that way): what a branch
+            // onto it ends on
             auto copperAt = [&]( int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer, VECTOR2I& aPos ) -> BOARD_CONNECTED_ITEM*
             {
                 BOARD_CONNECTED_ITEM* best = nullptr;
-                int64_t               bestD = (int64_t) std::max( pcbIUScale.mmToIU( 1.0 ), 4 * gr.cell );
+                int64_t               bestD = std::numeric_limits<int64_t>::max();
 
                 for( PCB_TRACK* track : board->Tracks() )
                 {
@@ -10169,7 +10171,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                                    : SEG( track->GetStart(), track->GetEnd() ).NearestPoint( aAt );
                     const int64_t  d = ( at - aAt ).EuclideanNorm();
 
-                    if( d < bestD )
+                    if( d < bestD && d <= gr.cell + track->GetWidth() )
                     {
                         bestD = d;
                         best = track;
