@@ -9962,8 +9962,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         // a way through a net's grid copper as a corridor (docs corridor.md): a gate at each corner (zero
         // wide, on the run's layer, the rooms of the run to the next), a via gate where the layer changes
-        // at a via, the last point a free point; the rooms widened from the run's cells
-        GRID_ROOMS rooms( gr.space, std::max( 1, (int) std::ceil( pcbIUScale.mmToIU( 1.0 ) / (double) std::max( gr.cell, 1 ) ) ) );
+        // at a via, the last point a free point; the rooms widened from the run's cells into the net's
+        // share of the free space
+        GRID_ROOMS rooms( gr.space, gr.nets );
 
         auto cornerEnd = [&]( BOARD_CONNECTED_ITEM* aItem, const VECTOR2I& aAt ) -> nlohmann::json
         {
@@ -10154,13 +10155,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                   return x.branch.way.length < y.branch.way.length;
                               } );
 
-            // the net's copper nearest a junction point, within a grid cell and the copper's width of it (the
-            // junction is a cell's centre on the grid's way, the copper laid along that way): what a branch
-            // onto it ends on
-            auto copperAt = [&]( int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer, VECTOR2I& aPos ) -> BOARD_CONNECTED_ITEM*
+            // the net's copper nearest a junction point, in the net's own space round it (its share of the free
+            // space, where the rooms its copper was laid in lie), else within a grid cell and the copper's width
+            // of it (the junction is a cell's centre on the grid's way): what a branch onto it ends on
+            auto copperAt = [&]( size_t aNet, const VECTOR2I& aAt, PCB_LAYER_ID aLayer, VECTOR2I& aPos ) -> BOARD_CONNECTED_ITEM*
             {
-                BOARD_CONNECTED_ITEM* best = nullptr;
-                int64_t               bestD = std::numeric_limits<int64_t>::max();
+                const int                  aNetCode = gridNets[aNet].netCode;
+                const std::optional<BOX2I> space = rooms.SpaceAt( (int) aNet, aLayer, aAt );
+                BOARD_CONNECTED_ITEM*      best = nullptr;
+                int64_t                    bestD = std::numeric_limits<int64_t>::max();
 
                 for( PCB_TRACK* track : board->Tracks() )
                 {
@@ -10171,7 +10174,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                                    : SEG( track->GetStart(), track->GetEnd() ).NearestPoint( aAt );
                     const int64_t  d = ( at - aAt ).EuclideanNorm();
 
-                    if( d < bestD && d <= gr.cell + track->GetWidth() )
+                    if( d < bestD && ( d <= gr.cell + track->GetWidth() || ( space && space->Contains( at ) ) ) )
                     {
                         bestD = d;
                         best = track;
@@ -10227,7 +10230,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 // between two junctions: from the copper laid at the first one
                 VECTOR2I              fromPos;
                 BOARD_CONNECTED_ITEM* from = d.branch.a >= 0 ? n.ends[d.branch.a]
-                                                             : copperAt( n.netCode, d.branch.way.runs.front().points.front(),
+                                                             : copperAt( d.net, d.branch.way.runs.front().points.front(),
                                                                          d.branch.way.runs.front().layer, fromPos );
 
                 if( !from )
@@ -10243,7 +10246,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 // onto a junction no copper has reached yet: on through it to the end of another branch
                 // there
-                if( b < 0 && !copperAt( n.netCode, d.branch.bAt, d.branch.bLayer, toPos ) )
+                if( b < 0 && !copperAt( d.net, d.branch.bAt, d.branch.bLayer, toPos ) )
                 {
                     for( size_t o = step + 1; o < order.size(); ++o )
                     {
@@ -10304,7 +10307,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
                 else
                 {
-                    to = copperAt( n.netCode, d.branch.bAt, d.branch.bLayer, toPos );
+                    to = copperAt( d.net, d.branch.bAt, d.branch.bLayer, toPos );
 
                     if( !to )
                     {

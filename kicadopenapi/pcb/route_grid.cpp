@@ -5253,12 +5253,143 @@ bool GRID_SPACE::Free( int aNet, int aLayer, int aX, int aY ) const
 }
 
 
-GRID_ROOMS::GRID_ROOMS( std::shared_ptr<const GRID_SPACE> aSpace, int aGrowCells ) :
-        m_space( std::move( aSpace ) ),
-        m_grow( std::max( 0, aGrowCells ) )
+GRID_ROOMS::GRID_ROOMS( std::shared_ptr<const GRID_SPACE> aSpace, const std::vector<GRID_NET_RESULT>& aWays ) :
+        m_space( std::move( aSpace ) )
 {
-    if( m_space )
-        m_claimed.assign( m_space->layers.size() * m_space->nx * m_space->ny, 0 );
+    if( !m_space )
+        return;
+
+    const GRID_SPACE& g = *m_space;
+    const size_t      plane = (size_t) g.nx * g.ny;
+
+    m_claimed.assign( g.layers.size() * plane, 0 );
+    m_owner.assign( g.layers.size() * plane, 0 );
+
+    std::deque<size_t> open;
+
+    auto own = [&]( int aNet, int aLayer, int aX, int aY )
+    {
+        if( aX < 0 || aY < 0 || aX >= g.nx || aY >= g.ny )
+            return;
+
+        const size_t i = (size_t) aLayer * plane + (size_t) aY * g.nx + aX;
+
+        if( m_owner[i] == 0 )
+        {
+            m_owner[i] = aNet + 1;
+            open.push_back( i );
+        }
+    };
+
+    auto cellOf = [&]( const VECTOR2I& aP )
+    {
+        return std::make_pair( (int) std::lround( (double) ( aP.x - g.origin.x ) / g.cell ),
+                               (int) std::lround( (double) ( aP.y - g.origin.y ) / g.cell ) );
+    };
+
+    for( size_t k = 0; k < aWays.size(); ++k )
+    {
+        for( const GRID_TRACK& track : aWays[k].tracks )
+        {
+            const auto layerIt = std::find( g.layers.begin(), g.layers.end(), track.layer );
+
+            if( layerIt == g.layers.end() )
+                continue;
+
+            const int l = (int) ( layerIt - g.layers.begin() );
+
+            for( size_t p = 0; p < track.points.size(); ++p )
+            {
+                const auto [x1, y1] = cellOf( track.points[p] );
+                const auto [x0, y0] = p > 0 ? cellOf( track.points[p - 1] ) : std::make_pair( x1, y1 );
+                const int  steps = std::max( { std::abs( x1 - x0 ), std::abs( y1 - y0 ), 1 } );
+
+                for( int t = 0; t <= steps; ++t )
+                {
+                    own( (int) k, l, x0 + (int) std::lround( (double) ( x1 - x0 ) * t / steps ),
+                         y0 + (int) std::lround( (double) ( y1 - y0 ) * t / steps ) );
+                }
+            }
+        }
+
+        for( const VECTOR2I& via : aWays[k].vias )
+        {
+            const auto [x, y] = cellOf( via );
+
+            for( int l = 0; l < (int) g.layers.size(); ++l )
+                own( (int) k, l, x, y );
+        }
+    }
+
+    while( !open.empty() )
+    {
+        const size_t i = open.front();
+        open.pop_front();
+
+        const int net = m_owner[i] - 1;
+        const int l = (int) ( i / plane );
+        const int x = (int) ( i % plane ) % g.nx;
+        const int y = (int) ( i % plane ) / g.nx;
+
+        for( const auto& [dx, dy] : { std::pair{ 1, 0 }, std::pair{ -1, 0 }, std::pair{ 0, 1 }, std::pair{ 0, -1 } } )
+        {
+            if( g.Free( net, l, x + dx, y + dy ) )
+                own( net, l, x + dx, y + dy );
+        }
+    }
+}
+
+
+std::optional<BOX2I> GRID_ROOMS::SpaceAt( int aNet, PCB_LAYER_ID aLayer, const VECTOR2I& aAt ) const
+{
+    if( !m_space )
+        return std::nullopt;
+
+    const GRID_SPACE& g = *m_space;
+    const auto        layerIt = std::find( g.layers.begin(), g.layers.end(), aLayer );
+
+    if( layerIt == g.layers.end() )
+        return std::nullopt;
+
+    const size_t plane = (size_t) ( layerIt - g.layers.begin() ) * g.nx * g.ny;
+    const int    x = (int) std::lround( (double) ( aAt.x - g.origin.x ) / g.cell );
+    const int    y = (int) std::lround( (double) ( aAt.y - g.origin.y ) / g.cell );
+
+    auto mine = [&]( int aX, int aY )
+    {
+        return aX >= 0 && aY >= 0 && aX < g.nx && aY < g.ny && m_owner[plane + (size_t) aY * g.nx + aX] == aNet + 1;
+    };
+
+    if( !mine( x, y ) )
+        return std::nullopt;
+
+    std::array<int, 4> box = { x, y, x, y };
+
+    for( bool grew = true; grew; )
+    {
+        grew = false;
+
+        for( int side = 0; side < 4; ++side )
+        {
+            const bool alongX = side < 2;
+            const int  at = side == 0 ? box[0] - 1 : side == 1 ? box[2] + 1 : side == 2 ? box[1] - 1 : box[3] + 1;
+            bool       ok = true;
+
+            for( int u = alongX ? box[1] : box[0]; ok && u <= ( alongX ? box[3] : box[2] ); ++u )
+                ok = alongX ? mine( at, u ) : mine( u, at );
+
+            if( ok )
+            {
+                ( side == 0 ? box[0] : side == 1 ? box[2] : side == 2 ? box[1] : box[3] ) = at;
+                grew = true;
+            }
+        }
+    }
+
+    const VECTOR2I half( g.cell / 2, g.cell / 2 );
+    const VECTOR2I p0 = g.origin + VECTOR2I( box[0] * g.cell, box[1] * g.cell ) - half;
+    const VECTOR2I p1 = g.origin + VECTOR2I( box[2] * g.cell, box[3] * g.cell ) + half;
+    return BOX2I( p0, p1 - p0 );
 }
 
 
@@ -5287,15 +5418,15 @@ std::vector<BOX2I> GRID_ROOMS::Rooms( int aNet, PCB_LAYER_ID aLayer, const VECTO
     auto open = [&]( int aX, int aY )
     {
         const int32_t c = m_claimed[plane + (size_t) aY * g.nx + aX];
-        return g.Free( aNet, l, aX, aY ) && ( c == 0 || c == aNet + 1 );
+        return m_owner[plane + (size_t) aY * g.nx + aX] == aNet + 1 && ( c == 0 || c == aNet + 1 );
     };
 
     // a box of cells x0 y0 x1 y1 grown a row at a time on the sides given while the new row is open
     auto grow = [&]( std::array<int, 4> aBox, bool aAcrossX, bool aAcrossY )
     {
-        for( int round = 0; round < m_grow; ++round )
+        for( bool grew = true; grew; )
         {
-            bool grew = false;
+            grew = false;
 
             for( int side = 0; side < 4; ++side )
             {
@@ -5320,9 +5451,6 @@ std::vector<BOX2I> GRID_ROOMS::Rooms( int aNet, PCB_LAYER_ID aLayer, const VECTO
                 ( side == 0 ? aBox[0] : side == 1 ? aBox[2] : side == 2 ? aBox[1] : aBox[3] ) = at;
                 grew = true;
             }
-
-            if( !grew )
-                break;
         }
 
         for( int y = aBox[1]; y <= aBox[3]; ++y )

@@ -248,22 +248,29 @@ struct GRID_SPACE
     bool Free( int aNet, int aLayer, int aX, int aY ) const;
 };
 
-/// @brief Rooms of corridors from a grid's free space: a straight run's cells widened while the cells
-/// stay free for the net and no other net's room has them; one net's rooms may share cells, other
-/// nets' rooms never do
+/// @brief Rooms of corridors from a grid's free space.  The free space is shared out between the nets'
+/// ways: each free cell goes to the way nearest it (a breadth-first growth from every way at once,
+/// through the cells free for that way's net), so a net's space reaches the next obstacle or half way
+/// to the next net's way.  A straight run's cells are widened while the cells stay the net's; one
+/// net's rooms may share cells, other nets' rooms never do
 class GRID_ROOMS
 {
 public:
-    GRID_ROOMS( std::shared_ptr<const GRID_SPACE> aSpace, int aGrowCells );
+    /// @brief aWays: the grid's copper per net of the request (GRID_RESULT::nets)
+    GRID_ROOMS( std::shared_ptr<const GRID_SPACE> aSpace, const std::vector<GRID_NET_RESULT>& aWays );
 
     /// @brief The rooms of the run aFrom -> aTo of the request's net aNet on aLayer (board units, in
     /// order along the run): one when the run is axis-parallel, a room per cell of a diagonal; none
     /// without a space or off the routing layers
     std::vector<BOX2I> Rooms( int aNet, PCB_LAYER_ID aLayer, const VECTOR2I& aFrom, const VECTOR2I& aTo );
 
+    /// @brief The box of the net aNet's space round aAt on aLayer: its cell widened on every side while
+    /// the cells stay the net's (no room claimed); none when the cell is not the net's
+    std::optional<BOX2I> SpaceAt( int aNet, PCB_LAYER_ID aLayer, const VECTOR2I& aAt ) const;
+
 private:
     std::shared_ptr<const GRID_SPACE> m_space;
-    int                               m_grow = 0;
+    std::vector<int32_t>              m_owner;     ///< layers * cells: the net (request index + 1) whose space it is
     std::vector<int32_t>              m_claimed;   ///< layers * cells: the net (request index + 1) whose room has it
 };
 
