@@ -1,7 +1,7 @@
 /// @file methods_pcb_shape_ops.cpp
 /// @brief kicadopenapi shape editing and copies: pcb_shapes_edit, pcb_array, pcb_duplicate.
 ///
-/// Polygon booleans and Fillet / Chamfer / Dogbone Lines on board graphics (the edit tool's
+/// Polygon booleans and Fillet / Chamfer / Dogbone / Extend Lines on board graphics (the edit tool's
 /// routines), Create Array (grid or circular) and Duplicate (and Increment) of footprints,
 /// drawings, tracks, vias and zones; one commit per call.
 #include "kopenapi_pcb.h"
@@ -293,10 +293,10 @@ static KOPENAPI_RESULT h_pcb_shapes_edit( KOPENAPI_CONTEXT& aCtx, const nlohmann
     BOARD*            board = context->GetBoard();
     const std::string op = aArgs.value( "op", std::string() );
     const bool        boolean = op == "merge" || op == "subtract" || op == "intersect";
-    const bool        lines = op == "fillet" || op == "chamfer" || op == "dogbone";
+    const bool        lines = op == "fillet" || op == "chamfer" || op == "dogbone" || op == "extend";
 
     if( !boolean && !lines )
-        return KOPENAPI_RESULT::Error( 400, "op: merge, subtract, intersect, fillet, chamfer or dogbone" );
+        return KOPENAPI_RESULT::Error( 400, "op: merge, subtract, intersect, fillet, chamfer, dogbone or extend" );
 
     if( !aArgs.contains( "uuids" ) || !aArgs["uuids"].is_array() || aArgs["uuids"].empty() )
         return KOPENAPI_RESULT::Error( 400, "uuids: the board shapes (pcb_drawing_list)" );
@@ -322,7 +322,7 @@ static KOPENAPI_RESULT h_pcb_shapes_edit( KOPENAPI_CONTEXT& aCtx, const nlohmann
         {
             KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error(
                     400, boolean ? "booleans take polygons, rectangles and circles"
-                                 : "fillet / chamfer / dogbone take lines, polygons and rectangles" );
+                                 : "fillet / chamfer / dogbone / extend take lines, polygons and rectangles" );
             refused.body["uuid"] = str( shape->m_Uuid.AsString() );
             refused.body["shape"] = str( shape->ShowShape() );
             return refused;
@@ -393,85 +393,50 @@ static KOPENAPI_RESULT h_pcb_shapes_edit( KOPENAPI_CONTEXT& aCtx, const nlohmann
     {
         const double size = aArgs.value( "radius_mm", aArgs.value( "setback_mm", 1.0 ) );
 
-        if( size <= 0 )
+        if( size <= 0 && op != "extend" )
             return KOPENAPI_RESULT::Error( 400, "radius_mm / setback_mm must be positive" );
 
-        // Rectangles and polygons become their sides, as Fillet / Chamfer Lines does
-        std::vector<PCB_SHAPE*> segments;
+        MODIFY_LINES_RESULT done = ModifyLines(
+                board, commit, shapes, op == "extend",
+                [&]( ITEM_MODIFICATION_ROUTINE::CHANGE_HANDLER& aHandler ) -> std::unique_ptr<PAIRWISE_LINE_ROUTINE>
+                {
+                    if( op == "fillet" )
+                        return std::make_unique<LINE_FILLET_ROUTINE>( board, aHandler, toIU( size ) );
 
-        for( PCB_SHAPE* shape : shapes )
+                    if( op == "chamfer" )
+                        return std::make_unique<LINE_CHAMFER_ROUTINE>( board, aHandler, CHAMFER_PARAMS{ toIU( size ), toIU( size ) } );
+
+                    if( op == "dogbone" )
+                    {
+                        return std::make_unique<DOGBONE_CORNER_ROUTINE>(
+                                board, aHandler, DOGBONE_CORNER_ROUTINE::PARAMETERS{ toIU( size ), aArgs.value( "add_slots", false ) } );
+                    }
+
+                    return std::make_unique<LINE_EXTENSION_ROUTINE>( board, aHandler );
+                } );
+
+        if( done.m_status == MODIFY_LINES_RESULT::STATUS::NOT_TWO_LINES )
         {
-            if( shape->GetShape() == SHAPE_T::SEGMENT )
-            {
-                segments.push_back( shape );
-                continue;
-            }
-
-            std::vector<VECTOR2I> pts;
-
-            if( shape->GetShape() == SHAPE_T::RECTANGLE )
-            {
-                const VECTOR2I s = shape->GetStart();
-                const VECTOR2I e = shape->GetEnd();
-                pts = { s, VECTOR2I( e.x, s.y ), e, VECTOR2I( s.x, e.y ) };
-            }
-            else
-            {
-                for( int i = 0; i < shape->GetPolyShape().VertexCount(); ++i )
-                    pts.push_back( shape->GetPolyShape().CVertex( i ) );
-            }
-
-            for( size_t i = 0; i < pts.size(); ++i )
-            {
-                auto* side = new PCB_SHAPE( board, SHAPE_T::SEGMENT );
-                side->SetStart( pts[i] );
-                side->SetEnd( pts[( i + 1 ) % pts.size()] );
-                side->SetStroke( shape->GetStroke() );
-                side->SetLayer( shape->GetLayer() );
-                commit.Add( side );
-                created.push_back( side );
-                segments.push_back( side );
-            }
-
-            removed.insert( shape->m_Uuid );
-            commit.Remove( shape );
+            KOPENAPI_RESULT refused = KOPENAPI_RESULT::Error( 400, "extend: exactly two lines" );
+            refused.body["lines"] = done.m_segmentCount;
+            return refused;
         }
 
-        if( segments.size() < 2 )
-        {
-            commit.Revert();
+        if( done.m_status != MODIFY_LINES_RESULT::STATUS::DONE )
             return KOPENAPI_RESULT::Error( 400, op + ": at least two lines" );
-        }
 
-        std::unique_ptr<PAIRWISE_LINE_ROUTINE> routine;
+        created.insert( created.end(), done.m_sides.begin(), done.m_sides.end() );
+        created.insert( created.end(), done.m_created.begin(), done.m_created.end() );
+        modified.insert( done.m_modified.begin(), done.m_modified.end() );
 
-        if( op == "fillet" )
-        {
-            routine = std::make_unique<LINE_FILLET_ROUTINE>( board, handler, toIU( size ) );
-        }
-        else if( op == "chamfer" )
-        {
-            routine = std::make_unique<LINE_CHAMFER_ROUTINE>( board, handler,
-                                                              CHAMFER_PARAMS{ toIU( size ), toIU( size ) } );
-        }
-        else
-        {
-            routine = std::make_unique<DOGBONE_CORNER_ROUTINE>(
-                    board, handler, DOGBONE_CORNER_ROUTINE::PARAMETERS{ toIU( size ), aArgs.value( "add_slots", false ) } );
-        }
+        for( PCB_SHAPE* shape : done.m_decomposed )
+            removed.insert( shape->m_Uuid );
 
-        for( PCB_SHAPE* s : segments )
-            s->ClearFlags( STRUCT_DELETED );
+        for( BOARD_ITEM* item : done.m_removed )
+            removed.insert( item->m_Uuid );
 
-        alg::for_all_pairs( segments.begin(), segments.end(),
-                            [&]( PCB_SHAPE* a, PCB_SHAPE* b )
-                            {
-                                if( !( a->GetFlags() & STRUCT_DELETED ) && !( b->GetFlags() & STRUCT_DELETED ) )
-                                    routine->ProcessLinePair( *a, *b );
-                            } );
-
-        successes = routine->GetSuccesses();
-        failures = routine->GetFailures();
+        successes = done.m_successes;
+        failures = done.m_failures;
     }
 
     if( successes == 0 )
@@ -733,10 +698,11 @@ KOPENAPI_REGISTER( "pcb_shapes_edit",
                    "Edit board graphics like Edit > Shape Modification: merge / subtract / intersect "
                    "polygons, rectangles and circles (the first uuid is the base, subtract cuts the others "
                    "from it, the result keeps its layer and stroke), fillet / chamfer / dogbone the corners "
-                   "where lines meet (rectangles and polygons become their sides); one undo step; answers "
+                   "where lines meet, extend exactly two lines to where they would meet (rectangles and "
+                   "polygons become their sides, as Edit > Shape Modification does); one undo step; answers "
                    "the resulting shapes, the removed uuids and the corners done (422 when nothing changed)",
                    R"json({"type":"object","required":["op","uuids"],"properties":{
-                        "op":{"type":"string","enum":["merge","subtract","intersect","fillet","chamfer","dogbone"]},
+                        "op":{"type":"string","enum":["merge","subtract","intersect","fillet","chamfer","dogbone","extend"]},
                         "uuids":{"type":"array","items":{"type":"string"},"description":"board shapes (pcb_drawing_list)"},
                         "radius_mm":{"type":"number","default":1,"description":"fillet / dogbone radius"},
                         "setback_mm":{"type":"number","default":1,"description":"chamfer setback"},

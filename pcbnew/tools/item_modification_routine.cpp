@@ -27,6 +27,9 @@
 #include <geometry/shape_utils.h>
 #include <geometry/vector_utils.h>
 
+#include <board_item_container.h>
+#include <commit.h>
+#include <core/kicad_algo.h>
 #include <pad.h>
 #include <pcb_track.h>
 #include <tools/pcb_tool_utils.h>
@@ -1042,4 +1045,133 @@ void OUTSET_ROUTINE::ProcessItem( BOARD_ITEM& aItem )
     // case, but since we can't it's better to err on the side of safety.
     if( m_params.deleteSourceItems && GetSuccesses() > 0 && GetFailures() == 0 )
         handler.DeleteItem( aItem );
+}
+
+
+MODIFY_LINES_RESULT ModifyLines( BOARD_ITEM_CONTAINER* aModel, COMMIT& aCommit, const std::vector<PCB_SHAPE*>& aShapes,
+                                 bool aExactlyTwo, const LINE_ROUTINE_FACTORY& aMakeRoutine )
+{
+    MODIFY_LINES_RESULT     result;
+    std::vector<PCB_SHAPE*> lines;
+
+    for( PCB_SHAPE* shape : aShapes )
+    {
+        std::vector<VECTOR2I> pts;
+
+        if( shape->GetShape() == SHAPE_T::SEGMENT )
+        {
+            lines.push_back( shape );
+            continue;
+        }
+        else if( shape->GetShape() == SHAPE_T::RECTANGLE )
+        {
+            const VECTOR2I start( shape->GetStart() );
+            const VECTOR2I end( shape->GetEnd() );
+            pts = { start, VECTOR2I( end.x, start.y ), end, VECTOR2I( start.x, end.y ) };
+        }
+        else if( shape->GetShape() == SHAPE_T::POLY )
+        {
+            for( int jj = 0; jj < shape->GetPolyShape().VertexCount(); ++jj )
+                pts.emplace_back( shape->GetPolyShape().CVertex( jj ) );
+        }
+        else
+        {
+            continue;
+        }
+
+        result.m_decomposed.push_back( shape );
+
+        if( pts.size() < 2 )
+            continue;
+
+        for( size_t jj = 0; jj < pts.size(); ++jj )
+        {
+            PCB_SHAPE* line = new PCB_SHAPE( aModel, SHAPE_T::SEGMENT );
+            line->SetStart( pts[jj] );
+            line->SetEnd( pts[( jj + 1 ) % pts.size()] );
+            line->SetWidth( shape->GetWidth() );
+            line->SetLayer( shape->GetLayer() );
+            result.m_sides.push_back( line );
+        }
+    }
+
+    result.m_segmentCount = (int) ( lines.size() + result.m_sides.size() );
+
+    auto discardSides = [&]()
+    {
+        for( PCB_SHAPE* line : result.m_sides )
+            delete line;
+
+        result.m_sides.clear();
+        result.m_decomposed.clear();
+    };
+
+    if( aExactlyTwo && result.m_segmentCount != 2 )
+    {
+        discardSides();
+        result.m_status = MODIFY_LINES_RESULT::STATUS::NOT_TWO_LINES;
+        return result;
+    }
+    else if( result.m_segmentCount < 2 )
+    {
+        discardSides();
+        result.m_status = MODIFY_LINES_RESULT::STATUS::TOO_FEW_LINES;
+        return result;
+    }
+
+    ITEM_MODIFICATION_ROUTINE::CALLABLE_BASED_HANDLER handler(
+            [&]( std::unique_ptr<BOARD_ITEM> aItem )
+            {
+                result.m_created.push_back( aItem.get() );
+                aCommit.Add( aItem.release() );
+            },
+            [&]( BOARD_ITEM& aItem )
+            {
+                // Sides are new in this commit already
+                if( !alg::contains( result.m_sides, &aItem ) && !alg::contains( result.m_modified, &aItem ) )
+                {
+                    aCommit.Modify( &aItem );
+                    result.m_modified.push_back( &aItem );
+                }
+            },
+            [&]( BOARD_ITEM& aItem )
+            {
+                aItem.SetFlags( STRUCT_DELETED );
+                result.m_removed.push_back( &aItem );
+                aCommit.Remove( &aItem );
+            } );
+
+    std::unique_ptr<PAIRWISE_LINE_ROUTINE> routine = aMakeRoutine( handler );
+
+    if( !routine )
+    {
+        discardSides();
+        result.m_status = MODIFY_LINES_RESULT::STATUS::CANCELLED;
+        return result;
+    }
+
+    for( PCB_SHAPE* line : result.m_sides )
+    {
+        aCommit.Add( line );
+        lines.push_back( line );
+    }
+
+    for( PCB_SHAPE* shape : result.m_decomposed )
+        aCommit.Remove( shape );
+
+    for( PCB_SHAPE* line : lines )
+        line->ClearFlags( STRUCT_DELETED );
+
+    alg::for_all_pairs( lines.begin(), lines.end(),
+                        [&]( PCB_SHAPE* a, PCB_SHAPE* b )
+                        {
+                            if( ( a->GetFlags() & STRUCT_DELETED ) == 0 && ( b->GetFlags() & STRUCT_DELETED ) == 0 )
+                                routine->ProcessLinePair( *a, *b );
+                        } );
+
+    result.m_successes = routine->GetSuccesses();
+    result.m_failures = routine->GetFailures();
+    result.m_commitDescription = routine->GetCommitDescription();
+    result.m_statusMessage = routine->GetStatusMessage( result.m_segmentCount );
+    return result;
 }

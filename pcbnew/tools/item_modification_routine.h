@@ -457,4 +457,49 @@ private:
     const PARAMETERS m_params;
 };
 
+
+class BOARD_ITEM_CONTAINER;
+class COMMIT;
+
+/**
+ * The outcome of ModifyLines.
+ */
+struct MODIFY_LINES_RESULT
+{
+    enum class STATUS
+    {
+        DONE,
+        TOO_FEW_LINES, ///< fewer than two lines after rectangles and polygons became their sides
+        NOT_TWO_LINES, ///< extend takes exactly two lines
+        CANCELLED      ///< the routine factory returned none
+    };
+
+    STATUS                   m_status = STATUS::DONE;
+    int                      m_segmentCount = 0;
+    std::vector<PCB_SHAPE*>  m_sides;      ///< lines made from the rectangles and polygons
+    std::vector<PCB_SHAPE*>  m_decomposed; ///< the rectangles and polygons replaced by their sides
+    std::vector<BOARD_ITEM*> m_created;    ///< new items from the routine
+    std::vector<BOARD_ITEM*> m_modified;   ///< given lines the routine changed
+    std::vector<BOARD_ITEM*> m_removed;    ///< lines the routine deleted (given ones or sides)
+    unsigned                 m_successes = 0;
+    unsigned                 m_failures = 0;
+    wxString                 m_commitDescription;
+    std::optional<wxString>  m_statusMessage;
+};
+
+using LINE_ROUTINE_FACTORY =
+        std::function<std::unique_ptr<PAIRWISE_LINE_ROUTINE>( ITEM_MODIFICATION_ROUTINE::CHANGE_HANDLER& )>;
+
+/**
+ * Fillet / Chamfer / Dogbone / Extend Lines on graphic lines, rectangles and polygons: rectangles
+ * and polygons become their sides, then the routine from \a aMakeRoutine runs on every pair of
+ * lines.  All changes go into \a aCommit; the caller pushes or reverts it.
+ *
+ * @param aModel the board or footprint the new lines belong to.
+ * @param aExactlyTwo the routine needs exactly two lines (extend).
+ * @param aMakeRoutine called once the lines are counted; nullptr cancels without changes.
+ */
+MODIFY_LINES_RESULT ModifyLines( BOARD_ITEM_CONTAINER* aModel, COMMIT& aCommit, const std::vector<PCB_SHAPE*>& aShapes,
+                                 bool aExactlyTwo, const LINE_ROUTINE_FACTORY& aMakeRoutine );
+
 #endif /* ITEM_MODIFICATION_ROUTINE_H_ */
