@@ -1130,19 +1130,8 @@ bool PCB_EDIT_FRAME::SavePcbFile( const wxString& aFileName, bool addToHistory,
     UpdateTitle();
     UpdateStatusBar();
 
-    // Capture entire project state for PCB save events. Skip when running standalone
-    // without a project loaded - the save path can land anywhere on the filesystem and
-    // there is no project context for a snapshot to live under.
-    if( !Prj().IsNullProject() )
-    {
-        Kiway().LocalHistory().RunRegisteredSaversAndCommit( Prj().GetProjectPath(), wxS( "PCB Save" ), wxS( "pcb" ) );
-
-        // Drop the autosave file for the board we just persisted.  Scope to the PCB
-        // source so a concurrent open eeschema does not lose recovery data for an
-        // unsaved schematic sheet.  RunRegisteredSaversAndCommit above is a no-op when
-        // format is ZIP; this call is conversely a no-op in INCREMENTAL mode.
-        Kiway().LocalHistory().RemoveAutosaveFiles( Prj().GetProjectPath(), { pcbFileName.GetFullPath() } );
-    }
+    // Capture entire project state for PCB save events
+    GetBoard()->CommitSaveToHistory( Kiway().LocalHistory() );
 
     if( m_autoSaveTimer )
         m_autoSaveTimer->Stop();

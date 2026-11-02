@@ -47,6 +47,7 @@
 #include <list>
 
 struct HISTORY_FILE_DATA;
+class LOCAL_HISTORY;
 class BOARD_DESIGN_SETTINGS;
 class BOARD_CONNECTED_ITEM;
 class BOARD_COMMIT;
@@ -1697,6 +1698,20 @@ public:
      * @param aFileData Output vector to append serialized data for history inclusion
      */
     void SaveToHistory( const wxString& aProjectPath, std::vector<HISTORY_FILE_DATA>& aFileData );
+
+    /**
+     * Register SaveToHistory as this board's local-history saver.
+     *
+     * @param aIsModified the editor's modified flag; outside incremental local history a clean
+     *                    board contributes nothing, as for the editor's autosave
+     */
+    void RegisterHistorySaver( LOCAL_HISTORY& aHistory, const std::function<bool()>& aIsModified );
+
+    /**
+     * After the board file is saved: commit the project snapshot tagged as a board save and drop
+     * the board's autosave file, as the editor's save does.  Nothing without a project.
+     */
+    void CommitSaveToHistory( LOCAL_HISTORY& aHistory );
 
     /**
      * Liveness token handed to LOCAL_HISTORY::RegisterSaver so a shared autosave timer skips this

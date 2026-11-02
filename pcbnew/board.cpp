@@ -84,6 +84,7 @@
 #include <mutex>
 #include <pcb_board_outline.h>
 #include <local_history.h>
+#include <settings/common_settings.h>
 #include <pcb_io/pcb_io_mgr.h>
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 #include <advanced_config.h>
@@ -4573,6 +4574,43 @@ int BOARD::GetPadWithCastellatedAttrCount()
     }
 
     return count;
+}
+
+
+void BOARD::RegisterHistorySaver( LOCAL_HISTORY& aHistory, const std::function<bool()>& aIsModified )
+{
+    aHistory.RegisterSaver(
+            this,
+            [this, aIsModified]( const wxString& aProjectPath, std::vector<HISTORY_FILE_DATA>& aFileData )
+            {
+                // See SCHEMATIC::SaveToHistory: the dirty check is only valid in ZIP
+                // mode.  In INCREMENTAL mode the manual-save flow clears the dirty
+                // flag before the saver runs, so filtering would drop the snapshot.
+                bool filterClean = !Pgm().GetCommonSettings()->AutosaveUsesLocalHistory();
+
+                if( filterClean && !aIsModified() )
+                    return;
+
+                SaveToHistory( aProjectPath, aFileData );
+            },
+            GetHistoryLifetimeToken() );
+}
+
+
+void BOARD::CommitSaveToHistory( LOCAL_HISTORY& aHistory )
+{
+    // Skip when running standalone without a project loaded - the save path can land anywhere
+    // on the filesystem and there is no project context for a snapshot to live under.
+    if( !m_project || m_project->IsNullProject() )
+        return;
+
+    aHistory.RunRegisteredSaversAndCommit( m_project->GetProjectPath(), wxS( "PCB Save" ), wxS( "pcb" ) );
+
+    // Drop the autosave file for the board just persisted.  Scope to the PCB source so a
+    // concurrent open eeschema does not lose recovery data for an unsaved schematic sheet.
+    // RunRegisteredSaversAndCommit above is a no-op when format is ZIP; this call is conversely
+    // a no-op in INCREMENTAL mode.
+    aHistory.RemoveAutosaveFiles( m_project->GetProjectPath(), { GetFileName() } );
 }
 
 

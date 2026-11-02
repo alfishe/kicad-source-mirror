@@ -26,6 +26,8 @@
 #include <drc/drc_engine.h>
 #include <footprint.h>
 #include <gestfich.h>
+#include <kiway.h>
+#include <local_history.h>
 #include <netlist_reader/board_netlist_updater.h>
 #include <netlist_reader/netlist_reader.h>
 #include <netlist_reader/pcb_netlist_utils.h>
@@ -53,6 +55,9 @@ HEADLESS_PCB_CONTEXT::HEADLESS_PCB_CONTEXT( std::unique_ptr<BOARD> aBoard, PROJE
 
     m_board->SetProject( m_project );
     m_toolManager->SetEnvironment( m_board.get(), nullptr, nullptr, aSettings, nullptr );
+
+    if( m_kiway )
+        m_board->RegisterHistorySaver( m_kiway->LocalHistory(), [this]() { return m_contentModified; } );
 }
 
 
@@ -62,7 +67,12 @@ HEADLESS_PCB_CONTEXT::~HEADLESS_PCB_CONTEXT()
     // (m_BoardSettings) to the board's design settings. If the board is destroyed while the
     // project still exists, that pointer becomes dangling.
     if( m_board )
+    {
+        if( m_kiway )
+            m_kiway->LocalHistory().UnregisterSaver( m_board.get() );
+
         m_board->ClearProject();
+    }
 }
 
 
@@ -116,6 +126,9 @@ bool HEADLESS_PCB_CONTEXT::SaveBoard()
         pro.MakeAbsolute();
 
         Pgm().GetSettingsManager().SaveProjectAs( pro.GetFullPath(), m_board->GetProject() );
+
+        if( m_kiway )
+            m_board->CommitSaveToHistory( m_kiway->LocalHistory() );
     }
 
     return success;
@@ -148,6 +161,9 @@ bool HEADLESS_PCB_CONTEXT::SaveBoardAs( const wxString& aFileName )
     pro.SetExt( FILEEXT::ProjectFileExtension );
 
     Pgm().GetSettingsManager().SaveProjectAs( pro.GetFullPath(), m_board->GetProject() );
+
+    if( m_kiway )
+        m_board->CommitSaveToHistory( m_kiway->LocalHistory() );
 
     return true;
 }
@@ -289,11 +305,17 @@ bool HEADLESS_PCB_CONTEXT::RevertToSaved()
     if( !reloaded )
         return false;
 
+    if( m_kiway )
+        m_kiway->LocalHistory().UnregisterSaver( m_board.get() );
+
     m_board = std::move( reloaded );
     m_board->SetProject( m_project );
     m_toolManager->SetEnvironment( m_board.get(), nullptr, nullptr, GetAppSettings<PCBNEW_SETTINGS>( "pcbnew" ),
                                    nullptr );
     m_contentModified = false;
+
+    if( m_kiway )
+        m_board->RegisterHistorySaver( m_kiway->LocalHistory(), [this]() { return m_contentModified; } );
 
     return true;
 }

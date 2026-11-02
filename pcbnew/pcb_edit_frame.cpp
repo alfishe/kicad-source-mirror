@@ -2794,23 +2794,7 @@ void PCB_EDIT_FRAME::ProjectChanged()
     // Saver serializes the in-memory BOARD into HISTORY_FILE_DATA. Prettify and
     // file I/O happen on a background thread to avoid blocking the UI.
     if( GetBoard() )
-    {
-        Kiway().LocalHistory().RegisterSaver(
-                GetBoard(),
-                [this]( const wxString& aProjectPath, std::vector<HISTORY_FILE_DATA>& aFileData )
-                {
-                    // See SCHEMATIC::SaveToHistory: the dirty check is only valid in ZIP
-                    // mode.  In INCREMENTAL mode the manual-save flow clears the dirty
-                    // flag before the saver runs, so filtering would drop the snapshot.
-                    bool filterClean = !Pgm().GetCommonSettings()->AutosaveUsesLocalHistory();
-
-                    if( filterClean && !IsContentModified() )
-                        return;
-
-                    GetBoard()->SaveToHistory( aProjectPath, aFileData );
-                },
-                GetBoard()->GetHistoryLifetimeToken() );
-    }
+        GetBoard()->RegisterHistorySaver( Kiway().LocalHistory(), [this]() { return IsContentModified(); } );
 }
 
 
