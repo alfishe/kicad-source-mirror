@@ -2444,13 +2444,22 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
         // a rail pin's via by its pad (a fine pitch's stagger as the router's ways out): a lane running past it
         // keeps outside the via
-        std::vector<std::pair<int64_t, int>> railReach;
+        // a pin a lane runs in front of (a rail pin, a pin going to another layer, a straight one, a pair's):
+        // walled in on its layer, it leaves by a via by its pad; the lane keeps outside that via
+        std::vector<std::tuple<int64_t, int, PCB_LAYER_ID>> viaReach;
+        std::set<const PORT*>                               turning;
+
+        for( const LANE& l : lanes )
+        {
+            if( l.turn > 0 )
+                turning.insert( l.port );
+        }
 
         for( const PORT& p : ports )
         {
-            const int side = sideIndex( p.side );
+            const int side = sideIndex( p.padSide );
 
-            if( p.kind != "rail" || side < 0 || p.pad->GetAttribute() != PAD_ATTRIB::SMD )
+            if( turning.count( &p ) || side < 0 || p.pad->GetAttribute() != PAD_ATTRIB::SMD )
                 continue;
 
             NETCLASS*      netclass = p.pad->GetEffectiveNetClass();
@@ -2464,13 +2473,14 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
             for( PAD* q : a.fp->Pads() )
             {
-                if( q != p.pad && padSideOf( extent, q->GetPosition() ) == p.side )
+                if( q != p.pad && padSideOf( extent, q->GetPosition() ) == p.padSide )
                     padPitch = std::min( padPitch, (double) ( q->GetPosition() - p.pad->GetPosition() ).EuclideanNorm() );
             }
 
             const double apart = via + clearance;
             const int    depth = 2 * clearance + via + ( padPitch < apart ? KiROUND( std::sqrt( apart * apart - padPitch * padPitch ) ) : 0 );
-            railReach.emplace_back( perimeter( side, p.pad->GetPosition() ), past + depth + clearance );
+            viaReach.emplace_back( perimeter( side, p.pad->GetPosition() ), past + depth + clearance,
+                                    p.pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu );
         }
 
         const int steps = 16;
@@ -2480,12 +2490,12 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             LANE& l = lanes[order[m]];
             int   off = base;
 
-            for( const auto& [at, reach] : railReach )
+            for( const auto& [at, reach, layer] : viaReach )
             {
                 for( int64_t k : { -loop, (int64_t) 0, loop } )
                 {
                     // the polyline is given to the micrometre: rounded outward, half of one to spare
-                    if( l.lo <= at + k && at + k <= l.hi )
+                    if( layer == l.layer && l.lo <= at + k && at + k <= l.hi )
                         off = std::max( off, ( reach + l.width / 2 + 500 + 999 ) / 1000 * 1000 );
                 }
             }
@@ -3257,7 +3267,7 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "offset_mm past the courtyard, polyline_mm (pad end, out to the offset, the corners, out past the "
                    "last to one front for the lanes leaving there, two pitches past the outermost), shift_mm and moved_by (other parts' pads, other nets' tracks or vias in its way: "
                    "moved out a pitch at a time, the lanes outside it with it), blocked_by (still in the way after "
-                   "16 pitches), outside the vias its package's rail pins take by their pads when it runs past them, off_board, crossings with other lanes on its layer; straight ones run out past the "
+                   "16 pitches), outside the vias its package's other connected SMD pins on its layer take by their pads when it runs past them, off_board, crossings with other lanes on its layer; straight ones run out past the "
                    "lanes going by their pin. Also each port's lane (rank, offset_mm, polyline_mm) and each lane as a corridor (corridor.md: its corners the gates, its slot the rooms). pitch_mm, "
                    "base_mm, counts and the crossings (pads, at_mm). Read only",
 
