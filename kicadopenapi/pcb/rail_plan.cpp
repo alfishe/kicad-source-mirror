@@ -45,9 +45,20 @@ std::optional<UNDER_PART> underPartArea( BOARD* aBoard, FOOTPRINT* aFp )
     if( aFp->Pads().size() < 8 )
         return std::nullopt;
 
-    const BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
-    std::shared_ptr<NETCLASS>    defaultClass = bds.m_NetSettings ? bds.m_NetSettings->GetDefaultNetclass() : nullptr;
-    const int clearance = std::max( { bds.m_MinClearance, defaultClass && defaultClass->HasClearance() ? defaultClass->GetClearance() : 0, 0 } );
+    // a via as the rules size it for the part's nets, the largest, and its clearance
+    const PCB_LAYER_ID layer = aFp->GetLayer() == B_Cu ? B_Cu : F_Cu;
+    int                clearance = 0, viaDia = 0;
+    std::set<int>      nets;
+
+    for( PAD* pad : aFp->Pads() )
+    {
+        if( !nets.insert( pad->GetNetCode() ).second )
+            continue;
+
+        const KOPENAPI_RULE_VIA via = KopenapiRuleVia( aBoard, pad->GetNetCode(), pad->GetPosition(), layer );
+        clearance = std::max( clearance, via.clearance );
+        viaDia = std::max( viaDia, via.dia );
+    }
 
     BOX2I centres;
     int   padLength = 0;
@@ -75,10 +86,11 @@ std::optional<UNDER_PART> underPartArea( BOARD* aBoard, FOOTPRINT* aFp )
         }
     }
 
+    // the inside a clearance past the pads' inner ends: an area only where a via fits in it both ways
     BOX2I inner = centres;
-    inner.Inflate( -( padLength / 2 + pcbIUScale.mmToIU( 0.1 ) ) );
+    inner.Inflate( -( padLength / 2 + clearance ) );
 
-    if( inner.GetWidth() <= 0 || inner.GetHeight() <= 0 )
+    if( inner.GetWidth() < viaDia || inner.GetHeight() < viaDia )
         return std::nullopt;
 
     // pads on all four sides (a quad package); two rows (SOIC, headers) leave room between
@@ -129,7 +141,7 @@ std::optional<UNDER_PART> underPartArea( BOARD* aBoard, FOOTPRINT* aFp )
         {
             for( PCB_LAYER_ID l : pad->GetLayerSet().CuStack() )
             {
-                if( l == ( aFp->GetLayer() == B_Cu ? B_Cu : F_Cu ) )
+                if( l == layer )
                     pad->TransformShapeToPolygon( open, l, clearance, ARC_LOW_DEF, ERROR_OUTSIDE );
             }
         }
@@ -148,7 +160,7 @@ std::optional<UNDER_PART> underPartArea( BOARD* aBoard, FOOTPRINT* aFp )
             return std::nullopt;
     }
 
-    return UNDER_PART{ aFp, aFp->GetLayer() == B_Cu ? B_Cu : F_Cu, std::move( area ), !insidePads.empty() };
+    return UNDER_PART{ aFp, layer, std::move( area ), !insidePads.empty() };
 }
 
 

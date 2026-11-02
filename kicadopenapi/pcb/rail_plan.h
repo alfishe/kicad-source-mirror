@@ -22,7 +22,8 @@ std::optional<VECTOR2I> outwardOf( const PAD* aPad, const BOX2I& aCentres );
 /// ring of pads on its side, where a track or via of another net walls its pins in.  With an
 /// exposed pad the area is the ring between the pad rows and the exposed pad (the exposed pad and
 /// its clearance stay open: its own vias go there); parts with an array of pads inside (BGA) have
-/// no such area
+/// no such area. It starts the rules' clearance past the pads' inner ends and exists only where a
+/// via as the rules size it for the part's nets fits in it both ways
 struct UNDER_PART
 {
     FOOTPRINT*     fp;
