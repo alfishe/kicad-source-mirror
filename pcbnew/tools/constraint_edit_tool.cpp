@@ -59,6 +59,7 @@
 #include <constraints/pcb_constraint.h>
 #include <constraints/constraint_builder.h>
 #include <constraints/board_constraint_adapter.h>
+#include <constraints/constraint_edit.h>
 
 #include <base_units.h>
 #include <geometry/seg.h>
@@ -511,13 +512,7 @@ void CONSTRAINT_EDIT_TOOL::applyDiagnostics( const BOARD_CONSTRAINT_DIAGNOSTICS&
 void CONSTRAINT_EDIT_TOOL::removeConstraint( PCB_CONSTRAINT* aConstraint )
 {
     // Remember the member shapes so their clusters can re-settle once the constraint is gone.
-    std::vector<PCB_SHAPE*> members;
-
-    for( const CONSTRAINT_MEMBER& member : aConstraint->GetMembers() )
-    {
-        if( PCB_SHAPE* shape = dynamic_cast<PCB_SHAPE*>( board()->ResolveItem( member.m_item, true ) ) )
-            members.push_back( shape );
-    }
+    std::vector<PCB_SHAPE*> members = ConstraintMemberShapes( board(), aConstraint );
 
     BOARD_COMMIT commit( this );
     commit.Remove( aConstraint );
@@ -626,36 +621,13 @@ void CONSTRAINT_EDIT_TOOL::HighlightConstraintMembers( const KIID& aId, int aMem
 
 bool CONSTRAINT_EDIT_TOOL::allMembersLocked( const PCB_CONSTRAINT* aConstraint ) const
 {
-    if( !board() || !aConstraint || aConstraint->GetMembers().empty() )
-        return false;
-
-    return std::ranges::all_of( aConstraint->GetMembers(),
-                                [&]( const CONSTRAINT_MEMBER& aMember )
-                                {
-                                    BOARD_ITEM* item = board()->ResolveItem( aMember.m_item, true );
-                                    return item && ConstraintItemIsLocked( item );
-                                } );
+    return ConstraintMembersLocked( board(), aConstraint );
 }
 
 
 bool CONSTRAINT_EDIT_TOOL::isDuplicateConstraint( const PCB_CONSTRAINT* aConstraint ) const
 {
-    if( !aConstraint || !board() )
-        return false;
-
-    auto scan = [&]( const CONSTRAINTS& aList )
-    {
-        return std::ranges::any_of( aList,
-                            [&]( const PCB_CONSTRAINT* aExisting )
-                            {
-                                return aExisting != aConstraint && ConstraintsAreDuplicate( *aExisting, *aConstraint );
-                            } );
-    };
-
-    if( scan( board()->Constraints() ) )
-        return true;
-
-    return board()->GetFirstFootprint() && scan( board()->GetFirstFootprint()->Constraints() );
+    return aConstraint && board() && ConstraintIsDuplicateOnBoard( board(), aConstraint );
 }
 
 
@@ -673,41 +645,12 @@ void CONSTRAINT_EDIT_TOOL::finishConstraintCommit( BOARD_COMMIT& aCommit,
     if( aAdded.empty() || !frame() )
         return;
 
-    // A locked shape is a fixed reference the solver may not move.  If every referenced item is
-    // locked there is nothing it can adjust, so the relation is recorded but the geometry cannot
-    // snap; tell the user rather than appearing to silently do nothing.  A fix asks for exactly
-    // that outcome, so on a locked item it is redundant, not thwarted.
-    if( aAdded.front()->GetConstraintType() != PCB_CONSTRAINT_TYPE::FIXED_POSITION
-        && allMembersLocked( aAdded.front() ) )
+    // Nothing else surfaces the diagnosis in the default configuration (hover overlay idle, panel
+    // hidden), so a constraint that cannot do its job is called out here.
+    if( wxString issue = ConstraintAddIssueText( CheckAddedConstraint( board(), aAdded.front(), ensureDiagnosis() ) );
+        !issue.IsEmpty() )
     {
-        frame()->ShowInfoBarWarning( _( "All items referenced by this constraint are locked, so the constraint cannot "
-                                        "move any geometry." ),
-                                     true );
-        return;
-    }
-
-    // In the default configuration (hover overlay idle, panel hidden) nothing else surfaces the
-    // diagnosis, so an unsatisfiable new constraint must be called out here or the add appears to
-    // succeed silently.  Mirrors the SolveAfterMove() warning for the same condition.
-    const BOARD_CONSTRAINT_DIAGNOSTICS& diag = ensureDiagnosis();
-
-    for( const PCB_CONSTRAINT* added : aAdded )
-    {
-        if( alg::contains( diag.conflicting, added->m_Uuid ) )
-        {
-            frame()->ShowInfoBarWarning( _( "The new geometric constraint conflicts with existing constraints and "
-                                            "could not be satisfied." ),
-                                         true );
-            return;
-        }
-
-        if( alg::contains( diag.errored, added->m_Uuid ) )
-        {
-            frame()->ShowInfoBarWarning( _( "The new geometric constraint could not be applied to the referenced "
-                                            "items." ),
-                                         true );
-            return;
-        }
+        frame()->ShowInfoBarWarning( issue, true );
     }
 }
 
@@ -756,27 +699,12 @@ bool CONSTRAINT_EDIT_TOOL::TryEditSelectedConstraint()
 
 void CONSTRAINT_EDIT_TOOL::solveAddedConstraint( PCB_CONSTRAINT* aConstraint )
 {
-    // A fix contributes no equation -- it is enforced by dropping its point from the unknowns -- so
-    // there is nothing to snap to.  Re-solving anyway would only expose the pinned shape to the
-    // cluster's other constraints with its own stay-put pin lifted, which can drift it.
-    if( aConstraint->GetConstraintType() == PCB_CONSTRAINT_TYPE::FIXED_POSITION )
-        return;
-
     // This solve runs after the add was pushed because SolveCluster gathers the cluster from
     // board->Constraints(), and BOARD_COMMIT only makes the constraint live at Push time.
     // APPEND_UNDO folds the snap into the add so creating a constraint is a single undoable action.
-    BOARD_COMMIT            commit( this );
-    std::vector<PCB_SHAPE*> modified;
+    BOARD_COMMIT commit( this );
+    SnapAddedConstraint( board(), aConstraint, commit );
 
-    ApplyConstraintImmediately(
-            board(), aConstraint, &modified,
-            [&]( BOARD_ITEM* aItem )
-            {
-                commit.Modify( aItem );
-            },
-            ConstraintReferenceShapes( board(), aConstraint ) );
-
-    // Push if the snap moved a shape or re-measured a reference value in this cluster.
     if( !commit.Empty() )
         commit.Push( _( "Apply Geometric Constraint" ), APPEND_UNDO );
 }
@@ -1608,36 +1536,17 @@ int CONSTRAINT_EDIT_TOOL::RemoveConstraints( const TOOL_EVENT& aEvent )
     if( selectedIds.empty() )
         return 0;
 
-    BOARD_COMMIT commit( this );
-    bool         any = false;
+    std::vector<PCB_CONSTRAINT*> referencing = ConstraintsReferencing( board(), selectedIds, IsFootprintEditor() );
 
-    auto removeReferencing =
-            [&]( const CONSTRAINTS& aConstraints )
-            {
-                for( PCB_CONSTRAINT* constraint : aConstraints )
-                {
-                    bool referenced = std::ranges::any_of( constraint->GetMembers(),
-                            [&]( const CONSTRAINT_MEMBER& aMember )
-                            { return selectedIds.contains( aMember.m_item ); } );
-
-                    if( referenced )
-                    {
-                        commit.Remove( constraint );
-                        any = true;
-                    }
-                }
-            };
-
-    if( board() )
+    if( !referencing.empty() )
     {
-        removeReferencing( board()->Constraints() );
+        BOARD_COMMIT commit( this );
 
-        if( IsFootprintEditor() && board()->GetFirstFootprint() )
-            removeReferencing( board()->GetFirstFootprint()->Constraints() );
-    }
+        for( PCB_CONSTRAINT* constraint : referencing )
+            commit.Remove( constraint );
 
-    if( any )
         commit.Push( _( "Remove Geometric Constraints" ) );
+    }
 
     refreshDiagnostics();
 

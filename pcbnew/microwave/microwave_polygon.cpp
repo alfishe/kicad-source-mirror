@@ -40,11 +40,11 @@
 #include <wx/radiobox.h>
 #include <wx/sizer.h>
 #include <wx/statbox.h>
+#include <wx/stattext.h>
 
-static std::vector< wxRealPoint > g_PolyEdges;
-static double  g_ShapeScaleX, g_ShapeScaleY;
-static wxSize  g_ShapeSize;
-static int     g_PolyShapeType;
+static MICROWAVE_SHAPE_FILE   g_ShapeFile;
+static VECTOR2I               g_ShapeSize;
+static MICROWAVE_POLYGON_MODE g_PolyShapeMode = MICROWAVE_POLYGON_MODE::NORMAL;
 
 
 enum id_mw_cmd {
@@ -68,22 +68,7 @@ public:
 private:
     void OnCancelClick( wxCommandEvent& event );
 
-    /**
-     * Read a description shape file.
-     *
-     *  File format is
-     *  Unit=MM
-     *  XScale=271.501
-     *  YScale=1.00133
-     *
-     *  $COORD
-     *  0                      0.6112600148417837
-     *  0.001851851851851852   0.6104800531118608
-     *  ....
-     *  $ENDCOORD
-     *
-     *  Each line is the X Y coord (normalized units from 0 to 1)
-     */
+    /// Read a shape description file (ReadMicrowaveShapeFile); its scale fills the size
     void ReadDataShapeDescr( wxCommandEvent& event );
 
     DECLARE_EVENT_TABLE()
@@ -92,6 +77,7 @@ private:
     wxRadioBox*      m_shapeOptionCtrl;
     UNIT_BINDER*     m_sizeX;
     UNIT_BINDER*     m_sizeY;
+    wxStaticText*    m_status;
 };
 
 
@@ -110,7 +96,7 @@ MWAVE_POLYGONAL_SHAPE_DLG::MWAVE_POLYGONAL_SHAPE_DLG( PCB_EDIT_FRAME* parent,
 {
     m_frame = parent;
 
-    g_PolyEdges.clear();
+    g_ShapeFile = MICROWAVE_SHAPE_FILE();
 
     wxBoxSizer* mainBoxSizer = new wxBoxSizer( wxVERTICAL );
     SetSizer( mainBoxSizer );
@@ -164,6 +150,9 @@ MWAVE_POLYGONAL_SHAPE_DLG::MWAVE_POLYGONAL_SHAPE_DLG( PCB_EDIT_FRAME* parent,
     buttonsBoxSizer->Add( btn, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxRIGHT, 10 );
     buttonsBoxSizer->AddStretchSpacer();
 
+    m_status = new wxStaticText( this, wxID_ANY, wxEmptyString );
+    mainBoxSizer->Insert( 1, m_status, 0, wxEXPAND | wxLEFT | wxRIGHT, 10 );
+
     wxStdDialogButtonSizer* sdbSizer = new wxStdDialogButtonSizer();
     buttonsBoxSizer->Add( sdbSizer, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5 );
     wxButton* sdbSizerOK = new wxButton( this, wxID_OK );
@@ -178,7 +167,7 @@ MWAVE_POLYGONAL_SHAPE_DLG::MWAVE_POLYGONAL_SHAPE_DLG( PCB_EDIT_FRAME* parent,
 
 void MWAVE_POLYGONAL_SHAPE_DLG::OnCancelClick( wxCommandEvent& event )
 {
-    g_PolyEdges.clear();
+    g_ShapeFile = MICROWAVE_SHAPE_FILE();
     event.Skip();
 }
 
@@ -190,7 +179,7 @@ bool MWAVE_POLYGONAL_SHAPE_DLG::TransferDataFromWindow()
 
     g_ShapeSize.x = m_sizeX->GetValue();
     g_ShapeSize.y = m_sizeY->GetValue();
-    g_PolyShapeType = m_shapeOptionCtrl->GetSelection();
+    g_PolyShapeMode = static_cast<MICROWAVE_POLYGON_MODE>( m_shapeOptionCtrl->GetSelection() );
 
     return true;
 }
@@ -210,20 +199,40 @@ void MWAVE_POLYGONAL_SHAPE_DLG::ReadDataShapeDescr( wxCommandEvent& event )
 
     wxFileName fn( fullFileName );
     s_lastpath = fn.GetPath();
-    g_PolyEdges.clear();
 
-    FILE* File = wxFopen( fullFileName, wxT( "rt" ) );
+    wxString error;
 
-    if( File == nullptr )
+    if( !ReadMicrowaveShapeFile( fullFileName, g_ShapeFile, &error ) )
     {
-        DisplayError( this, _( "File not found" ) );
+        g_ShapeFile = MICROWAVE_SHAPE_FILE();
+        m_status->SetLabel( error );
         return;
     }
 
-    double unitconv = pcbIUScale.IU_PER_MM;
-    g_ShapeScaleX = g_ShapeScaleY = 1.0;
+    m_status->SetLabel( wxString::Format( _( "%d points read from %s." ), (int) g_ShapeFile.points.size(),
+                                          fn.GetFullName() ) );
+    m_sizeX->SetValue( KiROUND( g_ShapeFile.scale.x ) );
+    m_sizeY->SetValue( KiROUND( g_ShapeFile.scale.y ) );
+}
 
-    FILE_LINE_READER fileReader( File, fullFileName );
+
+bool ReadMicrowaveShapeFile( const wxString& aPath, MICROWAVE_SHAPE_FILE& aShape, wxString* aError )
+{
+    FILE* File = wxFopen( aPath, wxT( "rt" ) );
+
+    if( File == nullptr )
+    {
+        if( aError )
+            *aError = wxString::Format( _( "File not found: %s" ), aPath );
+
+        return false;
+    }
+
+    double unitconv = pcbIUScale.IU_PER_MM;
+
+    aShape = MICROWAVE_SHAPE_FILE();
+
+    FILE_LINE_READER fileReader( File, aPath );
     FILTER_READER reader( fileReader );
 
     LOCALE_IO   toggle;
@@ -234,7 +243,10 @@ void MWAVE_POLYGONAL_SHAPE_DLG::ReadDataShapeDescr( wxCommandEvent& event )
         char* param1 = strtok( Line, " =\n\r" );
         char* param2 = strtok( nullptr, " \t\n\r" );
 
-        if( strncasecmp( param1, "Unit", 4 ) == 0 )
+        if( !param1 )
+            continue;
+
+        if( strncasecmp( param1, "Unit", 4 ) == 0 && param2 )
         {
             if( strncasecmp( param2, "inch", 4 ) == 0 )
                 unitconv = pcbIUScale.IU_PER_MILS*1000;
@@ -254,105 +266,96 @@ void MWAVE_POLYGONAL_SHAPE_DLG::ReadDataShapeDescr( wxCommandEvent& event )
                 param1 = strtok( Line, " \t\n\r" );
                 param2 = strtok( nullptr, " \t\n\r" );
 
+                if( !param1 )
+                    continue;
+
                 if( strncasecmp( param1, "$ENDCOORD", 8 ) == 0 )
                     break;
 
-                wxRealPoint coord( atof( param1 ), atof( param2 ) );
-                g_PolyEdges.push_back( coord );
+                aShape.points.emplace_back( atof( param1 ), param2 ? atof( param2 ) : 0.0 );
             }
         }
 
-        if( strncasecmp( Line, "XScale", 6 ) == 0 )
-            g_ShapeScaleX = atof( param2 );
+        if( strncasecmp( Line, "XScale", 6 ) == 0 && param2 )
+            aShape.scale.x = atof( param2 );
 
-        if( strncasecmp( Line, "YScale", 6 ) == 0 )
-            g_ShapeScaleY = atof( param2 );
+        if( strncasecmp( Line, "YScale", 6 ) == 0 && param2 )
+            aShape.scale.y = atof( param2 );
     }
 
-    g_ShapeScaleX *= unitconv;
-    g_ShapeScaleY *= unitconv;
+    aShape.scale.x *= unitconv;
+    aShape.scale.y *= unitconv;
 
-    m_sizeX->SetValue( (int) g_ShapeScaleX );
-    m_sizeY->SetValue( (int) g_ShapeScaleY );
+    if( aShape.points.empty() )
+    {
+        if( aError )
+            *aError = _( "Shape has no points." );
+
+        return false;
+    }
+
+    return true;
 }
 
 
-FOOTPRINT* MICROWAVE_TOOL::createPolygonShape()
+FOOTPRINT* CreateMicrowavePolygon( BOARD* aBoard, const std::vector<VECTOR2D>& aPoints, const VECTOR2I& aSize,
+                                   MICROWAVE_POLYGON_MODE aMode, wxString* aError )
 {
-    PAD*       pad1;
-    PAD*       pad2;
-    FOOTPRINT* footprint;
-    wxString   cmp_name;
-    int        pad_count = 2;
-    PCB_SHAPE* shape;
+    VECTOR2I size = aSize;
 
-    PCB_EDIT_FRAME& editFrame  = *getEditFrame<PCB_EDIT_FRAME>();
+    if( aMode == MICROWAVE_POLYGON_MODE::MIRRORED )
+        size.y = -size.y;
 
-    MWAVE_POLYGONAL_SHAPE_DLG dlg( &editFrame, wxDefaultPosition );
-
-    int ret = dlg.ShowModal();
-
-    if( ret != wxID_OK )
+    if( size.x == 0 || size.y == 0 )
     {
-        g_PolyEdges.clear();
+        if( aError )
+            *aError = _( "Shape has a null size." );
+
         return nullptr;
     }
 
-    if( g_PolyShapeType == 2 )  // mirrored
-        g_ShapeScaleY = -g_ShapeScaleY;
-
-    g_ShapeSize.x = KiROUND( g_ShapeScaleX );
-    g_ShapeSize.y = KiROUND( g_ShapeScaleY );
-
-    if(( g_ShapeSize.x ) == 0 || ( g_ShapeSize.y == 0 ) )
+    if( aPoints.empty() )
     {
-        editFrame.ShowInfoBarError( _( "Shape has a null size." ) );
+        if( aError )
+            *aError = _( "Shape has no points." );
+
         return nullptr;
     }
-
-    if( g_PolyEdges.size() == 0 )
-    {
-        editFrame.ShowInfoBarError( _( "Shape has no points." ) );
-        return nullptr;
-    }
-
-    cmp_name = wxT( "muwave_polygon" );
 
     // Create a footprint with 2 pads, orientation = 0, pos 0
-    footprint = createBaseFootprint( cmp_name, 0, pad_count );
+    FOOTPRINT* footprint = CreateMicrowaveBaseFootprint( aBoard, wxT( "muwave_polygon" ), 0, 2 );
 
     // We try to place the footprint anchor to the middle of the shape len
     VECTOR2I offset;
-    offset.x = -g_ShapeSize.x / 2;
+    offset.x = -size.x / 2;
 
     auto it = footprint->Pads().begin();
 
-    pad1 = *it;
+    PAD* pad1 = *it;
     pad1->SetX( offset.x );
 
-    pad2 = *( ++it );
-    pad2->SetX( offset.x + g_ShapeSize.x );
+    PAD* pad2 = *( ++it );
+    pad2->SetX( offset.x + size.x );
 
     // Add a polygonal edge (corners will be added later) on copper layer
-    shape = new PCB_SHAPE( footprint, SHAPE_T::POLY );
+    PCB_SHAPE* shape = new PCB_SHAPE( footprint, SHAPE_T::POLY );
     shape->SetFilled( true );
     shape->SetLayer( F_Cu );
 
     footprint->Add( shape, ADD_MODE::INSERT );
 
-    // Get the corner buffer of the polygonal edge
     std::vector<VECTOR2I> polyPoints;
-    polyPoints.reserve( g_PolyEdges.size() + 2 );
+    polyPoints.reserve( aPoints.size() + 2 );
 
     // Init start point coord:
     polyPoints.emplace_back( VECTOR2I( offset.x, 0 ) );
 
     VECTOR2I last_coordinate;
 
-    for( wxRealPoint& pt: g_PolyEdges )  // Copy points
+    for( const VECTOR2D& pt : aPoints )
     {
-        last_coordinate.x = KiROUND( pt.x * g_ShapeScaleX );
-        last_coordinate.y = -KiROUND( pt.y * g_ShapeScaleY );
+        last_coordinate.x = KiROUND( pt.x * size.x );
+        last_coordinate.y = -KiROUND( pt.y * size.y );
         last_coordinate += offset;
         polyPoints.push_back( last_coordinate );
     }
@@ -361,21 +364,15 @@ FOOTPRINT* MICROWAVE_TOOL::createPolygonShape()
     if( last_coordinate.y != 0 )
         polyPoints.emplace_back( VECTOR2I( last_coordinate.x, 0 ) );
 
-    switch( g_PolyShapeType )
+    if( aMode == MICROWAVE_POLYGON_MODE::SYMMETRICAL )
     {
-    case 0:     // shape from file
-    case 2:     // shape from file, mirrored (the mirror is already done)
-        break;
-
-    case 1:     // Symmetric shape: add the symmetric (mirrored) shape
+        // add the outline mirrored about the X axis
         for( int ndx = (int) polyPoints.size() - 1; ndx >= 0; --ndx )
         {
             VECTOR2I pt = polyPoints[ndx];
-            pt.y = -pt.y;   // mirror about X axis
+            pt.y = -pt.y;
             polyPoints.push_back( pt );
         }
-
-        break;
     }
 
     shape->SetPolyPoints( polyPoints );
@@ -383,8 +380,35 @@ FOOTPRINT* MICROWAVE_TOOL::createPolygonShape()
     // Set the polygon outline thickness to 0, only the polygonal shape is filled
     // without extra thickness.
     shape->SetStroke( STROKE_PARAMS( 0, LINE_STYLE::SOLID ) );
-    g_PolyEdges.clear();
 
+    return footprint;
+}
+
+
+FOOTPRINT* MICROWAVE_TOOL::createPolygonShape()
+{
+    PCB_EDIT_FRAME& editFrame  = *getEditFrame<PCB_EDIT_FRAME>();
+
+    MWAVE_POLYGONAL_SHAPE_DLG dlg( &editFrame, wxDefaultPosition );
+
+    if( dlg.ShowModal() != wxID_OK )
+    {
+        g_ShapeFile = MICROWAVE_SHAPE_FILE();
+        return nullptr;
+    }
+
+    wxString   error;
+    FOOTPRINT* footprint = CreateMicrowavePolygon( board(), g_ShapeFile.points, g_ShapeSize, g_PolyShapeMode,
+                                                   &error );
+    g_ShapeFile = MICROWAVE_SHAPE_FILE();
+
+    if( !footprint )
+    {
+        editFrame.ShowInfoBarError( error );
+        return nullptr;
+    }
+
+    editFrame.SetMsgPanel( footprint );
     editFrame.OnModify();
     return footprint;
 }

@@ -28,6 +28,7 @@
 #include <geometry/geometry_utils.h>
 #include <math/util.h>      // for KiROUND
 #include <microwave/microwave_tool.h>
+#include <new_footprint.h>
 #include <tool/tool_manager.h>
 #include <tools/pcb_actions.h>
 #include <pcb_edit_frame.h>
@@ -282,6 +283,35 @@ static INDUCTOR_S_SHAPE_RESULT BuildCornersList_S_Shape( std::vector<VECTOR2I>& 
 }
 
 
+static wxString microwaveInductorCorners( const MICROWAVE_INDUCTOR_PATTERN& aInductorPattern,
+                                          std::vector<VECTOR2I>& aBuffer )
+{
+    int min_len = ( aInductorPattern.m_End - aInductorPattern.m_Start ).EuclideanNorm();
+
+    // Control values (ii = minimum length)
+    if( aInductorPattern.m_Length < min_len )
+        return _( "Requested length < minimum length" );
+
+    switch( BuildCornersList_S_Shape( aBuffer, aInductorPattern.m_Start, aInductorPattern.m_End,
+                                      aInductorPattern.m_Length, aInductorPattern.m_Width ) )
+    {
+    case INDUCTOR_S_SHAPE_RESULT::TOO_LONG:  return _( "Requested length too large" );
+    case INDUCTOR_S_SHAPE_RESULT::TOO_SHORT: return _( "Requested length too small" );
+    case INDUCTOR_S_SHAPE_RESULT::NO_REPR:   return _( "Requested length can't be represented" );
+    case INDUCTOR_S_SHAPE_RESULT::OK:        break;
+    }
+
+    return wxEmptyString;
+}
+
+
+wxString CheckMicrowaveInductor( const MICROWAVE_INDUCTOR_PATTERN& aPattern )
+{
+    std::vector<VECTOR2I> buffer;
+    return microwaveInductorCorners( aPattern, buffer );
+}
+
+
 void MICROWAVE_TOOL::createInductorBetween( const VECTOR2I& aStart, const VECTOR2I& aEnd )
 {
     PCB_EDIT_FRAME& editFrame = *getEditFrame<PCB_EDIT_FRAME>();
@@ -289,34 +319,58 @@ void MICROWAVE_TOOL::createInductorBetween( const VECTOR2I& aStart, const VECTOR
     MICROWAVE_INDUCTOR_PATTERN pattern;
 
     pattern.m_Width = board()->GetDesignSettings().GetCurrentTrackWidth();
+    pattern.m_Start = aStart;
+    pattern.m_End = aEnd;
+    pattern.m_Length = ( aEnd - aStart ).EuclideanNorm();
 
-    pattern.m_Start = { aStart.x, aStart.y };
-    pattern.m_End = { aEnd.x, aEnd.y };
+    // Enter the desired length.
+    WX_TEXT_ENTRY_DIALOG dlg( &editFrame, _( "Length of track:" ), _( "Create Microwave Footprint" ),
+                              editFrame.StringFromValue( pattern.m_Length ) );
+
+    if( dlg.ShowQuasiModal() != wxID_OK )
+        return; // canceled by user
+
+    pattern.m_Length = editFrame.ValueFromString( dlg.GetValue() );
+
+    if( wxString error = CheckMicrowaveInductor( pattern ); !error.IsEmpty() )
+    {
+        editFrame.ShowInfoBarError( error );
+        return;
+    }
+
+    // Generate footprint. the value is also used as footprint name.
+    wxString             value = wxT( "L" );
+    WX_TEXT_ENTRY_DIALOG cmpdlg( &editFrame, _( "Component value:" ), _( "Create Microwave Footprint" ), value );
+    cmpdlg.SetTextValidator( FOOTPRINT_NAME_VALIDATOR( &value ) );
+
+    if( ( cmpdlg.ShowQuasiModal() != wxID_OK ) || value.IsEmpty() )
+        return;    //  Aborted by user
 
     wxString errorMessage;
+    auto     inductorFP = std::unique_ptr<FOOTPRINT>( CreateMicrowaveInductor( board(), pattern, value,
+                                                                                &errorMessage ) );
 
-    auto inductorFP = std::unique_ptr<FOOTPRINT>( createMicrowaveInductor( pattern, errorMessage ) );
-
-    // on any error, report if we can
-    if ( !inductorFP || !errorMessage.IsEmpty() )
+    if( !inductorFP )
     {
-        if ( !errorMessage.IsEmpty() )
+        if( !errorMessage.IsEmpty() )
             editFrame.ShowInfoBarError( errorMessage );
-    }
-    else
-    {
-        // at this point, we can save the footprint
-        m_toolMgr->RunAction<EDA_ITEM*>( ACTIONS::selectItem, inductorFP.get() );
 
-        BOARD_COMMIT commit( this );
-        commit.Add( inductorFP.release() );
-        commit.Push( _("Add Microwave Inductor" ) );
+        return;
     }
+
+    editFrame.SetMsgPanel( inductorFP.get() );
+
+    // at this point, we can save the footprint
+    m_toolMgr->RunAction<EDA_ITEM*>( ACTIONS::selectItem, inductorFP.get() );
+
+    BOARD_COMMIT commit( this );
+    commit.Add( inductorFP.release() );
+    commit.Push( _("Add Microwave Inductor" ) );
 }
 
 
-FOOTPRINT* MICROWAVE_TOOL::createMicrowaveInductor( MICROWAVE_INDUCTOR_PATTERN& aInductorPattern,
-                                                    wxString& aErrorMessage )
+FOOTPRINT* CreateMicrowaveInductor( BOARD* aBoard, const MICROWAVE_INDUCTOR_PATTERN& aInductorPattern,
+                                    const wxString& aValue, wxString* aErrorMessage )
 {
     /* Build a microwave inductor footprint.
      * - Length Mself.lng
@@ -351,62 +405,26 @@ FOOTPRINT* MICROWAVE_TOOL::createMicrowaveInductor( MICROWAVE_INDUCTOR_PATTERN& 
      * (Radius decreases if necessary)
      */
 
-    PAD*            pad;
-    PCB_EDIT_FRAME* editFrame = getEditFrame<PCB_EDIT_FRAME>();
+    PAD* pad;
 
-    VECTOR2I pt = aInductorPattern.m_End - aInductorPattern.m_Start;
-    int      min_len = pt.EuclideanNorm();
-    aInductorPattern.m_Length = min_len;
-
-    // Enter the desired length.
-    wxString             msg = editFrame->StringFromValue( aInductorPattern.m_Length );
-    WX_TEXT_ENTRY_DIALOG dlg( editFrame, _( "Length of track:" ), _( "Create Microwave Footprint" ), msg );
-
-    // TODO: why is this QuasiModal?
-    if( dlg.ShowQuasiModal() != wxID_OK )
-        return nullptr; // canceled by user
-
-    aInductorPattern.m_Length = editFrame->ValueFromString( dlg.GetValue() );
-
-    // Control values (ii = minimum length)
-    if( aInductorPattern.m_Length < min_len )
+    auto fail = [&]( const wxString& aMsg ) -> FOOTPRINT*
     {
-        aErrorMessage = _( "Requested length < minimum length" );
+        if( aErrorMessage )
+            *aErrorMessage = aMsg;
+
         return nullptr;
-    }
+    };
 
-    // Calculate the elements.
-    std::vector<VECTOR2I>         buffer;
-    const INDUCTOR_S_SHAPE_RESULT res = BuildCornersList_S_Shape( buffer, aInductorPattern.m_Start,
-                                                                  aInductorPattern.m_End,
-                                                                  aInductorPattern.m_Length,
-                                                                  aInductorPattern.m_Width );
+    if( aValue.IsEmpty() )
+        return fail( _( "The inductor needs a value." ) );
 
-    switch( res )
-    {
-    case INDUCTOR_S_SHAPE_RESULT::TOO_LONG:
-        aErrorMessage = _( "Requested length too large" );
-        return nullptr;
-    case INDUCTOR_S_SHAPE_RESULT::TOO_SHORT:
-        aErrorMessage = _( "Requested length too small" );
-        return nullptr;
-    case INDUCTOR_S_SHAPE_RESULT::NO_REPR:
-        aErrorMessage = _( "Requested length can't be represented" );
-        return nullptr;
-    case INDUCTOR_S_SHAPE_RESULT::OK:
-        break;
-    }
+    std::vector<VECTOR2I> buffer;
 
-    // Generate footprint. the value is also used as footprint name.
-    msg = wxT( "L" );
-    WX_TEXT_ENTRY_DIALOG cmpdlg( editFrame, _( "Component value:" ), _( "Create Microwave Footprint" ), msg );
-    cmpdlg.SetTextValidator( FOOTPRINT_NAME_VALIDATOR( &msg ) );
+    if( wxString error = microwaveInductorCorners( aInductorPattern, buffer ); !error.IsEmpty() )
+        return fail( error );
 
-    // TODO: why is this QuasiModal?
-    if( ( cmpdlg.ShowQuasiModal() != wxID_OK ) || msg.IsEmpty() )
-        return nullptr;    //  Aborted by user
-
-    FOOTPRINT* footprint = editFrame->CreateNewFootprint( msg, wxEmptyString );
+    // the value is also used as footprint name
+    FOOTPRINT* footprint = NewFootprintFromDefaults( aBoard, aValue, FP_SMD );
 
     footprint->SetFPID( LIB_ID( wxEmptyString, wxT( "mw_inductor" ) ) );
     footprint->SetAttributes( FP_EXCLUDE_FROM_POS_FILES | FP_EXCLUDE_FROM_BOM );

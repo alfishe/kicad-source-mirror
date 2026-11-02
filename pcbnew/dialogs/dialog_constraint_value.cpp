@@ -18,6 +18,7 @@
  */
 
 #include <dialogs/dialog_constraint_value.h>
+#include <constraints/constraint_edit.h>
 
 #include <confirm.h>
 #include <pcb_base_frame.h>
@@ -136,14 +137,7 @@ bool EditConstraintValue( PCB_BASE_FRAME* aFrame, PCB_CONSTRAINT* aConstraint, B
     if( dlg.ShowModal() != wxID_OK )
         return false;
 
-    aCommit.Modify( aConstraint );
-    aConstraint->SetValue( dlg.GetConstraintValue() );
-    aConstraint->SetDriving( dlg.GetDriving() );
-
-    // Snap the geometry to the new value in the same commit, the way creation does -- otherwise a
-    // driving length/radius/angle change is stored but the shapes keep their old size.
-    ApplyConstraintImmediately( aFrame->GetBoard(), aConstraint, nullptr,
-                                [&]( BOARD_ITEM* aItem ) { aCommit.Modify( aItem ); } );
+    SetConstraintValue( aFrame->GetBoard(), aConstraint, dlg.GetConstraintValue(), dlg.GetDriving(), aCommit );
 
     aCommit.Push( _( "Edit Geometric Constraint" ) );
     return true;

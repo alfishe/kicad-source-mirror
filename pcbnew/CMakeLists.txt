@@ -432,6 +432,7 @@ set( PCBNEW_CLASS_SRCS
     net_swap.cpp
     constraints/board_constraint_adapter.cpp
     constraints/constraint_system_2d.cpp
+    constraints/constraint_edit.cpp
     tools/constraint_edit_tool.cpp
     tools/constraint_overlay.cpp
     tools/view_overlay_holder.cpp

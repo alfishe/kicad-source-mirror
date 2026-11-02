@@ -27,6 +27,7 @@
 #include <macros.h>
 #include <string_utils.h>
 #include <pcb_edit_frame.h>
+#include <new_footprint.h>
 #include <eda_list_dialog.h>
 #include <filter_reader.h>
 #include <footprint_library_adapter.h>
@@ -1237,54 +1238,18 @@ bool FOOTPRINT_EDIT_FRAME::RevertFootprint( bool aSkipConfirmation )
 }
 
 
-FOOTPRINT* PCB_BASE_FRAME::CreateNewFootprint( wxString aFootprintName, const wxString& aLibName )
+FOOTPRINT* NewFootprintFromDefaults( BOARD* aBoard, const wxString& aName, int aAttributes )
 {
-    if( aFootprintName.IsEmpty() )
-        aFootprintName = _( "Untitled" );
-
-    int footprintAttrs = FP_SMD;
-
-    if( !aLibName.IsEmpty() )
-    {
-        FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( &Prj() );
-        std::vector<wxString> fpnames;
-        wxString      baseName = aFootprintName;
-        int           idx = 1;
-
-        // Make sure the name is unique
-        while( adapter->FootprintExists( aLibName, aFootprintName ) )
-            aFootprintName = baseName + wxString::Format( wxS( "_%d" ), idx++ );
-
-        // Try to infer the footprint attributes from an existing footprint in the library
-        try
-        {
-            fpnames = adapter->GetFootprintNames( aLibName, true );
-
-            if( !fpnames.empty() )
-            {
-                std::unique_ptr<FOOTPRINT> fp( adapter->LoadFootprint( aLibName, fpnames.back(), false ) );
-
-                if( fp )
-                    footprintAttrs = fp->GetAttributes();
-            }
-        }
-        catch( ... )
-        {
-            // best efforts
-        }
-    }
-
-    // Create the new footprint and add it to the head of the linked list of footprints
-    FOOTPRINT* footprint = new FOOTPRINT( GetBoard() );
+    FOOTPRINT* footprint = new FOOTPRINT( aBoard );
 
     // Update its name in lib
-    footprint->SetFPID( LIB_ID( wxEmptyString, aFootprintName ) );
+    footprint->SetFPID( LIB_ID( wxEmptyString, aName ) );
 
-    footprint->SetAttributes( footprintAttrs );
+    footprint->SetAttributes( aAttributes );
 
     PCB_LAYER_ID txt_layer;
     VECTOR2I     default_pos;
-    BOARD_DESIGN_SETTINGS& settings = GetDesignSettings();
+    BOARD_DESIGN_SETTINGS& settings = aBoard->GetDesignSettings();
 
     if( settings.m_DefaultFPTextItems.size() > 0 )
     {
@@ -1323,10 +1288,10 @@ FOOTPRINT* PCB_BASE_FRAME::CreateNewFootprint( wxString aFootprintName, const wx
     }
 
     if( footprint->GetReference().IsEmpty() )
-        footprint->SetReference( aFootprintName );
+        footprint->SetReference( aName );
 
     if( footprint->GetValue().IsEmpty() )
-        footprint->SetValue( aFootprintName );
+        footprint->SetValue( aName );
 
     footprint->RunOnChildren(
             [&]( BOARD_ITEM* aChild )
@@ -1343,6 +1308,49 @@ FOOTPRINT* PCB_BASE_FRAME::CreateNewFootprint( wxString aFootprintName, const wx
                 }
             },
             RECURSE_MODE::RECURSE );
+
+    return footprint;
+}
+
+
+FOOTPRINT* PCB_BASE_FRAME::CreateNewFootprint( wxString aFootprintName, const wxString& aLibName )
+{
+    if( aFootprintName.IsEmpty() )
+        aFootprintName = _( "Untitled" );
+
+    int footprintAttrs = FP_SMD;
+
+    if( !aLibName.IsEmpty() )
+    {
+        FOOTPRINT_LIBRARY_ADAPTER* adapter = PROJECT_PCB::FootprintLibAdapter( &Prj() );
+        std::vector<wxString> fpnames;
+        wxString      baseName = aFootprintName;
+        int           idx = 1;
+
+        // Make sure the name is unique
+        while( adapter->FootprintExists( aLibName, aFootprintName ) )
+            aFootprintName = baseName + wxString::Format( wxS( "_%d" ), idx++ );
+
+        // Try to infer the footprint attributes from an existing footprint in the library
+        try
+        {
+            fpnames = adapter->GetFootprintNames( aLibName, true );
+
+            if( !fpnames.empty() )
+            {
+                std::unique_ptr<FOOTPRINT> fp( adapter->LoadFootprint( aLibName, fpnames.back(), false ) );
+
+                if( fp )
+                    footprintAttrs = fp->GetAttributes();
+            }
+        }
+        catch( ... )
+        {
+            // best efforts
+        }
+    }
+
+    FOOTPRINT* footprint = NewFootprintFromDefaults( GetBoard(), aFootprintName, footprintAttrs );
 
     SetMsgPanel( footprint );
     return footprint;

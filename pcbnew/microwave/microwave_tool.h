@@ -23,28 +23,7 @@
 #include <tools/pcb_tool_base.h>
 
 #include <tool/tool_menu.h>
-
-// Microwave shapes that are created as board footprints when the user requests them.
-enum class MICROWAVE_FOOTPRINT_SHAPE
-{
-    GAP,
-    STUB,
-    STUB_ARC,
-    FUNCTION_SHAPE,
-};
-
-/**
- * Parameters for construction of a microwave inductor
- */
-struct MICROWAVE_INDUCTOR_PATTERN
-{
-public:
-    VECTOR2I m_Start;
-    VECTOR2I m_End;
-    int      m_Length;       // full length trace.
-    int      m_Width;        // Trace width.
-};
-
+#include <microwave/microwave_core.h>
 
 /**
  * Tool responsible for adding microwave features to PCBs
@@ -71,38 +50,11 @@ private:
     /// Draw a microwave inductor interactively
     int drawMicrowaveInductor( const TOOL_EVENT& aEvent );
 
-    /**
-     * Create a footprint "GAP" or "STUB" used in micro wave designs.
-     *
-     * This footprint has 2 pads:
-     * PAD_ATTRIB::SMD, rectangular, H size = V size = current track width.
-     * the "gap" is isolation created between this 2 pads
-     *
-     * @param aFootprintShape is the footprint to create.
-     * @return the new footprint.
-     */
+    /// Ask for the size (and the arc angle) of a gap, stub or arc stub and create it
     FOOTPRINT* createFootprint( MICROWAVE_FOOTPRINT_SHAPE aFootprintShape );
 
+    /// Ask for the shape description file, size and mode and create the polygon footprint
     FOOTPRINT* createPolygonShape();
-
-    /**
-     * Create an S-shaped coil footprint for microwave applications.
-     */
-    FOOTPRINT* createMicrowaveInductor( MICROWAVE_INDUCTOR_PATTERN& aPattern,
-                                        wxString& aErrorMessage );
-
-    /**
-     * Create a basic footprint for micro wave applications.
-     *
-     * The default pad settings are:
-     *  PAD_ATTRIB::SMD, rectangular, H size = V size = current track width.
-     *
-     * @param aValue is the text value.
-     * @param aTextSize is the size of ref and value texts ( <= 0 to use board default values ).
-     * @param aPadCount is number of pads.
-     * @return the new footprint.
-     */
-    FOOTPRINT* createBaseFootprint( const wxString& aValue, int aTextSize, int aPadCount );
 };
 
 

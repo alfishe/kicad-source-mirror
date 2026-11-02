@@ -18,129 +18,134 @@
  */
 
 
+#include <board.h>
 #include <board_design_settings.h>
 #include <footprint.h>
 #include <pad.h>
-#include <confirm.h>
 #include <dialogs/dialog_text_entry.h>
 #include <microwave/microwave_tool.h>
+#include <new_footprint.h>
+#include <pcb_edit_frame.h>
 #include <trigo.h>
 
 
-FOOTPRINT* MICROWAVE_TOOL::createFootprint( MICROWAVE_FOOTPRINT_SHAPE aFootprintShape )
+FOOTPRINT* CreateMicrowaveBaseFootprint( BOARD* aBoard, const wxString& aValue, int aTextSize, int aPadCount )
 {
-    int        offsetX;
-    int        offsetY;
-    PAD*       pad;
-    FOOTPRINT* footprint;
-    wxString   msg;
-    wxString   cmp_name;
-    int        pad_count = 2;
-    EDA_ANGLE  angle     = ANGLE_0;
+    FOOTPRINT* footprint = NewFootprintFromDefaults( aBoard, aValue, FP_SMD );
 
-    PCB_EDIT_FRAME* editFrame = getEditFrame<PCB_EDIT_FRAME>();
+    footprint->SetAttributes( FP_EXCLUDE_FROM_POS_FILES | FP_EXCLUDE_FROM_BOM );
 
-    // Ref and value text size (O = use board default value.
-    // will be set to a value depending on the footprint size, if possible
-    int text_size = 0;
+    if( aTextSize > 0 )
+    {
+        footprint->Reference().SetTextSize( VECTOR2I( aTextSize, aTextSize ) );
+        footprint->Reference().SetTextThickness( aTextSize / 5 );
+        footprint->Value().SetTextSize( VECTOR2I( aTextSize, aTextSize ) );
+        footprint->Value().SetTextThickness( aTextSize / 5 );
+    }
 
-    // Enter the size of the gap or stub
-    int gap_size = editFrame->GetDesignSettings().GetCurrentTrackWidth();
+    // Create 2 pads used in gaps and stubs.  The gap is between these 2 pads
+    // the stub is the pad 2
+    int pad_num = 1;
+    int tw = aBoard->GetDesignSettings().GetCurrentTrackWidth();
 
-    switch( aFootprintShape )
+    while( aPadCount-- )
+    {
+        PAD* pad = new PAD( footprint );
+        pad->SetPadstackMode( PADSTACK::MODE::NORMAL );
+
+        footprint->Add( pad, ADD_MODE::INSERT );
+
+        pad->SetSize( PADSTACK::ALL_LAYERS, VECTOR2I( tw, tw ) );
+
+        pad->SetPosition( footprint->GetPosition() );
+        pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::RECTANGLE );
+        pad->SetAttribute( PAD_ATTRIB::SMD );
+        pad->SetLayerSet( { F_Cu } );
+
+        pad->SetNumber( wxString::Format( wxT( "%d" ), pad_num ) );
+        pad_num++;
+    }
+
+    return footprint;
+}
+
+
+FOOTPRINT* CreateMicrowaveFootprint( BOARD* aBoard, MICROWAVE_FOOTPRINT_SHAPE aShape, int aSize,
+                                     const EDA_ANGLE& aArcAngle, wxString* aError )
+{
+    wxString  cmp_name;
+    int       pad_count = 2;
+    int       text_size = 0;      // 0 keeps the board default
+    EDA_ANGLE angle = aArcAngle;
+
+    switch( aShape )
     {
     case MICROWAVE_FOOTPRINT_SHAPE::GAP:
-        msg       = _( "Gap Size:" );
         cmp_name  = wxT( "muwave_gap" );
-        text_size = gap_size;
+        text_size = aSize;
         break;
 
     case MICROWAVE_FOOTPRINT_SHAPE::STUB:
-        msg       = _( "Stub Size:" );
         cmp_name  = wxT( "muwave_stub" );
-        text_size = gap_size;
-        pad_count = 2;
+        text_size = aSize;
         break;
 
     case MICROWAVE_FOOTPRINT_SHAPE::STUB_ARC:
-        msg       = _( "Arc Stub Radius Value:" );
         cmp_name  = wxT( "muwave_arcstub" );
         pad_count = 1;
         break;
 
     default:
-        msg = wxT( "???" );
-        break;
-    }
+        if( aError )
+            *aError = _( "Not a gap, stub or arc stub." );
 
-    wxString             value = editFrame->StringFromValue( gap_size );
-    WX_TEXT_ENTRY_DIALOG dlg( editFrame, msg, _( "Create Microwave Footprint" ), value );
-
-    // TODO: why is this QuasiModal?
-    if( dlg.ShowQuasiModal() != wxID_OK )
-        return nullptr; // canceled by user
-
-    value    = dlg.GetValue();
-    gap_size = editFrame->ValueFromString( value );
-
-    bool abort = false;
-
-    if( aFootprintShape == MICROWAVE_FOOTPRINT_SHAPE::STUB_ARC )
-    {
-        msg = wxT( "0.0" );
-        WX_TEXT_ENTRY_DIALOG angledlg( editFrame, _( "Angle in degrees:" ),
-                                       _( "Create Microwave Footprint" ), msg );
-
-        // TODO: why is this QuasiModal?
-        if( angledlg.ShowQuasiModal() != wxID_OK )
-            return nullptr; // canceled by user
-
-        msg = angledlg.GetValue();
-
-        double fval;
-
-        if( !msg.ToDouble( &fval ) )
-        {
-            DisplayError( editFrame, _( "Incorrect number, abort" ) );
-            abort = true;
-        }
-
-        angle = EDA_ANGLE( fval, DEGREES_T );
-
-        if( angle < ANGLE_0 )
-            angle = -angle;
-
-        if( angle > ANGLE_180 )
-            angle = ANGLE_180;
-    }
-
-    if( abort )
         return nullptr;
+    }
 
-    footprint = createBaseFootprint( cmp_name, text_size, pad_count );
-    auto it = footprint->Pads().begin();
-    pad = *it;
-
-    switch( aFootprintShape )
+    if( aSize <= 0 )
     {
-    case MICROWAVE_FOOTPRINT_SHAPE::GAP:     //Gap :
-        offsetX = -( gap_size + pad->GetSize( PADSTACK::ALL_LAYERS ).x ) / 2;
+        if( aError )
+            *aError = _( "The size must be positive." );
+
+        return nullptr;
+    }
+
+    if( angle < ANGLE_0 )
+        angle = -angle;
+
+    if( angle > ANGLE_180 )
+        angle = ANGLE_180;
+
+    FOOTPRINT* footprint = CreateMicrowaveBaseFootprint( aBoard, cmp_name, text_size, pad_count );
+    auto       it = footprint->Pads().begin();
+    PAD*       pad = *it;
+
+    switch( aShape )
+    {
+    case MICROWAVE_FOOTPRINT_SHAPE::GAP:
+    {
+        int offsetX = -( aSize + pad->GetSize( PADSTACK::ALL_LAYERS ).x ) / 2;
 
         pad->SetX( pad->GetPosition().x + offsetX );
 
         pad = *( it + 1 );
 
-        pad->SetX( pad->GetPosition().x + offsetX + gap_size + pad->GetSize( PADSTACK::ALL_LAYERS ).x );
+        pad->SetX( pad->GetPosition().x + offsetX + aSize + pad->GetSize( PADSTACK::ALL_LAYERS ).x );
         break;
+    }
 
-    case MICROWAVE_FOOTPRINT_SHAPE::STUB:     //Stub :
+    case MICROWAVE_FOOTPRINT_SHAPE::STUB:
+    {
         pad->SetNumber( wxT( "1" ) );
-        offsetY = -( gap_size + pad->GetSize( PADSTACK::ALL_LAYERS ).y ) / 2;
+        int offsetY = -( aSize + pad->GetSize( PADSTACK::ALL_LAYERS ).y ) / 2;
 
+        // the pads were inserted at the front, so the second one is the stub, pad 2
         pad = *( it + 1 );
-        pad->SetSize( PADSTACK::ALL_LAYERS, VECTOR2I( pad->GetSize( PADSTACK::ALL_LAYERS ).x, gap_size ) );
+        pad->SetNumber( wxT( "2" ) );
+        pad->SetSize( PADSTACK::ALL_LAYERS, VECTOR2I( pad->GetSize( PADSTACK::ALL_LAYERS ).x, aSize ) );
         pad->SetY( pad->GetPosition().y + offsetY );
         break;
+    }
 
     case MICROWAVE_FOOTPRINT_SHAPE::STUB_ARC:     // Arc Stub created by a polygonal approach:
     {
@@ -157,7 +162,7 @@ FOOTPRINT* MICROWAVE_TOOL::createFootprint( MICROWAVE_FOOTPRINT_SHAPE aFootprint
 
         for( int ii = 1; ii < numPoints - 1; ii++ )
         {
-            VECTOR2I pt( 0, -gap_size );
+            VECTOR2I pt( 0, -aSize );
             RotatePoint( &pt.x, &pt.y, theta );
             polyPoints.push_back( pt );
 
@@ -178,51 +183,69 @@ FOOTPRINT* MICROWAVE_TOOL::createFootprint( MICROWAVE_FOOTPRINT_SHAPE aFootprint
         break;
     }
 
-    // Update the footprint and board
-    editFrame->OnModify();
-
     return footprint;
 }
 
 
-FOOTPRINT* MICROWAVE_TOOL::createBaseFootprint( const wxString& aValue, int aTextSize, int aPadCount )
+FOOTPRINT* MICROWAVE_TOOL::createFootprint( MICROWAVE_FOOTPRINT_SHAPE aFootprintShape )
 {
-    PCB_EDIT_FRAME& editFrame = *getEditFrame<PCB_EDIT_FRAME>();
+    wxString  msg;
+    EDA_ANGLE angle = ANGLE_0;
 
-    FOOTPRINT* footprint = editFrame.CreateNewFootprint( aValue, wxEmptyString );
+    PCB_EDIT_FRAME* editFrame = getEditFrame<PCB_EDIT_FRAME>();
 
-    footprint->SetAttributes( FP_EXCLUDE_FROM_POS_FILES | FP_EXCLUDE_FROM_BOM );
+    // Enter the size of the gap or stub
+    int gap_size = editFrame->GetDesignSettings().GetCurrentTrackWidth();
 
-    if( aTextSize > 0 )
+    switch( aFootprintShape )
     {
-        footprint->Reference().SetTextSize( VECTOR2I( aTextSize, aTextSize ) );
-        footprint->Reference().SetTextThickness( aTextSize / 5 );
-        footprint->Value().SetTextSize( VECTOR2I( aTextSize, aTextSize ) );
-        footprint->Value().SetTextThickness( aTextSize / 5 );
+    case MICROWAVE_FOOTPRINT_SHAPE::GAP:      msg = _( "Gap Size:" );              break;
+    case MICROWAVE_FOOTPRINT_SHAPE::STUB:     msg = _( "Stub Size:" );             break;
+    case MICROWAVE_FOOTPRINT_SHAPE::STUB_ARC: msg = _( "Arc Stub Radius Value:" ); break;
+    default:                                  msg = wxT( "???" );                  break;
     }
 
-    // Create 2 pads used in gaps and stubs.  The gap is between these 2 pads
-    // the stub is the pad 2
-    int pad_num = 1;
+    wxString             value = editFrame->StringFromValue( gap_size );
+    WX_TEXT_ENTRY_DIALOG dlg( editFrame, msg, _( "Create Microwave Footprint" ), value );
 
-    while( aPadCount-- )
+    if( dlg.ShowQuasiModal() != wxID_OK )
+        return nullptr; // canceled by user
+
+    gap_size = editFrame->ValueFromString( dlg.GetValue() );
+
+    if( aFootprintShape == MICROWAVE_FOOTPRINT_SHAPE::STUB_ARC )
     {
-        PAD* pad = new PAD( footprint );
-        pad->SetPadstackMode( PADSTACK::MODE::NORMAL );
+        msg = wxT( "0.0" );
+        WX_TEXT_ENTRY_DIALOG angledlg( editFrame, _( "Angle in degrees:" ),
+                                       _( "Create Microwave Footprint" ), msg );
 
-        footprint->Add( pad, ADD_MODE::INSERT );
+        if( angledlg.ShowQuasiModal() != wxID_OK )
+            return nullptr; // canceled by user
 
-        int tw = editFrame.GetDesignSettings().GetCurrentTrackWidth();
-        pad->SetSize( PADSTACK::ALL_LAYERS, VECTOR2I( tw, tw ) );
+        double fval;
 
-        pad->SetPosition( footprint->GetPosition() );
-        pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::RECTANGLE );
-        pad->SetAttribute( PAD_ATTRIB::SMD );
-        pad->SetLayerSet( { F_Cu } );
+        if( !angledlg.GetValue().ToDouble( &fval ) )
+        {
+            editFrame->ShowInfoBarError( _( "Incorrect number, abort" ) );
+            return nullptr;
+        }
 
-        pad->SetNumber( wxString::Format( wxT( "%d" ), pad_num ) );
-        pad_num++;
+        angle = EDA_ANGLE( fval, DEGREES_T );
     }
+
+    wxString   error;
+    FOOTPRINT* footprint = CreateMicrowaveFootprint( board(), aFootprintShape, gap_size, angle, &error );
+
+    if( !footprint )
+    {
+        editFrame->ShowInfoBarError( error );
+        return nullptr;
+    }
+
+    editFrame->SetMsgPanel( footprint );
+
+    // Update the footprint and board
+    editFrame->OnModify();
 
     return footprint;
 }
