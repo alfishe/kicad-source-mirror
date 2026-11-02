@@ -2,12 +2,13 @@
 /// @brief kicadopenapi floorplan analysis (L3): the channels between the blocks of the board, their
 /// capacity per copper layer and the demand of the buses and links between blocks on them.  Read only.
 ///
-/// Blocks (pcb_blocks boxes), all-layer keep-outs and the board outside are obstacles.  Their box edges
-/// cut the board into a non-uniform grid of cells; a channel is a maximal free run of cell boundaries
-/// along one grid line (a cross-section of the free space between two obstacles).  Every bundle (the
-/// nets of one bus between two blocks, or the single nets between them) takes one cell path from its
-/// block to the other; each channel it crosses carries its width (track + clearance of each net's class).
-/// Overflows are negotiated over channels (PathFinder costs: present overuse and history).
+/// Blocks (their members' courtyards merged into a few boxes), all-layer keep-outs and the board outside
+/// are obstacles.  Their box edges cut the board into a non-uniform grid of cells; a channel is a maximal
+/// free run of cell boundaries along one grid line (a cross-section of the free space between two
+/// obstacles).  Every bundle (the nets of one bus between two blocks, or the single nets between them)
+/// takes one cell path from its pads' boxes in one block to those in the other; each channel it crosses
+/// carries its width (track + clearance of each net's class).  Overflows are negotiated over channels
+/// (PathFinder costs: present overuse and history).
 #include "kopenapi_pcb.h"
 
 #include <api/pcb_context.h>
@@ -97,8 +98,19 @@ std::optional<BOX2I> boxArg( const nlohmann::json& aV )
 
 struct FP_BLOCK
 {
-    std::string name;
-    BOX2I       box;
+    std::string              name;
+    BOX2I                    box;     ///< all of its boxes
+    std::vector<std::string> parts;
+    std::vector<int>         boxes;   ///< obstacle boxes (global ids)
+};
+
+
+/// @brief One obstacle box of a block: the courtyards of some of its members, merged
+struct FP_BOX
+{
+    int                      block = -1;
+    BOX2I                    box;
+    std::vector<std::string> parts;
 };
 
 
@@ -136,6 +148,7 @@ struct CELL
     uint64_t         blocked = 0;   ///< routing layers a keep-out takes
     int              wall = -1;
     std::vector<int> blocks;
+    std::vector<int> boxes;
 };
 
 
@@ -160,6 +173,7 @@ struct LINK
     std::vector<int> nets;
     double           demand = 0;   ///< mm
     std::set<std::string> classes;
+    std::set<int>    aBoxes, bBoxes;   ///< the boxes its nets leave from at a and at b
     std::vector<int> cuts;
     std::vector<int> cells;
     std::set<int>    crosses;
@@ -288,12 +302,12 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             continue;
 
         const int id = (int) blocks.size();
-        blocks.push_back( { j.value( "name", std::string() ), *box } );
+        blocks.push_back( { j.value( "name", std::string() ), *box, {}, {} } );
 
         for( const nlohmann::json& r : j.value( "parts", nlohmann::json::array() ) )
         {
-            if( r.is_string() )
-                blockOfRef.emplace( r.get<std::string>(), id );
+            if( r.is_string() && blockOfRef.emplace( r.get<std::string>(), id ).second )
+                blocks[id].parts.push_back( r.get<std::string>() );
         }
 
         for( const nlohmann::json& r : j.value( "rails", nlohmann::json::array() ) )
@@ -490,21 +504,156 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const FP_CLASS& defaults = classes["Default"];
     const double    defaultPitch = std::max( 0.01, toMm( defaults.width + defaults.clearance ) );
 
+    // obstacles: per block its members' courtyards, boxes merged while their union stays full
+    // (obstacles: bbox, one box per block as pcb_blocks gives it)
+    const std::string obstacles = aArgs.value( "obstacles", std::string( "parts" ) );
+
+    if( obstacles != "parts" && obstacles != "bbox" )
+        return KOPENAPI_RESULT::Error( 400, "obstacles: parts or bbox" );
+
+    const int    mergeGap = iu( std::max( 0.0, aArgs.value( "merge_gap_mm", toMm( defaults.width + defaults.clearance ) ) ) );
+    const double minFill = std::clamp( aArgs.value( "merge_fill", 0.7 ), 0.0, 1.0 );
+    const int    maxBoxes = std::clamp( aArgs.value( "max_boxes", 8 ), 1, 64 );
+
+    std::map<std::string, FOOTPRINT*> fpOfRef;
+
+    for( FOOTPRINT* fp : board->Footprints() )
+        fpOfRef.emplace( str( fp->GetReference() ), fp );
+
+    auto courtyardBox = []( FOOTPRINT* aFp )
+    {
+        const SHAPE_POLY_SET& cy = aFp->GetCourtyard( aFp->IsFlipped() ? B_CrtYd : F_CrtYd );
+        return cy.OutlineCount() > 0 ? cy.BBox() : aFp->GetBoundingBox( false );
+    };
+
+    std::vector<FP_BOX>        boxes;
+    std::map<std::string, int> boxOfRef;
+
+    auto boxArea = []( const BOX2I& aB ) { return double( aB.GetWidth() ) * aB.GetHeight(); };
+
+    for( size_t b = 0; b < blocks.size(); ++b )
+    {
+        std::vector<FP_BOX> own;
+
+        for( const std::string& ref : blocks[b].parts )
+        {
+            auto it = fpOfRef.find( ref );
+
+            if( it != fpOfRef.end() )
+                own.push_back( { (int) b, courtyardBox( it->second ), { ref } } );
+        }
+
+        if( own.empty() )
+            own.push_back( { (int) b, blocks[b].box, {} } );
+
+        auto join = [&]( size_t i, size_t j )
+        {
+            own[i].box.Merge( own[j].box );
+            own[i].parts.insert( own[i].parts.end(), own[j].parts.begin(), own[j].parts.end() );
+            own.erase( own.begin() + (long) j );
+        };
+
+        // the fill of two boxes' union: their areas (overlap once) over the union's
+        auto fillOf = [&]( size_t i, size_t j )
+        {
+            BOX2I u = own[i].box;
+            u.Merge( own[j].box );
+            const BOX2I  o = own[i].box.Intersect( own[j].box );
+            const double overlap = o.GetWidth() > 0 && o.GetHeight() > 0 ? boxArea( o ) : 0;
+            return boxArea( u ) > 0 ? ( boxArea( own[i].box ) + boxArea( own[j].box ) - overlap ) / boxArea( u ) : 1.0;
+        };
+
+        if( obstacles == "bbox" )
+        {
+            while( own.size() > 1 )
+                join( 0, 1 );
+        }
+        else
+        {
+            for( bool merged = true; merged; )
+            {
+                merged = false;
+
+                for( size_t i = 0; i < own.size() && !merged; ++i )
+                {
+                    for( size_t j = i + 1; j < own.size() && !merged; ++j )
+                    {
+                        BOX2I grown = own[i].box;
+                        grown.Inflate( mergeGap );
+
+                        if( grown.Intersects( own[j].box ) && fillOf( i, j ) >= minFill )
+                        {
+                            join( i, j );
+                            merged = true;
+                        }
+                    }
+                }
+            }
+
+            while( (int) own.size() > maxBoxes )
+            {
+                size_t bi = 0, bj = 1;
+                double best = -1;
+
+                for( size_t i = 0; i < own.size(); ++i )
+                {
+                    for( size_t j = i + 1; j < own.size(); ++j )
+                    {
+                        if( const double f = fillOf( i, j ); f > best )
+                        {
+                            best = f;
+                            bi = i;
+                            bj = j;
+                        }
+                    }
+                }
+
+                join( bi, bj );
+            }
+        }
+
+        bool first = true;
+
+        for( FP_BOX& fb : own )
+        {
+            for( const std::string& ref : fb.parts )
+                boxOfRef[ref] = (int) boxes.size();
+
+            if( first )
+                blocks[b].box = fb.box;
+            else
+                blocks[b].box.Merge( fb.box );
+
+            first = false;
+            blocks[b].boxes.push_back( (int) boxes.size() );
+            boxes.push_back( std::move( fb ) );
+        }
+    }
+
     // links: per signal net its blocks joined by a shortest tree; the nets of one bus between two
     // blocks, and the single nets between them, are one bundle each
-    std::map<int, std::set<int>> netBlocks;
+    std::map<int, std::set<int>>                netBlocks;
+    std::map<int, std::map<int, std::set<int>>> netBoxes;   ///< net -> block -> boxes of its pads
 
     for( FOOTPRINT* fp : board->Footprints() )
     {
-        auto it = blockOfRef.find( str( fp->GetReference() ) );
+        const std::string ref = str( fp->GetReference() );
+        auto              it = blockOfRef.find( ref );
 
         if( it == blockOfRef.end() )
             continue;
 
+        auto bx = boxOfRef.find( ref );
+
         for( PAD* pad : fp->Pads() )
         {
             if( pad->GetNetCode() > 0 && !rails.count( pad->GetNetCode() ) )
+            {
                 netBlocks[pad->GetNetCode()].insert( it->second );
+
+                if( bx != boxOfRef.end() )
+                    netBoxes[pad->GetNetCode()][it->second].insert( bx->second );
+            }
         }
     }
 
@@ -566,6 +715,12 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             l.bus = bus == busOfNet.end() ? std::string() : bus->second;
             l.nets.push_back( net );
             l.demand += width;
+
+            for( int x : netBoxes[net][a] )
+                l.aBoxes.insert( x );
+
+            for( int x : netBoxes[net][b] )
+                l.bBoxes.insert( x );
             l.classes.insert( className );
         }
     }
@@ -596,7 +751,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     addLines( ub );
 
-    for( const FP_BLOCK& b : blocks )
+    for( const FP_BOX& b : boxes )
         addLines( b.box );
 
     for( const FP_KEEPOUT& k : keepouts )
@@ -618,9 +773,10 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     auto span = []( const std::vector<int>& aLines, int aLow, int aHigh )
     {
+        const int last = (int) aLines.size() - 1;
         const int i0 = int( std::lower_bound( aLines.begin(), aLines.end(), aLow ) - aLines.begin() );
         const int i1 = int( std::lower_bound( aLines.begin(), aLines.end(), aHigh ) - aLines.begin() );
-        return std::make_pair( i0, i1 );   // cells i0 .. i1 - 1
+        return std::make_pair( std::min( i0, last ), std::min( i1, last ) );   // cells i0 .. i1 - 1
     };
 
     for( int j = 0; j < ny; ++j )
@@ -654,20 +810,26 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
         }
     }
 
-    std::vector<std::vector<int>> blockCells( blocks.size() );
+    std::vector<std::vector<int>> boxCells( boxes.size() );
 
-    for( size_t b = 0; b < blocks.size(); ++b )
+    for( size_t k = 0; k < boxes.size(); ++k )
     {
-        const auto [i0, i1] = span( xs, blocks[b].box.GetLeft(), blocks[b].box.GetRight() );
-        const auto [j0, j1] = span( ys, blocks[b].box.GetTop(), blocks[b].box.GetBottom() );
+        const auto [i0, i1] = span( xs, boxes[k].box.GetLeft(), boxes[k].box.GetRight() );
+        const auto [j0, j1] = span( ys, boxes[k].box.GetTop(), boxes[k].box.GetBottom() );
+        const int  b = boxes[k].block;
 
         for( int j = j0; j < j1; ++j )
         {
             for( int i = i0; i < i1; ++i )
             {
-                at( i, j ).kind = CELL_BLOCK;
-                at( i, j ).blocks.push_back( (int) b );
-                blockCells[b].push_back( j * nx + i );
+                CELL& c = at( i, j );
+                c.kind = CELL_BLOCK;
+                c.boxes.push_back( (int) k );
+
+                if( std::find( c.blocks.begin(), c.blocks.end(), b ) == c.blocks.end() )
+                    c.blocks.push_back( b );
+
+                boxCells[k].push_back( j * nx + i );
             }
         }
     }
@@ -786,7 +948,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     const size_t        n = cells.size();
     std::vector<double> cost( n ), cx( nx ), cy( ny );
     std::vector<int>    prev( n );
-    std::vector<unsigned> seenAt( n, 0 ), doneAt( n, 0 );
+    std::vector<unsigned> seenAt( n, 0 ), doneAt( n, 0 ), targetAt( n, 0 );
     unsigned              epoch = 0;
 
     for( int i = 0; i < nx; ++i )
@@ -802,7 +964,15 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     auto routeLink = [&]( LINK& aLink, double aPresent )
     {
-        const BOX2I& target = blocks[aLink.b].box;
+        const std::set<int> fromBoxes = aLink.aBoxes.empty() ? std::set<int>( blocks[aLink.a].boxes.begin(), blocks[aLink.a].boxes.end() )
+                                                             : aLink.aBoxes;
+        const std::set<int> toBoxes = aLink.bBoxes.empty() ? std::set<int>( blocks[aLink.b].boxes.begin(), blocks[aLink.b].boxes.end() )
+                                                           : aLink.bBoxes;
+        BOX2I target = boxes[*toBoxes.begin()].box;
+
+        for( int k : toBoxes )
+            target.Merge( boxes[k].box );
+
         const double tx0 = toMm( target.GetLeft() ), tx1 = toMm( target.GetRight() );
         const double ty0 = toMm( target.GetTop() ), ty1 = toMm( target.GetBottom() );
 
@@ -815,15 +985,24 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
         ++epoch;
 
+        for( int k : toBoxes )
+        {
+            for( int c : boxCells[k] )
+                targetAt[c] = epoch;
+        }
+
         using ENTRY = std::pair<double, int>;
         std::priority_queue<ENTRY, std::vector<ENTRY>, std::greater<ENTRY>> open;
 
-        for( int c : blockCells[aLink.a] )
+        for( int k : fromBoxes )
         {
-            cost[c] = 0;
-            prev[c] = -1;
-            seenAt[c] = epoch;
-            open.emplace( h( c % nx, c / nx ), c );
+            for( int c : boxCells[k] )
+            {
+                cost[c] = 0;
+                prev[c] = -1;
+                seenAt[c] = epoch;
+                open.emplace( h( c % nx, c / nx ), c );
+            }
         }
 
         auto cutCost = [&]( int aCut )
@@ -849,7 +1028,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             doneAt[c] = epoch;
             const int i = c % nx, j = c / nx;
 
-            if( cells[c].kind == CELL_BLOCK && has( cells[c], aLink.b ) )
+            if( targetAt[c] == epoch )
             {
                 reached = c;
                 break;
@@ -1202,7 +1381,29 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     nlohmann::json blockList = nlohmann::json::array();
 
     for( const FP_BLOCK& b : blocks )
-        blockList.push_back( { { "name", b.name }, { "box_mm", boxMm( b.box ) } } );
+    {
+        nlohmann::json list = nlohmann::json::array();
+
+        for( int k : b.boxes )
+            list.push_back( boxMm( boxes[k].box ) );
+
+        blockList.push_back( { { "name", b.name }, { "box_mm", boxMm( b.box ) }, { "boxes_mm", list } } );
+    }
+
+    int       slivers = 0, sliversUsed = 0, zeroLength = 0;
+    const int pitchIU = defaults.width + defaults.clearance;
+
+    for( const CUT& c : cuts )
+    {
+        if( c.to - c.from < pitchIU )
+        {
+            ++slivers;
+            sliversUsed += c.use > 0;
+        }
+    }
+
+    for( const LINK& l : links )
+        zeroLength += l.found && l.cells.size() <= 1;
 
     nlohmann::json keepoutList = nlohmann::json::array();
 
@@ -1257,6 +1458,10 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                              { "overflowing_links", linksOver },
                              { "links_without_path", linksMissing },
                              { "links_through_blocks", linksThrough },
+                             { "links_zero_length", zeroLength },
+                             { "boxes", boxes.size() },
+                             { "sliver_channels", slivers },
+                             { "sliver_channels_used", sliversUsed },
                              { "overflows", overflows.size() },
                              { "over_mm", r2( bestTotal ) } } },
               { "negotiation", { { "enabled", negotiate }, { "iterations", ran }, { "best_iteration", bestIteration },
@@ -1268,8 +1473,8 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
 KOPENAPI_REGISTER( "pcb_floorplan",
                    "The third level of laying a board out (L3, floorplan and buses): the channels between the "
-                   "blocks (pcb_blocks boxes as rigid obstacles, with keep-outs that bar tracks and the board "
-                   "outside) and how much of them the links between blocks need. A channel is a cross-section of "
+                   "blocks (each block's member courtyards merged into a few boxes, or its pcb_blocks bbox, as rigid "
+                   "obstacles, with keep-outs that bar tracks and the board outside) and how much of them the links between blocks need. A channel is a cross-section of "
                    "the free space between two obstacles (between: their names, board edge included) along the "
                    "line of an obstacle's edge; per channel its free length per routing copper layer (inner layers "
                    "mostly under a rail pour are planes, not counted), the tracks of each net class that cross it "
@@ -1293,6 +1498,10 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                             "rect":{"type":"array","items":{"type":"number"},"description":"[x0, y0, x1, y1] mm"},
                             "layers":{"type":"array","items":{"type":"string"},"description":"default every routing layer"}}},"description":"more areas that bar tracks, besides the board's rule areas"},
                         "edge_clearance_mm":{"type":"number","description":"default: the board's copper-to-edge clearance"},
+                        "obstacles":{"type":"string","enum":["parts","bbox"],"default":"parts","description":"parts: each block's member courtyards, merged into boxes while their union stays full; bbox: one box per block (pcb_blocks bbox)"},
+                        "merge_gap_mm":{"type":"number","description":"courtyards closer than this may merge (default one Default track pitch)"},
+                        "merge_fill":{"type":"number","default":0.7,"minimum":0,"maximum":1,"description":"two boxes merge when their areas fill this much of their union"},
+                        "max_boxes":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"boxes per block at most"},
                         "negotiate":{"type":"boolean","default":true,"description":"false: every bundle on its shortest path, one round"},
                         "iterations":{"type":"integer","default":8,"minimum":1,"maximum":64,"description":"negotiation rounds at most"},
                         "overflow_cost_mm":{"type":"number","default":5,"description":"detour worth one track over a channel's capacity, first round (doubles each round)"},
