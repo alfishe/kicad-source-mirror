@@ -641,6 +641,38 @@ BOARD_ITEM* PNS_PCBNEW_RULE_RESOLVER::getBoardItem( const PNS::ITEM* aItem, PCB_
 }
 
 
+// A track of the router's that is not on the board yet (a line or a segment): the rules see its pieces
+static bool isTempTrack( const PNS::ITEM* aItem )
+{
+    return aItem && !aItem->BoardItem()
+           && ( aItem->Kind() == PNS::ITEM::LINE_T || aItem->Kind() == PNS::ITEM::SEGMENT_T );
+}
+
+
+static int tempTrackWidth( const PNS::ITEM* aItem )
+{
+    return aItem->Kind() == PNS::ITEM::LINE_T ? static_cast<const PNS::LINE*>( aItem )->Width()
+                                              : static_cast<const PNS::SEGMENT*>( aItem )->Width();
+}
+
+
+static int tempTrackSegmentCount( const PNS::ITEM* aItem )
+{
+    return aItem->Kind() == PNS::ITEM::LINE_T ? static_cast<const PNS::LINE*>( aItem )->CLine().SegmentCount()
+                                              : 1;
+}
+
+
+static SEG tempTrackSegment( const PNS::ITEM* aItem, int aIdx )
+{
+    if( aItem->Kind() != PNS::ITEM::LINE_T )
+        return static_cast<const PNS::SEGMENT*>( aItem )->Seg();
+
+    const SHAPE_LINE_CHAIN& chain = static_cast<const PNS::LINE*>( aItem )->CLine();
+    return SEG( chain.CPoint( aIdx ), chain.CPoint( aIdx + 1 ) );
+}
+
+
 // The part of a line's segment within reach of an opposing item: the copper a clearance to that
 // item is about (the route is split at rule areas when it is committed, as DRC then sees it)
 static std::optional<SEG> segmentInReach( const VECTOR2I& aA, const VECTOR2I& aB, const BOX2I& aReach )
@@ -728,25 +760,31 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
 
     bool lineANeedsSegmentEval = false;
     bool lineBNeedsSegmentEval = false;
+    bool trackANeedsClip = false;
+    bool trackBNeedsClip = false;
 
     if( drcEngine->HasGeometryDependentRules() )
     {
         lineANeedsSegmentEval = isMultiSegmentLine( aItemA, parentA );
         lineBNeedsSegmentEval = isMultiSegmentLine( aItemB, parentB );
+
+        // A one-segment line or a segment against an item that is not a temporary track: the part
+        // within reach of the item, as for a longer line
+        trackANeedsClip = !lineANeedsSegmentEval && isTempTrack( aItemA ) && aItemB && !isTempTrack( aItemB );
+        trackBNeedsClip = !lineBNeedsSegmentEval && isTempTrack( aItemB ) && aItemA && !isTempTrack( aItemA );
     }
 
-    // Evaluate segments of a multi-segment LINE against a single opposing item.
+    // Evaluate the segments of a temporary track (a LINE, or a SEGMENT) against a single opposing item.
     auto evaluateLineSegments = [&]( const PNS::ITEM* aLineItem, BOARD_ITEM* aOpposingItem,
                                      bool aLineIsFirst, int aIdx ) -> DRC_CONSTRAINT
     {
         DRC_CONSTRAINT bestConstraint;
-        const auto* line = static_cast<const PNS::LINE*>( aLineItem );
-        const SHAPE_LINE_CHAIN& chain = line->CLine();
+        const int      width = tempTrackWidth( aLineItem );
 
         PCB_TRACK& dummyTrack = m_dummyTracks[aIdx];
         dummyTrack.SetLayer( board_layer );
         dummyTrack.SetNet( static_cast<NETINFO_ITEM*>( aLineItem->Net() ) );
-        dummyTrack.SetWidth( line->Width() );
+        dummyTrack.SetWidth( width );
 
         // Only the segments within reach of the opposing item decide its clearance: a rule
         // area another part of the line crosses (a courtyard at the start pad) does not apply
@@ -760,7 +798,7 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
             if( !m_biggestClearance )
                 m_biggestClearance = std::max( m_board->GetDesignSettings().GetBiggestClearanceValue(), 0 );
 
-            reach.Inflate( line->Width() / 2 + *m_biggestClearance );
+            reach.Inflate( width / 2 + *m_biggestClearance );
             useReach = true;
         }
 
@@ -770,12 +808,12 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
 
         auto evaluate = [&]( const VECTOR2I& aStart, const VECTOR2I& aEnd ) -> bool
         {
-            SEGMENT_RULE_CACHE_KEY key{ aOpposingItem, aLineItem->Net(), aStart,      aEnd, 0,
-                                        line->Width(), board_layer,      hostType,    aLineIsFirst };
+            SEGMENT_RULE_CACHE_KEY key{ aOpposingItem, aLineItem->Net(), aStart,   aEnd, 0,
+                                        width,         board_layer,      hostType, aLineIsFirst };
 
             if( memo )
             {
-                if( std::optional<size_t> state = regionState( SEG( aStart, aEnd ), line->Width() ) )
+                if( std::optional<size_t> state = regionState( SEG( aStart, aEnd ), width ) )
                 {
                     key.start = key.end = VECTOR2I();
                     key.region = *state + 1;
@@ -809,9 +847,9 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
 
         bool evaluated = false;
 
-        for( int i = 0; i < chain.SegmentCount(); i++ )
+        for( int i = 0; i < tempTrackSegmentCount( aLineItem ); i++ )
         {
-            SEG seg( chain.CPoint( i ), chain.CPoint( i + 1 ) );
+            SEG seg = tempTrackSegment( aLineItem, i );
 
             if( useReach )
             {
@@ -938,6 +976,23 @@ bool PNS_PCBNEW_RULE_RESOLVER::QueryConstraint( PNS::CONSTRAINT_TYPE aType,
         }
         else
         {
+            hostConstraint = evaluateLineSegments( aItemB, parentA, false, 1 );
+        }
+    }
+    else if( trackANeedsClip || trackBNeedsClip )
+    {
+        if( trackANeedsClip )
+        {
+            if( !parentB )
+                parentB = getBoardItem( aItemB, board_layer, 1 );
+
+            hostConstraint = evaluateLineSegments( aItemA, parentB, true, 0 );
+        }
+        else
+        {
+            if( !parentA )
+                parentA = getBoardItem( aItemA, board_layer, 0 );
+
             hostConstraint = evaluateLineSegments( aItemB, parentA, false, 1 );
         }
     }
@@ -1110,14 +1165,13 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
         return h;
     }
 
-    int width = aItem->Kind() == PNS::ITEM::LINE_T ? static_cast<const PNS::LINE*>( aItem )->Width()
-                                                    : static_cast<const PNS::SEGMENT*>( aItem )->Width();
+    int width = tempTrackWidth( aItem );
 
-    // QueryConstraint takes a segment, a one-segment line and a line far from another line whole,
-    // as a track from its first to its last point (getBoardItem)
-    bool whole = !isMultiSegmentLine( aItem );
+    // QueryConstraint takes a segment or a one-segment line against another temporary track, and a
+    // line far from another line, whole: as a track from its first to its last point (getBoardItem)
+    bool whole = !isMultiSegmentLine( aItem ) && isTempTrack( aOther );
 
-    if( !whole && isMultiSegmentLine( aOther ) )
+    if( isMultiSegmentLine( aItem ) && isMultiSegmentLine( aOther ) )
     {
         const PNS::LINE* other = static_cast<const PNS::LINE*>( aOther );
         BOX2I            box = static_cast<const PNS::LINE*>( aItem )->CLine().BBox();
@@ -1131,8 +1185,7 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
         return h;
     }
 
-    const PNS::LINE*        line = static_cast<const PNS::LINE*>( aItem );
-    const SHAPE_LINE_CHAIN& chain = line->CLine();
+    const int segments = tempTrackSegmentCount( aItem );
 
     if( !m_biggestClearance )
         m_biggestClearance = std::max( m_board->GetDesignSettings().GetBiggestClearanceValue(), 0 );
@@ -1145,9 +1198,10 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
 
         std::vector<size_t> seen;
 
-        for( int i = 0; i < chain.SegmentCount(); ++i )
+        for( int i = 0; i < segments; ++i )
         {
-            std::optional<SEG> inReach = segmentInReach( chain.CPoint( i ), chain.CPoint( i + 1 ), reach );
+            const SEG          seg = tempTrackSegment( aItem, i );
+            std::optional<SEG> inReach = segmentInReach( seg.A, seg.B, reach );
 
             if( !inReach )
                 continue;
@@ -1185,15 +1239,16 @@ size_t PNS_PCBNEW_RULE_RESOLVER::geometryNear( const PNS::ITEM* aItem, const PNS
     // exact points, as which of them it evaluates depends on them
     reach.Inflate( width + *m_biggestClearance + pcbIUScale.mmToIU( 1.0 ) );
 
-    for( int i = 0; i < chain.SegmentCount(); ++i )
+    for( int i = 0; i < segments; ++i )
     {
-        BOX2I segBox( chain.CPoint( i ), VECTOR2I( 0, 0 ) );
-        segBox.Merge( chain.CPoint( i + 1 ) );
+        const SEG seg = tempTrackSegment( aItem, i );
+        BOX2I     segBox( seg.A, VECTOR2I( 0, 0 ) );
+        segBox.Merge( seg.B );
 
         if( segBox.Intersects( reach ) )
         {
-            add( chain.CPoint( i ) );
-            add( chain.CPoint( i + 1 ) );
+            add( seg.A );
+            add( seg.B );
         }
     }
 
