@@ -3732,10 +3732,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // stage global (engine grid): each connection's way on a coarse grid of the board, nothing laid
     const std::string stage = aArgs.value( "stage", std::string( "full" ) );
 
-    if( stage != "full" && stage != "global" )
-        return KOPENAPI_RESULT::Error( 400, "stage: full or global" );
+    if( stage != "full" && stage != "global" && stage != "detail" )
+        return KOPENAPI_RESULT::Error( 400, "stage: full, global or detail" );
 
     const bool        globalStage = stage == "global";
+    const bool        detailStage = stage == "detail";
+
+    if( detailStage && aArgs.value( "dry_run", false ) )
+        return KOPENAPI_RESULT::Error( 400, "stage detail lays each route before the next: no dry_run (stage global shows the corridors)" );
 
     const bool        dryRun = aArgs.value( "dry_run", false ) || globalStage;
     const int         stepMs = std::clamp( aArgs.value( "step_ms", 0 ), 0, 5000 );
@@ -3753,8 +3757,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     const bool grid = engine == "grid";
 
-    if( globalStage && !grid )
-        return KOPENAPI_RESULT::Error( 400, "stage global: engine grid" );
+    if( ( globalStage || detailStage ) && !grid )
+        return KOPENAPI_RESULT::Error( 400, "stage global / detail: engine grid" );
 
     // attempts per connection and pass: a count, not a time (the same board routes the same way);
     // on a big board an attempt costs about a second
@@ -9113,8 +9117,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         params.maxRounds = std::clamp( aArgs.value( "max_rounds", 40 ), 1, 500 );
         params.variants = std::clamp( aArgs.value( "variants", 0 ), 0, 6 );
         params.cell = pcbIUScale.mmToIU( std::clamp( aArgs.value( "cell_mm", 0.0 ), 0.0, 1.0 ) );
-        params.coarse = globalStage && params.cell == 0;
-        params.raceWait = (float) std::clamp( aArgs.value( "race_wait", globalStage ? 0.1 : 0.25 ), 0.0, 4.0 );
+        params.coarse = ( globalStage || detailStage ) && params.cell == 0;
+        params.raceWait = (float) std::clamp( aArgs.value( "race_wait", globalStage || detailStage ? 0.1 : 0.25 ), 0.0, 4.0 );
         params.viaKeepOut = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_keepout_mm", 5.0 ), 0.0, 20.0 ) );
 
         for( const ESCAPE_FRONT& front : fronts )
@@ -9125,6 +9129,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         params.viaAway = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_mm", 7.0 ), 0.0, 30.0 ) );
         params.viaAwayCost = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_cost_mm", 8.0 ), 0.0, 100.0 ) );
         params.rowsCost = (float) std::clamp( aArgs.value( "rows_cost", 6.0 ), 1.0, 100.0 );
+        params.bodyCost = (float) std::clamp( aArgs.value( "body_cost", 1.0 ), 1.0, 100.0 );
         params.viaNearHole = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_near_hole_mm", 2.5 ), 0.0, 30.0 ) );
         params.viaNearHoleCost = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_near_hole_cost_mm", 6.0 ), 0.0, 100.0 ) );
         params.hug = (float) std::clamp( aArgs.value( "hug", 1.0 ), 0.05, 1.0 );
@@ -9499,6 +9504,332 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                           { "ms", std::round( msSince( started ) ) } } );
         }
 
+        // the detail stage: the grid's copper of each net cut into branches between its junctions (its
+        // ends, points where three ways meet), each branch by pns along its corridor (its corners and via
+        // sites as waypoints); bundles first, then the branches between two ends, then those onto a
+        // junction, shorter first. A branch that does not route so tries its via sites alone, then the
+        // grid's copper of it goes through the guard below
+        std::vector<int>         detailOf( jobs.size(), 0 );   // 1 joined by pns, 2 left to the grid's copper
+        std::vector<std::string> detailWhy( jobs.size() );
+        nlohmann::json           detailOut;
+
+        if( detailStage )
+        {
+            struct DETAIL
+            {
+                size_t      net;
+                GRID_BRANCH branch;
+            };
+
+            std::vector<DETAIL> order;
+
+            for( size_t k = 0; k < gridNets.size() && k < gr.nets.size(); ++k )
+            {
+                for( GRID_BRANCH& branch : GridBranches( gridNets[k], gr.nets[k], gr.cell ) )
+                    order.push_back( { k, std::move( branch ) } );
+            }
+
+            std::stable_sort( order.begin(), order.end(),
+                              [&]( const DETAIL& x, const DETAIL& y )
+                              {
+                                  const GRID_NET& nx = gridNets[x.net];
+                                  const GRID_NET& ny = gridNets[y.net];
+
+                                  if( ( nx.group >= 0 ) != ( ny.group >= 0 ) )
+                                      return nx.group >= 0;
+
+                                  if( nx.group != ny.group )
+                                      return nx.group < ny.group;
+
+                                  if( nx.rank != ny.rank )
+                                      return nx.rank < ny.rank;
+
+                                  if( ( x.branch.a >= 0 ) != ( y.branch.a >= 0 ) )
+                                      return x.branch.a >= 0;
+
+                                  if( ( x.branch.b >= 0 ) != ( y.branch.b >= 0 ) )
+                                      return x.branch.b >= 0;
+
+                                  return x.branch.way.length < y.branch.way.length;
+                              } );
+
+            auto hits = [&]( BOARD_CONNECTED_ITEM* aItem, const VECTOR2I& aAt )
+            {
+                return aItem && aItem->HitTest( aAt, gr.cell );
+            };
+
+            // the corridor as waypoints: its corners (not within two cells of the last one kept, nor on
+            // the ends) and a via where it changes layer
+            auto waypoints = [&]( const GRID_CORRIDOR& aWay, BOARD_CONNECTED_ITEM* aFrom, BOARD_CONNECTED_ITEM* aTo,
+                                  const VECTOR2I& aStart, bool aCorners )
+            {
+                std::vector<std::pair<VECTOR2I, std::optional<PCB_LAYER_ID>>> out;
+                VECTOR2I  last = aStart;
+                const int jog = 2 * gr.cell;
+
+                for( size_t r = 0; r < aWay.runs.size(); ++r )
+                {
+                    const std::vector<VECTOR2I>& pts = aWay.runs[r].points;
+
+                    for( size_t q = 0; aCorners && q + 1 < pts.size(); ++q )
+                    {
+                        if( ( r == 0 && q == 0 ) || ( pts[q] - last ).EuclideanNorm() < jog || hits( aFrom, pts[q] )
+                            || hits( aTo, pts[q] ) )
+                        {
+                            continue;
+                        }
+
+                        out.emplace_back( pts[q], std::nullopt );
+                        last = pts[q];
+                    }
+
+                    if( r + 1 < aWay.runs.size() && !pts.empty() )
+                    {
+                        out.emplace_back( pts.back(), aWay.runs[r + 1].layer );
+                        last = pts.back();
+                    }
+                }
+
+                return out;
+            };
+
+            // the net's copper nearest a junction point: what a branch onto it ends on
+            auto copperAt = [&]( int aNetCode, const VECTOR2I& aAt, PCB_LAYER_ID aLayer, VECTOR2I& aPos ) -> BOARD_CONNECTED_ITEM*
+            {
+                BOARD_CONNECTED_ITEM* best = nullptr;
+                int64_t               bestD = (int64_t) std::max( pcbIUScale.mmToIU( 1.0 ), 4 * gr.cell );
+
+                for( PCB_TRACK* track : board->Tracks() )
+                {
+                    if( track->GetNetCode() != aNetCode || ( track->Type() != PCB_VIA_T && track->GetLayer() != aLayer ) )
+                        continue;
+
+                    const VECTOR2I at = track->Type() == PCB_VIA_T ? track->GetPosition()
+                                                                   : SEG( track->GetStart(), track->GetEnd() ).NearestPoint( aAt );
+                    const int64_t  d = ( at - aAt ).EuclideanNorm();
+
+                    if( d < bestD )
+                    {
+                        bestD = d;
+                        best = track;
+                        aPos = at;
+                    }
+                }
+
+                return best;
+            };
+
+            int    byCorridor = 0, byViaSites = 0, toGrid = 0, branchesJoined = 0, pnsVias = 0;
+            double pnsLength = 0;
+            std::vector<GRID_NET_RESULT> left( gr.nets.size() );
+            std::vector<std::string>     netWhy( gridNets.size() );
+
+            for( size_t k = 0; k < left.size(); ++k )
+            {
+                left[k].walls = gr.nets[k].walls;
+                left[k].halfCellExits = gr.nets[k].halfCellExits;
+                left[k].reached.assign( gridNets[k].ends.size(), gr.nets[k].complete );
+            }
+
+            auto toLeft = [&]( const DETAIL& d, const std::string& aWhy )
+            {
+                toGrid++;
+
+                if( netWhy[d.net].empty() )
+                    netWhy[d.net] = aWhy;
+
+                GRID_NET_RESULT& r = left[d.net];
+
+                for( const GRID_CORRIDOR::RUN& run : d.branch.way.runs )
+                {
+                    if( run.points.size() > 1 )
+                        r.tracks.push_back( { run.layer, run.points } );
+                }
+
+                r.vias.insert( r.vias.end(), d.branch.way.vias.begin(), d.branch.way.vias.end() );
+                r.length += d.branch.way.length;
+            };
+
+            for( size_t step = 0; step < order.size(); ++step )
+            {
+                const DETAIL&   d = order[step];
+                const GRID_NET& n = gridNets[d.net];
+
+                if( !KopenapiJobStep( "detail", (int) step, (int) order.size(), std::to_string( n.netCode ), progressCounts( "detail" ) ) )
+                    break;
+
+                if( d.branch.way.runs.empty() || d.branch.way.runs.front().points.empty() )
+                    continue;
+
+                // between two junctions: from the copper laid at the first one
+                VECTOR2I              fromPos;
+                BOARD_CONNECTED_ITEM* from = d.branch.a >= 0 ? n.ends[d.branch.a]
+                                                             : copperAt( n.netCode, d.branch.way.runs.front().points.front(),
+                                                                         d.branch.way.runs.front().layer, fromPos );
+
+                if( !from )
+                {
+                    toLeft( d, "a branch between two junctions of its copper, no copper at the first yet" );
+                    continue;
+                }
+
+                BOARD_CONNECTED_ITEM* to = nullptr;
+                VECTOR2I              toPos;
+                GRID_CORRIDOR         way = d.branch.way;
+                int                   b = d.branch.b;
+
+                // onto a junction no copper has reached yet: on through it to the end of another branch
+                // there
+                if( b < 0 && !copperAt( n.netCode, d.branch.bAt, d.branch.bLayer, toPos ) )
+                {
+                    for( size_t o = step + 1; o < order.size(); ++o )
+                    {
+                        const GRID_BRANCH& other = order[o].branch;
+
+                        if( order[o].net != d.net || other.b >= 0 || other.a < 0 || other.a == d.branch.a
+                            || other.bAt != d.branch.bAt || other.bLayer != d.branch.bLayer )
+                        {
+                            continue;
+                        }
+
+                        std::vector<GRID_CORRIDOR::RUN> back( other.way.runs.rbegin(), other.way.runs.rend() );
+
+                        for( GRID_CORRIDOR::RUN& run : back )
+                            std::reverse( run.points.begin(), run.points.end() );
+
+                        if( !back.empty() && !way.runs.empty() && back.front().layer == way.runs.back().layer )
+                        {
+                            way.runs.back().points.insert( way.runs.back().points.end(), back.front().points.begin() + 1,
+                                                           back.front().points.end() );
+                            back.erase( back.begin() );
+                        }
+
+                        way.runs.insert( way.runs.end(), back.begin(), back.end() );
+                        way.vias.insert( way.vias.end(), other.way.vias.rbegin(), other.way.vias.rend() );
+                        way.length += other.way.length;
+                        b = other.a;
+                        break;
+                    }
+                }
+
+                if( b >= 0 )
+                {
+                    to = n.ends[b];
+                    toPos = to->Type() == PCB_PAD_T || to->Type() == PCB_VIA_T ? to->GetPosition() : way.runs.back().points.back();
+
+                    if( from->GetNetCode() > 0 )
+                    {
+                        const auto joined = board->GetConnectivity()->GetConnectedItems( from );
+
+                        if( std::find( joined.begin(), joined.end(), to ) != joined.end() )
+                        {
+                            branchesJoined++;
+                            continue;
+                        }
+                    }
+                }
+                else
+                {
+                    to = copperAt( n.netCode, d.branch.bAt, d.branch.bLayer, toPos );
+
+                    if( !to )
+                    {
+                        toLeft( d, "its junction has no copper of the net near it" );
+                        continue;
+                    }
+
+                    const auto joined = board->GetConnectivity()->GetConnectedItems( from );
+
+                    if( std::find( joined.begin(), joined.end(), to ) != joined.end() )
+                    {
+                        branchesJoined++;
+                        continue;
+                    }
+                }
+
+                const VECTOR2I start = from->Type() == PCB_PAD_T || from->Type() == PCB_VIA_T ? from->GetPosition()
+                                       : d.branch.a < 0                                         ? fromPos
+                                                                                                : way.runs.front().points.front();
+                const bool     viaAtEnd = !way.vias.empty() && ( way.vias.front() == start || way.vias.back() == toPos );
+                bool           ok = false;
+                nlohmann::json attempt = nlohmann::json::object();
+                std::string    why;
+
+                for( int widen = 0; widen < 2 && !ok && way.vias.size() + 1 == way.runs.size() && !viaAtEnd; ++widen )
+                {
+                    PAD*          pad = dynamic_cast<PAD*>( from );
+                    ROUTE_REQUEST req{ from, to, toPos, way.runs.front().layer, PNS::RM_Walkaround, false, {} };
+
+                    // the grid planned every net's way out: the ways kept open matter only off the corridor
+                    req.fronts = widen == 0 ? nullptr : &fronts;
+                    req.neckWidth = pad ? neckFor( pad, to ) : 0;
+                    req.vias = waypoints( way, from, to, start, widen == 0 );
+                    req.planned = true;
+
+                    if( !pad )
+                        req.fromPos = start;
+
+                    setDeadline( firstBudgetS > 0 ? firstBudgetS / 10 : 3.0 );
+                    attempt = nlohmann::json::object();
+                    ok = routeOne( *context, req, attempt, added );
+                    tryDeadline.reset();
+
+                    if( !ok )
+                        why += ( why.empty() ? "" : "; " ) + std::string( widen == 0 ? "along the corridor: " : "by its via sites: " )
+                               + attempt.value( "reason", std::string() );
+
+                    if( ok )
+                    {
+                        ( widen == 0 ? byCorridor : byViaSites )++;
+                        const nlohmann::json metrics = attempt.value( "metrics", nlohmann::json::object() );
+                        pnsLength += metrics.value( "length_mm", 0.0 );
+                        pnsVias += metrics.value( "vias", 0 );
+                    }
+                }
+
+                if( !ok )
+                {
+                    toLeft( d, viaAtEnd                                                    ? "its corridor changes layer where an end is"
+                               : way.vias.size() + 1 != way.runs.size() ? "its corridor changes layer through a pad"
+                               : why.empty() ? std::string( "the corridor's way does not route" ) : why );
+                }
+            }
+
+            // the connections pns joined; the rest go to the grid's copper of the branches it left
+            board->BuildConnectivity();
+
+            for( size_t k = 0; k < gridNets.size(); ++k )
+            {
+                for( size_t index : jobsOfNet[k] )
+                {
+                    JOB& job = jobs[index];
+                    job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
+                    job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+                    const auto joined = job.from ? board->GetConnectivity()->GetConnectedItems( job.from )
+                                                 : std::vector<BOARD_CONNECTED_ITEM*>();
+
+                    if( !job.to || std::find( joined.begin(), joined.end(), job.to ) == joined.end() )
+                    {
+                        detailOf[index] = 2;
+                        detailWhy[index] = netWhy[k].empty() ? std::string( "pns did not join it" ) : netWhy[k];
+                        continue;
+                    }
+
+                    detailOf[index] = 1;
+                    done[index] = true;
+                    rowOf[index] = (int) results.size();
+                    results.push_back( { { "net", job.net }, { "from", endName( job.from ) }, { "to", endName( job.to ) },
+                                         { "routed", true }, { "tries", 1 }, { "engine", "pns" }, { "detail", "branches" } } );
+                }
+            }
+
+            gr.nets = std::move( left );
+            detailOut = { { "branches", order.size() }, { "by_corridor", byCorridor }, { "by_via_sites", byViaSites },
+                          { "already_joined", branchesJoined }, { "to_grid_copper", toGrid },
+                          { "pns_length_mm", std::round( pnsLength * 100 ) / 100 }, { "pns_vias", pnsVias } };
+        }
+
         // each net's copper staged and guarded against the rest; a net the guard rejects stays out
         BOARD_COMMIT                        commit( context->GetToolManager() );
         std::vector<KIID>                   gridItems;
@@ -9731,6 +10062,21 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             gr.timeline->appliedBySwitch = false;
         }
 
+        // the detail stage: what the grid's copper joined, read from the board
+        if( detailStage )
+            board->BuildConnectivity();
+
+        auto joinedNow = [&]( size_t aIndex )
+        {
+            const JOB& job = jobs[aIndex];
+
+            if( !job.from || !job.to )
+                return false;
+
+            const auto joined = board->GetConnectivity()->GetConnectedItems( job.from );
+            return std::find( joined.begin(), joined.end(), job.to ) != joined.end();
+        };
+
         for( size_t k = 0; k < gridNets.size(); ++k )
         {
             const GRID_NET_RESULT* r = k < gr.nets.size() ? &gr.nets[k] : nullptr;
@@ -9738,9 +10084,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             for( size_t index : jobsOfNet[k] )
             {
+                if( detailOf[index] == 1 )
+                    continue;
+
                 const auto [a, b] = endsOfJob[index];
                 const bool reached = r && a < r->reached.size() && b < r->reached.size() && r->reached[a] && r->reached[b];
-                const bool ok = netOk[k] && reached;
+                const bool ok = detailStage ? netOk[k] && joinedNow( index ) : netOk[k] && reached;
                 nlohmann::json row = { { "net", jobs[index].net }, { "from", endName( jobs[index].from ) }, { "to", endName( jobs[index].to ) },
                                        { "routed", ok }, { "tries", 1 }, { "engine", "grid" } };
 
@@ -9921,6 +10270,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( gridNets[k].width < gridClassWidth[k] )
                     row["necked_from_mm"] = toMm( gridClassWidth[k] );
 
+                if( !detailWhy[index].empty() )
+                    row["pns_detail"] = detailWhy[index];
+
                 done[index] = ok;
                 rowOf[index] = (int) results.size();
                 results.push_back( row );
@@ -9932,7 +10284,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             const GAP&             gap = gaps[gg.gap];
             const GRID_NET_RESULT* r = gg.net < gr.nets.size() ? &gr.nets[gg.net] : nullptr;
             const bool             reached = r && (size_t) std::max( gg.a, gg.b ) < r->reached.size() && r->reached[gg.a] && r->reached[gg.b];
-            const bool             ok = reached && netOk[gg.net];
+            bool                   ok = reached && netOk[gg.net];
+
+            if( detailStage )
+            {
+                BOARD_CONNECTED_ITEM* a = gridNets[gg.net].ends[gg.a];
+                BOARD_CONNECTED_ITEM* b = gridNets[gg.net].ends[gg.b];
+                const auto            joined = board->GetConnectivity()->GetConnectedItems( a );
+                ok = std::find( joined.begin(), joined.end(), b ) != joined.end();
+            }
             nlohmann::json         row = { { "net", gap.net }, { "routed", ok }, { "tries", 1 }, { "engine", "grid" },
                                            { "gap", { { "from_mm", { toMm( gap.aPos.x ), toMm( gap.aPos.y ) } },
                                                       { "to_mm", { toMm( gap.bPos.x ), toMm( gap.bPos.y ) } } } } };
@@ -10083,6 +10443,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     { "guard_ms", std::round( msSince( guardFrom ) ) }, { "rejected", rejected },
                     { "costliest", costliest }, { "expanded_by_stage", gr.expandedByStage }, { "bundles", bundlesUsed },
                     { "timeline", timelineOut } };
+
+        if( detailStage )
+            gridOut["detail"] = detailOut;
 
         board->BuildConnectivity();
     }
@@ -16620,12 +16983,13 @@ KOPENAPI_REGISTER( "pcb_route",
                         "engine":{"type":"string","enum":["pns","grid"],"default":"pns","description":"grid: every net at once on one grid of the board, negotiated congestion (PathFinder) in parallel variants, the best legal result committed (diff-pair trunks still by pns, their rows say engine pns; no rip_up / clean_up passes; with dry_run the same search and guard, rows / totals / grid answered, nothing put on the board, the fills counted out as zones: refill would, the trunks not routed: their rows say not_simulated with the reason and the pairs' airwires are in the grid search; with from: 400; a fine-pitch end the grid walls in tries a lattice half a cell off at its pad: row half_cell_exits, grid.half_cell {tried, won, ms}); pns: one connection at a time with the push-and-shove router"},
                         "max_rounds":{"type":"integer","default":40,"description":"grid: negotiation rounds before the nets still crowding each other are routed apart or left out"},
                         "cell_mm":{"type":"number","default":0,"description":"grid: the cell, 0 a third of the finest track pitch (width + clearance) on a 0.025 mm step (stage global: half the pitch)"},
-                        "stage":{"type":"string","enum":["full","global"],"default":"full","description":"engine grid: full lays the copper; global only finds each connection's way on a coarse grid (cell half a track pitch), nothing laid: per connection from, to, found, corridor (runs: layer, points_mm), vias_mm (where it changes layer), layers, length_mm; answer connections, covered, vias, grid (variant, cell_mm, rounds, build_ms, route_ms, variant_stats)"},
+                        "stage":{"type":"string","enum":["full","global","detail"],"default":"full","description":"engine grid: full lays the grid's copper; detail: the global stage, then the grid's copper of each net cut into branches between its junctions (ends, points where three ways meet), each branch by pns along its corridor (corners and via sites as waypoints; bundles first, then branches between two ends, then onto a junction, shorter first; one that does not route tries its via sites alone, then the grid's copper of it through the guard): rows engine pns with detail branches, or engine grid with pns_detail (why pns did not); grid.detail {branches, by_corridor, by_via_sites, already_joined, to_grid_copper}; global only finds each connection's way on a coarse grid (cell half a track pitch), nothing laid: per connection from, to, found, corridor (runs: layer, points_mm), vias_mm (where it changes layer), layers, length_mm; answer connections, covered, vias, grid (variant, cell_mm, rounds, build_ms, route_ms, variant_stats)"},
                         "race_wait":{"type":"number","default":0.25,"description":"grid: once the first variant is done, the others get this share of its time again (2 s at least); stage global 0.1"},
                         "via_keepout_mm":{"type":"number","default":5,"description":"grid: only a chip's own nets put vias this far around it (pads on four sides, or an array outside its balls) while the board routes; other nets left short and, once all are joined, the via-saving pass may use it; 0 off"},
                         "bundles":{"description":"grid: \"auto\" (pcb_net_roles' bundles), \"off\", or [{name, nets}] in member order: a bundle's nets between the same parts are routed first, side by side (the answer's grid.bundles: name, parts, nets)","default":"auto"},
                         "via_away_mm":{"type":"number","default":7,"description":"grid: a signal via nearer a chip's pads (not an array's) than this costs more, linearly to the pads; 0 off"},
                         "via_away_cost_mm":{"type":"number","default":8,"description":"grid: a via at a chip's pads costs as much more as this length of track"},
+                        "body_cost":{"type":"number","default":1,"description":"grid: a track inside a fine-pitch package's ring of pins (between the pin rows and the exposed pad, on any layer) costs this many times more: the pins' ways in and their fan-out vias keep their room; 1 off"},
                         "rows_cost":{"type":"number","default":6,"description":"grid: a track between the two pin rows of a 2-row connector (a header) costs this many times more: pins leave the rows outward, rails run outside the row; 1 off"},
                         "via_near_hole_mm":{"type":"number","default":2.5,"description":"grid: a via nearer a through-hole pad or via of its own net than this costs more, linearly to the hole (the hole is on every layer: start on the layer needed there); 0 off"},
                         "via_near_hole_cost_mm":{"type":"number","default":6,"description":"grid: a via at its own net's through hole costs as much more as this length of track"},

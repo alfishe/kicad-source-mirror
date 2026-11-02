@@ -134,6 +134,7 @@ struct WORLD
     std::vector<std::vector<int32_t>> via;     ///< per sizes: cells
     std::vector<uint8_t>              fine;    ///< cells near a fine-pitch package
     std::vector<uint8_t>              rows;    ///< cells between the two pin rows of a connector
+    std::vector<uint8_t>              body;    ///< cells inside a fine-pitch package's ring of pins
     std::vector<uint32_t>             keep;    ///< cells around chips (a bit each) where only their own nets' vias go
     std::vector<uint16_t>             away;    ///< cells: distance in cells to the nearest chip pad, up to viaAway; empty none
     std::vector<int32_t>              endOf;   ///< states a net's track there stays inside its end copper: that net
@@ -1259,6 +1260,65 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
             continue;
 
         finePart[fp] = true;
+
+        // inside the ring of pins (pins on four sides, not an array): the room of the pins' ways in
+        // and their fan-out vias
+        if( aParams.bodyCost > 1.0f && isPackage( fp ) )
+        {
+            std::vector<BOX2I> pads;
+            BOX2I              centres;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                pads.push_back( pad->GetBoundingBox() );
+                centres = pads.size() == 1 ? BOX2I( pad->GetPosition(), VECTOR2I( 0, 0 ) ) : centres.Merge( pad->GetPosition() );
+            }
+
+            const int tol = (int) pitch / 2;
+            int       left = INT_MIN, right = INT_MAX, top = INT_MIN, bottom = INT_MAX;
+            int       sides[4] = { 0, 0, 0, 0 };
+
+            for( PAD* pad : fp->Pads() )
+            {
+                const VECTOR2I c = pad->GetPosition();
+                const BOX2I    b = pad->GetBoundingBox();
+
+                if( std::abs( c.x - centres.GetLeft() ) <= tol )
+                    left = std::max( left, b.GetRight() ), sides[0]++;
+
+                if( std::abs( c.x - centres.GetRight() ) <= tol )
+                    right = std::min( right, b.GetLeft() ), sides[1]++;
+
+                if( std::abs( c.y - centres.GetTop() ) <= tol )
+                    top = std::max( top, b.GetBottom() ), sides[2]++;
+
+                if( std::abs( c.y - centres.GetBottom() ) <= tol )
+                    bottom = std::min( bottom, b.GetTop() ), sides[3]++;
+            }
+
+            if( sides[0] >= 3 && sides[1] >= 3 && sides[2] >= 3 && sides[3] >= 3 && left < right && top < bottom
+                && !isArray( pads ) )
+            {
+                if( aWorld.body.empty() )
+                    aWorld.body.assign( aWorld.cells, 0 );
+
+                int x0, y0, x1, y1;
+                grid.CellOf( VECTOR2I( left, top ), x0, y0 );
+                grid.CellOf( VECTOR2I( right, bottom ), x1, y1 );
+
+                for( int y = std::max( 0, y0 ); y <= std::min( grid.ny - 1, y1 ); ++y )
+                {
+                    for( int x = std::max( 0, x0 ); x <= std::min( grid.nx - 1, x1 ); ++x )
+                    {
+                        const VECTOR2I c = grid.Centre( x, y );
+
+                        if( c.x > left && c.x < right && c.y > top && c.y < bottom )
+                            aWorld.body[grid.Index( x, y )] = 1;
+                    }
+                }
+            }
+        }
+
         box.Inflate( fineAround );
         int x0, y0, x1, y1;
         grid.CellOf( box.GetOrigin(), x0, y0 );
@@ -3571,7 +3631,8 @@ private:
                                          ? m_params.hug
                                          : 1.0f;
 
-            const float rows = !m_w.rows.empty() && m_w.rows[s % cells] ? m_params.rowsCost : 1.0f;
+            const float rows = ( !m_w.rows.empty() && m_w.rows[s % cells] ? m_params.rowsCost : 1.0f )
+                               * ( !m_w.body.empty() && m_w.body[s % cells] ? m_params.bodyCost : 1.0f );
 
             if( aHard )
                 return occ ? -1.0f : hug * rows;
@@ -4742,13 +4803,30 @@ std::string GRID_STRATEGY::Name() const
 }
 
 
-GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper, const BOARD_CONNECTED_ITEM* aFrom,
-                            const BOARD_CONNECTED_ITEM* aTo, int aTolerance )
+namespace
 {
-    GRID_CORRIDOR out;
 
-    if( !aFrom || !aTo )
-        return out;
+/// @brief A net's grid copper as a graph: nodes at the runs' corners and ends and at each via on
+/// every layer (UNDEFINED_LAYER: one of the net's ends, joined to the copper it touches)
+struct NET_GRAPH
+{
+    std::vector<std::pair<PCB_LAYER_ID, VECTOR2I>>   nodes;
+    std::vector<std::vector<std::pair<int, double>>> next;
+    size_t                                           copperNodes = 0;
+    std::vector<const BOARD_CONNECTED_ITEM*>         endOf;   ///< node copperNodes + i: endOf[i]
+
+    int EndNode( const BOARD_CONNECTED_ITEM* aItem ) const
+    {
+        auto it = std::find( endOf.begin(), endOf.end(), aItem );
+        return it == endOf.end() ? -1 : (int) ( copperNodes + ( it - endOf.begin() ) );
+    }
+};
+
+
+NET_GRAPH netGraph( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper, std::vector<const BOARD_CONNECTED_ITEM*> aMore,
+                    int aTolerance )
+{
+    NET_GRAPH g;
 
     struct SEGMENT
     {
@@ -4756,7 +4834,7 @@ GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper
         VECTOR2I     a, b;
     };
 
-    std::vector<SEGMENT> segments;
+    std::vector<SEGMENT>   segments;
     std::set<PCB_LAYER_ID> layers;
 
     for( const GRID_TRACK& t : aCopper.tracks )
@@ -4770,16 +4848,14 @@ GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper
         }
     }
 
-    // the graph's nodes: every run's corners and every via on each layer
     std::map<std::tuple<int, int, int>, int> index;
-    std::vector<std::pair<PCB_LAYER_ID, VECTOR2I>> nodes;
 
     auto node = [&]( PCB_LAYER_ID aLayer, const VECTOR2I& aAt )
     {
-        auto [it, fresh] = index.try_emplace( std::make_tuple( (int) aLayer, aAt.x, aAt.y ), (int) nodes.size() );
+        auto [it, fresh] = index.try_emplace( std::make_tuple( (int) aLayer, aAt.x, aAt.y ), (int) g.nodes.size() );
 
         if( fresh )
-            nodes.emplace_back( aLayer, aAt );
+            g.nodes.emplace_back( aLayer, aAt );
 
         return it->second;
     };
@@ -4790,30 +4866,50 @@ GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper
         node( s.layer, s.b );
     }
 
+    // a via's node on each layer it has a run on
+    auto viaLayers = [&]( const VECTOR2I& aAt )
+    {
+        std::vector<PCB_LAYER_ID> on;
+
+        for( PCB_LAYER_ID layer : layers )
+        {
+            for( const SEGMENT& s : segments )
+            {
+                if( s.layer == layer && SEG( s.a, s.b ).Distance( aAt ) <= 1 )
+                {
+                    on.push_back( layer );
+                    break;
+                }
+            }
+        }
+
+        return on;
+    };
+
     for( const VECTOR2I& v : aCopper.vias )
     {
-        for( PCB_LAYER_ID layer : layers )
+        for( PCB_LAYER_ID layer : viaLayers( v ) )
             node( layer, v );
     }
 
-    std::vector<std::vector<std::pair<int, double>>> next( nodes.size() );
+    g.next.resize( g.nodes.size() );
 
     auto join = [&]( int a, int b, double aCost )
     {
-        next[a].emplace_back( b, aCost );
-        next[b].emplace_back( a, aCost );
+        g.next[a].emplace_back( b, aCost );
+        g.next[b].emplace_back( a, aCost );
     };
 
     // each segment split at the nodes of its layer that lie on it
     for( const SEGMENT& s : segments )
     {
-        const SEG seg( s.a, s.b );
+        const SEG                           seg( s.a, s.b );
         std::vector<std::pair<double, int>> along;
 
-        for( size_t k = 0; k < nodes.size(); ++k )
+        for( size_t k = 0; k < g.nodes.size(); ++k )
         {
-            if( nodes[k].first == s.layer && seg.Distance( nodes[k].second ) <= 1 )
-                along.emplace_back( ( nodes[k].second - s.a ).EuclideanNorm(), (int) k );
+            if( g.nodes[k].first == s.layer && seg.Distance( g.nodes[k].second ) <= 1 )
+                along.emplace_back( ( g.nodes[k].second - s.a ).EuclideanNorm(), (int) k );
         }
 
         std::sort( along.begin(), along.end() );
@@ -4826,10 +4922,8 @@ GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper
     {
         std::vector<int> at;
 
-        for( PCB_LAYER_ID layer : layers )
+        for( PCB_LAYER_ID layer : viaLayers( v ) )
             at.push_back( node( layer, v ) );
-
-        next.resize( nodes.size() );
 
         for( size_t a = 0; a < at.size(); ++a )
         {
@@ -4838,97 +4932,46 @@ GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper
         }
     }
 
-    auto touches = [&]( const BOARD_CONNECTED_ITEM* aItem, int k )
+    g.copperNodes = g.nodes.size();
+
+    // each end a node of its own joined to the copper it touches: a pad joins the runs that end on it
+    // anywhere
+    std::vector<const BOARD_CONNECTED_ITEM*> ends( aNet.ends.begin(), aNet.ends.end() );
+    ends.insert( ends.end(), aMore.begin(), aMore.end() );
+
+    for( const BOARD_CONNECTED_ITEM* end : ends )
     {
-        return aItem->IsOnLayer( nodes[k].first ) && aItem->HitTest( nodes[k].second, aTolerance );
-    };
-
-    // each end of the net a node of its own (UNDEFINED_LAYER), joined to the copper it touches: a
-    // pad joins the runs that end on it anywhere
-    const size_t copperNodes = nodes.size();
-    std::vector<const BOARD_CONNECTED_ITEM*> endOf;
-
-    auto addEnd = [&]( const BOARD_CONNECTED_ITEM* aEnd )
-    {
-        if( !aEnd || std::find( endOf.begin(), endOf.end(), aEnd ) != endOf.end() )
-            return;
-
-        const int at = (int) nodes.size();
-        nodes.emplace_back( UNDEFINED_LAYER, aEnd->GetPosition() );
-        endOf.push_back( aEnd );
-        next.emplace_back();
-
-        for( size_t k = 0; k < copperNodes; ++k )
-        {
-            if( touches( aEnd, (int) k ) )
-                join( at, (int) k, 0 );
-        }
-    };
-
-    for( const BOARD_CONNECTED_ITEM* end : aNet.ends )
-        addEnd( end );
-
-    addEnd( aFrom );
-    addEnd( aTo );
-
-    auto endNode = [&]( const BOARD_CONNECTED_ITEM* aItem )
-    {
-        return (int) ( copperNodes + ( std::find( endOf.begin(), endOf.end(), aItem ) - endOf.begin() ) );
-    };
-
-    const int source = endNode( aFrom ), target = endNode( aTo );
-    std::vector<double> dist( nodes.size(), std::numeric_limits<double>::max() );
-    std::vector<int>    from( nodes.size(), -1 );
-    using ITEM = std::pair<double, int>;
-    std::priority_queue<ITEM, std::vector<ITEM>, std::greater<ITEM>> open;
-    dist[source] = 0;
-    open.push( { 0.0, source } );
-
-    int reached = -1;
-
-    while( !open.empty() )
-    {
-        auto [d, k] = open.top();
-        open.pop();
-
-        if( d > dist[k] )
+        if( !end || g.EndNode( end ) >= 0 )
             continue;
 
-        if( k == target )
-        {
-            reached = k;
-            break;
-        }
+        const int at = (int) g.nodes.size();
+        g.nodes.emplace_back( UNDEFINED_LAYER, end->GetPosition() );
+        g.endOf.push_back( end );
+        g.next.emplace_back();
 
-        for( const auto& [n, cost] : next[k] )
+        for( size_t k = 0; k < g.copperNodes; ++k )
         {
-            if( d + cost < dist[n] )
-            {
-                dist[n] = d + cost;
-                from[n] = k;
-                open.push( { dist[n], n } );
-            }
+            if( end->IsOnLayer( g.nodes[k].first ) && end->HitTest( g.nodes[k].second, aTolerance ) )
+                join( at, (int) k, 0 );
         }
     }
 
-    if( reached < 0 )
-        return out;
+    return g;
+}
 
-    std::vector<int> path;
 
-    for( int k = reached; k >= 0; k = from[k] )
-        path.push_back( k );
-
-    std::reverse( path.begin(), path.end() );
+/// @brief A path of graph nodes as runs per layer; through an end (a pad) the way goes on, on another
+/// layer too, without a via
+GRID_CORRIDOR toCorridor( const NET_GRAPH& aGraph, const std::vector<int>& aPath, double aLength )
+{
+    GRID_CORRIDOR out;
     out.found = true;
-    out.length = dist[reached];
-
-    // through a pad (an end node) the way goes on, on another layer too, without a via
+    out.length = aLength;
     bool padBetween = false;
 
-    for( int k : path )
+    for( int k : aPath )
     {
-        const auto& [layer, at] = nodes[k];
+        const auto& [layer, at] = aGraph.nodes[k];
 
         if( layer == UNDEFINED_LAYER )
         {
@@ -4970,6 +5013,181 @@ GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper
         }
 
         run.points = std::move( kept );
+    }
+
+    return out;
+}
+
+} // namespace
+
+
+GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper, const BOARD_CONNECTED_ITEM* aFrom,
+                            const BOARD_CONNECTED_ITEM* aTo, int aTolerance )
+{
+    if( !aFrom || !aTo )
+        return GRID_CORRIDOR();
+
+    const NET_GRAPH g = netGraph( aNet, aCopper, { aFrom, aTo }, aTolerance );
+    const int       source = g.EndNode( aFrom ), target = g.EndNode( aTo );
+
+    std::vector<double> dist( g.nodes.size(), std::numeric_limits<double>::max() );
+    std::vector<int>    from( g.nodes.size(), -1 );
+    using ITEM = std::pair<double, int>;
+    std::priority_queue<ITEM, std::vector<ITEM>, std::greater<ITEM>> open;
+    dist[source] = 0;
+    open.push( { 0.0, source } );
+
+    while( !open.empty() )
+    {
+        auto [d, k] = open.top();
+        open.pop();
+
+        if( d > dist[k] )
+            continue;
+
+        if( k == target )
+        {
+            std::vector<int> path;
+
+            for( int n = target; n >= 0; n = from[n] )
+                path.push_back( n );
+
+            std::reverse( path.begin(), path.end() );
+            return toCorridor( g, path, dist[target] );
+        }
+
+        for( const auto& [n, cost] : g.next[k] )
+        {
+            if( d + cost < dist[n] )
+            {
+                dist[n] = d + cost;
+                from[n] = k;
+                open.push( { dist[n], n } );
+            }
+        }
+    }
+
+    return GRID_CORRIDOR();
+}
+
+
+std::vector<GRID_BRANCH> GridBranches( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper, int aTolerance )
+{
+    std::vector<GRID_BRANCH> out;
+    const NET_GRAPH          g = netGraph( aNet, aCopper, {}, aTolerance );
+    const int                copper = (int) g.copperNodes;
+
+    // the end whose copper a node is in (-1 none): the copper on a pad is part of the pad
+    std::vector<int> owner( copper, -1 );
+
+    for( int k = 0; k < copper; ++k )
+    {
+        for( const auto& [n, cost] : g.next[k] )
+        {
+            if( n >= copper )
+            {
+                owner[k] = n;
+                break;
+            }
+        }
+    }
+
+    // the ways on from a node: copper neighbours not in the same end's copper
+    auto ways = [&]( int k )
+    {
+        std::vector<std::pair<int, double>> on;
+
+        for( const auto& [n, cost] : g.next[k] )
+        {
+            if( n < copper && !( owner[k] >= 0 && owner[n] == owner[k] ) )
+                on.emplace_back( n, cost );
+        }
+
+        return on;
+    };
+
+    auto junction = [&]( int k ) { return owner[k] >= 0 || ways( k ).size() >= 3; };
+
+    auto endIndex = [&]( int k ) -> int
+    {
+        if( owner[k] < 0 )
+            return -1;
+
+        auto it = std::find( aNet.ends.begin(), aNet.ends.end(), g.endOf[owner[k] - copper] );
+        return it == aNet.ends.end() ? -1 : (int) ( it - aNet.ends.begin() );
+    };
+
+    std::set<std::pair<int, int>> walked;   // a branch's first step out of its junction, each way
+
+    for( int j = 0; j < copper; ++j )
+    {
+        if( !junction( j ) )
+            continue;
+
+        for( const auto& [first, firstCost] : ways( j ) )
+        {
+            if( walked.count( { j, first } ) )
+                continue;
+
+            std::vector<int> path = { j };
+            double           length = 0;
+            int              prev = j, at = first;
+            double           step = firstCost;
+            bool             dead = false;
+
+            while( true )
+            {
+                path.push_back( at );
+                length += step;
+
+                if( junction( at ) )
+                    break;
+
+                int    onto = -1;
+                double cost = 0;
+
+                for( const auto& [n, c] : ways( at ) )
+                {
+                    if( n != prev )
+                    {
+                        onto = n;
+                        cost = c;
+                        break;
+                    }
+                }
+
+                if( onto < 0 || std::find( path.begin(), path.end(), onto ) != path.end() )
+                {
+                    dead = true;
+                    break;
+                }
+
+                prev = at;
+                at = onto;
+                step = cost;
+            }
+
+            walked.insert( { j, first } );
+            walked.insert( { at, path[path.size() - 2] } );
+
+            if( dead || at == j || ( owner[j] >= 0 && owner[at] == owner[j] ) )
+                continue;
+
+            GRID_BRANCH b;
+            b.a = endIndex( path.front() );
+            b.b = endIndex( path.back() );
+
+            if( b.a < 0 && b.b >= 0 )
+            {
+                std::reverse( path.begin(), path.end() );
+                std::swap( b.a, b.b );
+            }
+
+            b.way = toCorridor( g, path, length );
+            b.bAt = g.nodes[path.back()].second;
+            b.bLayer = g.nodes[path.back()].first;
+            out.push_back( std::move( b ) );
+        }
     }
 
     return out;

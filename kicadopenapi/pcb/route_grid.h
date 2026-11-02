@@ -81,6 +81,7 @@ struct GRID_PARAMS
     int                       viaNearHole = 0; ///< a via nearer a through hole of its own net than this costs more; 0 none
     int                       viaNearHoleCost = 0; ///< at the hole: as much as this length of track
     float                     rowsCost = 1.0f; ///< cost factor of a cell between the two pin rows of a connector; 1 none
+    float                     bodyCost = 1.0f; ///< cost factor of a cell inside a fine-pitch package's ring of pins; 1 none
     float                     hug = 1.0f;      ///< cost factor of a cell beside the copper of the net's own bundle; 1 none
     float                     astar = 1.2f;    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
     float                     pfStart = 1.0f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
@@ -245,6 +246,20 @@ struct GRID_CORRIDOR
 /// within aTolerance of it on its layers)
 GRID_CORRIDOR GridCorridor( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper, const BOARD_CONNECTED_ITEM* aFrom,
                             const BOARD_CONNECTED_ITEM* aTo, int aTolerance );
+
+/// @brief A piece of a net's grid copper between two junctions: ends of the net (a, b: indices into
+/// GRID_NET::ends) or a point where three ways meet (-1; b's at bAt on bLayer); a is an end when either is
+struct GRID_BRANCH
+{
+    int           a = -1, b = -1;
+    VECTOR2I      bAt;
+    PCB_LAYER_ID  bLayer = UNDEFINED_LAYER;
+    GRID_CORRIDOR way;
+};
+
+/// @brief The net's grid copper cut at its junctions (the net's ends, points where three ways meet);
+/// pieces that end nowhere are left out
+std::vector<GRID_BRANCH> GridBranches( const GRID_NET& aNet, const GRID_NET_RESULT& aCopper, int aTolerance );
 
 /**
  * Join each net's ends over one grid of the board, all nets together: negotiated congestion
