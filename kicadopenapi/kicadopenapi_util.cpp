@@ -275,12 +275,16 @@ bool KopenapiNaturalLess( const std::string& aA, const std::string& aB )
 }
 
 
-nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json& aArgs, size_t aDefaultLimit )
+nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json& aArgs, size_t aDefaultLimit,
+                             size_t aMaxLimit, bool aAllowFull )
 {
     size_t limit = aDefaultLimit;
 
     if( aArgs.contains( "limit" ) && aArgs["limit"].is_number_integer() )
-        limit = static_cast<size_t>( std::clamp( aArgs["limit"].get<long long>(), 1LL, 1000LL ) );
+        limit = static_cast<size_t>( std::clamp( aArgs["limit"].get<long long>(), 1LL, static_cast<long long>( aMaxLimit ) ) );
+
+    if( aAllowFull && aArgs.is_object() && aArgs.value( "full", false ) )
+        limit = std::numeric_limits<size_t>::max();
 
     size_t offset = 0;
 
@@ -300,10 +304,15 @@ nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json&
 }
 
 
-nlohmann::json KopenapiPageSchema( int aDefaultLimit )
+nlohmann::json KopenapiPageSchema( int aDefaultLimit, int aMaxLimit, bool aAllowFull )
 {
-    return { { "limit", { { "type", "integer" }, { "minimum", 1 }, { "maximum", 1000 }, { "default", aDefaultLimit } } },
-             { "cursor", { { "type", "string" }, { "description", "next_cursor of the previous page" } } } };
+    nlohmann::json page = { { "limit", { { "type", "integer" }, { "minimum", 1 }, { "maximum", aMaxLimit }, { "default", aDefaultLimit } } },
+                            { "cursor", { { "type", "string" }, { "description", "next_cursor of the previous page" } } } };
+
+    if( aAllowFull )
+        page["full"] = { { "type", "boolean" }, { "default", false }, { "description", "every item from the cursor on, no limit" } };
+
+    return page;
 }
 
 
@@ -347,10 +356,10 @@ nlohmann::json KopenapiNetRoleFromName( const std::string& aNetName )
 }
 
 
-nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit )
+nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit, int aMaxLimit, bool aAllowFull )
 {
     // a named object: a range-for over items() of a temporary iterates a destroyed object
-    const nlohmann::json page = KopenapiPageSchema( aDefaultLimit );
+    const nlohmann::json page = KopenapiPageSchema( aDefaultLimit, aMaxLimit, aAllowFull );
 
     for( const auto& [key, value] : page.items() )
         aProperties[key] = value;

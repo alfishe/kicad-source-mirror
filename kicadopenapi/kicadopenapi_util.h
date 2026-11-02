@@ -62,10 +62,12 @@ KICOMMON_API wxString KopenapiCanonicalPath( const wxString& aPath );
 /// @brief Natural order: "R2" < "R10", case-insensitive
 KICOMMON_API bool KopenapiNaturalLess( const std::string& aA, const std::string& aB );
 
-/// @brief One page of aItems: args "limit" (default aDefaultLimit, max 1000) and "cursor" (opaque,
-/// from the previous page).  Returns { items, total, next_cursor (null on the last page) }.
+/// @brief One page of aItems: args "limit" (default aDefaultLimit, max aMaxLimit) and "cursor" (opaque,
+/// from the previous page); aAllowFull: "full": true gives every item from the cursor on.
+/// Returns { items, total, next_cursor (null on the last page) }.
 KICOMMON_API nlohmann::json KopenapiPage( const nlohmann::json& aItems, const nlohmann::json& aArgs,
-                                          size_t aDefaultLimit = 100 );
+                                          size_t aDefaultLimit = 100, size_t aMaxLimit = 1000,
+                                          bool aAllowFull = false );
 
 /// @brief Role of a net guessed from its name only: { role: ground|power|clock|reset|signal|unconnected,
 /// basis: [...] }.  Hierarchical prefixes ("/CPU/") are ignored, a trailing '/' (active-low,
@@ -145,11 +147,13 @@ private:
     bool   m_full;
 };
 
-/// @brief JSON schema properties shared by all paginated methods (limit, cursor)
-KICOMMON_API nlohmann::json KopenapiPageSchema( int aDefaultLimit = 100 );
+/// @brief JSON schema properties shared by all paginated methods (limit up to aMaxLimit, cursor;
+/// full with aAllowFull)
+KICOMMON_API nlohmann::json KopenapiPageSchema( int aDefaultLimit = 100, int aMaxLimit = 1000, bool aAllowFull = false );
 
-/// @brief Object schema with aProperties plus limit/cursor
-KICOMMON_API nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit = 100 );
+/// @brief Object schema with aProperties plus limit/cursor (and full)
+KICOMMON_API nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit = 100,
+                                                 int aMaxLimit = 1000, bool aAllowFull = false );
 
 /// @brief Default page size of ranked searches (KopenapiRankedPage)
 constexpr int KOPENAPI_RANKED_PAGE = 20;

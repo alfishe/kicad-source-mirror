@@ -7,6 +7,10 @@
 #include <map>
 
 
+// violations a page of a check lists at most; full: true lists all
+static constexpr int CHECK_PAGE_MAX = 100000;
+
+
 bool KopenapiSeverityMask( const nlohmann::json& aArgs, int& aMask )
 {
     aMask = RPT_SEVERITY_ERROR | RPT_SEVERITY_WARNING;
@@ -46,7 +50,7 @@ nlohmann::json KopenapiCheckSchema( nlohmann::json aExtra )
     for( const auto& [key, value] : aExtra.items() )
         properties[key] = value;
 
-    return KopenapiPagedSchema( properties );
+    return KopenapiPagedSchema( properties, 100, CHECK_PAGE_MAX, true );
 }
 
 
@@ -92,7 +96,7 @@ nlohmann::json KopenapiCheckResult( const std::vector<nlohmann::json>& aViolatio
     for( size_t i = 0; i < aUnconnected.size() && i < limit; ++i )
         unconnected.push_back( aUnconnected[i] );
 
-    nlohmann::json result = KopenapiPage( rows, aArgs );
+    nlohmann::json result = KopenapiPage( rows, aArgs, 100, CHECK_PAGE_MAX, true );
     result["summary"] = { { "errors", errors },
                           { "warnings", warnings },
                           { "excluded", excluded },

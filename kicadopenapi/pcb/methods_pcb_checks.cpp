@@ -495,7 +495,7 @@ KOPENAPI_REGISTER( "pcb_drc",
                    "Run DRC (design rules check) on the open board with KiCad's own engine, like "
                    "`kicad-cli pcb drc`: summary by severity and type, violations (type, severity, "
                    "description, items with uuid and position in mm), unconnected items, ignored checks; "
-                   "filter by severity and type glob; paginated; refill_zones refills copper first "
+                   "filter by severity and type glob; paginated (limit up to 100000, cursor; full: true lists every violation); refill_zones refills copper first "
                    "(changes the board); the footprint libraries the board uses read again when their files changed "
                    "on disk (lib_footprint_mismatch against the current files, 3D models included); model_findings: 3D model "
                    "files not found and stale / mismatching <model>.meta.json (pcb_parts_check). For schematic parity use design_parity",
