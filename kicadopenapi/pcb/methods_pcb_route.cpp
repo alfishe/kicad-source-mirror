@@ -1356,6 +1356,7 @@ struct ROUTE_PROFILE
     int    ripUpsWalled = 0;      ///< rip-ups not made: no plan even through the routes of this call
     int    ripUpsPlanned = 0;     ///< rip-ups whose routes to take out a plan chose (the rest: the nearest in the corridor)
     std::map<std::string, int> ripUpsFailedAt;   ///< failed rip-ups by what failed: the route, a victim, a cut one
+    int    cutByRoutes = 0;       ///< routed connections a later route cut (moving their net's copper), opened again
     int    ripUpsSecond = 0;      ///< victims with no way back that took out routes in turn
     int    pairsStuck = 0;        ///< pair tries ended early: nothing placed after the first steps
     int    frontRetries = 0;      ///< tries refused for walling in a port, made again last with the ways out as obstacles
@@ -2526,6 +2527,27 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
 
     for( BOARD_ITEM* item : iface->m_added )
         aAdded.push_back( item->m_Uuid );
+
+    // every other net whose copper the route moved, the coupled one's too: its connections may be cut
+    std::set<int> movedNets;
+
+    for( const BOARD_ITEM* item : iface->m_added )
+    {
+        if( const auto* c = dynamic_cast<const BOARD_CONNECTED_ITEM*>( item ); c && c->GetNetCode() > 0 && c->GetNetCode() != aReq.from->GetNetCode() )
+            movedNets.insert( c->GetNetCode() );
+    }
+
+    for( const auto* items : { &iface->m_modified, &iface->m_removed } )
+    {
+        for( const BOARD_ITEM* item : *items )
+        {
+            if( const auto* c = dynamic_cast<const BOARD_CONNECTED_ITEM*>( item ); c && c->GetNetCode() > 0 && c->GetNetCode() != aReq.from->GetNetCode() )
+                movedNets.insert( c->GetNetCode() );
+        }
+    }
+
+    if( !movedNets.empty() )
+        aOut["moved_nets"] = movedNets;
 
     for( BOARD_ITEM* item : iface->m_added )
     {
@@ -5421,6 +5443,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     std::vector<ESCAPE_FRONT> fronts;
     const std::vector<bool>*  doneOf = nullptr;
 
+    // after a route that moved copper of other nets: their routed connections it cut are open again
+    std::function<void( const nlohmann::json& aMovedNets, const std::string& aBy )> reopenCut;
+
     // the planned ports of signal pins (ports), filled once the jobs are final
     std::map<const PAD*, PORT_GOAL> portGoals;
 
@@ -5880,8 +5905,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // Every way to route one connection: on a layer both ends are on (walkaround, then shove),
     // then out through a via near each end and across on another layer.  aShove false keeps every
     // other route as it is (rip-up attempts must be revertible).
-    auto tryRoute = [&]( JOB& aJob, nlohmann::json& aAttempt, int& aTries, bool aShove, bool aBothWays,
-                         bool aForward = true ) -> bool
+    auto tryRouteWays = [&]( JOB& aJob, nlohmann::json& aAttempt, int& aTries, bool aShove, bool aBothWays,
+                             bool aForward ) -> bool
     {
         struct TIMED
         {
@@ -6785,6 +6810,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         else if( !ok && aTries >= maxTries )
             aAttempt["reason"] = "gave up after " + std::to_string( aTries ) + " tries (max_tries); last: "
                                  + aAttempt.value( "reason", std::string( "-" ) );
+
+        return ok;
+    };
+
+    // a route never leaves a connection it cut behind as routed: a cut one is open again for the passes after
+    auto tryRoute = [&]( JOB& aJob, nlohmann::json& aAttempt, int& aTries, bool aShove, bool aBothWays,
+                         bool aForward = true ) -> bool
+    {
+        const bool ok = tryRouteWays( aJob, aAttempt, aTries, aShove, aBothWays, aForward );
+
+        if( ok && reopenCut && aAttempt.contains( "moved_nets" ) )
+            reopenCut( aAttempt["moved_nets"], aJob.net );
 
         return ok;
     };
@@ -9296,6 +9333,74 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     std::vector<int>  rowOf( jobs.size(), -1 );
     std::vector<bool> done( jobs.size(), false );
     std::vector<bool> overFirstBudget( jobs.size(), false );   // the first pass ran out of time for it
+
+    reopenCut = [&]( const nlohmann::json& aMovedNets, const std::string& aBy )
+    {
+        const std::set<int> moved = aMovedNets.get<std::set<int>>();
+        bool                built = false;
+
+        for( size_t k = 0; k < jobs.size(); ++k )
+        {
+            if( !done[k] || jobs[k].trunk || rowOf[k] < 0 || !moved.count( jobs[k].from->GetNetCode() ) )
+                continue;
+
+            auto* a = dynamic_cast<PAD*>( board->ResolveItem( jobs[k].fromId, true ) );
+            auto* b = dynamic_cast<PAD*>( board->ResolveItem( jobs[k].toId, true ) );
+
+            if( !a || !b )
+                continue;
+
+            if( !built )
+            {
+                board->BuildConnectivity();
+                built = true;
+            }
+
+            const auto joined = board->GetConnectivity()->GetConnectedItems( a );
+
+            if( std::find( joined.begin(), joined.end(), b ) != joined.end() )
+                continue;
+
+            done[k] = false;
+            profile.cutByRoutes++;
+            nlohmann::json& row = results[rowOf[k]];
+            row["routed"] = false;
+            row["reason"] = "cut by the route of " + aBy;
+        }
+    };
+
+    // connections opened by a cut that a rip-up put back joined: routed again
+    auto rejoinCut = [&]()
+    {
+        bool built = false;
+
+        for( size_t k = 0; k < jobs.size(); ++k )
+        {
+            if( done[k] || rowOf[k] < 0 || !results[rowOf[k]].value( "reason", std::string() ).starts_with( "cut by the route of" ) )
+                continue;
+
+            auto* a = dynamic_cast<PAD*>( board->ResolveItem( jobs[k].fromId, true ) );
+            auto* b = dynamic_cast<PAD*>( board->ResolveItem( jobs[k].toId, true ) );
+
+            if( !a || !b )
+                continue;
+
+            if( !built )
+            {
+                board->BuildConnectivity();
+                built = true;
+            }
+
+            const auto joined = board->GetConnectivity()->GetConnectedItems( a );
+
+            if( std::find( joined.begin(), joined.end(), b ) != joined.end() )
+            {
+                done[k] = true;
+                results[rowOf[k]]["routed"] = true;
+                results[rowOf[k]].erase( "reason" );
+            }
+        }
+    };
 
     // Ways out of the fine-pitch pads on the edges of their packages (pads inside the ring of an area
     // array are left to the fan-out): from the pad's end outward, room for a track or a via.  The
@@ -12698,6 +12803,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 undo.Push( _( "Rip up undone (API)" ) );
                 board->GetConnectivity()->RecalculateRatsnest();
+                rejoinCut();
                 ripFailed[index].insert( { boardVersion, victims } );
                 profile.ripUpsFailedAt[failedAt]++;
 
@@ -13510,6 +13616,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                              { "rip_ups_walled", profile.ripUpsWalled },
                                              { "rip_ups_failed_at", profile.ripUpsFailedAt },
                                              { "rip_ups_second", profile.ripUpsSecond },
+                                             { "cut_by_routes", profile.cutByRoutes },
                                              { "pairs_stuck", profile.pairsStuck },
                                              { "front_retries", { { "tried", profile.frontRetries }, { "won", profile.frontRetriesWon } } },
                                              { "pad_exits", { { "tried", profile.padExitsTried }, { "won", profile.padExitsWon } } },
