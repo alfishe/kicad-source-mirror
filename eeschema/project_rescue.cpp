@@ -32,6 +32,7 @@
 #include <wildcards_and_files_ext.h>
 #include <wx/msgdlg.h>
 
+#include <algorithm>
 #include <cctype>
 #include <map>
 #include <pgm_base.h>
@@ -100,6 +101,44 @@ static LIB_SYMBOL* findSymbol( const wxString& aName, LEGACY_SYMBOL_LIBS* aLibs,
     }
 
     return symbol;
+}
+
+
+/// The cache symbol of a library symbol written as "lib-name" or, as KiCad 5.1 writes it, "lib_name"
+static LIB_SYMBOL* findCachedSymbol( const LIB_ID& aId, LEGACY_SYMBOL_LIBS* aLibs )
+{
+    for( const wxChar* separator : { wxT( "-" ), wxT( "_" ) } )
+    {
+        const wxString name = aId.GetLibNickname().wx_str() + wxString( separator ) + aId.GetLibItemName().wx_str();
+
+        if( LIB_SYMBOL* symbol = findSymbol( name, aLibs, true ) )
+            return symbol;
+    }
+
+    return nullptr;
+}
+
+
+/// A message of the rescue in its frame's infobar; a message box without one
+static void rescueMessage( wxWindow* aParent, const wxString& aMessage, bool aError )
+{
+    for( wxWindow* window = aParent; window; window = window->GetParent() )
+    {
+        if( EDA_BASE_FRAME* frame = dynamic_cast<EDA_BASE_FRAME*>( window ); frame && frame->GetInfoBar() )
+        {
+            if( aError )
+                frame->ShowInfoBarError( aMessage, true );
+            else
+                frame->ShowInfoBarMsg( aMessage, true );
+
+            return;
+        }
+    }
+
+    if( aError )
+        DisplayErrorMessage( aParent, aMessage );
+    else
+        DisplayInfoMessage( aParent, aMessage );
 }
 
 
@@ -230,13 +269,7 @@ void RESCUE_CACHE_CANDIDATE::FindRescues( RESCUER& aRescuer, boost::ptr_vector<R
             // replaced by '_' when writing the symbol cache library so we have to test for
             // the LIB_NICKNAME_LIB_SYMBOL_NAME case.
             if( !cache_match && eachSymbol->GetLibId().IsValid() )
-            {
-                wxString tmp = wxString::Format( wxT( "%s-%s" ),
-                                                 eachSymbol->GetLibId().GetLibNickname().wx_str(),
-                                                 eachSymbol->GetLibId().GetLibItemName().wx_str() );
-                cache_match = findSymbol( tmp, PROJECT_SCH::LegacySchLibs( aRescuer.GetPrj() ),
-                                          true );
-            }
+                cache_match = findCachedSymbol( eachSymbol->GetLibId(), PROJECT_SCH::LegacySchLibs( aRescuer.GetPrj() ) );
 
             // Test whether there is a conflict or if the symbol can only be found in the cache
             // and the symbol name does not have any illegal characters.
@@ -371,12 +404,7 @@ void RESCUE_SYMBOL_LIB_TABLE_CANDIDATE::FindRescues( RESCUER& aRescuer,
             // replaced by '_' when writing the symbol cache library so we have to test for
             // the LIB_NICKNAME_LIB_SYMBOL_NAME case.
             if( !cache_match )
-            {
-                symbolName.Printf( wxT( "%s-%s" ),
-                                   symbol_id.GetLibNickname().wx_str(),
-                                   symbol_id.GetLibItemName().wx_str() );
-                cache_match = findSymbol( symbolName, PROJECT_SCH::LegacySchLibs( aRescuer.GetPrj() ), true );
-            }
+                cache_match = findCachedSymbol( symbol_id, PROJECT_SCH::LegacySchLibs( aRescuer.GetPrj() ) );
 
             // Get the library symbol from the symbol library table.
             lib_match = SchGetLibSymbol( symbol_id, PROJECT_SCH::SymbolLibAdapter( aRescuer.GetPrj() ) );
@@ -540,30 +568,23 @@ void RESCUER::UndoRescues()
 
 bool RESCUER::RescueProject( wxWindow* aParent, RESCUER& aRescuer, bool aRunningOnDemand )
 {
-    aRescuer.FindCandidates();
+    aRescuer.FindUniqueCandidates();
 
     if( !aRescuer.GetCandidateCount() )
     {
         if( aRunningOnDemand )
-        {
-            KICAD_MESSAGE_DIALOG dlg( aParent, _( "This project has nothing to rescue." ),
-                                      _( "Project Rescue Helper" ) );
-            dlg.ShowModal();
-        }
+            rescueMessage( aParent, _( "This project has nothing to rescue." ), false );
 
         return true;
     }
 
-    aRescuer.RemoveDuplicates();
     aRescuer.InvokeDialog( aParent, !aRunningOnDemand );
 
     // If no symbols were rescued, let the user know what's going on. He might
     // have clicked cancel by mistake, and should have some indication of that.
     if( !aRescuer.GetChosenCandidateCount() )
     {
-        KICAD_MESSAGE_DIALOG dlg( aParent, _( "No symbols were rescued." ),
-                                  _( "Project Rescue Helper" ) );
-        dlg.ShowModal();
+        rescueMessage( aParent, _( "No symbols were rescued." ), false );
 
         // Set the modified flag even on Cancel. Many users seem to instinctively want to Save at
         // this point, due to the reloading of the symbols, so we'll make the save button active.
@@ -578,9 +599,81 @@ bool RESCUER::RescueProject( wxWindow* aParent, RESCUER& aRescuer, bool aRunning
         return false;
     }
 
-    aRescuer.WriteRescueLibrary( aParent );
+    wxString error;
+
+    if( !aRescuer.WriteRescueLibrary( error ) )
+        rescueMessage( aParent, error, true );
 
     return true;
+}
+
+
+void RESCUER::FindUniqueCandidates()
+{
+    if( !m_all_candidates.empty() )
+        return;
+
+    FindCandidates();
+    RemoveDuplicates();
+}
+
+
+std::vector<wxString> RESCUER::ChooseCandidates( const std::optional<std::vector<wxString>>& aNames )
+{
+    std::vector<wxString>          unknown;
+    std::vector<RESCUE_CANDIDATE*> chosen;
+
+    if( aNames )
+    {
+        for( const wxString& name : *aNames )
+        {
+            auto it = std::find_if( m_all_candidates.begin(), m_all_candidates.end(),
+                                    [&]( const RESCUE_CANDIDATE& aCandidate )
+                                    {
+                                        return aCandidate.GetRequestedName() == name;
+                                    } );
+
+            if( it == m_all_candidates.end() )
+                unknown.push_back( name );
+            else if( std::find( chosen.begin(), chosen.end(), &*it ) == chosen.end() )
+                chosen.push_back( &*it );
+        }
+    }
+    else
+    {
+        for( RESCUE_CANDIDATE& candidate : m_all_candidates )
+            chosen.push_back( &candidate );
+    }
+
+    m_chosen_candidates = unknown.empty() ? chosen : std::vector<RESCUE_CANDIDATE*>();
+    return unknown;
+}
+
+
+bool RESCUER::RescueChosen( RESCUER& aRescuer, const std::optional<std::vector<wxString>>& aNames,
+                            wxString& aError )
+{
+    aRescuer.FindUniqueCandidates();
+
+    if( std::vector<wxString> unknown = aRescuer.ChooseCandidates( aNames ); !unknown.empty() )
+    {
+        aError = wxString::Format( _( "No rescue candidate named '%s'." ), unknown.front() );
+        return false;
+    }
+
+    if( !aRescuer.GetChosenCandidateCount() )
+        return true;
+
+    aRescuer.OpenRescueLibrary();
+
+    if( !aRescuer.DoRescues() )
+    {
+        aRescuer.UndoRescues();
+        aError = _( "A symbol could not be rescued; the rescues were undone." );
+        return false;
+    }
+
+    return aRescuer.WriteRescueLibrary( aError );
 }
 
 
@@ -659,7 +752,7 @@ void LEGACY_RESCUER::OpenRescueLibrary()
 }
 
 
-bool LEGACY_RESCUER::WriteRescueLibrary( wxWindow *aParent )
+bool LEGACY_RESCUER::WriteRescueLibrary( wxString& aError )
 {
     try
     {
@@ -667,8 +760,7 @@ bool LEGACY_RESCUER::WriteRescueLibrary( wxWindow *aParent )
     }
     catch( ... /* IO_ERROR ioe */ )
     {
-        DisplayError( aParent, wxString::Format( _( "Failed to create symbol library file '%s'." ),
-                                                 m_rescue_lib->GetFullFileName() ) );
+        aError = wxString::Format( _( "Failed to create symbol library file '%s'." ), m_rescue_lib->GetFullFileName() );
         return false;
     }
 
@@ -696,9 +788,9 @@ bool LEGACY_RESCUER::WriteRescueLibrary( wxWindow *aParent )
         libNames.Insert( libName, 0 );
         LEGACY_SYMBOL_LIBS::SetLibNamesAndPaths( m_prj, libPaths, libNames );
     }
-    catch( const IO_ERROR& )
+    catch( const IO_ERROR& ioe )
     {
-        // Could not get or save the current libraries.
+        aError = _( "The project's symbol library list could not be read or saved." ) + wxS( " " ) + ioe.What();
         return false;
     }
 
@@ -725,6 +817,7 @@ bool LEGACY_RESCUER::WriteRescueLibrary( wxWindow *aParent )
         // Restore the old list
         libs->clear();
         libs->transfer( libs->end(), libsSave.begin(), libsSave.end(), libsSave );
+        aError = _( "The symbol libraries could not be loaded again." );
         return false;
     }
 
@@ -793,7 +886,7 @@ void SYMBOL_LIB_TABLE_RESCUER::OpenRescueLibrary()
 }
 
 
-bool SYMBOL_LIB_TABLE_RESCUER::WriteRescueLibrary( wxWindow *aParent )
+bool SYMBOL_LIB_TABLE_RESCUER::WriteRescueLibrary( wxString& aError )
 {
     LIBRARY_MANAGER& manager = Pgm().GetLibraryManager();
 
@@ -815,9 +908,8 @@ bool SYMBOL_LIB_TABLE_RESCUER::WriteRescueLibrary( wxWindow *aParent )
     }
     catch( const IO_ERROR& ioe )
     {
-        wxString msg;
-        msg.Printf( _( "Failed to save rescue library %s." ), fn.GetFullPath() );
-        DisplayErrorMessage( aParent, msg, ioe.What() );
+        aError = wxString::Format( _( "Failed to save rescue library %s." ), fn.GetFullPath() ) + wxS( " " )
+                 + ioe.What();
         return false;
     }
 
@@ -830,7 +922,12 @@ bool SYMBOL_LIB_TABLE_RESCUER::WriteRescueLibrary( wxWindow *aParent )
 
         std::optional<LIBRARY_TABLE*> optTable = manager.Table( LIBRARY_TABLE_TYPE::SYMBOL,
                                                                 LIBRARY_TABLE_SCOPE::PROJECT );
-        wxCHECK( optTable, false );
+        if( !optTable )
+        {
+            aError = _( "The project has no symbol library table." );
+            return false;
+        }
+
         LIBRARY_TABLE* projectTable = *optTable;
         LIBRARY_TABLE_ROW* row = nullptr;
 
@@ -846,11 +943,9 @@ bool SYMBOL_LIB_TABLE_RESCUER::WriteRescueLibrary( wxWindow *aParent )
         bool success = true;
 
         projectTable->Save().map_error(
-                [&success]( const LIBRARY_ERROR& aError )
+                [&]( const LIBRARY_ERROR& aSaveError )
                 {
-                    wxMessageBox( _( "Error saving library table:\n\n" ) + aError.message,
-                                  _( "File Save Error" ), wxOK | wxICON_ERROR );
-
+                    aError = _( "Error saving library table:" ) + wxS( " " ) + aSaveError.message;
                     success = false;
                 } );
 

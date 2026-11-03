@@ -477,6 +477,8 @@ set( EESCHEMA_SRCS
     pin_type.cpp
     project_sch.cpp
     project_rescue.cpp
+    symbol_remapper.cpp
+    sch_bus_migration.cpp
     refdes_tracker.cpp
     sch_base_frame.cpp
     sch_bitmap.cpp

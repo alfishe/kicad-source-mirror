@@ -150,7 +150,7 @@ void SCH_CONNECTION::ConfigureFromLabel( const wxString& aLabel )
 
     wxString unescaped = UnescapeString( aLabel );
 
-    if( NET_SETTINGS::ParseBusVector( unescaped, &prefix, &members ) )
+    if( NET_SETTINGS::ParseBusVector( unescaped, &prefix, &members, &m_vector_start, &m_vector_end ) )
     {
         m_type = CONNECTION_TYPE::BUS;
         m_vector_prefix = std::move( prefix );

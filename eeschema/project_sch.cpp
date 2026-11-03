@@ -23,6 +23,7 @@
 #include <pgm_base.h>
 #include <wx/app.h>
 #include <core/utf8.h>
+#include <kicadopenapi_service.h>
 #include <project_sch.h>
 #include <libraries/legacy_symbol_library.h>
 #include <libraries/symbol_library_adapter.h>
@@ -87,7 +88,7 @@ SEARCH_STACK* PROJECT_SCH::SchSearchS( PROJECT* aProject )
 }
 
 
-LEGACY_SYMBOL_LIBS* PROJECT_SCH::LegacySchLibs( PROJECT* aProject )
+LEGACY_SYMBOL_LIBS* PROJECT_SCH::LegacySchLibs( PROJECT* aProject, wxString* aLoadErrors )
 {
     auto libs = static_cast<LEGACY_SYMBOL_LIBS*>( aProject->GetElem( PROJECT::ELEM::LEGACY_SYMBOL_LIBS ) );
 
@@ -100,29 +101,48 @@ LEGACY_SYMBOL_LIBS* PROJECT_SCH::LegacySchLibs( PROJECT* aProject )
         // Make PROJECT the new SYMBOL_LIBS owner.
         aProject->SetElem( PROJECT::ELEM::LEGACY_SYMBOL_LIBS, libs );
 
+        const bool quiet = aLoadErrors || !Pgm().IsGUI() || KICAD_OPENAPI_SERVICE::NoModalUi();
+
+        auto report = [&]( const wxString& aText )
+        {
+            wxLogWarning( wxS( "%s" ), aText );
+
+            if( aLoadErrors )
+                *aLoadErrors << aText;
+        };
+
         try
         {
-            libs->LoadAllLibraries( aProject );
+            libs->LoadAllLibraries( aProject, !quiet );
         }
         catch( const PARSE_ERROR& pe )
         {
             wxString    lib_list = UTF8( pe.inputLine );
-            wxWindow*   parent = Pgm().App().GetTopWindow();
 
-            // parent of this dialog cannot be NULL since that breaks the Kiway() chain.
-            HTML_MESSAGE_BOX dlg( parent, _( "Not Found" ) );
+            if( quiet )
+            {
+                report( _( "The following libraries were not found:" ) + wxS( "\n" ) + lib_list );
+            }
+            else
+            {
+                wxWindow* parent = Pgm().App().GetTopWindow();
 
-            dlg.MessageSet( _( "The following libraries were not found:" ) );
-            dlg.ListSet( lib_list );
-            dlg.Layout();
+                // parent of this dialog cannot be NULL since that breaks the Kiway() chain.
+                HTML_MESSAGE_BOX dlg( parent, _( "Not Found" ) );
 
-            dlg.ShowModal();
+                dlg.MessageSet( _( "The following libraries were not found:" ) );
+                dlg.ListSet( lib_list );
+                dlg.Layout();
+
+                dlg.ShowModal();
+            }
         }
         catch( const IO_ERROR& ioe )
         {
-            wxWindow* parent = Pgm().App().GetTopWindow();
-
-            DisplayError( parent, ioe.What() );
+            if( quiet )
+                report( ioe.What() );
+            else
+                DisplayError( Pgm().App().GetTopWindow(), ioe.What() );
         }
     }
 

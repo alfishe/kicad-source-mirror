@@ -28,6 +28,7 @@
 #include <project/project_file.h>
 #include <schematic.h>
 #include <reporter.h>
+#include <sch_autosave_recovery.h>
 #include <sch_commit.h>
 #include <sch_edit_frame.h>
 #include <sch_file_versions.h>
@@ -93,7 +94,8 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
                                             bool aSetActive,
                                             bool aForceDefaultProject,
                                             PROJECT* aProject,
-                                            bool aCalculateConnectivity, REPORTER* aRootReporter )
+                                            bool aCalculateConnectivity, REPORTER* aRootReporter,
+                                            const wxString& aContentDir )
 {
     wxFileName pro = aFileName;
     pro.SetExt( FILEEXT::ProjectFileExtension );
@@ -144,6 +146,12 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
 
     wxFileName schFile = aFileName;
     schFile.MakeAbsolute();
+
+    const auto contentPath = [&]( const wxFileName& aPath ) -> wxString
+    {
+        return aContentDir.IsEmpty() ? aPath.GetFullPath()
+                                     : MoveSchematicPath( aPath.GetFullPath(), schFile.GetPath(), aContentDir );
+    };
 
     try
     {
@@ -211,12 +219,13 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
 
         // Load every declared top-level sheet so headless callers plot what the GUI does
         // A missing named file still fails to load rather than falling back to its siblings
-        if( projectSheets.size() > 1 && namedSheet && schFile.FileExists() )
+        if( projectSheets.size() > 1 && namedSheet && wxFileExists( contentPath( schFile ) ) )
         {
             for( const TOP_LEVEL_SHEET_INFO& info : projectSheets )
             {
                 wxFileName sheetFn( projectDir, info.filename );
                 sheetFn.MakeAbsolute();
+                sheetFn = contentPath( sheetFn );
 
                 if( !sheetFn.FileExists() )
                     continue;
@@ -243,7 +252,7 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
         }
         else
         {
-            SCH_SHEET* rootSheet = loadSheet( schFile.GetFullPath(), namedSheet != nullptr );
+            SCH_SHEET* rootSheet = loadSheet( contentPath( schFile ), namedSheet != nullptr );
 
             if( !rootSheet )
             {

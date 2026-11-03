@@ -1057,6 +1057,21 @@ void PCB_CONTROL::pruneItemLayers( std::vector<BOARD_ITEM*>& aItems )
 }
 
 
+bool PCB_CONTROL::IsBoardContent( const std::string& aText )
+{
+    try
+    {
+        PCB_IO_KICAD_SEXPR          pi;
+        std::unique_ptr<BOARD_ITEM> item( pi.Parse( wxString::FromUTF8( aText ) ) );
+        return item != nullptr;
+    }
+    catch( ... )
+    {
+        return false;
+    }
+}
+
+
 int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
 {
     // The viewer frames cannot paste
@@ -1169,10 +1184,10 @@ int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
 
             // If it wasn't content, then paste as a text object.  A long one is confirmed in the
             // infobar (pcb_action confirm), and the confirmed text pasted by running Paste again.
-            if( clipText.size() > static_cast<size_t>( ADVANCED_CFG::GetCfg().m_MaxPastedTextLength )
-                && !KICAD_OPENAPI_SERVICE::ConfirmPrompts() && clipText != m_confirmedPasteText )
+            if( IsLongPasteText( clipText.ToStdString( wxConvUTF8 ) ) && !KICAD_OPENAPI_SERVICE::ConfirmPrompts()
+                && clipText != m_confirmedPasteText )
             {
-                m_frame->ShowInfoBarQuestion( _( "Pasting a long text string may be very slow." ), _( "Paste Anyway" ),
+                m_frame->ShowInfoBarQuestion( LongPasteQuestion(), _( "Paste Anyway" ),
                                               [this, clipText]()
                                               {
                                                   m_confirmedPasteText = clipText;

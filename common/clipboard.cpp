@@ -22,11 +22,13 @@
 #include <wx/clipbrd.h>
 #include <wx/dataobj.h>
 #include <wx/image.h>
+#include <wx/intl.h>
 #include <wx/log.h>
 #include <wx/mstream.h>
 #include <wx/string.h>
 #include <wx/sstream.h>
 
+#include <advanced_config.h>
 #include <io/csv.h>
 
 bool SaveClipboard( const std::string& aTextUTF8 )
@@ -113,8 +115,42 @@ bool SaveClipboard( const std::string& aTextUTF8, const std::vector<CLIPBOARD_MI
 }
 
 
+static std::optional<std::string>& clipboardTextOverride()
+{
+    static std::optional<std::string> s_text;
+    return s_text;
+}
+
+
+void SetClipboardTextOverride( const std::optional<std::string>& aText )
+{
+    clipboardTextOverride() = aText;
+}
+
+
+std::optional<std::string> GetClipboardTextOverride()
+{
+    return clipboardTextOverride();
+}
+
+
+bool IsLongPasteText( const std::string& aText )
+{
+    return aText.size() > static_cast<size_t>( ADVANCED_CFG::GetCfg().m_MaxPastedTextLength );
+}
+
+
+wxString LongPasteQuestion()
+{
+    return _( "Pasting a long text string may be very slow." );
+}
+
+
 std::string GetClipboardUTF8()
 {
+    if( clipboardTextOverride() )
+        return *clipboardTextOverride();
+
     std::string result;
 
     wxLogNull doNotLog; // disable logging of failed clipboard actions
@@ -164,6 +200,9 @@ std::string GetClipboardUTF8()
 std::unique_ptr<wxBitmap> GetImageFromClipboard()
 {
     std::unique_ptr<wxBitmap> bitmap;
+
+    if( clipboardTextOverride() )
+        return bitmap;
     wxLogNull                 doNotLog; // disable logging of failed clipboard actions
 
     // Check if clipboard is already open (same handling as GetClipboardUTF8)
@@ -255,6 +294,9 @@ bool SaveTabularDataToClipboard( const std::vector<std::vector<wxString>>& aData
 
 bool GetTabularDataFromClipboard( std::vector<std::vector<wxString>>& aData )
 {
+    if( clipboardTextOverride() )
+        return false;
+
     // Again, it would be ideal if we could detect a spreadsheet mimetype here,
     // but WX doesn't seem to do that on Linux, at least.
 

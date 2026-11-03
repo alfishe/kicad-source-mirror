@@ -29,9 +29,8 @@
 #define _DIALOG_SYMBOL_REMAP_H_
 
 
-class LEGACY_SYMBOL_LIB;
-class SCH_SYMBOL;
 class REPORTER;
+class SYMBOL_REMAPPER;
 
 
 class DIALOG_SYMBOL_REMAP : public DIALOG_SYMBOL_REMAP_BASE
@@ -45,46 +44,8 @@ protected:
     void OnUpdateUIRemapButton( wxUpdateUIEvent& aEvent ) override;
 
 private:
-    /**
-     * Add libraries found in the legacy library list to \a aLibs that are not found in
-     * the global symbol library table.
-     *
-     * This function is used to create a project symbol library table when converting
-     * legacy projects over to the new symbol library table implementation.  This only
-     * needs to be called the first time a legacy project is opened.  The cache library
-     * is ignored.
-     *
-     * @param aLibs is a vector container to add all of the libraries not found in the
-     *              global symbol library table that were found in the legacy library
-     *              list.
-     * @return the number of libraries found.
-     */
-    size_t getLibsNotInGlobalSymbolLibTable( std::vector< LEGACY_SYMBOL_LIB* >& aLibs );
-
-    void createProjectSymbolLibTable( REPORTER& aReporter );
-
-    void remapSymbolsToLibTable( REPORTER& aReporter );
-
-    bool remapSymbolToLibTable( SCH_SYMBOL* aSymbol );
-
-    /**
-     * Backup all of the files that could be modified by the remapping with a time stamp
-     * appended to the file name into the "remap_backup" folder in case something goes wrong.
-     *
-     * Backup the following:
-     * - All schematic (prj-name.sch -> remap_backup/prj-name-time-stamp.sch ) files.
-     * - The project (prj-name.pro) -> remap_backup/prj-name-time-stamp.pro) file.
-     * - The cache library (prj-name-cache.lib -> remap_backup/prj-name.-cache-time-stamp.lib)
-     *   file.
-     * - The rescue library (prj-name-rescue.lib -> remap_backup/prj-name.rescue-time-stamp.lib)
-     *   file.
-     * - The rescue library (prj-name-rescue.dcm -> remap_backup/prj-name.rescue-time-stamp.dcm)
-     *   file.
-     *
-     * @param aReporter is the #REPORTER object in which to write information messages.
-     * @return true to continue rescue or false to abort rescue.
-     */
-    bool backupProject( REPORTER& aReporter );
+    /// The backup before the remap; on errors asks whether to continue
+    bool backupProject( SYMBOL_REMAPPER& aRemapper, REPORTER& aReporter );
 
     bool m_remapped;
 

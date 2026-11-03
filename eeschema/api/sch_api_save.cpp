@@ -37,6 +37,8 @@
 #include <wx/filename.h>
 #include <wx/log.h>
 
+#include <algorithm>
+
 
 namespace SCH_API_SAVE
 {
@@ -257,6 +259,27 @@ bool SaveSchematicAs( SCHEMATIC& aSchematic, PROJECT& aProject, const wxString& 
     Pgm().GetSettingsManager().SaveProjectAs( projectFile.GetFullPath(), &aProject );
 
     return true;
+}
+
+
+std::vector<wxString> LegacySaveOverwrites( const std::vector<wxString>& aSheetFiles )
+{
+    std::vector<wxString> overwritten;
+
+    for( const wxString& file : aSheetFiles )
+    {
+        wxFileName fn( file );
+
+        if( !fn.IsOk() || fn.GetExt() == FILEEXT::KiCadSchematicFileExtension )
+            continue;
+
+        fn.SetExt( FILEEXT::KiCadSchematicFileExtension );
+
+        if( fn.FileExists() && std::find( overwritten.begin(), overwritten.end(), fn.GetFullPath() ) == overwritten.end() )
+            overwritten.push_back( fn.GetFullPath() );
+    }
+
+    return overwritten;
 }
 
 } // namespace SCH_API_SAVE

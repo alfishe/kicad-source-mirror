@@ -32,8 +32,11 @@ public:
     /**
      * Returns the list of symbol libraries from a legacy (pre-5.x) design
      * This is only used from the remapping dialog at this point.
+     *
+     * Libraries that fail to load are reported in aLoadErrors when given (and with no modal UI or
+     * no GUI), else in a dialog.
      */
-    static LEGACY_SYMBOL_LIBS* LegacySchLibs( PROJECT* aProject );
+    static LEGACY_SYMBOL_LIBS* LegacySchLibs( PROJECT* aProject, wxString* aLoadErrors = nullptr );
 
     /// Accessor for Eeschema search stack.
     static SEARCH_STACK* SchSearchS( PROJECT* aProject );

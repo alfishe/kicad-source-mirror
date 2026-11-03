@@ -26,6 +26,8 @@ class SCH_SHEET;
 
 #include <wx/string.h>
 
+#include <vector>
+
 namespace SCH_API_SAVE
 {
 
@@ -59,6 +61,10 @@ bool SaveSchematicCopy( SCHEMATIC& aSchematic, PROJECT& aProject, const wxString
  * @return true if the schematic was saved and the project re-targeted.
  */
 bool SaveSchematicAs( SCHEMATIC& aSchematic, PROJECT& aProject, const wxString& aFileName );
+
+/// The existing files a save of these sheet files replaces without being one of them: a KiCad 5
+/// sheet (.sch) is written as .kicad_sch beside it.
+std::vector<wxString> LegacySaveOverwrites( const std::vector<wxString>& aSheetFiles );
 
 } // namespace SCH_API_SAVE
 

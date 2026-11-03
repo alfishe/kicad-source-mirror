@@ -112,6 +112,9 @@ public:
     int SaveToLinkedDesignBlock( const TOOL_EVENT& aEvent );
     /// @param aAcceptQueries answer yes to the plugin's questions; otherwise the first one
     ///                       stops the append and is asked in the infobar
+    /// Paste reads @p aText as board content (items, a footprint); otherwise it pastes a text item
+    static bool IsBoardContent( const std::string& aText );
+
     int AppendBoard( PCB_IO& pi, const wxString& fileName, DESIGN_BLOCK* aDesignBlock = nullptr,
                      BOARD_COMMIT* aCommit = nullptr, bool aSkipMove = false, bool aAcceptQueries = false );
     int UpdateMessagePanel( const TOOL_EVENT& aEvent );

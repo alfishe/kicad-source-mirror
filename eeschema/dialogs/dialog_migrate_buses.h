@@ -24,18 +24,10 @@
 #include <vector>
 #include <sch_edit_frame.h>
 #include <dialog_migrate_buses_base.h>
+#include <sch_bus_migration.h>
 
 class CONNECTION_SUBGRAPH;
 
-
-struct BUS_MIGRATION_STATUS
-{
-    const CONNECTION_SUBGRAPH* subgraph;
-    std::vector<wxString>      labels;
-    std::vector<wxString>      possible_labels;
-    wxString                   approved_label;
-    bool                       approved;
-};
 
 class DIALOG_MIGRATE_BUSES : public DIALOG_MIGRATE_BUSES_BASE
 {
@@ -55,8 +47,6 @@ private:
     void loadGraphData();
 
     void updateUi();
-
-    std::vector<wxString> getProposedLabels( const std::vector<wxString>& aLabelList );
 
     void onItemSelected( wxListEvent& aEvent );
 

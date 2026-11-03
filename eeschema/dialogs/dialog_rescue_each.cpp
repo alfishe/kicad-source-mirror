@@ -260,16 +260,18 @@ bool DIALOG_RESCUE_EACH::TransferDataFromWindow()
     if( !wxDialog::TransferDataFromWindow() )
         return false;
 
+    std::vector<wxString> names;
+
     for( size_t index = 0; index < m_rescuer->GetCandidateCount(); ++index )
     {
         wxVariant val;
         m_ListOfConflicts->GetValue( val, index, 0 );
-        bool rescue_part = val.GetBool();
 
-        if( rescue_part )
-            m_rescuer->m_chosen_candidates.push_back( &m_rescuer->m_all_candidates[index] );
+        if( val.GetBool() )
+            names.push_back( m_rescuer->GetCandidates()[index].GetRequestedName() );
     }
 
+    m_rescuer->ChooseCandidates( names );
     return true;
 }
 

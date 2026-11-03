@@ -25,6 +25,7 @@
 #include <tool/tool_manager.h>
 #include <tool/actions.h>
 #include <dialog_migrate_buses.h>
+#include <sch_bus_migration.h>
 #include <sch_label.h>
 #include <view/view_controls.h>
 
@@ -89,25 +90,7 @@ DIALOG_MIGRATE_BUSES::~DIALOG_MIGRATE_BUSES()
 
 void DIALOG_MIGRATE_BUSES::loadGraphData()
 {
-    m_items.clear();
-    auto subgraphs = m_frame->Schematic().ConnectionGraph()->GetBusesNeedingMigration();
-
-    for( const CONNECTION_SUBGRAPH* subgraph : subgraphs )
-    {
-        BUS_MIGRATION_STATUS status;
-
-        status.subgraph = subgraph;
-        status.approved = false;
-
-        std::vector<SCH_ITEM*> labels = subgraph->GetVectorBusLabels();
-        wxASSERT( labels.size() > 1 );
-
-        for( SCH_ITEM* label : labels )
-            status.labels.push_back( static_cast<SCH_LABEL_BASE*>( label )->GetText() );
-
-        status.possible_labels = getProposedLabels( status.labels );
-        m_items.push_back( status );
-    }
+    m_items = SCH_BUS_MIGRATION::Find( m_frame->Schematic() );
 }
 
 
@@ -137,45 +120,6 @@ void DIALOG_MIGRATE_BUSES::updateUi()
 
     m_migration_list->Select( 0 );
     m_migration_list->SetColumnWidth( 1, -1 );
-}
-
-
-std::vector<wxString> DIALOG_MIGRATE_BUSES::getProposedLabels( const std::vector<wxString>& aLabelList )
-{
-    int lowest_start = INT_MAX;
-    int highest_end = -1;
-    int widest_bus = -1;
-
-    SCH_CONNECTION conn( m_frame->Schematic().ConnectionGraph() );
-
-    for( const wxString& label : aLabelList )
-    {
-        conn.ConfigureFromLabel( label );
-
-        int start = conn.VectorStart();
-        int end = conn.VectorEnd();
-
-        if( start < lowest_start )
-            lowest_start = start;
-
-        if( end > highest_end )
-            highest_end = end;
-
-        if( end - start + 1 > widest_bus )
-            widest_bus = end - start + 1;
-    }
-
-    std::vector<wxString> proposals;
-
-    for( const wxString& label : aLabelList )
-    {
-        conn.ConfigureFromLabel( label );
-        wxString proposal = conn.VectorPrefix();
-        proposal << "[" << highest_end << ".." << lowest_start << "]";
-        proposals.push_back( proposal );
-    }
-
-    return proposals;
 }
 
 
@@ -217,16 +161,7 @@ void DIALOG_MIGRATE_BUSES::onAcceptClicked( wxCommandEvent& aEvent )
 
     unsigned sel = m_selected_index;
 
-    m_items[sel].approved_label = m_cb_new_name->GetStringSelection();
-    m_items[sel].approved = true;
-
-    std::vector<SCH_ITEM*> labels =  m_items[sel].subgraph->GetVectorBusLabels();
-
-    for( SCH_ITEM* label : labels )
-    {
-        static_cast<SCH_LABEL_BASE*>( label )->SetText( m_items[sel].approved_label );
-        label->SetConnectivityDirty();
-    }
+    SCH_BUS_MIGRATION::Apply( m_items[sel], m_cb_new_name->GetStringSelection(), nullptr );
 
     m_migration_list->SetItem( sel, 2, m_items[sel].approved_label );
     m_migration_list->SetItem( sel, 3, _( "Updated" ) );

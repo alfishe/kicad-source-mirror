@@ -295,10 +295,13 @@ public:
      * @param aBus is a bus vector label string
      * @param aName out is the bus name, e.g. "A"
      * @param aMemberList is a list of member strings, e.g. "A7", "A6", and so on
+     * @param aBegin out is the lowest index, e.g. 0
+     * @param aEnd out is the highest index, e.g. 7
      * @return true if aBus was successfully parsed
      */
     static bool ParseBusVector( const wxString& aBus, wxString* aName,
-                                std::vector<wxString>* aMemberList );
+                                std::vector<wxString>* aMemberList, long* aBegin = nullptr,
+                                long* aEnd = nullptr );
 
     /**
      * Parse a bus group label into the name and a list of components.

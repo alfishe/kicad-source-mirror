@@ -523,27 +523,31 @@ bool SCH_EDITOR_CONTROL::rescueProject( RESCUER& aRescuer, bool aRunningOnDemand
         return false;
 
     if( aRescuer.GetCandidateCount() )
-    {
-        KIWAY_PLAYER* viewer = m_frame->Kiway().Player( FRAME_SCH_VIEWER, false );
-
-        if( viewer )
-            static_cast<SYMBOL_VIEWER_FRAME*>( viewer )->ReCreateLibList();
-
-        if( aRunningOnDemand )
-        {
-            SCH_SCREENS schematic( m_frame->Schematic().Root() );
-
-            schematic.UpdateSymbolLinks();
-            m_frame->RecalculateConnections( nullptr, GLOBAL_CLEANUP );
-        }
-
-        m_frame->ClearUndoRedoList();
-        m_frame->SyncView();
-        m_frame->GetCanvas()->Refresh();
-        m_frame->OnModify();
-    }
+        ShowRescuedSymbols( aRunningOnDemand );
 
     return true;
+}
+
+
+void SCH_EDITOR_CONTROL::ShowRescuedSymbols( bool aRelink )
+{
+    KIWAY_PLAYER* viewer = m_frame->Kiway().Player( FRAME_SCH_VIEWER, false );
+
+    if( viewer )
+        static_cast<SYMBOL_VIEWER_FRAME*>( viewer )->ReCreateLibList();
+
+    if( aRelink )
+    {
+        SCH_SCREENS schematic( m_frame->Schematic().Root() );
+
+        schematic.UpdateSymbolLinks();
+        m_frame->RecalculateConnections( nullptr, GLOBAL_CLEANUP );
+    }
+
+    m_frame->ClearUndoRedoList();
+    m_frame->SyncView();
+    m_frame->GetCanvas()->Refresh();
+    m_frame->OnModify();
 }
 
 
@@ -2273,6 +2277,26 @@ const LIB_SYMBOL* SCH_EDITOR_CONTROL::ChoosePasteLibSymbol( const SCH_SCREEN* aC
 }
 
 
+bool SCH_EDITOR_CONTROL::IsSchematicContent( SCHEMATIC& aSchematic, const std::string& aText )
+{
+    STRING_LINE_READER reader( aText, "Clipboard" );
+    SCH_IO_KICAD_SEXPR plugin;
+    SCH_SHEET          tempSheet;
+
+    tempSheet.SetScreen( new SCH_SCREEN( &aSchematic ) );
+
+    try
+    {
+        plugin.LoadContent( reader, &tempSheet );
+        return true;
+    }
+    catch( const IO_ERROR& )
+    {
+        return false;
+    }
+}
+
+
 int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
 {
     wxTextEntry* textEntry = dynamic_cast<wxTextEntry*>( wxWindow::FindFocus() );
@@ -2334,10 +2358,10 @@ int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
         {
             // a long text is confirmed in the infobar (sch_action confirm), then pasted by running
             // Paste again
-            if( content.size() > static_cast<size_t>( ADVANCED_CFG::GetCfg().m_MaxPastedTextLength )
-                && !KICAD_OPENAPI_SERVICE::ConfirmPrompts() && wxString::FromUTF8( content ) != m_confirmedPasteText )
+            if( IsLongPasteText( content ) && !KICAD_OPENAPI_SERVICE::ConfirmPrompts()
+                && wxString::FromUTF8( content ) != m_confirmedPasteText )
             {
-                m_frame->ShowInfoBarQuestion( _( "Pasting a long text string may be very slow." ), _( "Paste Anyway" ),
+                m_frame->ShowInfoBarQuestion( LongPasteQuestion(), _( "Paste Anyway" ),
                                               [this, text = wxString::FromUTF8( content )]()
                                               {
                                                   m_confirmedPasteText = text;

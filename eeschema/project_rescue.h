@@ -40,6 +40,9 @@
 #include <sch_io/kicad_legacy/sch_io_kicad_legacy.h>
 #include <class_draw_panel_gal.h>
 
+#include <optional>
+#include <vector>
+
 
 class LIB_SYMBOL;
 class SCH_SYMBOL;
@@ -220,6 +223,8 @@ public:
 
     RESCUE_SYMBOL_LIB_TABLE_CANDIDATE();
 
+    virtual wxString GetNewName() const override { return m_new_id.Format().wx_str(); }
+
     virtual LIB_SYMBOL* GetCacheCandidate() const override { return m_cache_candidate; }
 
     virtual wxString GetActionDescription() const override;
@@ -255,9 +260,9 @@ public:
      *
      * Called after successful PerformAction()s. If this fails, undo the actions.
      *
-     * @return True on success.
+     * @return True on success; otherwise false with @p aError.
      */
-    virtual bool WriteRescueLibrary( wxWindow *aParent ) = 0;
+    virtual bool WriteRescueLibrary( wxString& aError ) = 0;
 
     virtual void OpenRescueLibrary() = 0;
 
@@ -291,6 +296,17 @@ public:
      */
     size_t GetChosenCandidateCount() { return m_chosen_candidates.size(); }
 
+    const boost::ptr_vector<RESCUE_CANDIDATE>& GetCandidates() const { return m_all_candidates; }
+
+    const std::vector<RESCUE_CANDIDATE*>& GetChosenCandidates() const { return m_chosen_candidates; }
+
+    /**
+     * Choose the candidates to rescue by their requested name; every one when @p aNames is unset.
+     *
+     * @return the names in @p aNames that are no candidate (none of them is chosen then).
+     */
+    std::vector<wxString> ChooseCandidates( const std::optional<std::vector<wxString>>& aNames );
+
     /**
      * Get the list of symbols that need rescued.
      */
@@ -321,6 +337,18 @@ public:
     void UndoRescues();
 
     static bool RescueProject( wxWindow* aParent, RESCUER& aRescuer, bool aRunningOnDemand );
+
+    /// Populate the candidates once (FindCandidates), duplicately named ones removed.
+    void FindUniqueCandidates();
+
+    /**
+     * Rescue without a dialog: the candidates are found, @p aNames chosen (every candidate when
+     * unset), the chosen ones rescued, the rescue library written and the symbols relinked.
+     *
+     * @return false with @p aError when a name is no candidate or the rescue failed (undone).
+     */
+    static bool RescueChosen( RESCUER& aRescuer, const std::optional<std::vector<wxString>>& aNames,
+                              wxString& aError );
 
 protected:
     friend class DIALOG_RESCUE_EACH;
@@ -355,7 +383,7 @@ public:
 
     virtual void OpenRescueLibrary() override;
 
-    virtual bool WriteRescueLibrary( wxWindow *aParent ) override;
+    virtual bool WriteRescueLibrary( wxString& aError ) override;
 
     virtual void AddSymbol( LIB_SYMBOL* aNewSymbol ) override;
 
@@ -379,7 +407,7 @@ public:
 
     virtual void OpenRescueLibrary() override;
 
-    virtual bool WriteRescueLibrary( wxWindow* aParent ) override;
+    virtual bool WriteRescueLibrary( wxString& aError ) override;
 
     virtual void AddSymbol( LIB_SYMBOL* aNewSymbol ) override;
 

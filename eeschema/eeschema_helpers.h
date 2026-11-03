@@ -45,12 +45,15 @@ public:
                                             PROJECT* aProject = nullptr,
                                             bool aCalculateConnectivity = true,
                                             REPORTER* aRootReporter = nullptr );
+    /// @param aContentDir when set, the files are read from this copy of @p aFileName's directory
+    ///                    (the same relative paths), still named as the schematic's own
     static SCHEMATIC*        LoadSchematic( const wxString& aFileName,
                                             SCH_IO_MGR::SCH_FILE_T aFormat,
                                             bool aSetActive, bool aForceDefaultProject,
                                             PROJECT* aProject = nullptr,
                                             bool aCalculateConnectivity = true,
-                                            REPORTER* aRootReporter = nullptr );
+                                            REPORTER* aRootReporter = nullptr,
+                                            const wxString& aContentDir = wxEmptyString );
 
 private:
     static SCH_EDIT_FRAME*   s_SchEditFrame;

@@ -157,11 +157,7 @@ void RetargetSchematicFiles( SCHEMATIC& aSchematic, const wxString& aFromDir, co
         if( screen->GetFileName().IsEmpty() )
             continue;
 
-        wxFileName fn( screen->GetFileName() );
-        fn.MakeRelativeTo( aFromDir );
-        fn.MakeAbsolute( aToDir );
-        fn.Normalize( wxPATH_NORM_DOTS | wxPATH_NORM_ABSOLUTE );
-        screen->SetFileName( fn.GetFullPath() );
+        screen->SetFileName( MoveSchematicPath( screen->GetFileName(), aFromDir, aToDir ) );
 
         if( aMarkModified )
             screen->SetContentModified( true );
@@ -177,6 +173,16 @@ void RetargetSchematicFiles( SCHEMATIC& aSchematic, const wxString& aFromDir, co
         rel.MakeRelativeTo( aSchematic.Project().GetProjectPath() );
         sheet->SetFileName( rel.GetFullPath() );
     }
+}
+
+
+wxString MoveSchematicPath( const wxString& aPath, const wxString& aFromDir, const wxString& aToDir )
+{
+    wxFileName fn( aPath );
+    fn.MakeRelativeTo( aFromDir );
+    fn.MakeAbsolute( aToDir );
+    fn.Normalize( wxPATH_NORM_DOTS | wxPATH_NORM_ABSOLUTE );
+    return fn.GetFullPath();
 }
 
 

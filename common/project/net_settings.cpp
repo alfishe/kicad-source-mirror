@@ -1471,7 +1471,7 @@ static bool isEscaped( const wxString& aStr, size_t aPos )
 
 
 bool NET_SETTINGS::ParseBusVector( const wxString& aBus, wxString* aName,
-                                   std::vector<wxString>* aMemberList )
+                                   std::vector<wxString>* aMemberList, long* aBegin, long* aEnd )
 {
     auto isDigit =
             []( wxChar c )
@@ -1676,6 +1676,12 @@ bool NET_SETTINGS::ParseBusVector( const wxString& aBus, wxString* aName,
 
     if( aName )
         *aName = prefix;
+
+    if( aBegin )
+        *aBegin = begin;
+
+    if( aEnd )
+        *aEnd = end;
 
     if( aMemberList )
     {

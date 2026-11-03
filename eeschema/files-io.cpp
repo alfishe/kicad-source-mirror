@@ -72,6 +72,8 @@
 #include <tool/tool_manager.h>
 #include <tools/sch_actions.h>
 #include <sch_autosave_recovery.h>
+#include <api/sch_api_save.h>
+#include <sch_bus_migration.h>
 #include <tools/sch_editor_control.h>
 #include <tools/sch_navigate_tool.h>
 #include <trace_helpers.h>
@@ -423,7 +425,10 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
                     // Load each top-level sheet
                     for( const TOP_LEVEL_SHEET_INFO& sheetInfo : topLevelSheets )
                     {
-                        wxFileName sheetFileName( m_loadContentFrom.IsEmpty() ? Prj().GetProjectPath() : contentDir,
+                        wxFileName sheetFileName( m_loadContentFrom.IsEmpty()
+                                                          ? Prj().GetProjectPath()
+                                                          : MoveSchematicPath( Prj().GetProjectPath(),
+                                                                               wx_filename.GetPath(), contentDir ),
                                                   sheetInfo.filename );
 
                         // When loading legacy schematic files, ensure we are referencing the correct extension
@@ -626,9 +631,19 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
             // Convert old projects over to use symbol library table.
             if( schematic.HasNoFullyDefinedLibIds() )
             {
-                DIALOG_SYMBOL_REMAP dlgRemap( this );
+                if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+                {
+                    showLoadProblem( this, _( "This schematic uses the legacy symbol library list." ),
+                                     _( "Remap its symbols to the symbol library table: Tools > Remap "
+                                        "Legacy Library Symbols... (sch_remap_symbols)." ),
+                                     wxICON_WARNING );
+                }
+                else
+                {
+                    DIALOG_SYMBOL_REMAP dlgRemap( this );
 
-                dlgRemap.ShowQuasiModal();
+                    dlgRemap.ShowQuasiModal();
+                }
             }
             else
             {
@@ -833,13 +848,18 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         KopenapiKeepUiAlive();
 
         // Migrate conflicting bus definitions, but only for files old enough to store them.
-        // The connection graph must be rebuilt first so GetBusesNeedingMigration() can see the
-        // conflicting subgraphs; the earlier Reset() clears them.
         SCH_SCREEN* schRootScreen = Schematic().RootScreen();
         int         schFileVersion = schRootScreen ? schRootScreen->GetFileFormatVersionAtLoad() : 0;
+        const bool  oldBuses = DIALOG_MIGRATE_BUSES::ShouldPrompt( schFileVersion, 1 );
+        const bool  migrateBuses = oldBuses && !SCH_BUS_MIGRATION::Find( Schematic() ).empty();
 
-        if( DIALOG_MIGRATE_BUSES::ShouldPrompt(
-                    schFileVersion, Schematic().ConnectionGraph()->GetBusesNeedingMigration().size() ) )
+        if( migrateBuses && KICAD_OPENAPI_SERVICE::NoModalUi() )
+        {
+            showLoadProblem( this, _( "This schematic has buses with conflicting labels." ),
+                             _( "Each needs one name (sch_migrate_buses)." ),
+                             wxICON_WARNING );
+        }
+        else if( migrateBuses )
         {
             hideProgress();
 
@@ -853,8 +873,12 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
             OnModify();
             if( progressDialog )
                 progressDialog->Show();
+        }
 
-            // Relabeling the conflicting buses changes connectivity, so rebuild it.
+        // Relabeling the conflicting buses changes connectivity, and the search built the
+        // connection graph, so rebuild it.
+        if( oldBuses )
+        {
             RecalculateConnections( &dummy, GLOBAL_CLEANUP, &progressReporter );
             dummy.Push( _( "Schematic Cleanup" ),
                         SKIP_UNDO | SKIP_SET_DIRTY | SKIP_CONNECTIVITY | DELETE_REMOVED_ITEMS );
@@ -1351,8 +1375,8 @@ bool SCH_EDIT_FRAME::SaveProject( bool aSaveAs )
     }
 
     // Warn user on potential file overwrite.  This can happen on shared sheets.
-    wxArrayString overwrittenFiles;
-    wxArrayString lockedFiles;
+    wxArrayString         lockedFiles;
+    std::vector<wxString> sheetFiles;
 
     for( size_t i = 0; i < screens.GetCount(); i++ )
     {
@@ -1360,7 +1384,6 @@ bool SCH_EDIT_FRAME::SaveProject( bool aSaveAs )
 
         wxCHECK2( screen, continue );
 
-        // Convert legacy schematics file name extensions for the new format.
         wxFileName tmpFn = filenameMap[screen];
 
         if( !tmpFn.IsOk() )
@@ -1369,14 +1392,11 @@ bool SCH_EDIT_FRAME::SaveProject( bool aSaveAs )
         if( tmpFn.FileExists() && !tmpFn.IsFileWritable() )
             lockedFiles.Add( tmpFn.GetFullPath() );
 
-        if( tmpFn.GetExt() == FILEEXT::KiCadSchematicFileExtension )
-            continue;
-
-        tmpFn.SetExt( FILEEXT::KiCadSchematicFileExtension );
-
-        if( tmpFn.FileExists() )
-            overwrittenFiles.Add( tmpFn.GetFullPath() );
+        sheetFiles.push_back( tmpFn.GetFullPath() );
     }
+
+    // Legacy sheets are written under the new format's extension
+    const std::vector<wxString> overwrittenFiles = SCH_API_SAVE::LegacySaveOverwrites( sheetFiles );
 
     if( !lockedFiles.IsEmpty() )
     {
@@ -1394,7 +1414,7 @@ bool SCH_EDIT_FRAME::SaveProject( bool aSaveAs )
         return false;
     }
 
-    if( !overwrittenFiles.IsEmpty() )
+    if( !overwrittenFiles.empty() )
     {
         for( const wxString& overwrittenFile : overwrittenFiles )
         {

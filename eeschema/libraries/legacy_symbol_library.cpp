@@ -20,6 +20,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <optional>
 #include <algorithm>
 #include <kiface_base.h>
 #include <eda_base_frame.h>
@@ -496,24 +497,19 @@ void LEGACY_SYMBOL_LIBS::LoadAllLibraries( PROJECT* aProject, bool aShowProgress
     // Post symbol library table, this should be empty.  Only the cache library should get loaded.
     if( !lib_names.empty() )
     {
-        APP_PROGRESS_DIALOG lib_dialog( _( "Loading Symbol Libraries" ),
-                                        wxEmptyString,
-                                        lib_names.GetCount(),
-                                        nullptr,
-                                        false,
-                                        wxPD_APP_MODAL );
+        std::optional<APP_PROGRESS_DIALOG> lib_dialog;
 
         if( aShowProgress )
         {
-            lib_dialog.Show();
+            lib_dialog.emplace( _( "Loading Symbol Libraries" ), wxEmptyString, lib_names.GetCount(), nullptr,
+                                false, wxPD_APP_MODAL );
+            lib_dialog->Show();
         }
 
         for( unsigned i = 0; i < lib_names.GetCount();  ++i )
         {
-            if( aShowProgress )
-            {
-                lib_dialog.Update( i, wxString::Format( _( "Loading %s..." ), lib_names[i] ) );
-            }
+            if( lib_dialog )
+                lib_dialog->Update( i, wxString::Format( _( "Loading %s..." ), lib_names[i] ) );
 
             // lib_names[] does not store the file extension. Set it.
             // Remember lib_names[i] can contain a '.' in name, so using a wxFileName

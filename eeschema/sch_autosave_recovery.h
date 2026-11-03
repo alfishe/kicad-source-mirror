@@ -53,6 +53,10 @@ void RetargetSchematicFiles( SCHEMATIC& aSchematic, const wxString& aFromDir, co
                              bool aMarkModified );
 
 
+/// @p aPath moved from under @p aFromDir to the same relative place under @p aToDir
+wxString MoveSchematicPath( const wxString& aPath, const wxString& aFromDir, const wxString& aToDir );
+
+
 /// A new empty directory for StageSchematicAutosaves in the system's temporary directory
 wxString MakeSchematicStagingDir();
 

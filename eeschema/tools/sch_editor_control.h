@@ -75,6 +75,12 @@ public:
     bool RescueLegacyProject( bool aRunningOnDemand );
     bool RescueSymbolLibTableProject( bool aRunningOnDemand );
 
+    /// Paste reads @p aText as schematic content; otherwise it pastes a text item
+    static bool IsSchematicContent( SCHEMATIC& aSchematic, const std::string& aText );
+
+    /// The editor after a rescue: the library list, the links (@p aRelink), no undo, modified
+    void ShowRescuedSymbols( bool aRelink );
+
     /// Notifies pcbnew about the selected item.
     int CrossProbeToPcb( const TOOL_EVENT& aEvent );
 

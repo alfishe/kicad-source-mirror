@@ -294,9 +294,9 @@ private:
 
     long m_vector_index;    ///< Index of bus vector member nets
 
-    long m_vector_start;    ///< Highest member of a vector bus
+    long m_vector_start;    ///< Lowest member index of a vector bus
 
-    long m_vector_end;      ///< Lowest member of a vector bus
+    long m_vector_end;      ///< Highest member index of a vector bus
 
     /// Prefix name of the vector, if m_type == CONNECTION_BUS (or "" if not).
     wxString m_vector_prefix;

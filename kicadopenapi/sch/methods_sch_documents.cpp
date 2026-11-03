@@ -643,6 +643,77 @@ static KOPENAPI_RESULT h_sch_save( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         return saveVersionCopy( aCtx, *context, target, version );
     }
 
+    const bool asCopy = !aCtx.headless && aArgs.contains( "path" ) && aArgs["path"].is_string();
+    bool       legacy = false;
+
+    // a KiCad 5 sheet is written as .kicad_sch beside it, as the editor saves it: an existing file
+    // of that name is replaced only when asked (the editor asks)
+    if( !asCopy )
+    {
+        std::vector<wxString> sheetFiles;
+        SCH_SCREENS           screens( context->GetSchematic()->Root() );
+
+        for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+        {
+            if( screen->GetFileName().IsEmpty() )
+                continue;
+
+            sheetFiles.push_back( screen->GetFileName() );
+            legacy |= wxFileName( screen->GetFileName() ).GetExt() == FILEEXT::LegacySchematicFileExtension;
+        }
+
+        const std::vector<wxString> overwritten = SCH_API_SAVE::LegacySaveOverwrites( sheetFiles );
+
+        if( !overwritten.empty() && !aArgs.value( "overwrite", false ) )
+        {
+            std::string names;
+
+            for( const wxString& file : overwritten )
+                names += ( names.empty() ? "" : ", " ) + std::string( file.ToUTF8() );
+
+            return KOPENAPI_RESULT::Error( 409, "saving writes the KiCad 5 sheets as .kicad_sch and would overwrite "
+                                                "existing files: " + names + "; pass overwrite: true" );
+        }
+    }
+
+    // the editor's save converts the sheets and keeps its window (title, lock, history) in step
+    if( legacy && !aCtx.headless && !aArgs.contains( "path" ) )
+    {
+        SCH_EDIT_FRAME* frame = guiFrame( aCtx, false );
+
+        if( !frame )
+            return KopenapiNoSchematic();
+
+        std::vector<wxString> before;
+        SCH_SCREENS           screens( frame->Schematic().Root() );
+
+        for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+            before.push_back( screen->GetFileName() );
+
+        KICAD_OPENAPI_SERVICE::SetConfirmPrompts( aArgs.value( "overwrite", false ) );
+        const bool saved = frame->SaveProject();
+        KICAD_OPENAPI_SERVICE::SetConfirmPrompts( false );
+
+        if( !saved )
+            return KOPENAPI_RESULT::Error( 500, "saving the schematic failed (errors: journal)" );
+
+        nlohmann::json status = documentStatus( aCtx );
+        nlohmann::json renamed = nlohmann::json::array();
+
+        for( const wxString& file : before )
+        {
+            if( wxFileName( file ).GetExt() == FILEEXT::LegacySchematicFileExtension )
+            {
+                wxFileName current( file );
+                current.SetExt( FILEEXT::KiCadSchematicFileExtension );
+                renamed.push_back( std::string( current.GetFullPath().ToUTF8() ) );
+            }
+        }
+
+        status["converted_from_legacy"] = renamed;
+        return KOPENAPI_RESULT::Ok( status );
+    }
+
     nlohmann::json converted = aCtx.headless && s_schematic ? renameLegacySheets( *s_schematic )
                                                              : nlohmann::json::array();
     bool           ok = false;
@@ -712,7 +783,11 @@ static bool loadHeadlessContent( KOPENAPI_CONTEXT& aCtx, const wxString& aRootCo
 
     try
     {
-        loaded = EESCHEMA_HELPERS::LoadSchematic( copy.GetFullPath(), false, false, project );
+        // read from the copy's directory under the schematic's own names: the project's
+        // top-level sheets are found there too
+        loaded = EESCHEMA_HELPERS::LoadSchematic( original.GetFullPath(),
+                                                  SCH_IO_MGR::GuessPluginTypeFromSchPath( copy.GetFullPath() ),
+                                                  false, false, project, true, nullptr, copy.GetPath() );
     }
     catch( ... )
     {
@@ -1054,10 +1129,16 @@ KOPENAPI_REGISTER( "sch_save",
                    "Save the open schematic; with 'path' save as (headless switches to it, GUI writes a copy). "
                    "With 'version' (e.g. \"10.0\") write a copy of every sheet and the project that an earlier "
                    "KiCad opens: root at 'path', sub-sheets at their relative paths; the open schematic stays as "
-                   "it is. The result lists what the earlier format cannot hold (dropped or approximated)",
+                   "it is. The result lists what the earlier format cannot hold (dropped or approximated). "
+                   "KiCad 5 sheets (.sch) are written as .kicad_sch beside them (converted_from_legacy); an existing "
+                   "file of that name is replaced only with overwrite: true (409 naming them otherwise)",
                    nlohmann::json( { { "type", "object" },
                                      { "properties",
                                        { { "path", { { "type", "string" } } },
+                                         { "overwrite",
+                                           { { "type", "boolean" },
+                                             { "default", false },
+                                             { "description", "replace existing .kicad_sch files the KiCad 5 sheets are converted to" } } },
                                          { "version",
                                            { { "type", "string" },
                                              { "enum", KopenapiLegacyTargets() },
