@@ -431,6 +431,26 @@ wxString PATHS::GetStockPlugins3DPath()
     }
     else
     {
+        // An install moved elsewhere finds its plugins at the libdir relative to its bindir.
+        wxFileName lib( wxString::FromUTF8Unchecked( KICAD_PLUGINDIR ), wxEmptyString );
+        lib.MakeRelativeTo( wxString::FromUTF8Unchecked( KICAD_BINDIR ) );
+
+        wxFileName installed( wxStandardPaths::Get().GetExecutablePath() );
+        installed.SetFullName( wxEmptyString );
+
+        for( const wxString& dir : lib.GetDirs() )
+            installed.AppendDir( dir );
+
+        installed.AppendDir( wxT( "kicad" ) );
+        installed.AppendDir( wxT( "plugins" ) );
+        installed.AppendDir( wxT( "3d" ) );
+
+        if( installed.DirExists() )
+        {
+            installed.Normalize( wxPATH_NORM_DOTS | wxPATH_NORM_ABSOLUTE );
+            return installed.GetPathWithSep();
+        }
+
         // KICAD_PLUGINDIR = CMAKE_INSTALL_FULL_LIBDIR path is the absolute path
         // corresponding to the install path used for constructing KICAD_USER_PLUGIN
         wxString tfname = wxString::FromUTF8Unchecked( KICAD_PLUGINDIR );

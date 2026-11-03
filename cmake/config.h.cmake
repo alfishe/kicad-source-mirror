@@ -103,6 +103,7 @@
 
 // Plugins directory
 #define KICAD_PLUGINDIR                 "@CMAKE_INSTALL_FULL_LIBDIR@"
+#define KICAD_BINDIR                    "@CMAKE_INSTALL_FULL_BINDIR@"
 
 /// ngspice version string detected by pkg-config when available.
 #cmakedefine NGSPICE_BUILD_VERSION      "@NGSPICE_BUILD_VERSION@"
