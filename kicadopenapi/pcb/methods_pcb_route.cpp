@@ -14345,6 +14345,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     }
 
     const bool    planeless = planes.empty();
+    const double  viaCostIU = pcbIUScale.mmToIU( KopenapiViaCostMm( board, nlohmann::json::object(), net->GetNetCode() ) );
     std::set<KIID> ports;   // vias of a net without a plane at its row pins, kept for the router
 
     std::vector<KIID> added;
@@ -14818,9 +14819,9 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                             }
                         }
 
-                        // rings a via pitch apart, out a via pitch past the nearest other pad or via of the net
-                        // (the stub to it is the way past whatever lies between), and not short of the part's
-                        // courtyard; round each the spots a clearance apart
+                        // rings a via pitch apart, out a via pitch past where the stub and the via (KopenapiViaCostMm)
+                        // still cost less than a track to the nearest other pad or via of the net, and not short of the
+                        // part's courtyard; round each the spots a clearance apart
                         const int ringClear = KopenapiRuleVia( board, net->GetNetCode(), base, layer ).clearance;
                         double    ringsEnd = std::numeric_limits<double>::max();
                         double    partEnd = 0;
@@ -14846,7 +14847,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                             }
                         }
 
-                        ringsEnd = std::max( ringsEnd == std::numeric_limits<double>::max() ? 0.0 : ringsEnd, partEnd ) + viaDia + ringClear;
+                        ringsEnd = std::max( ringsEnd == std::numeric_limits<double>::max() ? 0.0 : ringsEnd - viaCostIU, partEnd ) + viaDia + ringClear;
 
                         for( int ring = 0;; ++ring )
                         {
