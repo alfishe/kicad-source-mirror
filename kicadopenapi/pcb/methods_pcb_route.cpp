@@ -1253,6 +1253,64 @@ struct ESCAPE_FRONT
 };
 
 
+/// @brief Whether a supply pin's way out is shut already: copper of a third net (not the pin's, not
+/// aNet, not aPartner, none of aSkip) lies in it within its clearance (that copper; null: open).
+/// Keeping it open for the pin frees nothing then
+static BOARD_CONNECTED_ITEM* frontShut( BOARD* aBoard, const ESCAPE_FRONT& aFront, int aNet, int aPartner,
+                                        const std::set<const BOARD_ITEM*>& aSkip = {} )
+{
+    const BOX2I box = aFront.shape.BBox();
+    const int   pin = aFront.pad->GetNetCode();
+
+    auto third = [&]( BOARD_CONNECTED_ITEM* aItem )
+    {
+        const int net = aItem->GetNetCode();
+
+        if( net == pin || net == aNet || net == aPartner || aSkip.count( aItem ) || !aItem->IsOnLayer( aFront.layer ) )
+            return false;
+
+        BOX2I reach = aItem->GetBoundingBox();
+        reach.Inflate( aItem->GetOwnClearance( aFront.layer ) );
+
+        if( !reach.Intersects( box ) )
+            return false;
+
+        // the rules' clearance to the pin, as the router keeps it
+        int clearance = aItem->GetOwnClearance( aFront.layer );
+
+        if( std::shared_ptr<DRC_ENGINE> drc = aBoard->GetDesignSettings().m_DRCEngine )
+        {
+            const DRC_CONSTRAINT c = drc->EvalRules( CLEARANCE_CONSTRAINT, aItem, aFront.pad, aFront.layer );
+
+            if( c.GetValue().HasMin() )
+                clearance = c.GetValue().Min();
+        }
+
+        return aItem->GetEffectiveShape( aFront.layer )->Collide( &aFront.shape, std::max( clearance - 1, 0 ) );
+    };
+
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        if( third( track ) )
+            return track;
+    }
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+    {
+        if( !fp->GetBoundingBox().Intersects( box ) )
+            continue;
+
+        for( PAD* pad : fp->Pads() )
+        {
+            if( pad != aFront.pad && third( pad ) )
+                return pad;
+        }
+    }
+
+    return nullptr;
+}
+
+
 /// @brief A signal pin's port from the layout plan (pcb_fanout_ports): its way out on its side, to past
 /// the courtyard on the pad's layer, or to a via onto the other layer
 struct PORT_GOAL
@@ -2043,9 +2101,12 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         {
             for( const ESCAPE_FRONT& front : *aReq.fronts )
             {
-                // a pair's tail is held to the supply pins' ways out only
-                if( !front.walls( aReq.from->GetNetCode() ) || ( aReq.pairTail && !front.supply ) )
+                // a pair's tail is held to the supply pins' ways out only, those still open
+                if( !front.walls( aReq.from->GetNetCode() )
+                    || ( aReq.pairTail && ( !front.supply || frontShut( board, front, aReq.from->GetNetCode(), front.partner ) ) ) )
+                {
                     continue;
+                }
 
                 auto item = std::make_unique<PCB_SHAPE>( board, SHAPE_T::SEGMENT );
                 item->SetStart( front.shape.GetSeg().A );
@@ -2207,6 +2268,41 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
             if( placer->CurrentEnd() != at )
             {
                 const VECTOR2I end = placer->CurrentEnd();
+
+                // whether the via itself fits there (the router's via, against the world's copper and
+                // holes by the rules): a via that does not fit stops any leg toward it at its start
+                PNS::VIA alone( at, PNS_LAYER_RANGE( iface->GetPNSLayerFromBoardLayer( F_Cu ), iface->GetPNSLayerFromBoardLayer( B_Cu ) ),
+                                viaSizes.ViaDiameter(), viaSizes.ViaDrill(), startItem ? startItem->Net() : nullptr );
+                const PNS::NODE::OPT_OBSTACLE hit = router->GetWorld()->CheckColliding( &alone );
+                aOut["via_room"] = !hit;
+
+                if( hit && hit->m_item )
+                {
+                    nlohmann::json by = { { "kind", hit->m_item->KindStr() }, { "clearance_mm", toMm( hit->m_clearance ) } };
+
+                    if( BOARD_ITEM* parent = hit->m_item->Parent() )
+                    {
+                        if( parent->Type() == PCB_PAD_T && parent->GetParentFootprint() )
+                            by["pad"] = str( parent->GetParentFootprint()->GetReference() ) + "." + str( static_cast<PAD*>( parent )->GetNumber() );
+
+                        if( BOARD_CONNECTED_ITEM* bci = dynamic_cast<BOARD_CONNECTED_ITEM*>( parent ) )
+                            by["net"] = str( bci->GetNetname() );
+                    }
+                    else
+                    {
+                        by["parent"] = "none (a router-only item: an escape front or a keep-out)";
+                    }
+
+                    PCB_VIA probe( board );
+                    probe.SetPosition( at );
+                    probe.SetViaType( VIATYPE::THROUGH );
+                    probe.SetLayerPair( F_Cu, B_Cu );
+                    probe.SetWidth( PADSTACK::ALL_LAYERS, viaSizes.ViaDiameter() );
+                    probe.SetDrill( viaSizes.ViaDrill() );
+                    probe.SetNet( aReq.from->GetNet() );
+                    by["guard_room"] = guard( board, { &probe }, {}, true ).empty();
+                    aOut["via_blocked_by"] = by;
+                }
                 router->StopRouting();
                 iface->Staged().Revert();
                 aOut["routed"] = false;
@@ -2460,8 +2556,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     const auto           guardedAt = std::chrono::steady_clock::now();
 
     // a pair and its tails pass the neighbours' ways out (the pair's series parts stand there anyway),
-    // not a supply pin's: a supply pin walled in is a part without power
+    // not a supply pin's still open: a supply pin walled in is a part without power
     const bool pairWay = aReq.diffPair || aReq.pairTail;
+    const std::set<const BOARD_ITEM*> changedSet( changed.begin(), changed.end() );
 
     if( aReq.fronts )
     {
@@ -2477,7 +2574,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
                     continue;
                 }
 
-                if( std::shared_ptr<DRC_ENGINE> drc = board->GetDesignSettings().m_DRCEngine )
+                if( std::shared_ptr<DRC_ENGINE> drc = pairWay ? board->GetDesignSettings().m_DRCEngine : nullptr )
                 {
                     const DRC_CONSTRAINT c = drc->EvalRules( CLEARANCE_CONSTRAINT, item, front.pad, front.layer );
 
@@ -2487,6 +2584,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
                         continue;
                     }
                 }
+
+                if( pairWay && frontShut( board, front, item->GetNetCode(), front.partner, changedSet ) )
+                    continue;
 
                 const std::string key = copperKey( item );
                 const VECTOR2I    at = item->GetEffectiveShape( front.layer )->Centre();
@@ -3207,6 +3307,12 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
 
             if( aOut.contains( "stopped_at_mm" ) )
                 profile.attemptList.back()["stopped_at_mm"] = aOut["stopped_at_mm"];
+
+            for( const char* key : { "via_room", "via_blocked_by" } )
+            {
+                if( aOut.contains( key ) )
+                    profile.attemptList.back()[key] = aOut[key];
+            }
         }
     }
 
@@ -3269,7 +3375,7 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
         {
             t["reason"] = aOut.value( "reason", std::string() );
 
-            for( const char* key : { "stopped_at_mm", "toward_mm", "walls_in", "overlap_mm" } )
+            for( const char* key : { "stopped_at_mm", "toward_mm", "walls_in", "overlap_mm", "via_room", "via_blocked_by" } )
             {
                 if( aOut.contains( key ) )
                     t[key] = aOut[key];
@@ -13998,6 +14104,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                          { "layer", str( board->GetLayerName( front.layer ) ) },
                                          { "way_out_mm", { { toMm( seg.A.x ), toMm( seg.A.y ) }, { toMm( seg.B.x ), toMm( seg.B.y ) } } },
                                          { "width_mm", toMm( front.shape.GetWidth() ) } } );
+
+                // a supply pin's way: whether other copper shuts it already (then a pair is not held to it)
+                if( front.supply )
+                {
+                    row["list"].back()["supply"] = true;
+                    BOARD_CONNECTED_ITEM* by = front.pad ? frontShut( board, front, -1, -1 ) : nullptr;
+                    row["list"].back()["shut"] = by != nullptr;
+
+                    if( by )
+                        row["list"].back()["shut_by"] = str( UnescapeString( by->GetNetname() ) );
+                }
             }
         }
 
@@ -20044,8 +20161,8 @@ KOPENAPI_REGISTER( "pcb_route",
                    "dia_mm, drill_mm), a failed row's blocked_by (what stands where it stopped or "
                    "could not start: pads, other nets' tracks / vias, rule areas barring tracks by rule_area name, uuid, layer), "
                    "totals (routed, length, vias, unrouted left), fronts (the ways out kept open, per part and kind - edge, inward, port, "
-                   "port_via, bus_via: ref, kind, count (one per layer), pads; full: list, each front's pad, layer, way_out_mm, width_mm), "
-                   "attempt_list (every router try in order: attempt, net, from, to, pass, kind, routed, ms, a failed try's reason and stopped_at_mm, copper_hash - a hash of the "
+                   "port_via, bus_via: ref, kind, count (one per layer), pads; full: list, each front's pad, layer, way_out_mm, width_mm; a supply or ground pin's: supply, shut and shut_by - another net's copper lies in that way already, so a pair is not held to it), "
+                   "attempt_list (every router try in order: attempt, net, from, to, pass, kind, routed, ms, a failed try's reason, stopped_at_mm and via_room (stopped before a via: whether that via alone fits there), copper_hash - a hash of the "
                    "copper it laid, the same on every platform: two runs part at the first try whose hash differs) and "
                    "profile (attempts; clearance_lookups / rule_evaluations: the router's clearances past its caches and the design "
                    "rule evaluations they took; dead_legs_skipped / via_spots_blocked / via_spots_in_escapes / rip_ups_skipped / rip_ups_walled: tries not made; "
@@ -20081,7 +20198,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills out while routing (they would block every crossing), refilled after; keep: routes must clear the fills"},
                         "clean_up":{"type":"boolean","default":true,"description":"after routing, each connection with vias or a detour (over 1.3 x the straight line) is routed again alone on a layer both ends are on, without moving anything; kept with fewer vias, or as many and 5 % shorter (a plan over the free space of those layers first: none, or no shorter, skips it); a detour over 1.6 x follows a plan through vias instead when that is a quarter shorter, a via counted as via_cost_mm (kept when a fifth shorter); clean_up: tried / skipped / kept / vias_removed / via_ways / vias_added / shortened_mm; rows cleaned"},
                         "rip_up_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the retry / rip-up pass gives one connection (its tries and the routes it took out going back), and the gaps pass one gap between two pieces of a net; spent: the rip-up fails and what it took out goes back; 0 no limit"},
-                        "attempts":{"type":"boolean","default":false,"description":"pns: each row lists its tries (at most 40): kind, pass, layer, from, points (vias / corners), routed, ms; a failed one its reason, stopped_at_mm, toward_mm, walls_in, the nearest blocker"},"stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does; while connections still wait for their first-pass try (first_pass_budget_s bounding it) or, failed there, for their turn in the retry pass (fewest tries first), it ends the turn of the one routing instead (budget stop_on_plateau_s); in the rip-up pass it ends that pass, and the gaps and clean_up passes still run (each under its own budget) before the call stops: what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
+                        "attempts":{"type":"boolean","default":false,"description":"pns: each row lists its tries (at most 40): kind, pass, layer, from, points (vias / corners), routed, ms; a failed one its reason, stopped_at_mm, toward_mm, via_room (stopped before a via: whether that via alone fits there), walls_in, the nearest blocker"},"stop_on_plateau_s":{"type":"number","default":0,"description":"pns: stop the call when no connection more was routed for this long (seconds; 0 never), as job_cancel does; while connections still wait for their first-pass try (first_pass_budget_s bounding it) or, failed there, for their turn in the retry pass (fewest tries first), it ends the turn of the one routing instead (budget stop_on_plateau_s); in the rip-up pass it ends that pass, and the gaps and clean_up passes still run (each under its own budget) before the call stops: what is routed is kept; the answer says stopped_on_plateau, stop_reason in job_get"},"first_pass_budget_s":{"type":"number","default":30,"minimum":0,"description":"seconds the first pass gives one connection; spent: it is left to the retry / rip-up pass (row budget: first_pass_budget_s, profile budget.first_pass_left); 0 no limit"},
                         "budgets":{"type":"string","enum":["time","work"],"default":"time","description":"time: first_pass_budget_s, rip_up_budget_s and stop_on_plateau_s on the wall clock; work: counted in the router's work (its stop checks: each walkaround / shove step and try) at work_per_s a second, so the same board routes the same under any load (A/B comparisons), the wall clock only a hard cap at wall_cap_x times a budget (profile budget: mode, work, work_per_s, wall_caps)"},
                         "trace_attempt":{"type":"integer","minimum":0,"default":0,"description":"debug: trace the router's try of this number (1 = the first; the segments' attempt): trace {attempt, from, to, layer, mode, vias, fronts, board_tracks (the board's track order), board_tracks_hash, pns {events: the router's steps as text without addresses, file:line first, total, capped, other_threads}, pns_hash, routed, out}; two runs' traces show where they part"},
                         "trace_last":{"type":"integer","minimum":0,"description":"debug: with trace_attempt, trace every try up to this one: traces [{attempt, from, to, ..., board_tracks_hash, pns_hash, pns_total, routed}] (no steps, no track list): the first try whose hashes differ between two runs is the one to trace alone"},
