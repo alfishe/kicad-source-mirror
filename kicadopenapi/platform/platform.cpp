@@ -43,6 +43,32 @@ fs::path DiscoveryDir()
     return dir.empty() ? TempRoot() / "kicad" / "openapi" : dir;
 }
 
+static fs::path envPath(const char* name)
+{
+#if defined(_WIN32)
+    return EnvPathWindows(name);
+#else
+    return EnvPathPosix(name);
+#endif
+}
+
+fs::path LogDir()
+{
+    for (const char* name : { "KOPENAPI_RUN_ROOT", "KICAD_CONFIG_HOME" })
+    {
+        if (fs::path root = envPath(name); !root.empty())
+            return root / "openapi-logs";
+    }
+#if defined(_WIN32)
+    fs::path dir = UserLogDirWindows();
+#elif defined(__APPLE__)
+    fs::path dir = UserLogDirMacOS();
+#else
+    fs::path dir = UserLogDirPosix();
+#endif
+    return dir.empty() ? fs::path() : dir / "openapi-logs";
+}
+
 fs::path ExecutableDir(const char* argv0)
 {
     fs::path exe;

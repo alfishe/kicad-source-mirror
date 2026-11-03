@@ -15,6 +15,9 @@ std::filesystem::path TempRootMacOS();
 
 std::filesystem::path ExecutablePathMacOS();
 
+/// @brief ~/Library/Logs/kicad
+std::filesystem::path UserLogDirMacOS();
+
 struct ProcessMemoryInfo;
 struct AllocatorInfo;
 ProcessMemoryInfo ProcessMemoryMacOS();

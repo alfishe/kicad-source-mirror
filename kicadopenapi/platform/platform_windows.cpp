@@ -104,6 +104,19 @@ std::filesystem::path EnvPathWindows(const char* name)
     return value ? std::filesystem::path(value) : std::filesystem::path();
 }
 
+std::filesystem::path UserLogDirWindows()
+{
+    std::filesystem::path local = EnvPathWindows("LOCALAPPDATA");
+
+    if (local.empty())
+    {
+        if (std::filesystem::path profile = EnvPathWindows("USERPROFILE"); !profile.empty())
+            local = profile / "AppData" / "Local";
+    }
+
+    return local.empty() ? local : local / "kicad" / "logs";
+}
+
 void SetEnvPathWindows(const char* name, const std::filesystem::path& value)
 {
     _wputenv_s(wideName(name).c_str(), value.c_str());

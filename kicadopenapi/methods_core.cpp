@@ -310,7 +310,7 @@ static KOPENAPI_RESULT h_app_restart( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
         wxSetEnv( wxS( "KICAD_OPENAPI_PORT" ), wxString::Format( wxS( "%d" ), port ) );
 
     std::string error;
-    const auto  logDir = kopenapi::platform::TempRoot() / "kicad" / "openapi-logs";
+    const auto  logDir = kopenapi::platform::LogDir();
     const long  pid = kopenapi::platform::SpawnDetached( argv, logDir / "restart.log", error );
 
     wxUnsetEnv( wxS( "KICAD_OPENAPI_WAIT_PID" ) );

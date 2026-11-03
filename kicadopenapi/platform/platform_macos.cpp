@@ -2,6 +2,7 @@
 
 #include "platform_macos.h"
 #include "platform.h"
+#include "platform_posix.h"
 
 #include <algorithm>
 #include <climits>
@@ -30,6 +31,12 @@ namespace kopenapi::platform
 std::filesystem::path TempRootMacOS()
 {
     return "/tmp";
+}
+
+std::filesystem::path UserLogDirMacOS()
+{
+    std::filesystem::path home = HomeDirPosix();
+    return home.empty() ? home : home / "Library" / "Logs" / "kicad";
 }
 
 std::filesystem::path ExecutablePathMacOS()

@@ -70,7 +70,7 @@ public:
 
         argv.push_back( aSettings.path.string() );
 
-        const std::filesystem::path logDir = kp::TempRoot() / "kicad" / "openapi-logs";
+        const std::filesystem::path logDir = kp::LogDir();
         std::error_code             ec;
         std::filesystem::create_directories( logDir, ec );
         m_log = logDir / ( "ffmpeg-" + std::to_string( kp::CurrentPid() ) + ".log" );

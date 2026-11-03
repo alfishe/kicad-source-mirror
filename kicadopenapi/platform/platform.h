@@ -23,6 +23,12 @@ std::filesystem::path TempRoot();
 /// kicadopenapi service
 std::filesystem::path DiscoveryDir();
 
+/// @brief Where the service's own logs go (journal, restarts, encoders), never a fixed temp dir:
+/// <KOPENAPI_RUN_ROOT>/openapi-logs when that is set, else <KICAD_CONFIG_HOME>/openapi-logs, else
+/// the OS's per-user log dir (macOS ~/Library/Logs/kicad, Windows %LOCALAPPDATA%\kicad\logs,
+/// elsewhere $XDG_STATE_HOME/kicad or ~/.local/state/kicad) / openapi-logs
+std::filesystem::path LogDir();
+
 /// @brief Directory of the running executable (argv0 is the fallback)
 std::filesystem::path ExecutableDir(const char* argv0);
 

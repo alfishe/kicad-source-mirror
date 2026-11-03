@@ -17,6 +17,10 @@ long CurrentPidPosix();
 bool ProcessAlivePosix(long pid);
 void SetEnvPosix(const std::string& name, const std::string& value);
 std::filesystem::path EnvPathPosix(const char* name);
+/// @brief $HOME, else the user database's home directory
+std::filesystem::path HomeDirPosix();
+/// @brief $XDG_STATE_HOME/kicad, else ~/.local/state/kicad
+std::filesystem::path UserLogDirPosix();
 void SetEnvPathPosix(const char* name, const std::filesystem::path& value);
 long SpawnDetachedPosix(const std::vector<std::string>& argv, const std::filesystem::path& logFile,
                         std::string& error);

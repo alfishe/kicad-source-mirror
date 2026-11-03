@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -52,6 +53,24 @@ std::filesystem::path EnvPathPosix(const char* name)
 {
     const char* value = std::getenv(name);
     return value ? std::filesystem::path(value) : std::filesystem::path();
+}
+
+std::filesystem::path HomeDirPosix()
+{
+    if (std::filesystem::path home = EnvPathPosix("HOME"); !home.empty())
+        return home;
+
+    const passwd* user = getpwuid(getuid());
+    return user && user->pw_dir ? std::filesystem::path(user->pw_dir) : std::filesystem::path();
+}
+
+std::filesystem::path UserLogDirPosix()
+{
+    if (std::filesystem::path state = EnvPathPosix("XDG_STATE_HOME"); state.is_absolute())
+        return state / "kicad";
+
+    std::filesystem::path home = HomeDirPosix();
+    return home.empty() ? home : home / ".local" / "state" / "kicad";
 }
 
 void SetEnvPathPosix(const char* name, const std::filesystem::path& value)

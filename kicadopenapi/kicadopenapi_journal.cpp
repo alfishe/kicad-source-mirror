@@ -151,7 +151,7 @@ void KOPENAPI_JOURNAL::Install( const std::string& aAppName )
         s.appName = aAppName.empty() ? std::string( "kicad" ) : aAppName;
 
         std::error_code ec;
-        fs::path        dir = kopenapi::platform::TempRoot() / "kicad" / "openapi-logs";
+        fs::path        dir = kopenapi::platform::LogDir();
         fs::create_directories( dir, ec );
 
         // Keep a day of logs
