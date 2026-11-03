@@ -316,6 +316,12 @@ public:
     /// @brief Marked by MarkConcurrentReads and not by MarkEditing
     bool IsConcurrentRead( const std::string& aName ) const;
 
+    /// @brief Methods that load files (documents, libraries, design blocks): a success answers what
+    /// the load logged, its errors in load_errors and its warnings in warnings (the dispatcher adds them)
+    static bool MarkLoading( std::initializer_list<const char*> aNames );
+
+    bool IsLoading( const std::string& aName ) const;
+
     std::optional<KOPENAPI_METHOD> Find( const std::string& aName ) const;
 
     /// @brief Keyword search for the MCP `search` tool: query tokens are matched against method
@@ -345,6 +351,7 @@ private:
     std::map<std::string, KOPENAPI_EVENT_TOPIC> m_eventTopics;
     std::set<std::string>                       m_editing;
     std::set<std::string>                       m_concurrentReads;
+    std::set<std::string>                       m_loading;
 };
 
 
@@ -367,6 +374,10 @@ private:
 /// @brief The methods of this file that read concurrently (see KOPENAPI_REGISTRY::MarkConcurrentReads)
 #define KOPENAPI_MARK_CONCURRENT_READS( ... )                                               \
     static const bool kopenapi_concurrent_reads_reg = KOPENAPI_REGISTRY::MarkConcurrentReads( { __VA_ARGS__ } )
+
+/// @brief The methods of this file that load files (see KOPENAPI_REGISTRY::MarkLoading)
+#define KOPENAPI_MARK_LOADING( ... )                                                        \
+    static const bool kopenapi_loading_reg = KOPENAPI_REGISTRY::MarkLoading( { __VA_ARGS__ } )
 
 #define KOPENAPI_REGISTER_VIEW_BENCHMARK( aDomain, aHandler )                              \
     static const bool kopenapi_view_bench_reg = KOPENAPI_REGISTRY::AddViewBenchmark( aDomain, aHandler )

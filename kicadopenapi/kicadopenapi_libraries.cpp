@@ -20,6 +20,19 @@ static std::string str( const wxString& aText )
 }
 
 
+void KopenapiLoadLibraryLogged( LIBRARY_MANAGER_ADAPTER& aAdapter, const wxString& aNickname )
+{
+    std::optional<LIB_STATUS> status = aAdapter.LoadLibraryEntry( aNickname );
+
+    if( status && status->load_status == LOAD_STATUS::LOAD_ERROR && status->error )
+    {
+        wxString title = status->error->message.BeforeFirst( '\n' );
+        title.StartsWith( wxS( "IO_ERROR: " ), &title );
+        wxLogError( _( "Error loading library '%s': %s" ), aNickname, title );
+    }
+}
+
+
 static nlohmann::json tableJson( const LIBRARY_TABLE* aTable, const char* aScope, int& aErrors )
 {
     nlohmann::json table = { { "scope", aScope },
@@ -395,7 +408,7 @@ KOPENAPI_RESULT KopenapiLibTableAdd( PROJECT& aProject, const KOPENAPI_LIB_TABLE
                                        str( editError ) );
 
     if( row.Type() != LIBRARY_TABLE_ROW::TABLE_TYPE_NAME && !row.Disabled() )
-        aKind.adapter->LoadLibraryEntry( nickname );
+        KopenapiLoadLibraryLogged( *aKind.adapter, nickname );
 
     std::optional<LIBRARY_TABLE*> table = Pgm().GetLibraryManager().Table( aKind.adapter->Type(), *scope );
     std::optional<LIBRARY_TABLE_ROW*> added = table ? ( *table )->Row( nickname ) : std::nullopt;
@@ -529,7 +542,7 @@ KOPENAPI_RESULT KopenapiLibTableSet( PROJECT& aProject, const KOPENAPI_LIB_TABLE
         return KOPENAPI_RESULT::Error( 500, "the row is not in the reloaded table" );
 
     if( ( *row )->Type() != LIBRARY_TABLE_ROW::TABLE_TYPE_NAME && !( *row )->Disabled() )
-        aKind.adapter->LoadLibraryEntry( newNickname );
+        KopenapiLoadLibraryLogged( *aKind.adapter, newNickname );
 
     return KOPENAPI_RESULT::Ok( rowJson( **row, *scope, aProject, aKind.adapter ) );
 }

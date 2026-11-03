@@ -285,7 +285,13 @@ void KOPENAPI_JOURNAL_MARK::AddTo( nlohmann::json& aBody ) const
         if( entry.value( "operation", std::string() ) != m_operation )
             continue;
 
-        const char* key = entry["level"] == "warning" ? "warnings" : "load_errors";
-        aBody[key].push_back( entry["message"] );
+        const char*     key = entry["level"] == "warning" ? "warnings" : "load_errors";
+        nlohmann::json& list = aBody[key];
+
+        if( list.is_null() )
+            list = nlohmann::json::array();
+
+        if( list.is_array() && std::find( list.begin(), list.end(), entry["message"] ) == list.end() )
+            list.push_back( entry["message"] );
     }
 }

@@ -810,3 +810,4 @@ KOPENAPI_REGISTER( "pcb_append",
                    false, h_pcb_append, 600 );
 
 KOPENAPI_MARK_EDITING( "pcb_design_block_save", "pcb_design_block_place", "pcb_append" );
+KOPENAPI_MARK_LOADING( "pcb_design_block_place", "pcb_append" );

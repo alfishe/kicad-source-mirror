@@ -1851,6 +1851,12 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                           const uint64_t  logBefore = KOPENAPI_JOURNAL::Summary().value( "last_seq", uint64_t( 0 ) );
                           KOPENAPI_RESULT result;
 
+                          // a method that loads files answers what the load logged
+                          std::optional<KOPENAPI_JOURNAL_MARK> loadMessages;
+
+                          if( KOPENAPI_REGISTRY::Get().IsLoading( name ) )
+                              loadMessages.emplace();
+
                           try
                           {
                               result = handler( ctxCopy, args );
@@ -1879,6 +1885,9 @@ KICAD_OPENAPI_SERVICE::IMPL::mainCall( const std::string& aName, const nlohmann:
                               if( !log.empty() )
                                   result.body["error"]["log"] = log;
                           }
+
+                          if( result.status < 400 && loadMessages && result.body.is_object() )
+                              loadMessages->AddTo( result.body );
 
                           if( result.status < 400 )
                               addPoints( result.body, 0 );

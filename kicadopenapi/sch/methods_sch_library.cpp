@@ -665,7 +665,7 @@ static KOPENAPI_RESULT h_sch_lib_symbol_save( KOPENAPI_CONTEXT& aCtx, const nloh
     if( row )
     {
         adapter->ReloadLibraryEntry( row->Nickname(), row->Scope() );
-        adapter->LoadLibraryEntry( row->Nickname() );
+        KopenapiLoadLibraryLogged( *adapter, row->Nickname() );
     }
 
     nlohmann::json result = { { "library", { { "nickname", row ? nlohmann::json( str( row->Nickname() ) ) : nlohmann::json() },
@@ -789,3 +789,5 @@ KOPENAPI_REGISTER( "sch_lib_table_set",
                    KopenapiLibTableSchema( "set" ), false,
                    []( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
                    { return libTable( aCtx, aArgs, KopenapiLibTableSet ); } );
+
+KOPENAPI_MARK_LOADING( "sch_lib_table_add", "sch_lib_table_set", "sch_lib_symbol_save" );

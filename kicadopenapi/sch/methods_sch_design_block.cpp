@@ -777,3 +777,4 @@ KOPENAPI_REGISTER( "sch_sheet_import",
                    false, h_sch_sheet_import );
 
 KOPENAPI_MARK_EDITING( "sch_design_block_save", "sch_design_block_place", "sch_sheet_import" );
+KOPENAPI_MARK_LOADING( "sch_design_block_place", "sch_sheet_import" );

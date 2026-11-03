@@ -27,6 +27,10 @@ KICOMMON_API nlohmann::json KopenapiLibraryTables( const LIBRARY_MANAGER_ADAPTER
 /// directory: a table pointing into another build's bundle that no longer exists.
 KICOMMON_API void KopenapiCheckGlobalLibraryTables();
 
+/// @brief Loads a library now (LoadLibraryEntry); a failure is logged as the error the libraries'
+/// status bar shows, so the call that loaded it answers it (load_errors)
+KICOMMON_API void KopenapiLoadLibraryLogged( LIBRARY_MANAGER_ADAPTER& aAdapter, const wxString& aNickname );
+
 /// @brief Make sure the footprint libraries of the current project are loaded (from any kiface; the
 /// adapter lives in the shared library manager).  A project switch aborts running loads but
 /// leaves a per-library status behind, and cvpcb's lookups (ERC footprint links, netlist pad

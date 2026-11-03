@@ -513,3 +513,5 @@ KOPENAPI_REGISTER( "pcb_lib_table_set",
                    KopenapiLibTableSchema( "set" ), false,
                    []( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
                    { return libTable( aCtx, aArgs, KopenapiLibTableSet ); } );
+
+KOPENAPI_MARK_LOADING( "pcb_lib_table_add", "pcb_lib_table_set" );

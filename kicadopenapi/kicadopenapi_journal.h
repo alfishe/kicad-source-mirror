@@ -68,7 +68,8 @@ public:
     KOPENAPI_JOURNAL_MARK();
 
     /// @brief The errors this operation recorded since the mark into aBody["load_errors"], the
-    /// warnings into aBody["warnings"] (their messages; nothing added when there are none)
+    /// warnings into aBody["warnings"] (their messages, each once, after what the arrays hold;
+    /// nothing added when there are none)
     void AddTo( nlohmann::json& aBody ) const;
 
 private:

@@ -33,7 +33,7 @@ void KopenapiAnswerQueries( PCB_IO& aPlugin, KOPENAPI_BOARD_QUERIES& aQueries )
                 }
 
                 aQueries.asked.push_back( question );
-                wxLogWarning( "%s: %s (loading goes on)", aTitle, aMessage );
+                wxLogWarning( "%s: %s", aTitle, aMessage );
                 return true;
             } );
 }

@@ -1,7 +1,6 @@
 /// @file methods_pcb_documents.cpp
 /// @brief kicadopenapi PCB document methods: pcb_open, pcb_close, pcb_save, pcb_revert, and the
 /// "pcb" document provider.  Compiled into the pcbnew kiface; registered when it loads.
-#include <kicadopenapi_journal.h>
 #include <kicadopenapi_util.h>
 #include <kicadopenapi_change_feed.h>
 #include <model_thread.h>
@@ -513,7 +512,6 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
 
     KOPENAPI_RESULT         result;
     KOPENAPI_BOARD_QUERIES& queries = KopenapiBoardQueries();
-    KOPENAPI_JOURNAL_MARK   loadMessages;
 
     queries = KOPENAPI_BOARD_QUERIES();
     queries.accept = aArgs.value( "accept_queries", true );
@@ -542,26 +540,9 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
                                             "the open: " + answered.declined );
     }
 
-    // what the editor shows in its infobar or would have asked in a dialog (a failure carries it
-    // in error.log)
-    if( result.status == 200 )
-        loadMessages.AddTo( result.body );
-
+    // the reader's questions answered yes (the dispatcher adds the rest of what the load logged)
     if( result.status == 200 && !answered.asked.empty() )
-    {
-        nlohmann::json& warnings = result.body["warnings"];
-
-        if( !warnings.is_array() )
-            warnings = nlohmann::json::array();
-
-        for( const std::string& question : answered.asked )
-        {
-            // the question once, not also as the line the answer logged
-            warnings.erase( std::remove( warnings.begin(), warnings.end(), question + " (loading goes on)" ),
-                            warnings.end() );
-            warnings.push_back( question );
-        }
-    }
+        result.body["warnings"] = answered.asked;
 
     // the editor offers these in its infobar
     if( result.status == 200 )
@@ -1373,3 +1354,4 @@ KOPENAPI_REGISTER( "pcb_autosave",
                    false, h_pcb_autosave, 120 );
 
 KOPENAPI_MARK_EDITING( "pcb_repair" );
+KOPENAPI_MARK_LOADING( "pcb_open", "pcb_revert" );

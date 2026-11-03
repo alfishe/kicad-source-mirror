@@ -177,3 +177,4 @@ KOPENAPI_REGISTER( "pcb_import_ses",
                    false, h_pcb_import_ses, 300 );
 
 KOPENAPI_MARK_EDITING( "pcb_import_ses" );
+KOPENAPI_MARK_LOADING( "pcb_import_ses" );
