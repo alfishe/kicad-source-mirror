@@ -1483,7 +1483,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     // courtyard; sizes as the rules ask of the bus's nets.
     using AT = std::array<double, 2>;
     const bool   innerRing = aArgs.value( "inner_ring", true );
-    const double viaCost = std::max( 0.0, aArgs.value( "via_cost_mm", 2.0 ) );
+    const double viaCost = KopenapiViaCostMm( board, aArgs );
     int          ringsLaid = 0;
     std::vector<PCB_LAYER_ID> powerLayers;
 
@@ -3693,6 +3693,7 @@ static KOPENAPI_RESULT h_pcb_floorplan( KOPENAPI_CONTEXT& aCtx, const nlohmann::
               { "channel_count", cuts.size() },
               { "channels_used", std::count_if( cuts.begin(), cuts.end(), []( const CUT& c ) { return c.use > 0; } ) },
               { "channels", channels },
+              { "via_cost_mm", r2( viaCost ) },
               { "overflows", overflows },
               { "links", linkList },
               { "ports", portList },
@@ -3774,7 +3775,7 @@ KOPENAPI_REGISTER( "pcb_floorplan",
                         "split_topology_only":{"type":"boolean","default":false,"description":"bus nets in it by their end parts only (pcb_layout_graph net_source topology) go with the single nets between the blocks"},
                         "port_sides":{"type":"boolean","default":true,"description":"a bus leaves and enters its end blocks by its ends' exit sides (pcb_layout_graph ends); false: by any side"},
                         "inner_ring":{"type":"boolean","default":true,"description":"allow inner rings: a bus may leave (enter) its end part by another side than its pins' by a via row at the pins' side (as far out as their 45 degree fan to it needs, sizes by the rules) down to a layer the stack-up types power, round the part in a band outside its courtyard, up by a row at that side. A candidate way in the negotiation (cost: its length + 2 x via_cost_mm + its channel's overflow), taken where cheaper or where the surface way overflows (link rings: layer, net, rows, band, channel, cost, islands; rings_refused: why, where the way overflows). Only inside one pour of a net not ground (pcb_net_roles), no copper of another net in the band or at the rows, no pad of the net cut off the pour"},
-                        "via_cost_mm":{"type":"number","default":2.0,"description":"mm of track a via costs (inner rings: two per track)"},
+                        "via_cost_mm":{"type":"number","minimum":0,"description":"mm of track a via costs (inner rings: two per track); default from the rules as pcb_route's: the routing room a via of the default class takes on each signal layer, as track (the answer's via_cost_mm)"},
                         "corridor_merge":{"type":"boolean","default":true,"description":"a corridor's gates (portals crossed) that a straight run from an earlier gate to a later one passes, inside each portal less the ribbon's half width and a pitch, are dropped; the earlier gate's rooms_mm lists the regions the run goes through (corridor.md); summary gates_merged"},
                         "copper_stretches":{"type":"boolean","default":false,"description":"each link's corridor crossing gets free_mm: per routing layer the runs [lo_mm, hi_mm] of its free stretch no copper on that layer is in (tracks, vias, pads at the board's clearance; fills not counted)"},
                         "reroute":{"type":"string","enum":["overflowed","all"],"default":"overflowed","description":"after the first round reroute only the bundles on an overflowing channel, or all"},
