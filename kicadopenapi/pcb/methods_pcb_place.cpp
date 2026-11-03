@@ -3857,8 +3857,9 @@ bool finePitch( FOOTPRINT* aFootprint )
 /// @brief The spot for a via from aPin of a package to a part under it on the other side: on the line
 /// from the pin into the body (along the package axis, then straight to its middle), just past the
 /// pin's inner end, clear of other nets' copper (pads, tracks, vias, the spots in aTaken) by the
-/// clearance; else just past the pin's outer end.  A spot of the net within 1.2 mm of the pin is
-/// shared instead.  aDirection gets the board axis pointing into the body.
+/// clearance; else past the pin's outer end, up to one via pitch (via + clearance) beyond the pad.  A
+/// spot of the net closer than a via pitch to that one (the two would not fit side by side) is shared
+/// instead.  aDirection gets the board axis pointing into the body.
 /// The way a pin of a quad row takes into its package: along the package axis, in the board's frame
 VECTOR2D inwardAxis( PAD* aPin )
 {
@@ -3997,39 +3998,53 @@ std::optional<VECTOR2I> viaSpotUnder( BOARD* aBoard, PAD* aPin, int aViaDiameter
 
     aDirection = std::abs( axis.x ) >= std::abs( axis.y ) ? ( axis.x > 0 ? "right" : "left" ) : ( axis.y > 0 ? "down" : "up" );
 
-    // a neighbour pin of the net already has one close by: shared
+    // two vias of the net fit side by side a via pitch apart (the rules' via and clearance); the walk out
+    // past the pin's outer end goes one via pitch beyond the pad
+    const int  viaPitch = aViaDiameter + clearance;
+    const BOX2I padBox = aPin->GetBoundingBox();
+    const int  padHalf = std::abs( axis.x ) >= std::abs( axis.y ) ? padBox.GetWidth() / 2 : padBox.GetHeight() / 2;
+
+    std::optional<VECTOR2I> ownSpot;
+
+    for( const VECTOR2D& ray : { axis, toMiddle / span } )
+    {
+        for( int along = step; !ownSpot && along < span; along += step )
+        {
+            const VECTOR2I at = pin + VECTOR2I( KiROUND( ray.x * along ), KiROUND( ray.y * along ) );
+
+            if( free( at ) )
+                ownSpot = at;
+        }
+    }
+
+    for( int along = step; !ownSpot && !finePitch( host ) && along <= padHalf + viaPitch; along += step )
+    {
+        const VECTOR2I at = pin - VECTOR2I( KiROUND( axis.x * along ), KiROUND( axis.y * along ) );
+
+        if( free( at ) )
+            ownSpot = at;
+    }
+
+    // a neighbour pin of the net has a spot where this pin's ownSpot would not fit beside it (or this pin has
+    // none, and that one is within the package's reach): shared
     const VIA_SPOT* shared = nullptr;
 
     for( const VIA_SPOT& taken : aTaken )
     {
-        if( net > 0 && taken.net == net && ( taken.at - pin ).EuclideanNorm() <= toIU( 1.2 ) && stubClear( taken.at )
-            && ( !shared || ( taken.at - pin ).EuclideanNorm() < ( shared->at - pin ).EuclideanNorm() ) )
-        {
+        if( net <= 0 || taken.net != net || !stubClear( taken.at ) )
+            continue;
+
+        const bool crowds = ownSpot ? ( taken.at - *ownSpot ).EuclideanNorm() < viaPitch : ( taken.at - pin ).EuclideanNorm() <= span;
+
+        if( crowds && ( !shared || ( taken.at - pin ).EuclideanNorm() < ( shared->at - pin ).EuclideanNorm() ) )
             shared = &taken;
-        }
     }
 
     if( shared )
         return shared->at;
 
-    for( const VECTOR2D& ray : { axis, toMiddle / span } )
-    {
-        for( int along = step; along < span; along += step )
-        {
-            const VECTOR2I at = pin + VECTOR2I( KiROUND( ray.x * along ), KiROUND( ray.y * along ) );
-
-            if( free( at ) )
-                return at;
-        }
-    }
-
-    for( int along = step; !finePitch( host ) && along < toIU( 2.0 ); along += step )
-    {
-        const VECTOR2I at = pin - VECTOR2I( KiROUND( axis.x * along ), KiROUND( axis.y * along ) );
-
-        if( free( at ) )
-            return at;
-    }
+    if( ownSpot )
+        return ownSpot;
 
     return std::nullopt;
 }
