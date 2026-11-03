@@ -18176,6 +18176,164 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
     std::vector<BOARD_CONNECTED_ITEM*>                 spotStaged;
     std::map<PAD*, std::vector<BOARD_CONNECTED_ITEM*>> spotStagedOf;
 
+    std::map<PAD*, std::optional<VECTOR2I>> farOf;
+
+    auto farCached = [&]( PAD* aPad ) -> const std::optional<VECTOR2I>&
+    {
+        auto it = farOf.find( aPad );
+
+        if( it == farOf.end() )
+            it = farOf.emplace( aPad, aPad->GetNetCode() > 0 ? farEnd( aPad ) : std::nullopt ).first;
+
+        return it->second;
+    };
+
+    auto takesVia = [&]( PAD* aPad )
+    {
+        if( aPad->GetNetCode() <= 0 || !farCached( aPad ) )
+            return false;
+
+        if( !withPorts )
+            return true;
+
+        const auto portOf = plan.find( str( aPad->GetNumber() ) );
+        return portOf != plan.end() && ( portOf->second.kind == "rail" || portOf->second.layer == "other" );
+    };
+
+    // the ways out of the pins kept on their layer, round the package: a way whose far end lies behind its row,
+    // or more along the row than out, runs along the row toward it, past the row's end and round the corner while
+    // the far end is behind that side too. A way that runs in front of a pin whose own way goes elsewhere (out,
+    // or along the other way) crosses it, so it runs on the other layer there and all along the package
+    struct ROW_GEOM
+    {
+        VECTOR2I dir, tangent;
+        int64_t  tip = std::numeric_limits<int64_t>::min(), lo = std::numeric_limits<int64_t>::max(),
+                 hi = std::numeric_limits<int64_t>::min();
+    };
+
+    struct WALK_SEG
+    {
+        int     side;
+        int64_t from, to;   ///< along that side's row
+        int     toward;
+    };
+
+    std::map<int, ROW_GEOM> rowGeom;
+
+    for( auto& [sideKey, list] : bySide )
+    {
+        if( sideKey == INSIDE )
+            continue;
+
+        ROW_GEOM& g = rowGeom[sideKey];
+        g.dir = out[sideKey];
+        g.tangent = VECTOR2I( g.dir.y != 0 ? 1 : 0, g.dir.x != 0 ? 1 : 0 );
+
+        for( PAD* pad : list )
+        {
+            const VECTOR2I c = pad->GetPosition();
+            const BOX2I    pb = pad->GetBoundingBox();
+            const int64_t  a = (int64_t) c.x * g.tangent.x + (int64_t) c.y * g.tangent.y;
+
+            g.tip = std::max( g.tip, (int64_t) c.x * g.dir.x + (int64_t) c.y * g.dir.y + ( g.dir.x != 0 ? pb.GetWidth() : pb.GetHeight() ) / 2 );
+            g.lo = std::min( g.lo, a );
+            g.hi = std::max( g.hi, a );
+        }
+    }
+
+    auto alongOf = [&]( int aSide, const VECTOR2I& aAt ) { return (int64_t) aAt.x * rowGeom[aSide].tangent.x + (int64_t) aAt.y * rowGeom[aSide].tangent.y; };
+    auto outOf = [&]( int aSide, const VECTOR2I& aAt ) { return (int64_t) aAt.x * rowGeom[aSide].dir.x + (int64_t) aAt.y * rowGeom[aSide].dir.y - rowGeom[aSide].tip; };
+
+    // a pin's heading on its row: along it (toward its far end) or out (0)
+    auto towardOf = [&]( int aSide, PAD* aPad ) -> int
+    {
+        const std::optional<VECTOR2I>& far = farCached( aPad );
+
+        if( !far || !rowGeom.count( aSide ) )
+            return 0;
+
+        const int64_t da = alongOf( aSide, *far ) - alongOf( aSide, aPad->GetPosition() );
+        const int64_t outFar = outOf( aSide, *far );
+
+        return da != 0 && ( outFar <= 0 || std::abs( da ) > outFar ) ? ( da > 0 ? 1 : -1 ) : 0;
+    };
+
+    std::map<PAD*, int>                   padSide;
+    std::map<PAD*, std::vector<WALK_SEG>> walkOf;
+    std::set<PAD*>                        otherLayer;
+
+    for( auto& [sideKey, list] : bySide )
+    {
+        for( PAD* pad : list )
+            padSide[pad] = sideKey;
+    }
+
+    for( auto& [sideKey, list] : bySide )
+    {
+        if( sideKey == INSIDE || !withPorts )
+            continue;
+
+        for( PAD* q : list )
+        {
+            const std::optional<VECTOR2I>& far = farCached( q );
+            int                            t = far && !takesVia( q ) ? towardOf( sideKey, q ) : 0;
+
+            if( !t )
+                continue;
+
+            std::vector<WALK_SEG>& walk = walkOf[q];
+            int                    s = sideKey;
+            int64_t                from = alongOf( s, q->GetPosition() );
+
+            for( int k = 0; k < 3 && t; ++k )
+            {
+                const ROW_GEOM& g = rowGeom[s];
+                const int64_t   end = t > 0 ? g.hi : g.lo;
+                const int64_t   farAt = alongOf( s, *far );
+                const bool      behind = outOf( s, *far ) <= 0;
+
+                if( t * ( farAt - end ) <= 0 )
+                {
+                    walk.push_back( { s, from, farAt, t } );
+                    break;
+                }
+
+                walk.push_back( { s, from, end, t } );
+
+                if( !behind )
+                    break;
+
+                // round the corner: the side at that end, heading away from this side's front
+                const VECTOR2I next = g.tangent * t;
+                auto           it = std::find_if( rowGeom.begin(), rowGeom.end(), [&]( const auto& e ) { return e.second.dir == next; } );
+
+                if( it == rowGeom.end() )
+                    break;
+
+                s = it->first;
+                t = ( -g.dir.x * it->second.tangent.x - g.dir.y * it->second.tangent.y ) > 0 ? 1 : -1;
+                from = ( t > 0 ? it->second.lo : it->second.hi ) - t * pitch;
+            }
+
+            for( const WALK_SEG& seg : walk )
+            {
+                for( PAD* r : bySide[seg.side] )
+                {
+                    const int64_t a = alongOf( seg.side, r->GetPosition() );
+
+                    if( r == q || r->GetNetCode() <= 0 || r->GetNetCode() == q->GetNetCode() || takesVia( r ) || !farCached( r )
+                        || seg.toward * ( a - seg.from ) <= 0 || seg.toward * ( seg.to - a ) < 0 )
+                    {
+                        continue;
+                    }
+
+                    if( towardOf( seg.side, r ) != seg.toward )
+                        otherLayer.insert( q );
+                }
+            }
+        }
+    }
+
     for( auto& [sideKey, list] : bySide )
     {
         const SIDE side = (SIDE) sideKey;
@@ -18208,7 +18366,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
             if( !onlyNets.empty() && !onlyNets.count( pad->GetNetCode() ) )
                 continue;
 
-            fars[pad] = farEnd( pad );
+            fars[pad] = farCached( pad );
 
             if( !fars[pad] )
             {
@@ -18229,18 +18387,6 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         // a pad elsewhere), whatever nets were asked, and spreads them by the gap between two of them
         std::vector<PAD*> fanned;
 
-        auto takesVia = [&]( PAD* aPad )
-        {
-            if( aPad->GetNetCode() <= 0 || !farEnd( aPad ) )
-                return false;
-
-            if( !withPorts )
-                return true;
-
-            const auto portOf = plan.find( str( aPad->GetNumber() ) );
-            return portOf != plan.end() && ( portOf->second.kind == "rail" || portOf->second.layer == "other" );
-        };
-
         for( PAD* pad : list )
         {
             if( takesVia( pad ) )
@@ -18251,7 +18397,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         {
             for( PAD* pad : list )
             {
-                if( pad->GetNetCode() > 0 && farEnd( pad ) )
+                if( pad->GetNetCode() > 0 && farCached( pad ) )
                     fanned.push_back( pad );
             }
         }
@@ -18353,7 +18499,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
 
             for( PAD* pad : list )
             {
-                if( pad->GetNetCode() <= 0 || std::find( fanned.begin(), fanned.end(), pad ) != fanned.end() || !farEnd( pad ) )
+                if( pad->GetNetCode() <= 0 || std::find( fanned.begin(), fanned.end(), pad ) != fanned.end() || !farCached( pad ) )
                     continue;
 
                 const int64_t at = alongAt( pad );
@@ -18497,35 +18643,65 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
 
         const int64_t rayEnd = tipLine + reachMin;
 
-        // a via keeps out of the escape fronts of the row's pins that leave straight (no via of their own, a pad
-        // elsewhere, a way between other-net pads), as pcb_route reserves them (KopenapiPadEscapeDepth past the
-        // row): a via that would reach into one goes past it, by what keeps it clear of the front's end; a via
-        // in no front stays where the fan puts it
+        // a via keeps out of the escape fronts of the row's pins that leave on their layer (no via of their own, a
+        // pad elsewhere, a way between other-net pads), as pcb_route reserves them (KopenapiPadEscapeDepth past
+        // the row): a via that would reach into one goes past it, by what keeps it clear of the front's end. The
+        // row's ways that run along it on the other layer (above) dive in their fronts and run on in front of the
+        // row: a via they pass goes out past their band (the deepest front, their tracks side by side at the
+        // rules' clearance, then the via's own clearance). A via in no front or band stays put
         std::map<PAD*, int64_t> reachOf;
 
         if( withVias && withPorts )
         {
-            const std::set<PAD*> viaPins( fanned.begin(), fanned.end() );
+            const std::set<PAD*>              viaPins( fanned.begin(), fanned.end() );
             std::vector<std::pair<PAD*, int>> ways;
 
             for( PAD* q : list )
             {
-                if( !viaPins.count( q ) && q->GetNetCode() > 0 && farEnd( q ) && KopenapiPadWayBetween( aBoard, q ) )
+                if( !viaPins.count( q ) && q->GetNetCode() > 0 && farCached( q ) && KopenapiPadWayBetween( aBoard, q ) )
                     ways.emplace_back( q, KopenapiRuleTrack( aBoard, q->GetNetCode(), q->GetPosition(), q->IsOnLayer( F_Cu ) ? F_Cu : B_Cu ).opt );
             }
 
             for( PAD* p : fanned )
             {
-                int64_t r = rayEnd;
+                int64_t       r = rayEnd;
+                const int64_t at = fannedAt( p );
 
                 for( const auto& [q, qWidth] : ways )
                 {
                     const double keep = viaDia / 2.0 + clearance + qWidth / 2.0 + slack;
-                    const double apart = std::abs( fannedAt( p ) - alongAt( q ) );
+                    const double apart = std::abs( at - alongAt( q ) );
 
                     if( q->GetNetCode() != p->GetNetCode() && apart < keep )
                         r = std::max( r, tipLine + KopenapiPadEscapeDepth( aBoard, q ) + (int64_t) std::ceil( std::sqrt( keep * keep - apart * apart ) ) );
                 }
+
+                int64_t front = KopenapiPadEscapeDepth( aBoard, p ), lanes = 0;
+                int     passing = 0, apartLanes = clearance, apartVia = clearance;
+
+                for( PAD* q : otherLayer )
+                {
+                    if( q->GetNetCode() == p->GetNetCode() || padSide[q] != side )
+                        continue;
+
+                    for( const WALK_SEG& seg : walkOf[q] )
+                    {
+                        if( seg.side != side || seg.toward * ( at - seg.from ) <= 0 || seg.toward * ( seg.to - at ) <= 0 )
+                            continue;
+
+                        const PCB_LAYER_ID layer = q->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
+
+                        front = std::max<int64_t>( front, KopenapiPadEscapeDepth( aBoard, q ) );
+
+                        lanes += KopenapiRuleTrack( aBoard, q->GetNetCode(), q->GetPosition(), layer ).opt;
+                        apartLanes = std::max( apartLanes, KopenapiRuleVia( aBoard, q->GetNetCode(), q->GetPosition(), layer ).clearance );
+                        apartVia = std::max( apartVia, KopenapiRuleVia( aBoard, q->GetNetCode(), q->GetPosition(), layer, p ).clearance );
+                        passing++;
+                    }
+                }
+
+                if( passing )
+                    r = std::max( r, tipLine + front + lanes + ( passing - 1 ) * (int64_t) apartLanes + apartVia + viaDia / 2 + slack );
 
                 reachOf[p] = r;
             }
@@ -18646,7 +18822,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         {
             for( PAD* pad : viaFirst )
             {
-                if( pad->GetNetCode() > 0 && farEnd( pad ) )
+                if( pad->GetNetCode() > 0 && farCached( pad ) )
                     planSpot( pad, {} );
             }
         }
