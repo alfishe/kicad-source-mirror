@@ -18497,6 +18497,46 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
 
         const int64_t rayEnd = tipLine + reachMin;
 
+        // a via keeps out of the escape fronts of the row's pins that leave straight (no via of their own, a pad
+        // elsewhere, a way between other-net pads), as pcb_route reserves them (KopenapiPadEscapeDepth past the
+        // row): a via that would reach into one goes past it, by what keeps it clear of the front's end; a via
+        // in no front stays where the fan puts it
+        std::map<PAD*, int64_t> reachOf;
+
+        if( withVias && withPorts )
+        {
+            const std::set<PAD*> viaPins( fanned.begin(), fanned.end() );
+            std::vector<std::pair<PAD*, int>> ways;
+
+            for( PAD* q : list )
+            {
+                if( !viaPins.count( q ) && q->GetNetCode() > 0 && farEnd( q ) && KopenapiPadWayBetween( aBoard, q ) )
+                    ways.emplace_back( q, KopenapiRuleTrack( aBoard, q->GetNetCode(), q->GetPosition(), q->IsOnLayer( F_Cu ) ? F_Cu : B_Cu ).opt );
+            }
+
+            for( PAD* p : fanned )
+            {
+                int64_t r = rayEnd;
+
+                for( const auto& [q, qWidth] : ways )
+                {
+                    const double keep = viaDia / 2.0 + clearance + qWidth / 2.0 + slack;
+                    const double apart = std::abs( fannedAt( p ) - alongAt( q ) );
+
+                    if( q->GetNetCode() != p->GetNetCode() && apart < keep )
+                        r = std::max( r, tipLine + KopenapiPadEscapeDepth( aBoard, q ) + (int64_t) std::ceil( std::sqrt( keep * keep - apart * apart ) ) );
+                }
+
+                reachOf[p] = r;
+            }
+        }
+
+        auto baseReach = [&]( PAD* aPad )
+        {
+            auto it = reachOf.find( aPad );
+            return it != reachOf.end() ? it->second : rayEnd;
+        };
+
         int64_t toCourtyard = rayEnd;
 
         if( courtyard.OutlineCount() )
@@ -18516,7 +18556,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         {
             const VECTOR2I     at = aPad->GetPosition();
             const PCB_LAYER_ID layer = aPad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
-            const int64_t      reach = aReach >= 0 ? aReach : rayEnd + aRow * ( viaDia + clearance );
+            const int64_t      reach = aReach >= 0 ? aReach : baseReach( aPad ) + aRow * ( viaDia + clearance );
             const int64_t      out = std::min( knee[aPad], reach - tipLine );
             const int64_t      slant = std::min( std::abs( fannedAt( aPad ) - alongAt( aPad ) ), std::max<int64_t>( 0, reach - tipLine - out ) );
             const int64_t      to = alongAt( aPad ) + halfOf( aPad ) * slant;
