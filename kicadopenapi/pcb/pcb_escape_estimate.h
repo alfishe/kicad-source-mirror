@@ -28,10 +28,6 @@ struct ESCAPE_ESTIMATE
     double ms = 0;
     std::vector<std::string> boxedPads;   ///< REF.PAD of the ends boxed in
     std::vector<std::pair<double, double>> railViaSpots;   ///< mm
-
-    /// @brief Lower is better: a connection left without a way weighs as much as ten vias, a via as
-    /// much as 10 mm of track
-    double Cost() const { return 10.0 * ( boxedIn + firstPassFailed + overflowing ) + vias + lengthMm / 10.0; }
 };
 
 /// @param aRails nets left out (they go to their planes)

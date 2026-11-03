@@ -25,6 +25,7 @@
 #include <board_commit.h>
 #include <chrono>
 #include <optional>
+#include <tuple>
 #include <board_design_settings.h>
 #include <convert_basic_shapes_to_polygon.h>
 #include <connectivity/connectivity_data.h>
@@ -6850,7 +6851,26 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                 const double                margin = spec.value( "orientation_margin_mm", 6.0 );
                 nlohmann::json              byTurn = nlohmann::json::array();
                 std::vector<int>            failed( 4, 0 );
+                std::vector<int>            planCost( 4, std::numeric_limits<int>::max() / 2 );
                 std::vector<double>         rest( 4, 0.0 );
+                const double                viaCostMm = KopenapiViaCostMm( board, {} );
+
+                // the L1 ports plan's turn cost per quarter turn (an edge-fixed part has a cost for turn 0 only)
+                if( std::optional<KOPENAPI_METHOD> ports = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" ) )
+                {
+                    const KOPENAPI_RESULT plan = ports->handler( aCtx, { { "ref", str( anchor->GetReference() ) } } );
+
+                    if( plan.status < 400 && plan.body.contains( "rotation" ) )
+                    {
+                        for( const nlohmann::json& row : plan.body["rotation"].value( "by_turn", nlohmann::json::array() ) )
+                        {
+                            const int q = row.value( "quarter_turns_cw", -1 );
+
+                            if( q >= 0 && q < 4 )
+                                planCost[q] = row.value( "cost", 0 );
+                        }
+                    }
+                }
 
                 const std::set<const FOOTPRINT*> members( parts.begin(), parts.end() );
                 const OUTLINE                    outline( board );
@@ -6922,10 +6942,13 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                     trial.Revert();
 
                     failed[q] = e.boxedIn + e.firstPassFailed + e.overflowing + (int) unplaced;
-                    rest[q] = e.vias + e.lengthMm / 10.0;
+                    rest[q] = e.lengthMm + e.vias * viaCostMm;
 
-                    byTurn.push_back( { { "quarter_turns_cw", q }, { "cost", std::round( ( 10.0 * failed[q] + rest[q] ) * 10 ) / 10 },
-                                        { "failed", failed[q] }, { "connections", e.connections }, { "boxed_in", e.boxedIn },
+                    const bool planned = planCost[q] < std::numeric_limits<int>::max() / 2;
+
+                    byTurn.push_back( { { "quarter_turns_cw", q }, { "failed", failed[q] },
+                                        { "plan_cost", planned ? nlohmann::json( planCost[q] ) : nlohmann::json() },
+                                        { "cost", std::round( rest[q] * 10 ) / 10 }, { "connections", e.connections }, { "boxed_in", e.boxedIn },
                                         { "first_pass_failed", e.firstPassFailed }, { "overflowing", e.overflowing }, { "vias", e.vias },
                                         { "length_mm", e.lengthMm }, { "rail_vias", e.railVias },
                                         { "rail_vias_at_mm", e.railViaSpots }, { "unplaced", unplaced }, { "boxed_in_at", e.boxedPads },
@@ -6933,26 +6956,60 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
                     orientation["cell_mm"] = e.cellMm;
                 }
 
-                // fewest connections without a way first; among those the shortest (vias + length), but
-                // the anchor stays as it is unless that saves a tenth
-                const int fewest = *std::min_element( failed.begin(), failed.end() );
-                int       best = -1;
-
-                for( int q = 0; q < 4; ++q )
+                // ranked in order: fewest connections without a way out, length plus vias (apart by more than
+                // one via), the ports plan's turn cost (blind to what is in the way: it only parts turns the
+                // estimate cannot tell apart); the anchor stays as it is unless a turn is strictly better
+                auto better = [&]( int a, int b )
                 {
-                    if( failed[q] == fewest && ( best < 0 || rest[q] < rest[best] ) )
+                    if( failed[a] != failed[b] )
+                        return failed[a] < failed[b];
+
+                    if( std::abs( rest[a] - rest[b] ) > viaCostMm )
+                        return rest[a] < rest[b];
+
+                    return planCost[a] < planCost[b];
+                };
+
+                int best = 0;
+
+                for( int q = 1; q < 4; ++q )
+                {
+                    if( better( q, best ) )
                         best = q;
                 }
 
-                if( failed[0] == fewest && rest[best] > 0.9 * rest[0] )
-                {
+                if( best != 0 && !better( best, 0 ) )
                     best = 0;
-                    orientation["why"] = "kept: no turn gets more connections out, none saves a tenth of the vias and length";
-                }
+
+                if( best == 0 )
+                    orientation["why"] = "kept: no turn gets more connections out, none saves more than a via's cost of length and vias, none of those has a cheaper turn in the ports plan";
+                else if( failed[best] < failed[0] )
+                    orientation["why"] = "fewer connections without a way out";
+                else if( rest[best] < rest[0] - viaCostMm )
+                    orientation["why"] = "as many ways out, more than a via's cost shorter";
                 else
+                    orientation["why"] = "as many ways out, as long within a via's cost, a cheaper turn in the ports plan";
+
+                orientation["via_cost_mm"] = std::round( viaCostMm * 100 ) / 100;
+
+                std::vector<int> order;
+
+                for( int q = 0; q < 4; ++q )
                 {
-                    orientation["why"] = failed[best] < failed[0] ? "fewer connections without a way out"
-                                                                  : "as many ways out, a tenth or more shorter";
+                    if( failed[q] < std::numeric_limits<int>::max() / 2 )
+                        order.push_back( q );
+                }
+
+                std::stable_sort( order.begin(), order.end(),
+                                  [&]( int a, int b ) { return std::tie( failed[a], rest[a], planCost[a] ) < std::tie( failed[b], rest[b], planCost[b] ); } );
+                std::stable_partition( order.begin(), order.end(), [&]( int q ) { return q == best; } );
+
+                for( nlohmann::json& row : byTurn )
+                {
+                    const int q = row.value( "quarter_turns_cw", -1 );
+
+                    if( auto it = std::find( order.begin(), order.end(), q ); it != order.end() )
+                        row["rank"] = 1 + ( it - order.begin() );
                 }
 
                 turns = best;
@@ -7060,7 +7117,7 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
 static const char* PLACE_GROUP_BLOCK = R"json({
     "anchor":{"type":"string","description":"reference of the main part; it does not move (orientation may turn it in place)"},
-    "orientation":{"description":"the anchor's quarter turn: keep (default); auto - each of the four tried (the block placed, then a quick route of every non-rail connection with an end within orientation_margin_mm of the anchor's courtyard, the far ends reached straight from the box's edge, on a grid of the anchor's pad pitch (or one track pitch) over the routing layers, the rails' stitching vias as pcb_stitch lays them as walls and each via taking its room on every layer, shortest first without rip-up, then negotiated), the turn with the fewest connections left without a way (boxed in, failed in the first pass, still sharing cells, parts unplaced), of those the one with the fewest vias + mm / 10; the anchor stays as it is unless a turn gets more connections out or saves a tenth (why says which); a turn whose courtyard runs into another part of its side (not the block's) or over the board's edge is not tried (by_turn blocked_by); or 0..3 quarter turns clockwise. The anchor turns about its courtyard's centre; a locked one needs override_locks (auto keeps it: why kept, by lock, turns 1..3 blocked_by locked). Answer orientation: quarter_turns_cw, rotation_deg, why, by_turn (auto: per turn failed, its parts, vias, length_mm, rail_vias, cost = 10 x failed + vias + mm / 10)","oneOf":[{"type":"string","enum":["keep","auto"]},{"type":"integer","minimum":0,"maximum":3}]},
+    "orientation":{"description":"the anchor's quarter turn: keep (default); auto - each of the four tried (the block placed, then a quick route of every non-rail connection with an end within orientation_margin_mm of the anchor's courtyard, the far ends reached straight from the box's edge, on a grid of the anchor's pad pitch (or one track pitch) over the routing layers, the rails' stitching vias as pcb_stitch lays them as walls and each via taking its room on every layer, shortest first without rip-up, then negotiated), the turns ranked in order: the fewest connections left without a way (boxed in, failed in the first pass, still sharing cells, parts unplaced), then the lowest cost = length_mm + vias x the rules' via cost (via_cost_mm), two turns within one via_cost_mm of each other as long, then the cheapest turn in the ports plan (pcb_fanout_ports rotation.by_turn cost; an edge-fixed anchor has one for turn 0 only, the others rank after it); the anchor stays as it is unless a turn is strictly better (why says which); a turn whose courtyard runs into another part of its side (not the block's) or over the board's edge is not tried (by_turn blocked_by); or 0..3 quarter turns clockwise. The anchor turns about its courtyard's centre; a locked one needs override_locks (auto keeps it: why kept, by lock, turns 1..3 blocked_by locked). Answer orientation: quarter_turns_cw, rotation_deg, why, via_cost_mm (auto), by_turn (auto: per turn failed, its parts, plan_cost, vias, length_mm, cost, rail_vias, rank: 1 first)","oneOf":[{"type":"string","enum":["keep","auto"]},{"type":"integer","minimum":0,"maximum":3}]},
     "orientation_margin_mm":{"type":"number","default":6,"description":"orientation auto: how far round the anchor's courtyard the estimate routes"},
     "parts":{"type":"array","items":{"type":"string"}},
     "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
