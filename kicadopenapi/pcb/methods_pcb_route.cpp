@@ -7506,7 +7506,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 const KOPENAPI_RESULT fan = fanout->handler( aCtx, { { "ref", str( fp->GetReference() ) }, { "ports", true },
                                                                      { "stubs", false }, { "dry_run", true }, { "nets", viaNets },
-                                                                     { "full", true }, { "zones", "keep" } } );
+                                                                     { "full", true }, { "zones", zoneMode } } );
 
                 if( fan.status == 200 && fan.body.contains( "via_spots" ) && fan.body["via_spots"].is_array() )
                 {
@@ -19325,7 +19325,7 @@ KOPENAPI_REGISTER( "pcb_fanout",
                         "direction":{"type":"string","enum":["inward","up","down","left","right"],"description":"stubs straight this way (edge mode); inward: away from the board edge the pads sit on (found by itself for card-edge fingers)"},
                         "stub_mm":{"type":"number","description":"edge mode: stub length from the pad centre"},
                         "via":{"type":"string","enum":["none","always","stagger"],"default":"none","description":"edge mode: a via at each stub end, stagger: on two alternating lines"},
-                        "zones":{"type":"string","enum":["refill","keep"],"default":"refill"},
+                        "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: other nets' pour fills give way (the guard does not count them; a plane takes the vias in) and are refilled after; keep: the fills stay as they are, so the fan-out must clear them (on a board with planes most vias find no spot). A dry run refills nothing either way"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json, 20 ),
                    false, h_pcb_fanout, 300 );
 

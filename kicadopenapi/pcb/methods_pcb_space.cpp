@@ -2717,7 +2717,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             }
 
             const KOPENAPI_RESULT fan = fanout->handler( aCtx, { { "ref", str( a.fp->GetReference() ) }, { "ports", true }, { "dry_run", true },
-                                                                 { "full", true }, { "zones", "keep" } } );
+                                                                 { "full", true }, { "zones", "refill" } } );
             const nlohmann::json  noSpots = nlohmann::json::array();
             const nlohmann::json& rows = fan.status == 200 && fan.body.contains( "via_spots" ) && fan.body["via_spots"].is_array()
                                                  ? fan.body["via_spots"] : noSpots;
