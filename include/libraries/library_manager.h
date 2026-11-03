@@ -156,6 +156,11 @@ public:
     /// Loads all available libraries for this adapter type in the background
     void AsyncLoad();
 
+    /// Loads the named libraries that are enabled and not loaded yet in the background, ahead of
+    /// AsyncLoad's queue.  The future is ready once they are; the loads belong to the adapter
+    /// (BlockUntilLoaded and AbortAsyncLoad wait for them), so a caller may stop waiting early.
+    std::shared_future<void> LoadInBackground( const std::vector<wxString>& aNicknames );
+
     virtual std::optional<LIB_STATUS> LoadOne( LIB_DATA* aLib ) = 0;
 
     /// Validates that a library is loadable.  May not necessarily load the library!
@@ -246,6 +251,9 @@ protected:
     /// Aborts any async load in progress; blocks until fully done aborting
     void abortLoad();
 
+    /// One library's load on a loader thread: status LOADING, enumerated, LOADED or LOAD_ERROR
+    void loadQueued( const wxString& aNickname, LIBRARY_TABLE_SCOPE aScope, const wxString& aUri );
+
     /// Aborts pending loads and resets every project-scope cache entry in place
     /// (plugin and row cleared, status returned to INVALID) while preserving the
     /// nickname keys. Keeping the keys acts as a sentinel: fetchIfLoaded() finds
@@ -278,6 +286,7 @@ protected:
 
     std::atomic_bool               m_abort;
     std::vector<std::future<void>> m_futures;
+    std::vector<std::future<void>> m_namedFutures;   ///< LoadInBackground's
 
     std::atomic<size_t> m_loadCount{ 0 };
     std::atomic<size_t> m_loadTotal{ 0 };

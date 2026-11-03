@@ -1431,7 +1431,7 @@ void LIBRARY_MANAGER_ADAPTER::abortLoad()
     {
         std::lock_guard lock( m_loadMutex );
 
-        if( m_futures.empty() )
+        if( m_futures.empty() && m_namedFutures.empty() )
             return;
 
         wxLogTrace( traceLibraries, "Aborting library load..." );
@@ -1445,6 +1445,7 @@ void LIBRARY_MANAGER_ADAPTER::abortLoad()
         std::lock_guard lock( m_loadMutex );
         m_abort.store( false );
         m_futures.clear();
+        m_namedFutures.clear();
         m_loadTotal.store( 0 );
         m_loadCount.store( 0 );
     }
@@ -1471,6 +1472,9 @@ void LIBRARY_MANAGER_ADAPTER::BlockUntilLoaded()
     wxLogTrace( traceLibraries, "BlockUntilLoaded: waiting on %zu futures", m_futures.size() );
 
     for( const std::future<void>& future : m_futures )
+        future.wait();
+
+    for( const std::future<void>& future : m_namedFutures )
         future.wait();
 
     wxLogTrace( traceLibraries, "BlockUntilLoaded: all futures complete, loadCount=%zu, loadTotal=%zu",
@@ -1850,6 +1854,121 @@ std::optional<LIB_STATUS> LIBRARY_MANAGER_ADAPTER::GetLibraryStatus( const wxStr
 }
 
 
+void LIBRARY_MANAGER_ADAPTER::loadQueued( const wxString& aNickname, LIBRARY_TABLE_SCOPE aScope,
+                                          const wxString& aUri )
+{
+    std::shared_mutex& mutex = aScope == LIBRARY_TABLE_SCOPE::GLOBAL ? globalLibsMutex() : m_librariesMutex;
+    LIBRARY_RESULT<LIB_DATA*> result = loadIfNeeded( aNickname );
+
+    if( result.has_value() )
+    {
+        LIB_DATA* lib = *result;
+
+        try
+        {
+            {
+                std::unique_lock lock( mutex );
+                lib->status.load_status = LOAD_STATUS::LOADING;
+            }
+
+            enumerateLibrary( lib, aUri );
+
+            {
+                std::unique_lock lock( mutex );
+                lib->status.load_status = LOAD_STATUS::LOADED;
+            }
+        }
+        catch( IO_ERROR& e )
+        {
+            std::unique_lock lock( mutex );
+            lib->status.load_status = LOAD_STATUS::LOAD_ERROR;
+            lib->status.error = LIBRARY_ERROR( e.Problem(), e.Where() );
+            wxLogTrace( traceLibraries, "%s: plugin threw exception: %s", aNickname, e.What() );
+        }
+    }
+    else
+    {
+        std::unique_lock lock( mutex );
+
+        std::map<wxString, LIB_DATA>& target = aScope == LIBRARY_TABLE_SCOPE::GLOBAL ? globalLibs() : m_libraries;
+
+        target[aNickname].status = LIB_STATUS( { .load_status = LOAD_STATUS::LOAD_ERROR, .error = result.error() } );
+    }
+}
+
+
+std::shared_future<void> LIBRARY_MANAGER_ADAPTER::LoadInBackground( const std::vector<wxString>& aNicknames )
+{
+    struct LOAD_WORK
+    {
+        wxString            nickname;
+        LIBRARY_TABLE_SCOPE scope;
+        wxString            uri;
+    };
+
+    auto work = std::make_shared<std::vector<LOAD_WORK>>();
+
+    // URIs resolved here: their expansion reads PROJECT data
+    for( const wxString& nickname : aNicknames )
+    {
+        std::optional<LIBRARY_TABLE_ROW*> row = m_manager.GetRow( Type(), nickname );
+
+        if( !row || ( *row )->Disabled() || IsLibraryLoaded( nickname ) )
+            continue;
+
+        // one the background load is reading already is waited for, not read twice
+        if( std::optional<LIB_STATUS> status = GetLibraryStatus( nickname );
+            status && status->load_status == LOAD_STATUS::LOADING )
+        {
+            continue;
+        }
+
+        work->push_back( { nickname, ( *row )->Scope(), getUri( *row ) } );
+    }
+
+    auto                     done = std::make_shared<std::promise<void>>();
+    std::shared_future<void> loaded = done->get_future().share();
+
+    if( work->empty() )
+    {
+        done->set_value();
+        return loaded;
+    }
+
+    std::lock_guard lock( m_loadMutex );
+
+    std::erase_if( m_namedFutures,
+                   []( std::future<void>& aFuture )
+                   {
+                       return aFuture.valid() && aFuture.wait_for( 0s ) == std::future_status::ready;
+                   } );
+
+    m_namedFutures.emplace_back( GetKiCadThreadPool().submit_task(
+            [this, work, done]()
+            {
+                for( const LOAD_WORK& item : *work )
+                {
+                    if( m_abort.load() )
+                        break;
+
+                    try
+                    {
+                        loadQueued( item.nickname, item.scope, item.uri );
+                    }
+                    catch( ... )
+                    {
+                        wxLogTrace( traceLibraries, "LoadInBackground: %s failed", item.nickname );
+                    }
+                }
+
+                done->set_value();
+            },
+            BS::pr::high ) );
+
+    return loaded;
+}
+
+
 void LIBRARY_MANAGER_ADAPTER::AsyncLoad()
 {
     std::unique_lock<std::mutex> asyncLock( m_loadMutex, std::try_to_lock );
@@ -1973,60 +2092,7 @@ void LIBRARY_MANAGER_ADAPTER::AsyncLoad()
                             return;
 
                         const LOAD_WORK& work = ( *workQueue )[idx];
-                        LIBRARY_RESULT<LIB_DATA*> result = loadIfNeeded( work.nickname );
-
-                        if( result.has_value() )
-                        {
-                            LIB_DATA* lib = *result;
-
-                            try
-                            {
-                                {
-                                    std::unique_lock lock(
-                                            work.scope == LIBRARY_TABLE_SCOPE::GLOBAL
-                                                    ? globalLibsMutex()
-                                                    : m_librariesMutex );
-                                    lib->status.load_status = LOAD_STATUS::LOADING;
-                                }
-
-                                enumerateLibrary( lib, work.uri );
-
-                                {
-                                    std::unique_lock lock(
-                                            work.scope == LIBRARY_TABLE_SCOPE::GLOBAL
-                                                    ? globalLibsMutex()
-                                                    : m_librariesMutex );
-                                    lib->status.load_status = LOAD_STATUS::LOADED;
-                                }
-                            }
-                            catch( IO_ERROR& e )
-                            {
-                                std::unique_lock lock(
-                                        work.scope == LIBRARY_TABLE_SCOPE::GLOBAL
-                                                ? globalLibsMutex()
-                                                : m_librariesMutex );
-                                lib->status.load_status = LOAD_STATUS::LOAD_ERROR;
-                                lib->status.error = LIBRARY_ERROR( e.Problem(), e.Where() );
-                                wxLogTrace( traceLibraries, "%s: plugin threw exception: %s",
-                                            work.nickname, e.What() );
-                            }
-                        }
-                        else
-                        {
-                            std::unique_lock lock(
-                                    work.scope == LIBRARY_TABLE_SCOPE::GLOBAL
-                                            ? globalLibsMutex()
-                                            : m_librariesMutex );
-
-                            std::map<wxString, LIB_DATA>& target =
-                                    ( work.scope == LIBRARY_TABLE_SCOPE::GLOBAL ) ? globalLibs()
-                                                                                  : m_libraries;
-
-                            target[work.nickname].status = LIB_STATUS( {
-                                    .load_status = LOAD_STATUS::LOAD_ERROR,
-                                    .error = result.error()
-                            } );
-                        }
+                        loadQueued( work.nickname, work.scope, work.uri );
 
                         ++m_loadCount;
                     }

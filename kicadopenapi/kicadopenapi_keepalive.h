@@ -40,6 +40,12 @@ KICOMMON_API void KopenapiCompute( const std::function<void()>& aWork );
 /// read now, before the edit goes on (the owner's write ends and is taken again)
 KICOMMON_API void KopenapiReadPoint();
 
+/// @brief Waits for work running elsewhere (a library load on the loader threads) until aPending()
+/// is 0: API readers read the documents meanwhile (a READ_WINDOW), the UI paints, and the call
+/// reports aPhase with aTotal - aPending() of aTotal done.  False as soon as the call or job is asked
+/// to stop (the work goes on where it runs).  Main thread or headless owner
+KICOMMON_API bool KopenapiAwait( const std::string& aPhase, int aTotal, const std::function<int()>& aPending );
+
 /// @brief True on a worker of KopenapiCompute
 KICOMMON_API bool KopenapiInComputeWorker();
 

@@ -110,6 +110,27 @@ void KopenapiReadPoint()
 }
 
 
+bool KopenapiAwait( const std::string& aPhase, int aTotal, const std::function<int()>& aPending )
+{
+    int pending = aPending();
+
+    if( pending <= 0 )
+        return true;
+
+    MODEL_THREAD::READ_WINDOW window;
+
+    for( ; pending > 0; pending = aPending() )
+    {
+        if( !KopenapiJobProgress( aPhase, std::max( 0, aTotal - pending ), aTotal ) )
+            return false;
+
+        std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+    }
+
+    return true;
+}
+
+
 bool KopenapiInComputeWorker()
 {
     return tlComputeWorker;

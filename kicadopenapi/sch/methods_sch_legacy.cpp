@@ -130,14 +130,22 @@ KOPENAPI_RESULT h_sch_rescue_symbols( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 
     rescuer->FindUniqueCandidates();
 
+    wxFileName library( schematic->GetFileName() );
+    library.SetName( library.GetName() + wxS( "-rescue" ) );
+    library.SetExt( legacy ? FILEEXT::LegacySymbolLibFileExtension : FILEEXT::KiCadSymbolLibFileExtension );
+
+    if( rescuer->Stopped() )
+    {
+        return KOPENAPI_RESULT::Ok( { { "kind", legacy ? "legacy_libraries" : "library_table" },
+                                      { "stopped", true },
+                                      { "rescued", nlohmann::json::array() },
+                                      { "library", str( library.GetFullPath() ) } } );
+    }
+
     nlohmann::json candidates = nlohmann::json::array();
 
     for( const RESCUE_CANDIDATE& candidate : rescuer->GetCandidates() )
         candidates.push_back( candidateJson( candidate ) );
-
-    wxFileName library( schematic->GetFileName() );
-    library.SetName( library.GetName() + wxS( "-rescue" ) );
-    library.SetExt( legacy ? FILEEXT::LegacySymbolLibFileExtension : FILEEXT::KiCadSymbolLibFileExtension );
 
     nlohmann::json out = { { "kind", legacy ? "legacy_libraries" : "library_table" },
                            { "candidates", candidates },
@@ -486,7 +494,9 @@ KOPENAPI_REGISTER( "sch_rescue_symbols",
                    "get a copy of the cached symbol in <schematic>-rescue (added to the project's symbol library "
                    "table; a .lib for projects without one) and are relinked to it. candidates lists every one "
                    "(name, new_name, action, in_cache, in_library); dry_run: true changes nothing; names picks the "
-                   "ones to rescue (default all; an unknown name 404). The schematic is then unsaved",
+                   "ones to rescue (default all; an unknown name 404). The schematic is then unsaved. The symbols' "
+                   "libraries not loaded yet load first, off the main thread (reading calls answer meanwhile, "
+                   "job_get shows it); a stop then (job_cancel) answers stopped: true, nothing rescued",
                    R"json({"type":"object","properties":{
                         "dry_run":{"type":"boolean","default":false},
                         "names":{"type":"array","items":{"type":"string"},

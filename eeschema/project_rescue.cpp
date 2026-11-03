@@ -38,6 +38,10 @@
 #include <set>
 #include <pgm_base.h>
 #include <libraries/symbol_library_adapter.h>
+#include <kicadopenapi_keepalive.h>
+
+#include <chrono>
+#include <future>
 
 
 // Helper sort function, used in getSymbols, to sort a symbol list by lib_id
@@ -571,6 +575,9 @@ bool RESCUER::RescueProject( wxWindow* aParent, RESCUER& aRescuer, bool aRunning
 {
     aRescuer.FindUniqueCandidates();
 
+    if( aRescuer.Stopped() )
+        return false;
+
     if( !aRescuer.GetCandidateCount() )
     {
         if( aRunningOnDemand )
@@ -655,6 +662,12 @@ bool RESCUER::RescueChosen( RESCUER& aRescuer, const std::optional<std::vector<w
                             wxString& aError )
 {
     aRescuer.FindUniqueCandidates();
+
+    if( aRescuer.Stopped() )
+    {
+        aError = _( "Stopped while the symbol libraries loaded; nothing was rescued." );
+        return false;
+    }
 
     if( std::vector<wxString> unknown = aRescuer.ChooseCandidates( aNames ); !unknown.empty() )
     {
@@ -852,19 +865,39 @@ SYMBOL_LIB_TABLE_RESCUER::SYMBOL_LIB_TABLE_RESCUER( PROJECT& aProject, SCHEMATIC
 void SYMBOL_LIB_TABLE_RESCUER::FindCandidates()
 {
     // The symbols' libraries are compared loaded: one the background load has not reached yet
-    // would look empty, and its symbols found only in the cache
+    // would look empty, and its symbols found only in the cache.  They load on the loader
+    // threads; meanwhile the UI paints, API readers read and a stop ends the wait
     SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( m_prj );
     std::set<wxString>      nicknames;
 
     for( SCH_SYMBOL* symbol : m_symbols )
         nicknames.insert( symbol->GetLibId().GetLibNickname() );
 
-    for( const wxString& nickname : nicknames )
-    {
-        std::optional<LIBRARY_TABLE_ROW*> row = adapter->GetRow( nickname );
+    std::shared_future<void> loaded = adapter->LoadInBackground( { nicknames.begin(), nicknames.end() } );
 
-        if( row && !( *row )->Disabled() && !adapter->IsLibraryLoaded( nickname ) )
-            adapter->LoadOne( nickname );
+    const auto pending =
+            [&]() -> int
+            {
+                int count = 0;
+
+                for( const wxString& nickname : nicknames )
+                {
+                    std::optional<LIB_STATUS> status = adapter->GetLibraryStatus( nickname );
+
+                    if( status && status->load_status == LOAD_STATUS::LOADING )
+                        count++;
+                }
+
+                if( loaded.wait_for( std::chrono::seconds( 0 ) ) != std::future_status::ready )
+                    return std::max( count, 1 );
+
+                return count;
+            };
+
+    if( !KopenapiAwait( "rescue: loading symbol libraries", (int) nicknames.size(), pending ) )
+    {
+        m_stopped = true;
+        return;
     }
 
     RESCUE_SYMBOL_LIB_TABLE_CANDIDATE::FindRescues( *this, m_all_candidates );

@@ -287,6 +287,12 @@ public:
     void RemoveDuplicates();
 
     /**
+     * The search was stopped (the call or job running it was asked to stop) before the libraries
+     * it compares with were loaded: it found nothing.
+     */
+    bool Stopped() const { return m_stopped; }
+
+    /**
      * Return the number of rescue candidates found.
      */
     size_t GetCandidateCount() { return m_all_candidates.size(); }
@@ -363,6 +369,7 @@ protected:
     std::vector<RESCUE_CANDIDATE*>      m_chosen_candidates;
 
     std::vector<RESCUE_LOG>             m_rescue_log;
+    bool                                m_stopped = false;
 };
 
 
