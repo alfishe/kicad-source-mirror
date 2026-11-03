@@ -46,6 +46,18 @@ std::shared_ptr<PCB_CONTEXT> KopenapiPcbContext( KOPENAPI_CONTEXT& aCtx );
 /// @brief 409 "no board open" result for methods that need one
 KOPENAPI_RESULT KopenapiNoBoard();
 
+class FOOTPRINT;
+
+/// @brief A mounting hole, fiducial or a part without nets
+bool KopenapiIsMechanicalPart( const FOOTPRINT* aFp );
+
+/// @brief A connector by its reference or library (never a mechanical part)
+bool KopenapiIsConnectorPart( const FOOTPRINT* aFp );
+
+/// @brief An anchor of a block: an IC or connector, a part of more than aMaxPartPins numbered pads or a
+/// connector, not mechanical
+bool KopenapiIsAnchorPart( const FOOTPRINT* aFp, int aMaxPartPins = 3 );
+
 /// @brief A frameless board's page (User size) fitted to its outline plus 10 mm: plots and renders
 /// draw the page
 void KopenapiFitPage( BOARD* aBoard, const BOX2I& aOutline );

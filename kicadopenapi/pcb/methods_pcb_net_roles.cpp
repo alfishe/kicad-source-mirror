@@ -34,7 +34,7 @@
 
 static const char* const PROJECT_KEY = "kicadopenapi.net_roles";
 
-static const std::set<std::string> ROLES = { "ground", "power", "power_hc", "pair", "clock", "matched", "bus",
+static const std::set<std::string> ROLES = { "ground", "power", "power_hc", "local_supply", "pair", "clock", "matched", "bus",
                                              "analog", "analog_hs", "switching", "signal", "nc", "fixed" };
 
 
@@ -214,7 +214,7 @@ static std::vector<std::string> expandMember( const std::string& aMember )
 
 static bool isPowerRole( const std::string& aRole )
 {
-    return aRole == "ground" || aRole == "power" || aRole == "power_hc";
+    return aRole == "ground" || aRole == "power" || aRole == "power_hc" || aRole == "local_supply";
 }
 
 
@@ -831,6 +831,41 @@ static KOPENAPI_RESULT h_pcb_net_roles( KOPENAPI_CONTEXT& aCtx, const nlohmann::
                         nlohmann::json::array( { std::to_string( roots.size() ) + " lines join the same parts" } ) );
     }
 
+    // a supply with exactly one anchor on it (an IC or connector; the rest small parts) is that anchor's own
+    std::map<std::string, bool> anchorRef;
+
+    for( FOOTPRINT* fp : board->Footprints() )
+    {
+        anchorRef[str( fp->GetReference() )] = KopenapiIsAnchorPart( fp );
+    }
+
+    for( NET_FACTS& f : nets )
+    {
+        if( f.fixedRole || ( f.role != "power" && f.role != "power_hc" ) )
+            continue;
+
+        std::vector<std::string> anchors;
+
+        for( const std::string& ref : f.refs )
+        {
+            if( anchorRef[ref] )
+                anchors.push_back( ref );
+        }
+
+        if( anchors.size() != 1 )
+            continue;
+
+        if( f.role == "power_hc" )
+        {
+            f.tags.insert( "local_supply" );
+            f.basis.push_back( "local supply: one anchor on it: " + anchors.front() );
+        }
+        else
+        {
+            f.Set( "local_supply", "topology", "one anchor on it: " + anchors.front() );
+        }
+    }
+
     nlohmann::json rows = nlohmann::json::array();
     nlohmann::json counts = nlohmann::json::object();
     nlohmann::json rails = nlohmann::json::array();
@@ -953,7 +988,7 @@ static KOPENAPI_RESULT h_pcb_net_roles_set( KOPENAPI_CONTEXT& aCtx, const nlohma
             const std::string role = row["role"].get<std::string>();
 
             if( !ROLES.count( role ) )
-                return KOPENAPI_RESULT::Error( 400, "role '" + role + "' is none of ground, power, power_hc, pair, clock, "
+                return KOPENAPI_RESULT::Error( 400, "role '" + role + "' is none of ground, power, power_hc, local_supply, pair, clock, "
                                                     "matched, bus, analog, analog_hs, switching, signal, nc, fixed" );
 
             entry["role"] = role;
@@ -1067,7 +1102,8 @@ static KOPENAPI_RESULT h_pcb_net_roles_set( KOPENAPI_CONTEXT& aCtx, const nlohma
 
 KOPENAPI_REGISTER( "pcb_net_roles",
                    "What each net is for the router, without routing: one primary role per net (ground, power, "
-                   "power_hc, pair, clock, matched, analog_hs (crystal), switching, bus, signal, unconnected) with "
+                   "power_hc, local_supply (a supply with one IC or connector on it, the rest small parts: that "
+                   "part's own; a power_hc one keeps its role with the tag local_supply), pair, clock, matched, analog_hs (crystal), switching, bus, signal, unconnected) with "
                    "tags, source (project, drc_rule, net_class, pins, schematic, name, topology) and basis; "
                    "differential pairs (KiCad's suffix rule plus DP / DM, D+ / D-, sharing a part, or named by a "
                    "custom diff-pair rule); matched groups and per-net rules (length, skew, diff-pair gap from the "
@@ -1094,7 +1130,7 @@ KOPENAPI_REGISTER( "pcb_net_roles_set",
                    R"json({"type":"object","properties":{
                         "nets":{"type":"array","items":{"type":"object","properties":{
                             "net":{"type":"string"},
-                            "role":{"type":"string","enum":["ground","power","power_hc","pair","clock","matched","bus","analog","analog_hs","switching","signal","nc","fixed"]},
+                            "role":{"type":"string","enum":["ground","power","power_hc","local_supply","pair","clock","matched","bus","analog","analog_hs","switching","signal","nc","fixed"]},
                             "current_a":{"type":"number","minimum":0},
                             "tags":{"type":"array","items":{"type":"string"}},
                             "edge":{"type":["object","null"],"description":"driver edge: {family (lvcmos33, lvcmos18, hc, ahc, ac, f, mcu_fast, mcu_slow, fpga_fast, fpga_slow, sstl, lvds, hcsl, cml, usb2_hs), tr_ps, tr_def (10-90 default, 20-80), rout_ohm, swing_v, nm_v, driver (ref.pin)}; given values win over the family defaults"},

@@ -159,7 +159,7 @@ struct BOARD_BLOCKS
 {
     std::vector<PART>               parts;
     std::map<const FOOTPRINT*, int> index;
-    std::set<int>                   rails, grounds;
+    std::set<int>                   rails, grounds, locals;
     std::vector<BLOCK>              blocks;
     std::vector<int>                partBlock;   ///< part -> block, -1 none
     std::vector<int>                mechanical;
@@ -179,8 +179,52 @@ std::string sheetOf( FOOTPRINT* aFp )
 }
 
 
-/// @brief Rails (ground / power nets) as pcb_net_roles decides them, else from the names
-void findRails( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, std::set<int>& aRails, std::set<int>& aGrounds )
+} // namespace
+
+
+bool KopenapiIsMechanicalPart( const FOOTPRINT* aFp )
+{
+    bool connected = false;
+
+    for( PAD* pad : aFp->Pads() )
+        connected = connected || ( !pad->GetNumber().IsEmpty() && pad->GetNetCode() > 0 );
+
+    const std::string lib = str( aFp->GetFPID().GetLibItemName() ) + " " + str( aFp->GetFPID().GetLibNickname() );
+    const std::string prefix = KopenapiRefPrefix( str( aFp->GetReference() ) );
+    return !connected || prefix == "H" || prefix == "MH" || prefix == "FID"
+           || lib.find( "MountingHole" ) != std::string::npos || lib.find( "Fiducial" ) != std::string::npos;
+}
+
+
+bool KopenapiIsConnectorPart( const FOOTPRINT* aFp )
+{
+    const std::string lib = str( aFp->GetFPID().GetLibItemName() ) + " " + str( aFp->GetFPID().GetLibNickname() );
+    return !KopenapiIsMechanicalPart( aFp )
+           && ( KopenapiIsConnectorRef( str( aFp->GetReference() ) ) || lib.find( "Connector" ) != std::string::npos );
+}
+
+
+bool KopenapiIsAnchorPart( const FOOTPRINT* aFp, int aMaxPartPins )
+{
+    if( KopenapiIsMechanicalPart( aFp ) )
+        return false;
+
+    int pads = 0;
+
+    for( PAD* pad : aFp->Pads() )
+        pads += !pad->GetNumber().IsEmpty();
+
+    return KopenapiIsConnectorPart( aFp ) || pads > aMaxPartPins;
+}
+
+
+namespace
+{
+
+/// @brief Rails (ground / power nets) as pcb_net_roles decides them, else from the names; aLocal: the
+/// local_supply ones (one anchor on each)
+void findRails( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, std::set<int>& aRails, std::set<int>& aGrounds,
+                std::set<int>* aLocal = nullptr )
 {
     std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" );
 
@@ -194,7 +238,7 @@ void findRails( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, std::set<int>& aRails, st
             {
                 const std::string role = n.value( "role", std::string() );
 
-                if( role != "ground" && role != "power" && role != "power_hc" )
+                if( role != "ground" && role != "power" && role != "power_hc" && role != "local_supply" )
                     continue;
 
                 if( NETINFO_ITEM* net = KopenapiFindNet( aBoard, n.value( "net", std::string() ) ) )
@@ -203,6 +247,12 @@ void findRails( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, std::set<int>& aRails, st
 
                     if( role == "ground" )
                         aGrounds.insert( net->GetNetCode() );
+
+                    const nlohmann::json tags = n.value( "tags", nlohmann::json::array() );
+
+                    if( aLocal && ( role == "local_supply"
+                                    || std::find( tags.begin(), tags.end(), "local_supply" ) != tags.end() ) )
+                        aLocal->insert( net->GetNetCode() );
                 }
             }
 
@@ -275,21 +325,15 @@ BOARD_BLOCKS buildBlocks( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, const GROUP_OPT
 
         p.nets.assign( nets.begin(), nets.end() );
 
-        const std::string lib = str( fp->GetFPID().GetLibItemName() ) + " " + str( fp->GetFPID().GetLibNickname() );
-        const std::string prefix = KopenapiRefPrefix( p.ref );
-        p.connector = KopenapiIsConnectorRef( p.ref ) || lib.find( "Connector" ) != std::string::npos;
-        p.mechanical = nets.empty() || prefix == "H" || prefix == "MH" || prefix == "FID"
-                       || lib.find( "MountingHole" ) != std::string::npos || lib.find( "Fiducial" ) != std::string::npos;
-
-        if( p.mechanical )
-            p.connector = false;
+        p.mechanical = KopenapiIsMechanicalPart( fp );
+        p.connector = KopenapiIsConnectorPart( fp );
 
         b.index[fp] = (int) b.parts.size();
         b.parts.push_back( std::move( p ) );
     }
 
     b.partBlock.assign( b.parts.size(), -1 );
-    findRails( aCtx, aBoard, b.rails, b.grounds );
+    findRails( aCtx, aBoard, b.rails, b.grounds, &b.locals );
 
     std::map<int, std::vector<int>> netParts;
     std::map<int, int>              netPads;
@@ -407,19 +451,11 @@ BOARD_BLOCKS buildBlocks( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, const GROUP_OPT
         return n > 0 && !b.rails.count( n ) && ( aOpt.maxFanout <= 0 || netPads[n] <= aOpt.maxFanout );
     };
 
-    // a supply with one anchor on it, the rest small parts (a relay's coil net, switched by its driver
-    // transistor): the anchor's own, it reaches those parts through it
+    // a local_supply (pcb_net_roles: one anchor on it, a relay's coil net switched by its driver
+    // transistor): the anchor reaches its parts through it
     auto localRail = [&]( int n )
     {
-        if( n <= 0 || !b.rails.count( n ) || b.grounds.count( n ) )
-            return false;
-
-        int anchorsOn = 0;
-
-        for( int o : netParts[n] )
-            anchorsOn += !b.parts[o].mechanical && !isSmall( o );
-
-        return anchorsOn == 1;
+        return b.locals.count( n ) > 0;
     };
 
     // signal members: breadth-first from each anchor through small parts

@@ -100,7 +100,7 @@ static bool signalLike( const std::string& aRole )
 
 static bool powerRole( const std::string& aRole )
 {
-    return aRole == "power" || aRole == "power_hc";
+    return aRole == "power" || aRole == "power_hc" || aRole == "local_supply";
 }
 
 

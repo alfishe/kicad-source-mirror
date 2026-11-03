@@ -130,7 +130,7 @@ bool isGround( const std::string& aRole )
 
 bool isRail( const std::string& aRole )
 {
-    return aRole == "power" || aRole == "power_hc";
+    return aRole == "power" || aRole == "power_hc" || aRole == "local_supply";
 }
 
 
