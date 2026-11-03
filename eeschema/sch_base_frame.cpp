@@ -777,12 +777,12 @@ wxString SCH_BASE_FRAME::SelectLibrary( const wxString& aDialogTitle, const wxSt
 
             if( adapter->HasLibrary( libraryName, false ) )
             {
-                DisplayError( this, wxString::Format( _( "Library '%s' already exists." ), libraryName ) );
+                ShowInfoBarError( wxString::Format( _( "Library '%s' already exists." ), libraryName ), true );
                 break;
             }
 
             if( !mgr.CreateLibrary( fn.GetFullPath(), scope ) )
-                DisplayError( this, wxString::Format( _( "Could not add library '%s'." ), libraryName ) );
+                ShowInfoBarError( wxString::Format( _( "Could not add library '%s'." ), libraryName ), true );
 
             break;
         }

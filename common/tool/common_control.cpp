@@ -69,6 +69,35 @@ wxString COMMON_CONTROL::m_bugReportTemplate = wxS(
         "```" );
 
 
+/// The frame's infobar; a frame without one (the project manager) shows a message box
+static void showError( EDA_BASE_FRAME* aFrame, const wxString& aMessage )
+{
+    if( aFrame->GetInfoBar() )
+        aFrame->ShowInfoBarError( aMessage, true );
+    else
+        DisplayErrorMessage( aFrame, aMessage );
+}
+
+
+/// true: open the online help now (only a frame without an infobar asks in a dialog); false: asked
+/// in the infobar, whose link opens it
+static bool askOnlineHelp( EDA_BASE_FRAME* aFrame, const wxString& aQuestion, const wxString& aUrl )
+{
+    if( aFrame->GetInfoBar() )
+    {
+        aFrame->ShowInfoBarQuestion( aQuestion, _( "Online Help" ),
+                                     [aFrame, aUrl]()
+                                     {
+                                         GetAssociatedDocument( aFrame, aUrl, &aFrame->Prj() );
+                                     } );
+        return false;
+    }
+
+    KICAD_MESSAGE_DIALOG dlg( nullptr, aQuestion, _( "File Not Found" ), wxYES_NO | wxNO_DEFAULT | wxCANCEL );
+    return dlg.ShowModal() == wxID_YES;
+}
+
+
 void COMMON_CONTROL::Reset( RESET_REASON aReason )
 {
     m_frame = getEditFrame<EDA_BASE_FRAME>();
@@ -285,7 +314,7 @@ int COMMON_CONTROL::ShowProjectManager( const TOOL_EVENT& aEvent )
     if( top && top->GetFrameType() == KICAD_MAIN_FRAME_T )
         showFrame( top );
     else
-        KICAD_MESSAGE_DIALOG( m_frame, _( "Can not switch to project manager in stand-alone mode." ) );
+        showError( m_frame, _( "Can not switch to project manager in stand-alone mode." ) );
 
     return 0;
 }
@@ -366,13 +395,11 @@ int COMMON_CONTROL::ShowHelp( const TOOL_EVENT& aEvent )
 
         if( !helpFile )
         {
-            msg = wxString::Format( _( "Help file '%s' or\n'%s' could not be found.\n"
+            msg = wxString::Format( _( "Help file '%s' or '%s' could not be found.  "
                                        "Do you want to access the KiCad online help?" ),
                                     names[0], names[1] );
-            KICAD_MESSAGE_DIALOG dlg( nullptr, msg, _( "File Not Found" ),
-                                      wxYES_NO | wxNO_DEFAULT | wxCANCEL );
 
-            if( dlg.ShowModal() != wxID_YES )
+            if( !askOnlineHelp( m_frame, msg, baseUrl + names[0] + wxS( "/" ) ) )
                 return -1;
 
             helpFile = baseUrl + names[0] + wxS( "/" );
@@ -386,13 +413,11 @@ int COMMON_CONTROL::ShowHelp( const TOOL_EVENT& aEvent )
 
         if( !helpFile )
         {
-            msg = wxString::Format( _( "Help file '%s' could not be found.\n"
+            msg = wxString::Format( _( "Help file '%s' could not be found.  "
                                        "Do you want to access the KiCad online help?" ),
                                     base_name );
-            KICAD_MESSAGE_DIALOG dlg( nullptr, msg, _( "File Not Found" ),
-                                      wxYES_NO | wxNO_DEFAULT | wxCANCEL );
 
-            if( dlg.ShowModal() != wxID_YES )
+            if( !askOnlineHelp( m_frame, msg, baseUrl + base_name + wxS( "/" ) ) )
                 return -1;
 
             helpFile = baseUrl + base_name + wxS( "/" );
@@ -492,17 +517,13 @@ int COMMON_CONTROL::ShowPluginFolder( const TOOL_EVENT& aEvent )
     {
         if( !PATHS::EnsurePathExists( dir ) )
         {
-            DisplayErrorMessage( m_frame,
-                                 wxString::Format( _( "Unable to create plugin directory '%s'." ),
-                                                   dir ) );
+            showError( m_frame, wxString::Format( _( "Unable to create plugin directory '%s'." ), dir ) );
             return 0;
         }
     }
 
     if( !LaunchExternal( dir ) )
-        DisplayErrorMessage( m_frame,
-                             wxString::Format( _( "Unable to open plugin directory '%s'." ),
-                                               dir ) );
+        showError( m_frame, wxString::Format( _( "Unable to open plugin directory '%s'." ), dir ) );
 
     return 0;
 }

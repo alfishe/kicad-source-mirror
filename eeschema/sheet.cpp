@@ -44,6 +44,7 @@
 #include <sch_sheet_loader.h>
 #include <dialogs/dialog_sheet_properties.h>
 #include <tool/actions.h>
+#include <kicadopenapi_service.h>
 
 #include <wx/clipbrd.h>
 #include <wx/dcmemory.h>
@@ -56,6 +57,20 @@
 #include <libraries/symbol_library_adapter.h>
 
 #include "printing/sch_printout.h"
+
+
+/// IsOK(), or while working for an agent its confirm argument (the question in the journal)
+static bool askSheetQuestion( wxWindow* aParent, const wxString& aQuestion )
+{
+    if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+    {
+        const bool go = KICAD_OPENAPI_SERVICE::ConfirmPrompts();
+        wxLogWarning( wxS( "%s (%s)" ), aQuestion, go ? wxS( "confirm: true" ) : wxS( "declined, confirm: true goes on" ) );
+        return go;
+    }
+
+    return IsOK( aParent, aQuestion );
+}
 
 
 bool SCH_EDIT_FRAME::CheckSheetForRecursion( SCH_SHEET* aSheet, SCH_SHEET_PATH* aCurrentSheet )
@@ -84,7 +99,7 @@ bool SCH_EDIT_FRAME::CheckSheetForRecursion( SCH_SHEET* aSheet, SCH_SHEET_PATH* 
                        "has the sheet '%s' or one of its subsheets as a parent somewhere in the "
                        "schematic hierarchy." ),
                     destFilePath );
-        DisplayError( this, msg );
+        ShowInfoBarError( msg, true );
         return true;
     }
 
@@ -106,7 +121,7 @@ bool SCH_EDIT_FRAME::checkForNoFullyDefinedLibIds( SCH_SHEET* aSheet )
                        "must first be remapped before it can be imported into the current "
                        "project." ),
                     aSheet->GetScreen()->GetFileName() );
-        DisplayInfoMessage( this, msg );
+        ShowInfoBarWarning( msg, true );
         return true;
     }
 
@@ -193,13 +208,11 @@ bool SCH_EDIT_FRAME::ChangeSheetFile( SCH_SHEET* aSheet, const wxString& aNewFil
     if( !screenFileName.Normalize( FN_NORMALIZE_FLAGS | wxPATH_NORM_ENV_VARS,
                                    currentScreenFileName.GetPath() ) )
     {
-        msg = wxString::Format( _( "Cannot normalize new sheet schematic file path:\n"
-                                   "'%s'\n"
-                                   "against parent sheet schematic file path:\n"
-                                   "'%s'." ),
+        msg = wxString::Format( _( "Cannot normalize new sheet schematic file path '%s' against parent sheet "
+                                   "schematic file path '%s'." ),
                                 sheetFileName.GetPath(),
                                 currentScreenFileName.GetPath() );
-        DisplayError( this, msg );
+        ShowInfoBarError( msg, true );
         return false;
     }
 
@@ -235,7 +248,7 @@ bool SCH_EDIT_FRAME::ChangeSheetFile( SCH_SHEET* aSheet, const wxString& aNewFil
         {
             clearAnnotation = true;
 
-            if( !IsOK( this, wxString::Format( _( "'%s' already exists." ),
+            if( !askSheetQuestion( this, wxString::Format( _( "'%s' already exists." ),
                                                sheetFileName.GetFullName() )
                              + wxT( "\n\n" )
                              + wxString::Format( _( "Link '%s' to this file?" ),
@@ -254,7 +267,7 @@ bool SCH_EDIT_FRAME::ChangeSheetFile( SCH_SHEET* aSheet, const wxString& aNewFil
                 msg.Printf( _( "Failed to copy schematic file '%s' to destination '%s'." ),
                             *aSourceSheetFilename,
                             newAbsoluteFilename );
-                DisplayError( this, msg );
+                ShowInfoBarError( msg, true );
                 return false;
             }
         }
@@ -282,7 +295,7 @@ bool SCH_EDIT_FRAME::ChangeSheetFile( SCH_SHEET* aSheet, const wxString& aNewFil
                 clearAnnotation = true;
                 oldScreen = aSheet->GetScreen();
 
-                if( !IsOK( this, wxString::Format( _( "Change '%s' link from '%s' to '%s'?" ),
+                if( !askSheetQuestion( this, wxString::Format( _( "Change '%s' link from '%s' to '%s'?" ),
                                                     newAbsoluteFilename,
                                                     aSheet->GetFileName(),
                                                     sheetFileName.GetFullName() )
@@ -300,7 +313,7 @@ bool SCH_EDIT_FRAME::ChangeSheetFile( SCH_SHEET* aSheet, const wxString& aNewFil
                 // Save current content to new file name
                 if( aSheet->GetScreenCount() > 1 )
                 {
-                    if( !IsOK( this, wxString::Format( _( "Create new file '%s' with contents "
+                    if( !askSheetQuestion( this, wxString::Format( _( "Create new file '%s' with contents "
                                                            "of '%s'?" ),
                                                         sheetFileName.GetFullName(),
                                                         aSheet->GetFileName() )
@@ -331,7 +344,7 @@ bool SCH_EDIT_FRAME::ChangeSheetFile( SCH_SHEET* aSheet, const wxString& aNewFil
             {
                 msg = wxString::Format( _( "Error occurred saving schematic file '%s'." ),
                                         newAbsoluteFilename );
-                DisplayErrorMessage( this, msg, ioe.What() );
+                ShowInfoBarError( msg + wxS( " " ) + ioe.What(), true );
 
                 msg = wxString::Format( _( "Failed to save schematic '%s'" ),
                                         newAbsoluteFilename );
@@ -420,6 +433,16 @@ public:
     bool Continue( const wxString& aTitle, const wxString& aMessage, const wxString& aDetail,
                    const wxString& aContinueLabel ) override
     {
+        // working for an agent: its confirm argument answers, the journal has the question
+        if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        {
+            const bool go = KICAD_OPENAPI_SERVICE::ConfirmPrompts();
+
+            wxLogWarning( wxS( "%s %s (%s: %s)" ), aMessage, aDetail, aContinueLabel,
+                          go ? wxS( "confirm: true" ) : wxS( "declined, confirm: true goes on" ) );
+            return go;
+        }
+
         KICAD_MESSAGE_DIALOG dlg( m_frame, aMessage, aTitle,
                                   wxOK | wxCANCEL | wxCANCEL_DEFAULT | wxCENTER | wxICON_QUESTION );
         dlg.SetOKCancelLabels( KICAD_MESSAGE_DIALOG::ButtonLabel( aContinueLabel ),
@@ -433,10 +456,10 @@ public:
 
     void Error( const wxString& aMessage, const wxString& aDetail ) override
     {
-        DisplayErrorMessage( m_frame, aMessage, aDetail );
+        m_frame->ShowInfoBarError( aDetail.IsEmpty() ? aMessage : aMessage + wxS( " " ) + aDetail, true );
     }
 
-    void Info( const wxString& aMessage ) override { DisplayInfoMessage( m_frame, aMessage ); }
+    void Info( const wxString& aMessage ) override { m_frame->ShowInfoBarWarning( aMessage, true ); }
 
     void LoadFailed( const wxString& aFileName ) override
     {
@@ -644,6 +667,14 @@ bool SCH_EDIT_FRAME::AllowCaseSensitiveFileNameClashes( const wxString& aOldName
 
     if( eeconfig()->m_Appearance.show_sheet_filename_case_sensitivity_dialog && can_cause_issues() )
     {
+        if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        {
+            return askSheetQuestion( this, wxString::Format( _( "The file name '%s' can cause issues with an "
+                                                                "existing file name on systems with case "
+                                                                "insensitive file names." ),
+                                                             fn.GetName() ) );
+        }
+
         msg.Printf( _( "The file name '%s' can cause issues with an existing file name\n"
                        "already defined in the schematic on systems that support case\n"
                        "insensitive file names.  This will cause issues if you copy this\n"

@@ -306,9 +306,9 @@ bool BACK_ANNOTATE::FetchNetlistFromPCB( std::string& aNetlist )
 
     if( Kiface().IsSingle() )
     {
-        DisplayErrorMessage( m_frame, _( "Cannot fetch PCB netlist because Schematic Editor is opened in "
+        m_frame->ShowInfoBarError( _( "Cannot fetch PCB netlist because Schematic Editor is opened in "
                                          "stand-alone mode.\n"
-                                         "You must launch the KiCad project manager and create a project." ) );
+                                         "You must launch the KiCad project manager and create a project." ), true );
         return false;
     }
 

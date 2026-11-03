@@ -1012,7 +1012,7 @@ int EE_GRAPHIC_TOOL::ImportGraphics( const TOOL_EVENT& aEvent )
     // Ensure the list is not empty:
     if( list.empty() )
     {
-        wxMessageBox( _( "No graphic items found in file." ) );
+        m_frame->ShowInfoBarError( _( "No graphic items found in file." ), true );
         return 0;
     }
 

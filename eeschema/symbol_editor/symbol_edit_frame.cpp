@@ -1361,7 +1361,7 @@ wxString SYMBOL_EDIT_FRAME::AddLibraryFile( bool aCreateNew )
 
     if( adapter->HasLibrary( libName ) )
     {
-        DisplayError( this, wxString::Format( _( "Library '%s' already exists." ), libName ) );
+        ShowInfoBarError( wxString::Format( _( "Library '%s' already exists." ), libName ), true );
         return wxEmptyString;
     }
 
@@ -1371,17 +1371,17 @@ wxString SYMBOL_EDIT_FRAME::AddLibraryFile( bool aCreateNew )
         // CreateLibrary fails on an existing path.
         if( fn.FileExists() && !wxRemoveFile( fn.GetFullPath() ) )
         {
-            DisplayError( this, wxString::Format( _( "Could not overwrite the library file '%s'.\n"
+            ShowInfoBarError( wxString::Format( _( "Could not overwrite the library file '%s'.\n"
                                                      "Make sure you have write permissions and try again." ),
-                                                  fn.GetFullPath() ) );
+                                                  fn.GetFullPath() ), true );
             return wxEmptyString;
         }
 
         if( !m_libMgr->CreateLibrary( fn.GetFullPath(), scope ) )
         {
-            DisplayError( this, wxString::Format( _( "Could not create the library file '%s'.\n"
+            ShowInfoBarError( wxString::Format( _( "Could not create the library file '%s'.\n"
                                                      "Make sure you have write permissions and try again." ),
-                                                  fn.GetFullPath() ) );
+                                                  fn.GetFullPath() ), true );
             return wxEmptyString;
         }
     }
@@ -1389,7 +1389,7 @@ wxString SYMBOL_EDIT_FRAME::AddLibraryFile( bool aCreateNew )
     {
         if( !m_libMgr->AddLibrary( fn.GetFullPath(), scope ) )
         {
-            DisplayError( this, _( "Could not open the library file." ) );
+            ShowInfoBarError( _( "Could not open the library file." ), true );
             return wxEmptyString;
         }
     }
@@ -1404,10 +1404,7 @@ wxString SYMBOL_EDIT_FRAME::AddLibraryFile( bool aCreateNew )
     table->Save().map_error(
             [&]( const LIBRARY_ERROR& aError )
             {
-                KICAD_MESSAGE_DIALOG dlg( this, _( "Error saving library table." ), _( "File Save Error" ),
-                                          wxOK | wxICON_ERROR );
-                dlg.SetExtendedMessage( aError.message );
-                dlg.ShowModal();
+                ShowInfoBarError( _( "Error saving library table." ) + wxS( " " ) + aError.message, true );
 
                 success = false;
             } );
@@ -1441,13 +1438,13 @@ void SYMBOL_EDIT_FRAME::DdAddLibrary( wxString aLibFile )
 
     if( adapter->HasLibrary( libName ) )
     {
-        DisplayError( this, wxString::Format( _( "Library '%s' already exists." ), libName ) );
+        ShowInfoBarError( wxString::Format( _( "Library '%s' already exists." ), libName ), true );
         return;
     }
 
     if( !m_libMgr->AddLibrary( fn.GetFullPath(), LIBRARY_TABLE_SCOPE::PROJECT ) )
     {
-        DisplayError( this, _( "Could not open the library file." ) );
+        ShowInfoBarError( _( "Could not open the library file." ), true );
         return;
     }
 
@@ -1459,10 +1456,7 @@ void SYMBOL_EDIT_FRAME::DdAddLibrary( wxString aLibFile )
     table->Save().map_error(
             [&]( const LIBRARY_ERROR& aError )
             {
-                KICAD_MESSAGE_DIALOG dlg( this, _( "Error saving library table." ), _( "File Save Error" ),
-                                          wxOK | wxICON_ERROR );
-                dlg.SetExtendedMessage( aError.message );
-                dlg.ShowModal();
+                ShowInfoBarError( _( "Error saving library table." ) + wxS( " " ) + aError.message, true );
 
                 success = false;
             } );
@@ -2032,7 +2026,7 @@ void SYMBOL_EDIT_FRAME::KiwayMailIn( KIWAY_MAIL_EVENT& mail )
                 msg.Printf( _( "The current configuration does not include the symbol library '%s'." ),
                             uri );
                 msg += wxS( "\n" ) + _( "Use Manage Symbol Libraries to edit the configuration." );
-                DisplayErrorMessage( this, _( "Library not found in symbol library table." ), msg );
+                ShowInfoBarError( _( "Library not found in symbol library table." ) + wxS( " " ) + msg, true );
                 break;
             }
 
@@ -2043,7 +2037,7 @@ void SYMBOL_EDIT_FRAME::KiwayMailIn( KIWAY_MAIL_EVENT& mail )
                 msg.Printf( _( "The symbol library '%s' is not enabled in the current configuration." ),
                             UnescapeString( libNickname ) );
                 msg += wxS( "\n" ) + _( "Use Manage Symbol Libraries to edit the configuration." );
-                DisplayErrorMessage( this, _( "Symbol library not enabled." ), msg );
+                ShowInfoBarError( _( "Symbol library not enabled." ) + wxS( " " ) + msg, true );
                 break;
             }
 
@@ -2387,10 +2381,7 @@ bool SYMBOL_EDIT_FRAME::addLibTableEntry( const wxString& aLibFile, LIBRARY_TABL
                            },
                            error ) )
     {
-        KICAD_MESSAGE_DIALOG dlg( this, _( "Error saving library table." ), _( "File Save Error" ),
-                                  wxOK | wxICON_ERROR );
-        dlg.SetExtendedMessage( error );
-        dlg.ShowModal();
+        ShowInfoBarError( _( "Error saving library table." ) + wxS( " " ) + error, true );
         return false;
     }
 
@@ -2450,10 +2441,7 @@ bool SYMBOL_EDIT_FRAME::replaceLibTableEntry( const wxString& aLibNickname, cons
     table->Save().map_error(
             [&]( const LIBRARY_ERROR& aError )
             {
-                KICAD_MESSAGE_DIALOG dlg( this, _( "Error saving library table." ), _( "File Save Error" ),
-                                          wxOK | wxICON_ERROR );
-                dlg.SetExtendedMessage( aError.message );
-                dlg.ShowModal();
+                ShowInfoBarError( _( "Error saving library table." ) + wxS( " " ) + aError.message, true );
 
                 success = false;
             } );

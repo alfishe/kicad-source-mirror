@@ -1442,6 +1442,9 @@ void EDA_BASE_FRAME::ShowInfoBarError( const wxString& aErrorMsg, bool aShowClos
 {
     wxCHECK( m_infoBar, /* void */ );
 
+    if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        wxLogError( wxS( "%s" ), aErrorMsg );
+
     m_infoBar->RemoveAllButtons();
 
     if( aShowCloseButton )
@@ -1455,6 +1458,9 @@ void EDA_BASE_FRAME::ShowInfoBarError( const wxString& aErrorMsg, bool aShowClos
                                        std::function<void(void)> aCallback )
 {
     wxCHECK( m_infoBar, /* void */ );
+
+    if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        wxLogError( wxS( "%s" ), aErrorMsg );
 
     m_infoBar->RemoveAllButtons();
 
@@ -1471,6 +1477,9 @@ void EDA_BASE_FRAME::ShowInfoBarError( const wxString& aErrorMsg, bool aShowClos
 void EDA_BASE_FRAME::ShowInfoBarWarning( const wxString& aWarningMsg, bool aShowCloseButton )
 {
     wxCHECK( m_infoBar, /* void */ );
+
+    if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        wxLogWarning( wxS( "%s" ), aWarningMsg );
 
     m_infoBar->RemoveAllButtons();
 
@@ -1554,15 +1563,39 @@ wxString EDA_BASE_FRAME::GetFileFromHistory( int cmdId, const wxString& type, FI
 
     if( !wxFileName::FileExists( fn ) )
     {
-        KICAD_MESSAGE_DIALOG dlg( this, wxString::Format( _( "File '%s' was not found.\n" ), fn ), _( "Error" ),
-                                  wxYES_NO | wxYES_DEFAULT | wxICON_ERROR | wxCENTER );
+        const wxString question = wxString::Format( _( "File '%s' was not found." ), fn ) + wxS( " " )
+                                  + _( "Do you want to remove it from list of recently opened files?" );
 
-        dlg.SetExtendedMessage( _( "Do you want to remove it from list of recently opened files?" ) );
-        dlg.SetYesNoLabels( KICAD_MESSAGE_DIALOG::ButtonLabel( _( "Remove" ) ),
-                            KICAD_MESSAGE_DIALOG::ButtonLabel( _( "Keep" ) ) );
+        if( m_infoBar )
+        {
+            ShowInfoBarQuestion( question, _( "Remove" ),
+                                 [this, aFileHistory, file = fn]()
+                                 {
+                                     for( size_t ii = 0; ii < aFileHistory->GetCount(); ++ii )
+                                     {
+                                         if( aFileHistory->GetHistoryFile( ii ) == file )
+                                         {
+                                             aFileHistory->RemoveFileFromHistory( ii );
+                                             break;
+                                         }
+                                     }
 
-        if( dlg.ShowModal() == wxID_YES )
-            aFileHistory->RemoveFileFromHistory( i );
+                                     if( GetMenuBar() )
+                                     {
+                                         ReCreateMenuBar();
+                                         GetMenuBar()->Refresh();
+                                     }
+                                 } );
+        }
+        else
+        {
+            KICAD_MESSAGE_DIALOG dlg( this, question, _( "Error" ), wxYES_NO | wxYES_DEFAULT | wxICON_ERROR | wxCENTER );
+            dlg.SetYesNoLabels( KICAD_MESSAGE_DIALOG::ButtonLabel( _( "Remove" ) ),
+                                KICAD_MESSAGE_DIALOG::ButtonLabel( _( "Keep" ) ) );
+
+            if( dlg.ShowModal() == wxID_YES )
+                aFileHistory->RemoveFileFromHistory( i );
+        }
 
         fn.Clear();
     }
@@ -1905,7 +1938,9 @@ bool EDA_BASE_FRAME::IsWritable( const wxFileName& aFileName, bool aVerbose )
 
     if( !msg.IsEmpty() )
     {
-        if( aVerbose )
+        if( aVerbose && m_infoBar )
+            ShowInfoBarError( msg, true );
+        else if( aVerbose )
             DisplayErrorMessage( this, msg );
 
         return false;

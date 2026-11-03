@@ -29,6 +29,7 @@
 #include <tools/sch_line_wire_bus_tool.h>
 #include <tools/sch_move_tool.h>
 #include <tools/sch_drawing_tools.h>
+#include <kicadopenapi_service.h>
 #include <confirm.h>
 #include <connection_graph.h>
 #include <advanced_config.h>
@@ -2690,9 +2691,8 @@ int SCH_EDIT_TOOL::ChangeSymbols( const TOOL_EVENT& aEvent )
         // while the canvas shows variant-resolved values, so require the default variant.
         if( !m_frame->Schematic().GetCurrentVariant().IsEmpty() )
         {
-            DisplayInfoMessage( m_frame,
-                    _( "Change Symbol is not available when a design variant is active. "
-                       "Use Set Variant Symbol or switch to the default variant first." ) );
+            m_frame->ShowInfoBarMsg( _( "Change Symbol is not available when a design variant is active. "
+                       "Use Set Variant Symbol or switch to the default variant first." ), true );
             return 0;
         }
 
@@ -2784,8 +2784,8 @@ int SCH_EDIT_TOOL::SetVariantSymbol( const TOOL_EVENT& aEvent )
         wxString symLabel =
                 picked.LibId.Format().empty() ? picked.LibId.GetLibItemName().wx_str() : picked.LibId.Format().wx_str();
 
-        DisplayErrorMessage( m_frame, wxString::Format(
-                _( "Could not load symbol '%s' from library." ), symLabel ) );
+        m_frame->ShowInfoBarError( wxString::Format(
+                _( "Could not load symbol '%s' from library." ), symLabel ), true );
         return 0;
     }
 
@@ -2811,7 +2811,7 @@ int SCH_EDIT_TOOL::SetVariantSymbol( const TOOL_EVENT& aEvent )
                 msg += wxS( "\u2022 " ) + issue.detail + wxS( "\n" );
 
             msg += wxS( "\n" ) + _( "Choose a symbol with equivalent pins and pin positions." );
-            wxMessageBox( msg, _( "Variant Symbol Compatibility" ), wxOK | wxICON_ERROR, m_frame );
+            m_frame->ShowInfoBarError( msg, true );
             return 0;
         }
     }
@@ -3775,25 +3775,38 @@ int SCH_EDIT_TOOL::CleanupSheetPins( const TOOL_EVENT& aEvent )
 {
     SCH_SELECTION& selection = m_selectionTool->RequestSelection( { SCH_SHEET_T } );
     SCH_SHEET*     sheet = (SCH_SHEET*) selection.Front();
-    SCH_COMMIT     commit( m_toolMgr );
 
     if( !sheet || !sheet->HasUndefinedPins() )
         return 0;
 
-    if( !IsOK( m_frame, _( "Do you wish to delete the unreferenced pins from this sheet?" ) ) )
+    const bool hover = selection.IsHover();
+
+    auto cleanup = [this, id = sheet->m_Uuid, hover]()
+    {
+        SCH_SHEET* target = dynamic_cast<SCH_SHEET*>( m_frame->Schematic().ResolveItem( id, nullptr, true ) );
+
+        if( !target || !target->HasUndefinedPins() )
+            return;
+
+        SCH_COMMIT commit( m_toolMgr );
+        commit.Modify( target, m_frame->GetScreen() );
+        target->CleanupSheet();
+        updateItem( target, true );
+        commit.Push( _( "Cleanup Sheet Pins" ) );
+
+        if( hover )
+            m_toolMgr->RunAction( ACTIONS::selectionClear );
+    };
+
+    if( KICAD_OPENAPI_SERVICE::ConfirmPrompts() )
+    {
+        cleanup();
         return 0;
+    }
 
-    commit.Modify( sheet, m_frame->GetScreen() );
-
-    sheet->CleanupSheet();
-
-    updateItem( sheet, true );
-
-    commit.Push( _( "Cleanup Sheet Pins" ) );
-
-    if( selection.IsHover() )
-        m_toolMgr->RunAction( ACTIONS::selectionClear );
-
+    // the infobar asks, nothing waits for it
+    m_frame->ShowInfoBarQuestion( _( "Do you wish to delete the unreferenced pins from this sheet?" ),
+                                  _( "Delete Pins" ), cleanup );
     return 0;
 }
 
@@ -3889,7 +3902,7 @@ int SCH_EDIT_TOOL::DdAddImage( const TOOL_EVENT& aEvent )
 
     if( !image->GetReferenceImage().ReadImageFile( *filename ) )
     {
-        wxMessageBox( wxString::Format( _( "Could not load image from '%s'." ), *filename ) );
+        m_frame->ShowInfoBarError( wxString::Format( _( "Could not load image from '%s'." ), *filename ), true );
         delete image;
         return 0;
     }

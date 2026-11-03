@@ -1391,9 +1391,9 @@ void SCH_EDIT_FRAME::OnUpdatePCB()
 {
     if( Kiface().IsSingle() )
     {
-        DisplayError( this,  _( "Cannot update the PCB because the Schematic Editor is opened in stand-alone "
+        ShowInfoBarError( _( "Cannot update the PCB because the Schematic Editor is opened in stand-alone "
                                 "mode. In order to create/update PCBs from schematics, launch the main KiCad "
-                                "application and create a project." ) );
+                                "application and create a project." ), true );
         return;
     }
 
@@ -1491,7 +1491,7 @@ void SCH_EDIT_FRAME::NewProject()
         {
             wxString msg;
             msg.Printf( _( "Schematic file '%s' already exists." ), create_me.GetFullName() );
-            DisplayError( this, msg );
+            ShowInfoBarError( msg, true );
             return ;
         }
 
@@ -1647,7 +1647,7 @@ void SCH_EDIT_FRAME::OnOpenCvpcb()
     }
     catch( const IO_ERROR& )
     {
-        DisplayError( this, _( "Could not open CvPcb" ) );
+        ShowInfoBarError( _( "Could not open CvPcb" ), true );
     }
 }
 

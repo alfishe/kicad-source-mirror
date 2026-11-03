@@ -1271,7 +1271,7 @@ int SCH_DRAWING_TOOLS::PlaceImage( const TOOL_EVENT& aEvent )
 
                 if( !image || !image->GetReferenceImage().ReadImageFile( fullFilename ) )
                 {
-                    wxMessageBox( wxString::Format( _( "Could not load image from '%s'." ), fullFilename ) );
+                    m_frame->ShowInfoBarError( wxString::Format( _( "Could not load image from '%s'." ), fullFilename ), true );
                     delete image;
                     image = nullptr;
                     continue;
@@ -2792,7 +2792,7 @@ int SCH_DRAWING_TOOLS::DrawSheet( const TOOL_EVENT& aEvent )
 
     if( ( isDrawSheetCopy || isDrawSheetFromDesignBlock ) && !wxFileExists( filename ) )
     {
-        wxMessageBox( wxString::Format( _( "File '%s' does not exist." ), filename ) );
+        m_frame->ShowInfoBarError( wxString::Format( _( "File '%s' does not exist." ), filename ), true );
         return 0;
     }
 

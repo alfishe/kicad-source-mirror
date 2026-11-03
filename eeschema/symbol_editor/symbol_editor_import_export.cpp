@@ -89,7 +89,7 @@ void SYMBOL_EDIT_FRAME::ImportSymbol()
     if( piType == SCH_IO_MGR::SCH_FILE_UNKNOWN )
     {
         msg.Printf( _( "Unable to find a reader for '%s'." ), fn.GetFullPath() );
-        DisplayError( this, msg );
+        ShowInfoBarError( msg, true );
         return;
     }
 
@@ -140,7 +140,7 @@ void SYMBOL_EDIT_FRAME::ImportSymbol()
         catch( const IO_ERROR& ioe )
         {
             msg.Printf( _( "Cannot import symbol '%s': %s" ), symbolName, ioe.What() );
-            DisplayErrorMessage( this, msg );
+            ShowInfoBarError( msg, true );
         }
     }
 
@@ -152,7 +152,7 @@ void SYMBOL_EDIT_FRAME::ImportSymbol()
         if( skippedCount > 0 )
         {
             msg.Printf( _( "Imported %d symbol(s), skipped %d." ), importedCount, skippedCount );
-            DisplayInfoMessage( this, msg );
+            ShowInfoBarMsg( msg, true );
         }
     }
 }

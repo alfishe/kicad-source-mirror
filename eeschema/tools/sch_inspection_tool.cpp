@@ -291,7 +291,7 @@ int SCH_INSPECTION_TOOL::CheckSymbol( const TOOL_EVENT& aEvent )
 
     if( messages.empty() )
     {
-        DisplayInfoMessage( m_frame, _( "No symbol issues found." ) );
+        m_frame->ShowInfoBarMsg( _( "No symbol issues found." ), true );
     }
     else
     {

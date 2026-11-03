@@ -448,7 +448,7 @@ LIB_SYMBOL* SYMBOL_LIBRARY_MANAGER::GetBufferedSymbol( const wxString& aSymbolNa
             msg.Printf( _( "Error loading symbol %s from library '%s'." ),
                         aSymbolName,
                         aLibrary );
-            DisplayErrorMessage( &m_frame, msg, e.What() );
+            m_frame.ShowInfoBarError( msg + wxS( " " ) + e.What(), true );
             bufferedSymbol = nullptr;
         }
     }
@@ -641,7 +641,7 @@ LIB_SYMBOL* SYMBOL_LIBRARY_MANAGER::GetSymbol( const wxString& aSymbolName, cons
         msg.Printf( _( "Cannot load symbol '%s' from library '%s'." ),
                     aSymbolName,
                     aLibrary );
-        DisplayErrorMessage( &m_frame, msg, e.What() );
+        m_frame.ShowInfoBarError( msg + wxS( " " ) + e.What(), true );
     }
 
     return symbol;

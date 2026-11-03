@@ -423,49 +423,26 @@ int SCH_EDITOR_CONTROL::SaveCurrSheetCopyAs( const TOOL_EVENT& aEvent )
 
 int SCH_EDITOR_CONTROL::Revert( const TOOL_EVENT& aEvent )
 {
-    SCHEMATIC& schematic = m_frame->Schematic();
-    SCH_SHEET& root = schematic.Root();
+    const wxString file = m_frame->Prj().AbsolutePath( m_frame->Schematic().GetFileName() );
 
-    // Save original sheet path to restore if user cancels
-    SCH_SHEET_PATH originalSheet = m_frame->GetCurrentSheet();
-    bool wasOnSubsheet = ( m_frame->GetCurrentSheet().Last() != &root );
-
-    // Navigate to root sheet first (needed for proper reload), but don't repaint yet
-    if( wasOnSubsheet )
+    auto revert = [this, file]()
     {
-        // Use the properly constructed root sheet path from the hierarchy
-        // (manually pushing root creates a path with empty KIID which causes assertions)
-        SCH_SHEET_PATH rootSheetPath = schematic.Hierarchy().at( 0 );
+        if( !m_frame->ReloadCurrentDocument() )
+            m_frame->ShowInfoBarError( wxString::Format( _( "'%s' could not be reverted." ), file ), true );
+    };
 
-        m_frame->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet,
-                                                               &rootSheetPath );
-        // Don't call wxSafeYield() here - avoid repainting the root sheet before the dialog
+    // nothing unsaved is lost
+    if( !m_frame->IsContentModified() || KICAD_OPENAPI_SERVICE::ConfirmPrompts() )
+    {
+        revert();
+        return 0;
     }
 
-    wxString msg;
-    msg.Printf( _( "Revert '%s' (and all sub-sheets) to last version saved?" ), schematic.GetFileName() );
-
-    if( !IsOK( m_frame, msg ) )
-    {
-        // User cancelled - navigate back to original sheet
-        if( wasOnSubsheet )
-        {
-            m_frame->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet,
-                                                                   &originalSheet );
-            wxSafeYield();
-        }
-
-        return false;
-    }
-
-    SCH_SCREENS screenList( schematic.Root() );
-
-    for( SCH_SCREEN* screen = screenList.GetFirst(); screen; screen = screenList.GetNext() )
-        screen->SetContentModified( false );    // do not prompt the user for changes
-
-    m_frame->ReleaseFile();
-    m_frame->OpenProjectFiles( std::vector<wxString>( 1, schematic.GetFileName() ), KICTL_REVERT );
-
+    // the infobar asks, nothing waits for it
+    m_frame->ShowInfoBarQuestion( wxString::Format( _( "Revert '%s' (and all sub-sheets) to last version saved? "
+                                                       "The unsaved changes are lost." ),
+                                                    file ),
+                                  _( "Revert" ), revert );
     return 0;
 }
 
@@ -846,7 +823,7 @@ int SCH_EDITOR_CONTROL::SimProbe( const TOOL_EVENT& aEvent )
                     }
                     catch( const IO_ERROR& e )
                     {
-                        DisplayErrorMessage( m_frame, e.What() );
+                        m_frame->ShowInfoBarError( e.What(), true );
                     }
                 }
                 else if( item->IsType( voltageProbeTypes ) )
@@ -1076,7 +1053,7 @@ static bool highlightNet( TOOL_MANAGER* aToolMgr, const SCH_SHEET_PATH& aSheetPa
 
         if( erc.TestDuplicateSheetNames( false ) > 0 )
         {
-            wxMessageBox( _( "Error: duplicate sub-sheet names found in current sheet." ) );
+            editFrame->ShowInfoBarError( _( "Error: duplicate sub-sheet names found in current sheet." ), true );
             retVal = false;
         }
         else
@@ -1590,7 +1567,7 @@ int SCH_EDITOR_CONTROL::ReplaceTerminalPin( const TOOL_EVENT& aEvent )
     }
     else
     {
-        DisplayError( editFrame, _( "Unable to replace the net chain terminal pin." ) );
+        editFrame->ShowInfoBarError( _( "Unable to replace the net chain terminal pin." ), true );
     }
 
     return 0;
@@ -1623,14 +1600,14 @@ int SCH_EDITOR_CONTROL::NameNetChain( const TOOL_EVENT& aEvent )
 
         if( !SCH_NETCHAIN::IsValidName( newName ) )
         {
-            DisplayError( editFrame, _( "Chain name cannot contain spaces, quotes, or parentheses." ) );
+            editFrame->ShowInfoBarError( _( "Chain name cannot contain spaces, quotes, or parentheses." ), true );
             return 0;
         }
 
         if( !chains.RenameCommittedNetChain( oldName, newName ) )
         {
-            DisplayError( editFrame, wxString::Format( _( "Unable to rename net chain '%s' to '%s'." ),
-                                                       oldName, newName ) );
+            editFrame->ShowInfoBarError( wxString::Format( _( "Unable to rename net chain '%s' to '%s'." ),
+                                                       oldName, newName ), true );
             return 0;
         }
 
@@ -1665,7 +1642,7 @@ int SCH_EDITOR_CONTROL::CreateNetChainBetweenPins( const TOOL_EVENT& aEvent )
     SCH_NETCHAIN* potential = chains.FindPotentialNetChainBetweenPins( pinA, path, pinB, path );
     if( !potential )
     {
-        DisplayError( editFrame, _( "No potential net chain connects the selected pins." ) );
+        editFrame->ShowInfoBarError( _( "No potential net chain connects the selected pins." ), true );
         return 0;
     }
 
@@ -1674,8 +1651,8 @@ int SCH_EDITOR_CONTROL::CreateNetChainBetweenPins( const TOOL_EVENT& aEvent )
     {
         if( SCH_NETCHAIN* owner = chains.GetNetChainForNet( net ) )
         {
-            DisplayError( editFrame, wxString::Format( _( "The selected pins are already in net chain '%s'." ),
-                                                       owner->GetName() ) );
+            editFrame->ShowInfoBarError( wxString::Format( _( "The selected pins are already in net chain '%s'." ),
+                                                       owner->GetName() ), true );
             return 0;
         }
     }
@@ -1742,21 +1719,21 @@ int SCH_EDITOR_CONTROL::CreateNetChainBetweenPins( const TOOL_EVENT& aEvent )
     if( !SCH_NETCHAIN::IsValidName( name ) )
     {
         restoreHighlight();
-        DisplayError( editFrame, _( "Chain name cannot contain spaces, quotes, or parentheses." ) );
+        editFrame->ShowInfoBarError( _( "Chain name cannot contain spaces, quotes, or parentheses." ), true );
         return 0;
     }
 
     if( chains.GetNetChainByName( name ) )
     {
         restoreHighlight();
-        DisplayError( editFrame, wxString::Format( _( "A net chain named '%s' already exists." ), name ) );
+        editFrame->ShowInfoBarError( wxString::Format( _( "A net chain named '%s' already exists." ), name ), true );
         return 0;
     }
 
     if( !chains.CreateNetChainFromPotential( potential, name ) )
     {
         restoreHighlight();
-        DisplayError( editFrame, wxString::Format( _( "Unable to create net chain '%s'." ), name ) );
+        editFrame->ShowInfoBarError( wxString::Format( _( "Unable to create net chain '%s'." ), name ), true );
         return 0;
     }
 
@@ -2413,7 +2390,7 @@ int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
 
                 if( !tableEditTool->validatePasteIntoSelection( currentSelection, errorMsg ) )
                 {
-                    DisplayError( m_frame, errorMsg );
+                    m_frame->ShowInfoBarError( errorMsg, true );
                     return 0;
                 }
 
@@ -2426,7 +2403,7 @@ int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
                 }
                 else
                 {
-                    DisplayError( m_frame, _( "Failed to paste cells" ) );
+                    m_frame->ShowInfoBarError( _( "Failed to paste cells" ), true );
                     return 0;
                 }
             }
@@ -2542,11 +2519,11 @@ int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
 
             if( hierarchy.TestForRecursion( sheetHierarchy, destFn.GetFullPath( wxPATH_UNIX ) ) )
             {
-                auto msg = wxString::Format( _( "The pasted sheet '%s'\n"
+                auto msg = wxString::Format( _( "The pasted sheet '%s' "
                                                 "was dropped because the destination already has "
                                                 "the sheet or one of its subsheets as a parent." ),
                                              sheet->GetFileName() );
-                DisplayError( m_frame, msg );
+                m_frame->ShowInfoBarError( msg, true );
                 loadedItems.pop_back();
             }
         }
@@ -3253,9 +3230,9 @@ int SCH_EDITOR_CONTROL::EditSymbolLibraryLinks( const TOOL_EVENT& aEvent )
 {
     if( !m_frame->Schematic().GetCurrentVariant().IsEmpty() )
     {
-        DisplayInfoMessage( m_frame,
-                _( "Bulk Edit Symbol Library Links is not available when a design variant is "
-                   "active. Switch to the default variant first." ) );
+        m_frame->ShowInfoBarWarning( _( "Bulk Edit Symbol Library Links is not available when a design variant "
+                                        "is active. Switch to the default variant first." ),
+                                     true );
         return 0;
     }
 

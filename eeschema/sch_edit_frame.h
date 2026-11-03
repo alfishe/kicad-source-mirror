@@ -1155,6 +1155,7 @@ private:
     SCH_CONNECTIVITY::SUBSCRIPTION m_connectivitySubscription;
     SCHEMATIC*                  m_schematic;          ///< The currently loaded schematic
     wxString                    m_loadContentFrom;    ///< See LoadSchematicContentFrom.
+    bool                        m_confirmedOverwrite = false;   ///< SaveProject's overwrite question answered
     wxString                    m_highlightedConn;    ///< The highlighted net or bus or empty string.
     wxString                    m_highlightedNetChain;
 

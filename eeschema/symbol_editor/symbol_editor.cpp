@@ -73,7 +73,7 @@ bool SYMBOL_EDIT_FRAME::saveCurrentSymbol()
 
             if( !schframe )      // happens when the schematic editor has been closed
             {
-                DisplayErrorMessage( this, _( "No schematic currently open." ) );
+                ShowInfoBarError( _( "No schematic currently open." ), true );
                 return false;
             }
             else
@@ -145,7 +145,7 @@ bool SYMBOL_EDIT_FRAME::LoadSymbol( const LIB_ID& aLibId, int aUnit, int aBodySt
                 msg.Printf( _( "Error loading symbol %s from library '%s'." ),
                             aLibId.GetUniStringLibId(),
                             aLibId.GetUniStringLibItemName() );
-                DisplayErrorMessage( this, msg, ioe.What() );
+                ShowInfoBarError( msg + wxS( " " ) + ioe.What(), true );
                 return false;
             }
         }
@@ -211,7 +211,7 @@ bool SYMBOL_EDIT_FRAME::LoadSymbolFromLib( const wxString& aLibName, const wxStr
         msg.Printf( _( "Error loading symbol %s from library '%s'." ),
                     UnescapeString( aSymbolName ),
                     UnescapeString( aLibName ) );
-        DisplayErrorMessage( this, msg, ioe.What() );
+        ShowInfoBarError( msg + wxS( " " ) + ioe.What(), true );
         return false;
     }
 
