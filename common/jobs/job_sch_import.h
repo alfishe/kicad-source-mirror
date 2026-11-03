@@ -23,6 +23,7 @@
 #include <kicommon.h>
 #include "job.h"
 #include "job_import_utils.h"
+#include <io/common/plugin_common_choose_project.h>
 #include <map>
 
 /**
@@ -60,6 +61,10 @@ public:
     IMPORT_REPORT_FORMAT m_reportFormat = IMPORT_REPORT_FORMAT::NONE;
     wxString             m_reportFile;
     std::map<wxString, wxString> m_netNameMap;
+
+    /// Answers an importer's "choose project" question (several schematics in one file); unset:
+    /// the importer's own choice
+    CHOOSE_PROJECT_HANDLER m_chooseProject;
 };
 
 #endif

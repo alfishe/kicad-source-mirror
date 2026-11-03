@@ -1,7 +1,6 @@
 /// @file methods_sch_documents.cpp
 /// @brief kicadopenapi schematic document methods: sch_open, sch_close, sch_save, sch_revert, and
 /// the "sch" document provider.  Compiled into the eeschema kiface; registered when it loads.
-#include <kicadopenapi_journal.h>
 #include <kicadopenapi_util.h>
 #include <kicadopenapi_change_feed.h>
 #include <model_thread.h>
@@ -16,6 +15,10 @@
 #include <api/sch_api_save.h>
 #include <api/sch_context.h>
 #include <eeschema_helpers.h>
+#include <jobs/job_sch_import.h>
+#include <kiway_player.h>
+#include <reporter.h>
+#include <sch_io/sch_io_mgr.h>
 #include <local_history.h>
 #include <sch_autosave_recovery.h>
 #include <settings/common_settings.h>
@@ -379,8 +382,7 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         }
     }
 
-    KOPENAPI_RESULT       result;
-    KOPENAPI_JOURNAL_MARK loadMessages;
+    KOPENAPI_RESULT result;
 
     if( aCtx.headless )
     {
@@ -397,17 +399,231 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
             result.body["hint"] = "another process may have the file open (errors: journal); override_lock: true opens it anyway";
     }
 
-    // what the editor shows in its infobar or would have asked in a dialog (a failure carries it
-    // in error.log)
-    if( result.status == 200 )
-        loadMessages.AddTo( result.body );
-
     // the editor offers these in its infobar
     if( result.status == 200 )
     {
         if( nlohmann::json newer = newerAutosaves( aCtx ); !newer.empty() )
             result.body["autosaves"] = newer;
     }
+
+    return result;
+}
+
+
+/// @brief The importers sch_import offers: its format name, the job's format, the plugin
+struct SCH_IMPORT_FORMAT
+{
+    const char*            name;
+    JOB_SCH_IMPORT::FORMAT job;
+    SCH_IO_MGR::SCH_FILE_T type;
+};
+
+
+static const std::vector<SCH_IMPORT_FORMAT>& importFormats()
+{
+    static const std::vector<SCH_IMPORT_FORMAT> formats = {
+        { "altium", JOB_SCH_IMPORT::FORMAT::ALTIUM, SCH_IO_MGR::SCH_ALTIUM },
+        { "cadstar", JOB_SCH_IMPORT::FORMAT::CADSTAR, SCH_IO_MGR::SCH_CADSTAR_ARCHIVE },
+        { "diptrace", JOB_SCH_IMPORT::FORMAT::DIPTRACE, SCH_IO_MGR::SCH_DIPTRACE },
+        { "eagle", JOB_SCH_IMPORT::FORMAT::EAGLE, SCH_IO_MGR::SCH_EAGLE },
+        { "easyeda", JOB_SCH_IMPORT::FORMAT::EASYEDA, SCH_IO_MGR::SCH_EASYEDA },
+        { "easyedapro", JOB_SCH_IMPORT::FORMAT::EASYEDAPRO, SCH_IO_MGR::SCH_EASYEDAPRO },
+        { "easyedapro", JOB_SCH_IMPORT::FORMAT::AUTO, SCH_IO_MGR::SCH_EASYEDAPRO_V3 },
+        { "easypc", JOB_SCH_IMPORT::FORMAT::EASYPC, SCH_IO_MGR::SCH_EASYPC },
+        { "geda", JOB_SCH_IMPORT::FORMAT::AUTO, SCH_IO_MGR::SCH_GEDA },
+        { "ltspice", JOB_SCH_IMPORT::FORMAT::LTSPICE, SCH_IO_MGR::SCH_LTSPICE },
+        { "orcad", JOB_SCH_IMPORT::FORMAT::ORCAD, SCH_IO_MGR::SCH_ORCAD },
+        { "pads", JOB_SCH_IMPORT::FORMAT::PADS, SCH_IO_MGR::SCH_PADS },
+        { "pcad", JOB_SCH_IMPORT::FORMAT::PCAD, SCH_IO_MGR::SCH_PCAD },
+    };
+
+    return formats;
+}
+
+
+/// @brief The importer's "choose project" question answered by the call: the source project
+/// named by `project` (its name, schematic name or id), else the first one offered
+struct SCH_IMPORT_CHOICE
+{
+    std::string    wanted;
+    nlohmann::json offered = nlohmann::json::array();
+    std::string    chosen;
+    bool           missing = false;
+};
+
+
+static CHOOSE_PROJECT_HANDLER importChooser( const std::shared_ptr<SCH_IMPORT_CHOICE>& aChoice )
+{
+    return [aChoice]( const std::vector<IMPORT_PROJECT_DESC>& aOffers )
+    {
+        std::vector<IMPORT_PROJECT_DESC> chosen;
+        const wxString                   wanted = wxString::FromUTF8( aChoice->wanted );
+
+        for( const IMPORT_PROJECT_DESC& offer : aOffers )
+        {
+            aChoice->offered.push_back( { { "name", offer.ComboName.ToStdString( wxConvUTF8 ) },
+                                          { "schematic", offer.SchematicName.ToStdString( wxConvUTF8 ) },
+                                          { "schematic_id", offer.SchematicId.ToStdString( wxConvUTF8 ) },
+                                          { "board", offer.PCBName.ToStdString( wxConvUTF8 ) } } );
+
+            const bool match = wanted.IsEmpty() || offer.ComboName == wanted || offer.SchematicName == wanted
+                               || offer.SchematicId == wanted || offer.ComboId == wanted;
+
+            if( chosen.empty() && match )
+            {
+                chosen.push_back( offer );
+                aChoice->chosen = ( offer.SchematicName.IsEmpty() ? offer.ComboName : offer.SchematicName )
+                                          .ToStdString( wxConvUTF8 );
+            }
+        }
+
+        aChoice->missing = chosen.empty();
+        return chosen;
+    };
+}
+
+
+static KOPENAPI_RESULT h_sch_import( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    KOPENAPI_HISTORY::Get().Reset( "sch", "sch_import" );
+
+    if( !aArgs.contains( "path" ) || !aArgs["path"].is_string() || aArgs["path"].get<std::string>().empty() )
+        return KOPENAPI_RESULT::Error( 400, "'path' must be a non-empty string: the schematic to import" );
+
+    wxFileName source( KopenapiCanonicalPath( wxString::FromUTF8( aArgs["path"].get<std::string>() ) ) );
+    source.MakeAbsolute();
+
+    if( !source.FileExists() )
+        return KOPENAPI_RESULT::Error( 404, "file not found: " + source.GetFullPath().ToStdString( wxConvUTF8 ) );
+
+    if( source.GetExt() == FILEEXT::KiCadSchematicFileExtension || source.GetExt() == FILEEXT::LegacySchematicFileExtension )
+        return KOPENAPI_RESULT::Error( 400, "a KiCad schematic: sch_open opens it" );
+
+    const SCH_IO_MGR::SCH_FILE_T guessed = SCH_IO_MGR::GuessPluginTypeFromSchPath( source.GetFullPath(),
+                                                                                   KICTL_NONKICAD_ONLY );
+    const SCH_IMPORT_FORMAT*     format = nullptr;
+    const std::string            wantedFormat = aArgs.value( "format", std::string() );
+    nlohmann::json               names = nlohmann::json::array();
+
+    for( const SCH_IMPORT_FORMAT& f : importFormats() )
+    {
+        if( names.empty() || names.back() != f.name )
+            names.push_back( f.name );
+
+        if( !format && ( wantedFormat.empty() ? f.type == guessed : wantedFormat == f.name ) )
+            format = &f;
+    }
+
+    if( !format && !wantedFormat.empty() )
+        return KOPENAPI_RESULT::Error( 400, "format: one of " + names.dump() );
+
+    if( !format )
+        return KOPENAPI_RESULT::Error( 422, "no schematic importer reads " + source.GetFullName().ToStdString( wxConvUTF8 )
+                                                    + " (formats: " + names.dump() + ")" );
+
+    // where File > Import puts it: beside the source, under its name
+    wxFileName target( source );
+    target.SetExt( FILEEXT::KiCadSchematicFileExtension );
+    wxFileName targetProject( target );
+    targetProject.SetExt( FILEEXT::ProjectFileExtension );
+
+    if( target.FileExists() && !aArgs.value( "overwrite", false ) )
+    {
+        return KOPENAPI_RESULT::Error( 409, target.GetFullName().ToStdString( wxConvUTF8 )
+                                                    + " exists: sch_open opens it, overwrite: true imports over it" );
+    }
+
+    if( std::shared_ptr<SCH_CONTEXT> current = KopenapiSchContext( aCtx ) )
+    {
+        if( isModified( *current ) )
+        {
+            if( !aArgs.value( "discard", false ) )
+                return KOPENAPI_RESULT::Error( 409, "the open schematic has unsaved changes; sch_save, "
+                                                    "sch_revert, or pass discard: true" );
+
+            clearModified( *current );
+        }
+    }
+
+    auto choice = std::make_shared<SCH_IMPORT_CHOICE>();
+    choice->wanted = aArgs.value( "project", std::string() );
+
+    KOPENAPI_RESULT result;
+
+    if( aCtx.headless )
+    {
+        if( std::string other = projectConflict( aCtx, targetProject ); !other.empty() )
+        {
+            return KOPENAPI_RESULT::Error( 409, "this process serves project " + other
+                                                        + "; pcb_close first, or start another instance" );
+        }
+
+        // the importer extracts its symbols into the active project: the target's
+        releaseHeadless();
+
+        SETTINGS_MANAGER& settings = Pgm().GetSettingsManager();
+
+        if( !settings.GetProject( targetProject.GetFullPath() ) )
+            settings.LoadProject( targetProject.GetFullPath(), true );
+
+        JOB_SCH_IMPORT job;
+        job.m_inputFile = source.GetFullPath();
+        job.m_format = format->job;
+        job.m_chooseProject = importChooser( choice );
+        job.SetConfiguredOutputPath( target.GetFullPath() );
+
+        const int status = aCtx.kiway->ProcessJob( KIWAY::FACE_SCH, &job, &WXLOG_REPORTER::GetInstance() );
+
+        if( choice->missing && !choice->offered.empty() )
+            return KOPENAPI_RESULT::Error( 404, "no project '" + choice->wanted + "' in the file; offered: "
+                                                        + choice->offered.dump() );
+
+        if( status != 0 )
+            return KOPENAPI_RESULT::Error( 422, "the import failed (why: error.log)" );
+
+        result = openHeadless( aCtx, target, aArgs );
+    }
+    else
+    {
+        if( !wantedFormat.empty() && format->type != guessed )
+            return KOPENAPI_RESULT::Error( 400, "the editor picks the importer from the file (File > Import): "
+                                                "leave format out" );
+
+        SCH_EDIT_FRAME* frame = guiFrame( aCtx, true );
+
+        if( !frame )
+            return KOPENAPI_RESULT::Error( 500, "could not create the schematic editor window" );
+
+        KICAD_OPENAPI_SERVICE::SetOverrideLock( aArgs.value( "override_lock", false ) );
+        frame->SetImportProjectChooser( importChooser( choice ) );
+
+        const bool opened = frame->OpenProjectFiles( { source.GetFullPath() }, KICTL_NONKICAD_ONLY );
+
+        frame->SetImportProjectChooser( nullptr );
+        KICAD_OPENAPI_SERVICE::SetOverrideLock( false );
+
+        if( choice->missing && !choice->offered.empty() )
+            return KOPENAPI_RESULT::Error( 404, "no project '" + choice->wanted + "' in the file; offered: "
+                                                        + choice->offered.dump() );
+
+        if( !opened )
+            return KOPENAPI_RESULT::Error( 422, "the import failed (why: error.log)" );
+
+        frame->Iconize( false );
+        frame->Show( true );
+        frame->Raise();
+
+        result = KOPENAPI_RESULT::Ok( documentStatus( aCtx ) );
+    }
+
+    if( result.status != 200 )
+        return result;
+
+    result.body["imported_from"] = source.GetFullPath().ToStdString( wxConvUTF8 );
+    result.body["format"] = format->name;
+
+    if( !choice->offered.empty() )
+        result.body["project_choice"] = { { "offered", choice->offered }, { "chosen", choice->chosen } };
 
     return result;
 }
@@ -1127,6 +1343,23 @@ KOPENAPI_REGISTER( "sch_open",
                                    "description":"GUI: open even when another process has the file open (never asked in a dialog; refused with a journal error otherwise)"}}})json"_json,
                    false, h_sch_open, 120 );
 
+KOPENAPI_REGISTER( "sch_import",
+                   "Import a schematic of another tool (File > Import > Non-KiCad Schematic, the same importers: Altium, "
+                   "CADSTAR, DipTrace, Eagle, EasyEDA, EasyEDA Pro, Easy-PC, gEDA, LTspice, OrCAD, PADS, P-CAD) as "
+                   "<name>.kicad_sch beside it, in its project, and open it. No dialog: the importer's issues come "
+                   "back in warnings / load_errors, a file with several projects takes project (else the first; "
+                   "project_choice lists them). Headless the import is written at once; the GUI editor holds it "
+                   "unsaved, as File > Import does (sch_save writes it)",
+                   R"json({"type":"object","required":["path"],"properties":{
+                        "path":{"type":"string","description":"the file to import"},
+                        "format":{"type":"string","enum":["altium","cadstar","diptrace","eagle","easyeda","easyedapro","easypc","geda","ltspice","orcad","pads","pcad"],
+                                  "description":"the importer; default: the one that reads the file"},
+                        "project":{"type":"string","description":"the source project (name, schematic name or id) when the file holds several"},
+                        "overwrite":{"type":"boolean","default":false,"description":"import even when <name>.kicad_sch exists (it is replaced)"},
+                        "discard":{"type":"boolean","default":false,"description":"drop unsaved changes of the open schematic"},
+                        "override_lock":{"type":"boolean","default":false,"description":"GUI: import even when another process has the file open"}}})json"_json,
+                   false, h_sch_import, 300 );
+
 KOPENAPI_REGISTER( "sch_close", "Close the open schematic: refuses with unsaved changes unless discard: true, which "
                    "drops them without any dialog (a warning goes to the journal); GUI: the editor window closes",
                    R"json({"type":"object","properties":{"discard":{"type":"boolean","default":false}}})json"_json,
@@ -1174,3 +1407,5 @@ KOPENAPI_REGISTER( "sch_autosave",
                         "path":{"type":"string","description":"one copy (sch_autosave_list)"},
                         "discard":{"type":"boolean","default":false,"description":"drop unsaved changes (rescue, restore)"}}})json"_json,
                    false, h_sch_autosave, 120 );
+
+KOPENAPI_MARK_LOADING( "sch_open", "sch_revert", "sch_import" );

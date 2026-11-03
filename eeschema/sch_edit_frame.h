@@ -42,6 +42,7 @@
 #include <widgets/net_navigator_tree.h>
 #include <map>
 #include <connectivity/conn_subscription.h>
+#include <io/common/plugin_common_choose_project.h>
 
 class SCH_ITEM;
 class EDA_ITEM;
@@ -514,6 +515,12 @@ public:
      * @param aRootCopy the root sheet's copy; the other sheets beside it as in the schematic.
      */
     bool LoadSchematicContentFrom( const wxString& aRootCopy );
+
+    /**
+     * While working for an agent, the next imports answer an importer's "choose project" question
+     * with @p aChooser instead of a dialog (unset: the importer's own choice).
+     */
+    void SetImportProjectChooser( CHOOSE_PROJECT_HANDLER aChooser ) { m_importProjectChooser = std::move( aChooser ); }
 
     bool CanAcceptApiCommands() override;
 
@@ -1155,6 +1162,7 @@ private:
     SCH_CONNECTIVITY::SUBSCRIPTION m_connectivitySubscription;
     SCHEMATIC*                  m_schematic;          ///< The currently loaded schematic
     wxString                    m_loadContentFrom;    ///< See LoadSchematicContentFrom.
+    CHOOSE_PROJECT_HANDLER      m_importProjectChooser;   ///< See SetImportProjectChooser.
     bool                        m_confirmedOverwrite = false;   ///< SaveProject's overwrite question answered
     wxString                    m_highlightedConn;    ///< The highlighted net or bus or empty string.
     wxString                    m_highlightedNetChain;

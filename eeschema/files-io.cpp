@@ -1682,15 +1682,32 @@ bool SCH_EDIT_FRAME::importFile( const wxString& aFileName, int aFileType,
         {
             IO_RELEASER<SCH_IO>  pi( SCH_IO_MGR::FindPlugin( fileType ) );
             DIALOG_HTML_REPORTER errorReporter( this );
-            WX_PROGRESS_REPORTER progressReporter( this, _( "Import Schematic" ), 1, PR_CAN_ABORT );
+
+            // working for an agent: no dialogs; the import's issues go to the log (the journal),
+            // the project choice is the agent's (SetImportProjectChooser) or the importer's own
+            const bool                          noModal = KICAD_OPENAPI_SERVICE::NoModalUi();
+            std::optional<WX_PROGRESS_REPORTER> progressDialog;
+            KOPENAPI_KEEPALIVE_REPORTER         apiProgress;
+            PROGRESS_REPORTER_BASE&             progressReporter =
+                    noModal ? static_cast<PROGRESS_REPORTER_BASE&>( apiProgress )
+                            : progressDialog.emplace( this, _( "Import Schematic" ), 1, PR_CAN_ABORT );
 
             if( PROJECT_CHOOSER_PLUGIN* c_pi = dynamic_cast<PROJECT_CHOOSER_PLUGIN*>( pi.get() ) )
             {
-                c_pi->RegisterCallback( std::bind( DIALOG_IMPORT_CHOOSE_PROJECT::RunModal,
-                                                   this, std::placeholders::_1 ) );
+                if( !noModal )
+                {
+                    c_pi->RegisterCallback( std::bind( DIALOG_IMPORT_CHOOSE_PROJECT::RunModal,
+                                                       this, std::placeholders::_1 ) );
+                }
+                else if( m_importProjectChooser )
+                {
+                    c_pi->RegisterCallback( m_importProjectChooser );
+                }
             }
 
-            if( eeconfig()->m_System.show_import_issues )
+            if( noModal )
+                pi->SetReporter( &WXLOG_REPORTER::GetInstance() );
+            else if( eeconfig()->m_System.show_import_issues )
                 pi->SetReporter( errorReporter.m_Reporter );
             else
                 pi->SetReporter( &NULL_REPORTER::GetInstance() );
@@ -1733,7 +1750,7 @@ bool SCH_EDIT_FRAME::importFile( const wxString& aFileName, int aFileType,
                     fpReconciler.Reconcile( Schematic() );
                 }
 
-                if( errorReporter.m_Reporter->HasMessage() )
+                if( !noModal && errorReporter.m_Reporter->HasMessage() )
                 {
                     errorReporter.m_Reporter->Flush(); // Build HTML messages
                     errorReporter.ShowModal();

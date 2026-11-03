@@ -1621,6 +1621,12 @@ int EESCHEMA_JOBS_HANDLER::JobImport( JOB* aJob )
     // Without this the importer's warnings go to the wx log and never reach the import report
     pi->SetReporter( &importMessages );
 
+    if( PROJECT_CHOOSER_PLUGIN* chooser = dynamic_cast<PROJECT_CHOOSER_PLUGIN*>( pi.get() ) )
+    {
+        if( job->m_chooseProject )
+            chooser->RegisterCallback( job->m_chooseProject );
+    }
+
     try
     {
         m_reporter->Report( wxString::Format( _( "Importing '%s' using %s format...\n" ),
