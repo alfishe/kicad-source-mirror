@@ -3,6 +3,7 @@
 #include <kicadopenapi_annotations.h>
 #include <kicadopenapi_editor_input.h>
 #include <kicadopenapi_keepalive.h>
+#include <kicadopenapi_service.h>
 
 #include <base_units.h>
 #include <class_draw_panel_gal.h>
@@ -582,7 +583,10 @@ KOPENAPI_RESULT KopenapiEditorAction( EDA_DRAW_FRAME* aFrame, const EDA_IU_SCALE
         }
     }
 
+    // the action's infobar confirmations (e.g. a long text paste) answered yes
+    KICAD_OPENAPI_SERVICE::SetConfirmPrompts( aArgs.value( "confirm", false ) );
     const bool ran = aFrame->GetToolManager()->RunAction( *action );
+    KICAD_OPENAPI_SERVICE::SetConfirmPrompts( false );
     pump();
     releasePointerIfIdle();
 
@@ -621,6 +625,7 @@ const nlohmann::json& KopenapiEditorActionSchema()
     static const nlohmann::json schema = R"json({"type":"object","properties":{
         "action":{"type":"string","description":"tool action name, e.g. pcbnew.InteractiveRouter.SingleTrack"},
         "at":{"type":"array","items":{"type":"number"},"description":"[x, y] mm: the pointer is put there first"},
-        "list":{"type":"string","description":"instead of running: actions whose name or label match this glob (name, label, hotkey)"}}})json"_json;
+        "list":{"type":"string","description":"instead of running: actions whose name or label match this glob (name, label, hotkey)"},
+        "confirm":{"type":"boolean","default":false,"description":"answer yes to the confirmation the action asks in the editor's infobar (e.g. pasting a long text); otherwise it is asked there (and in the journal) and the action stops"}}})json"_json;
     return schema;
 }

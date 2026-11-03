@@ -42,6 +42,7 @@
 #include <core/base64.h>
 #include <clipboard.h>
 #include <confirm.h>
+#include <kicadopenapi_service.h>
 #include <connection_graph.h>
 #include <connectivity/conn_netchain_manager.h>
 #include <connectivity/conn_navigation.h>
@@ -2354,13 +2355,22 @@ int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
     {
         // If it wasn't schematic content, paste as a text object
         {
-            if( content.size() > static_cast<size_t>( ADVANCED_CFG::GetCfg().m_MaxPastedTextLength ) )
+            // a long text is confirmed in the infobar (sch_action confirm), then pasted by running
+            // Paste again
+            if( content.size() > static_cast<size_t>( ADVANCED_CFG::GetCfg().m_MaxPastedTextLength )
+                && !KICAD_OPENAPI_SERVICE::ConfirmPrompts() && wxString::FromUTF8( content ) != m_confirmedPasteText )
             {
-                int result = IsOK( m_frame, _( "Pasting a long text text string may be very slow.  "
-                                               "Do you want to continue?" ) );
-                if( !result )
-                    return 0;
+                m_frame->ShowInfoBarQuestion( _( "Pasting a long text string may be very slow." ), _( "Paste Anyway" ),
+                                              [this, text = wxString::FromUTF8( content )]()
+                                              {
+                                                  m_confirmedPasteText = text;
+                                                  m_toolMgr->RunAction( ACTIONS::paste );
+                                                  m_confirmedPasteText.clear();
+                                              } );
+                return 0;
             }
+
+            m_confirmedPasteText.clear();
 
             SCH_TEXT* text_item = new SCH_TEXT( VECTOR2I( 0, 0 ), content );
             tempScreen->Append( text_item );

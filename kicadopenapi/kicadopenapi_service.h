@@ -113,6 +113,11 @@ public:
     static void SetOverrideLock( bool aOverride );
     static bool OverrideLock();
 
+    /// @brief Yes to the confirmation an editor asks in its infobar (e.g. pasting a long text) while
+    /// NoModalUi(): pcb_action / sch_action confirm sets it for the duration of the action
+    static void SetConfirmPrompts( bool aConfirm );
+    static bool ConfirmPrompts();
+
     /// @brief KICAD_OPENAPI_PORT env override (0: a port the OS assigns), else DEFAULT_PORT.
     static int DefaultPort();
 

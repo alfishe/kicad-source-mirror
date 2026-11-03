@@ -301,9 +301,11 @@ struct APPENDED
 /// board is then as before
 std::optional<APPENDED> appendBoard( BOARD* aBoard, BOARD_COMMIT& aCommit, const wxString& aFile,
                                      PCB_IO_MGR::PCB_FILE_T aType, const std::optional<VECTOR2I>& aAt,
-                                     const nlohmann::json& aLayerMap, std::string& aError, int& aStatus )
+                                     const nlohmann::json& aLayerMap, std::string& aError, int& aStatus,
+                                     bool aAcceptQueries = true )
 {
     APPENDED                out;
+    std::string             declined;   ///< the reader's question answered no
     BOARD_ITEM_SET          existingItems = aBoard->GetItemSet();
     std::set<NETINFO_ITEM*> existingNets;
 
@@ -345,10 +347,18 @@ std::optional<APPENDED> appendBoard( BOARD* aBoard, BOARD_COMMIT& aCommit, const
             return std::nullopt;
         }
 
-        // the editor asks; the API goes on and says what it was asked
+        // the editor asks in its infobar; the API answers aAcceptQueries and says what it was asked
         pi->SetQueryUserCallback(
                 [&]( wxString aTitle, int, wxString aMessage, wxString ) -> bool
                 {
+                    if( !aAcceptQueries )
+                    {
+                        if( declined.empty() )
+                            declined = str( aTitle + wxS( ": " ) + aMessage );
+
+                        return false;
+                    }
+
                     out.warnings.push_back( str( aTitle + wxS( ": " ) + aMessage ) );
                     return true;
                 } );
@@ -394,8 +404,18 @@ std::optional<APPENDED> appendBoard( BOARD* aBoard, BOARD_COMMIT& aCommit, const
     catch( const IO_ERROR& ioe )
     {
         clearSkipStruct();
-        aError = "could not be read: " + str( ioe.What() );
-        aStatus = 422;
+
+        if( !declined.empty() )
+        {
+            aError = "the reader asked and accept_queries: false answered no, which stops the append: " + declined;
+            aStatus = 409;
+        }
+        else
+        {
+            aError = "could not be read: " + str( ioe.What() );
+            aStatus = 422;
+        }
+
         return std::nullopt;
     }
 
@@ -706,7 +726,7 @@ KOPENAPI_RESULT h_pcb_append( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArg
     int                     status = 400;
     BOARD_COMMIT            commit( context->GetToolManager() );
     std::optional<APPENDED> appended = appendBoard( brd, commit, path, type, at, aArgs.value( "layer_map", nlohmann::json() ),
-                                                    error, status );
+                                                    error, status, aArgs.value( "accept_queries", true ) );
 
     if( !appended )
         return KOPENAPI_RESULT::Error( status, "path: " + error );
@@ -778,9 +798,12 @@ KOPENAPI_REGISTER( "pcb_append",
                    "item at at_mm (default where the file has it); group (default false) puts it in one group named "
                    "after the file. A foreign board's layers map by layer_map (source name -> KiCad layer, null to "
                    "drop) else the importer's guess; the answer says the mapping (layer_map, and unmapped_layers left out). References are not renumbered: "
-                   "duplicate_refs names the ones now on the board twice",
+                   "duplicate_refs names the ones now on the board twice. The reader's questions (the editor asks them in its infobar, "
+                   "e.g. rescue items on layers the file does not define to User.Comments) are answered by accept_queries: yes by "
+                   "default (each one in warnings), no stops the append (409 with the question)",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string","description":"absolute path"},
+                        "accept_queries":{"type":"boolean","default":true},
                         "at_mm":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},
                         "group":{"type":"boolean","default":false},
                         "layer_map":{"type":"object","additionalProperties":{"type":["string","null"]}}}})json"_json,

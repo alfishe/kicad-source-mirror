@@ -74,7 +74,7 @@
 #include <wx/filename.h>
 #include <zone.h>
 #include <confirm.h>
-#include <kidialog.h>
+#include <kicadopenapi_service.h>
 #include <connectivity/connectivity_data.h>
 #include <core/kicad_algo.h>
 #include <dialogs/hotkey_cycle_popup.h>
@@ -1167,14 +1167,22 @@ int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
             if( clipText.empty() )
                 return 0;
 
-            // If it wasn't content, then paste as a text object.
-            if( clipText.size() > static_cast<size_t>( ADVANCED_CFG::GetCfg().m_MaxPastedTextLength ) )
+            // If it wasn't content, then paste as a text object.  A long one is confirmed in the
+            // infobar (pcb_action confirm), and the confirmed text pasted by running Paste again.
+            if( clipText.size() > static_cast<size_t>( ADVANCED_CFG::GetCfg().m_MaxPastedTextLength )
+                && !KICAD_OPENAPI_SERVICE::ConfirmPrompts() && clipText != m_confirmedPasteText )
             {
-                int result = IsOK( m_frame, _( "Pasting a long text text string may be very slow.  "
-                                               "Do you want to continue?" ) );
-                if( !result )
-                    return 0;
+                m_frame->ShowInfoBarQuestion( _( "Pasting a long text string may be very slow." ), _( "Paste Anyway" ),
+                                              [this, clipText]()
+                                              {
+                                                  m_confirmedPasteText = clipText;
+                                                  m_toolMgr->RunAction( ACTIONS::paste );
+                                                  m_confirmedPasteText.clear();
+                                              } );
+                return 0;
             }
+
+            m_confirmedPasteText.clear();
 
             std::unique_ptr<PCB_TEXT> item = std::make_unique<PCB_TEXT>( m_frame->GetModel() );
             item->SetText( clipText );
@@ -2095,7 +2103,7 @@ bool PCB_CONTROL::placeBoardItems( BOARD_COMMIT* aCommit, std::vector<BOARD_ITEM
 
 
 int PCB_CONTROL::AppendBoard( PCB_IO& pi, const wxString& fileName, DESIGN_BLOCK* aDesignBlock, BOARD_COMMIT* aCommit,
-                              bool aSkipMove )
+                              bool aSkipMove, bool aAcceptQueries )
 {
     PCB_EDIT_FRAME* editFrame = dynamic_cast<PCB_EDIT_FRAME*>( m_frame );
 
@@ -2146,6 +2154,9 @@ int PCB_CONTROL::AppendBoard( PCB_IO& pi, const wxString& fileName, DESIGN_BLOCK
     int  initialCopperLayerCount = brd->GetCopperLayerCount();
     LSET initialEnabledLayers = brd->GetEnabledLayers();
 
+    wxString declinedQuery;
+    wxString declinedAction;
+
     // Load the data
     try
     {
@@ -2157,17 +2168,23 @@ int PCB_CONTROL::AppendBoard( PCB_IO& pi, const wxString& fileName, DESIGN_BLOCK
         props["page_height"] = std::to_string( editFrame->GetPageSizeIU().y );
         props[PCB_IO_LOAD_PROPERTIES::APPEND_PRESERVE_DESTINATION_STACKUP] = "";
 
+        // The plugin's questions (e.g. rescue items on undefined layers) are not asked in a
+        // dialog: declined here, then asked in the infobar, whose answer appends again accepting them
         pi.SetQueryUserCallback(
                 [&]( wxString aTitle, int aIcon, wxString aMessage, wxString aAction ) -> bool
                 {
-                    KIDIALOG dlg( editFrame, aMessage, aTitle, wxOK | wxCANCEL | aIcon );
+                    if( aAcceptQueries || KICAD_OPENAPI_SERVICE::ConfirmPrompts() )
+                        return true;
 
-                    if( !aAction.IsEmpty() )
-                        dlg.SetOKLabel( aAction );
+                    if( declinedQuery.IsEmpty() )
+                    {
+                        aMessage.Replace( wxS( "\n\n" ), wxS( " " ) );
+                        aMessage.Replace( wxS( "\n" ), wxS( " " ) );
+                        declinedQuery = aTitle + wxS( ": " ) + aMessage;
+                        declinedAction = aAction.IsEmpty() ? _( "Continue" ) : aAction;
+                    }
 
-                    dlg.DoNotShowCheckbox( aMessage, 0 );
-
-                    return dlg.ShowModal() == wxID_OK;
+                    return false;
                 } );
 
         // Let the user remap the appended board's layers onto this board when they do not match
@@ -2187,8 +2204,41 @@ int PCB_CONTROL::AppendBoard( PCB_IO& pi, const wxString& fileName, DESIGN_BLOCK
     }
     catch( const IO_ERROR& ioe )
     {
-        editFrame->ShowInfoBarError( _( "Error loading board." ) + wxS( " " ) + ioe.What(), true );
         clearSkipStructOnExistingItems();
+
+        // a declined question stopped the load: asked in the infobar, its answer appends again
+        if( !declinedQuery.IsEmpty() && !aCommit )
+        {
+            std::optional<LIB_ID> blockId;
+
+            if( aDesignBlock )
+                blockId = aDesignBlock->GetLibId();
+
+            editFrame->ShowInfoBarQuestion( declinedQuery, declinedAction,
+                    [this, editFrame, fileName, blockId, aSkipMove]()
+                    {
+                        std::unique_ptr<DESIGN_BLOCK> designBlock;
+
+                        if( blockId )
+                        {
+                            designBlock.reset( editFrame->GetDesignBlockPane()->GetDesignBlock( *blockId, true,
+                                                                                                false ) );
+
+                            if( !designBlock )
+                                return;
+                        }
+
+                        PCB_IO_MGR::PCB_FILE_T type = PCB_IO_MGR::FindPluginTypeFromBoardPath( fileName );
+                        IO_RELEASER<PCB_IO>    plugin( PCB_IO_MGR::FindPlugin( type ) );
+
+                        if( plugin )
+                            AppendBoard( *plugin, fileName, designBlock.get(), nullptr, aSkipMove, true );
+                    } );
+        }
+        else
+        {
+            editFrame->ShowInfoBarError( _( "Error loading board." ) + wxS( " " ) + ioe.What(), true );
+        }
 
         return 1;
     }

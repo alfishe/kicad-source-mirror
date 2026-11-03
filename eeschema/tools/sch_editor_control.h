@@ -270,6 +270,7 @@ private:
     EDA_ITEM*   m_pickerItem;               // Current item for picker highlighting.
 
     std::string m_duplicateClipboard;       // Temporary storage for Duplicate action
+    wxString    m_confirmedPasteText;       // A long text the infobar confirmed
     bool        m_duplicateIsHoverSelection;
 
     bool        m_highlightBusMembers;

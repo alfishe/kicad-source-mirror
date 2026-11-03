@@ -110,8 +110,10 @@ public:
     int ApplyDesignBlockLayout( const TOOL_EVENT& aEvent );
     int PlaceLinkedDesignBlock( const TOOL_EVENT& aEvent );
     int SaveToLinkedDesignBlock( const TOOL_EVENT& aEvent );
+    /// @param aAcceptQueries answer yes to the plugin's questions; otherwise the first one
+    ///                       stops the append and is asked in the infobar
     int AppendBoard( PCB_IO& pi, const wxString& fileName, DESIGN_BLOCK* aDesignBlock = nullptr,
-                     BOARD_COMMIT* aCommit = nullptr, bool aSkipMove = false );
+                     BOARD_COMMIT* aCommit = nullptr, bool aSkipMove = false, bool aAcceptQueries = false );
     int UpdateMessagePanel( const TOOL_EVENT& aEvent );
     int PlaceCharacteristics( const TOOL_EVENT& aEvent );
     int PlaceStackup( const TOOL_EVENT& aEvent );
@@ -202,6 +204,8 @@ private:
      * closed leaves nothing dangling here.
      */
     wxWeakRef<wxDialog>                     m_drillGroupsDialog;
+
+    wxString                                m_confirmedPasteText;   ///< a long text the infobar confirmed
 };
 
 #endif

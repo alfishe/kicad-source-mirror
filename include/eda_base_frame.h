@@ -303,6 +303,14 @@ public:
     void ShowInfoBarMsg( const wxString& aMsg, bool aShowCloseButton = false );
 
     /**
+     * Ask in the #WX_INFOBAR instead of a modal question: the message with a warning icon, a link
+     * labelled @p aActionLabel that runs @p aAction (after the click), and a close button that
+     * declines.  Nothing waits for the answer.
+     */
+    void ShowInfoBarQuestion( const wxString& aMessage, const wxString& aActionLabel,
+                              std::function<void()> aAction );
+
+    /**
      * Return the settings object used in SaveSettings(), and is overloaded in
      * #KICAD_MANAGER_FRAME.
      */

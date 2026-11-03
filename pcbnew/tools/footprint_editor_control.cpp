@@ -50,6 +50,7 @@
 #include <pcb_group.h>
 #include <zone.h>
 #include <footprint_library_adapter.h>
+#include <footprint_rename.h>
 #include <dialogs/dialog_cleanup_graphics.h>
 #include <dialogs/dialog_footprint_checker.h>
 #include <dialogs/dialog_footprint_properties_fp_editor.h>
@@ -481,33 +482,29 @@ int FOOTPRINT_EDITOR_CONTROL::RenameFootprint( const TOOL_EVENT& aEvent )
     wxString libraryName = fpID.GetLibNickname();
     wxString oldName = fpID.GetLibItemName();
     wxString newName;
-    wxString msg;
 
     if( !libTool->RenameLibrary( _( "Change Footprint Name" ), oldName,
-            [&]( const wxString& aNewName )
+            [&]( const wxString& aNewName ) -> RENAME_VERDICT
             {
                 newName = aNewName;
 
-                if( newName.IsEmpty() )
+                FOOTPRINT_RENAME_CHECK check = CheckFootprintRename( oldName, newName,
+                        [&]( const wxString& aName )
+                        {
+                            return adapter->FootprintExists( libraryName, aName );
+                        } );
+
+                if( check == FOOTPRINT_RENAME_CHECK::EMPTY )
+                    return { FootprintRenameMessage( check, newName, libraryName ), false };
+
+                if( check == FOOTPRINT_RENAME_CHECK::EXISTS )
                 {
-                    wxMessageBox( _( "Footprint must have a name." ) );
-                    return false;
+                    return { FootprintRenameMessage( check, newName, libraryName ) + wxS( " " )
+                                     + _( "OK again overwrites it." ),
+                             true };
                 }
 
-                // If no change, accept it without prompting
-                if( oldName != newName && adapter->FootprintExists( libraryName, newName ) )
-                {
-                    msg = wxString::Format( _( "Footprint '%s' already exists in library '%s'." ),
-                                            newName, libraryName );
-
-                    KIDIALOG errorDlg( m_frame, msg, _( "Confirmation" ),
-                                       wxOK | wxCANCEL | wxICON_WARNING );
-                    errorDlg.SetOKLabel( _( "Overwrite" ) );
-
-                    return errorDlg.ShowModal() == wxID_OK;
-                }
-
-                return true;
+                return {};
             } ) )
     {
         return 0;   // canceled by user
@@ -524,10 +521,7 @@ int FOOTPRINT_EDITOR_CONTROL::RenameFootprint( const TOOL_EVENT& aEvent )
 
         if( footprint )
         {
-            footprint->SetFPID( LIB_ID( libraryName, newName ) );
-
-            if( footprint->GetValue() == oldName )
-                footprint->SetValue( newName );
+            ApplyFootprintRename( *footprint, oldName, newName );
 
             m_frame->OnModify();
             m_frame->UpdateView();
@@ -541,10 +535,7 @@ int FOOTPRINT_EDITOR_CONTROL::RenameFootprint( const TOOL_EVENT& aEvent )
         {
             try
             {
-                footprint->SetFPID( LIB_ID( libraryName, newName ) );
-
-                if( footprint->GetValue() == oldName )
-                    footprint->SetValue( newName );
+                ApplyFootprintRename( *footprint, oldName, newName );
 
                 // Both names are one file on a case-insensitive filesystem.
                 adapter->DeleteFootprint( libraryName, oldName );

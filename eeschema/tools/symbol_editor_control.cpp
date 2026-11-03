@@ -362,10 +362,9 @@ int SYMBOL_EDITOR_CONTROL::EditLibrarySymbol( const TOOL_EVENT& aEvent )
         const wxString libName = libId.GetLibNickname();
         const wxString symbolName = libId.GetLibItemName();
 
-        DisplayError( editFrame,
-                      wxString::Format( _( "Failed to load symbol %s from "
-                                           "library %s." ),
-                                        UnescapeString( symbolName ), UnescapeString( libName ) ) );
+        editFrame->ShowInfoBarError( wxString::Format( _( "Failed to load symbol %s from library %s." ),
+                                                       UnescapeString( symbolName ), UnescapeString( libName ) ),
+                                     true );
     }
     return 0;
 }
@@ -491,7 +490,7 @@ int SYMBOL_EDITOR_CONTROL::OpenDirectory( const TOOL_EVENT& aEvent )
 
     if( !explorerCommand.EndsWith( "%F" ) )
     {
-        wxMessageBox( _( "Missing/malformed file explorer argument '%F' in common settings." ) );
+        m_frame->ShowInfoBarError( _( "Missing/malformed file explorer argument '%F' in common settings." ), true );
         return 0;
     }
 
@@ -519,7 +518,7 @@ int SYMBOL_EDITOR_CONTROL::OpenWithTextEditor( const TOOL_EVENT& aEvent )
 
     if( textEditorName.IsEmpty() )
     {
-        wxMessageBox( _( "No text editor selected in KiCad. Please choose one." ) );
+        m_frame->ShowInfoBarError( _( "No text editor selected in KiCad. Please choose one." ), true );
         return 0;
     }
 
@@ -636,38 +635,28 @@ int SYMBOL_EDITOR_CONTROL::RenameSymbol( const TOOL_EVENT& aEvent )
     wxString libName = libId.GetLibNickname();
     wxString oldName = libId.GetLibItemName();
     wxString newName;
-    wxString msg;
 
     if( !libMgr.LibraryExists( libName ) )
         return 0;
 
     if( !libTool->RenameLibrary( _( "Change Symbol Name" ), oldName,
-            [&]( const wxString& aNewName )
+            [&]( const wxString& aNewName ) -> RENAME_VERDICT
             {
                 newName = EscapeString( aNewName, CTX_LIBID );
 
                 if( newName.IsEmpty() )
-                {
-                    wxMessageBox( _( "Symbol must have a name." ) );
-                    return false;
-                }
+                    return { _( "Symbol must have a name." ), false };
 
                 // If no change, accept it without prompting
                 if( newName != oldName && libMgr.SymbolNameInUse( newName, libName ) )
                 {
-                    msg.Printf( _( "Symbol '%s' already exists in library '%s'." ),
-                                UnescapeString( newName ),
-                                libName );
-
-                    KIDIALOG errorDlg( m_frame, msg, _( "Confirmation" ),
-                                       wxOK | wxCANCEL | wxICON_WARNING );
-
-                    errorDlg.SetOKLabel( _( "Overwrite" ) );
-
-                    return errorDlg.ShowModal() == wxID_OK;
+                    return { wxString::Format( _( "Symbol '%s' already exists in library '%s'." ),
+                                               UnescapeString( newName ), libName )
+                                     + wxS( " " ) + _( "OK again overwrites it." ),
+                             true };
                 }
 
-                return true;
+                return {};
             } ) )
     {
         return 0;   // cancelled by user
@@ -842,7 +831,7 @@ int SYMBOL_EDITOR_CONTROL::ExportView( const TOOL_EVENT& aEvent )
 
     if( !symbol )
     {
-        wxMessageBox( _( "No symbol to export" ) );
+        m_frame->ShowInfoBarError( _( "No symbol to export" ), true );
         return 0;
     }
 
@@ -864,7 +853,7 @@ int SYMBOL_EDITOR_CONTROL::ExportView( const TOOL_EVENT& aEvent )
 
         if( !editFrame->SaveCanvasImageToFile( dlg.GetPath(), BITMAP_TYPE::PNG ) )
         {
-            wxMessageBox( wxString::Format( _( "Can't save file '%s'." ), dlg.GetPath() ) );
+            m_frame->ShowInfoBarError( wxString::Format( _( "Can't save file '%s'." ), dlg.GetPath() ), true );
         }
     }
 
@@ -891,7 +880,7 @@ int SYMBOL_EDITOR_CONTROL::ExportSymbolAsSVG( const TOOL_EVENT& aEvent )
 
     if( !symbol )
     {
-        wxMessageBox( _( "No symbol to export" ) );
+        m_frame->ShowInfoBarError( _( "No symbol to export" ), true );
         return 0;
     }
 
@@ -926,7 +915,7 @@ int SYMBOL_EDITOR_CONTROL::FlattenSymbol( const TOOL_EVENT& aEvent )
 
     if( !symId.IsValid() )
     {
-        wxMessageBox( _( "No symbol to flatten" ) );
+        m_frame->ShowInfoBarError( _( "No symbol to flatten" ), true );
         return 0;
     }
 
@@ -936,7 +925,7 @@ int SYMBOL_EDITOR_CONTROL::FlattenSymbol( const TOOL_EVENT& aEvent )
 
     if( !libMgr.UpdateSymbol( flatSymbol.get(), symId.GetLibNickname() ) )
     {
-        wxMessageBox( _( "Failed to update library with flattened symbol" ) );
+        m_frame->ShowInfoBarError( _( "Failed to update library with flattened symbol" ), true );
         return 0;
     }
 
@@ -982,7 +971,7 @@ int SYMBOL_EDITOR_CONTROL::AddSymbolToSchematic( const TOOL_EVENT& aEvent )
 
         if( !schframe )      // happens when the schematic editor is not active (or closed)
         {
-            DisplayErrorMessage( m_frame, _( "No schematic currently open." ) );
+            m_frame->ShowInfoBarError( _( "No schematic currently open." ), true );
             return 0;
         }
 

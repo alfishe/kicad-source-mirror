@@ -24,6 +24,16 @@
 
 class EDA_DRAW_FRAME;
 
+
+/// A rename dialog's answer on an entered name: an empty message accepts it; otherwise the
+/// message shows in the dialog's status line and the name is refused, unless it is a warning to
+/// confirm (e.g. an overwrite), which OK with the same name again accepts
+struct RENAME_VERDICT
+{
+    wxString message;
+    bool     confirm = false;
+};
+
 /**
  * Module editor specific tools.
  */
@@ -43,7 +53,7 @@ public:
     int LibraryTreeSearch( const TOOL_EVENT& aEvent );
 
     bool RenameLibrary( const wxString& aTitle, const wxString& aName,
-                        std::function<bool( const wxString& aNewName )> aValidator );
+                        std::function<RENAME_VERDICT( const wxString& aNewName )> aValidator );
 
 private:
     void changeSelectedPinStatus( const bool aPin );

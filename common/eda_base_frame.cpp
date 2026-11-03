@@ -57,6 +57,7 @@
 #include <tool/action_toolbar.h>
 #include <tool/actions.h>
 #include <kicadopenapi_remote.h>
+#include <kicadopenapi_service.h>
 #include <tool/common_control.h>
 #include <tool/tool_manager.h>
 #include <tool/tool_dispatcher.h>
@@ -1490,6 +1491,32 @@ void EDA_BASE_FRAME::ShowInfoBarMsg( const wxString& aMsg, bool aShowCloseButton
         m_infoBar->AddCloseButton();
 
     GetInfoBar()->ShowMessageFor( aMsg, 8000, wxICON_INFORMATION );
+}
+
+
+void EDA_BASE_FRAME::ShowInfoBarQuestion( const wxString& aMessage, const wxString& aActionLabel,
+                                          std::function<void()> aAction )
+{
+    wxCHECK( m_infoBar, /* void */ );
+
+    // working for an agent: the question is in the journal too
+    if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        wxLogWarning( wxS( "%s (%s: in the infobar)" ), aMessage, aActionLabel );
+
+    m_infoBar->RemoveAllButtons();
+    m_infoBar->AddLink( aActionLabel,
+                        [this, aAction]( wxHyperlinkEvent& )
+                        {
+                            // after the click: the action may replace the infobar's links
+                            CallAfter(
+                                    [this, aAction]()
+                                    {
+                                        GetInfoBar()->Dismiss();
+                                        aAction();
+                                    } );
+                        } );
+    m_infoBar->AddCloseButton();
+    m_infoBar->ShowMessage( aMessage, wxICON_WARNING );
 }
 
 

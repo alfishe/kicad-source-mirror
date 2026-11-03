@@ -244,6 +244,7 @@ static std::string checkArgs( const nlohmann::json& aSchema, const nlohmann::jso
     return error;
 }
 static std::atomic<bool> s_overrideLock{ false };
+static std::atomic<bool> s_confirmPrompts{ false };
 
 
 static void removeStaleDiscoveryFiles( const fs::path& aDir )
@@ -2888,6 +2889,18 @@ void KICAD_OPENAPI_SERVICE::SetOverrideLock( bool aOverride )
 bool KICAD_OPENAPI_SERVICE::OverrideLock()
 {
     return s_overrideLock;
+}
+
+
+void KICAD_OPENAPI_SERVICE::SetConfirmPrompts( bool aConfirm )
+{
+    s_confirmPrompts = aConfirm;
+}
+
+
+bool KICAD_OPENAPI_SERVICE::ConfirmPrompts()
+{
+    return s_confirmPrompts;
 }
 
 

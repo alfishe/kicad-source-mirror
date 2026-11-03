@@ -22,6 +22,8 @@
 #include <project.h>
 #include <kiway.h>
 #include "wx/generic/textdlgg.h"
+#include <wx/stattext.h>
+#include <algorithm>
 #include "library_editor_control.h"
 
 
@@ -173,24 +175,49 @@ class RENAME_DIALOG : public wxTextEntryDialog
 {
 public:
     RENAME_DIALOG( wxWindow* aParent, const wxString& aTitle, const wxString& aName,
-                   std::function<bool( const wxString& newName )> aValidator ) :
+                   std::function<RENAME_VERDICT( const wxString& newName )> aValidator ) :
             wxTextEntryDialog( aParent, _( "New name:" ), aTitle, aName ),
             m_validator( std::move( aValidator ) )
-    { }
+    {
+        // the validator's errors and warnings: in the dialog, no message box over it
+        m_status = new wxStaticText( this, wxID_ANY, wxEmptyString );
+
+        if( wxSizer* sizer = GetSizer() )
+        {
+            sizer->Insert( sizer->GetItemCount() > 0 ? sizer->GetItemCount() - 1 : 0, m_status, 0,
+                           wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10 );
+        }
+    }
 
 protected:
     bool TransferDataFromWindow() override
     {
-        return m_validator( m_textctrl->GetValue().Trim( true ).Trim( false ) );
+        const wxString name = wxString( m_textctrl->GetValue() ).Trim( true ).Trim( false );
+        RENAME_VERDICT verdict = m_validator( name );
+
+        if( verdict.message.IsEmpty() || ( verdict.confirm && name == m_confirmed ) )
+            return true;
+
+        m_confirmed = verdict.confirm ? name : wxString();
+        m_status->SetLabel( verdict.message );
+        m_status->Wrap( std::max( GetClientSize().x - 20, 200 ) );
+        Layout();
+
+        if( wxSizer* sizer = GetSizer() )
+            sizer->Fit( this );
+
+        return false;
     }
 
 private:
-    std::function<bool( const wxString& aNewName )> m_validator;
+    std::function<RENAME_VERDICT( const wxString& aNewName )> m_validator;
+    wxStaticText*                                             m_status;
+    wxString                                                  m_confirmed;
 };
 
 
 bool LIBRARY_EDITOR_CONTROL::RenameLibrary( const wxString& aTitle, const wxString& aName,
-                                            std::function<bool( const wxString& aNewName )> aValidator )
+                                            std::function<RENAME_VERDICT( const wxString& aNewName )> aValidator )
 {
     RENAME_DIALOG dlg( m_frame, aTitle, aName, std::move( aValidator ) );
 

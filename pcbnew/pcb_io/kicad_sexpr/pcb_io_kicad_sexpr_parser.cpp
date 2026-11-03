@@ -1497,7 +1497,8 @@ BOARD* PCB_IO_KICAD_SEXPR_PARSER::parseBOARD_unchecked()
 
         destLayerName = m_board->GetLayerName( destLayer );
 
-        if( Pgm().IsGUI() && m_queryUserCallback )
+        // asked whenever the caller can answer (an editor, an API call); the error otherwise
+        if( m_queryUserCallback )
         {
             msg.Printf( _( "Items found on undefined layers (%s).\n"
                            "Do you wish to rescue them to the %s layer?\n"

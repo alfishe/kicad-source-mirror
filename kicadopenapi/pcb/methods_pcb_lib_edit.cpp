@@ -9,6 +9,7 @@
 #include <common.h>
 #include <embedded_files.h>
 #include <footprint.h>
+#include <footprint_rename.h>
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 #include <project.h>
 #include <tool/tool_manager.h>
@@ -253,6 +254,70 @@ static KOPENAPI_RESULT h_pcb_lib_footprint_save( KOPENAPI_CONTEXT& aCtx, const n
 }
 
 
+/// Change Footprint Name (the footprint editor's, FOOTPRINT_EDITOR_CONTROL::RenameFootprint) on a
+/// library directory: the dialog's checks (CheckFootprintRename), overwrite instead of its question
+static KOPENAPI_RESULT h_pcb_lib_footprint_rename( KOPENAPI_CONTEXT&, const nlohmann::json& aArgs )
+{
+    const wxString library = wxString::FromUTF8( aArgs.value( "library", std::string() ) );
+    const wxString oldName = wxString::FromUTF8( aArgs.value( "name", std::string() ) );
+    const wxString newName = wxString::FromUTF8( aArgs.value( "new_name", std::string() ) ).Trim( true ).Trim( false );
+
+    if( library.IsEmpty() || !library.EndsWith( wxS( ".pretty" ) ) || !wxFileName( library ).IsAbsolute() )
+        return KOPENAPI_RESULT::Error( 400, "library: absolute path of a .pretty directory" );
+
+    try
+    {
+        PCB_IO_KICAD_SEXPR io;
+
+        if( !wxDir::Exists( library ) || oldName.IsEmpty() || !io.FootprintExists( library, oldName ) )
+            return KOPENAPI_RESULT::Error( 404, "name: no such footprint in the library" );
+
+        const wxString nickname = wxFileName( library ).GetName();
+        const FOOTPRINT_RENAME_CHECK check = CheckFootprintRename( oldName, newName,
+                [&]( const wxString& aName )
+                {
+                    return io.FootprintExists( library, aName );
+                } );
+
+        if( check == FOOTPRINT_RENAME_CHECK::EMPTY )
+            return KOPENAPI_RESULT::Error( 400, str( FootprintRenameMessage( check, newName, nickname ) ) );
+
+        const bool overwrite = check == FOOTPRINT_RENAME_CHECK::EXISTS;
+
+        if( overwrite && !aArgs.value( "overwrite", false ) )
+        {
+            return KOPENAPI_RESULT::Error( 409, str( FootprintRenameMessage( check, newName, nickname ) )
+                                                        + " (overwrite: true replaces it)" );
+        }
+
+        if( check != FOOTPRINT_RENAME_CHECK::UNCHANGED )
+        {
+            std::unique_ptr<FOOTPRINT> footprint = io.FootprintLoad( library, oldName, true );
+
+            if( !footprint )
+                return KOPENAPI_RESULT::Error( 422, "the footprint could not be read" );
+
+            ApplyFootprintRename( *footprint, oldName, newName );
+
+            // as the editor: the old one first (both names are one file on a case-insensitive disk)
+            io.FootprintDelete( library, oldName );
+            io.FootprintSave( library, footprint.get() );
+        }
+
+        const wxString file = library + wxFileName::GetPathSeparator() + newName + wxS( "." )
+                              + FILEEXT::KiCadFootprintFileExtension;
+
+        return KOPENAPI_RESULT::Ok( { { "name", str( newName ) }, { "old_name", str( oldName ) },
+                                      { "file", str( file ) }, { "overwritten", overwrite },
+                                      { "renamed", check != FOOTPRINT_RENAME_CHECK::UNCHANGED } } );
+    }
+    catch( const IO_ERROR& e )
+    {
+        return KOPENAPI_RESULT::Error( 500, str( e.What() ) );
+    }
+}
+
+
 KOPENAPI_REGISTER( "pcb_footprint_models_embed",
                    "Embed the 3D model files of board footprints into the footprints themselves "
                    "(kicad-embed://...): the footprint carries its model, no path variables needed; "
@@ -274,3 +339,15 @@ KOPENAPI_REGISTER( "pcb_lib_footprint_save",
                    false, h_pcb_lib_footprint_save, 300 );
 
 KOPENAPI_MARK_EDITING( "pcb_footprint_models_embed" );
+
+KOPENAPI_REGISTER( "pcb_lib_footprint_rename",
+                   "Change Footprint Name, as the footprint editor's: footprint name of the library (absolute path of "
+                   "a .pretty directory) becomes new_name (its value too when that was the old name). An empty name "
+                   "is refused (400); a name another footprint has is refused (409) unless overwrite: true, which "
+                   "replaces that footprint (the editor asks it in its rename dialog)",
+                   R"json({"type":"object","required":["library","name","new_name"],"properties":{
+                        "library":{"type":"string","description":"absolute path of the .pretty directory"},
+                        "name":{"type":"string"},
+                        "new_name":{"type":"string"},
+                        "overwrite":{"type":"boolean","default":false}}})json"_json,
+                   false, h_pcb_lib_footprint_rename );
