@@ -1243,6 +1243,7 @@ struct ESCAPE_FRONT
     bool                port = false;  ///< the layout plan's port of a signal pin (ports)
     std::shared_ptr<const std::set<int>> only;   ///< the nets it walls out; none: every other net
     int                 partner = -1;  ///< the pad's diff pair partner net: it leaves beside it, not walled out
+    bool                supply = false; ///< a supply or ground pin (pcb_net_roles): a pair walls it in no more than any other route
     const char*         kind = "edge"; ///< edge (a fine-pitch pad's way out), inward, port, port_via, bus_via
 
     bool walls( int aNet ) const
@@ -2042,7 +2043,8 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         {
             for( const ESCAPE_FRONT& front : *aReq.fronts )
             {
-                if( !front.walls( aReq.from->GetNetCode() ) )
+                // a pair's tail is held to the supply pins' ways out only
+                if( !front.walls( aReq.from->GetNetCode() ) || ( aReq.pairTail && !front.supply ) )
                     continue;
 
                 auto item = std::make_unique<PCB_SHAPE>( board, SHAPE_T::SEGMENT );
@@ -2457,17 +2459,33 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
     const nlohmann::json violations = guard( board, changed, iface->m_removed );
     const auto           guardedAt = std::chrono::steady_clock::now();
 
-    if( aReq.fronts && !aReq.diffPair && !aReq.pairTail )
+    // a pair and its tails pass the neighbours' ways out (the pair's series parts stand there anyway),
+    // not a supply pin's: a supply pin walled in is a part without power
+    const bool pairWay = aReq.diffPair || aReq.pairTail;
+
+    if( aReq.fronts )
     {
         for( BOARD_CONNECTED_ITEM* item : changed )
         {
             for( const ESCAPE_FRONT& front : *aReq.fronts )
             {
-                // the way out is the pad's copper: another net keeps its clearance from it
-                if( !front.walls( item->GetNetCode() ) || !item->IsOnLayer( front.layer )
+                // the way out is the pad's copper: another net keeps its clearance from it (the rules'
+                // clearance to that pad, as the router's search keeps it)
+                if( ( pairWay && !front.supply ) || !front.walls( item->GetNetCode() ) || !item->IsOnLayer( front.layer )
                     || !item->GetEffectiveShape( front.layer )->Collide( &front.shape, std::max( item->GetOwnClearance( front.layer ) - 1, 0 ) ) )
                 {
                     continue;
+                }
+
+                if( std::shared_ptr<DRC_ENGINE> drc = board->GetDesignSettings().m_DRCEngine )
+                {
+                    const DRC_CONSTRAINT c = drc->EvalRules( CLEARANCE_CONSTRAINT, item, front.pad, front.layer );
+
+                    if( c.GetValue().HasMin()
+                        && !item->GetEffectiveShape( front.layer )->Collide( &front.shape, std::max( c.GetValue().Min() - 1, 0 ) ) )
+                    {
+                        continue;
+                    }
                 }
 
                 const std::string key = copperKey( item );
@@ -3104,9 +3122,23 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     const std::string netName = aReq.from ? str( UnescapeString( aReq.from->GetNetname() ) ) : std::string();
     const int      fromNet = aReq.from ? aReq.from->GetNetCode() : 0;
     const VECTOR2I fromAt = aReq.from ? aReq.fromPos.value_or( aReq.from->GetPosition() ) : VECTOR2I();
-    const bool   ok = aReq.exact ? layExact( aContext, aReq, aOut, aAdded ) : routeOneImpl( aContext, aReq, aOut, aAdded );
+    bool         ok = aReq.exact ? layExact( aContext, aReq, aOut, aAdded ) : routeOneImpl( aContext, aReq, aOut, aAdded );
     ROUTE_PROFILE  scratch;
     ROUTE_PROFILE& profile = ROUTE_PROFILES::Of( aContext.GetBoard(), scratch );
+
+    // a pair's tail refused for walling in a supply pin: made again at once with the supply pins' ways
+    // out as obstacles to the search
+    if( !ok && !aReq.exact && aReq.pairTail && aReq.fronts && !aReq.frontsInWorld && aOut.contains( "walls_in" ) )
+    {
+        ROUTE_REQUEST  again = aReq;
+        nlohmann::json out = nlohmann::json::object();
+        again.frontsInWorld = true;
+        profile.frontRetries++;
+        ok = routeOneImpl( aContext, again, out, aAdded );
+        profile.frontRetriesWon += ok;
+        out["walls_in_first"] = aOut["walls_in"];
+        aOut = std::move( out );
+    }
 
     if( !ok && profile.wallRefused && !*profile.wallRefused && aReq.fronts && !aReq.frontsInWorld && !aReq.diffPair
         && padToPad
@@ -9912,10 +9944,36 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     }
 
     // a pair's two pins leave side by side: neither's way out walls the other
+    std::set<int> supplyNets;
+
+    if( !fronts.empty() )
+    {
+        if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+        {
+            const KOPENAPI_RESULT r = roles->handler( aCtx, nlohmann::json::object() );
+
+            if( r.status < 400 && r.body.contains( "nets" ) && r.body["nets"].is_array() )
+            {
+                for( const nlohmann::json& row : r.body["nets"] )
+                {
+                    const std::string role = row.value( "role", std::string() );
+
+                    if( role == "power" || role == "power_hc" || role == "local_supply" || role == "ground" )
+                    {
+                        if( NETINFO_ITEM* net = KopenapiFindNet( board, row.value( "net", std::string() ) ) )
+                            supplyNets.insert( net->GetNetCode() );
+                    }
+                }
+            }
+        }
+    }
+
     for( ESCAPE_FRONT& front : fronts )
     {
         if( const NETINFO_ITEM* coupled = coupledNet( board, front.pad->GetNet(), &explicitPairs ) )
             front.partner = coupled->GetNetCode();
+
+        front.supply = supplyNets.count( front.pad->GetNetCode() ) > 0;
     }
 
     // live progress: this call's connections (airwires, then gaps) summed from the rows as the
