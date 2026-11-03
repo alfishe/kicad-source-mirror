@@ -1,6 +1,7 @@
 /// @file methods_sch_documents.cpp
 /// @brief kicadopenapi schematic document methods: sch_open, sch_close, sch_save, sch_revert, and
 /// the "sch" document provider.  Compiled into the eeschema kiface; registered when it loads.
+#include <kicadopenapi_journal.h>
 #include <kicadopenapi_util.h>
 #include <kicadopenapi_change_feed.h>
 #include <model_thread.h>
@@ -378,7 +379,8 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         }
     }
 
-    KOPENAPI_RESULT result;
+    KOPENAPI_RESULT       result;
+    KOPENAPI_JOURNAL_MARK loadMessages;
 
     if( aCtx.headless )
     {
@@ -394,6 +396,11 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         if( result.status != 200 )
             result.body["hint"] = "another process may have the file open (errors: journal); override_lock: true opens it anyway";
     }
+
+    // what the editor shows in its infobar or would have asked in a dialog (a failure carries it
+    // in error.log)
+    if( result.status == 200 )
+        loadMessages.AddTo( result.body );
 
     // the editor offers these in its infobar
     if( result.status == 200 )

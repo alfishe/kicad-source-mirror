@@ -989,6 +989,15 @@ bool KICAD_MANAGER_FRAME::LoadProject( const wxFileName& aProjectFileName )
         SetMruPath( Prj().GetProjectPath() );
 
     if( Pgm().GetCommonSettings()->AutosaveUsesLocalHistory()
+            && Kiway().LocalHistory().HeadNewerThanLastSave( Prj().GetProjectPath() )
+            && KICAD_OPENAPI_SERVICE::NoModalUi() )
+    {
+        // working for an agent: neither restored nor discarded; the history keeps them
+        ShowInfoBarWarning( _( "KiCad found unsaved changes from your last session that are newer than the saved "
+                               "project files. They are kept in the local history (sch_autosave / pcb_autosave "
+                               "with the editor open)." ) );
+    }
+    else if( Pgm().GetCommonSettings()->AutosaveUsesLocalHistory()
             && Kiway().LocalHistory().HeadNewerThanLastSave( Prj().GetProjectPath() ) )
     {
         wxString head = Kiway().LocalHistory().GetHeadHash( Prj().GetProjectPath() );

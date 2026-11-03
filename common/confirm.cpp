@@ -159,6 +159,16 @@ static int g_lastUnsavedChangesResult = -1;
 
 bool HandleUnsavedChanges( wxWindow* aParent, const wxString& aMessage, const std::function<bool()>& aSaveFunction )
 {
+    // working for an agent (kicadopenapi): no modal question; the changes are kept and the step
+    // that would drop them does not happen
+    if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+    {
+        g_lastUnsavedChangesResult = wxID_CANCEL;
+        wxLogError( _( "%s Not asked while working for an agent: save or discard the changes first." ),
+                    aMessage );
+        return false;
+    }
+
     g_lastUnsavedChangesResult = UnsavedChangesDialog( aParent, aMessage );
 
     switch( g_lastUnsavedChangesResult )

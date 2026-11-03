@@ -21,6 +21,7 @@
  */
 
 #include <pcb/kopenapi_board_load.h>
+#include <kicadopenapi_service.h>
 #include <pcb/kopenapi_model_warmup.h>
 #include <kicadopenapi_jobs.h>
 #include <kicadopenapi_keepalive.h>
@@ -611,6 +612,12 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         // notify user that fullFileName does not exist, ask if user wants to create it.
         msg.Printf( _( "PCB '%s' does not exist. Do you wish to create it?" ), fullFileName );
 
+        if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        {
+            wxLogError( _( "PCB '%s' does not exist." ), fullFileName );
+            return false;
+        }
+
         if( !IsOK( this, msg ) )
             return false;
     }
@@ -757,6 +764,14 @@ bool PCB_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
             loaderOptions.plugin_configurator =
                     [&]( PCB_IO& aPlugin )
                     {
+                        // working for an agent: the importer's own layer guess and project
+                        // choice, the reader's questions answered as the API says (logged)
+                        if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+                        {
+                            KopenapiAnswerQueries( aPlugin, KopenapiBoardQueries() );
+                            return;
+                        }
+
                         if( LAYER_MAPPABLE_PLUGIN* mappable_pi =
                                     dynamic_cast<LAYER_MAPPABLE_PLUGIN*>( &aPlugin ) )
                         {

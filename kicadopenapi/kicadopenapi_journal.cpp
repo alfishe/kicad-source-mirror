@@ -266,3 +266,26 @@ void KOPENAPI_JOURNAL::Clear()
     s.errors = 0;
     s.warnings = 0;
 }
+
+
+KOPENAPI_JOURNAL_MARK::KOPENAPI_JOURNAL_MARK()
+{
+    wxLog::FlushActive();
+    m_seq = KOPENAPI_JOURNAL::Summary()["last_seq"].get<uint64_t>();
+    m_operation = KOPENAPI_JOURNAL::Operation();
+}
+
+
+void KOPENAPI_JOURNAL_MARK::AddTo( nlohmann::json& aBody ) const
+{
+    wxLog::FlushActive();
+
+    for( const nlohmann::json& entry : KOPENAPI_JOURNAL::Entries( m_seq, 200, "warning" ) )
+    {
+        if( entry.value( "operation", std::string() ) != m_operation )
+            continue;
+
+        const char* key = entry["level"] == "warning" ? "warnings" : "load_errors";
+        aBody[key].push_back( entry["message"] );
+    }
+}

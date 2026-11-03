@@ -297,6 +297,14 @@ SCHEMATIC* EESCHEMA_HELPERS::LoadSchematic( const wxString& aFileName,
         return nullptr;
     }
 
+    // as the editor's load reports it (its infobar)
+    if( !pi->GetError().IsEmpty() )
+    {
+        wxLogError( _( "The entire schematic could not be loaded.  Errors occurred attempting to load "
+                       "hierarchical sheets. %s" ),
+                    wxString( pi->GetError() ).Trim().Trim( false ) );
+    }
+
     SCH_SHEET_LIST sheetList = schematic->BuildSheetListSortedByPageNumbers();
     SCH_SCREENS    screens( schematic->Root() );
 

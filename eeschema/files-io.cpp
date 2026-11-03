@@ -253,6 +253,12 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         // notify user that fullFileName does not exist, ask if user wants to create it.
         msg.Printf( _( "Schematic '%s' does not exist.  Do you wish to create it?" ), fullFileName );
 
+        if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+        {
+            wxLogError( _( "Schematic '%s' does not exist." ), fullFileName );
+            return false;
+        }
+
         if( !IsOK( this, msg ) )
             return false;
     }
@@ -352,7 +358,12 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
             // And when a schematic file is loaded, we need these libs to initialize
             // some parameters (links to PART LIB, dangling ends ...)
             Prj().SetElem( PROJECT::ELEM::LEGACY_SYMBOL_LIBS, nullptr );
-            PROJECT_SCH::LegacySchLibs( &Prj() );
+
+            wxString libErrors;
+            PROJECT_SCH::LegacySchLibs( &Prj(), &libErrors );
+
+            if( !libErrors.IsEmpty() )
+                showLoadProblem( this, _( "Symbol libraries could not be loaded." ), libErrors, wxICON_WARNING );
         }
     }
     else
@@ -706,8 +717,26 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
 
                 if( ( !cfg || !cfg->m_RescueNeverShow ) && !cacheExists )
                 {
-                    SCH_EDITOR_CONTROL* editor = m_toolManager->GetTool<SCH_EDITOR_CONTROL>();
-                    editor->RescueSymbolLibTableProject( false );
+                    if( KICAD_OPENAPI_SERVICE::NoModalUi() )
+                    {
+                        SYMBOL_LIB_TABLE_RESCUER rescuer( Prj(), &Schematic(), &GetCurrentSheet(),
+                                                          GetCanvas()->GetBackend() );
+                        rescuer.FindUniqueCandidates();
+
+                        if( rescuer.GetCandidateCount() )
+                        {
+                            showLoadProblem( this,
+                                             wxString::Format( _( "%zu symbols need a rescue." ),
+                                                               rescuer.GetCandidateCount() ),
+                                             _( "Tools > Rescue Symbols... (sch_rescue_symbols)." ),
+                                             wxICON_WARNING );
+                        }
+                    }
+                    else
+                    {
+                        SCH_EDITOR_CONTROL* editor = m_toolManager->GetTool<SCH_EDITOR_CONTROL>();
+                        editor->RescueSymbolLibTableProject( false );
+                    }
                 }
             }
 

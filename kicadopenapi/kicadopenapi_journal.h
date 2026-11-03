@@ -60,4 +60,20 @@ public:
     static void Clear();
 };
 
+
+/// @brief The journal from here on: what a load reported, for the API's load result
+class KICOMMON_API KOPENAPI_JOURNAL_MARK
+{
+public:
+    KOPENAPI_JOURNAL_MARK();
+
+    /// @brief The errors this operation recorded since the mark into aBody["load_errors"], the
+    /// warnings into aBody["warnings"] (their messages; nothing added when there are none)
+    void AddTo( nlohmann::json& aBody ) const;
+
+private:
+    uint64_t    m_seq;
+    std::string m_operation;
+};
+
 #endif
