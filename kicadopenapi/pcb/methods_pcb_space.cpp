@@ -2008,7 +2008,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
     std::vector<PORT>                  ports;
     std::map<GROUP_KEY, std::set<int>> toNets;
     std::map<GROUP_KEY, bool>          thtEnd;
-    std::set<int>                      seen;
+    std::set<long long>                seen;
 
     for( PAD* pad : a.fp->Pads() )
     {
@@ -2057,11 +2057,27 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         port.kind = bestOther ? "signal" : "local";
         port.toSide = towards( b.parts[port.to].centre );
 
-        if( seen.insert( code ).second )
+        // a net to several parts of other blocks (a bus to two chips) is in a group per far part: its order
+        // is to hold at each of them
+        std::vector<int> fars = { port.to };
+
+        for( size_t j = 0; j < b.parts.size() && bestOther; ++j )
         {
+            if( (int) j != anchor && (int) j != port.to && b.partBlock[j] != ownBlock
+                && std::find( b.parts[j].nets.begin(), b.parts[j].nets.end(), code ) != b.parts[j].nets.end() )
+            {
+                fars.push_back( (int) j );
+            }
+        }
+
+        for( int far : fars )
+        {
+            if( !seen.insert( code * 65536LL + far ).second )
+                continue;
+
             PAD* farPad = nullptr;
 
-            for( PAD* fp : b.parts[port.to].fp->Pads() )
+            for( PAD* fp : b.parts[far].fp->Pads() )
             {
                 if( fp->GetNetCode() == code && !fp->GetNumber().IsEmpty() )
                 {
@@ -2072,7 +2088,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
             if( farPad )
             {
-                const GROUP_KEY key{ port.to, port.side, padSideOf( padExtent( b.parts[port.to].fp ), farPad->GetPosition() ),
+                const GROUP_KEY key{ far, port.side, padSideOf( padExtent( b.parts[far].fp ), farPad->GetPosition() ),
                                      padLayer( farPad ) };
                 toNets[key].insert( code );
                 thtEnd[key] = thtEnd[key] || key.farLayer == "THT" || padLayer( pad ) == "THT";
@@ -3852,7 +3868,8 @@ KOPENAPI_REGISTER( "pcb_fanout_ports",
                    "half of its side), and the layer: pins whose order "
                    "matches their far end's stay on the pad's layer, the rest of a group (two or more nets to "
                    "one part; the longest run in order kept) change layer by a via; rails go to their plane. "
-                   "groups: per far part, side of the package and side and layer the nets arrive on (F, B, THT), the order "
+                   "groups: per far part (a net to several parts of other blocks, a bus to two chips, is in a group for each; "
+                   "moved by a via in any of them, it changes layer), side of the package and side and layer the nets arrive on (F, B, THT), the order "
                    "at both ends, crossings, the nets kept and moved (at a THT end the pin itself changes layer: "
                    "no via), "
                    "crossings_left (pairs that still cross after the vias: another side or the part mirrored, "
