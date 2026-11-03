@@ -89,13 +89,13 @@ bool GetTabularDataFromClipboard( std::vector<std::vector<wxString>>& aData );
 std::string GetClipboardUTF8();
 
 /**
- * Paste reads @p aText instead of the system clipboard (text only: no image, no table) until the
- * override is cleared with std::nullopt; an explicit paste text, e.g. from the API.
+ * The parameter of the paste action that pastes this text instead of the clipboard's content (the
+ * editors' PasteText); the system clipboard is neither read nor written.
  */
-void SetClipboardTextOverride( const std::optional<std::string>& aText );
-
-/// The text SetClipboardTextOverride set, if any
-std::optional<std::string> GetClipboardTextOverride();
+struct PASTE_TEXT
+{
+    std::string text;
+};
 
 /// A paste of @p aText as a text item asks first: a long one may be very slow
 bool IsLongPasteText( const std::string& aText );

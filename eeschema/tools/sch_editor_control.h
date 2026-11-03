@@ -78,6 +78,9 @@ public:
     /// Paste reads @p aText as schematic content; otherwise it pastes a text item
     static bool IsSchematicContent( SCHEMATIC& aSchematic, const std::string& aText );
 
+    /// Edit > Paste of @p aText instead of the clipboard's content; the clipboard is untouched
+    bool PasteText( const std::string& aText );
+
     /// The editor after a rescue: the library list, the links (@p aRelink), no undo, modified
     void ShowRescuedSymbols( bool aRelink );
 

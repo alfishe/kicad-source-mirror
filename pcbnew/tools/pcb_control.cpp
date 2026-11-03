@@ -1072,6 +1072,12 @@ bool PCB_CONTROL::IsBoardContent( const std::string& aText )
 }
 
 
+bool PCB_CONTROL::PasteText( const std::string& aText )
+{
+    return m_toolMgr->RunAction( ACTIONS::paste, PASTE_TEXT{ aText } );
+}
+
+
 int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
 {
     // The viewer frames cannot paste
@@ -1096,8 +1102,26 @@ int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
 
     BOARD_COMMIT commit( m_frame );
 
-    CLIPBOARD_IO pi;
-    BOARD_ITEM*  clipItem = pi.Parse();
+    std::optional<PASTE_TEXT> explicitText = aEvent.ParameterIf<PASTE_TEXT>();
+    BOARD_ITEM*               clipItem = nullptr;
+
+    if( explicitText )
+    {
+        try
+        {
+            PCB_IO_KICAD_SEXPR pi;
+            clipItem = pi.Parse( wxString::FromUTF8( explicitText->text ) );
+        }
+        catch( ... )
+        {
+            clipItem = nullptr;
+        }
+    }
+    else
+    {
+        CLIPBOARD_IO pi;
+        clipItem = pi.Parse();
+    }
 
     PCB_SELECTION_TOOL* selTool = m_toolMgr->GetTool<PCB_SELECTION_TOOL>();
 
@@ -1168,7 +1192,9 @@ int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
         // When the clipboard doesn't parse, create a PCB item with the clipboard contents
         std::vector<BOARD_ITEM*> newItems;
 
-        if( std::unique_ptr<wxBitmap> clipImg = GetImageFromClipboard() )
+        std::unique_ptr<wxBitmap> clipImg = explicitText ? nullptr : GetImageFromClipboard();
+
+        if( clipImg )
         {
             auto refImg = std::make_unique<PCB_REFERENCE_IMAGE>( m_frame->GetModel() );
 
@@ -1177,13 +1203,13 @@ int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
         }
         else
         {
-            const wxString clipText = GetClipboardUTF8();
+            const wxString clipText = wxString::FromUTF8( explicitText ? explicitText->text : GetClipboardUTF8() );
 
             if( clipText.empty() )
                 return 0;
 
             // If it wasn't content, then paste as a text object.  A long one is confirmed in the
-            // infobar (pcb_action confirm), and the confirmed text pasted by running Paste again.
+            // infobar (pcb_action confirm), and then this text is pasted.
             if( IsLongPasteText( clipText.ToStdString( wxConvUTF8 ) ) && !KICAD_OPENAPI_SERVICE::ConfirmPrompts()
                 && clipText != m_confirmedPasteText )
             {
@@ -1191,7 +1217,7 @@ int PCB_CONTROL::Paste( const TOOL_EVENT& aEvent )
                                               [this, clipText]()
                                               {
                                                   m_confirmedPasteText = clipText;
-                                                  m_toolMgr->RunAction( ACTIONS::paste );
+                                                  PasteText( clipText.ToStdString( wxConvUTF8 ) );
                                                   m_confirmedPasteText.clear();
                                               } );
                 return 0;

@@ -1,5 +1,5 @@
 /// @file methods_sch_paste.cpp
-/// @brief kicadopenapi sch_paste: Edit > Paste of an explicit text instead of the system clipboard.
+/// @brief kicadopenapi sch_paste: Edit > Paste of an explicit text; the system clipboard is untouched.
 ///
 /// The editor's own paste reads it (schematic content or a text item), so its checks are the same: a
 /// long text item is confirmed by confirm (the editor asks in its infobar).
@@ -16,7 +16,6 @@
 #include <sch_sheet_path.h>
 #include <sch_text.h>
 #include <schematic.h>
-#include <tool/actions.h>
 #include <tool/tool_manager.h>
 #include <tools/sch_editor_control.h>
 
@@ -48,12 +47,10 @@ static KOPENAPI_RESULT h_sch_paste( KOPENAPI_CONTEXT& aCtx, const nlohmann::json
         if( !frame )
             return KopenapiNoSchematic();
 
-        // the editor's Paste, reading this text: the pasted items follow the pointer to be placed
-        SetClipboardTextOverride( text );
+        // the editor's paste of this text: the pasted items follow the pointer to be placed
         KICAD_OPENAPI_SERVICE::SetConfirmPrompts( confirm );
-        const bool ran = frame->GetToolManager()->RunAction( ACTIONS::paste );
+        const bool ran = frame->GetToolManager()->GetTool<SCH_EDITOR_CONTROL>()->PasteText( text );
         KICAD_OPENAPI_SERVICE::SetConfirmPrompts( false );
-        SetClipboardTextOverride( std::nullopt );
 
         return KOPENAPI_RESULT::Ok( { { "pasted", content ? "content" : "text" },
                                       { "ran", ran },

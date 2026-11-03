@@ -38,7 +38,6 @@
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr_parser.h>
 #include <kicad_clipboard.h>
-#include <clipboard.h>
 #include <kidialog.h>
 #include <io/kicad/kicad_io_utils.h>
 
@@ -96,9 +95,6 @@ void CLIPBOARD_IO::clipboardWriter( const wxString& aData )
 
 wxString CLIPBOARD_IO::clipboardReader()
 {
-    if( std::optional<std::string> text = GetClipboardTextOverride() )
-        return wxString::FromUTF8( *text );
-
     wxLogNull doNotLog; // disable logging of failed clipboard actions
 
     auto clipboard = wxTheClipboard;

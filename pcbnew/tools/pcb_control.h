@@ -110,11 +110,14 @@ public:
     int ApplyDesignBlockLayout( const TOOL_EVENT& aEvent );
     int PlaceLinkedDesignBlock( const TOOL_EVENT& aEvent );
     int SaveToLinkedDesignBlock( const TOOL_EVENT& aEvent );
-    /// @param aAcceptQueries answer yes to the plugin's questions; otherwise the first one
-    ///                       stops the append and is asked in the infobar
     /// Paste reads @p aText as board content (items, a footprint); otherwise it pastes a text item
     static bool IsBoardContent( const std::string& aText );
 
+    /// Edit > Paste of @p aText instead of the clipboard's content; the clipboard is untouched
+    bool PasteText( const std::string& aText );
+
+    /// @param aAcceptQueries answer yes to the plugin's questions; otherwise the first one
+    ///                       stops the append and is asked in the infobar
     int AppendBoard( PCB_IO& pi, const wxString& fileName, DESIGN_BLOCK* aDesignBlock = nullptr,
                      BOARD_COMMIT* aCommit = nullptr, bool aSkipMove = false, bool aAcceptQueries = false );
     int UpdateMessagePanel( const TOOL_EVENT& aEvent );

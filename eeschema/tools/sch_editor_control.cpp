@@ -2297,11 +2297,18 @@ bool SCH_EDITOR_CONTROL::IsSchematicContent( SCHEMATIC& aSchematic, const std::s
 }
 
 
+bool SCH_EDITOR_CONTROL::PasteText( const std::string& aText )
+{
+    return m_toolMgr->RunAction( ACTIONS::paste, PASTE_TEXT{ aText } );
+}
+
+
 int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
 {
-    wxTextEntry* textEntry = dynamic_cast<wxTextEntry*>( wxWindow::FindFocus() );
+    std::optional<PASTE_TEXT> explicitText = aEvent.ParameterIf<PASTE_TEXT>();
+    wxTextEntry*              textEntry = dynamic_cast<wxTextEntry*>( wxWindow::FindFocus() );
 
-    if( textEntry )
+    if( textEntry && !explicitText )
     {
         textEntry->Paste();
         return 0;
@@ -2317,13 +2324,15 @@ int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
     // 1. application/kicad format (handled by GetClipboardUTF8 which checks this first)
     // 2. Text data that can be parsed as KiCad S-expressions
     // 3. Bitmap/image data (fallback only if no valid text content)
-    if( aEvent.IsAction( &ACTIONS::duplicate ) )
+    if( explicitText )
+        content = explicitText->text;
+    else if( aEvent.IsAction( &ACTIONS::duplicate ) )
         content = m_duplicateClipboard;
     else
         content = GetClipboardUTF8();
 
     // Only fall back to image data if there's no text content
-    if( content.empty() )
+    if( content.empty() && !explicitText )
     {
         std::unique_ptr<wxBitmap> clipImg = GetImageFromClipboard();
 
@@ -2337,6 +2346,9 @@ int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
 
         return 0;
     }
+
+    if( content.empty() )
+        return 0;
 
     if( aEvent.IsAction( &ACTIONS::duplicate ) )
         eventPos = getViewControls()->GetCursorPosition( false );
@@ -2356,16 +2368,16 @@ int SCH_EDITOR_CONTROL::Paste( const TOOL_EVENT& aEvent )
     {
         // If it wasn't schematic content, paste as a text object
         {
-            // a long text is confirmed in the infobar (sch_action confirm), then pasted by running
-            // Paste again
+            // a long text is confirmed in the infobar (sch_action confirm), then this text is
+            // pasted
             if( IsLongPasteText( content ) && !KICAD_OPENAPI_SERVICE::ConfirmPrompts()
                 && wxString::FromUTF8( content ) != m_confirmedPasteText )
             {
                 m_frame->ShowInfoBarQuestion( LongPasteQuestion(), _( "Paste Anyway" ),
-                                              [this, text = wxString::FromUTF8( content )]()
+                                              [this, content]()
                                               {
-                                                  m_confirmedPasteText = text;
-                                                  m_toolMgr->RunAction( ACTIONS::paste );
+                                                  m_confirmedPasteText = wxString::FromUTF8( content );
+                                                  PasteText( content );
                                                   m_confirmedPasteText.clear();
                                               } );
                 return 0;
