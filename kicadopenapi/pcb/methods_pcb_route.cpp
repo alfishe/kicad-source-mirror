@@ -17759,6 +17759,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
     std::map<PAD*, VIA_SPOT>                           viaSpots;
     std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> spotItems;
     std::vector<BOARD_CONNECTED_ITEM*>                 spotStaged;
+    std::map<PAD*, std::vector<BOARD_CONNECTED_ITEM*>> spotStagedOf;
 
     for( auto& [sideKey, list] : bySide )
     {
@@ -17972,6 +17973,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
                     for( auto& item : items )
                     {
                         spotStaged.push_back( item.get() );
+                        spotStagedOf[pad].push_back( item.get() );
                         spotItems.push_back( std::move( item ) );
                     }
 
@@ -18033,7 +18035,13 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
                 if( via )
                     fresh.push_back( via.get() );
 
-                const nlohmann::json violations = guard( aBoard, fresh, {}, zoneMode == "refill", &staged );
+                // a laid via keeps clear of the other pins' spots too (the vias their routes lay there)
+                std::vector<BOARD_CONNECTED_ITEM*> with = staged;
+
+                if( padVia )
+                    with.insert( with.end(), spotStaged.begin(), spotStaged.end() );
+
+                const nlohmann::json violations = guard( aBoard, fresh, {}, zoneMode == "refill", &with );
 
                 if( !violations.empty() )
                 {
@@ -18075,6 +18083,15 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
 
                 for( BOARD_CONNECTED_ITEM* item : fresh )
                     staged.push_back( item );
+
+                // the laid via replaces the pin's spot
+                if( auto it = spotStagedOf.find( pad ); padVia && it != spotStagedOf.end() )
+                {
+                    for( BOARD_CONNECTED_ITEM* item : it->second )
+                        spotStaged.erase( std::remove( spotStaged.begin(), spotStaged.end(), item ), spotStaged.end() );
+
+                    spotStagedOf.erase( it );
+                }
 
                 for( auto& leg : legs )
                 {
