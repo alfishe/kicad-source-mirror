@@ -9,6 +9,7 @@
 /// a placement matrix inside the outline, ratsnest cost).
 #include "kopenapi_pcb.h"
 #include "kopenapi_pcb_templates.h"
+#include "../kopenapi_support_roles.h"
 #include "rail_plan.h"
 #include <geometry/shape_segment.h>
 #include "pcb_escape_estimate.h"
@@ -328,6 +329,18 @@ bool henryValue( const FOOTPRINT* aFootprint )
         ++i;
 
     return i < text.size() && ( text[i] == 'H' || text[i] == 'h' );
+}
+
+
+static std::string supportRoleField( FOOTPRINT* aFootprint )
+{
+    PCB_FIELD* field = aFootprint->GetField( wxString( KOPENAPI_SUPPORT_ROLE_FIELD ) );
+
+    if( !field )
+        return std::string();
+
+    wxString text = field->GetText();
+    return str( text.Trim().Trim( false ).Lower() );
 }
 
 
@@ -4126,7 +4139,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         bool             decoupling = false;   // across two rails of the anchor
         double           farads = 1.0;
         bool             capacitor = false;
-        bool             bulk = false;          // a capacitor of 10 uF or more, or electrolytic (CP_ footprint)
+        bool             bulk = false;          // Support.Role bulk
         bool             inductor = false;      // a regulator's inductor at its switching pin
     };
 
@@ -4164,9 +4177,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         member.capacitor = faradsOf( part ).has_value() || prefix == "C";
         member.farads = faradsOf( part ).value_or( 1.0 );
-        member.bulk = member.capacitor
-                      && ( ( faradsOf( part ) && *faradsOf( part ) >= 10e-6 * ( 1 - 1e-9 ) )
-                           || str( part->GetFPID().GetLibItemName().wx_str() ).rfind( "CP_", 0 ) == 0 );
+        member.bulk = member.capacitor && supportRoleField( part ) == "bulk";
         member.inductor = !member.capacitor && ( henryValue( part ) || prefix == "L" );
         member.decoupling = member.ownNets == 0
                             && ( member.capacitor || member.inductor || prefix == "R" || prefix == "FB" );
@@ -5503,7 +5514,7 @@ std::optional<KOPENAPI_RESULT> addDecoupling( KOPENAPI_CONTEXT& aCtx, BOARD* aBo
 /// @brief Decoupling capacitors by supply pin: every C part across a supply rail and a ground goes to
 /// one part on that rail (more than two pads, connectors aside) - the one drawn nearest to it in the
 /// open schematic (on the board when none is open) that still has a supply pin group (adjacent pins
-/// of a rail count once) without one.  Capacitors of 1 uF and more are bulk: one per part and rail.
+/// of a rail count once) without one.  Capacitors with Support.Role bulk: one per part and rail.
 /// So a row of capacitors drawn for several ICs is split by count.  The anchor's share is appended
 /// to aParts; aNote lists it.
 void addDecouplingPerPin( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnchor, std::vector<FOOTPRINT*>& aParts,
@@ -5563,7 +5574,7 @@ void addDecouplingPerPin( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnc
         if( supply <= 0 || !rails.count( supply ) || !users.count( supply ) )
             continue;
 
-        caps.push_back( { fp, supply, faradsOf( fp ).value_or( 0.0 ) >= 1e-6 } );
+        caps.push_back( { fp, supply, supportRoleField( fp ) == "bulk" } );
     }
 
     auto padDistance = [&]( FOOTPRINT* aCap, FOOTPRINT* aUser, int aNet )
@@ -5668,8 +5679,8 @@ void addDecouplingPerPin( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, FOOTPRINT* aAnc
     }
 
     aNote = { { "chosen", chosen }, { "supply_pin_groups", groups }, { "by", drawn ? "schematic distance" : "board distance" },
-              { "rule", "one capacitor under 1 uF per supply pin group (adjacent pins of a rail count once) and one bulk "
-                        "capacitor per rail, each capacitor to the part on its rail nearest to it with a share left" } };
+              { "rule", "one decoupling capacitor per supply pin group (adjacent pins of a rail count once) and one bulk "
+                        "capacitor (Support.Role bulk) per rail, each capacitor to the part on its rail nearest to it with a share left" } };
 
     if( !spare.empty() )
         aNote["unassigned"] = spare;
@@ -7235,9 +7246,9 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "parts":{"type":"array","items":{"type":"string"}},
     "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
     "depth":{"type":"integer","description":"from_schematic: how far sch_subcircuit grows (default 2)"},
-    "decoupling":{"type":"string","enum":["per_pin","schematic"],"description":"add the anchor's decoupling capacitors: per_pin - each supply pin group of the anchor (adjacent pins of a rail count once) one capacitor under 1 uF of its rail plus one bulk per rail, the rail's capacitors split among the parts on it by count, each to the part drawn nearest to it (schematic if open, else board); schematic - C parts across two of its rails drawn nearest to it on its sheet, one per supply pin group (a guess). The answer's decoupling.chosen lists them"},
+    "decoupling":{"type":"string","enum":["per_pin","schematic"],"description":"add the anchor's decoupling capacitors: per_pin - each supply pin group of the anchor (adjacent pins of a rail count once) one decoupling capacitor of its rail plus one bulk (Support.Role bulk) per rail, the rail's capacitors split among the parts on it by count, each to the part drawn nearest to it (schematic if open, else board); schematic - C parts across two of its rails drawn nearest to it on its sheet, one per supply pin group (a guess). The answer's decoupling.chosen lists them"},
     "decap_max_mm":{"type":"number","description":"overrides the decoupling template's reach (pcb_templates_get: via_pitch + pad_to_pad by default): a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far; each row names its template and reach_mm"},
-    "bulk_max_mm":{"type":"number","description":"overrides the bulk template (a bulk capacitor - 10 uF or more, or electrolytic: a CP_ footprint; its row says bulk - serves the rail, not one pin): placed as near as the others, listed in decoupling_far only past this; by default never"},
+    "bulk_max_mm":{"type":"number","description":"overrides the bulk template (a bulk capacitor - Support.Role bulk, never a value threshold; its row says bulk - serves the rail, not one pin): placed as near as the others, listed in decoupling_far only past this; by default never"},
     "templates":{"type":"array","items":{"type":"object"},"description":"support-part templates for this call only (the call layer of pcb_templates_get)"},
     "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part whose ports plan lays lanes for the group's pins (pcb_fanout_ports lanes) gives those lanes instead of the escapes, and the way goes on from their ends (signal_ways: per corridor its lines, polyline_mm and width_mm); a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off. Given, it is also the length of the anchor's fine-pitch and pair pins' escapes the parts' own vias keep clear of; by default those run as pcb_stitch's do, past the anchor's courtyard by one via pitch (the rules' via + clearance)"},
     "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach: each supply pin gets a via spot just beyond its inner end, under the body, clear of the other nets' copper and spots by the clearance (else beyond its outer end, up to a via pitch past the pad; a neighbour pin's spot of the net is shared when this pin's own would sit closer than a via pitch, via + clearance, to it), and the cap's pad goes inward of the spot where there is room, else on any side of it, its other pads clear of every spot; the row gives via_spot_mm; default on for a fine-pitch anchor (the rules leave no track between its neighbour pads, or no two vias side by side), off otherwise; the row says side"},
