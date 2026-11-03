@@ -3158,7 +3158,15 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
         std::snprintf( hash, sizeof( hash ), "%016llx", (unsigned long long) fnv );
         profile.attemptList.push_back( { { "attempt", profile.attempts }, { "net", netName }, { "from", fromEnd }, { "to", toEnd },
                                          { "pass", profile.pass }, { "kind", kind }, { "routed", ok },
-                                         { "copper_hash", ok ? std::string( hash ) : std::string() } } );
+                                         { "copper_hash", ok ? std::string( hash ) : std::string() }, { "ms", ms } } );
+
+        if( !ok )
+        {
+            profile.attemptList.back()["reason"] = aOut.value( "reason", std::string( "-" ) );
+
+            if( aOut.contains( "stopped_at_mm" ) )
+                profile.attemptList.back()["stopped_at_mm"] = aOut["stopped_at_mm"];
+        }
     }
 
     if( !ok )
@@ -19970,7 +19978,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "could not start: pads, other nets' tracks / vias, rule areas barring tracks by rule_area name, uuid, layer), "
                    "totals (routed, length, vias, unrouted left), fronts (the ways out kept open, per part and kind - edge, inward, port, "
                    "port_via, bus_via: ref, kind, count (one per layer), pads; full: list, each front's pad, layer, way_out_mm, width_mm), "
-                   "attempt_list (every router try in order: attempt, net, from, to, pass, kind, routed, copper_hash - a hash of the "
+                   "attempt_list (every router try in order: attempt, net, from, to, pass, kind, routed, ms, a failed try's reason and stopped_at_mm, copper_hash - a hash of the "
                    "copper it laid, the same on every platform: two runs part at the first try whose hash differs) and "
                    "profile (attempts; clearance_lookups / rule_evaluations: the router's clearances past its caches and the design "
                    "rule evaluations they took; dead_legs_skipped / via_spots_blocked / via_spots_in_escapes / rip_ups_skipped / rip_ups_walled: tries not made; "
