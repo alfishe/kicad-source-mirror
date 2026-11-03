@@ -6859,6 +6859,46 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                        && aAttempt.contains( "stopped_at_mm" ) && !aAttempt.contains( "toward_mm" );
             };
 
+            // a through-hole end is on every layer: the route leaves it (or reaches it) on another
+            // layer itself, one via at the other end, no via beside the through-hole pin
+            auto through = []( BOARD_CONNECTED_ITEM* aEnd )
+            {
+                return aEnd->Type() == PCB_PAD_T && static_cast<PAD*>( aEnd )->GetAttribute() == PAD_ATTRIB::PTH;
+            };
+
+            for( PCB_LAYER_ID cross : layers )
+            {
+                const bool fromHere = through( way.from ) && cross != start;
+                const bool toHere = through( way.to ) && !fromHere && cross != start;
+
+                if( ok || ( !fromHere && !toHere ) )
+                    continue;
+
+                int budget = 9;
+
+                for( const VECTOR2I& v : fromHere ? ends : starts )
+                {
+                    if( ok || aTries >= maxTries || budget-- <= 0 || overTime() )
+                        break;
+
+                    ROUTE_REQUEST req{ way.from, way.to, way.toPos, fromHere ? cross : start, PNS::RM_Walkaround, dryRun, {} };
+                    req.fronts = &fronts;
+                    req.tried = keepTries ? &aJob.tried : nullptr;
+                    req.neckWidth = neckFor( way.from, way.to );
+                    req.pairTail = pairTail( way.to );
+                    req.vias = { { v, fromHere ? arrive : cross } };
+                    aAttempt = nlohmann::json::object();
+                    aTries++;
+                    ok = routeOne( *context, req, aAttempt, added );
+
+                    if( ok )
+                        noteInward( req, aAttempt );
+                }
+            }
+
+            if( ok )
+                break;
+
             // ends on different layers: one via, near the far end first (the start leaves on its
             // own layer), then near the start
             if( arrive != start )
