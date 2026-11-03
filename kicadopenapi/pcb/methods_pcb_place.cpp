@@ -8,6 +8,7 @@
 /// is none, connectors along the board edges, the rest by KiCad's own autoplacer (AR_AUTOPLACER:
 /// a placement matrix inside the outline, ratsnest cost).
 #include "kopenapi_pcb.h"
+#include "kopenapi_pcb_templates.h"
 #include "rail_plan.h"
 #include <geometry/shape_segment.h>
 #include "pcb_escape_estimate.h"
@@ -2469,6 +2470,8 @@ struct NEAR_OPTIONS
     PAD*                         mateTarget = nullptr;   ///< the mate's pin
     const std::vector<VIA_SPOT>* viaSpots = nullptr;   ///< vias to come, the part's pads kept clear of them
     const std::set<const FOOTPRINT*>* pending = nullptr;   ///< parts placed after this one: no obstacles
+    const KOPENAPI_TEMPLATES*    templates = nullptr;   ///< support-part templates (pcb_templates_get)
+    const std::map<int, std::string>* netRoles = nullptr;   ///< pcb_net_roles role per net code
 };
 
 struct NEAR_PLACEMENT
@@ -4057,6 +4060,26 @@ std::string pinSide( FOOTPRINT* aPart, PAD* aPad )
 }
 
 
+/// @brief pcb_net_roles' role per net code
+std::map<int, std::string> netRolesByCode( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard )
+{
+    std::map<int, std::string> out;
+
+    if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+    {
+        const KOPENAPI_RESULT r = roles->handler( aCtx, nlohmann::json::object() );
+
+        for( const nlohmann::json& row : r.body.value( "nets", nlohmann::json::array() ) )
+        {
+            if( NETINFO_ITEM* net = KopenapiFindNet( aBoard, row.value( "net", std::string() ) ) )
+                out[net->GetNetCode()] = row.value( "role", std::string() );
+        }
+    }
+
+    return out;
+}
+
+
 /// @brief Places the parts of a functional block around its main part: each next to the pad of the
 /// anchor it belongs to.  A part's pad goes to the anchor pad of its most specific shared net (the
 /// net with the fewest pads on the board); a part across two rails of the anchor (a decoupling
@@ -4609,8 +4632,78 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
     // series parts set beside their pair's other one in its search: their pin and pad
     std::map<FOOTPRINT*, std::pair<PAD*, PAD*>> besideMate;
 
+    // a decoupling member's reach from its template at its supply pin (decap_max_mm / bulk_max_mm when
+    // given); a geometry token that is only known once placed (the inductor's loop) leaves report_past
+    struct REACH
+    {
+        double      limitMm = 0;
+        double      reportMm = -1;   // < 0: never reported far
+        std::string key;
+        std::string role;
+    };
+
+    auto reachOf = [&]( const MEMBER& aMember ) -> REACH
+    {
+        REACH r;
+        r.role = aMember.bulk ? "bulk" : aMember.capacitor ? "decoupling" : "filter";
+
+        if( r.role == "bulk" ? aBulkMaxMm >= 0 : aDecapMaxMm >= 0 )
+        {
+            r.limitMm = r.role == "bulk" ? aBulkMaxMm : aDecapMaxMm;
+            r.reportMm = r.limitMm;
+            r.key = r.role == "bulk" ? "bulk_max_mm" : "decap_max_mm";
+            return r;
+        }
+
+        PAD* pin = anchorPads.count( aMember.nets.front() ) ? anchorPads[aMember.nets.front()].front() : nullptr;
+        std::string pinRole;
+
+        if( pin && aOptions.netRoles )
+        {
+            auto it = aOptions.netRoles->find( pin->GetNetCode() );
+            pinRole = it != aOptions.netRoles->end() ? it->second : std::string();
+        }
+
+        auto resolve = [&]( const std::string& aRole, std::optional<int>& aReach, std::optional<int>& aReport ) -> std::string
+        {
+            const nlohmann::json* tpl = aOptions.templates ? aOptions.templates->Find( pinRole, aRole ) : nullptr;
+
+            if( !tpl )
+                return std::string();
+
+            std::map<std::string, int> context;
+            nlohmann::json             terms = nlohmann::json::array();
+            std::string                error;
+            aReach = KopenapiTemplateDistance( aBoard, pin, aMember.part, tpl->value( "reach", std::string() ), context, terms, error );
+
+            if( aReach )
+                context["reach"] = *aReach;
+
+            const std::string past = tpl->value( "report_past", std::string( "reach" ) );
+            aReport = past == "never" ? std::nullopt
+                                      : KopenapiTemplateDistance( aBoard, pin, aMember.part, past, context, terms, error );
+            return tpl->value( "pin_role", std::string() ) + "/" + aRole;
+        };
+
+        std::optional<int> reach, report;
+        r.key = resolve( r.role, reach, report );
+        r.reportMm = report ? toMm( *report ) : -1;
+
+        // a reach known only from the layout (a bulk part's rail entry): the decoupling template's, until placed
+        if( !reach && !report && r.role != "decoupling" )
+        {
+            std::optional<int> unused;
+            resolve( "decoupling", reach, unused );
+        }
+
+        r.limitMm = reach ? toMm( *reach ) : report ? toMm( *report ) : 0;
+        return r;
+    };
+
     for( const MEMBER& member : members )
     {
+        const REACH  memberReach = member.decoupling ? reachOf( member ) : REACH();
+        const double decapMaxMm = memberReach.limitMm;
         const int net = member.nets.front();
         PAD*      target = nullptr;
         double    bestScore = std::numeric_limits<double>::max();
@@ -4747,7 +4840,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         }
 
         options.partHeight = heightOf( member.part );
-        options.corridorYieldMm = member.decoupling ? aDecapMaxMm : -1;
+        options.corridorYieldMm = member.decoupling ? decapMaxMm : -1;
 
         // a fine-pitch anchor (no track between its pads by the rules) keeps a ring for its fan-out, unless asked otherwise
         if( options.hostRingMm < 0 )
@@ -4777,7 +4870,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         }
 
         // a decoupling capacitor kept out by the ring: inside it when that brings it within reach
-        if( placement.ok && member.decoupling && placement.padDistanceMm > aDecapMaxMm && options.hostRingMm > 0 && !viaPad )
+        if( placement.ok && member.decoupling && placement.padDistanceMm > decapMaxMm && options.hostRingMm > 0 && !viaPad )
         {
             const VECTOR2I  pos = member.part->GetPosition();
             const EDA_ANGLE angle = member.part->GetOrientation();
@@ -4800,7 +4893,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
         // still out of reach: under the anchor on the other side, when that brings it within reach (a
         // cap, or a filter resistor; the inductor stays on the regulator's side)
         if( placement.ok && member.decoupling && ( member.capacitor || ( !member.inductor && member.part->Pads().size() == 2 ) )
-            && decapOtherSide && placement.padDistanceMm > aDecapMaxMm
+            && decapOtherSide && placement.padDistanceMm > decapMaxMm
             && !viaPad )
         {
             const VECTOR2I  pos = member.part->GetPosition();
@@ -4835,13 +4928,13 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
             NEAR_PLACEMENT flipped = placeNear( aBoard, member.part, target, under );
 
-            if( spot && ( !flipped.ok || flipped.padDistanceMm > aDecapMaxMm ) )
+            if( spot && ( !flipped.ok || flipped.padDistanceMm > decapMaxMm ) )
             {
                 under.direction = "auto";   // no room inward of the spot: on any side of it
                 flipped = placeNear( aBoard, member.part, target, under );
             }
 
-            if( flipped.ok && flipped.padDistanceMm <= aDecapMaxMm )
+            if( flipped.ok && flipped.padDistanceMm <= decapMaxMm )
             {
                 placement = flipped;
 
@@ -4867,7 +4960,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
         // still out of reach on either side (the inductor: always): in the old spots of the group's
         // parts yet to go (they move anyway)
-        if( placement.ok && member.decoupling && ( placement.padDistanceMm > aDecapMaxMm || member.inductor ) && !viaPad )
+        if( placement.ok && member.decoupling && ( placement.padDistanceMm > decapMaxMm || member.inductor ) && !viaPad )
         {
             const VECTOR2I             pos = member.part->GetPosition();
             const EDA_ANGLE            angle = member.part->GetOrientation();
@@ -4883,7 +4976,7 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
 
             // the inductor closes the switching loop: inside the ring and at the narrow gap whenever
             // that is closer
-            if( closer.ok && ( closer.padDistanceMm > aDecapMaxMm || member.inductor )
+            if( closer.ok && ( closer.padDistanceMm > decapMaxMm || member.inductor )
                 && ( free.hostRingMm > 0 || ( member.inductor && !free.gapGiven && ( free.channel || free.gapMm > 0.25 ) ) ) )
             {
                 const VECTOR2I  ringPos = member.part->GetPosition();
@@ -5011,10 +5104,13 @@ void placeGroup( BOARD* aBoard, BOARD_COMMIT& aCommit, FOOTPRINT* aAnchor, std::
             if( member.bulk )
                 row["bulk"] = true;
 
-            if( const double reach = member.bulk ? aBulkMaxMm : aDecapMaxMm; placement.padDistanceMm > reach )
+            row["template"] = memberReach.key;
+            row["reach_mm"] = std::round( memberReach.limitMm * 1000 ) / 1000;
+
+            if( memberReach.reportMm >= 0 && placement.padDistanceMm > memberReach.reportMm )
             {
                 farAway.push_back( { { "ref", row["ref"] }, { "target", row["target"] }, { "pad_distance_mm", row["pad_distance_mm"] },
-                                 { "decap_max_mm", reach } } );
+                                     { "decap_max_mm", memberReach.reportMm }, { "template", memberReach.key } } );
             }
         }
 
@@ -6582,8 +6678,13 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
         options.ownVias = &ownVias;
         options.escapeKeepMm = group.contains( "escape_keep_mm" ) ? escapeKeep : -1;
 
+        const KOPENAPI_TEMPLATES         templates = KopenapiLoadTemplates( board, group.value( "templates", nlohmann::json() ) );
+        const std::map<int, std::string> netRoles = netRolesByCode( aCtx, board );
+        options.templates = &templates;
+        options.netRoles = &netRoles;
+
         placeGroup( board, groupCommit, anchor, parts, options, group.value( "side", std::string( "same" ) ) == "opposite",
-                    group.value( "decap_max_mm", 3.0 ), group.value( "bulk_max_mm", 10.0 ),
+                    group.value( "decap_max_mm", -1.0 ), group.value( "bulk_max_mm", -1.0 ),
                     group.contains( "decap_bottom" ) ? std::optional<bool>( group.value( "decap_bottom", false ) ) : std::nullopt,
                     row, placed, group.value( "decap_vias", true ) );
 
@@ -6762,8 +6863,8 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
             return fail( KOPENAPI_RESULT::Error( 400, *wrong ) );
 
         const std::string side = spec.value( "side", std::string( "same" ) );
-        const double      decapMax = spec.value( "decap_max_mm", 3.0 );
-        const double      bulkMax = spec.value( "bulk_max_mm", 10.0 );
+        const double      decapMax = spec.value( "decap_max_mm", -1.0 );
+        const double      bulkMax = spec.value( "bulk_max_mm", -1.0 );
 
         if( side != "same" && side != "opposite" )
             return fail( KOPENAPI_RESULT::Error( 400, "side: same (as the anchor) or opposite (under it, on the other side of the board)" ) );
@@ -6812,9 +6913,13 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
             const std::map<int, int>    pairs = diffPairs( aCtx, board );
             std::map<const FOOTPRINT*, int> rooms;
             std::vector<VIA_SPOT>       ownVias;
+            const KOPENAPI_TEMPLATES    templates = KopenapiLoadTemplates( board, spec.value( "templates", nlohmann::json() ) );
+            const std::map<int, std::string> netRoles = netRolesByCode( aCtx, board );
 
             auto place = [&]( BOARD_COMMIT& aCommit, nlohmann::json& aOut, std::vector<KIID>& aMoved )
             {
+                options.templates = &templates;
+                options.netRoles = &netRoles;
                 corridors = escapeKeep > 0 ? signalCorridors( aCtx, board, escapeKeep, parts ) : std::vector<CORRIDOR>();
 
                 for( CORRIDOR& c : portCorridors( aCtx, board, anchor, portsKeep( spec ), spec.value( "open_sides", nlohmann::json() ), &pairs ) )
@@ -7131,8 +7236,9 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "from_schematic":{"type":"boolean","default":false,"description":"without parts: take the block's members from the open schematic (sch_subcircuit of the anchor)"},
     "depth":{"type":"integer","description":"from_schematic: how far sch_subcircuit grows (default 2)"},
     "decoupling":{"type":"string","enum":["per_pin","schematic"],"description":"add the anchor's decoupling capacitors: per_pin - each supply pin group of the anchor (adjacent pins of a rail count once) one capacitor under 1 uF of its rail plus one bulk per rail, the rail's capacitors split among the parts on it by count, each to the part drawn nearest to it (schematic if open, else board); schematic - C parts across two of its rails drawn nearest to it on its sheet, one per supply pin group (a guess). The answer's decoupling.chosen lists them"},
-    "decap_max_mm":{"type":"number","default":3,"description":"a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far"},
-    "bulk_max_mm":{"type":"number","default":10,"description":"a bulk capacitor (10 uF or more, or electrolytic: a CP_ footprint; its row says bulk) serves the rail, not one pin: placed as near as the others, it is listed in decoupling_far only past this"},
+    "decap_max_mm":{"type":"number","description":"overrides the decoupling template's reach (pcb_templates_get: via_pitch + pad_to_pad by default): a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far; each row names its template and reach_mm"},
+    "bulk_max_mm":{"type":"number","description":"overrides the bulk template (a bulk capacitor - 10 uF or more, or electrolytic: a CP_ footprint; its row says bulk - serves the rail, not one pin): placed as near as the others, listed in decoupling_far only past this; by default never"},
+    "templates":{"type":"array","items":{"type":"object"},"description":"support-part templates for this call only (the call layer of pcb_templates_get)"},
     "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part whose ports plan lays lanes for the group's pins (pcb_fanout_ports lanes) gives those lanes instead of the escapes, and the way goes on from their ends (signal_ways: per corridor its lines, polyline_mm and width_mm); a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off. Given, it is also the length of the anchor's fine-pitch and pair pins' escapes the parts' own vias keep clear of; by default those run as pcb_stitch's do, past the anchor's courtyard by one via pitch (the rules' via + clearance)"},
     "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach: each supply pin gets a via spot just beyond its inner end, under the body, clear of the other nets' copper and spots by the clearance (else beyond its outer end, up to a via pitch past the pad; a neighbour pin's spot of the net is shared when this pin's own would sit closer than a via pitch, via + clearance, to it), and the cap's pad goes inward of the spot where there is room, else on any side of it, its other pads clear of every spot; the row gives via_spot_mm; default on for a fine-pitch anchor (the rules leave no track between its neighbour pads, or no two vias side by side), off otherwise; the row says side"},
     "ports_keep_mm":{"type":"number","minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter; a differential pair's pins open their side's band whatever their port's kind). A series part - two pads, one signal net of the anchor's - never enters a band: it aims its pad at its pin's straight way out at the band's outer edge, so it stands just past the band in its pin's line. Default: each band as deep as its side's signal ports and pairs take fanning out side by side - each port's class track width + clearance summed, a differential pair once at 2 widths + its gap + a clearance; given: that many mm for every side; 0 off. No part yields to a band to come within reach (a decoupling capacitor goes to the other side or beside it); only a part with no spot at all outside the bands enters one (its row names it, in_corridor). Two alike series parts on neighbour pins the other way round than the pins trade places (swapped); corridors lists them as ports <side> (<far parts>), ports_bands gives their boxes"},
