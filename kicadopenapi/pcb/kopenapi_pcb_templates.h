@@ -5,9 +5,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <map>
+#include <optional>
 #include <string>
 
 class BOARD;
+class FOOTPRINT;
+class PAD;
 struct KOPENAPI_CONTEXT;
 
 /// @brief pcb_support_roles' answer: parts [{ref, role, source, pin_net, pin_role, ...}], unassigned, counts
@@ -35,3 +39,11 @@ std::string KopenapiTemplatesProjectFile( BOARD* aBoard );
 
 /// @brief Empty when the distance expression is valid, else why not
 std::string KopenapiTemplateExpressionError( const std::string& aExpr, bool aLiteralAllowed, bool aNeverAllowed );
+
+/// @brief A distance expression resolved at an anchor pin for a part, in IU.  The rule tokens (via_pitch,
+/// track_pitch, pad_to_pad, courtyard, escape) come from the board's rules; the geometry ones (ring, ports_band,
+/// loop, rail_entry, reach) from aContext.  aTerms gets {term, mm, from} per term; nullopt with aError when a
+/// token has no value here.
+std::optional<int> KopenapiTemplateDistance( BOARD* aBoard, const PAD* aPin, const FOOTPRINT* aPart,
+                                             const std::string& aExpr, const std::map<std::string, int>& aContext,
+                                             nlohmann::json& aTerms, std::string& aError );

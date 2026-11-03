@@ -7,7 +7,13 @@
 #include "kopenapi_pcb_templates.h"
 
 #include <api/pcb_context.h>
+#include <base_units.h>
 #include <board.h>
+#include <board_design_settings.h>
+#include <drc/drc_engine.h>
+#include <footprint.h>
+#include <netclass.h>
+#include <pad.h>
 #include <kicadopenapi_util.h>
 #include <kopenapi_support_roles.h>
 #include <paths.h>
@@ -143,6 +149,190 @@ std::string KopenapiTemplateExpressionError( const std::string& aExpr, bool aLit
     }
 
     return count ? std::string() : "an empty expression";
+}
+
+
+/// The terms of an expression: (multiple, token or "mm" for a literal, literal value in mm)
+struct TERM
+{
+    double      times = 1;
+    std::string token;
+    double      mm = 0;
+    std::string text;
+};
+
+
+static std::vector<TERM> termsOf( const std::string& aExpr )
+{
+    std::string text = aExpr;
+
+    for( const std::string times : { "\xC3\x97", "*" } )
+    {
+        for( size_t at = text.find( times ); at != std::string::npos; at = text.find( times ) )
+            text.replace( at, times.size(), " x " );
+    }
+
+    std::vector<TERM> out;
+    std::stringstream terms( text );
+
+    for( std::string term; std::getline( terms, term, '+' ); )
+    {
+        std::stringstream        words( trim( term ) );
+        std::vector<std::string> w;
+
+        for( std::string x; words >> x; )
+            w.push_back( x );
+
+        TERM t;
+        t.text = trim( term );
+
+        if( w.size() == 1 )
+            t.token = w[0];
+        else if( w.size() == 3 )
+        {
+            t.times = std::strtod( w[0].c_str(), nullptr );
+            t.token = w[2];
+        }
+        else if( w.size() == 2 )
+        {
+            t.token = "mm";
+            t.mm = std::strtod( w[0].c_str(), nullptr );
+        }
+
+        out.push_back( t );
+    }
+
+    return out;
+}
+
+
+std::optional<int> KopenapiTemplateDistance( BOARD* aBoard, const PAD* aPin, const FOOTPRINT* aPart,
+                                             const std::string& aExpr, const std::map<std::string, int>& aContext,
+                                             nlohmann::json& aTerms, std::string& aError )
+{
+    if( std::string e = KopenapiTemplateExpressionError( aExpr, true, false ); !e.empty() )
+    {
+        aError = e;
+        return std::nullopt;
+    }
+
+    BOARD_DESIGN_SETTINGS&      ds = aBoard->GetDesignSettings();
+    std::shared_ptr<DRC_ENGINE> drc = ds.m_DRCEngine;
+    NETCLASS*                   nc = aPin ? aPin->GetEffectiveNetClass() : nullptr;
+    const PCB_LAYER_ID          layer = aPin && aPin->IsOnLayer( B_Cu ) && !aPin->IsOnLayer( F_Cu ) ? B_Cu : F_Cu;
+    const int clearance = std::max( { ds.m_MinClearance, nc && nc->HasClearance() ? nc->GetClearance() : 0, 1 } );
+
+    const int dia = nc && nc->HasViaDiameter() ? nc->GetViaDiameter() : ds.GetCurrentViaSize();
+    const int drill = nc && nc->HasViaDrill() ? nc->GetViaDrill() : ds.GetCurrentViaDrill();
+    const int viaPitch = std::max( dia + clearance, drill + std::max( ds.m_HoleToHoleMin, 0 ) );
+
+    auto rule = [&]( const std::string& aToken, std::string& aFrom ) -> std::optional<int>
+    {
+        if( aToken == "via_pitch" )
+        {
+            aFrom = "via diameter + clearance (" + std::string( nc ? nc->GetName().ToUTF8() : "default" ) + ")";
+            return viaPitch;
+        }
+
+        if( aToken == "track_pitch" )
+        {
+            const int width = nc && nc->HasTrackWidth() ? nc->GetTrackWidth() : ds.GetCurrentTrackWidth();
+            aFrom = "track width + clearance";
+            return std::max( width, ds.m_TrackMinWidth ) + clearance;
+        }
+
+        if( aToken == "pad_to_pad" )
+        {
+            if( !aPart )
+                return std::nullopt;
+
+            int best = 0;
+
+            for( const PAD* a : aPart->Pads() )
+            {
+                for( const PAD* b : aPart->Pads() )
+                {
+                    const int d = KiROUND( ( a->GetPosition() - b->GetPosition() ).EuclideanNorm() );
+
+                    if( a != b && d > 0 && ( best == 0 || d < best ) )
+                        best = d;
+                }
+            }
+
+            aFrom = "the part's pad pitch";
+            return best > 0 ? std::optional<int>( best ) : std::nullopt;
+        }
+
+        if( aToken == "courtyard" )
+        {
+            int value = 0;
+
+            if( drc && aPart )
+            {
+                const DRC_CONSTRAINT c = drc->EvalRules( COURTYARD_CLEARANCE_CONSTRAINT, aPart, aPin ? aPin->GetParentFootprint() : nullptr, layer );
+
+                if( c.GetSeverity() != RPT_SEVERITY_IGNORE && c.GetValue().HasMin() )
+                    value = std::max( c.GetValue().Min(), 0 );
+            }
+
+            aFrom = "courtyard_clearance rule";
+            return value;
+        }
+
+        if( aToken == "escape" )
+        {
+            if( drc && aPin )
+            {
+                const DRC_CONSTRAINT c = drc->EvalRules( MAX_UNCOUPLED_CONSTRAINT, aPin, nullptr, layer );
+
+                if( c.GetSeverity() != RPT_SEVERITY_IGNORE && c.GetValue().HasMax() && c.GetValue().Max() > 0 )
+                {
+                    aFrom = "diff_pair_uncoupled rule";
+                    return c.GetValue().Max();
+                }
+            }
+
+            aFrom = "no uncoupled-length rule: via_pitch";
+            return viaPitch;
+        }
+
+        return std::nullopt;
+    };
+
+    int total = 0;
+
+    for( const TERM& t : termsOf( aExpr ) )
+    {
+        std::string        from;
+        std::optional<int> value;
+
+        if( t.token == "mm" )
+        {
+            value = pcbIUScale.mmToIU( t.mm );
+            from = "literal";
+        }
+        else if( auto it = aContext.find( t.token ); it != aContext.end() )
+        {
+            value = it->second;
+            from = "geometry";
+        }
+        else
+        {
+            value = rule( t.token, from );
+        }
+
+        if( !value )
+        {
+            aError = "'" + t.token + "' has no value here (" + aExpr + ")";
+            return std::nullopt;
+        }
+
+        const int v = KiROUND( t.times * *value );
+        aTerms.push_back( { { "term", t.text }, { "mm", pcbIUScale.IUTomm( v ) }, { "from", from } } );
+        total += v;
+    }
+
+    return total;
 }
 
 
@@ -415,6 +605,68 @@ static KOPENAPI_RESULT h_pcb_templates_get( KOPENAPI_CONTEXT& aCtx, const nlohma
     const KOPENAPI_TEMPLATES t = KopenapiLoadTemplates( board, aArgs.value( "templates", nlohmann::json() ) );
     nlohmann::json           body = { { "templates", t.templates }, { "files", t.files }, { "problems", t.problems } };
 
+    if( aArgs.contains( "resolve" ) && aArgs["resolve"].is_object() )
+    {
+        const std::string pinArg = aArgs["resolve"].value( "pin", std::string() );
+        const std::string partArg = aArgs["resolve"].value( "part", std::string() );
+        const size_t      dot = pinArg.find( '.' );
+        const PAD*        pin = nullptr;
+        const FOOTPRINT*  part = nullptr;
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            const std::string ref = str( fp->GetReference() );
+
+            if( ref == partArg )
+                part = fp;
+
+            if( dot != std::string::npos && ref == pinArg.substr( 0, dot ) )
+            {
+                for( PAD* pad : fp->Pads() )
+                {
+                    if( str( pad->GetNumber() ) == pinArg.substr( dot + 1 ) )
+                        pin = pad;
+                }
+            }
+        }
+
+        if( !pin || ( !partArg.empty() && !part ) )
+            return KOPENAPI_RESULT::Error( 404, "resolve: pin '" + pinArg + "' or part '" + partArg + "' not found" );
+
+        std::map<std::string, int> context;
+
+        const nlohmann::json geometry = aArgs["resolve"].value( "geometry", nlohmann::json::object() );
+
+        for( const auto& [token, mm] : geometry.items() )
+        {
+            if( mm.is_number() )
+                context[token] = pcbIUScale.mmToIU( mm.get<double>() );
+        }
+
+        for( nlohmann::json& tpl : body["templates"] )
+        {
+            for( const char* field : { "reach", "report_past" } )
+            {
+                const std::string expr = tpl.value( field, std::string() );
+
+                if( expr.empty() || expr == "never" )
+                    continue;
+
+                nlohmann::json     terms = nlohmann::json::array();
+                std::string        error;
+                std::optional<int> v = KopenapiTemplateDistance( board, pin, part, expr, context, terms, error );
+
+                if( v && std::string( field ) == "reach" )
+                    context["reach"] = *v;
+
+                tpl["resolved"][field] = v ? nlohmann::json( { { "mm", pcbIUScale.IUTomm( *v ) }, { "terms", terms } } )
+                                           : nlohmann::json( { { "error", error } } );
+            }
+
+            context.erase( "reach" );
+        }
+    }
+
     if( aArgs.value( "parts", true ) )
     {
         const nlohmann::json roles = KopenapiSupportRoles( aCtx, board, aArgs.value( "refs", std::string() ) );
@@ -574,6 +826,11 @@ KOPENAPI_REGISTER( "pcb_templates_get",
                                      { "properties",
                                        { { "templates", { { "type", "array" }, { "items", nlohmann::json::parse( TEMPLATE_ITEM ) } } },
                                          { "parts", { { "type", "boolean" }, { "default", true } } },
+                                         { "resolve", { { "type", "object" },
+                                                        { "description", "resolve reach / report_past at pin (REF.PAD) for part (REF): rule tokens from the board's rules, geometry tokens (ring, ports_band, loop, rail_entry) from geometry {token: mm}" },
+                                                        { "properties", { { "pin", { { "type", "string" } } },
+                                                                          { "part", { { "type", "string" } } },
+                                                                          { "geometry", { { "type", "object" } } } } } } },
                                          { "refs", { { "type", "string" }, { "description", "glob over references" } } } } } } ),
                    false, h_pcb_templates_get );
 
