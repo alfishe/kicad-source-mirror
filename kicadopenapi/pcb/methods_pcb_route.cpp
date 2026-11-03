@@ -7568,21 +7568,104 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
             }
 
-            // a moved pin with no spot from the fan-out: a via past the tips of its neighbours' ways out
+            nlohmann::json spotsOut = nlohmann::json::array();
+            nlohmann::json noSpot = nlohmann::json::array();
+
+            auto viaDiaOf = [&]( const PAD* aPad )
+            {
+                NETCLASS* netclass = aPad->GetEffectiveNetClass();
+                return netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
+            };
+
+            auto viaDrillOf = [&]( const PAD* aPad )
+            {
+                NETCLASS* netclass = aPad->GetEffectiveNetClass();
+                return netclass && netclass->HasViaDrill() ? netclass->GetViaDrill() : ds.GetCurrentViaDrill();
+            };
+
+            for( const auto& [pad, goal] : portGoals )
+            {
+                if( pad->GetParentFootprint() == fp && goal.via )
+                {
+                    spotsOut.push_back( { { "pad", str( fp->GetReference() ) + "." + str( pad->GetNumber() ) },
+                                          { "at_mm", { toMm( goal.via->x ), toMm( goal.via->y ) } }, { "from", "fan_out" } } );
+                }
+            }
+
+            // a moved pin with no spot from the fan-out: a via past the tips of its neighbours' ways out, as far
+            // out as keeps it a via and the rules' clearance from the other planned spots, off their ways out and
+            // clear of the board's copper; none: the route plans its own
             for( auto& [pad, goal] : portGoals )
             {
                 if( pad->GetParentFootprint() != fp || !goal.other || goal.via )
                     continue;
 
                 NETCLASS* netclass = pad->GetEffectiveNetClass();
-                const int clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0, 1 } );
-                const int dia = netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter() : ds.GetCurrentViaSize();
-                goal.via = goal.tip + goal.dir * ( goal.width / 2 + clearance + dia / 2 );
+                const int net = pad->GetNetCode();
+                const int dia = viaDiaOf( pad );
+                const int drill = viaDrillOf( pad );
+                const int clearance = std::max( { ds.m_MinClearance, netclass && netclass->HasClearance() ? netclass->GetClearance() : 0,
+                                                  KopenapiRuleVia( board, net, goal.tip, goal.layer ).clearance, 1 } );
+                const int first = goal.width / 2 + clearance + dia / 2;
+                const int step = ( dia + clearance ) / 2;
+
+                PCB_VIA probe( board );
+                probe.SetViaType( VIATYPE::THROUGH );
+                probe.SetLayerPair( F_Cu, B_Cu );
+                probe.SetWidth( PADSTACK::ALL_LAYERS, dia );
+                probe.SetDrill( drill );
+                probe.SetNet( pad->GetNet() );
+
+                auto clear = [&]( const VECTOR2I& aAt )
+                {
+                    for( const auto& [other, g] : portGoals )
+                    {
+                        if( other == pad || other->GetNetCode() == net )
+                            continue;
+
+                        const int keep = std::max( clearance, KopenapiRuleVia( board, net, aAt, goal.layer,
+                                                                              const_cast<PAD*>( other ) ).clearance );
+
+                        if( g.via )
+                        {
+                            const int apart = std::max( ( dia + viaDiaOf( other ) ) / 2 + keep,
+                                                        ( drill + viaDrillOf( other ) ) / 2 + ds.m_HoleToHoleMin );
+
+                            if( ( *g.via - aAt ).EuclideanNorm() < apart )
+                                return false;
+                        }
+
+                        if( SEG( g.start, g.via ? *g.via : g.tip ).Distance( aAt ) < dia / 2 + keep + g.width / 2 )
+                            return false;
+                    }
+
+                    probe.SetPosition( aAt );
+                    return guard( board, { &probe }, {}, zoneMode == "refill" ).empty();
+                };
+
+                for( int k = 0; k <= 4 && !goal.via; ++k )
+                {
+                    const VECTOR2I at = goal.tip + goal.dir * ( first + k * step );
+
+                    if( clear( at ) )
+                        goal.via = at;
+                }
+
+                const std::string name = str( fp->GetReference() ) + "." + str( pad->GetNumber() );
+
+                if( goal.via )
+                    spotsOut.push_back( { { "pad", name }, { "at_mm", { toMm( goal.via->x ), toMm( goal.via->y ) } }, { "from", "past_tips" } } );
+                else
+                    noSpot.push_back( name );
             }
 
             pkg["pins"] = planned;
             pkg["vias"] = viaNets.size();
             pkg["fan_spots"] = fanSpots;
+            pkg["spots"] = spotsOut;
+
+            if( !noSpot.empty() )
+                pkg["no_spot"] = noSpot;
             portsOut.push_back( pkg );
         }
     }
