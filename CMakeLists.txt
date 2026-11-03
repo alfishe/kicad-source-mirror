@@ -778,6 +778,15 @@ else()
 
     # RPATH settings for building shared libraries
     set( CMAKE_MACOSX_RPATH FALSE )
+
+    # The build tree's bundle libraries load by @rpath and every binary looks in its own bundle
+    # first: a copy of the bundle runs on its own libraries, never on those of the build it came from
+    set( CMAKE_BUILD_RPATH "@loader_path/../Frameworks;@executable_path/../Frameworks" )
+endif()
+
+if( UNIX AND NOT APPLE )
+    # build-tree RPATHs relative to $ORIGIN: a copy of the build runs on its own libraries
+    set( CMAKE_BUILD_RPATH_USE_ORIGIN ON )
 endif()
 
 mark_as_advanced( KICAD_BIN

@@ -48,7 +48,8 @@ if( APPLE )
     # puts library into the main kicad.app bundle in build tree
     set_target_properties( kicad_3dsg PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${OSX_BUNDLE_BUILD_LIB_DIR}"
-        INSTALL_NAME_DIR "${OSX_BUNDLE_BUILD_LIB_DIR}"
+        INSTALL_NAME_DIR "@rpath"
+        BUILD_WITH_INSTALL_NAME_DIR ON
     )
 endif()
 

@@ -98,7 +98,8 @@ target_include_directories( kicad_3d_import PRIVATE
 if( APPLE )
     set_target_properties( kicad_3d_import PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${OSX_BUNDLE_BUILD_LIB_DIR}"
-        INSTALL_NAME_DIR "${OSX_BUNDLE_BUILD_LIB_DIR}"
+        INSTALL_NAME_DIR "@rpath"
+        BUILD_WITH_INSTALL_NAME_DIR ON
     )
 endif()
 
