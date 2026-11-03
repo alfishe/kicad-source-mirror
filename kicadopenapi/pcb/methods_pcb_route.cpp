@@ -6264,10 +6264,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                         if( outward )
                         {
-                            const VECTOR2I near = t->Type() == PCB_VIA_T ? t->GetPosition()
-                                                                          : SEG( t->GetStart(), t->GetEnd() ).NearestPoint( at );
+                            const VECTOR2I closest = t->Type() == PCB_VIA_T ? t->GetPosition()
+                                                                             : SEG( t->GetStart(), t->GetEnd() ).NearestPoint( at );
 
-                            if( (int64_t) ( near - at ).x * outward->x + (int64_t) ( near - at ).y * outward->y < 0 )
+                            if( (int64_t) ( closest - at ).x * outward->x + (int64_t) ( closest - at ).y * outward->y < 0 )
                                 continue;
                         }
 
