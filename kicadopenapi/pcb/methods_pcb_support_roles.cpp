@@ -9,6 +9,7 @@
 #include <board.h>
 #include <footprint.h>
 #include <kicadopenapi_util.h>
+#include <kopenapi_support_roles.h>
 #include <netinfo.h>
 #include <pad.h>
 #include <pcb_field.h>
@@ -19,10 +20,6 @@
 #include <set>
 
 
-static const char* const ROLE_FIELD = "Support.Role";
-
-static const std::set<std::string> SUPPORT_ROLES = { "decoupling", "bulk", "filter", "inductor", "series", "pullup",
-                                                     "crystal", "crystal_load", "esd", "none" };
 
 
 static std::string str( const wxString& aText )
@@ -153,7 +150,7 @@ nlohmann::json KopenapiSupportRoles( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, cons
         p.fp = fp;
         p.ref = str( fp->GetReference() );
 
-        if( PCB_FIELD* f = fp->GetField( wxString( ROLE_FIELD ) ) )
+        if( PCB_FIELD* f = fp->GetField( wxString( KOPENAPI_SUPPORT_ROLE_FIELD ) ) )
         {
             wxString text = f->GetText();
             p.field = str( text.Trim().Trim( false ).Lower() );
@@ -217,7 +214,7 @@ nlohmann::json KopenapiSupportRoles( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, cons
 
         if( !p.field.empty() )
         {
-            if( !SUPPORT_ROLES.count( p.field ) )
+            if( !KopenapiSupportRoleValues().count( p.field ) )
             {
                 unassigned.push_back( { { "ref", p.ref }, { "reason", "unknown Support.Role '" + p.field + "'" } } );
                 continue;
