@@ -1410,6 +1410,7 @@ struct ROUTE_PROFILE
     std::map<std::string, TALLY> byPass;     ///< first pass, retry from both ends, rip-up
     std::string                  pass = "first";
     std::set<int>                shovedNets;   ///< nets of other copper a committed route moved
+    nlohmann::json               attemptList = nlohmann::json::array();   ///< every try: number, connection, pass, kind, routed, copper hash
 
     /// @brief Who laid a piece of copper: the pass, the job (>= 0) or gap (-2 - index), the attempt
     struct LAID
@@ -3083,6 +3084,15 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
                                          ? str( fromPad->GetParentFootprint()->GetReference() ) + "." + str( fromPad->GetNumber() )
                                          : std::string( "copper" );
     const bool     padToPad = aReq.from && aReq.from->Type() == PCB_PAD_T && aReq.to && aReq.to->Type() == PCB_PAD_T;
+    auto endName = []( const BOARD_ITEM* aEnd ) -> std::string
+    {
+        const PAD* pad = dynamic_cast<const PAD*>( aEnd );
+        return pad && pad->GetParentFootprint() ? str( pad->GetParentFootprint()->GetReference() ) + "." + str( pad->GetNumber() )
+               : aEnd ? std::string( "copper" ) : std::string();
+    };
+    const std::string fromEnd = endName( aReq.from );
+    const std::string toEnd = endName( aReq.to );
+    const std::string netName = aReq.from ? str( UnescapeString( aReq.from->GetNetname() ) ) : std::string();
     const int      fromNet = aReq.from ? aReq.from->GetNetCode() : 0;
     const VECTOR2I fromAt = aReq.from ? aReq.fromPos.value_or( aReq.from->GetPosition() ) : VECTOR2I();
     const bool   ok = aReq.exact ? layExact( aContext, aReq, aOut, aAdded ) : routeOneImpl( aContext, aReq, aOut, aAdded );
@@ -3118,6 +3128,37 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
         t->tries++;
         t->routed += ok;
         t->ms += ms;
+    }
+
+    // the try in the call's list: the copper it laid as a hash, two runs compare by it
+    {
+        std::vector<std::string> pieces;
+
+        for( size_t i = before; ok && i < aAdded.size(); ++i )
+        {
+            if( const BOARD_ITEM* item = aContext.GetBoard()->ResolveItem( aAdded[i], true ) )
+                pieces.push_back( copperKey( item ) );
+        }
+
+        if( ok && pieces.empty() && aOut.contains( "segments" ) )
+            pieces.push_back( aOut["segments"].dump() );
+
+        std::sort( pieces.begin(), pieces.end() );
+        std::string all;
+
+        for( const std::string& piece : pieces )
+            all += piece + ";";
+
+        uint64_t fnv = 1469598103934665603ULL;   // FNV-1a: the same on every platform
+
+        for( unsigned char c : all )
+            fnv = ( fnv ^ c ) * 1099511628211ULL;
+
+        char hash[17];
+        std::snprintf( hash, sizeof( hash ), "%016llx", (unsigned long long) fnv );
+        profile.attemptList.push_back( { { "attempt", profile.attempts }, { "net", netName }, { "from", fromEnd }, { "to", toEnd },
+                                         { "pass", profile.pass }, { "kind", kind }, { "routed", ok },
+                                         { "copper_hash", ok ? std::string( hash ) : std::string() } } );
     }
 
     if( !ok )
@@ -13866,8 +13907,29 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         for( const auto& [key, tally] : byPart )
             frontsOut.push_back( { { "ref", key.first }, { "kind", key.second }, { "count", tally.first }, { "pads", tally.second.size() } } );
 
+        // full: each front, where it runs
+        for( const ESCAPE_FRONT& front : cap.Full() ? fronts : std::vector<ESCAPE_FRONT>() )
+        {
+            const FOOTPRINT* fp = front.pad ? front.pad->GetParentFootprint() : nullptr;
+            const std::string ref = fp ? str( fp->GetReference() ) : std::string();
+
+            for( nlohmann::json& row : frontsOut )
+            {
+                if( row["ref"] != ref || row["kind"] != front.kind )
+                    continue;
+
+                const SEG& seg = front.shape.GetSeg();
+                row["list"].push_back( { { "pad", front.pad ? ref + "." + str( front.pad->GetNumber() ) : std::string() },
+                                         { "layer", str( board->GetLayerName( front.layer ) ) },
+                                         { "way_out_mm", { { toMm( seg.A.x ), toMm( seg.A.y ) }, { toMm( seg.B.x ), toMm( seg.B.y ) } } },
+                                         { "width_mm", toMm( front.shape.GetWidth() ) } } );
+            }
+        }
+
         cap.Put( answer, "fronts", std::move( frontsOut ) );
     }
+
+    cap.Put( answer, "attempt_list", std::move( profile.attemptList ) );
 
     if( profile.traceAttempt > 0 && profile.traceLast == profile.traceAttempt )
         answer["trace"] = profile.traces.empty() ? nlohmann::json::object() : std::move( profile.traces[0] );
@@ -19441,7 +19503,9 @@ KOPENAPI_REGISTER( "pcb_route",
                    "dia_mm, drill_mm), a failed row's blocked_by (what stands where it stopped or "
                    "could not start: pads, other nets' tracks / vias, rule areas barring tracks by rule_area name, uuid, layer), "
                    "totals (routed, length, vias, unrouted left), fronts (the ways out kept open, per part and kind - edge, inward, port, "
-                   "port_via, bus_via: ref, kind, count (one per layer), pads) and "
+                   "port_via, bus_via: ref, kind, count (one per layer), pads; full: list, each front's pad, layer, way_out_mm, width_mm), "
+                   "attempt_list (every router try in order: attempt, net, from, to, pass, kind, routed, copper_hash - a hash of the "
+                   "copper it laid, the same on every platform: two runs part at the first try whose hash differs) and "
                    "profile (attempts; clearance_lookups / rule_evaluations: the router's clearances past its caches and the design "
                    "rule evaluations they took; dead_legs_skipped / via_spots_blocked / via_spots_in_escapes / rip_ups_skipped / rip_ups_walled: tries not made; "
                    "rip_ups_planned: rip-ups whose routes a plan chose; rip_ups_second: routes taken out that had no way back "
