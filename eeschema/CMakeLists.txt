@@ -458,6 +458,7 @@ set( EESCHEMA_SRCS
     sch_design_block_utils.cpp
     eeschema_config.cpp
     eeschema_helpers.cpp
+    sch_autosave_recovery.cpp
     eeschema_jobs_handler.cpp
     eeschema_settings.cpp
     symbol_fields_data_model.cpp

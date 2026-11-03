@@ -277,19 +277,6 @@ static nlohmann::json repairJson( const BOARD_REPAIR_RESULT& aResult, bool aDryR
 }
 
 
-static nlohmann::json autosaveJson( const AUTOSAVE_FILE_INFO& aInfo )
-{
-    auto stamp = []( const wxDateTime& aTime ) -> nlohmann::json
-    {
-        return aTime.IsValid() ? nlohmann::json( utf8( aTime.FormatISOCombined( ' ' ) ) ) : nlohmann::json();
-    };
-
-    return { { "path", utf8( aInfo.autosavePath ) }, { "source", utf8( aInfo.sourcePath ) },
-             { "time", stamp( aInfo.autosaveTime ) }, { "source_time", stamp( aInfo.sourceTime ) },
-             { "newer", aInfo.newer } };
-}
-
-
 /// @brief The board's auto-saved copies newer than its file (the ones the editor offers on open)
 static nlohmann::json newerAutosaves( KOPENAPI_CONTEXT& aCtx )
 {
@@ -302,7 +289,7 @@ static nlohmann::json newerAutosaves( KOPENAPI_CONTEXT& aCtx )
     for( const AUTOSAVE_FILE_INFO& info : FindBoardAutosaves( aCtx.kiway->LocalHistory(), *context->GetBoard() ) )
     {
         if( info.newer )
-            out.push_back( autosaveJson( info ) );
+            out.push_back( KopenapiAutosaveJson( info ) );
     }
 
     return out;
@@ -899,7 +886,7 @@ static KOPENAPI_RESULT h_pcb_autosave_list( KOPENAPI_CONTEXT& aCtx, const nlohma
     nlohmann::json list = nlohmann::json::array();
 
     for( const AUTOSAVE_FILE_INFO& info : FindBoardAutosaves( aCtx.kiway->LocalHistory(), *context->GetBoard() ) )
-        list.push_back( autosaveJson( info ) );
+        list.push_back( KopenapiAutosaveJson( info ) );
 
     const COMMON_SETTINGS* cs = Pgm().GetCommonSettings();
 
@@ -965,7 +952,7 @@ static KOPENAPI_RESULT h_pcb_autosave( KOPENAPI_CONTEXT& aCtx, const nlohmann::j
     nlohmann::json used = nlohmann::json::array();
 
     for( const AUTOSAVE_FILE_INFO& info : chosen )
-        used.push_back( autosaveJson( info ) );
+        used.push_back( KopenapiAutosaveJson( info ) );
 
     if( action == "rescue" )
     {

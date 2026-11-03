@@ -70,6 +70,7 @@
 #include <tool/actions.h>
 #include <tool/tool_manager.h>
 #include <tools/sch_actions.h>
+#include <sch_autosave_recovery.h>
 #include <tools/sch_editor_control.h>
 #include <tools/sch_navigate_tool.h>
 #include <trace_helpers.h>
@@ -105,6 +106,34 @@ bool SCH_EDIT_FRAME::ReloadCurrentDocument()
     if( fn.GetFullPath().IsEmpty() || !wxFileExists( fn.GetFullPath() ) )
         return false;
 
+    prepareReload();
+    return OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+}
+
+
+bool SCH_EDIT_FRAME::LoadSchematicContentFrom( const wxString& aRootCopy )
+{
+    wxFileName fn = Prj().AbsolutePath( Schematic().GetFileName() );
+
+    if( fn.GetFullPath().IsEmpty() || !wxFileExists( aRootCopy ) )
+        return false;
+
+    prepareReload();
+
+    m_loadContentFrom = aRootCopy;
+    bool ok = OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+    m_loadContentFrom.clear();
+
+    if( !ok )
+        return false;
+
+    OnModify();
+    return true;
+}
+
+
+void SCH_EDIT_FRAME::prepareReload()
+{
     if( GetCurrentSheet().Last() != &Schematic().Root() )
     {
         SCH_SHEET_PATH rootSheetPath = Schematic().Hierarchy().at( 0 );
@@ -127,7 +156,6 @@ bool SCH_EDIT_FRAME::ReloadCurrentDocument()
         screen->SetContentModified( false );
 
     ReleaseFile();
-    return OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
 }
 
 
@@ -151,6 +179,10 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
 
     wxString   fullFileName( aFileSet[0] );
     wxFileName wx_filename( fullFileName );
+
+    // LoadSchematicContentFrom: the sheets are read from this copy, kept under the files' names
+    const wxString contentFileName = m_loadContentFrom.IsEmpty() ? fullFileName : m_loadContentFrom;
+    const wxString contentDir = wxFileName( contentFileName ).GetPath();
 
     // We insist on caller sending us an absolute path, if it does not, we say it's a bug.
     wxASSERT_MSG( wx_filename.IsAbsolute(), wxS( "Path is not absolute!" ) );
@@ -184,7 +216,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
     wxFileName pro = fullFileName;
     pro.SetExt( FILEEXT::ProjectFileExtension );
 
-    bool is_new = !wxFileName::IsFileReadable( fullFileName );
+    bool is_new = !wxFileName::IsFileReadable( contentFileName );
 
     // If its a non-existent schematic and caller thinks it exists
     if( is_new && !( aCtl & KICTL_CREATE ) )
@@ -257,13 +289,13 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
 
     // Crash-recovery: when zip-format autosave is active, look for autosave files newer
     // than the saved schematic and offer to recover them before any sheet is loaded.
-    if( !is_new )
+    if( !is_new && m_loadContentFrom.IsEmpty() )
         CheckForAutosaveFiles( wx_filename.GetPath(), { FILEEXT::KiCadSchematicFileExtension } );
 
     // Start a new schematic object now that we sorted out our project
     std::unique_ptr<SCHEMATIC> newSchematic = std::make_unique<SCHEMATIC>( &Prj() );
 
-    SCH_IO_MGR::SCH_FILE_T schFileType = SCH_IO_MGR::GuessPluginTypeFromSchPath( fullFileName, aCtl );
+    SCH_IO_MGR::SCH_FILE_T schFileType = SCH_IO_MGR::GuessPluginTypeFromSchPath( contentFileName, aCtl );
 
     bool isNonKicadImport = schFileType != SCH_IO_MGR::SCH_KICAD
                             && schFileType != SCH_IO_MGR::SCH_LEGACY
@@ -364,7 +396,8 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
                     // Load each top-level sheet
                     for( const TOP_LEVEL_SHEET_INFO& sheetInfo : topLevelSheets )
                     {
-                        wxFileName sheetFileName( Prj().GetProjectPath(), sheetInfo.filename );
+                        wxFileName sheetFileName( m_loadContentFrom.IsEmpty() ? Prj().GetProjectPath() : contentDir,
+                                                  sheetInfo.filename );
 
                         // When loading legacy schematic files, ensure we are referencing the correct extension
                         if( schFileType == SCH_IO_MGR::SCH_LEGACY )
@@ -411,7 +444,7 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
                 else
                 {
                     // Legacy single-root format: Load the single root sheet
-                    SCH_SHEET* rootSheet = pi->LoadSchematicFile( fullFileName, newSchematic.get() );
+                    SCH_SHEET* rootSheet = pi->LoadSchematicFile( contentFileName, newSchematic.get() );
 
                     if( rootSheet )
                     {
@@ -474,6 +507,9 @@ bool SCH_EDIT_FRAME::OpenProjectFiles( const std::vector<wxString>& aFileSet, in
         }
 
         SetSchematic( newSchematic.release() );
+
+        if( !failedLoad && !m_loadContentFrom.IsEmpty() )
+            RetargetSchematicFiles( Schematic(), contentDir, wx_filename.GetPath(), true );
 
         // This fixes a focus issue after the progress reporter is done on GTK.  It shouldn't
         // cause any issues on macOS and Windows.  If it does, it will have to be conditionally

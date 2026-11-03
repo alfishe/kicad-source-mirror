@@ -507,6 +507,14 @@ public:
 
     bool ReloadCurrentDocument() override;
 
+    /**
+     * Replace the schematic by the content of a copy of its sheet files (StageSchematicAutosaves),
+     * kept under the schematic's own file names and marked unsaved; unsaved changes are dropped
+     * without asking.
+     * @param aRootCopy the root sheet's copy; the other sheets beside it as in the schematic.
+     */
+    bool LoadSchematicContentFrom( const wxString& aRootCopy );
+
     bool CanAcceptApiCommands() override;
 
     /**
@@ -1131,6 +1139,9 @@ private:
     // functions of the editor frame.
     friend class SCH_EDITOR_CONTROL;
 
+    /// Drop the open schematic ahead of loading its files again.
+    void prepareReload();
+
     enum
     {
         ID_NET_NAVIGATOR_EXPAND_ALL = wxID_HIGHEST + 400,
@@ -1143,6 +1154,7 @@ private:
     void subscribeConnectivity();
     SCH_CONNECTIVITY::SUBSCRIPTION m_connectivitySubscription;
     SCHEMATIC*                  m_schematic;          ///< The currently loaded schematic
+    wxString                    m_loadContentFrom;    ///< See LoadSchematicContentFrom.
     wxString                    m_highlightedConn;    ///< The highlighted net or bus or empty string.
     wxString                    m_highlightedNetChain;
 

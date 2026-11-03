@@ -15,6 +15,9 @@
 #include <api/sch_api_save.h>
 #include <api/sch_context.h>
 #include <eeschema_helpers.h>
+#include <local_history.h>
+#include <sch_autosave_recovery.h>
+#include <settings/common_settings.h>
 #include <kiway.h>
 #include <tool/tool_manager.h>
 #include <tool/actions.h>
@@ -311,6 +314,25 @@ static KOPENAPI_RESULT openGui( KOPENAPI_CONTEXT& aCtx, const wxFileName& aSchem
 }
 
 
+/// @brief The schematic's auto-saved copies newer than their files (the ones the editor offers on open)
+static nlohmann::json newerAutosaves( KOPENAPI_CONTEXT& aCtx )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+    nlohmann::json               out = nlohmann::json::array();
+
+    if( !context || !context->GetSchematic() || !aCtx.kiway )
+        return out;
+
+    for( const AUTOSAVE_FILE_INFO& info : FindSchematicAutosaves( aCtx.kiway->LocalHistory(), *context->GetSchematic() ) )
+    {
+        if( info.newer )
+            out.push_back( KopenapiAutosaveJson( info ) );
+    }
+
+    return out;
+}
+
+
 static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     KOPENAPI_HISTORY::Get().Reset( "sch", "sch_open" );   // earlier marks belong to another document state
@@ -356,16 +378,29 @@ static KOPENAPI_RESULT h_sch_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         }
     }
 
+    KOPENAPI_RESULT result;
+
     if( aCtx.headless )
-        return openHeadless( aCtx, schematic, aArgs );
+    {
+        result = openHeadless( aCtx, schematic, aArgs );
+    }
+    else
+    {
+        // a file another process has open: opened only when asked (no modal question)
+        KICAD_OPENAPI_SERVICE::SetOverrideLock( aArgs.value( "override_lock", false ) );
+        result = openGui( aCtx, schematic );
+        KICAD_OPENAPI_SERVICE::SetOverrideLock( false );
 
-    // a file another process has open: opened only when asked (no modal question)
-    KICAD_OPENAPI_SERVICE::SetOverrideLock( aArgs.value( "override_lock", false ) );
-    KOPENAPI_RESULT result = openGui( aCtx, schematic );
-    KICAD_OPENAPI_SERVICE::SetOverrideLock( false );
+        if( result.status != 200 )
+            result.body["hint"] = "another process may have the file open (errors: journal); override_lock: true opens it anyway";
+    }
 
-    if( result.status != 200 )
-        result.body["hint"] = "another process may have the file open (errors: journal); override_lock: true opens it anyway";
+    // the editor offers these in its infobar
+    if( result.status == 200 )
+    {
+        if( nlohmann::json newer = newerAutosaves( aCtx ); !newer.empty() )
+            result.body["autosaves"] = newer;
+    }
 
     return result;
 }
@@ -659,14 +694,15 @@ static KOPENAPI_RESULT h_sch_revert( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
 // ---- edit history (kicadopenapi_history.h) --------------------------------------------------
 
-/// @brief Headless: load the copy written into aDir as the open schematic, under its own paths, unsaved
-static bool restoreHeadless( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
+/// @brief Headless: load a copy of the schematic's files (root sheet aRootCopy, the other sheets
+/// beside it as in the schematic) as the open schematic, under its own paths, unsaved
+static bool loadHeadlessContent( KOPENAPI_CONTEXT& aCtx, const wxString& aRootCopy )
 {
     if( !s_headless || !s_schematic )
         return false;
 
     const wxFileName original( s_schematic->GetFileName() );
-    const wxFileName copy( wxString::FromUTF8( aDir ), original.GetFullName() );
+    const wxFileName copy( aRootCopy );
     PROJECT*         project = &s_headless->Prj();
     SCHEMATIC*       loaded = nullptr;
 
@@ -689,27 +725,219 @@ static bool restoreHeadless( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
         return false;
     }
 
-    // Every sheet file back under the document's own directory, all of them unsaved
-    SCH_SCREENS screens( loaded->Root() );
-
-    for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
-    {
-        // the virtual root's screen has no file
-        if( screen->GetFileName().IsEmpty() )
-            continue;
-
-        wxFileName fn( screen->GetFileName() );
-        fn.MakeRelativeTo( copy.GetPath() );
-        fn.MakeAbsolute( original.GetPath() );
-        screen->SetFileName( fn.GetFullPath() );
-        screen->SetContentModified( true );
-    }
+    RetargetSchematicFiles( *loaded, copy.GetPath(), original.GetPath(), true );
 
     s_headless.reset();
     delete s_schematic;
     s_schematic = loaded;
     s_headless = std::make_shared<HEADLESS_SCH_CONTEXT>( &s_schematic, project, aCtx.kiway );
     return true;
+}
+
+
+/// @brief Headless: load the copy written into aDir as the open schematic, under its own paths, unsaved
+static bool restoreHeadless( KOPENAPI_CONTEXT& aCtx, const std::string& aDir )
+{
+    if( !s_schematic )
+        return false;
+
+    const wxFileName copy( wxString::FromUTF8( aDir ), wxFileName( s_schematic->GetFileName() ).GetFullName() );
+    return loadHeadlessContent( aCtx, copy.GetFullPath() );
+}
+
+
+// ---- auto-saved copies ----------------------------------------------------------------------
+
+static KOPENAPI_RESULT h_sch_autosave_list( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context || !context->GetSchematic() )
+        return KopenapiNoSchematic();
+
+    if( !aCtx.kiway )
+        return KOPENAPI_RESULT::Error( 409, "autosave files are not available in this host" );
+
+    nlohmann::json list = nlohmann::json::array();
+
+    for( const AUTOSAVE_FILE_INFO& info : FindSchematicAutosaves( aCtx.kiway->LocalHistory(), *context->GetSchematic() ) )
+        list.push_back( KopenapiAutosaveJson( info ) );
+
+    const COMMON_SETTINGS* cs = Pgm().GetCommonSettings();
+
+    return KOPENAPI_RESULT::Ok(
+            { { "autosaves", list },
+              { "enabled", cs->m_Backup.enabled },
+              { "format", cs->m_Backup.format == BACKUP_FORMAT::ZIP ? "zip" : "incremental" },
+              { "location", cs->m_Backup.location == BACKUP_LOCATION::USER_DIR ? "user_dir" : "project_dir" },
+              { "writes_autosave_files", cs->m_Backup.enabled && !cs->AutosaveUsesLocalHistory() } } );
+}
+
+
+/// @brief Rescue: the sheets' copies replace the open schematic under its own file names, unsaved
+static bool rescueSchematic( KOPENAPI_CONTEXT& aCtx, const std::vector<AUTOSAVE_FILE_INFO>& aChosen,
+                             std::string& aError )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+    const wxString               dir = MakeSchematicStagingDir();
+    wxString                     error;
+
+    if( dir.IsEmpty() )
+    {
+        aError = "no temporary directory for the copies";
+        return false;
+    }
+
+    const wxString root = StageSchematicAutosaves( *context->GetSchematic(), aChosen, dir, error );
+    bool           ok = false;
+
+    if( root.IsEmpty() )
+    {
+        aError = std::string( error.utf8_str() );
+    }
+    else if( aCtx.headless )
+    {
+        ok = loadHeadlessContent( aCtx, root );
+    }
+    else if( SCH_EDIT_FRAME* frame = guiFrame( aCtx, false ) )
+    {
+        ok = frame->LoadSchematicContentFrom( root );
+    }
+
+    if( !ok && aError.empty() )
+        aError = "the auto-saved copies could not be loaded";
+
+    wxFileName::Rmdir( dir, wxPATH_RMDIR_RECURSIVE );
+    return ok;
+}
+
+
+/// Rescue and the choices of the editor's autosave infobar on open (EDA_BASE_FRAME::RecoverAutosaveFiles),
+/// on the schematic's auto-saved copies
+static KOPENAPI_RESULT h_sch_autosave( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    std::shared_ptr<SCH_CONTEXT> context = KopenapiSchContext( aCtx );
+
+    if( !context || !context->GetSchematic() )
+        return KopenapiNoSchematic();
+
+    if( !aCtx.kiway )
+        return KOPENAPI_RESULT::Error( 409, "autosave files are not available in this host" );
+
+    const std::string action = aArgs.value( "action", std::string() );
+
+    if( action != "rescue" && action != "restore" && action != "keep_both" && action != "discard" )
+        return KOPENAPI_RESULT::Error( 400, "action: rescue, restore, keep_both or discard" );
+
+    std::vector<AUTOSAVE_FILE_INFO> all = FindSchematicAutosaves( aCtx.kiway->LocalHistory(), *context->GetSchematic() );
+    std::vector<AUTOSAVE_FILE_INFO> chosen;
+
+    if( aArgs.contains( "path" ) )
+    {
+        const wxFileName want( wxString::FromUTF8( aArgs.value( "path", std::string() ) ) );
+
+        for( const AUTOSAVE_FILE_INFO& info : all )
+        {
+            if( wxFileName( info.autosavePath ).SameAs( want ) )
+                chosen.push_back( info );
+        }
+
+        if( chosen.empty() )
+            return KOPENAPI_RESULT::Error( 404, "path: not an auto-saved copy of this schematic (sch_autosave_list)" );
+    }
+    else if( action == "rescue" )
+    {
+        // the newest copy of each sheet file
+        std::set<wxString> sources;
+
+        for( const AUTOSAVE_FILE_INFO& info : all )
+        {
+            if( sources.insert( wxFileName( info.sourcePath ).GetFullPath() ).second )
+                chosen.push_back( info );
+        }
+    }
+    else if( action == "discard" )
+    {
+        chosen = all;
+    }
+    else
+    {
+        for( const AUTOSAVE_FILE_INFO& info : all )
+        {
+            if( info.newer )
+                chosen.push_back( info );
+        }
+    }
+
+    if( chosen.empty() )
+        return KOPENAPI_RESULT::Error( 404, "no auto-saved copy of this schematic" + std::string( action == "rescue" || action == "discard" ? "" : " newer than its files" ) + " (sch_autosave_list)" );
+
+    const bool replaces = action == "rescue" || action == "restore";
+
+    if( replaces && isModified( *context ) && !aArgs.value( "discard", false ) )
+        return KOPENAPI_RESULT::Error( 409, "the schematic has unsaved changes, which " + action + " drops; sch_save, or pass discard: true" );
+
+    nlohmann::json used = nlohmann::json::array();
+
+    for( const AUTOSAVE_FILE_INFO& info : chosen )
+        used.push_back( KopenapiAutosaveJson( info ) );
+
+    if( action == "rescue" )
+    {
+        KOPENAPI_HISTORY::Get().Reset( "sch", "sch_autosave" );   // another document state
+
+        std::string error;
+
+        if( !rescueSchematic( aCtx, chosen, error ) )
+            return KOPENAPI_RESULT::Error( 422, error );
+
+        nlohmann::json out = documentStatus( aCtx );
+        out["action"] = action;
+        out["autosaves"] = used;
+        return KOPENAPI_RESULT::Ok( out );
+    }
+
+    AUTOSAVE_RECOVERY_CHOICE choice = action == "restore"     ? AUTOSAVE_RECOVERY_CHOICE::RESTORE
+                                      : action == "keep_both" ? AUTOSAVE_RECOVERY_CHOICE::KEEP_BOTH
+                                                              : AUTOSAVE_RECOVERY_CHOICE::KEEP_CURRENT;
+
+    std::vector<std::pair<wxString, wxString>> pairs;
+
+    for( const AUTOSAVE_FILE_INFO& info : chosen )
+        pairs.emplace_back( info.autosavePath, info.sourcePath );
+
+    std::vector<wxString> written;
+    const wxString        errors = LOCAL_HISTORY::ResolveAutosaveFiles( pairs, choice, &written );
+    bool                  reloaded = false;
+
+    if( choice == AUTOSAVE_RECOVERY_CHOICE::RESTORE && !written.empty() )
+    {
+        KOPENAPI_HISTORY::Get().Reset( "sch", "sch_autosave" );
+        clearModified( *context );
+        reloaded = context->RevertToSaved();
+    }
+
+    nlohmann::json files = nlohmann::json::array();
+
+    for( const wxString& file : written )
+        files.push_back( std::string( file.utf8_str() ) );
+
+    nlohmann::json out = documentStatus( aCtx );
+    out["action"] = action;
+    out["autosaves"] = used;
+    out["written"] = files;
+
+    if( choice == AUTOSAVE_RECOVERY_CHOICE::RESTORE )
+        out["reloaded"] = reloaded;
+
+    if( !errors.IsEmpty() )
+    {
+        KOPENAPI_RESULT r = KOPENAPI_RESULT::Error( 500, std::string( errors.utf8_str() ) );
+        r.body.update( out );
+        return r;
+    }
+
+    return KOPENAPI_RESULT::Ok( out );
 }
 
 
@@ -805,7 +1033,8 @@ KOPENAPI_REGISTER_DOCUMENTS( "sch", documentStatus, releaseHeadless );
 KOPENAPI_REGISTER_HISTORY( "sch", history() );
 
 KOPENAPI_REGISTER( "sch_open",
-                   "Open a schematic (.kicad_sch, a KiCad 5 .sch, or its .kicad_pro / .pro; a KiCad 5 schematic is saved as .kicad_sch): editor window in the GUI, in memory headless",
+                   "Open a schematic (.kicad_sch, a KiCad 5 .sch, or its .kicad_pro / .pro; a KiCad 5 schematic is saved as .kicad_sch): editor window in the GUI, in memory headless. "
+                   "autosaves lists auto-saved copies of its sheets newer than their files (the editor offers them in its infobar; sch_autosave)",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "discard":{"type":"boolean","default":false,
@@ -837,3 +1066,23 @@ KOPENAPI_REGISTER( "sch_save",
 
 KOPENAPI_REGISTER( "sch_revert", "Reload the open schematic from disk, dropping unsaved changes",
                    R"json({"type":"object","properties":{}})json"_json, false, h_sch_revert, 120 );
+
+KOPENAPI_REGISTER( "sch_autosave_list",
+                   "The auto-saved copies of the open schematic's sheet files (the autosave files KiCad writes "
+                   "while the backup format is Zip; left-over ones are offered in any format), newest first: path, "
+                   "source, time, source_time, newer (newer than the sheet file and different: offered on open). "
+                   "Also the autosave settings (enabled, format, location, writes_autosave_files)",
+                   R"json({"type":"object","properties":{}})json"_json, false, h_sch_autosave_list );
+
+KOPENAPI_REGISTER( "sch_autosave",
+                   "Recover from the open schematic's auto-saved copies. action: rescue (the newest copy of each "
+                   "sheet, or path, replaces the open schematic under its own file names, unsaved; the sheet files "
+                   "are not touched), or the choices the editor's infobar offers on open for the copies newer than "
+                   "their files (or path): restore (the copies replace the sheet files, which are reloaded), "
+                   "keep_both (each copy is moved beside its file as <name>.recovered.<time>.kicad_sch), discard "
+                   "(deleted; every copy unless path). rescue and restore refuse unsaved changes unless discard: true",
+                   R"json({"type":"object","required":["action"],"properties":{
+                        "action":{"type":"string","enum":["rescue","restore","keep_both","discard"]},
+                        "path":{"type":"string","description":"one copy (sch_autosave_list)"},
+                        "discard":{"type":"boolean","default":false,"description":"drop unsaved changes (rescue, restore)"}}})json"_json,
+                   false, h_sch_autosave, 120 );

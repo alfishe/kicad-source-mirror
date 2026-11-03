@@ -185,6 +185,11 @@ KICOMMON_API nlohmann::json KopenapiPageSchema( int aDefaultLimit = 100, int aMa
 KICOMMON_API nlohmann::json KopenapiPagedSchema( nlohmann::json aProperties, int aDefaultLimit = 100,
                                                  int aMaxLimit = 1000 );
 
+struct AUTOSAVE_FILE_INFO;
+
+/// @brief An auto-saved copy (LOCAL_HISTORY::ListAutosaveFiles): path, source, time, source_time, newer
+KICOMMON_API nlohmann::json KopenapiAutosaveJson( const AUTOSAVE_FILE_INFO& aInfo );
+
 /// @brief Default page size of ranked searches (KopenapiRankedPage)
 constexpr int KOPENAPI_RANKED_PAGE = 20;
 

@@ -1,4 +1,5 @@
 #include "kicadopenapi_util.h"
+#include <local_history.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -949,4 +950,22 @@ std::vector<std::string> KopenapiDidYouMean( const std::vector<std::string>& aNa
         out.push_back( ranked[i].second );
 
     return out;
+}
+
+
+nlohmann::json KopenapiAutosaveJson( const AUTOSAVE_FILE_INFO& aInfo )
+{
+    auto text = []( const wxString& aText )
+    {
+        return std::string( aText.utf8_str() );
+    };
+
+    auto stamp = [&]( const wxDateTime& aTime ) -> nlohmann::json
+    {
+        return aTime.IsValid() ? nlohmann::json( text( aTime.FormatISOCombined( ' ' ) ) ) : nlohmann::json();
+    };
+
+    return { { "path", text( aInfo.autosavePath ) }, { "source", text( aInfo.sourcePath ) },
+             { "time", stamp( aInfo.autosaveTime ) }, { "source_time", stamp( aInfo.sourceTime ) },
+             { "newer", aInfo.newer } };
 }
