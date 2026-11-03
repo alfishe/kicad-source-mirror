@@ -4,6 +4,7 @@
 /// footprint's `Support.Role` field (from its symbol), else from connectivity for unambiguous topologies,
 /// else the part is unassigned.  No value thresholds.
 #include "kopenapi_pcb.h"
+#include "kopenapi_pcb_templates.h"
 
 #include <api/pcb_context.h>
 #include <board.h>
@@ -211,6 +212,7 @@ nlohmann::json KopenapiSupportRoles( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, cons
             row["capacitance_f"] = cap;
 
         std::string role, reason;
+        int         pinNet = 0;   // the net of the anchor pin the part serves: its template's pin_role
 
         if( !p.field.empty() )
         {
@@ -266,6 +268,7 @@ nlohmann::json KopenapiSupportRoles( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, cons
                 else
                 {
                     role = "decoupling";
+                    pinNet = y;
                     const auto& pin = anchorPins[y].front();
                     row["anchor"] = pin.first + "." + pin.second;
                     reason = "between " + netName( y ) + " and " + netName( x ) + " at " + pin.first + "." + pin.second;
@@ -274,16 +277,19 @@ nlohmann::json KopenapiSupportRoles( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, cons
             else if( has( []( const std::string& r ) { return r == "switching"; }, x, y ) && powerRole( roleOf( y ) ) )
             {
                 role = "inductor";
+                pinNet = x;
                 reason = "in series from switching " + netName( x ) + " to " + netName( y );
             }
             else if( has( []( const std::string& r ) { return r == "analog_hs"; }, x, y ) && roleOf( y ) == "ground" )
             {
                 role = "crystal_load";
+                pinNet = x;
                 reason = "from crystal net " + netName( x ) + " to " + netName( y );
             }
             else if( has( signalLike, x, y ) && ( powerRole( roleOf( y ) ) || roleOf( y ) == "ground" ) )
             {
                 role = "pullup";
+                pinNet = x;
                 reason = "from " + netName( x ) + " to " + netName( y );
             }
             else if( signalLike( ra ) && signalLike( rb ) && anchorPins.count( a ) && anchorPins.count( b ) )
@@ -302,6 +308,7 @@ nlohmann::json KopenapiSupportRoles( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, cons
                 if( !far.empty() )
                 {
                     role = "series";
+                    pinNet = a;
                     reason = "in series on " + far;
                 }
             }
@@ -321,6 +328,22 @@ nlohmann::json KopenapiSupportRoles( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, cons
         {
             unassigned.push_back( { { "ref", p.ref }, { "reason", reason } } );
             continue;
+        }
+
+        // a field or a crystal: the net of an anchor pin, a supply or signal before ground
+        for( int pass = 0; pass < 2 && pinNet == 0; ++pass )
+        {
+            for( int n : p.nets )
+            {
+                if( pinNet == 0 && anchorPins.count( n ) && ( pass == 1 || roleOf( n ) != "ground" ) )
+                    pinNet = n;
+            }
+        }
+
+        if( pinNet > 0 )
+        {
+            row["pin_net"] = netName( pinNet );
+            row["pin_role"] = roleOf( pinNet );
         }
 
         row["role"] = role;
@@ -352,7 +375,8 @@ KOPENAPI_REGISTER( "pcb_support_roles",
                    "inductor; crystal net to ground -> crystal_load; signal to a supply or ground -> pullup; in "
                    "series between pins of two different ICs -> series; a part on two crystal nets -> crystal. "
                    "bulk, filter and esd come only from the field; no value thresholds. Answers parts [{ref, value, "
-                   "capacitance_f, role, source, reason, anchor}], unassigned [{ref, reason}] (two-terminal parts "
+                   "capacitance_f, role, source, reason, anchor, pin_net, pin_role (the role of the anchor pin's net: the "
+                   "template key)}], unassigned [{ref, reason}] (two-terminal parts "
                    "with no field and no unambiguous topology, and unknown field values) and counts",
                    R"json({"type":"object","properties":{
                         "refs":{"type":"string","description":"glob over references"}}})json"_json,
