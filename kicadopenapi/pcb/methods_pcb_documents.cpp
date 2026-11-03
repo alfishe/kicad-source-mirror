@@ -18,6 +18,7 @@
 #include <pcb_io/kicad_sexpr/pcb_io_kicad_sexpr.h>
 #include <richio.h>
 #include <board_loader.h>
+#include "kopenapi_board_load.h"
 #include <board_recovery.h>
 #include <footprint.h>
 #include <board_design_settings.h>
@@ -383,10 +384,17 @@ static KOPENAPI_RESULT openHeadless( KOPENAPI_CONTEXT& aCtx, const wxFileName& a
         return KOPENAPI_RESULT::Error( 415, "not a KiCad board file" );
 
     std::unique_ptr<BOARD> board;
+    BOARD_LOADER::OPTIONS  options;
+
+    // the editor asks the reader's questions; the API answers them by accept_queries
+    options.plugin_configurator = []( PCB_IO& aPlugin )
+    {
+        KopenapiAnswerQueries( aPlugin, KopenapiBoardQueries() );
+    };
 
     try
     {
-        board = BOARD_LOADER::Load( aBoard.GetFullPath(), type, project );
+        board = BOARD_LOADER::Load( aBoard.GetFullPath(), type, project, options );
     }
     catch( const IO_ERROR& ioe )
     {
@@ -502,7 +510,11 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         }
     }
 
-    KOPENAPI_RESULT result;
+    KOPENAPI_RESULT         result;
+    KOPENAPI_BOARD_QUERIES& queries = KopenapiBoardQueries();
+
+    queries = KOPENAPI_BOARD_QUERIES();
+    queries.accept = aArgs.value( "accept_queries", true );
 
     if( aCtx.headless )
     {
@@ -515,8 +527,23 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
         result = openGui( aCtx, board );
         KICAD_OPENAPI_SERVICE::SetOverrideLock( false );
 
-        if( result.status != 200 )
+        if( result.status != 200 && queries.declined.empty() )
             result.body["hint"] = "another process may have the file open (errors: journal); override_lock: true opens it anyway";
+    }
+
+    const KOPENAPI_BOARD_QUERIES answered = queries;
+    queries = KOPENAPI_BOARD_QUERIES();
+
+    if( result.status != 200 && !answered.declined.empty() )
+    {
+        return KOPENAPI_RESULT::Error( 409, "the reader asked and accept_queries: false answered no, which stops "
+                                            "the open: " + answered.declined );
+    }
+
+    if( result.status == 200 && !answered.asked.empty() )
+    {
+        for( const std::string& question : answered.asked )
+            result.body["warnings"].push_back( question );
     }
 
     // the editor offers these in its infobar
@@ -1256,9 +1283,13 @@ KOPENAPI_REGISTER_DOCUMENTS( "pcb", documentStatus,
 
 KOPENAPI_REGISTER( "pcb_open",
                    "Open a board (.kicad_pcb, a KiCad 4 .brd, or its .kicad_pro / .pro; a .brd is saved as .kicad_pcb): editor window in the GUI, in memory headless. "
-                   "autosaves lists auto-saved copies newer than the file (the editor offers them in its infobar; pcb_autosave)",
+                   "autosaves lists auto-saved copies newer than the file (the editor offers them in its infobar; pcb_autosave). "
+                   "The reader's questions (the editor asks them, e.g. rescue items on layers the file does not define to "
+                   "User.Comments) are answered by accept_queries: yes by default (each one in warnings), no stops the open "
+                   "(409 with the question)",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
+                        "accept_queries":{"type":"boolean","default":true},
                         "discard":{"type":"boolean","default":false,
                                    "description":"Drop unsaved changes of the currently open board; headless, also reread the .kicad_pro from disk (unless a schematic of this process uses the project)"},
                         "switch_project":{"type":"boolean","default":false,

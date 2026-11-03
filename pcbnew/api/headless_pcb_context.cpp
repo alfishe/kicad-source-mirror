@@ -32,6 +32,7 @@
 #include <netlist_reader/board_netlist_updater.h>
 #include <netlist_reader/netlist_reader.h>
 #include <netlist_reader/pcb_netlist_utils.h>
+#include <pcb/kopenapi_board_load.h>
 #include <pcbnew_settings.h>
 #include <pgm_base.h>
 #include <project.h>
@@ -309,7 +310,14 @@ bool HEADLESS_PCB_CONTEXT::reload( const wxString& aPath, bool aModified )
 
     try
     {
-        reloaded = BOARD_LOADER::Load( aPath, pluginType, m_project );
+        // the reader's questions are answered as pcb_open answers them by default
+        BOARD_LOADER::OPTIONS options;
+        options.plugin_configurator = []( PCB_IO& aPlugin )
+        {
+            KopenapiAnswerQueries( aPlugin, KopenapiBoardQueries() );
+        };
+
+        reloaded = BOARD_LOADER::Load( aPath, pluginType, m_project, options );
     }
     catch( ... )
     {

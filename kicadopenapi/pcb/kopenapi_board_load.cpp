@@ -9,6 +9,36 @@
 #include <wx/thread.h>
 
 
+KOPENAPI_BOARD_QUERIES& KopenapiBoardQueries()
+{
+    static KOPENAPI_BOARD_QUERIES s_queries;
+    return s_queries;
+}
+
+
+void KopenapiAnswerQueries( PCB_IO& aPlugin, KOPENAPI_BOARD_QUERIES& aQueries )
+{
+    aPlugin.SetQueryUserCallback(
+            [&aQueries]( wxString aTitle, int, wxString aMessage, wxString ) -> bool
+            {
+                const std::string question( ( aTitle + wxS( ": " ) + aMessage ).ToUTF8() );
+
+                if( !aQueries.accept )
+                {
+                    if( aQueries.declined.empty() )
+                        aQueries.declined = question;
+
+                    wxLogWarning( "%s: %s (answered no, loading stops)", aTitle, aMessage );
+                    return false;
+                }
+
+                aQueries.asked.push_back( question );
+                wxLogWarning( "%s: %s (loading goes on)", aTitle, aMessage );
+                return true;
+            } );
+}
+
+
 std::unique_ptr<BOARD> KopenapiLoadBoard( const wxString& aFileName, PCB_IO_MGR::PCB_FILE_T aFormat,
                                           PROJECT* aProject, const BOARD_LOADER::OPTIONS& aOptions )
 {
@@ -22,12 +52,7 @@ std::unique_ptr<BOARD> KopenapiLoadBoard( const wxString& aFileName, PCB_IO_MGR:
         if( aOptions.plugin_configurator )
             aOptions.plugin_configurator( aPlugin );
 
-        aPlugin.SetQueryUserCallback(
-                []( wxString aTitle, int, wxString aMessage, wxString ) -> bool
-                {
-                    wxLogWarning( "%s: %s (loading goes on)", aTitle, aMessage );
-                    return true;
-                } );
+        KopenapiAnswerQueries( aPlugin, KopenapiBoardQueries() );
     };
 
     std::unique_ptr<BOARD> board;
