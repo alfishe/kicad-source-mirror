@@ -18259,16 +18259,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         if( fanned.empty() )
             fanned = list;
 
-        int fanPitch = std::numeric_limits<int>::max();
-
-        for( size_t i = 1; i < fanned.size(); ++i )
-            fanPitch = std::min<int>( fanPitch, (int) std::abs( along( fanned[i]->GetPosition() ) - along( fanned[i - 1]->GetPosition() ) ) );
-
-        fanPitch = std::max( pitch, fanPitch == std::numeric_limits<int>::max() ? pitch : fanPitch );
-
-        const int64_t mid = ( along( fanned.front()->GetPosition() ) + along( fanned.back()->GetPosition() ) ) / 2;
         int64_t       tipLine = std::numeric_limits<int64_t>::min();
-        int64_t       maxOffset = 0;
         // the rules' track, narrowed so two side by side keep the clearance at the pitch
         const auto    netted = std::find_if( list.begin(), list.end(), []( PAD* p ) { return p->GetNetCode() > 0; } );
         PAD*          sized = netted != list.end() ? *netted : todo.front();
@@ -18285,22 +18276,226 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
             tipLine = std::max( tipLine, across( pad->GetPosition() ) + ( dir.x != 0 ? pb.GetWidth() : pb.GetHeight() ) / 2 );
         }
 
-        for( PAD* pad : fanned )
-            maxOffset = std::max( maxOffset, std::abs( along( pad->GetPosition() ) - mid ) );
-
         // a via keeps the copper clearance from its ring and the hole clearance from its hole, whichever
         // reaches further; the spread keeps a grid step over what the pitch must hold (rounding at the limit)
         const double viaKeep = std::max( viaDia / 2.0 + clearance, viaDrill / 2.0 + bds.m_HoleClearance );
+        const int    slack = pcbIUScale.mmToIU( 0.005 );
         const double need = ( withVias ? ( rows > 1 ? viaKeep + width / 2.0
                                                     : std::max( { viaDia / 2.0 + viaKeep, double( viaDrill + bds.m_HoleToHoleMin ) } ) )
                                        : double( width + clearance ) )
-                            + pcbIUScale.mmToIU( 0.005 );
-        const double cosMax = std::min( 0.999, std::max( 0.2, double( width + clearance ) / fanPitch ) );
-        // a neighbour's ray, at up to the fan's steepest angle, passes a via by the spread times its cosine
-        const double spread = need <= fanPitch ? 1.0 : withVias ? need / ( fanPitch * cosMax ) : need / fanPitch;
-        const double tanMax = std::sqrt( 1.0 - cosMax * cosMax ) / cosMax;
-        const int64_t rayLength = std::max<int64_t>( clearance, KiROUND( maxOffset * ( spread - 1.0 ) / tanMax ) );
-        const int64_t rayEnd = tipLine + rayLength;
+                            + slack;
+        const double pastVia = viaKeep + width / 2.0 + slack;   // a leg past a via
+
+        // the fan's groups: neighbours that take a via closer than their vias need spread round the group's
+        // middle; a group whose spread reaches the next one joins it; a pin with room keeps its place
+        auto alongAt = [&]( PAD* aPad ) { return along( aPad->GetPosition() ); };
+
+        struct FAN_GROUP
+        {
+            size_t  first = 0, last = 0;   ///< into fanned
+            double  spread = 1.0;
+            int64_t mid = 0;
+        };
+
+        std::vector<FAN_GROUP> groups;
+
+        auto spreadOf = [&]( FAN_GROUP& aGroup )
+        {
+            double gap = std::numeric_limits<double>::max();
+
+            for( size_t k = aGroup.first + 1; k <= aGroup.last; ++k )
+                gap = std::min( gap, double( alongAt( fanned[k] ) - alongAt( fanned[k - 1] ) ) );
+
+            aGroup.spread = gap < need ? need / std::max( gap, 1.0 ) : 1.0;
+            aGroup.mid = ( alongAt( fanned[aGroup.first] ) + alongAt( fanned[aGroup.last] ) ) / 2;
+        };
+
+        auto spreadAt = [&]( const FAN_GROUP& aGroup, size_t aIndex )
+        {
+            return aGroup.mid + ( alongAt( fanned[aIndex] ) - aGroup.mid ) * aGroup.spread;
+        };
+
+        for( size_t k = 0; k < fanned.size(); ++k )
+        {
+            if( k > 0 && alongAt( fanned[k] ) - alongAt( fanned[k - 1] ) < need )
+                groups.back().last = k;
+            else
+                groups.push_back( { k, k } );
+        }
+
+        for( bool joined = true; joined; )
+        {
+            joined = false;
+
+            for( FAN_GROUP& g : groups )
+                spreadOf( g );
+
+            for( size_t k = 1; k < groups.size() && !joined; ++k )
+            {
+                if( spreadAt( groups[k], groups[k].first ) - spreadAt( groups[k - 1], groups[k - 1].last ) < need )
+                {
+                    groups[k - 1].last = groups[k].last;
+                    groups.erase( groups.begin() + k );
+                    joined = true;
+                }
+            }
+        }
+
+        // a group spreads clear of the lanes of the pins kept on their layer beside it: its middle shifts
+        // away from them where the room between them holds it
+        for( FAN_GROUP& g : groups )
+        {
+            if( g.spread <= 1.0 || !withPorts )
+                continue;
+
+            const int64_t lowest = alongAt( fanned[g.first] ), highest = alongAt( fanned[g.last] );
+            double        lo = -std::numeric_limits<double>::max(), hi = std::numeric_limits<double>::max();
+
+            for( PAD* pad : list )
+            {
+                if( pad->GetNetCode() <= 0 || std::find( fanned.begin(), fanned.end(), pad ) != fanned.end() || !farEnd( pad ) )
+                    continue;
+
+                const int64_t at = alongAt( pad );
+
+                if( at < lowest )
+                    lo = std::max( lo, at + pastVia );
+                else if( at > highest )
+                    hi = std::min( hi, at - pastVia );
+            }
+
+            // the spread places of the group's ends: mid + (end - mid) * spread within [lo, hi]
+            const double atMost = lo > -std::numeric_limits<double>::max() ? ( lowest * g.spread - lo ) / ( g.spread - 1.0 )
+                                                                          : std::numeric_limits<double>::max();
+            const double atLeast = hi < std::numeric_limits<double>::max() ? ( highest * g.spread - hi ) / ( g.spread - 1.0 )
+                                                                           : -std::numeric_limits<double>::max();
+
+            if( atLeast <= atMost )
+                g.mid = (int64_t) std::clamp( (double) g.mid, atLeast, atMost );
+        }
+
+        // each pin's group: the fanned pins' own, a pin within a group's span that one's, else none (it keeps its place)
+        std::map<PAD*, const FAN_GROUP*> groupOf;
+
+        for( PAD* pad : list )
+        {
+            for( const FAN_GROUP& g : groups )
+            {
+                if( alongAt( pad ) >= alongAt( fanned[g.first] ) && alongAt( pad ) <= alongAt( fanned[g.last] ) )
+                    groupOf[pad] = &g;
+            }
+        }
+
+        // the fan: a pin's leg runs straight out to its knee, at 45 degrees away from its group's middle to its
+        // spread place, then straight out to its via. The knees step back from the middle out, so a leg
+        // keeps the clearance from the pads and knees on its way and the legs past a via keep it from the via
+        auto fannedAt = [&]( PAD* aPad ) -> int64_t
+        {
+            auto it = groupOf.find( aPad );
+
+            if( it == groupOf.end() )
+                return alongAt( aPad );
+
+            return it->second->mid + KiROUND( ( alongAt( aPad ) - it->second->mid ) * it->second->spread );
+        };
+        auto halfOf = [&]( PAD* aPad ) { return fannedAt( aPad ) > alongAt( aPad ) ? 1 : fannedAt( aPad ) < alongAt( aPad ) ? -1 : 0; };
+        auto halfWidth = [&]( PAD* aPad )
+        {
+            const BOX2I pb = aPad->GetBoundingBox();
+            return (int64_t) ( dir.x != 0 ? pb.GetHeight() : pb.GetWidth() ) / 2;
+        };
+
+        const double         root2 = std::sqrt( 2.0 );
+        const double         beside = width / 2.0 + clearance + slack;           // a leg's edge off a pad
+        const double         sideBySide = double( width + clearance + slack );   // two legs side by side
+        std::map<PAD*, int64_t> knee;
+
+        // a leg leaving at 45 degrees clears the corners of the pads beyond it on its side
+        auto cornerKnee = [&]( PAD* aPad )
+        {
+            double e = 0;
+
+            for( PAD* other : list )
+            {
+                const int64_t d = ( alongAt( other ) - alongAt( aPad ) ) * halfOf( aPad );
+
+                if( other != aPad && d > 0 && other->GetNetCode() != aPad->GetNetCode() )
+                    e = std::max( e, root2 * beside - double( d - halfWidth( other ) ) );
+            }
+
+            return (int64_t) std::ceil( e );
+        };
+
+        for( PAD* pad : list )
+            knee[pad] = halfOf( pad ) ? cornerKnee( pad ) : 0;
+
+        int64_t reachMin = clearance;
+
+        for( const FAN_GROUP& g : groups )
+        {
+            for( int half : { -1, 1 } )
+            {
+                std::vector<PAD*> chain;
+
+                for( size_t k = g.first; k <= g.last; ++k )
+                {
+                    if( halfOf( fanned[k] ) == half )
+                        chain.push_back( fanned[k] );
+                }
+
+                // outermost first: each knee further out than the next one's by what two parallel legs need
+                std::sort( chain.begin(), chain.end(),
+                           [&]( PAD* x, PAD* y ) { return std::abs( alongAt( x ) - g.mid ) > std::abs( alongAt( y ) - g.mid ); } );
+
+                for( size_t k = 1; k < chain.size(); ++k )
+                {
+                    const int64_t d = std::abs( alongAt( chain[k] ) - alongAt( chain[k - 1] ) );
+                    knee[chain[k]] = std::max( knee[chain[k]], knee[chain[k - 1]] + (int64_t) std::ceil( std::max( 0.0, root2 * sideBySide - d ) ) );
+                }
+
+                // the pin in the group's middle goes straight out: the first leg each side leaves it behind
+                for( size_t k = g.first; k <= g.last; ++k )
+                {
+                    if( !halfOf( fanned[k] ) && !chain.empty() )
+                        chain.push_back( fanned[k] );
+                }
+
+                // a via sits past its elbow until the next leg out passes it by the rules
+                for( size_t k = 0; k < chain.size(); ++k )
+                {
+                    const int64_t elbow = knee[chain[k]] + std::abs( fannedAt( chain[k] ) - alongAt( chain[k] ) );
+                    reachMin = std::max( reachMin, elbow );
+
+                    if( withVias && k > 0 )
+                    {
+                        const int64_t d = std::abs( alongAt( chain[k] ) - alongAt( chain[k - 1] ) );
+                        const int64_t back = knee[chain[k]] - knee[chain[k - 1]];
+                        reachMin = std::max( reachMin, elbow + (int64_t) std::ceil( root2 * pastVia - double( d + back ) ) );
+                    }
+                }
+            }
+        }
+
+        // a via clears the corners of the other nets' pads in the row
+        for( PAD* pad : fanned )
+        {
+            if( !withVias )
+                break;
+
+            for( PAD* other : list )
+            {
+                if( other == pad || other->GetNetCode() == pad->GetNetCode() )
+                    continue;
+
+                const double a = std::max<double>( 0.0, std::abs( alongAt( other ) - fannedAt( pad ) ) - halfWidth( other ) );
+                const double r = viaDia / 2.0 + clearance + slack;
+
+                if( a < r )
+                    reachMin = std::max( reachMin, (int64_t) std::ceil( std::sqrt( r * r - a * a ) ) );
+            }
+        }
+
+        const int64_t rayEnd = tipLine + reachMin;
 
         int64_t toCourtyard = rayEnd;
 
@@ -18315,22 +18510,24 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
             return VECTOR2I( (int) ( aAlong * tangent.x + aAcross * dir.x ), (int) ( aAlong * tangent.y + aAcross * dir.y ) );
         };
 
-        // the legs from a pad to a via spot on row aRow (aVia: the via there too), as the fan lays them
-        auto viaWay = [&]( PAD* aPad, int aRow, std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>>& aItems, int aReach = -1,
+        // the legs from a pad to a via spot on row aRow (or out to aReach), as the fan lays them
+        auto viaWay = [&]( PAD* aPad, int aRow, std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>>& aItems, int64_t aReach = -1,
                            std::vector<VECTOR2I>* aPath = nullptr )
         {
             const VECTOR2I     at = aPad->GetPosition();
             const PCB_LAYER_ID layer = aPad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
-            const int64_t      fanned = mid + KiROUND( ( along( at ) - mid ) * spread );
             const int64_t      reach = aReach >= 0 ? aReach : rayEnd + aRow * ( viaDia + clearance );
-            const VECTOR2I     knee = point( along( at ), tipLine );
-            const VECTOR2I     ray = point( fanned, rayEnd );
-            const VECTOR2I     spot = point( fanned, reach );
+            const int64_t      out = std::min( knee[aPad], reach - tipLine );
+            const int64_t      slant = std::min( std::abs( fannedAt( aPad ) - alongAt( aPad ) ), std::max<int64_t>( 0, reach - tipLine - out ) );
+            const int64_t      to = alongAt( aPad ) + halfOf( aPad ) * slant;
+            const VECTOR2I     bend = point( alongAt( aPad ), tipLine + out );
+            const VECTOR2I     elbow = point( to, tipLine + out + slant );
+            const VECTOR2I     spot = point( to, reach );
 
             if( aPath )
                 *aPath = { at };
 
-            for( const auto& [p0, p1] : { std::pair{ at, knee }, std::pair{ knee, ray }, std::pair{ ray, spot } } )
+            for( const auto& [p0, p1] : { std::pair{ at, bend }, std::pair{ bend, elbow }, std::pair{ elbow, spot } } )
             {
                 if( p0 == p1 )
                     continue;
@@ -18350,52 +18547,71 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
             return spot;
         };
 
-        if( withPorts )
+        // the pins that take a via first: theirs are the spots laid, the others' keep off them
+        std::vector<PAD*> viaFirst = fanned;
+
+        for( PAD* pad : list )
         {
-            for( PAD* pad : list )
+            if( std::find( viaFirst.begin(), viaFirst.end(), pad ) == viaFirst.end() )
+                viaFirst.push_back( pad );
+        }
+
+        // a pin's via spot: its preferred line first, then the others, then further out, clear of the spots
+        // planned so far and of aLaid (copper this call lays)
+        auto planSpot = [&]( PAD* aPad, const std::vector<BOARD_CONNECTED_ITEM*>& aLaid )
+        {
+            const int first = (int) ( ( std::find( list.begin(), list.end(), aPad ) - list.begin() ) % rows );
+
+            for( int r = 0; r < rows + 2; ++r )
             {
-                if( pad->GetNetCode() <= 0 || !farEnd( pad ) )
+                const int row = r < rows ? ( first + r ) % rows : r;
+                std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> items;
+                std::vector<VECTOR2I>                              path;
+                const VECTOR2I spot = viaWay( aPad, row, items, -1, &path );
+
+                auto via = std::make_unique<PCB_VIA>( aBoard );
+                via->SetViaType( VIATYPE::THROUGH );
+                via->SetPosition( spot );
+                via->SetWidth( PADSTACK::ALL_LAYERS, viaDia );
+                via->SetDrill( viaDrill );
+                via->SetLayerPair( F_Cu, B_Cu );
+                via->SetNet( aPad->GetNet() );
+                items.push_back( std::move( via ) );
+
+                std::vector<BOARD_CONNECTED_ITEM*> fresh;
+
+                for( const auto& item : items )
+                    fresh.push_back( item.get() );
+
+                std::vector<BOARD_CONNECTED_ITEM*> with = spotStaged;
+                with.insert( with.end(), aLaid.begin(), aLaid.end() );
+
+                if( !guard( aBoard, fresh, {}, zoneMode == "refill", &with ).empty() )
                     continue;
 
-                const int first = (int) ( ( std::find( list.begin(), list.end(), pad ) - list.begin() ) % rows );
+                viaSpots[aPad] = { spot, row, false, side, path };
 
-                for( int r = 0; r < rows + 2; ++r )
+                for( auto& item : items )
                 {
-                    const int row = r < rows ? ( first + r ) % rows : r;
-                    std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> items;
-                    std::vector<VECTOR2I>                              path;
-                    const VECTOR2I spot = viaWay( pad, row, items, -1, &path );
-
-                    auto via = std::make_unique<PCB_VIA>( aBoard );
-                    via->SetViaType( VIATYPE::THROUGH );
-                    via->SetPosition( spot );
-                    via->SetWidth( PADSTACK::ALL_LAYERS, viaDia );
-                    via->SetDrill( viaDrill );
-                    via->SetLayerPair( F_Cu, B_Cu );
-                    via->SetNet( pad->GetNet() );
-                    items.push_back( std::move( via ) );
-
-                    std::vector<BOARD_CONNECTED_ITEM*> fresh;
-
-                    for( const auto& item : items )
-                        fresh.push_back( item.get() );
-
-                    if( !guard( aBoard, fresh, {}, zoneMode == "refill", &spotStaged ).empty() )
-                        continue;
-
-                    viaSpots[pad] = { spot, row, false, side, path };
-
-                    for( auto& item : items )
-                    {
-                        spotStaged.push_back( item.get() );
-                        spotStagedOf[pad].push_back( item.get() );
-                        spotItems.push_back( std::move( item ) );
-                    }
-
-                    break;
+                    spotStaged.push_back( item.get() );
+                    spotStagedOf[aPad].push_back( item.get() );
+                    spotItems.push_back( std::move( item ) );
                 }
+
+                return;
+            }
+        };
+
+        if( withPorts )
+        {
+            for( PAD* pad : viaFirst )
+            {
+                if( pad->GetNetCode() > 0 && farEnd( pad ) )
+                    planSpot( pad, {} );
             }
         }
+
+        std::stable_partition( todo.begin(), todo.end(), [&]( PAD* aPad ) { return takesVia( aPad ); } );
 
         for( PAD* pad : todo )
         {
@@ -18427,7 +18643,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
             {
                 std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> legs;
                 std::vector<VECTOR2I>                              path;
-                const VECTOR2I spot = viaWay( pad, r, legs, padVia ? -1 : (int) toCourtyard, &path );
+                const VECTOR2I spot = viaWay( pad, r, legs, padVia ? -1 : toCourtyard, &path );
 
                 std::unique_ptr<PCB_VIA> via;
 
@@ -18450,11 +18666,17 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
                 if( via )
                     fresh.push_back( via.get() );
 
-                // a laid via keeps clear of the other pins' spots too (the vias their routes lay there)
+                // a laid via keeps clear of the spots of the other pins that take one; a kept pin's spot is no copper
                 std::vector<BOARD_CONNECTED_ITEM*> with = staged;
 
                 if( padVia )
-                    with.insert( with.end(), spotStaged.begin(), spotStaged.end() );
+                {
+                    for( const auto& [other, items] : spotStagedOf )
+                    {
+                        if( other != pad && takesVia( other ) )
+                            with.insert( with.end(), items.begin(), items.end() );
+                    }
+                }
 
                 const nlohmann::json violations = guard( aBoard, fresh, {}, zoneMode == "refill", &with );
 
@@ -18540,6 +18762,34 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
 
             if( !done )
                 skip( pad, last.substr( 0, 400 ) );
+        }
+
+        // a kept pin's spot where the laid copper now is: planned again round it, else none
+        for( PAD* pad : viaFirst )
+        {
+            auto it = viaSpots.find( pad );
+            auto items = spotStagedOf.find( pad );
+
+            if( !withPorts || it == viaSpots.end() || it->second.laid || items == spotStagedOf.end() )
+                continue;
+
+            std::vector<BOARD_CONNECTED_ITEM*> mine = items->second;
+
+            for( BOARD_CONNECTED_ITEM* item : mine )
+                spotStaged.erase( std::remove( spotStaged.begin(), spotStaged.end(), item ), spotStaged.end() );
+
+            std::vector<BOARD_CONNECTED_ITEM*> with = spotStaged;
+            with.insert( with.end(), staged.begin(), staged.end() );
+
+            if( guard( aBoard, mine, {}, zoneMode == "refill", &with ).empty() )
+            {
+                spotStaged.insert( spotStaged.end(), mine.begin(), mine.end() );
+                continue;
+            }
+
+            spotStagedOf.erase( items );
+            viaSpots.erase( it );
+            planSpot( pad, staged );
         }
     }
 
