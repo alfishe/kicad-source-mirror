@@ -1777,7 +1777,7 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
 /// leaves a pad along an earlier route doubles it (and a cut at a courtyard edge makes an exact
 /// twin).  A segment covered whole is not added; a covered head or tail is cut back to the end of
 /// the copper there (the two meet); copper in the middle stays doubled.  A shove's unchanged copy
-/// of a segment is covered whole too.
+/// of a segment is covered whole too, and so is a piece two legs of the same try lay twice.
 static void trimOverOwnCopper( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard )
 {
     for( auto it = aIface.m_added.begin(); it != aIface.m_added.end(); )
@@ -1806,13 +1806,15 @@ static void trimOverOwnCopper( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard )
 
             const SEG line( a, fresh->GetEnd() );
 
-            for( PCB_TRACK* other : aBoard->Tracks() )
+            // true: the scan ends (fresh covered or cut)
+            auto against = [&]( PCB_TRACK* other ) -> bool
             {
-                if( other->Type() != PCB_TRACE_T || aIface.m_removed.count( other ) || other->GetNetCode() != fresh->GetNetCode()
-                    || other->GetLayer() != fresh->GetLayer() || other->GetWidth() < fresh->GetWidth()
-                    || line.LineDistance( other->GetStart() ) > 1 || line.LineDistance( other->GetEnd() ) > 1 )
+                if( other == fresh || other->Type() != PCB_TRACE_T || aIface.m_removed.count( other )
+                    || other->GetNetCode() != fresh->GetNetCode() || other->GetLayer() != fresh->GetLayer()
+                    || other->GetWidth() < fresh->GetWidth() || line.LineDistance( other->GetStart() ) > 1
+                    || line.LineDistance( other->GetEnd() ) > 1 )
                 {
-                    continue;
+                    return false;
                 }
 
                 auto t = [&]( const VECTOR2I& p ) { return double( ( p - a ).Dot( d ) ) / len; };
@@ -1821,27 +1823,34 @@ static void trimOverOwnCopper( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard )
                 const VECTOR2I hi = startFirst ? other->GetEnd() : other->GetStart();
 
                 if( t( hi ) <= 1 || t( lo ) >= len - 1 )
-                    continue;
+                    return false;
 
                 if( t( lo ) <= 1 && t( hi ) >= len - 1 )
-                {
                     covered = true;
-                    break;
-                }
-
-                if( t( lo ) <= 1 )
-                {
+                else if( t( lo ) <= 1 )
                     fresh->SetStart( hi );
-                    cut = true;
-                    break;
-                }
-
-                if( t( hi ) >= len - 1 )
-                {
+                else if( t( hi ) >= len - 1 )
                     fresh->SetEnd( lo );
-                    cut = true;
+                else
+                    return false;
+
+                cut = !covered;
+                return true;
+            };
+
+            bool stop = false;
+
+            for( PCB_TRACK* other : aBoard->Tracks() )
+            {
+                if( ( stop = against( other ) ) )
                     break;
-                }
+            }
+
+            // this try's own segments kept before this one: two legs of one route can lay the same piece
+            for( auto kept = aIface.m_added.begin(); !stop && kept != it; ++kept )
+            {
+                if( ( *kept )->Type() == PCB_TRACE_T )
+                    stop = against( static_cast<PCB_TRACK*>( *kept ) );
             }
         }
 
