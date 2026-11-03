@@ -7592,9 +7592,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
             }
 
-            // a moved pin with no spot from the fan-out: a via past the tips of its neighbours' ways out, as far
-            // out as keeps it a via and the rules' clearance from the other planned spots, off their ways out and
-            // clear of the board's copper; none: the route plans its own
+            // a moved pin with no spot from the fan-out: a via past the tips of its neighbours' ways out, the first
+            // spot out along its way that keeps a via and the rules' clearance from the other planned spots, off their
+            // ways out and clear of the board's copper; vias are walked past, the walk ends at the first other
+            // obstacle (copper but vias, a keep-out, another part's courtyard, the board's edge); none: the route
+            // plans its own
             for( auto& [pad, goal] : portGoals )
             {
                 if( pad->GetParentFootprint() != fp || !goal.other || goal.via )
@@ -7616,8 +7618,55 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 probe.SetDrill( drill );
                 probe.SetNet( pad->GetNet() );
 
-                auto clear = [&]( const VECTOR2I& aAt )
+                enum class SPOT { FREE, VIA, WALL };
+
+                auto blocked = [&]( const VECTOR2I& aAt )
                 {
+                    if( !board->GetBoundingBox().Contains( aAt ) )
+                        return true;
+
+                    if( hasBoardArea )
+                    {
+                        const SEG::ecoord keep = dia / 2 + std::max( ds.m_CopperEdgeClearance, 0 );
+
+                        if( !boardArea.Contains( aAt ) )
+                            return true;
+
+                        for( int i = 0; i < boardArea.OutlineCount(); ++i )
+                        {
+                            if( boardArea.COutline( i ).SquaredDistance( aAt, true ) < keep * keep )
+                                return true;
+
+                            for( int h = 0; h < boardArea.HoleCount( i ); ++h )
+                            {
+                                if( boardArea.CHole( i, h ).SquaredDistance( aAt, true ) < keep * keep )
+                                    return true;
+                            }
+                        }
+                    }
+
+                    for( FOOTPRINT* part : board->Footprints() )
+                    {
+                        if( part == fp )
+                            continue;
+
+                        for( PCB_LAYER_ID side : { F_CrtYd, B_CrtYd } )
+                        {
+                            if( part->GetCourtyard( side ).OutlineCount() && part->GetCourtyard( side ).Contains( aAt ) )
+                                return true;
+                        }
+                    }
+
+                    return false;
+                };
+
+                auto spotAt = [&]( const VECTOR2I& aAt )
+                {
+                    if( blocked( aAt ) )
+                        return SPOT::WALL;
+
+                    SPOT spot = SPOT::FREE;
+
                     for( const auto& [other, g] : portGoals )
                     {
                         if( other == pad || other->GetNetCode() == net )
@@ -7632,22 +7681,37 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                         ( drill + viaDrillOf( other ) ) / 2 + ds.m_HoleToHoleMin );
 
                             if( ( *g.via - aAt ).EuclideanNorm() < apart )
-                                return false;
+                                spot = SPOT::VIA;
                         }
 
                         if( SEG( g.start, g.via ? *g.via : g.tip ).Distance( aAt ) < dia / 2 + keep + g.width / 2 )
-                            return false;
+                            spot = SPOT::VIA;
                     }
 
                     probe.SetPosition( aAt );
-                    return guard( board, { &probe }, {}, zoneMode == "refill" ).empty();
+
+                    for( const nlohmann::json& v : guard( board, { &probe }, {}, zoneMode == "refill" ) )
+                    {
+                        const nlohmann::json& other = v.contains( "other" ) ? v["other"] : nlohmann::json();
+
+                        if( !other.is_object() || other.value( "type", std::string() ) != "via" )
+                            return SPOT::WALL;
+
+                        spot = SPOT::VIA;
+                    }
+
+                    return spot;
                 };
 
-                for( int k = 0; k <= 4 && !goal.via; ++k )
+                for( int k = 0; !goal.via; ++k )
                 {
                     const VECTOR2I at = goal.tip + goal.dir * ( first + k * step );
+                    const SPOT     spot = spotAt( at );
 
-                    if( clear( at ) )
+                    if( spot == SPOT::WALL )
+                        break;
+
+                    if( spot == SPOT::FREE )
                         goal.via = at;
                 }
 
@@ -19319,7 +19383,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "wall_cap_x":{"type":"number","default":10,"minimum":1,"description":"budgets work: a budget also ends after this many times its seconds on the wall clock (wall_caps counts them; a capped run is no longer load-independent)"},
                         "rip_up_scope":{"type":"string","enum":["call","unlocked"],"default":"call","description":"call: the rip-up takes out only routes of this call; unlocked: also unlocked copper of other nets near the connections left (earlier calls, laid by hand; pairs and locked copper never), routed again after (rip_up.earlier_routes_rerouted, other_nets_moved) or all put back"},
                         "bus":{"description":"pns: \"off\", \"auto\" (pcb_net_roles' bundles) or [{name, nets}]: the members of a bus leaving the same side of a package are routed one after another in pin order, the pin on the inside of the turn first (answer bus: name, part, side, nets in order; row bus)","default":"off"},
-                        "ports":{"oneOf":[{"type":"boolean"},{"type":"array","items":{"type":"string"}}],"description":"layout level 1 goals: the signal pins of these packages (true: every package with 8 SMD pads or more) follow their port from pcb_fanout_ports: the way out on the pin's side is kept open to past the courtyard on the pad's layer (a pin planned round_the_part: to the courtyard's edge, it turns right past it; layer other: to the via spot the plan's fan-out would lay, the spot kept free on every layer), and the pin's routes leave through it first (the tip as a corner, or the via), arriving through the far pin's port when the layers allow; a connection that does not route that way is routed as any other. Rows routed so name port (round_the_part when planned so); ports answers per package the pins and vias planned, tries, won and ms"},
+                        "ports":{"oneOf":[{"type":"boolean"},{"type":"array","items":{"type":"string"}}],"description":"layout level 1 goals: the signal pins of these packages (true: every package with 8 SMD pads or more) follow their port from pcb_fanout_ports: the way out on the pin's side is kept open to past the courtyard on the pad's layer (a pin planned round_the_part: to the courtyard's edge, it turns right past it; layer other: to the via spot the plan's fan-out would lay, the spot kept free on every layer), and the pin's routes leave through it first (the tip as a corner, or the via), arriving through the far pin's port when the layers allow; a connection that does not route that way is routed as any other. Rows routed so name port (round_the_part when planned so); ports answers per package the pins and vias planned, spots (pad, at_mm, from fan_out, or past_tips: the first spot out along the way past the neighbours' tips a via keeps the rules' clearance from the other planned spots, their ways out and the board's copper, walking past vias, stopped by other copper, a keep-out, another part's courtyard or the board's edge) and no_spot (the pins left to plan their own), tries, won and ms"},
                         "lanes":{"type":"boolean","default":false,"description":"with ports: each pin kept on its pad's layer runs its lane from pcb_fanout_ports lanes. The lanes round a package are laid as tracks before any route (where the guard lets them, at both ends of a connection); the leg between two lanes whose ends face each other is a straight run, one 45 degree jog and a straight run, the jogs of a bus staggered so its legs keep their pitch, laid as computed where it is clean, else routed from lane end to lane end. A lane its route did not use is taken out again. Routes so made are left as they are by clean_up. Rows routed so name port.lane (the rank), ring_laid, far_ring_laid; ports.lanes counts laid_tracks, refused, taken_out"},
                         "bus_paths":{"description":"pns: \"off\", \"floorplan\" (or {floorplan: {pcb_floorplan arguments}}): every bus link pcb_floorplan finds, along its corridor, the connections of its nets between the two blocks' parts; or [{name, nets, points_mm: [[x_mm, y_mm] (a free point) or {at_mm, along: x | y, lo_mm, hi_mm, into_mm: [x0, y0, x1, y1]} (a portal crossed into that region: the ribbon inside lo..hi, joined to the next portal by axis-parallel runs inside the region; rooms_mm: [[x0, y0, x1, y1], ...] the regions to the next gate, more than one: joined by the straight run, which lies inside them (docs corridor.md))]}]: the connections of those nets, from the end nearer the first point. A corridor is a soft goal: at the turn of its first connection each member gets one try along it, across it in order, in a tenth of first_pass_budget_s; the members it does not route keep their turn and their usual tries with their whole budget. The answer's corridors give the centre line (line_mm) the members run beside at their pitch. With floorplan, ports and lanes: a link whose ring pcb_floorplan gives (links rings) is laid first along it, one lane per net on the ring's layer from its row of vias at the pins' side round the part to the other row, nested innermost first, the pins taking those spots in their order by a 45 degree fan (the spots pushed out past the row when the fan needs it); that link's corridor is not used and the answer's ring_lanes give each lane (net, rank, polyline_mm, leg_mm, refused)","default":"off"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},
