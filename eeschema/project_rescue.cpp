@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <set>
 #include <pgm_base.h>
 #include <libraries/symbol_library_adapter.h>
 
@@ -850,6 +851,22 @@ SYMBOL_LIB_TABLE_RESCUER::SYMBOL_LIB_TABLE_RESCUER( PROJECT& aProject, SCHEMATIC
 
 void SYMBOL_LIB_TABLE_RESCUER::FindCandidates()
 {
+    // The symbols' libraries are compared loaded: one the background load has not reached yet
+    // would look empty, and its symbols found only in the cache
+    SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( m_prj );
+    std::set<wxString>      nicknames;
+
+    for( SCH_SYMBOL* symbol : m_symbols )
+        nicknames.insert( symbol->GetLibId().GetLibNickname() );
+
+    for( const wxString& nickname : nicknames )
+    {
+        std::optional<LIBRARY_TABLE_ROW*> row = adapter->GetRow( nickname );
+
+        if( row && !( *row )->Disabled() && !adapter->IsLibraryLoaded( nickname ) )
+            adapter->LoadOne( nickname );
+    }
+
     RESCUE_SYMBOL_LIB_TABLE_CANDIDATE::FindRescues( *this, m_all_candidates );
 }
 

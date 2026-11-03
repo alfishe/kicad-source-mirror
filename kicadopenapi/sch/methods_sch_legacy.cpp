@@ -8,7 +8,6 @@
 
 #include <api/sch_context.h>
 #include <connection_graph.h>
-#include <kicadopenapi_keepalive.h>
 #include <kicadopenapi_util.h>
 #include <libraries/symbol_library_adapter.h>
 #include <libraries/legacy_symbol_library.h>
@@ -77,15 +76,6 @@ bool namesArg( const nlohmann::json& aArgs, std::optional<std::vector<wxString>>
 }
 
 
-/// @brief The project's symbol libraries loaded (the rescue compares the cache with them)
-void waitLibraries( PROJECT& aProject )
-{
-    SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( &aProject );
-    adapter->AsyncLoad();
-    KopenapiWaitLibraries( adapter );
-}
-
-
 /// @brief Every sheet of the open schematic marked unsaved (headless; the editor's OnModify in the GUI)
 void markModified( SCHEMATIC& aSchematic )
 {
@@ -125,7 +115,6 @@ KOPENAPI_RESULT h_sch_rescue_symbols( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
     SCHEMATIC*  schematic = context->GetSchematic();
     SCH_SCREENS screens( schematic->Root() );
 
-    waitLibraries( context->Prj() );
     const bool  legacy = screens.HasNoFullyDefinedLibIds();
 
     // as Rescue Symbols picks it: symbols without a library nickname rescue against the project's
@@ -333,8 +322,6 @@ KOPENAPI_RESULT h_sch_remap_symbols( KOPENAPI_CONTEXT& aCtx, const nlohmann::jso
 
     if( aArgs.value( "rescue", true ) )
     {
-        waitLibraries( project );
-
         LEGACY_RESCUER rescuer( project, &schematic, nullptr, EDA_DRAW_PANEL_GAL::GAL_TYPE_NONE );
         wxString       error;
 
