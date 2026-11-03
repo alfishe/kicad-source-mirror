@@ -1653,6 +1653,7 @@ struct CORRIDOR
     std::string    name;    ///< "USB_D+/USB_D-"
     SHAPE_POLY_SET area;
     BOX2I          box;
+    std::vector<std::pair<std::vector<VECTOR2I>, int>> ways;   ///< the lines it runs along, each with its width
 };
 
 
@@ -1766,7 +1767,9 @@ std::vector<VECTOR2I> wayAround( const VECTOR2I& aFrom, const VECTOR2I& aTo, con
 /// @brief Corridors of the board's pairs and clock nets (pcb_net_roles): between every two parts
 /// (more than two pads) that carry all nets of the group, a band as wide as the pair (or track)
 /// with its clearance along the shortest way around the parts that stay (more than two pads, not
-/// in aMoving), plus each pin's straight escape aEscapeMm long.  Groups joining more than four
+/// in aMoving), plus each pin's straight escape aEscapeMm long.  A part whose ports plan
+/// (pcb_fanout_ports lanes) lays the group's nets gives their lanes instead: each lane as a track
+/// with its clearance, the way going on from the lanes' ends, not from its pins.  Groups joining more than four
 /// parts get none.
 /// @brief Each differential pair net's partner, as pcb_net_roles pairs them
 std::map<int, int> diffPairs( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard )
@@ -1827,6 +1830,47 @@ std::vector<CORRIDOR> signalCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, do
     std::vector<CORRIDOR> out;
     const int             maxError = aBoard->GetDesignSettings().m_MaxError;
     const int             escape = toIU( aEscapeMm );
+
+    // each part's planned lanes (pcb_fanout_ports lanes): net code -> polyline, asked once per part
+    std::optional<KOPENAPI_METHOD>                                ports = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" );
+    std::map<FOOTPRINT*, std::map<int, std::vector<VECTOR2I>>> lanesOf;
+
+    auto lanes = [&]( FOOTPRINT* aFp ) -> const std::map<int, std::vector<VECTOR2I>>&
+    {
+        auto it = lanesOf.find( aFp );
+
+        if( it != lanesOf.end() )
+            return it->second;
+
+        std::map<int, std::vector<VECTOR2I>>& got = lanesOf[aFp];
+
+        if( !ports )
+            return got;
+
+        const KOPENAPI_RESULT r = ports->handler( aCtx, { { "ref", str( aFp->GetReference() ) }, { "lanes", true } } );
+
+        if( r.status != 200 || !r.body.contains( "lanes" ) || !r.body["lanes"].is_object() )
+            return got;
+
+        for( const nlohmann::json& lane : r.body["lanes"].value( "lanes", nlohmann::json::array() ) )
+        {
+            NETINFO_ITEM* net = lane.value( "net", nlohmann::json() ).is_string()
+                                        ? KopenapiFindNet( aBoard, lane["net"].get<std::string>() ) : nullptr;
+            const nlohmann::json poly = lane.value( "polyline_mm", nlohmann::json::array() );
+
+            if( !net || !poly.is_array() || poly.size() < 2 )
+                continue;
+
+            std::vector<VECTOR2I> pts;
+
+            for( const nlohmann::json& pt : poly )
+                pts.emplace_back( toIU( pt[0].get<double>() ), toIU( pt[1].get<double>() ) );
+
+            got[net->GetNetCode()] = std::move( pts );
+        }
+
+        return got;
+    };
 
     for( const std::vector<std::string>& group : groups )
     {
@@ -1906,15 +1950,55 @@ std::vector<CORRIDOR> signalCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, do
             return VECTOR2I( sum.x / (long long) aPads.size(), sum.y / (long long) aPads.size() );
         };
 
+        // an end whose part plans lanes for every pin of the group: the way goes on from the lanes' ends
+        std::vector<std::optional<VECTOR2I>> from( ends.size() );
+
+        for( size_t a = 0; a < ends.size(); ++a )
+        {
+            const std::map<int, std::vector<VECTOR2I>>& planned = lanes( ends[a].front()->GetParentFootprint() );
+            VECTOR2L                                    sum( 0, 0 );
+            bool                                        all = true;
+
+            for( PAD* pad : ends[a] )
+            {
+                auto it = planned.find( pad->GetNetCode() );
+                all = all && it != planned.end();
+
+                if( all )
+                    sum += VECTOR2L( it->second.back() );
+            }
+
+            if( all )
+            {
+                from[a] = VECTOR2I( sum.x / (long long) ends[a].size(), sum.y / (long long) ends[a].size() );
+
+                for( PAD* pad : ends[a] )
+                {
+                    const std::vector<VECTOR2I>& pts = planned.at( pad->GetNetCode() );
+
+                    for( size_t k = 1; k < pts.size(); ++k )
+                        TransformOvalToPolygon( corridor.area, pts[k - 1], pts[k], width + 2 * clearance, maxError, ERROR_OUTSIDE );
+
+                    corridor.ways.emplace_back( pts, width + 2 * clearance );
+                }
+            }
+        }
+
         for( size_t a = 0; a < ends.size(); ++a )
         {
             for( size_t b = a + 1; b < ends.size(); ++b )
             {
-                const std::vector<VECTOR2I> way = wayAround( centre( ends[a] ), centre( ends[b] ), walls, bounds );
+                const std::vector<VECTOR2I> way = wayAround( from[a].value_or( centre( ends[a] ) ), from[b].value_or( centre( ends[b] ) ),
+                                                             walls, bounds );
 
                 for( size_t k = 1; k < way.size(); ++k )
                     TransformOvalToPolygon( corridor.area, way[k - 1], way[k], band, maxError, ERROR_OUTSIDE );
+
+                corridor.ways.emplace_back( way, band );
             }
+
+            if( from[a] )
+                continue;
 
             // each pin's escape: straight out of its part, along the axis the pin sits on
             for( PAD* pad : ends[a] )
@@ -1943,6 +2027,25 @@ std::vector<CORRIDOR> signalCorridors( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, do
 /// to another block, as a band from the pads out past the courtyard by aKeepMm; the block's parts keep out
 /// of it, so the signals leave the block without weaving between them
 /// @brief A ports band (portCorridors) as a row: its name and box
+nlohmann::json wayJson( const CORRIDOR& aCorridor )
+{
+    auto           mm = []( int aIU ) { return std::round( toMm( aIU ) * 1000 ) / 1000; };
+    nlohmann::json ways = nlohmann::json::array();
+
+    for( const auto& [pts, width] : aCorridor.ways )
+    {
+        nlohmann::json line = nlohmann::json::array();
+
+        for( const VECTOR2I& pt : pts )
+            line.push_back( { mm( pt.x ), mm( pt.y ) } );
+
+        ways.push_back( { { "width_mm", mm( width ) }, { "polyline_mm", line } } );
+    }
+
+    return { { "name", aCorridor.name }, { "ways", ways } };
+}
+
+
 nlohmann::json bandJson( const CORRIDOR& aBand )
 {
     auto mm = []( int aIU ) { return std::round( toMm( aIU ) * 1000 ) / 1000; };
@@ -6481,6 +6584,8 @@ static KOPENAPI_RESULT h_pcb_place_auto( KOPENAPI_CONTEXT& aCtx, const nlohmann:
 
             if( corridor.name.rfind( "ports ", 0 ) == 0 )
                 row["ports_bands"].push_back( bandJson( corridor ) );
+            else
+                row["signal_ways"].push_back( wayJson( corridor ) );
         }
 
         groupCommit.Push( _( "Place group (API)" ) );
@@ -6879,6 +6984,8 @@ static KOPENAPI_RESULT h_pcb_place_group( KOPENAPI_CONTEXT& aCtx, const nlohmann
 
                 if( corridor.name.rfind( "ports ", 0 ) == 0 )
                     out["ports_bands"].push_back( bandJson( corridor ) );
+                else
+                    out["signal_ways"].push_back( wayJson( corridor ) );
             }
 
             for( size_t k = before; k < moved.size(); ++k )
@@ -6961,7 +7068,7 @@ static const char* PLACE_GROUP_BLOCK = R"json({
     "decoupling":{"type":"string","enum":["per_pin","schematic"],"description":"add the anchor's decoupling capacitors: per_pin - each supply pin group of the anchor (adjacent pins of a rail count once) one capacitor under 1 uF of its rail plus one bulk per rail, the rail's capacitors split among the parts on it by count, each to the part drawn nearest to it (schematic if open, else board); schematic - C parts across two of its rails drawn nearest to it on its sheet, one per supply pin group (a guess). The answer's decoupling.chosen lists them"},
     "decap_max_mm":{"type":"number","default":3,"description":"a decoupling capacitor farther than this from its pin is placed inside the fan-out ring if that is nearer, and listed in decoupling_far"},
     "bulk_max_mm":{"type":"number","default":10,"description":"a bulk capacitor (10 uF or more, or electrolytic: a CP_ footprint; its row says bulk) serves the rail, not one pin: placed as near as the others, it is listed in decoupling_far only past this"},
-    "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off. Given, it is also the length of the anchor's fine-pitch and pair pins' escapes the parts' own vias keep clear of; by default those run as pcb_stitch's do, past the anchor's courtyard by one via pitch (the rules' via + clearance)"},
+    "escape_keep_mm":{"type":"number","default":2,"minimum":0,"description":"the way of differential pairs and clock nets (pcb_net_roles) between the parts they join, and each of their pins' straight escape this long, is kept free of the block's parts; a part whose ports plan lays lanes for the group's pins (pcb_fanout_ports lanes) gives those lanes instead of the escapes, and the way goes on from their ends (signal_ways: per corridor its lines, polyline_mm and width_mm); a part enters it only when it finds no other place (a decoupling capacitor: when only that brings it within decap_max_mm), its row then names it (in_corridor); 0 off. Given, it is also the length of the anchor's fine-pitch and pair pins' escapes the parts' own vias keep clear of; by default those run as pcb_stitch's do, past the anchor's courtyard by one via pitch (the rules' via + clearance)"},
     "decap_bottom":{"type":"boolean","description":"a decoupling capacitor still farther than decap_max_mm from its pin goes to the board's other side, under the anchor, when that brings it within reach: each supply pin gets a via spot just beyond its inner end, under the body, clear of the other nets' copper and spots by the clearance (else beyond its outer end; a neighbour pin of the net within 1.2 mm shares it), and the cap's pad goes inward of the spot where there is room, else on any side of it, its other pads clear of every spot; the row gives via_spot_mm; default on for a fine-pitch anchor (0.65 mm or less), off otherwise; the row says side"},
     "ports_keep_mm":{"type":"number","minimum":0,"description":"layout level 2: the sides where the anchor's signals leave for other blocks (pcb_fanout_ports), as a band from those pads out past its courtyard, are kept free of the block's parts like escape_keep_mm (parts on those nets may enter; a differential pair's pins open their side's band whatever their port's kind). A series part - two pads, one signal net of the anchor's - never enters a band: it aims its pad at its pin's straight way out at the band's outer edge, so it stands just past the band in its pin's line. Default: each band as deep as its side's signal ports and pairs take fanning out side by side - each port's class track width + clearance summed, a differential pair once at 2 widths + its gap + a clearance; given: that many mm for every side; 0 off. No part yields to a band to come within reach (a decoupling capacitor goes to the other side or beside it); only a part with no spot at all outside the bands enters one (its row names it, in_corridor). Two alike series parts on neighbour pins the other way round than the pins trade places (swapped); corridors lists them as ports <side> (<far parts>), ports_bands gives their boxes"},
     "decap_vias":{"type":"boolean","default":true,"description":"decap_bottom: lay each bottom cap's via at its spot with a stub from the pin on the pin's layer (net class sizes, the stub no wider than the pin), in the same undo step, and the cap's pad joined to it on the cap's side where that track keeps clear; the rows say via_laid / via_joined, the answer vias_laid; the planes are refilled after"},
