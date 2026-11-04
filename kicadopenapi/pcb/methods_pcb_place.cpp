@@ -3086,17 +3086,17 @@ public:
         if( m_pads.empty() )
             return;
 
-        BOX2I near = aNear;
-        near.Inflate( m_reach );
+        BOX2I reachBox = aNear;
+        reachBox.Inflate( m_reach );
 
         for( FOOTPRINT* fp : aBoard->Footprints() )
         {
-            if( fp == aPart || ( aPending && aPending->count( fp ) ) || !fp->GetBoundingBox().Intersects( near ) )
+            if( fp == aPart || ( aPending && aPending->count( fp ) ) || !fp->GetBoundingBox().Intersects( reachBox ) )
                 continue;
 
             for( PAD* pad : fp->Pads() )
             {
-                if( ( pad->GetLayerSet() & partLayers ).any() && pad->GetBoundingBox().Intersects( near ) )
+                if( ( pad->GetLayerSet() & partLayers ).any() && pad->GetBoundingBox().Intersects( reachBox ) )
                     m_others.push_back( pad );
             }
         }
@@ -3397,9 +3397,9 @@ NEAR_PLACEMENT placeNear( BOARD* aBoard, FOOTPRINT* aPart, PAD* aTarget, const N
 
     if( need )
     {
-        BOX2I near( target, VECTOR2I( 0, 0 ) );
-        near.Inflate( reach + aPart->GetBoundingBox().GetWidth() + aPart->GetBoundingBox().GetHeight() );
-        vias.emplace( aBoard, aPart, host, near, aOptions.ownVias, aOptions.pending, aOptions.escapeKeepMm < 0 ? -1 : toIU( aOptions.escapeKeepMm ), aOptions.pairs );
+        BOX2I reachBox( target, VECTOR2I( 0, 0 ) );
+        reachBox.Inflate( reach + aPart->GetBoundingBox().GetWidth() + aPart->GetBoundingBox().GetHeight() );
+        vias.emplace( aBoard, aPart, host, reachBox, aOptions.ownVias, aOptions.pending, aOptions.escapeKeepMm < 0 ? -1 : toIU( aOptions.escapeKeepMm ), aOptions.pairs );
 
         if( !vias->Needed() )
             vias.reset();

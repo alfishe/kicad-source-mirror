@@ -18566,13 +18566,13 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
     // a pin's heading on its row: along it (toward its far end) or out (0)
     auto towardOf = [&]( int aSide, PAD* aPad ) -> int
     {
-        const std::optional<VECTOR2I>& far = farCached( aPad );
+        const std::optional<VECTOR2I>& farPos = farCached( aPad );
 
-        if( !far || !rowGeom.count( aSide ) )
+        if( !farPos || !rowGeom.count( aSide ) )
             return 0;
 
-        const int64_t da = alongOf( aSide, *far ) - alongOf( aSide, aPad->GetPosition() );
-        const int64_t outFar = outOf( aSide, *far );
+        const int64_t da = alongOf( aSide, *farPos ) - alongOf( aSide, aPad->GetPosition() );
+        const int64_t outFar = outOf( aSide, *farPos );
 
         return da != 0 && ( outFar <= 0 || std::abs( da ) > outFar ) ? ( da > 0 ? 1 : -1 ) : 0;
     };
@@ -18594,8 +18594,8 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
 
         for( PAD* q : list )
         {
-            const std::optional<VECTOR2I>& far = farCached( q );
-            int                            t = far && !takesVia( q ) ? towardOf( sideKey, q ) : 0;
+            const std::optional<VECTOR2I>& farPos = farCached( q );
+            int                            t = farPos && !takesVia( q ) ? towardOf( sideKey, q ) : 0;
 
             if( !t )
                 continue;
@@ -18608,8 +18608,8 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
             {
                 const ROW_GEOM& g = rowGeom[s];
                 const int64_t   end = t > 0 ? g.hi : g.lo;
-                const int64_t   farAt = alongOf( s, *far );
-                const bool      behind = outOf( s, *far ) <= 0;
+                const int64_t   farAt = alongOf( s, *farPos );
+                const bool      behind = outOf( s, *farPos ) <= 0;
 
                 if( t * ( farAt - end ) <= 0 )
                 {

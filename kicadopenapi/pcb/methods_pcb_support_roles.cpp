@@ -294,22 +294,22 @@ nlohmann::json KopenapiSupportRoles( KOPENAPI_CONTEXT& aCtx, BOARD* aBoard, cons
             }
             else if( signalLike( ra ) && signalLike( rb ) && anchorPins.count( a ) && anchorPins.count( b ) )
             {
-                std::string far;
+                std::string seriesVia;
 
                 for( const auto& pa : anchorPins[a] )
                 {
                     for( const auto& pb : anchorPins[b] )
                     {
-                        if( pa.first != pb.first && far.empty() )
-                            far = pa.first + "." + pa.second + " - " + pb.first + "." + pb.second;
+                        if( pa.first != pb.first && seriesVia.empty() )
+                            seriesVia = pa.first + "." + pa.second + " - " + pb.first + "." + pb.second;
                     }
                 }
 
-                if( !far.empty() )
+                if( !seriesVia.empty() )
                 {
                     role = "series";
                     pinNet = a;
-                    reason = "in series on " + far;
+                    reason = "in series on " + seriesVia;
                 }
             }
 
