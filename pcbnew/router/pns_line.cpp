@@ -367,10 +367,14 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
             hnew.Split(ip.p);
     }
 
+    // a point off the hull's box (grown by the edge test's 1 nm) is neither on its edge nor inside
+    BOX2I hullBox = hnew.BBox();
+    hullBox.Inflate( 2 );
+
     for( int i = 0; i < pnew.PointCount(); i++ )
     {
         const VECTOR2I& p = pnew.CPoint( i );
-        bool            onEdge = hnew.PointOnEdge( p );
+        bool            onEdge = hullBox.Contains( p ) && hnew.PointOnEdge( p );
 
         if ( !onEdge )
             continue;
@@ -399,8 +403,9 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
     for( int i = 0; i < pnew.PointCount(); i++ )
     {
         const VECTOR2I& p = pnew.CPoint(i);
-        bool            onEdge = hnew.PointOnEdge( p );
-        bool            inside = hnew.PointInside( p );
+        const bool      near = hullBox.Contains( p );
+        bool            onEdge = near && hnew.PointOnEdge( p );
+        bool            inside = near && hnew.PointInside( p );
 
         #ifdef TOM_EXTRA_DEBUG
         printf("pnew %d inside %d onedge %d\n", i, !!inside, !!onEdge );
