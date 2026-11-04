@@ -12802,11 +12802,66 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         return copperBetween( board, a, b );
     };
 
+    // nets of the call: copper of other nets that a shove laid again is theirs and stays
+    std::set<int> callNets;
+
+    for( const JOB& job : jobs )
+    {
+        if( job.foreign )
+            continue;
+
+        callNets.insert( job.from->GetNetCode() );
+
+        if( NETINFO_ITEM* coupled = job.trunk ? coupledNet( board, job.from->GetNet(), &explicitPairs ) : nullptr )
+            callNets.insert( coupled->GetNetCode() );
+    }
+
+    // copper of this call that leads nowhere (left by failed tries, rip-ups, router slivers) taken
+    // out; before each retry round too (aAll false: tracks only, a lane or a via laid ahead of its
+    // route stays), where it would shut in a pin that nothing else does
+    int stubs = 0;
+
+    auto sweepStubs = [&]( bool aAll )
+    {
+        for( bool again = !dryRun; again; )
+        {
+            again = false;
+            board->BuildConnectivity();
+            std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
+            BOARD_COMMIT                       sweep( context->GetToolManager() );
+
+            for( const KIID& id : added )
+            {
+                PCB_TRACK* track = dynamic_cast<PCB_TRACK*>( board->ResolveItem( id, true ) );
+
+                if( !track || track->IsLocked() || !callNets.count( track->GetNetCode() ) )
+                    continue;
+
+                if( !aAll && ( track->Type() == PCB_VIA_T || ringItems.count( track ) ) )
+                    continue;
+
+                if( conn->TestTrackEndpointDangling( track, true ) )
+                {
+                    sweep.Remove( track );
+                    stubs++;
+                    again = true;
+                }
+            }
+
+            if( again )
+                sweep.Push( _( "Remove dangling copper (API)" ) );
+            else
+                sweep.Revert();
+        }
+    };
+
     plateauInRipUp = true;
 
     for( int round = 0; round < ripRounds && !KopenapiJobCancelled() && !plateauPassCut; ++round )
     {
         bool progress = false;
+
+        sweepStubs( false );
 
         // the connections with fewest tries first: one that failed fast is not left without a turn
         // behind the slow ones; in the first round the plateau waits until each has had its turn
@@ -12872,9 +12927,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 profile.pass = "retry";
 
-                // until a rip-up has moved routes, the board has only gained copper since the first
-                // pass: the forward way failed there already
-                if( tryRoute( job, attempt, tries, false, true, rippedOk > 0 || overFirstBudget[index] ) )
+                // until a rip-up has moved routes or dangling copper went, the board has only gained
+                // copper since the first pass: the forward way failed there already
+                if( tryRoute( job, attempt, tries, false, true, rippedOk > 0 || stubs > 0 || overFirstBudget[index] ) )
                 {
                     progress = true;
                     boardVersion++;
@@ -13773,20 +13828,6 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         board->BuildConnectivity();
     }
 
-    // nets of the call: copper of other nets that a shove laid again is theirs and stays
-    std::set<int> callNets;
-
-    for( const JOB& job : jobs )
-    {
-        if( job.foreign )
-            continue;
-
-        callNets.insert( job.from->GetNetCode() );
-
-        if( NETINFO_ITEM* coupled = job.trunk ? coupledNet( board, job.from->GetNet(), &explicitPairs ) : nullptr )
-            callNets.insert( coupled->GetNetCode() );
-    }
-
     // a segment of this call laid over another one end to end (two routes of a net, or a rip-up's
     // way back, over the same piece): one copy stays
     int            twins = 0;
@@ -13851,36 +13892,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             drop.Revert();
     }
 
-    // copper of this call that leads nowhere (left by rip-ups, router slivers) taken out
-    int stubs = 0;
-
-    for( bool again = !dryRun; again; )
-    {
-        again = false;
-        board->BuildConnectivity();
-        std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
-        BOARD_COMMIT                       sweep( context->GetToolManager() );
-
-        for( const KIID& id : added )
-        {
-            PCB_TRACK* track = dynamic_cast<PCB_TRACK*>( board->ResolveItem( id, true ) );
-
-            if( !track || track->IsLocked() || !callNets.count( track->GetNetCode() ) )
-                continue;
-
-            if( conn->TestTrackEndpointDangling( track, true ) )
-            {
-                sweep.Remove( track );
-                stubs++;
-                again = true;
-            }
-        }
-
-        if( again )
-            sweep.Push( _( "Remove dangling copper (API)" ) );
-        else
-            sweep.Revert();
-    }
+    sweepStubs( true );
 
     // the rows as the copper is now: a routed one still joined (a later rip-up can cut a chain it
     // shared), a failed one perhaps joined by a later route
