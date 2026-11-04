@@ -6162,6 +6162,42 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         if( !aForward )
             ways.erase( ways.begin() );
 
+        // a via the net's copper (tracks, zones) reaches on one layer only (a fan-out port via): the
+        // route meets it on the other layers first, that layer last (else the via is left dead and its
+        // ways shut)
+        std::optional<PCB_LAYER_ID> portLayer;
+        bool                        portFirst = false;
+
+        if( aJob.to && aJob.to->Type() == PCB_VIA_T )
+        {
+            std::set<PCB_LAYER_ID> reached;
+
+            for( BOARD_CONNECTED_ITEM* item : board->GetConnectivity()->GetConnectedItems( aJob.to ) )
+            {
+                if( item->Type() == PCB_TRACE_T || item->Type() == PCB_ARC_T )
+                    reached.insert( item->GetLayer() );
+            }
+
+            // the net's zones round it (filled or not yet)
+            for( ZONE* zone : board->Zones() )
+            {
+                if( zone->GetNetCode() != aJob.to->GetNetCode() || zone->GetIsRuleArea()
+                    || !zone->Outline()->Contains( aJob.to->GetPosition() ) )
+                {
+                    continue;
+                }
+
+                for( PCB_LAYER_ID l : LSET( zone->GetLayerSet() & aJob.to->GetLayerSet() ).CuStack() )
+                    reached.insert( l );
+            }
+
+            if( reached.size() == 1 && layers.size() > 1 && viasAllowed )
+            {
+                portLayer = *reached.begin();
+                portFirst = true;
+            }
+        }
+
         // a try refused for walling in another pin's port: made again as the last try, with the ways out as
         // obstacles to the search (made at once, its detour round the part shuts the ports after it)
         std::optional<ROUTE_REQUEST> portRefused, wallRefused;
@@ -6444,7 +6480,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         // the global plan: a way over the free space of the layers, the router follows its corners
         int  planned = -1;   // -1 no plan made, 0 none found, 1 found
         int  boxed = 0;      // the plan's end shut in a room of its own: 1 the start, 2 the target
-        std::optional<ROUTE_PLAN> later;   // a plan through vias between ends on one layer: after shove
+        std::optional<ROUTE_PLAN> later;      // a plan through vias between ends on one layer: after shove
+        std::optional<ROUTE_PLAN> samePlan;   // a plan on the port via's own layer: last
 
         auto followPlan = [&]( const WAY& aWay, const ROUTE_PLAN& aPlan )
         {
@@ -6634,11 +6671,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             const bool common = std::any_of( layers.begin(), layers.end(), [&]( PCB_LAYER_ID l )
                                              { return way.from->IsOnLayer( l ) && way.to->IsOnLayer( l ); } );
 
-            if( plan.vias > 0 && common && aShove )
+            if( portFirst && plan.vias == 0 )
+                samePlan = plan;
+            else if( plan.vias > 0 && common && aShove )
                 later = plan;
             else
                 followPlan( way, plan );
         };
+
 
         // on a layer both ends are on: walkaround, then the plan, then shove (slow when it fails: last)
         auto onLayers = [&]( PNS::PNS_MODE aMode )
@@ -6648,6 +6688,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 for( PCB_LAYER_ID layer : layers )
                 {
                     if( ok || aTries >= maxTries || rail || !way.from->IsOnLayer( layer ) || !way.to->IsOnLayer( layer ) )
+                        continue;
+
+                    if( portFirst && portLayer == layer )
                         continue;
 
                     ROUTE_REQUEST req{ way.from, way.to, way.toPos, layer, aMode, dryRun, {} };
@@ -6660,6 +6703,23 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     ok = routeOne( *context, req, aAttempt, added );
                 }
             }
+        };
+
+        // the port via's own layer, when its other layers gave no way
+        auto portFallback = [&]()
+        {
+            if( ok || !portFirst || aTries >= maxTries || overTime() )
+                return;
+
+            const nlohmann::json before = aAttempt;
+            portFirst = false;
+            onLayers( PNS::RM_Walkaround );
+
+            if( !ok && samePlan && aTries < maxTries && !overTime() )
+                followPlan( ways.front(), *samePlan );
+
+            if( !ok && !before.is_null() )
+                aAttempt = before;
         };
 
         onLayers( PNS::RM_Walkaround );
@@ -6788,8 +6848,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         // the escape spots below find none either (they only try fewer ways)
         if( planned == 0 )
         {
-            aAttempt["plan"] = "no way over the free space around the connection";
-            return false;
+            portFallback();
+
+            if( !ok )
+                aAttempt["plan"] = "no way over the free space around the connection";
+
+            return ok;
         }
 
         for( const WAY& way : ways )
@@ -6879,17 +6943,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                        && aAttempt.contains( "stopped_at_mm" ) && !aAttempt.contains( "toward_mm" );
             };
 
-            // a through-hole end is on every layer: the route leaves it (or reaches it) on another
-            // layer itself, one via at the other end, no via beside the through-hole pin
-            auto through = []( BOARD_CONNECTED_ITEM* aEnd )
+            // a through-hole end (a pin, a port via) is on every layer: the route leaves it (or reaches
+            // it) on another layer itself, one via at the other end, no via beside the through-hole pin
+            auto through = [&]( BOARD_CONNECTED_ITEM* aEnd )
             {
-                return aEnd->Type() == PCB_PAD_T && static_cast<PAD*>( aEnd )->GetAttribute() == PAD_ATTRIB::PTH;
+                return ( portFirst && aEnd == aJob.to )
+                       || ( aEnd->Type() == PCB_PAD_T && static_cast<PAD*>( aEnd )->GetAttribute() == PAD_ATTRIB::PTH );
             };
 
             for( PCB_LAYER_ID cross : layers )
             {
                 const bool fromHere = through( way.from ) && cross != start;
-                const bool toHere = through( way.to ) && !fromHere && cross != start;
+                const bool toHere = through( way.to ) && !fromHere && cross != start && !( portFirst && cross == portLayer );
 
                 if( ok || ( !fromHere && !toHere ) )
                     continue;
@@ -7061,6 +7126,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 aAttempt = std::move( again );
             }
         }
+
+        portFallback();
 
         if( !ok && overTime() )
         {

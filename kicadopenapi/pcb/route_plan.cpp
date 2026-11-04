@@ -196,6 +196,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     const size_t         cells = (size_t) grid.nx * grid.ny;
     std::vector<uint8_t> track( cells * L, 0 );   // a track's centre may not be here, per layer
     std::vector<uint8_t> via( cells, 0 );         // a via's centre may not be here
+    std::vector<uint8_t> rowsVia( cells, 0 );     // over a chip's rows of pins (the ends' own cells cleared)
     const int            slack = cell / 4;        // a straight run between cell centres
     // within 0.8 mm of another net's pad: that pad's way out, which a plan passing there would take
     std::vector<uint8_t> nearPad( cells * L, 0 );
@@ -396,7 +397,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                     rows.Merge( pad->GetBoundingBox() );
 
                 if( !inside->Contains( fromPos ) && !inside->Contains( aReq.toPos ) )
-                    grid.Mark( SHAPE_RECT( rows ), viaRadius, via );
+                    grid.Mark( SHAPE_RECT( rows ), viaRadius, rowsVia );
             }
         }
 
@@ -596,6 +597,26 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         return finish();
 
     std::vector<uint8_t> isGoal( cells * L, 0 );
+
+    // the ends' own copper may take their via, the rest of the rows not
+    {
+        std::vector<uint8_t> own( cells, 0 );
+
+        for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( aReq.from ), aReq.to } )
+        {
+            const PAD*         pad = dynamic_cast<const PAD*>( end );
+            const PCB_LAYER_ID layer = pad ? pad->GetPrincipalLayer() : end->GetLayer();
+
+            if( std::shared_ptr<SHAPE> s = end->GetEffectiveShape( layer ) )
+                grid.Mark( *s, 0, own );
+        }
+
+        own[grid.Index( sx, sy )] = 1;
+        own[grid.Index( gx, gy )] = 1;
+
+        for( size_t c = 0; c < cells; ++c )
+            via[c] |= rowsVia[c] && !own[c];
+    }
 
     for( int l = 0; l < L; ++l )
     {
