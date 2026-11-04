@@ -9,6 +9,7 @@
 #include <board.h>
 #include <board_loader.h>
 #include <diff_merge/pcb_differ.h>
+#include <kicadopenapi_util.h>
 #include <kiway.h>
 #include <local_history.h>
 #include <pgm_base.h>
@@ -58,7 +59,7 @@ struct OTHER_BOARD
             mgr.UnloadProject( project, false );
 
         if( !tempDir.IsEmpty() )
-            wxFileName::Rmdir( tempDir, wxPATH_RMDIR_RECURSIVE );
+            KopenapiRemoveTree( tempDir );
     }
 };
 

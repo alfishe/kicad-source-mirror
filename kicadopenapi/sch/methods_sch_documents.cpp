@@ -1105,7 +1105,7 @@ static bool rescueSchematic( KOPENAPI_CONTEXT& aCtx, const std::vector<AUTOSAVE_
     if( !ok && aError.empty() )
         aError = "the auto-saved copies could not be loaded";
 
-    wxFileName::Rmdir( dir, wxPATH_RMDIR_RECURSIVE );
+    KopenapiRemoveTree( dir );
     return ok;
 }
 

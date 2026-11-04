@@ -60,6 +60,11 @@ KICOMMON_API long KopenapiUuidMatch( const std::vector<std::string>& aUuids, con
 /// exists): one spelling per file, so a project reached through another path is the same project
 KICOMMON_API wxString KopenapiCanonicalPath( const wxString& aPath );
 
+/// @brief Remove a folder and everything in it (missing is fine). Not wxFileName::Rmdir: on
+/// Windows that goes through the shell (SHFileOperation), which rescans the taskbar's recent
+/// items for every folder and takes seconds each
+KICOMMON_API void KopenapiRemoveTree( const wxString& aDir );
+
 /// @brief Natural order: "R2" < "R10", case-insensitive
 KICOMMON_API bool KopenapiNaturalLess( const std::string& aA, const std::string& aB );
 

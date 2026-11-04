@@ -676,6 +676,15 @@ nlohmann::json KopenapiRankedPage( std::vector<std::pair<KOPENAPI_TEXT_MATCH, nl
 }
 
 
+void KopenapiRemoveTree( const wxString& aDir )
+{
+    std::error_code ec;
+
+    if( !aDir.IsEmpty() )
+        std::filesystem::remove_all( std::filesystem::path( aDir.wc_str() ), ec );
+}
+
+
 wxString KopenapiCanonicalPath( const wxString& aPath )
 {
     std::error_code             ec;

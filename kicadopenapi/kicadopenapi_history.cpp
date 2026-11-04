@@ -137,7 +137,7 @@ struct KOPENAPI_HISTORY::IMPL
     static void removeDir( const std::string& aDir )
     {
         if( !aDir.empty() )
-            wxFileName::Rmdir( wxString::FromUTF8( aDir ), wxPATH_RMDIR_RECURSIVE );
+            KopenapiRemoveTree( wxString::FromUTF8( aDir ) );
     }
 
     static void drop( const MARK& aMark )
