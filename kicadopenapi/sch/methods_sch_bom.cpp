@@ -94,9 +94,11 @@ static KOPENAPI_RESULT h_sch_bom( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     if( !presetName.empty() )
     {
-        const BOM_PRESET* found = nullptr;
+        // kept: found may point into it
+        const std::vector<BOM_PRESET> builtIn = BOM_PRESET::BuiltInPresets();
+        const BOM_PRESET*             found = nullptr;
 
-        for( const BOM_PRESET& p : BOM_PRESET::BuiltInPresets() )
+        for( const BOM_PRESET& p : builtIn )
         {
             if( str( p.name ) == presetName )
                 found = &p;
@@ -112,7 +114,7 @@ static KOPENAPI_RESULT h_sch_bom( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         {
             std::vector<std::string> names;
 
-            for( const BOM_PRESET& p : BOM_PRESET::BuiltInPresets() )
+            for( const BOM_PRESET& p : builtIn )
                 names.push_back( str( p.name ) );
 
             for( const BOM_PRESET& p : sch->Settings().m_BomPresets )
