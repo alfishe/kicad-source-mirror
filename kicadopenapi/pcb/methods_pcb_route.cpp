@@ -12903,9 +12903,16 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 for( size_t other = 0; other < jobs.size(); ++other )
                 {
-                    if( !done[other] || aKeep.count( other ) || partner[other] >= 0 || jobs[other].to->Type() != PCB_PAD_T
+                    if( !done[other] || aKeep.count( other ) || partner[other] >= 0 )
+                        continue;
+
+                    // the ends by id: rip-ups delete and put back copper, a kept pointer may be gone
+                    const PAD*        otherFrom = dynamic_cast<PAD*>( board->ResolveItem( jobs[other].fromId, true ) );
+                    const BOARD_ITEM* otherTo = board->ResolveItem( jobs[other].toId, true );
+
+                    if( !otherFrom || !otherTo || otherTo->Type() != PCB_PAD_T
                         || ( rowOf[other] >= 0 && results[rowOf[other]].value( "joined_by_earlier_route", false ) )
-                        || jobs[other].from->GetNetCode() == aTarget.from->GetNetCode() )
+                        || otherFrom->GetNetCode() == aTarget.from->GetNetCode() )
                     {
                         continue;   // pairs stay; a joined airwire has no copper of its own; the own net is no obstacle
                     }
@@ -13489,7 +13496,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( size_t k = 0; k < jobs.size(); ++k )
         {
-            if( !done[k] || jobs[k].trunk || jobs[k].busVia || jobs[k].corridorRouted || jobs[k].laneRouted || partner[k] >= 0 || rowOf[k] < 0 || jobs[k].to->Type() != PCB_PAD_T
+            if( !done[k] || jobs[k].trunk || jobs[k].busVia || jobs[k].corridorRouted || jobs[k].laneRouted || partner[k] >= 0 || rowOf[k] < 0 || !dynamic_cast<PAD*>( board->ResolveItem( jobs[k].toId, true ) )
                 || !results[rowOf[k]].value( "routed", false ) || results[rowOf[k]].value( "joined_by_earlier_route", false ) )
             {
                 continue;
