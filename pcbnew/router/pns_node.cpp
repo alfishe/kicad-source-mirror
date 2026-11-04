@@ -366,14 +366,24 @@ NODE::OPT_OBSTACLE NODE::NearestObstacle( const LINE* aLine,
     DIRECTION_45::CORNER_MODE cornerMode = ROUTER::GetInstance()->Settings().GetCornerMode();
     OBSTACLES                 obstacleSet;
 
+    // one head for all the segments, alive until the end: the set orders its obstacles by their
+    // heads' geometry, and one item hit by two segments stays one obstacle
+    std::optional<SEGMENT> s;
+
     for( int i = 0; i < aLine->CLine().SegmentCount(); i++ )
     {
         // Note: Clearances between &s and other items are cached,
         // which means they'll be the same for all segments in the line.
         // Disabling the cache will lead to slowness.
 
-        const SEGMENT s( *aLine, aLine->CLine().CSegment( i ) );
-        QueryColliding( &s, obstacleSet, aOpts );
+        const SEG seg = aLine->CLine().CSegment( i );
+
+        if( s )
+            s->SetEnds( seg.A, seg.B );
+        else
+            s.emplace( *aLine, seg );
+
+        QueryColliding( &*s, obstacleSet, aOpts );
     }
 
     if( aLine->EndsWithVia() )
