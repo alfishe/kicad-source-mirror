@@ -5604,8 +5604,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         std::stable_sort( jobs.begin(), jobs.end(),
                           [&]( const JOB& x, const JOB& y )
                           {
-                              const bool fx = finePad( x.from ) || ( x.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( x.to.get() ) ) );
-                              const bool fy = finePad( y.from ) || ( y.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( y.to.get() ) ) );
+                              const bool fx = finePad( x.from ) || ( x.to && x.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( x.to.get() ) ) );
+                              const bool fy = finePad( y.from ) || ( y.to && y.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( y.to.get() ) ) );
 
                               if( fx != fy )
                                   return fx;
@@ -6181,7 +6181,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         std::vector<WAY> ways = { { aJob.from, aJob.to, aJob.toPos } };
 
-        if( aBothWays && aJob.to->Type() == PCB_PAD_T )
+        if( aBothWays && aJob.to && aJob.to->Type() == PCB_PAD_T )
             ways.push_back( { static_cast<PAD*>( aJob.to.get() ), aJob.from, aJob.from->GetPosition() } );
 
         // aForward false: the forward way is known to fail
@@ -10596,7 +10596,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             // routed alone from its far pad to the end of the pair's line
             std::map<int, std::pair<PCB_TRACK*, VECTOR2I>> pairEnds;   // net code -> its line's open end
 
-            if( pairOk && !dryRun )
+            if( pairOk && !dryRun && job.to && other.to )
             {
                 for( JOB* mine : { &job, &other } )
                 {
@@ -10733,7 +10733,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
 
         // an airwire an earlier route (a pair's trunk, a path through a pad) already joined
-        if( !dryRun && alongTried[index] <= 0 && job.to->Type() == PCB_PAD_T )
+        if( !dryRun && alongTried[index] <= 0 && job.to && job.to->Type() == PCB_PAD_T )
         {
             const auto joined = board->GetConnectivity()->GetConnectedItems( job.from );
 
@@ -10827,9 +10827,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                { "from", str( job.from->GetParentFootprint()->GetReference() ) + "." + str( job.from->GetNumber() ) },
                                { "routed", ok }, { "tries", tries } };
 
-        if( job.to->Type() == PCB_PAD_T )
-            row["to"] = str( static_cast<PAD*>( job.to.get() )->GetParentFootprint()->GetReference() ) + "."
-                        + str( static_cast<PAD*>( job.to.get() )->GetNumber() );
+        // a failed try's rollback may have taken the copper it was to end on
+        if( const PAD* toPad = dynamic_cast<const PAD*>( job.to.get() ) )
+            row["to"] = str( toPad->GetParentFootprint()->GetReference() ) + "." + str( toPad->GetNumber() );
 
         if( busRow.is_object() )
             row["bus"] = busRow;
@@ -13576,7 +13576,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             for( PCB_LAYER_ID layer : layers )
             {
-                if( job.from->IsOnLayer( layer ) && job.to->IsOnLayer( layer ) )
+                if( job.from->IsOnLayer( layer ) && job.to && job.to->IsOnLayer( layer ) )
                     shared.push_back( layer );
             }
 
