@@ -247,6 +247,11 @@ KOPENAPI_RESULT KopenapiNoSuchNet( BOARD* aBoard, const std::string& aName, cons
 /// sides of an edge connector's finger, or a pad stacked on another, are not neighbours)
 bool KopenapiPadNeighbours( const PAD* aA, const PAD* aB );
 
+/// The room between a chip's rows of pins when it has pins on four sides and is no ball or land
+/// array (QFP, QFN, LGA): from the inner edge of each row's pads; nullopt otherwise. A pin is in a
+/// row when its centre is within aTolerance of that side's outermost centres
+std::optional<BOX2I> KopenapiPadRingInside( const FOOTPRINT* aFp, int aTolerance );
+
 /// @brief A track as KiCad's rules size it: the narrowest they allow (a track_width min, the board
 /// minimum) and the width they ask (opt, else the net class's, else the board's current), in IU
 struct KOPENAPI_RULE_TRACK

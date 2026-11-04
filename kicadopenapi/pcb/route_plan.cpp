@@ -9,6 +9,7 @@
 #include <footprint.h>
 #include <geometry/shape.h>
 #include <geometry/shape_poly_set.h>
+#include <geometry/shape_rect.h>
 #include <geometry/shape_segment.h>
 #include <netclass.h>
 #include <pad.h>
@@ -22,6 +23,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <functional>
 #include <queue>
 #include <set>
@@ -343,7 +345,13 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                 continue;
 
             if( std::shared_ptr<SHAPE> s = aShape( layer ) )
-                put( *s, rule( CLEARANCE_CONSTRAINT, &probeVia, aItem, layer, floor ) + viaRadius + slack, via, viaSoft, 0 );
+            {
+                // the via's copper keeps the clearance, its hole the hole clearance
+                const int reach = std::max( rule( CLEARANCE_CONSTRAINT, &probeVia, aItem, layer, floor ) + viaRadius,
+                                            rule( HOLE_CLEARANCE_CONSTRAINT, &probeVia, aItem, layer, ds.m_HoleClearance )
+                                                    + aReq.viaDrill / 2 );
+                put( *s, reach + slack, via, viaSoft, 0 );
+            }
         }
     };
 
@@ -369,6 +377,28 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     {
         if( !fp->GetBoundingBox( false ).Intersects( region ) )
             continue;
+
+        // no via inside a chip's ring of pins nor among its rows (as the escape spots): the pins' ways
+        // out and in and their fan-out vias keep that room; an end inside the ring (an exposed pad) or
+        // a part the call opens keeps it open
+        if( vias && !aReq.ringOpen.count( fp ) )
+        {
+            int edge = INT_MAX;
+
+            for( PAD* pad : fp->Pads() )
+                edge = std::min( edge, (int) std::min( pad->GetBoundingBox().GetWidth(), pad->GetBoundingBox().GetHeight() ) );
+
+            if( const std::optional<BOX2I> inside = KopenapiPadRingInside( fp, std::max( edge / 2, 1 ) ) )
+            {
+                BOX2I rows = fp->Pads().front()->GetBoundingBox();
+
+                for( PAD* pad : fp->Pads() )
+                    rows.Merge( pad->GetBoundingBox() );
+
+                if( !inside->Contains( fromPos ) && !inside->Contains( aReq.toPos ) )
+                    grid.Mark( SHAPE_RECT( rows ), viaRadius, via );
+            }
+        }
 
         for( PAD* pad : fp->Pads() )
         {

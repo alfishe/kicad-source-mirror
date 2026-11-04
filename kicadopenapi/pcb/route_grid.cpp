@@ -1264,42 +1264,13 @@ void buildWorld( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_P
 
         // inside the ring of pins (pins on four sides, not an array): the room of the pins' ways in
         // and their fan-out vias
-        if( aParams.bodyCost > 1.0f && isPackage( fp ) )
+        if( aParams.bodyCost > 1.0f )
         {
-            std::vector<BOX2I> pads;
-            BOX2I              centres;
-
-            for( PAD* pad : fp->Pads() )
+            if( const std::optional<BOX2I> inside = KopenapiPadRingInside( fp, (int) pitch / 2 ) )
             {
-                pads.push_back( pad->GetBoundingBox() );
-                centres = pads.size() == 1 ? BOX2I( pad->GetPosition(), VECTOR2I( 0, 0 ) ) : centres.Merge( pad->GetPosition() );
-            }
+                const int left = inside->GetLeft(), right = inside->GetRight(), top = inside->GetTop(),
+                          bottom = inside->GetBottom();
 
-            const int tol = (int) pitch / 2;
-            int       left = INT_MIN, right = INT_MAX, top = INT_MIN, bottom = INT_MAX;
-            int       sides[4] = { 0, 0, 0, 0 };
-
-            for( PAD* pad : fp->Pads() )
-            {
-                const VECTOR2I c = pad->GetPosition();
-                const BOX2I    b = pad->GetBoundingBox();
-
-                if( std::abs( c.x - centres.GetLeft() ) <= tol )
-                    left = std::max( left, b.GetRight() ), sides[0]++;
-
-                if( std::abs( c.x - centres.GetRight() ) <= tol )
-                    right = std::min( right, b.GetLeft() ), sides[1]++;
-
-                if( std::abs( c.y - centres.GetTop() ) <= tol )
-                    top = std::max( top, b.GetBottom() ), sides[2]++;
-
-                if( std::abs( c.y - centres.GetBottom() ) <= tol )
-                    bottom = std::min( bottom, b.GetTop() ), sides[3]++;
-            }
-
-            if( sides[0] >= 3 && sides[1] >= 3 && sides[2] >= 3 && sides[3] >= 3 && left < right && top < bottom
-                && !isArray( pads ) )
-            {
                 if( aWorld.body.empty() )
                     aWorld.body.assign( aWorld.cells, 0 );
 
@@ -3958,6 +3929,48 @@ GRID_NET_RESULT toGeometry( const WORLD& aWorld, const GRID_PARAMS& aParams, con
 }
 
 } // namespace
+
+
+std::optional<BOX2I> KopenapiPadRingInside( const FOOTPRINT* aFp, int aTolerance )
+{
+    if( aFp->Pads().size() < 8 || !isPackage( aFp ) )
+        return std::nullopt;
+
+    std::vector<BOX2I> pads;
+    BOX2I              centres;
+
+    for( PAD* pad : aFp->Pads() )
+    {
+        pads.push_back( pad->GetBoundingBox() );
+        centres = pads.size() == 1 ? BOX2I( pad->GetPosition(), VECTOR2I( 0, 0 ) ) : centres.Merge( pad->GetPosition() );
+    }
+
+    int left = INT_MIN, right = INT_MAX, top = INT_MIN, bottom = INT_MAX;
+    int sides[4] = { 0, 0, 0, 0 };
+
+    for( PAD* pad : aFp->Pads() )
+    {
+        const VECTOR2I c = pad->GetPosition();
+        const BOX2I    b = pad->GetBoundingBox();
+
+        if( std::abs( c.x - centres.GetLeft() ) <= aTolerance )
+            left = std::max( left, b.GetRight() ), sides[0]++;
+
+        if( std::abs( c.x - centres.GetRight() ) <= aTolerance )
+            right = std::min( right, b.GetLeft() ), sides[1]++;
+
+        if( std::abs( c.y - centres.GetTop() ) <= aTolerance )
+            top = std::max( top, b.GetBottom() ), sides[2]++;
+
+        if( std::abs( c.y - centres.GetBottom() ) <= aTolerance )
+            bottom = std::min( bottom, b.GetTop() ), sides[3]++;
+    }
+
+    if( sides[0] < 3 || sides[1] < 3 || sides[2] < 3 || sides[3] < 3 || left >= right || top >= bottom || isArray( pads ) )
+        return std::nullopt;
+
+    return BOX2I( VECTOR2I( left, top ), VECTOR2I( right - left, bottom - top ) );
+}
 
 
 /// @brief The board as the search sees it, hashed: a branch must route over the same. Nets by name:

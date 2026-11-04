@@ -6088,6 +6088,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         req.stop = overTime;
         req.viaCost = pcbIUScale.mmToIU( viaCostMm );
 
+        for( const auto& [fp, ep] : inwardParts )
+            req.ringOpen.insert( fp );
+
         for( const ESCAPE_FRONT& front : fronts )
         {
             if( front.walls( aFrom->GetNetCode() ) && !pairTail( aTo ) )
@@ -6441,6 +6444,22 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         // the global plan: a way over the free space of the layers, the router follows its corners
         int  planned = -1;   // -1 no plan made, 0 none found, 1 found
         int  boxed = 0;      // the plan's end shut in a room of its own: 1 the start, 2 the target
+        std::optional<ROUTE_PLAN> later;   // a plan through vias between ends on one layer: after shove
+
+        auto followPlan = [&]( const WAY& aWay, const ROUTE_PLAN& aPlan )
+        {
+            ROUTE_REQUEST req{ aWay.from, aWay.to, aWay.toPos, aPlan.startLayer, PNS::RM_Walkaround, dryRun, {} };
+            req.fronts = &fronts;
+            req.tried = keepTries ? &aJob.tried : nullptr;
+            req.neckWidth = neckFor( aWay.from, aWay.to );
+            req.pairTail = pairTail( aWay.to );
+            req.vias = aPlan.points;
+            req.planned = true;
+            aAttempt = nlohmann::json::object();
+            aTries++;
+            ok = routeOne( *context, req, aAttempt, added );
+        };
+
         auto planTry = [&]()
         {
             if( ok || !planning || rail || ways.empty() || aTries >= maxTries )
@@ -6608,19 +6627,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                            + ( list.empty() ? std::string() : ", by " + list );
             }
 
-            if( plan.found )
-            {
-                ROUTE_REQUEST req{ way.from, way.to, way.toPos, plan.startLayer, PNS::RM_Walkaround, dryRun, {} };
-                req.fronts = &fronts;
-                req.tried = keepTries ? &aJob.tried : nullptr;
-                req.neckWidth = neckFor( way.from, way.to );
-                req.pairTail = pairTail( way.to );
-                req.vias = plan.points;
-                req.planned = true;
-                aAttempt = nlohmann::json::object();
-                aTries++;
-                ok = routeOne( *context, req, aAttempt, added );
-            }
+            if( !plan.found )
+                return;
+
+            // ends on a common layer: the shove try on it comes before a plan's vias
+            const bool common = std::any_of( layers.begin(), layers.end(), [&]( PCB_LAYER_ID l )
+                                             { return way.from->IsOnLayer( l ) && way.to->IsOnLayer( l ); } );
+
+            if( plan.vias > 0 && common && aShove )
+                later = plan;
+            else
+                followPlan( way, plan );
         };
 
         // on a layer both ends are on: walkaround, then the plan, then shove (slow when it fails: last)
@@ -6665,6 +6682,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( !ok && !before.is_null() )
                 aAttempt = before;
         }
+
+        if( !ok && later && aTries < maxTries && !overTime() )
+            followPlan( ways.front(), *later );
 
         // a walkaround that never got away from the start pad (it heads for the target and the pad's
         // side that way is shut): a corner out of each free side of the pad, the outward side first, as

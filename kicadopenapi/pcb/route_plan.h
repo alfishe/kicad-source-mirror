@@ -5,11 +5,13 @@
 #include <math/vector2d.h>
 #include <functional>
 #include <optional>
+#include <set>
 #include <vector>
 
 class BOARD;
 class BOARD_CONNECTED_ITEM;
 class PAD;
+class FOOTPRINT;
 
 /// @brief A connection to plan: from a pad to a pad (or other item of the net) over the given layers
 struct ROUTE_PLAN_REQUEST
@@ -35,6 +37,9 @@ struct ROUTE_PLAN_REQUEST
 
     /// @brief No track of this connection across these (ways out of other nets' pads kept open)
     std::vector<std::pair<PCB_LAYER_ID, SHAPE_SEGMENT>> keepOut;
+
+    /// @brief Parts whose ring of pins the call opens to vias (inward_escapes)
+    std::set<const FOOTPRINT*> ringOpen;
 
     /// @brief Search the whole board, not a box round the ends (the box's search reached its cut
     /// sides and found nothing)
