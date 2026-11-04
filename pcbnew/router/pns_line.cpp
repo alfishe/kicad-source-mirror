@@ -414,9 +414,9 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
     for( int i = 0; i < pnew.PointCount(); i++ )
     {
         const VECTOR2I& p = pnew.CPoint(i);
-        const bool      near = hullBox.Contains( p );
-        bool            onEdge = near && hnew.PointOnEdge( p );
-        bool            inside = near && hnew.PointInside( p );
+        const bool      inBox = hullBox.Contains( p );
+        bool            onEdge = inBox && hnew.PointOnEdge( p );
+        bool            inside = inBox && hnew.PointInside( p );
 
         #ifdef TOM_EXTRA_DEBUG
         printf("pnew %d inside %d onedge %d\n", i, !!inside, !!onEdge );
