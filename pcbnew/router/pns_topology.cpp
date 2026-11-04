@@ -1237,21 +1237,25 @@ const TOPOLOGY::CLUSTER TOPOLOGY::AssembleCluster( ITEM* aStart, int aLayer, dou
             if( aExcludedNet && obs.m_item->Net() == aExcludedNet )
                 continue;
 
-            if( obs.m_item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) && obs.m_item->Layers().Overlaps( aLayer ) )
+            // the cluster's box only bounds its growth: without a limit it is not needed
+            if( aAreaExpansionLimit > 0.0 )
             {
-                auto line = m_world->AssembleLine( static_cast<LINKED_ITEM*>(obs.m_item) );
-                clusterBBox.Merge( line.CLine().BBox() );
-            }
-            else
-            {
-                clusterBBox.Merge( obs.m_item->Shape( aLayer )->BBox() );
-            }
+                if( obs.m_item->OfKind( ITEM::SEGMENT_T | ITEM::ARC_T ) && obs.m_item->Layers().Overlaps( aLayer ) )
+                {
+                    auto line = m_world->AssembleLine( static_cast<LINKED_ITEM*>(obs.m_item) );
+                    clusterBBox.Merge( line.CLine().BBox() );
+                }
+                else
+                {
+                    clusterBBox.Merge( obs.m_item->Shape( aLayer )->BBox() );
+                }
 
-            const int64_t currentArea = clusterBBox.GetArea();
-            const double areaRatio = (double) currentArea / (double) ( initialArea + 1 );
+                const int64_t currentArea = clusterBBox.GetArea();
+                const double areaRatio = (double) currentArea / (double) ( initialArea + 1 );
 
-            if( aAreaExpansionLimit > 0.0 && areaRatio > aAreaExpansionLimit )
-                break;
+                if( areaRatio > aAreaExpansionLimit )
+                    break;
+            }
 
             if( processed.find( obs.m_item ) == processed.end() &&
                 obs.m_item->Layers().Overlaps( aLayer ) && !( obs.m_item->Marker() & MK_HEAD ) )
