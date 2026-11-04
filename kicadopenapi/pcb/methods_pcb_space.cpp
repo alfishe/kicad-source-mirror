@@ -2106,14 +2106,14 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
             }
         }
 
-        for( int far : fars )
+        for( int farIdx : fars )
         {
-            if( !seen.insert( code * 65536LL + far ).second )
+            if( !seen.insert( code * 65536LL + farIdx ).second )
                 continue;
 
             PAD* farPad = nullptr;
 
-            for( PAD* fp : b.parts[far].fp->Pads() )
+            for( PAD* fp : b.parts[farIdx].fp->Pads() )
             {
                 if( fp->GetNetCode() == code && !fp->GetNumber().IsEmpty() )
                 {
@@ -2124,7 +2124,7 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
 
             if( farPad )
             {
-                const GROUP_KEY key{ far, port.side, padSideOf( padExtent( b.parts[far].fp ), farPad->GetPosition() ),
+                const GROUP_KEY key{ farIdx, port.side, padSideOf( padExtent( b.parts[farIdx].fp ), farPad->GetPosition() ),
                                      padLayer( farPad ) };
                 toNets[key].insert( code );
                 thtEnd[key] = thtEnd[key] || key.farLayer == "THT" || padLayer( pad ) == "THT";
@@ -2304,9 +2304,9 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
         else if( p.to >= 0 && p.kind != "rail" && padLayer( p.pad ) != "THT" )
         {
             // a far end only on the other side's copper: the pin changes layer at its fan-out via
-            for( PAD* far : b.parts[p.to].fp->Pads() )
+            for( PAD* farPad : b.parts[p.to].fp->Pads() )
             {
-                if( far->GetNetCode() == p.code && padLayer( far ) != "THT" && padLayer( far ) != padLayer( p.pad ) )
+                if( farPad->GetNetCode() == p.code && padLayer( farPad ) != "THT" && padLayer( farPad ) != padLayer( p.pad ) )
                 {
                     p.via = true;
                     p.why = "its far end is on the other layer: a via to it";
@@ -2903,11 +2903,11 @@ static KOPENAPI_RESULT h_pcb_fanout_ports( KOPENAPI_CONTEXT& aCtx, const nlohman
                 LANE&     l = lanes[k];
                 const int64_t outer = front[{ l.turn == 2 ? l.next : l.own, l.to }];
                 const int64_t past = std::max<int64_t>( outer + pitch, wayOut[l.to] + l.clearance + l.width / 2 );
-                const int     far = lineAt( l.to, (int) std::max<int64_t>( outer, std::min<int64_t>( past, room[l.to] - l.width / 2 - l.clearance ) ) );
+                const int     farAt = lineAt( l.to, (int) std::max<int64_t>( outer, std::min<int64_t>( past, room[l.to] - l.width / 2 - l.clearance ) ) );
 
                 // published to the micron (polyline_mm): rounded outward, so the front holds as read
                 const double  um = pcbIUScale.mmToIU( 0.001 );
-                const int     farLine = KiROUND( ( outward[l.to].x + outward[l.to].y > 0 ? std::ceil( far / um ) : std::floor( far / um ) ) * um );
+                const int     farLine = KiROUND( ( outward[l.to].x + outward[l.to].y > 0 ? std::ceil( farAt / um ) : std::floor( farAt / um ) ) * um );
 
                 if( l.to % 2 == 0 )
                     l.pts.back().x = farLine;

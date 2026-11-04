@@ -2718,10 +2718,10 @@ public:
             if( !obstacleBox.Intersects( box ) )
                 continue;
 
-            const bool     near = aNear && aNearArea && m_owners[i] && aNear->count( m_owners[i] );
-            SHAPE_POLY_SET moved = near ? *aNearArea : aArea;
+            const bool     nearOwner = aNear && aNearArea && m_owners[i] && aNear->count( m_owners[i] );
+            SHAPE_POLY_SET moved = nearOwner ? *aNearArea : aArea;
             moved.Move( aDelta );
-            moved.BooleanIntersection( near && m_bare[i].OutlineCount() ? m_bare[i] : obstacle );
+            moved.BooleanIntersection( nearOwner && m_bare[i].OutlineCount() ? m_bare[i] : obstacle );
 
             if( !moved.IsEmpty() )
                 return false;
