@@ -5082,12 +5082,38 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     const KOPENAPI_UNROUTED openAtStart = KopenapiUnrouted( board, false );
     std::optional<KOPENAPI_UNROUTED> openAtEnd;
 
+    // A job's far end, held by id and found on the board at each use: a pad, or copper that a
+    // route's rollback or a rip-up deletes and puts back as a copy (same id, new item)
+    struct END_REF
+    {
+        BOARD* board = nullptr;
+        KIID   id = niluuid;
+
+        END_REF() = default;
+        END_REF( BOARD_CONNECTED_ITEM* aItem ) { *this = aItem; }
+
+        END_REF& operator=( BOARD_CONNECTED_ITEM* aItem )
+        {
+            board = aItem ? aItem->GetBoard() : nullptr;
+            id = aItem ? aItem->m_Uuid : niluuid;
+            return *this;
+        }
+
+        BOARD_CONNECTED_ITEM* get() const
+        {
+            return board ? dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( id, true ) ) : nullptr;
+        }
+
+        operator BOARD_CONNECTED_ITEM*() const { return get(); }
+        BOARD_CONNECTED_ITEM* operator->() const { return get(); }
+    };
+
     // the ends are found again by id before each job: an earlier route (shove) or the UI kept
     // alive between jobs may have removed or replaced them
     struct JOB
     {
         PAD*                  from;
-        BOARD_CONNECTED_ITEM* to;
+        END_REF               to;
         KIID                  fromId;
         KIID                  toId;
         VECTOR2I              toPos;
@@ -5578,8 +5604,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         std::stable_sort( jobs.begin(), jobs.end(),
                           [&]( const JOB& x, const JOB& y )
                           {
-                              const bool fx = finePad( x.from ) || ( x.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( x.to ) ) );
-                              const bool fy = finePad( y.from ) || ( y.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( y.to ) ) );
+                              const bool fx = finePad( x.from ) || ( x.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( x.to.get() ) ) );
+                              const bool fy = finePad( y.from ) || ( y.to->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( y.to.get() ) ) );
 
                               if( fx != fy )
                                   return fx;
@@ -6156,7 +6182,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         std::vector<WAY> ways = { { aJob.from, aJob.to, aJob.toPos } };
 
         if( aBothWays && aJob.to->Type() == PCB_PAD_T )
-            ways.push_back( { static_cast<PAD*>( aJob.to ), aJob.from, aJob.from->GetPosition() } );
+            ways.push_back( { static_cast<PAD*>( aJob.to.get() ), aJob.from, aJob.from->GetPosition() } );
 
         // aForward false: the forward way is known to fail
         if( !aForward )
@@ -6249,7 +6275,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( !ga )
             {
-                a = static_cast<PAD*>( aJob.to );
+                a = static_cast<PAD*>( aJob.to.get() );
                 b = aJob.from;
                 bPos = aJob.from->GetPosition();
                 std::swap( ga, gb );
@@ -6452,7 +6478,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         portTry();
 
         // a laid lane its route did not leave from: taken out again, the connection routed as any other
-        for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( aJob.from ), aJob.to } )
+        for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( aJob.from ), aJob.to.get() } )
         {
             auto it = !ok && end && end->Type() == PCB_PAD_T ? portGoals.find( static_cast<PAD*>( end ) ) : portGoals.end();
 
@@ -7510,7 +7536,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( taken.count( k ) || !codes.count( jobs[k].from->GetNetCode() ) )
                     continue;
 
-                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[k].from ), jobs[k].to } )
+                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[k].from ), jobs[k].to.get() } )
                 {
                     if( FOOTPRINT* fp = end->Type() == PCB_PAD_T ? static_cast<PAD*>( end )->GetParentFootprint() : nullptr;
                         fp && fp->Pads().size() >= 4 )
@@ -7554,7 +7580,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 if( j.from->GetParentFootprint() != source )
                 {
-                    PAD* farPad = dynamic_cast<PAD*>( j.to );
+                    PAD* farPad = dynamic_cast<PAD*>( j.to.get() );
 
                     if( !farPad || farPad->GetParentFootprint() != source )
                         continue;
@@ -8092,7 +8118,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( jobs[k].bus >= 0 )
                 continue;
 
-            for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[k].from ), jobs[k].to } )
+            for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[k].from ), jobs[k].to.get() } )
             {
                 const PAD* pad = end && end->Type() == PCB_PAD_T ? static_cast<const PAD*>( end ) : nullptr;
                 auto       it = pad ? portGoals.find( pad ) : portGoals.end();
@@ -8144,7 +8170,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     VECTOR2I         farAt = portEnd[k] == jobs[k].from ? jobs[k].toPos : jobs[k].from->GetPosition();
 
                     if( portEnd[k] == jobs[k].from && jobs[k].to && jobs[k].to->Type() == PCB_PAD_T )
-                        farPad = static_cast<const PAD*>( jobs[k].to );
+                        farPad = static_cast<const PAD*>( jobs[k].to.get() );
 
                     if( auto it = farPad ? portGoals.find( farPad ) : portGoals.end(); it != portGoals.end() && !it->second.lane.empty() )
                         farAt = it->second.lane.back();
@@ -8210,7 +8236,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( JOB& job : jobs )
         {
-            for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( job.from ), job.to } )
+            for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( job.from ), job.to.get() } )
             {
                 PAD* pad = end && end->Type() == PCB_PAD_T ? static_cast<PAD*>( end ) : nullptr;
                 auto it = pad ? portGoals.find( pad ) : portGoals.end();
@@ -8285,7 +8311,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         for( const JOB& job : jobs )
         {
             PAD* a = job.from;
-            PAD* b = job.to && job.to->Type() == PCB_PAD_T ? static_cast<PAD*>( job.to ) : nullptr;
+            PAD* b = job.to && job.to->Type() == PCB_PAD_T ? static_cast<PAD*>( job.to.get() ) : nullptr;
 
             if( !a || !b || !a->GetParentFootprint() || !b->GetParentFootprint() )
                 continue;
@@ -9619,7 +9645,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 JOB& j = jobs[m.job];
 
-                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to } )
+                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to.get() } )
                 {
                     const PAD* pad = end && end->Type() == PCB_PAD_T ? static_cast<const PAD*>( end ) : nullptr;
                     const auto tip = pad ? fanTip( pad ) : std::nullopt;
@@ -9644,7 +9670,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 const JOB& j = jobs[m.job];
 
-                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to } )
+                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to.get() } )
                 {
                     if( laneEndOf( end ) )
                         laneEnds[( ( end == j.from ) == m.forward ) ? 0 : 1]++;
@@ -9662,7 +9688,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 for( MEMBER& m : members )
                 {
                     JOB&                  j = jobs[m.job];
-                    BOARD_CONNECTED_ITEM* end = ( side == 0 ) == m.forward ? static_cast<BOARD_CONNECTED_ITEM*>( j.from ) : j.to;
+                    BOARD_CONNECTED_ITEM* end = ( side == 0 ) == m.forward ? static_cast<BOARD_CONNECTED_ITEM*>( j.from ) : j.to.get();
                     const PCB_TRACK*      last = laneEndOf( end );
 
                     ( side == 0 ? m.start : m.end ) = last->GetEnd();
@@ -10113,7 +10139,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( partner[k] >= 0 )
                 continue;
 
-            for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[k].from ), jobs[k].to } )
+            for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[k].from ), jobs[k].to.get() } )
             {
                 if( PAD* pad = dynamic_cast<PAD*>( end ); pad && pad->GetParentFootprint() )
                     addFronts( pad, k );
@@ -10329,7 +10355,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( int side = 0; side < 2; ++side )
         {
-            BOARD_CONNECTED_ITEM* end = side == 0 ? static_cast<BOARD_CONNECTED_ITEM*>( job.from ) : job.to;
+            BOARD_CONNECTED_ITEM* end = side == 0 ? static_cast<BOARD_CONNECTED_ITEM*>( job.from ) : job.to.get();
             auto                  it = ( side == 0 ? job.laneFrom : job.laneTo ) && end && end->Type() == PCB_PAD_T
                                                ? portGoals.find( static_cast<PAD*>( end ) ) : portGoals.end();
             PCB_TRACK*            last = it != portGoals.end() && !it->second.ring.empty()
@@ -10521,8 +10547,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             // from either end of the trunk; the pair follows the corridor a single route finds first
             // (tried, not kept)
-            PAD* const trunkEnds[2][2] = { { job.from, static_cast<PAD*>( job.to ) },
-                                           { static_cast<PAD*>( job.to ), job.from } };
+            PAD* const trunkEnds[2][2] = { { job.from, static_cast<PAD*>( job.to.get() ) },
+                                           { static_cast<PAD*>( job.to.get() ), job.from } };
 
             // the guiding single route is the same whatever the pair's mode: found once per end and layer
             std::map<std::tuple<PAD*, PAD*, int>, std::vector<VECTOR2I>> guides;
@@ -10630,7 +10656,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     const auto  joined = board->GetConnectivity()->GetConnectedItems( track );
                     const bool  fromOn = std::find( joined.begin(), joined.end(), wire.from ) != joined.end();
                     const bool  toOn = std::find( joined.begin(), joined.end(), wire.to ) != joined.end();
-                    PAD*        farPad = !fromOn ? wire.from : dynamic_cast<PAD*>( wire.to );
+                    PAD*        farPad = !fromOn ? wire.from : dynamic_cast<PAD*>( wire.to.get() );
 
                     if( fromOn == toOn || !farPad )
                         continue;
@@ -10657,8 +10683,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     nlohmann::json row = { { "net", mine->net },
                                            { "from", str( mine->from->GetParentFootprint()->GetReference() ) + "."
                                                              + str( mine->from->GetNumber() ) },
-                                           { "to", str( static_cast<PAD*>( mine->to )->GetParentFootprint()->GetReference() ) + "."
-                                                           + str( static_cast<PAD*>( mine->to )->GetNumber() ) },
+                                           { "to", str( static_cast<PAD*>( mine->to.get() )->GetParentFootprint()->GetReference() ) + "."
+                                                           + str( static_cast<PAD*>( mine->to.get() )->GetNumber() ) },
                                            { "routed", true },
                                            { "trunk", true },
                                            { "engine", "pns" },
@@ -10717,8 +10743,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 rowOf[index] = (int) results.size();
                 results.push_back( { { "net", job.net },
                                      { "from", str( job.from->GetParentFootprint()->GetReference() ) + "." + str( job.from->GetNumber() ) },
-                                     { "to", str( static_cast<PAD*>( job.to )->GetParentFootprint()->GetReference() ) + "."
-                                                     + str( static_cast<PAD*>( job.to )->GetNumber() ) },
+                                     { "to", str( static_cast<PAD*>( job.to.get() )->GetParentFootprint()->GetReference() ) + "."
+                                                     + str( static_cast<PAD*>( job.to.get() )->GetNumber() ) },
                                      { "routed", true },
                                      { "tries", 0 },
                                      { "joined_by_earlier_route", true },
@@ -10802,8 +10828,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                { "routed", ok }, { "tries", tries } };
 
         if( job.to->Type() == PCB_PAD_T )
-            row["to"] = str( static_cast<PAD*>( job.to )->GetParentFootprint()->GetReference() ) + "."
-                        + str( static_cast<PAD*>( job.to )->GetNumber() );
+            row["to"] = str( static_cast<PAD*>( job.to.get() )->GetParentFootprint()->GetReference() ) + "."
+                        + str( static_cast<PAD*>( job.to.get() )->GetNumber() );
 
         if( busRow.is_object() )
             row["bus"] = busRow;
@@ -10960,7 +10986,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 n.width = std::min( n.width, neck );
 
-                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( job.from ), job.to } )
+                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( job.from ), job.to.get() } )
                 {
                     if( end && end->Type() == PCB_PAD_T && finePad( static_cast<PAD*>( end ) ) )
                     {
@@ -11996,7 +12022,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             for( size_t index : jobsOfNet[k] )
             {
-                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ), jobs[index].to } )
+                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ), jobs[index].to.get() } )
                 {
                     if( !end || end->Type() != PCB_PAD_T || !finePad( static_cast<PAD*>( end ) ) )
                         continue;
@@ -12287,7 +12313,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         if( w.end != a && w.end != b )
                             continue;
 
-                        BOARD_CONNECTED_ITEM* end = w.end == a ? static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ) : jobs[index].to;
+                        BOARD_CONNECTED_ITEM* end = w.end == a ? static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ) : jobs[index].to.get();
                         std::string           name = endName( end );
                         nlohmann::json        by = nlohmann::json::array();
                         std::string           list;
@@ -12385,8 +12411,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     {
                         nlohmann::json by = nlohmann::json::array();
 
-                        for( const auto& [e, end, aim] : { std::tuple{ a, static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ), jobs[index].to },
-                                                           std::tuple{ b, jobs[index].to, static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ) } } )
+                        for( const auto& [e, end, aim] : { std::tuple{ a, static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ), jobs[index].to.get() },
+                                                           std::tuple{ b, jobs[index].to.get(), static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ) } } )
                         {
                             if( r && (size_t) e < r->reached.size() && r->reached[e] )
                                 continue;
@@ -12406,7 +12432,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     // the reason a fine-pitch end cannot be left, with its numbers (before the wall's)
                     if( !reached && !KopenapiJobCancelled() )
                     {
-                        for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ), jobs[index].to } )
+                        for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ), jobs[index].to.get() } )
                         {
                             if( !end || end->Type() != PCB_PAD_T || !finePad( static_cast<PAD*>( end ) ) )
                                 continue;
