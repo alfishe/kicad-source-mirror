@@ -862,21 +862,16 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
 
     if( reached < 0 )
     {
-        // the start's room goes on past the box: once more over the whole board
-        if( open.Empty() && reachedCut && !aReq.wholeBoard )
-        {
-            ROUTE_PLAN_REQUEST wide = aReq;
-            wide.wholeBoard = true;
+        // the room of the target in the box (the states a track or a via of the net reaches from it),
+        // searched as far as the start's: closed inside the box, the target is shut in, also over the
+        // whole board
+        constexpr size_t ROOM = 20000;
+        const size_t     cap = std::max( ROOM, (size_t) plan.expanded );
+        size_t           room = 0;
+        bool             roomCut = false;
 
-            ROUTE_PLAN again = PlanRoute( wide );
-            again.ms += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
-            return again;
-        }
-
-        // all the start reaches searched: is it the start's room or the target's that is shut
         if( open.Empty() )
         {
-            constexpr size_t ROOM = 20000;
             std::vector<uint8_t> seen( states, 0 );
             std::vector<int>     todo;
 
@@ -886,18 +881,22 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
             for( const auto& [s, esc] : goalEscapes )
                 todo.push_back( s );
 
-            size_t room = 0;
-
             for( int s : todo )
                 seen[s] = 1;
 
-            while( !todo.empty() && room <= ROOM )
+            while( !todo.empty() && room <= cap && !roomCut )
             {
                 const int s = todo.back();
                 todo.pop_back();
                 room++;
 
                 const int l = s / (int) cells, c = s % (int) cells, x = c % grid.nx, y = c / grid.nx;
+
+                if( ( x == 0 && cutSide[0] ) || ( y == 0 && cutSide[1] ) || ( x == grid.nx - 1 && cutSide[2] )
+                    || ( y == grid.ny - 1 && cutSide[3] ) )
+                {
+                    roomCut = true;
+                }
 
                 for( int d = 0; d < 8; d += 2 )
                 {
@@ -929,8 +928,25 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                     }
                 }
             }
+        }
 
-            if( room <= ROOM && (size_t) plan.expanded > room )
+        const bool targetShut = open.Empty() && room <= cap && !roomCut;
+
+        // the start's room goes on past the box: once more over the whole board
+        if( open.Empty() && reachedCut && !aReq.wholeBoard && !targetShut )
+        {
+            ROUTE_PLAN_REQUEST wide = aReq;
+            wide.wholeBoard = true;
+
+            ROUTE_PLAN again = PlanRoute( wide );
+            again.ms += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
+            return again;
+        }
+
+        // all the start reaches searched: is it the start's room or the target's that is shut
+        if( open.Empty() )
+        {
+            if( targetShut && (size_t) plan.expanded > room )
             {
                 plan.boxedEnd = 2;
                 plan.boxedRoom = room;
