@@ -350,8 +350,19 @@ bool LINE::Walkaround( const SHAPE_LINE_CHAIN& aObstacle, SHAPE_LINE_CHAIN& aPat
                 return nullptr;
             };
 
+    // the cluster's walk goes round its items one by one, mostly with the same path: its self
+    // crossing is found once per path
+    thread_local std::vector<VECTOR2I>                        lastPath;
+    thread_local std::optional<SHAPE_LINE_CHAIN::INTERSECTION> lastCross;
+
+    if( pnew.IsClosed() || pnew.CPoints() != lastPath )
+    {
+        lastPath = pnew.CPoints();
+        lastCross = pnew.SelfIntersecting();
+    }
+
     // corner case for loopy tracks: insert the end loop point back into the hull
-    if( const std::optional<SHAPE_LINE_CHAIN::INTERSECTION> isect = pnew.SelfIntersecting() )
+    if( const std::optional<SHAPE_LINE_CHAIN::INTERSECTION> isect = lastCross )
     {
         if( isect->p != pnew.CLastPoint() )
             pnew.Split( isect->p );
