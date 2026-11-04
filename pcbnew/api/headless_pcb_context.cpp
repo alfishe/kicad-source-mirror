@@ -292,7 +292,7 @@ bool HEADLESS_PCB_CONTEXT::LoadContentFrom( const wxString& aPath )
 }
 
 
-bool HEADLESS_PCB_CONTEXT::reload( const wxString& aPath, bool aModified )
+bool HEADLESS_PCB_CONTEXT::reload( wxString aPath, bool aModified )
 {
     wxCHECK( m_board && m_project, false );
 

@@ -75,7 +75,8 @@ public:
     bool LoadContentFrom( const wxString& aPath ) override;
 
 private:
-    bool reload( const wxString& aPath, bool aModified );
+    // aPath by value: it may be the replaced board's own file name
+    bool reload( wxString aPath, bool aModified );
 
     std::unique_ptr<BOARD> m_board;
     PROJECT* m_project;
