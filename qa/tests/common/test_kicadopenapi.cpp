@@ -279,9 +279,9 @@ BOOST_AUTO_TEST_CASE( ArgsUnknownNameSuggestsNearest )
     BOOST_CHECK( bad.find( "unknown argument 'layers'" ) != std::string::npos );
     BOOST_CHECK( bad.find( "did you mean 'layer'" ) != std::string::npos );
 
-    const std::string far = KopenapiValidateArgs( "t_route", ROUTE_SCHEMA, { { "from", "U1.3" }, { "colour", 1 } } );
-    BOOST_CHECK( far.find( "unknown argument 'colour'" ) != std::string::npos );
-    BOOST_CHECK( far.find( "did you mean" ) == std::string::npos );
+    const std::string unknownArg = KopenapiValidateArgs( "t_route", ROUTE_SCHEMA, { { "from", "U1.3" }, { "colour", 1 } } );
+    BOOST_CHECK( unknownArg.find( "unknown argument 'colour'" ) != std::string::npos );
+    BOOST_CHECK( unknownArg.find( "did you mean" ) == std::string::npos );
 }
 
 
