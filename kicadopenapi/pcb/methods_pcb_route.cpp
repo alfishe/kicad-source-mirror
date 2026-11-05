@@ -3860,6 +3860,17 @@ static KOPENAPI_RESULT h_pcb_route_connection( KOPENAPI_CONTEXT& aCtx, const nlo
 /// mode.  One push per accepted route (rollback by steps undoes the whole call: it is one step).
 namespace
 {
+/// @brief A net's tracks and vias by end point and the pads they end on, for copperBetween
+struct NET_COPPER
+{
+    std::vector<PCB_TRACK*>                                    items;
+    std::map<std::pair<int, int>, std::vector<size_t>>         atPoint;
+    std::vector<std::pair<PAD*, std::vector<size_t>>>          pads;
+    std::vector<std::vector<size_t>>                           padsOf;
+};
+
+NET_COPPER              netCopper( BOARD* aBoard, int aNet );
+std::vector<PCB_TRACK*> copperBetween( const NET_COPPER& aNet, PAD* aFrom, PAD* aTo );
 std::vector<PCB_TRACK*> copperBetween( BOARD* aBoard, PAD* aFrom, PAD* aTo );
 }
 
@@ -13566,16 +13577,35 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         std::vector<CLEAN_TRY> candidates;
         std::set<PCB_TRACK*>   trunkCopper;   // pairs stay as they are
 
-        for( size_t t = 0; t < trunks.size(); ++t )
+        // the board does not change while the candidates are collected: one copper index per net
+        std::map<int, NET_COPPER> netIndex;
+
+        auto indexedChain = [&]( JOB& aJob ) -> std::vector<PCB_TRACK*>
+        {
+            PAD* a = dynamic_cast<PAD*>( board->ResolveItem( aJob.fromId, true ) );
+            PAD* b = dynamic_cast<PAD*>( board->ResolveItem( aJob.toId, true ) );
+
+            if( !a || !b )
+                return {};
+
+            auto it = netIndex.find( a->GetNetCode() );
+
+            if( it == netIndex.end() )
+                it = netIndex.emplace( a->GetNetCode(), netCopper( board, a->GetNetCode() ) ).first;
+
+            return copperBetween( it->second, a, b );
+        };
+
+        for( size_t t = 0; t < trunks.size() && !KopenapiJobCancelled(); ++t )
         {
             if( done[t] )
             {
-                for( PCB_TRACK* track : chainOf( jobs[t] ) )
+                for( PCB_TRACK* track : indexedChain( jobs[t] ) )
                     trunkCopper.insert( track );
             }
         }
 
-        for( size_t k = 0; k < jobs.size(); ++k )
+        for( size_t k = 0; k < jobs.size() && !KopenapiJobCancelled(); ++k )
         {
             if( !done[k] || jobs[k].trunk || jobs[k].busVia || jobs[k].corridorRouted || jobs[k].laneRouted || partner[k] >= 0 || rowOf[k] < 0 || !dynamic_cast<PAD*>( board->ResolveItem( jobs[k].toId, true ) )
                 || !results[rowOf[k]].value( "routed", false ) || results[rowOf[k]].value( "joined_by_earlier_route", false ) )
@@ -13583,7 +13613,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 continue;
             }
 
-            const std::vector<PCB_TRACK*> chain = chainOf( jobs[k] );
+            const std::vector<PCB_TRACK*> chain = indexedChain( jobs[k] );
 
             if( chain.empty()
                 || std::any_of( chain.begin(), chain.end(),
@@ -16532,16 +16562,14 @@ nlohmann::json trackJson( BOARD* aBoard, PCB_TRACK* aTrack )
 }
 
 
-/// @brief The tracks and vias that join two pads of one net: the shortest chain of items touching end
-/// to end (through other pads of the net too); empty when the pads are not joined by copper
-std::vector<PCB_TRACK*> copperBetween( BOARD* aBoard, PAD* aFrom, PAD* aTo )
+NET_COPPER netCopper( BOARD* aBoard, int aNet )
 {
-    std::vector<PCB_TRACK*> items;
+    NET_COPPER net;
 
     for( PCB_TRACK* track : aBoard->Tracks() )
     {
-        if( track->GetNetCode() == aFrom->GetNetCode() )
-            items.push_back( track );
+        if( track->GetNetCode() == aNet )
+            net.items.push_back( track );
     }
 
     auto ends = []( PCB_TRACK* aTrack ) -> std::vector<VECTOR2I>
@@ -16552,13 +16580,10 @@ std::vector<PCB_TRACK*> copperBetween( BOARD* aBoard, PAD* aFrom, PAD* aTo )
         return { aTrack->GetStart(), aTrack->GetEnd() };
     };
 
-    // items by end point; pads of the net with the items ending on them
-    std::map<std::pair<int, int>, std::vector<size_t>> atPoint;
-
-    for( size_t i = 0; i < items.size(); i++ )
+    for( size_t i = 0; i < net.items.size(); i++ )
     {
-        for( const VECTOR2I& e : ends( items[i] ) )
-            atPoint[{ e.x, e.y }].push_back( i );
+        for( const VECTOR2I& e : ends( net.items[i] ) )
+            net.atPoint[{ e.x, e.y }].push_back( i );
     }
 
     auto touches = []( PAD* aPad, PCB_TRACK* aTrack, const VECTOR2I& aEnd )
@@ -16566,24 +16591,22 @@ std::vector<PCB_TRACK*> copperBetween( BOARD* aBoard, PAD* aFrom, PAD* aTo )
         return ( aPad->GetLayerSet() & aTrack->GetLayerSet() ).any() && aPad->HitTest( aEnd, 0 );
     };
 
-    std::vector<std::pair<PAD*, std::vector<size_t>>> pads;
-
     for( FOOTPRINT* fp : aBoard->Footprints() )
     {
         for( PAD* pad : fp->Pads() )
         {
-            if( pad->GetNetCode() != aFrom->GetNetCode() )
+            if( pad->GetNetCode() != aNet )
                 continue;
 
-            pads.emplace_back( pad, std::vector<size_t>() );
+            net.pads.emplace_back( pad, std::vector<size_t>() );
 
-            for( size_t i = 0; i < items.size(); i++ )
+            for( size_t i = 0; i < net.items.size(); i++ )
             {
-                for( const VECTOR2I& e : ends( items[i] ) )
+                for( const VECTOR2I& e : ends( net.items[i] ) )
                 {
-                    if( touches( pad, items[i], e ) )
+                    if( touches( pad, net.items[i], e ) )
                     {
-                        pads.back().second.push_back( i );
+                        net.pads.back().second.push_back( i );
                         break;
                     }
                 }
@@ -16591,21 +16614,30 @@ std::vector<PCB_TRACK*> copperBetween( BOARD* aBoard, PAD* aFrom, PAD* aTo )
         }
     }
 
-    std::vector<std::vector<size_t>> padsOf( items.size() );
+    net.padsOf.resize( net.items.size() );
 
-    for( size_t p = 0; p < pads.size(); p++ )
+    for( size_t p = 0; p < net.pads.size(); p++ )
     {
-        for( size_t i : pads[p].second )
-            padsOf[i].push_back( p );
+        for( size_t i : net.pads[p].second )
+            net.padsOf[i].push_back( p );
     }
 
-    const size_t        none = items.size();
-    std::vector<size_t> parent( items.size(), none );
-    std::vector<bool>   seen( items.size(), false );
-    std::deque<size_t>  queue;
-    std::set<size_t>    goal;
+    return net;
+}
 
-    for( const auto& [pad, list] : pads )
+
+/// @brief The tracks and vias that join two pads of one net: the shortest chain of items touching end
+/// to end (through other pads of the net too); empty when the pads are not joined by copper
+std::vector<PCB_TRACK*> copperBetween( const NET_COPPER& aNet, PAD* aFrom, PAD* aTo )
+{
+    const std::vector<PCB_TRACK*>& items = aNet.items;
+    const size_t                   none = items.size();
+    std::vector<size_t>            parent( items.size(), none );
+    std::vector<bool>              seen( items.size(), false );
+    std::deque<size_t>             queue;
+    std::set<size_t>               goal;
+
+    for( const auto& [pad, list] : aNet.pads )
     {
         if( pad == aFrom )
         {
@@ -16646,19 +16678,26 @@ std::vector<PCB_TRACK*> copperBetween( BOARD* aBoard, PAD* aFrom, PAD* aTo )
             }
         };
 
-        for( const VECTOR2I& e : ends( items[at] ) )
+        const std::vector<VECTOR2I> atEnds = items[at]->Type() == PCB_VIA_T
+                                                     ? std::vector<VECTOR2I>{ items[at]->GetPosition() }
+                                                     : std::vector<VECTOR2I>{ items[at]->GetStart(), items[at]->GetEnd() };
+
+        for( const VECTOR2I& e : atEnds )
         {
-            for( size_t next : atPoint[{ e.x, e.y }] )
-                visit( next );
+            if( auto it = aNet.atPoint.find( { e.x, e.y } ); it != aNet.atPoint.end() )
+            {
+                for( size_t next : it->second )
+                    visit( next );
+            }
         }
 
         // through a pad of the net (not the two asked for): everything else ending on it
-        for( size_t p : padsOf[at] )
+        for( size_t p : aNet.padsOf[at] )
         {
-            if( pads[p].first == aFrom || pads[p].first == aTo )
+            if( aNet.pads[p].first == aFrom || aNet.pads[p].first == aTo )
                 continue;
 
-            for( size_t next : pads[p].second )
+            for( size_t next : aNet.pads[p].second )
             {
                 if( !seen[next] )
                 {
@@ -16671,6 +16710,12 @@ std::vector<PCB_TRACK*> copperBetween( BOARD* aBoard, PAD* aFrom, PAD* aTo )
     }
 
     return {};
+}
+
+
+std::vector<PCB_TRACK*> copperBetween( BOARD* aBoard, PAD* aFrom, PAD* aTo )
+{
+    return copperBetween( netCopper( aBoard, aFrom->GetNetCode() ), aFrom, aTo );
 }
 
 
