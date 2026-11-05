@@ -68,7 +68,7 @@ struct RECORD_WRITER
         data.insert( data.end(), body.begin(), body.end() );
     }
 
-    void pascal( const std::string& aText )
+    void pascalString( const std::string& aText )
     {
         u8( aText.size() );
         data.insert( data.end(), aText.begin(), aText.end() );
@@ -115,7 +115,7 @@ std::vector<char> textRecord( size_t aLength, const std::string& aText, bool aWi
     rec.subrecord( sub.data, aLength );
 
     RECORD_WRITER text;
-    text.pascal( aText );
+    text.pascalString( aText );
     rec.subrecord( text.data, text.data.size() );
 
     // Next record's first byte: the parser must stop exactly before it
@@ -131,7 +131,7 @@ std::vector<char> padRecord( size_t aLength )
     rec.u8( static_cast<uint8_t>( ALTIUM_RECORD::PAD ) );
 
     RECORD_WRITER name;
-    name.pascal( "7" );
+    name.pascalString( "7" );
     rec.subrecord( name.data, name.data.size() );
 
     for( int i = 0; i < 3; i++ )
