@@ -66,6 +66,7 @@ struct PIN
     bool        moved = false;    ///< leaves on the other layer than its pad's (a via at an SMD pad)
     std::optional<VECTOR2I> via;
     VECTOR2I    slot;
+    VECTOR2I    knee;              ///< straight out from the pad past the vias and the pads' ways out
     int         slotSide = 0;
     int         rank = 0;          ///< place in its link's band
 };
@@ -81,6 +82,7 @@ struct LINK
     bool             fast = false;
     VECTOR2I         arrives;    ///< where it comes from: its far pads' centre, or given
     bool             arrivesGiven = false;
+    std::optional<int> fixedLayer;   ///< given: the layer it leaves on (0 F.Cu, 1 B.Cu), not searched
     double           arrivesS = 0;
     int              padLayer = 0;   ///< 0 F, 1 B, 2 through-hole only
     int              farLayer = 2;   ///< 0 F, 1 B, 2 both / unknown
@@ -555,6 +557,16 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
                                               pcbIUScale.mmToIU( given["from_mm"][1].get<double>() ) );
                     link->arrivesGiven = true;
                 }
+
+                if( given.contains( "layer" ) && given["layer"].is_string() )
+                {
+                    const std::string layer = given["layer"].get<std::string>();
+
+                    if( layer != "F.Cu" && layer != "B.Cu" )
+                        return KOPENAPI_RESULT::Error( 400, "links[].layer: F.Cu or B.Cu, not " + layer );
+
+                    link->fixedLayer = layer == "B.Cu" ? 1 : 0;
+                }
             }
         }
     }
@@ -696,7 +708,18 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
     std::vector<int> layerOf( buses.size(), 0 );
 
     for( size_t i = 0; i < buses.size(); ++i )
-        layerOf[i] = links[buses[i]].padLayer == 1 ? 1 : 0;
+        layerOf[i] = links[buses[i]].fixedLayer ? *links[buses[i]].fixedLayer : links[buses[i]].padLayer == 1 ? 1 : 0;
+
+    auto fixedKept = [&]( const std::vector<int>& aOf )
+    {
+        for( size_t i = 0; i < buses.size(); ++i )
+        {
+            if( links[buses[i]].fixedLayer && aOf[i] != *links[buses[i]].fixedLayer )
+                return false;
+        }
+
+        return true;
+    };
 
     std::string search = "exact";
     int         variants = 0;
@@ -712,6 +735,9 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
 
             for( size_t i = 0; i < buses.size(); ++i )
                 tryOf[i] = ( mask >> i ) & 1;
+
+            if( !fixedKept( tryOf ) )
+                continue;
 
             variants++;
             const SCORE s = scoreOf( pins, links, buses, tryOf );
@@ -729,6 +755,9 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
 
         for( size_t i = 0; i < buses.size(); ++i )
         {
+            if( links[buses[i]].fixedLayer )
+                continue;
+
             std::vector<int> other = layerOf;
             other[i] = 1 - other[i];
             variants++;
@@ -908,6 +937,24 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
         out[3] = std::max( out[3], base.GetLeft() - v.x + reach );
     }
 
+    // and past every SMD pad's way out (pcb_route keeps it free of other nets till the pad's route is in)
+    for( const PIN& pin : pins )
+    {
+        if( pin.tht )
+            continue;
+
+        const BOX2I land = pin.pad->GetBoundingBox();
+        const int   reach = KopenapiPadEscapeDepth( board, pin.pad ) + std::max( ds.m_MinClearance, 1 ) + pitchMax / 2;
+
+        switch( pin.side )
+        {
+        case 0: out[0] = std::max( out[0], base.GetTop() - land.GetTop() + reach ); break;
+        case 1: out[1] = std::max( out[1], land.GetRight() - base.GetRight() + reach ); break;
+        case 2: out[2] = std::max( out[2], land.GetBottom() - base.GetBottom() + reach ); break;
+        default: out[3] = std::max( out[3], base.GetLeft() - land.GetLeft() + reach ); break;
+        }
+    }
+
     PORT_RECT line;
     line.rect = BOX2I( VECTOR2I( base.GetLeft() - out[3], base.GetTop() - out[0] ),
                        VECTOR2I( base.GetWidth() + out[1] + out[3], base.GetHeight() + out[0] + out[2] ) );
@@ -1051,6 +1098,43 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
         }
     }
 
+    // each pin straight out to its knee on that line, then to its slot at 45 degrees at most: the port line
+    // goes out per side as far as the widest step across from a knee to its slot there
+    {
+        const BOX2I clear = line.rect;
+        int         extra[4] = { 0, 0, 0, 0 };
+
+        for( PIN& pin : pins )
+        {
+            const VECTOR2I at = pin.pad->GetPosition();
+
+            switch( pin.side )
+            {
+            case 0: pin.knee = VECTOR2I( at.x, clear.GetTop() ); break;
+            case 1: pin.knee = VECTOR2I( clear.GetRight(), at.y ); break;
+            case 2: pin.knee = VECTOR2I( at.x, clear.GetBottom() ); break;
+            default: pin.knee = VECTOR2I( clear.GetLeft(), at.y ); break;
+            }
+
+            if( pin.link >= 0 && pin.slotSide == pin.side )
+            {
+                const int step = pin.side % 2 == 0 ? std::abs( pin.slot.x - pin.knee.x ) : std::abs( pin.slot.y - pin.knee.y );
+                extra[pin.side] = std::max( extra[pin.side], step );
+            }
+        }
+
+        static const VECTOR2I outward[4] = { { 0, -1 }, { 1, 0 }, { 0, 1 }, { -1, 0 } };
+
+        for( PIN& pin : pins )
+        {
+            if( pin.link >= 0 )
+                pin.slot += outward[pin.slotSide] * extra[pin.slotSide];
+        }
+
+        line.rect = BOX2I( VECTOR2I( clear.GetLeft() - extra[3], clear.GetTop() - extra[0] ),
+                           VECTOR2I( clear.GetWidth() + extra[1] + extra[3], clear.GetHeight() + extra[0] + extra[2] ) );
+    }
+
     // the answer
     nlohmann::json linksOut = nlohmann::json::array(), pinsOut = nlohmann::json::array();
     const bool     withPaths = aArgs.value( "lanes", false );
@@ -1083,6 +1167,8 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
             if( pin.via )
                 row["via_mm"] = pointMm( *pin.via );
 
+            row["knee_mm"] = pointMm( pin.knee );
+
             if( withPaths )
             {
                 nlohmann::json path = nlohmann::json::array( { pointMm( pin.pad->GetPosition() ) } );
@@ -1090,6 +1176,7 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
                 if( pin.via )
                     path.push_back( pointMm( *pin.via ) );
 
+                path.push_back( pointMm( pin.knee ) );
                 path.push_back( pointMm( pin.slot ) );
                 row["path_mm"] = path;
             }
@@ -1183,11 +1270,12 @@ KOPENAPI_REGISTER( "pcb_end_plan",
                    "matched), vias, links off their far end's layer, the width moved. A pin that leaves on the "
                    "other layer than its pad's gets a via where pcb_fanout puts it (dry run; no_spot when it has "
                    "none). A single whose pin lies inside a bus's run on its layer goes to the other layer "
-                   "(singles_boxed when both are taken). The port line runs round the courtyard a pitch out, past "
-                   "the vias; per layer each link takes one band of slots at its pitch (track + clearance), the "
+                   "(singles_boxed when both are taken). Each pin goes straight out to its knee, past the courtyard "
+                   "a pitch, the vias and the pads' ways out (as pcb_route keeps them), then to its slot at 45 "
+                   "degrees at most: the port line lies as far out again as the widest step across; per layer each link takes one band of slots at its pitch (track + clearance), the "
                    "bands in their order round the part, each as near its pins as the others let it. Answers per "
                    "link its layer, vias, nets in slot order, slots, room (pads to slots), arrives_mm / side; per "
-                   "pin its slot, slot side, layer, via and gate (via / point), path_mm with lanes; ends_overflow "
+                   "pin its slot, slot side, layer, via, knee and gate (via / point), path_mm with lanes; ends_overflow "
                    "(a side whose bands at home need more than its length, per layer); breaks_left, "
                    "crossings_left. Read only",
                    R"json({"type":"object","required":["ref"],"properties":{
@@ -1195,8 +1283,9 @@ KOPENAPI_REGISTER( "pcb_end_plan",
                         "links":{"type":"array","items":{"type":"object","properties":{
                             "name":{"type":"string"},
                             "nets":{"type":"array","items":{"type":"string"}},
-                            "from_mm":{"type":"array","items":{"type":"number"},"description":"[x, y]: where the link arrives from (default: its far pads' centre)"}}},
+                            "from_mm":{"type":"array","items":{"type":"number"},"description":"[x, y]: where the link arrives from (default: its far pads' centre)"},
+                            "layer":{"type":"string","enum":["F.Cu","B.Cu"],"description":"a bus's layer fixed (e.g. the layer its other end's plan chose): not searched, its pins on the other layer through vias"}}},
                             "description":"these links instead of pcb_layout_graph's buses; the part's other signal nets go alone"},
                         "max_links":{"type":"integer","default":10,"minimum":1,"maximum":14,"description":"buses whose layer choices are all tried; more: one at a time"},
-                        "lanes":{"type":"boolean","default":false,"description":"per pin path_mm: pad, via, slot"}}})json"_json,
+                        "lanes":{"type":"boolean","default":false,"description":"per pin path_mm: pad, via, knee, slot"}}})json"_json,
                    false, h_pcb_end_plan, 60 );
