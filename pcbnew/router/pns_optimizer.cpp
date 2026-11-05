@@ -1370,6 +1370,13 @@ bool verifyDpBypass( NODE* aNode, DIFF_PAIR* aPair, bool aRefIsP, const SHAPE_LI
 }
 
 
+static bool dpStopRequested()
+{
+    ROUTER* router = ROUTER::GetInstance();
+    return router && router->Settings().StopRequested();
+}
+
+
 bool coupledBypass( NODE* aNode, DIFF_PAIR* aPair, bool aRefIsP, const SHAPE_LINE_CHAIN& aRef,
                     const SHAPE_LINE_CHAIN& aRefBypass, const SHAPE_LINE_CHAIN& aCoupled,
                     SHAPE_LINE_CHAIN& aNewCoupled )
@@ -1385,7 +1392,7 @@ bool coupledBypass( NODE* aNode, DIFF_PAIR* aPair, bool aRefIsP, const SHAPE_LIN
     SHAPE_LINE_CHAIN bestBypass;
     int              si, ei;
 
-    for( int i=0; i< nStarts; i++ )
+    for( int i=0; i< nStarts && !dpStopRequested(); i++ )
     {
         for( int j = 1; j < aCoupled.PointCount() - 1; j++ )
         {
@@ -1402,6 +1409,9 @@ bool coupledBypass( NODE* aNode, DIFF_PAIR* aPair, bool aRefIsP, const SHAPE_LIN
                 
                 std::tie(coupledLength, tmp)= aPair->CoupledLength( aRef, bypass );
 
+                if( coupledLength <= bestLength )
+                    continue;
+
                 SHAPE_LINE_CHAIN newCoupled = aCoupled;
 
                 si = vStartIdx[i];
@@ -1412,8 +1422,7 @@ bool coupledBypass( NODE* aNode, DIFF_PAIR* aPair, bool aRefIsP, const SHAPE_LIN
                 else
                     newCoupled.Replace( ei, si, bypass.Reverse() );
 
-                if( coupledLength > bestLength && verifyDpBypass( aNode, aPair, aRefIsP, aRef,
-                                                                  newCoupled) )
+                if( verifyDpBypass( aNode, aPair, aRefIsP, aRef, newCoupled ) )
                 {
                     bestBypass = std::move( newCoupled );
                     bestLength = coupledLength;
@@ -1452,7 +1461,7 @@ bool OPTIMIZER::mergeDpStep( DIFF_PAIR* aPair, bool aTryP, int step )
     std::tie(clenPre, tmp) = aPair->CoupledLength( currentPath, coupledPath );
     int64_t budget = clenPre / 10; // fixme: come up with something more intelligent here...
 
-    while( n < n_segs - step )
+    while( n < n_segs - step && !dpStopRequested() )
     {
         const SEG s1    = currentPath.CSegment( n );
         const SEG s2    = currentPath.CSegment( n + step );
@@ -1524,7 +1533,7 @@ bool OPTIMIZER::mergeDpSegments( DIFF_PAIR* aPair )
         if( step_n > max_step_n )
             step_n = max_step_n;
 
-        if( step_p < 1 && step_n < 1 )
+        if( ( step_p < 1 && step_n < 1 ) || dpStopRequested() )
             break;
 
         bool found_anything_p = false;
