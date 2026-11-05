@@ -285,22 +285,64 @@ struct PLAN_GRID
         aHi = std::min( aX1, (int) std::floor( hi / cell ) );
     }
 
-    /// @brief Each() for polygons (zone fills, outlines: thousands of corners): the polygon grown by
-    /// aInflate, filled row by row between its edge crossings
+    /// @brief Each() for polygons (zone fills, outlines: thousands of corners): the cells inside the
+    /// polygon, filled row by row between its edge crossings, and those within aInflate of an edge.
+    /// The polygon is never grown: the work is linear in its corners and edges that cannot reach the
+    /// grid are passed by. A cell is visited once.
     template <typename SKIP, typename VISIT>
     void EachInPoly( const SHAPE_POLY_SET& aPoly, int aInflate, size_t aOffset, SKIP aSkip, VISIT aVisit ) const
     {
-        SHAPE_POLY_SET grown = aPoly.CloneDropTriangulation();
+        if( nx <= 0 || ny <= 0 )
+            return;
 
-        if( aInflate > 0 )
-            grown.Inflate( aInflate, CORNER_STRATEGY::ROUND_ALL_CORNERS, std::max( cell / 8, 1 ) );
+        std::vector<uint8_t> seen( (size_t) nx * ny, 0 );
+
+        auto take = [&]( int aX, int aY )
+        {
+            const size_t c = Index( aX, aY );
+
+            if( seen[c] )
+                return;
+
+            seen[c] = 1;
+
+            if( !aSkip( aOffset + c ) )
+                aVisit( aOffset + c );
+        };
+
+        const double r = std::max( aInflate, 0 );
+        const double right = (double) ( nx - 1 ) * cell;
+        const double bottom = (double) ( ny - 1 ) * cell;
 
         std::vector<std::vector<double>> crossings( ny );
 
-        for( auto seg = grown.CIterateSegmentsWithHoles(); seg; ++seg )
+        for( auto seg = aPoly.CIterateSegmentsWithHoles(); seg; ++seg )
         {
             VECTOR2I a = seg.Get().A - origin;
             VECTOR2I b = seg.Get().B - origin;
+
+            if( r > 0 && std::max( a.x, b.x ) + r >= 0 && std::min( a.x, b.x ) - r <= right
+                && std::max( a.y, b.y ) + r >= 0 && std::min( a.y, b.y ) - r <= bottom )
+            {
+                PIECE edge;
+                edge.ax = a.x;
+                edge.ay = a.y;
+                edge.bx = b.x;
+                edge.by = b.y;
+                edge.radius = r;
+
+                const int y0 = std::max( 0, (int) std::ceil( ( std::min( a.y, b.y ) - r ) / cell ) );
+                const int y1 = std::min( ny - 1, (int) std::floor( ( std::max( a.y, b.y ) + r ) / cell ) );
+
+                for( int y = y0; y <= y1; ++y )
+                {
+                    int lo, hi;
+                    RowSpan( edge, y, r, 0, nx - 1, lo, hi );
+
+                    for( int x = lo; x <= hi; ++x )
+                        take( x, y );
+                }
+            }
 
             if( a.y == b.y )
                 continue;
@@ -312,10 +354,10 @@ struct PLAN_GRID
             const int r0 = std::max( 0, (int) std::ceil( (double) a.y / cell ) );
             const int r1 = std::min( ny - 1, (int) std::ceil( (double) b.y / cell ) - 1 );
 
-            for( int r = r0; r <= r1; ++r )
+            for( int row = r0; row <= r1; ++row )
             {
-                const double y = (double) r * cell;
-                crossings[r].push_back( a.x + ( y - a.y ) * ( b.x - a.x ) / ( b.y - a.y ) );
+                const double y = (double) row * cell;
+                crossings[row].push_back( a.x + ( y - a.y ) * ( b.x - a.x ) / ( b.y - a.y ) );
             }
         }
 
@@ -330,12 +372,7 @@ struct PLAN_GRID
                 const int x1 = std::min( nx - 1, (int) std::floor( xs[k + 1] / cell ) );
 
                 for( int x = x0; x <= x1; ++x )
-                {
-                    const size_t i = aOffset + Index( x, y );
-
-                    if( !aSkip( i ) )
-                        aVisit( i );
-                }
+                    take( x, y );
             }
         }
     }
