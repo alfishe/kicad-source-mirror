@@ -8585,6 +8585,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         VECTOR2I              padStart, padEnd;   ///< its pads, when fanned out from them
         bool                  fanStart = false, fanEnd = false;
         bool                  slotStart = false, slotEnd = false;   ///< its ends at an end plan's slots
+        std::optional<BOX2I>  freeStart, freeEnd;   ///< round a part its lanes pass under: no corners there, the router's way
         int                   corridor = -1;     ///< bus_paths: the corridor it belongs to (index in corridorOut)
         std::optional<PCB_LAYER_ID> startOn;     ///< the layer its ribbon starts on when an end plan moves it
     };
@@ -9617,6 +9618,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 j.corridorVia.erase( j.corridorVia.begin() );
             }
 
+            while( members[k].freeStart && !j.corridor.empty() && members[k].freeStart->Contains( j.corridor.front() ) && !j.corridorVia.front() )
+            {
+                j.corridor.erase( j.corridor.begin() );
+                j.corridorVia.erase( j.corridorVia.begin() );
+            }
+
+            while( members[k].freeEnd && !j.corridor.empty() && members[k].freeEnd->Contains( j.corridor.back() ) && !j.corridorVia.back() )
+            {
+                j.corridor.pop_back();
+                j.corridorVia.pop_back();
+            }
+
             while( portAtEnd && !j.corridor.empty() && portAtEnd->Contains( j.corridor.back() ) && !j.corridorVia.back() )
             {
                 j.corridor.pop_back();
@@ -9649,7 +9662,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 const std::optional<BOX2I>&    port = atEnd ? j.fanEndPort : j.fanStartPort;
                 const std::optional<VECTOR2I>& slot = atEnd ? j.fanEnd : j.fanStart;
 
-                if( !port || !slot || j.corridor.empty() || ( atEnd ? members[k].slotEnd : members[k].slotStart ) == false )
+                if( !port || !slot || j.corridor.empty() || ( atEnd ? members[k].slotEnd : members[k].slotStart ) == false
+                    || ( atEnd ? members[k].freeEnd : members[k].freeStart ) )
                     continue;
 
                 const VECTOR2I c = atEnd ? j.corridor.back() : j.corridor.front();
@@ -9979,6 +9993,16 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         };
 
         std::map<const FOOTPRINT*, END_PLAN> endPlans;
+
+        // a bus whose slots at its two ends are in other orders: at its far part the order it arrives in
+        // (part, corridor -> its nets clockwise round the part); the members still out of it after that leave
+        // the bus for the other layer (net -> layer), the bus keeping its layer (corridor -> layer)
+        std::map<std::pair<const FOOTPRINT*, size_t>, std::vector<std::string>> orderAt;
+        std::map<std::string, std::string> offBus;
+        std::map<size_t, std::string>      busLayer;
+        std::set<size_t>                   orderLeft;
+        std::map<size_t, std::pair<int, BOX2I>> underAt;   ///< per corridor: the end whose part its lanes pass under, round it
+        std::map<size_t, nlohmann::json>   ordersFound;   ///< per corridor, first trial: its slots clockwise round its first part, anticlockwise round its last
         std::optional<KOPENAPI_METHOD> endPlanner = KOPENAPI_REGISTRY::Get().Find( "pcb_end_plan" );
         const bool                     withEndPlan = aArgs.value( "end_plan", true );
         int                            endSlotted = 0;
@@ -10088,12 +10112,50 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             nlohmann::json links = nlohmann::json::array();
             std::set<std::string> inCorridors, movedSingles;
 
+            bool ordered = false;
+
             for( const auto& [ci, link] : given )
             {
-                links.push_back( link );
+                nlohmann::json kept = link;
+                kept["nets"] = nlohmann::json::array();
 
                 for( const nlohmann::json& n : link["nets"] )
-                    inCorridors.insert( n.get<std::string>() );
+                {
+                    const std::string net = n.get<std::string>();
+                    inCorridors.insert( net );
+
+                    if( auto off = offBus.find( net ); off != offBus.end() )
+                    {
+                        links.push_back( { { "name", net }, { "nets", { net } }, { "layer", off->second } } );
+                        movedSingles.insert( net );
+                        fixed = true;
+                        ordered = true;
+                    }
+                    else
+                    {
+                        kept["nets"].push_back( net );
+                    }
+                }
+
+                if( kept["nets"].size() < link["nets"].size() && busLayer.count( ci ) )
+                    kept["layer"] = busLayer[ci];
+
+                if( auto order = orderAt.find( { aFp, ci } ); order != orderAt.end() )
+                {
+                    kept["order"] = nlohmann::json::array();
+
+                    for( const std::string& net : order->second )
+                    {
+                        if( !offBus.count( net ) && std::find( kept["nets"].begin(), kept["nets"].end(), net ) != kept["nets"].end() )
+                            kept["order"].push_back( net );
+                    }
+
+                    fixed = true;
+                    ordered = true;
+                }
+
+                if( !kept["nets"].empty() )
+                    links.push_back( kept );
             }
 
             for( PAD* pad : aFp->Pads() )
@@ -10140,7 +10202,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             // planned when a bus or a moved single changes layer there (a shared end: two buses or more), else each
             // pin's own fan-out
-            const bool used = r.status == 200 && vias > 0 && ( !shared || buses >= 2 );
+            const bool used = r.status == 200 && ( ( vias > 0 && ( !shared || buses >= 2 ) ) || ordered );
             nlohmann::json report = { { "ref", str( aFp->GetReference() ) }, { "used", used },
                                       { "for", shared ? "shared end" : "far end" } };
 
@@ -10342,309 +10404,631 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             return it == plan->second.end() || it->second.other ? std::nullopt : std::optional<VECTOR2I>( it->second.tip );
         };
 
-        for( CORRIDOR& c : corridors )
-        {
-            std::set<int> codes;
+        // when end plans are asked, two trials first (see the trials below): the plans made again after each
+        // that changed them, the jobs as before
+        const bool             trialsAsked = withEndPlan && endPlanner && !corridors.empty();
+        const std::vector<JOB> jobsBeforeTrials = trialsAsked ? jobs : std::vector<JOB>();
+        const size_t           plansOutBefore = endPlansOut.size();
 
-            for( const std::string& n : c.nets )
+        for( int stage = trialsAsked ? 0 : 2; stage < 3; ++stage )
+        {
+            if( stage > 0 && trialsAsked )
             {
-                if( NETINFO_ITEM* info = KopenapiFindNet( board, n ) )
-                    codes.insert( info->GetNetCode() );
+                jobs = jobsBeforeTrials;
+                fannedOut = 0;
+                endSlotted = 0;
+
+                if( ( stage == 1 && !orderAt.empty() ) || ( stage == 2 && !offBus.empty() ) )
+                {
+                    endPlans.clear();
+                    endPlansOut.erase( endPlansOut.begin() + (long) plansOutBefore, endPlansOut.end() );
+                }
+
+                if( stage == 1 && orderAt.empty() )
+                    stage = 2;
             }
 
-            std::vector<MEMBER> members;
-            const VECTOR2I      front = c.points.front().at, back = c.points.back().at;
-            int                 partEnds = 0;   ///< members ending on copper of their net already there
-
-            // the block an end is in: its part's; a track or via end (a net partly routed), the block
-            // whose parts' pads are nearer
-            std::vector<VECTOR2I> padsOf[2];
-
-            for( FOOTPRINT* fp : board->Footprints() )
+            for( CORRIDOR& c : corridors )
             {
-                const std::string ref = str( fp->GetReference() );
+                std::set<int> codes;
 
-                for( int side = 0; side < 2; ++side )
+                for( const std::string& n : c.nets )
                 {
-                    if( ( side == 0 ? c.aParts : c.bParts ).count( ref ) )
+                    if( NETINFO_ITEM* info = KopenapiFindNet( board, n ) )
+                        codes.insert( info->GetNetCode() );
+                }
+
+                std::vector<MEMBER> members;
+                const VECTOR2I      front = c.points.front().at, back = c.points.back().at;
+                int                 partEnds = 0;   ///< members ending on copper of their net already there
+
+                // the block an end is in: its part's; a track or via end (a net partly routed), the block
+                // whose parts' pads are nearer
+                std::vector<VECTOR2I> padsOf[2];
+
+                for( FOOTPRINT* fp : board->Footprints() )
+                {
+                    const std::string ref = str( fp->GetReference() );
+
+                    for( int side = 0; side < 2; ++side )
                     {
-                        for( PAD* pad : fp->Pads() )
-                            padsOf[side].push_back( pad->GetPosition() );
+                        if( ( side == 0 ? c.aParts : c.bParts ).count( ref ) )
+                        {
+                            for( PAD* pad : fp->Pads() )
+                                padsOf[side].push_back( pad->GetPosition() );
+                        }
                     }
                 }
-            }
 
-            auto sideOf = [&]( BOARD_CONNECTED_ITEM* aItem, const VECTOR2I& aPos )
-            {
-                const std::string ref = refOf( aItem );
-
-                if( !ref.empty() )
-                    return c.aParts.count( ref ) ? 0 : c.bParts.count( ref ) ? 1 : -1;
-
-                double nearest[2] = { std::numeric_limits<double>::max(), std::numeric_limits<double>::max() };
-
-                for( int side = 0; side < 2; ++side )
+                auto sideOf = [&]( BOARD_CONNECTED_ITEM* aItem, const VECTOR2I& aPos )
                 {
-                    for( const VECTOR2I& at : padsOf[side] )
-                        nearest[side] = std::min( nearest[side], double( ( at - aPos ).EuclideanNorm() ) );
-                }
+                    const std::string ref = refOf( aItem );
 
-                return nearest[0] <= nearest[1] ? 0 : 1;
-            };
+                    if( !ref.empty() )
+                        return c.aParts.count( ref ) ? 0 : c.bParts.count( ref ) ? 1 : -1;
 
-            // a connection's end as a corridor names it: "REF.PAD", or a copper item's point (and layer)
-            auto endIs = [&]( const nlohmann::json& aEnd, BOARD_CONNECTED_ITEM* aItem, const VECTOR2I& aPos )
-            {
-                if( aEnd.is_string() )
-                {
-                    const PAD* pad = aItem && aItem->Type() == PCB_PAD_T ? static_cast<const PAD*>( aItem ) : nullptr;
-                    return pad && refOf( aItem ) + "." + str( pad->GetNumber() ) == aEnd.get<std::string>();
-                }
+                    double nearest[2] = { std::numeric_limits<double>::max(), std::numeric_limits<double>::max() };
 
-                const VECTOR2I at( pcbIUScale.mmToIU( aEnd["at_mm"][0].get<double>() ), pcbIUScale.mmToIU( aEnd["at_mm"][1].get<double>() ) );
-                const std::optional<PCB_LAYER_ID> layer = aEnd.value( "layer", nlohmann::json() ).is_string()
-                                                                  ? parseLayer( board, aEnd["layer"].get<std::string>() ) : std::nullopt;
-                return ( aPos - at ).EuclideanNorm() <= pcbIUScale.mmToIU( 0.05 ) && ( !layer || ( aItem && aItem->IsOnLayer( *layer ) ) );
-            };
-
-            for( size_t k = 0; k < jobs.size(); ++k )
-            {
-                const JOB& j = jobs[k];
-
-                if( j.trunk || j.foreign || j.busVia || j.corridorOf >= 0 || !codes.count( j.from->GetNetCode() ) )
-                    continue;
-
-                bool forward = true;
-
-                if( !c.from.is_null() )
-                {
-                    const bool there = endIs( c.from, j.from, j.from->GetPosition() ) && endIs( c.to, j.to, j.toPos );
-                    const bool back = endIs( c.to, j.from, j.from->GetPosition() ) && endIs( c.from, j.to, j.toPos );
-
-                    if( !there && !back )
-                        continue;
-
-                    forward = there;
-                }
-                else if( !c.aParts.empty() || !c.bParts.empty() )
-                {
-                    const int from = sideOf( j.from, j.from->GetPosition() ), to = sideOf( j.to, j.toPos );
-
-                    if( from < 0 || to < 0 || from == to )
-                        continue;
-
-                    forward = from == 0;
-                    partEnds += !refOf( j.to ).empty() ? 0 : 1;
-                }
-                else
-                {
-                    const double fwd = ( j.from->GetPosition() - front ).EuclideanNorm() + ( j.toPos - back ).EuclideanNorm();
-                    const double rev = ( j.from->GetPosition() - back ).EuclideanNorm() + ( j.toPos - front ).EuclideanNorm();
-                    forward = fwd <= rev;
-                }
-
-                members.push_back( { k, forward, forward ? j.from->GetPosition() : j.toPos, forward ? j.toPos : j.from->GetPosition(), 0, j.from } );
-            }
-
-            // the fan-out from packages of 8 SMD pads or more, the plan's (pcb_fanout_ports): a member leaves
-            // its pin straight out on the pin's side to past the courtyard, then closes up to the ribbon
-            for( MEMBER& m : members )
-            {
-                JOB& j = jobs[m.job];
-
-                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to.get() } )
-                {
-                    const PAD* pad = end && end->Type() == PCB_PAD_T ? static_cast<const PAD*>( end ) : nullptr;
-
-                    if( const END_SLOT* es = pad ? endSlotOf( pad ) : nullptr )
+                    for( int side = 0; side < 2; ++side )
                     {
+                        for( const VECTOR2I& at : padsOf[side] )
+                            nearest[side] = std::min( nearest[side], double( ( at - aPos ).EuclideanNorm() ) );
+                    }
+
+                    return nearest[0] <= nearest[1] ? 0 : 1;
+                };
+
+                // a connection's end as a corridor names it: "REF.PAD", or a copper item's point (and layer)
+                auto endIs = [&]( const nlohmann::json& aEnd, BOARD_CONNECTED_ITEM* aItem, const VECTOR2I& aPos )
+                {
+                    if( aEnd.is_string() )
+                    {
+                        const PAD* pad = aItem && aItem->Type() == PCB_PAD_T ? static_cast<const PAD*>( aItem ) : nullptr;
+                        return pad && refOf( aItem ) + "." + str( pad->GetNumber() ) == aEnd.get<std::string>();
+                    }
+
+                    const VECTOR2I at( pcbIUScale.mmToIU( aEnd["at_mm"][0].get<double>() ), pcbIUScale.mmToIU( aEnd["at_mm"][1].get<double>() ) );
+                    const std::optional<PCB_LAYER_ID> layer = aEnd.value( "layer", nlohmann::json() ).is_string()
+                                                                      ? parseLayer( board, aEnd["layer"].get<std::string>() ) : std::nullopt;
+                    return ( aPos - at ).EuclideanNorm() <= pcbIUScale.mmToIU( 0.05 ) && ( !layer || ( aItem && aItem->IsOnLayer( *layer ) ) );
+                };
+
+                for( size_t k = 0; k < jobs.size(); ++k )
+                {
+                    const JOB& j = jobs[k];
+
+                    if( j.trunk || j.foreign || j.busVia || j.corridorOf >= 0 || !codes.count( j.from->GetNetCode() )
+                        || offBus.count( j.net ) )
+                        continue;
+
+                    bool forward = true;
+
+                    if( !c.from.is_null() )
+                    {
+                        const bool there = endIs( c.from, j.from, j.from->GetPosition() ) && endIs( c.to, j.to, j.toPos );
+                        const bool back = endIs( c.to, j.from, j.from->GetPosition() ) && endIs( c.from, j.to, j.toPos );
+
+                        if( !there && !back )
+                            continue;
+
+                        forward = there;
+                    }
+                    else if( !c.aParts.empty() || !c.bParts.empty() )
+                    {
+                        const int from = sideOf( j.from, j.from->GetPosition() ), to = sideOf( j.to, j.toPos );
+
+                        if( from < 0 || to < 0 || from == to )
+                            continue;
+
+                        forward = from == 0;
+                        partEnds += !refOf( j.to ).empty() ? 0 : 1;
+                    }
+                    else
+                    {
+                        const double fwd = ( j.from->GetPosition() - front ).EuclideanNorm() + ( j.toPos - back ).EuclideanNorm();
+                        const double rev = ( j.from->GetPosition() - back ).EuclideanNorm() + ( j.toPos - front ).EuclideanNorm();
+                        forward = fwd <= rev;
+                    }
+
+                    members.push_back( { k, forward, forward ? j.from->GetPosition() : j.toPos, forward ? j.toPos : j.from->GetPosition(), 0, j.from } );
+                }
+
+                // the fan-out from packages of 8 SMD pads or more, the plan's (pcb_fanout_ports): a member leaves
+                // its pin straight out on the pin's side to past the courtyard, then closes up to the ribbon
+                for( MEMBER& m : members )
+                {
+                    JOB& j = jobs[m.job];
+
+                    for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to.get() } )
+                    {
+                        const PAD* pad = end && end->Type() == PCB_PAD_T ? static_cast<const PAD*>( end ) : nullptr;
+
+                        if( const END_SLOT* es = pad ? endSlotOf( pad ) : nullptr )
+                        {
+                            const bool atStart = ( end == j.from ) == m.forward;
+                            ( atStart ? m.padStart : m.padEnd ) = atStart ? m.start : m.end;
+                            ( atStart ? m.fanStart : m.fanEnd ) = true;
+                            ( atStart ? m.slotStart : m.slotEnd ) = true;
+                            ( atStart ? m.start : m.end ) = es->slot;
+                            ( atStart ? j.fanStart : j.fanEnd ) = es->slot;
+
+                            if( es->via )
+                                ( atStart ? j.fanStartVia : j.fanEndVia ) = std::make_tuple( *es->via, es->padLayer, es->layer );
+
+                            if( es->knee != es->slot )
+                                ( atStart ? j.fanStartKnee : j.fanEndKnee ) = es->knee;
+
+                            ( atStart ? j.fanStartBends : j.fanEndBends ) = es->bends;
+
+                            if( es->port.GetWidth() > 0 && es->port.GetHeight() > 0 )
+                                ( atStart ? j.fanStartPort : j.fanEndPort ) = es->port;
+
+                            j.endPath[end == j.from ? 0 : 1] = plannedEnd( pad, *es );
+
+                            if( atStart && es->layer != es->padLayer )
+                                m.startOn = es->layer;
+
+                            endSlotted++;
+                            continue;
+                        }
+
+                        const auto tip = pad ? fanTip( pad ) : std::nullopt;
+
+                        if( !tip )
+                            continue;
+
                         const bool atStart = ( end == j.from ) == m.forward;
                         ( atStart ? m.padStart : m.padEnd ) = atStart ? m.start : m.end;
                         ( atStart ? m.fanStart : m.fanEnd ) = true;
-                        ( atStart ? m.slotStart : m.slotEnd ) = true;
-                        ( atStart ? m.start : m.end ) = es->slot;
-                        ( atStart ? j.fanStart : j.fanEnd ) = es->slot;
+                        ( atStart ? m.start : m.end ) = *tip;
+                        ( atStart ? j.fanStart : j.fanEnd ) = *tip;
+                        fannedOut++;
+                    }
+                }
 
-                        if( es->via )
-                            ( atStart ? j.fanStartVia : j.fanEndVia ) = std::make_tuple( *es->via, es->padLayer, es->layer );
+                // the trials: a bus between two parts whose ends there go in other orders round them, its far part
+                // planned again with the order the bus arrives in; then the members still out of it leave it for the
+                // other layer when they are in order among themselves (two layers untangle it), all but the longest
+                // run in the bus's order
+                if( stage < 2 )
+                {
+                    if( members.size() < 2 )
+                        continue;
 
-                        if( es->knee != es->slot )
-                            ( atStart ? j.fanStartKnee : j.fanEndKnee ) = es->knee;
+                    auto padAt = [&]( const MEMBER& m, bool aEnd ) -> const PAD*
+                    {
+                        const JOB&                  j = jobs[m.job];
+                        const BOARD_CONNECTED_ITEM* item = aEnd == m.forward ? static_cast<const BOARD_CONNECTED_ITEM*>( j.to.get() ) : j.from;
+                        return item && item->Type() == PCB_PAD_T ? static_cast<const PAD*>( item ) : nullptr;
+                    };
 
-                        ( atStart ? j.fanStartBends : j.fanEndBends ) = es->bends;
+                    const size_t     count = members.size();
+                    const size_t     ci = (size_t) ( &c - &corridors[0] );
+                    const PAD*       firstPad = padAt( members.front(), false );
+                    const PAD*       lastPad = padAt( members.front(), true );
+                    const FOOTPRINT* parts[2] = { firstPad ? firstPad->GetParentFootprint() : nullptr,
+                                                  lastPad ? lastPad->GetParentFootprint() : nullptr };
 
-                        if( es->port.GetWidth() > 0 && es->port.GetHeight() > 0 )
-                            ( atStart ? j.fanStartPort : j.fanEndPort ) = es->port;
-
-                        j.endPath[end == j.from ? 0 : 1] = plannedEnd( pad, *es );
-
-                        if( atStart && es->layer != es->padLayer )
-                            m.startOn = es->layer;
-
-                        endSlotted++;
+                    if( !parts[0] || !parts[1] || parts[0] == parts[1]
+                        || std::any_of( members.begin(), members.end(), [&]( const MEMBER& m )
+                                        { const PAD* x = padAt( m, false ); const PAD* y = padAt( m, true );
+                                          return !x || !y || x->GetParentFootprint() != parts[0] || y->GetParentFootprint() != parts[1]; } ) )
+                    {
                         continue;
                     }
 
-                    const auto tip = pad ? fanTip( pad ) : std::nullopt;
+                    // the slots clockwise round each part, the band cut where its slots are farthest apart: the
+                    // bus lies flat on one layer only when one end's order is the other's reversed
+                    auto clockwise = [&]( int aEnd )
+                    {
+                        const VECTOR2D      centre( parts[aEnd]->GetPosition() );
+                        std::vector<double> angle( count );
+                        std::vector<size_t> seq( count );
+                        std::iota( seq.begin(), seq.end(), 0 );
 
-                    if( !tip )
+                        for( size_t k = 0; k < count; ++k )
+                        {
+                            const VECTOR2D d = VECTOR2D( aEnd ? members[k].end : members[k].start ) - centre;
+                            angle[k] = std::atan2( d.y, d.x );
+                        }
+
+                        std::sort( seq.begin(), seq.end(), [&]( size_t x, size_t y ) { return angle[x] < angle[y]; } );
+                        size_t cut = 0;
+                        double widest = -1;
+
+                        for( size_t k = 0; k < count; ++k )
+                        {
+                            double g = angle[seq[( k + 1 ) % count]] - angle[seq[k]];
+
+                            if( k + 1 == count )
+                                g += 2 * M_PI;
+
+                            if( g > widest )
+                            {
+                                widest = g;
+                                cut = ( k + 1 ) % count;
+                            }
+                        }
+
+                        std::rotate( seq.begin(), seq.begin() + (long) cut, seq.end() );
+                        return seq;
+                    };
+
+                    const std::vector<size_t> byStart = clockwise( 0 );
+                    std::vector<size_t>       byEnd = clockwise( 1 );
+                    std::reverse( byEnd.begin(), byEnd.end() );
+                    std::vector<size_t> rank( count );
+
+                    for( size_t k = 0; k < count; ++k )
+                        rank[byEnd[k]] = k;
+
+                    if( stage == 0 )
+                    {
+                        nlohmann::json& found = ordersFound[ci];
+
+                        for( size_t k = 0; k < count; ++k )
+                        {
+                            found["first_clockwise"].push_back( jobs[members[byStart[k]].job].net );
+                            found["last_anticlockwise"].push_back( jobs[members[byEnd[k]].job].net );
+                        }
+                    }
+
+                    if( std::equal( byStart.begin(), byStart.end(), byEnd.begin() ) )
                         continue;
 
-                    const bool atStart = ( end == j.from ) == m.forward;
-                    ( atStart ? m.padStart : m.padEnd ) = atStart ? m.start : m.end;
-                    ( atStart ? m.fanStart : m.fanEnd ) = true;
-                    ( atStart ? m.start : m.end ) = *tip;
-                    ( atStart ? j.fanStart : j.fanEnd ) = *tip;
-                    fannedOut++;
+                    // under a part the lanes can pass to its slots from the other side (any order then) when a strip
+                    // the bus's width runs right across its pads' box on the bus's layer, clear of its pads there,
+                    // the via spots of its plan and the copper already laid
+                    int busPitch = 0;
+
+                    for( const MEMBER& m : members )
+                        busPitch = std::max( busPitch, pitchOfNet( m.item ) );
+
+                    auto passUnderOn = [&]( int aEnd, PCB_LAYER_ID layer )
+                    {
+                        const int          half = busPitch / 2;
+                        const int          via = board->GetDesignSettings().GetCurrentViaSize();
+                        BOX2I              box;
+                        std::vector<BOX2I> blocks;
+
+                        for( PAD* p : parts[aEnd]->Pads() )
+                        {
+                            box = box.GetWidth() == 0 && box.GetHeight() == 0 ? p->GetBoundingBox() : box.Merge( p->GetBoundingBox() );
+
+                            if( p->IsOnLayer( layer ) )
+                                blocks.push_back( p->GetBoundingBox() );
+                        }
+
+                        if( auto plan = endPlans.find( parts[aEnd] ); plan != endPlans.end() )
+                        {
+                            for( const auto& [otherPad, slot] : plan->second.slots )
+                            {
+                                if( slot.via )
+                                    blocks.push_back( BOX2I( *slot.via - VECTOR2I( via / 2, via / 2 ), VECTOR2I( via, via ) ) );
+                            }
+                        }
+
+                        for( PCB_TRACK* t : board->Tracks() )
+                        {
+                            if( t->IsOnLayer( layer ) && t->GetBoundingBox().Intersects( box ) )
+                                blocks.push_back( t->GetBoundingBox() );
+                        }
+
+                        const int64_t need = (int64_t) busPitch * (int64_t) count;
+
+                        for( int axis = 0; axis < 2; ++axis )
+                        {
+                            const int lo = axis ? box.GetLeft() : box.GetTop();
+                            const int hi = axis ? box.GetRight() : box.GetBottom();
+                            std::vector<std::pair<int, int>> taken;
+
+                            for( const BOX2I& b : blocks )
+                            {
+                                if( b.Intersects( box ) )
+                                    taken.emplace_back( ( axis ? b.GetLeft() : b.GetTop() ) - half, ( axis ? b.GetRight() : b.GetBottom() ) + half );
+                            }
+
+                            std::sort( taken.begin(), taken.end() );
+                            int64_t at = lo;
+
+                            for( const auto& [from, to] : taken )
+                            {
+                                if( from - at >= need )
+                                    return true;
+
+                                at = std::max<int64_t>( at, to );
+                            }
+
+                            if( hi - at >= need )
+                                return true;
+                        }
+
+                        return false;
+                    };
+
+                    // on the slots' layer when the end is planned, else on either outer layer
+                    auto passUnder = [&]( int aEnd )
+                    {
+                        const PAD*      pad = padAt( members.front(), aEnd == 1 );
+                        const END_SLOT* es = pad ? endSlotOf( pad ) : nullptr;
+
+                        if( es )
+                            return passUnderOn( aEnd, es->layer );
+
+                        return passUnderOn( aEnd, F_Cu ) || passUnderOn( aEnd, B_Cu );
+                    };
+
+                    if( passUnder( 0 ) || passUnder( 1 ) )
+                    {
+                        const int end = passUnder( 1 ) ? 1 : 0;
+                        BOX2I     round = parts[end]->GetBoundingBox( false );
+                        round.Inflate( busPitch * (int) count + pcbIUScale.mmToIU( 1.0 ) );
+                        underAt[ci] = { end, round };
+
+                        if( stage == 0 )
+                            ordersFound[ci]["passes_under"] = str( parts[end]->GetReference() );
+
+                        continue;
+                    }
+
+                    if( stage == 0 )
+                    {
+                        // the far part: the end with fewer buses to plan for (the last when as many), asked for the
+                        // reverse of the other end's clockwise order
+                        const bool atEnd = linksAt( parts[1] ).size() <= linksAt( parts[0] ).size();
+                        std::vector<size_t> sorted = atEnd ? byStart : clockwise( 1 );
+                        std::reverse( sorted.begin(), sorted.end() );
+                        std::vector<std::string>& order = orderAt[{ parts[atEnd ? 1 : 0], ci }];
+
+                        for( size_t k : sorted )
+                            order.push_back( jobs[members[k].job].net );
+
+                        continue;
+                    }
+
+                    // the longest increasing run of the far-end ranks in start order, and whether the rest is one too
+                    auto longestRun = [&]( const std::vector<size_t>& aSeq )
+                    {
+                        std::vector<size_t> tails, tailAt, prev( aSeq.size(), aSeq.size() );
+
+                        for( size_t k = 0; k < aSeq.size(); ++k )
+                        {
+                            const size_t at = std::lower_bound( tails.begin(), tails.end(), aSeq[k] ) - tails.begin();
+
+                            if( at == tails.size() )
+                            {
+                                tails.push_back( aSeq[k] );
+                                tailAt.push_back( k );
+                            }
+                            else
+                            {
+                                tails[at] = aSeq[k];
+                                tailAt[at] = k;
+                            }
+
+                            prev[k] = at > 0 ? tailAt[at - 1] : aSeq.size();
+                        }
+
+                        std::vector<bool> in( aSeq.size(), false );
+
+                        for( size_t k = tailAt.empty() ? aSeq.size() : tailAt.back(); k < aSeq.size(); k = prev[k] )
+                            in[k] = true;
+
+                        return in;
+                    };
+
+                    std::vector<size_t> seq( count );
+
+                    for( size_t k = 0; k < count; ++k )
+                        seq[k] = rank[byStart[k]];
+
+                    const std::vector<bool> inRun = longestRun( seq );
+                    std::vector<size_t>     rest;
+
+                    for( size_t k = 0; k < count; ++k )
+                    {
+                        if( !inRun[k] )
+                            rest.push_back( seq[k] );
+                    }
+
+                    if( !std::is_sorted( rest.begin(), rest.end() ) )
+                    {
+                        orderLeft.insert( ci );
+                        continue;
+                    }
+
+                    for( size_t k = 0; k < count; ++k )
+                    {
+                        // the layer the member leaves its first part on: its slot's, else its pad's
+                        const MEMBER&   m = members[byStart[k]];
+                        const PAD*      pad = padAt( m, false );
+                        const END_SLOT* es = pad ? endSlotOf( pad ) : nullptr;
+
+                        if( !pad )
+                            continue;
+
+                        const bool back = es ? es->layer == B_Cu : !pad->IsOnLayer( F_Cu ) && pad->IsOnLayer( B_Cu );
+
+                        if( inRun[k] )
+                            busLayer[ci] = back ? "B.Cu" : "F.Cu";
+                        else
+                            offBus[jobs[m.job].net] = back ? "F.Cu" : "B.Cu";
+                    }
+
+                    continue;
                 }
+
+                if( auto under = underAt.find( (size_t) ( &c - &corridors[0] ) ); under != underAt.end() )
+            {
+                for( MEMBER& m : members )
+                    ( under->second.first == 1 ? m.freeEnd : m.freeStart ) = under->second.second;
             }
 
             // lanes: at an end where every member's pin has its lane laid, the members start (end) at the lanes'
-            // ends; the rings are their way round the package
-            int laneEnds[2] = { 0, 0 };
-
-            for( const MEMBER& m : members )
-            {
-                const JOB& j = jobs[m.job];
-
-                for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to.get() } )
-                {
-                    if( laneEndOf( end ) )
-                        laneEnds[( ( end == j.from ) == m.forward ) ? 0 : 1]++;
-                }
-            }
-
-            for( int side = 0; side < 2; ++side )
-            {
-                if( laneEnds[side] != (int) members.size() )
-                {
-                    laneEnds[side] = 0;
-                    continue;
-                }
-
-                for( MEMBER& m : members )
-                {
-                    JOB&                  j = jobs[m.job];
-                    BOARD_CONNECTED_ITEM* end = ( side == 0 ) == m.forward ? static_cast<BOARD_CONNECTED_ITEM*>( j.from ) : j.to.get();
-                    const PCB_TRACK*      last = laneEndOf( end );
-
-                    ( side == 0 ? m.start : m.end ) = last->GetEnd();
-                    ( side == 0 ? m.fanStart : m.fanEnd ) = false;
-                    ( end == j.from ? j.fanStart : j.fanEnd ) = std::nullopt;
-                    ( end == j.from ? j.laneFrom : j.laneTo ) = true;
-                }
-            }
-
-            nlohmann::json out = { { "name", c.name }, { "points", c.points.size() } };
-
-            if( !c.a.empty() )
-            {
-                out["a"] = c.a;
-                out["b"] = c.b;
-            }
-
-            if( members.size() < ( c.from.is_null() ? 2u : 1u ) )
-            {
-                out["skipped"] = members.empty() ? "no connection of its nets runs between its ends"
-                                                 : "one connection of its nets runs between its ends";
-                corridorOut.push_back( out );
-                continue;
-            }
-
-            // every member leaving (reaching) by its lane: the way starts at the gate that makes the way from
-            // the lane ends shortest, the gates round the package (the ring's part) dropped
-            CORRIDOR along = c;
-            int      laneTrimmed = 0;
-
-            for( bool atStart : { true, false } )
-            {
-                std::vector<CROSSING>& pts = along.points;
-
-                if( laneEnds[atStart ? 0 : 1] != (int) members.size() || pts.size() < 2 )
-                    continue;
-
-                VECTOR2D mid( 0, 0 ), farMid( 0, 0 );
+                // ends; the rings are their way round the package
+                int laneEnds[2] = { 0, 0 };
 
                 for( const MEMBER& m : members )
                 {
-                    mid += VECTOR2D( atStart ? m.start : m.end ) / (double) members.size();
-                    farMid += VECTOR2D( atStart ? m.end : m.start ) / (double) members.size();
+                    const JOB& j = jobs[m.job];
+
+                    for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to.get() } )
+                    {
+                        if( laneEndOf( end ) )
+                            laneEnds[( ( end == j.from ) == m.forward ) ? 0 : 1]++;
+                    }
                 }
 
-                const size_t        count = pts.size();
-                std::vector<double> rest( count, 0 );
-                auto                at = [&]( size_t k ) { return VECTOR2D( pts[atStart ? k : count - 1 - k].at ); };
-
-                rest[count - 1] = ( farMid - at( count - 1 ) ).EuclideanNorm();
-
-                for( size_t k = count - 1; k-- > 0; )
-                    rest[k] = rest[k + 1] + ( at( k + 1 ) - at( k ) ).EuclideanNorm();
-
-                size_t best = 0;
-
-                for( size_t k = 1; k < count; ++k )
+                for( int side = 0; side < 2; ++side )
                 {
-                    if( pts[atStart ? k : count - 1 - k].viaTo )
-                        break;
+                    if( laneEnds[side] != (int) members.size() )
+                    {
+                        laneEnds[side] = 0;
+                        continue;
+                    }
 
-                    if( ( at( k ) - mid ).EuclideanNorm() + rest[k] < ( at( best ) - mid ).EuclideanNorm() + rest[best] - 1 )
-                        best = k;
+                    for( MEMBER& m : members )
+                    {
+                        JOB&                  j = jobs[m.job];
+                        BOARD_CONNECTED_ITEM* end = ( side == 0 ) == m.forward ? static_cast<BOARD_CONNECTED_ITEM*>( j.from ) : j.to.get();
+                        const PCB_TRACK*      last = laneEndOf( end );
+
+                        ( side == 0 ? m.start : m.end ) = last->GetEnd();
+                        ( side == 0 ? m.fanStart : m.fanEnd ) = false;
+                        ( end == j.from ? j.fanStart : j.fanEnd ) = std::nullopt;
+                        ( end == j.from ? j.laneFrom : j.laneTo ) = true;
+                    }
                 }
 
-                if( best == 0 )
+                nlohmann::json out = { { "name", c.name }, { "points", c.points.size() } };
+
+                for( const std::string& n : c.nets )
+                {
+                    if( offBus.count( n ) )
+                        out["off_bus"][n] = offBus[n];
+                }
+
+                for( const auto& [at, order] : orderAt )
+                {
+                    if( at.second == (size_t) ( &c - &corridors[0] ) )
+                        out["ordered_at"] = str( at.first->GetReference() );
+                }
+
+                if( auto found = ordersFound.find( (size_t) ( &c - &corridors[0] ) ); found != ordersFound.end() )
+                    out["orders_across"] = found->second;
+
+                if( orderLeft.count( (size_t) ( &c - &corridors[0] ) ) )
+                    out["order_left"] = "the members out of the bus's order are not in order among themselves: left on its layer";
+
+                if( !c.a.empty() )
+                {
+                    out["a"] = c.a;
+                    out["b"] = c.b;
+                }
+
+                if( members.size() < ( c.from.is_null() ? 2u : 1u ) )
+                {
+                    out["skipped"] = members.empty() ? "no connection of its nets runs between its ends"
+                                                     : "one connection of its nets runs between its ends";
+                    corridorOut.push_back( out );
                     continue;
+                }
 
-                if( atStart )
-                    pts.erase( pts.begin(), pts.begin() + best );
-                else
-                    pts.erase( pts.end() - best, pts.end() );
+                // every member leaving (reaching) by its lane: the way starts at the gate that makes the way from
+                // the lane ends shortest, the gates round the package (the ring's part) dropped
+                CORRIDOR along = c;
+                int      laneTrimmed = 0;
 
-                laneTrimmed += (int) best;
+                for( bool atStart : { true, false } )
+                {
+                    std::vector<CROSSING>& pts = along.points;
+
+                    if( laneEnds[atStart ? 0 : 1] != (int) members.size() || pts.size() < 2 )
+                        continue;
+
+                    VECTOR2D mid( 0, 0 ), farMid( 0, 0 );
+
+                    for( const MEMBER& m : members )
+                    {
+                        mid += VECTOR2D( atStart ? m.start : m.end ) / (double) members.size();
+                        farMid += VECTOR2D( atStart ? m.end : m.start ) / (double) members.size();
+                    }
+
+                    const size_t        count = pts.size();
+                    std::vector<double> rest( count, 0 );
+                    auto                at = [&]( size_t k ) { return VECTOR2D( pts[atStart ? k : count - 1 - k].at ); };
+
+                    rest[count - 1] = ( farMid - at( count - 1 ) ).EuclideanNorm();
+
+                    for( size_t k = count - 1; k-- > 0; )
+                        rest[k] = rest[k + 1] + ( at( k + 1 ) - at( k ) ).EuclideanNorm();
+
+                    size_t best = 0;
+
+                    for( size_t k = 1; k < count; ++k )
+                    {
+                        if( pts[atStart ? k : count - 1 - k].viaTo )
+                            break;
+
+                        if( ( at( k ) - mid ).EuclideanNorm() + rest[k] < ( at( best ) - mid ).EuclideanNorm() + rest[best] - 1 )
+                            best = k;
+                    }
+
+                    if( best == 0 )
+                        continue;
+
+                    if( atStart )
+                        pts.erase( pts.begin(), pts.begin() + best );
+                    else
+                        pts.erase( pts.end() - best, pts.end() );
+
+                    laneTrimmed += (int) best;
+                }
+
+                if( laneEnds[0] + laneEnds[1] )
+                {
+                    out["lane_ends"] = laneEnds[0] + laneEnds[1];
+                    out["lane_gates_dropped"] = laneTrimmed;
+                }
+
+                const int corridorIndex = (int) corridorOut.size();
+                corridorMembers += (int) members.size();
+
+                if( partEnds )
+                    out["ends_on_copper"] = partEnds;
+
+                if( fannedOut )
+                    out["fanned_out"] = fannedOut;
+
+                if( endSlotted )
+                    out["end_slots"] = endSlotted;
+
+                fannedOut = 0;
+                endSlotted = 0;
+                corridorOut.push_back( out );
+
+                for( MEMBER& m : members )
+                    m.corridor = corridorIndex;
+
+                CORRIDOR_PLAN* plan = nullptr;
+
+                for( CORRIDOR_PLAN& other : corridorPlans )
+                {
+                    if( sameGates( other.along, along ) )
+                        plan = &other;
+                }
+
+                if( !plan )
+                {
+                    corridorPlans.push_back( { along, codes, {}, {} } );
+                    plan = &corridorPlans.back();
+                }
+
+                plan->codes.insert( codes.begin(), codes.end() );
+                plan->members.insert( plan->members.end(), members.begin(), members.end() );
+                plan->indices.push_back( corridorIndex );
+                layLanes( *plan, 0 );
             }
-
-            if( laneEnds[0] + laneEnds[1] )
-            {
-                out["lane_ends"] = laneEnds[0] + laneEnds[1];
-                out["lane_gates_dropped"] = laneTrimmed;
-            }
-
-            const int corridorIndex = (int) corridorOut.size();
-            corridorMembers += (int) members.size();
-
-            if( partEnds )
-                out["ends_on_copper"] = partEnds;
-
-            if( fannedOut )
-                out["fanned_out"] = fannedOut;
-
-            if( endSlotted )
-                out["end_slots"] = endSlotted;
-
-            fannedOut = 0;
-            endSlotted = 0;
-            corridorOut.push_back( out );
-
-            for( MEMBER& m : members )
-                m.corridor = corridorIndex;
-
-            CORRIDOR_PLAN* plan = nullptr;
-
-            for( CORRIDOR_PLAN& other : corridorPlans )
-            {
-                if( sameGates( other.along, along ) )
-                    plan = &other;
-            }
-
-            if( !plan )
-            {
-                corridorPlans.push_back( { along, codes, {}, {} } );
-                plan = &corridorPlans.back();
-            }
-
-            plan->codes.insert( codes.begin(), codes.end() );
-            plan->members.insert( plan->members.end(), members.begin(), members.end() );
-            plan->indices.push_back( corridorIndex );
-            layLanes( *plan, 0 );
         }
 
         // the other connections at a used plan's pins (its singles): each pad's path on its first connection
@@ -21862,7 +22246,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "engine":{"type":"string","enum":["pns","grid"],"default":"pns","description":"grid: every net at once on one grid of the board, negotiated congestion (PathFinder) in parallel variants, the best legal result committed (diff-pair trunks still by pns, their rows say engine pns; no rip_up / clean_up passes; with dry_run the same search and guard, rows / totals / grid answered, nothing put on the board, the fills counted out as zones: refill would, the trunks not routed: their rows say not_simulated with the reason and the pairs' airwires are in the grid search; with from: 400; a fine-pitch end the grid walls in tries a lattice half a cell off at its pad: row half_cell_exits, grid.half_cell {tried, won, ms}); pns: one connection at a time with the push-and-shove router"},
                         "max_rounds":{"type":"integer","default":40,"description":"grid: negotiation rounds before the nets still crowding each other are routed apart or left out"},
                         "cell_mm":{"type":"number","default":0,"description":"grid: the cell, 0 a third of the finest track pitch (width + clearance) on a 0.025 mm step (stage global: half the pitch)"},
-                        "end_plan":{"type":"boolean","default":true,"description":"bus_paths: the parts two corridors or more end at are planned by pcb_end_plan (the corridors as links), and so are the moved buses' and moved singles' far parts with that layer kept; a plan is used where a bus (or a moved single) changes layer (at a shared end two buses or more). Each pin of a used plan, corridor members and singles alike, starts (ends) at its slot: its path pad, via, knee, bends, slot laid before the first route along a corridor, the route going on from the slot (its length cap counting the path), taken out when that route fails or never runs (kept when another route of its net ended on it); a single inside buses' runs on both layers keeps its fan-out. Answer bus_paths.end_plans (per part planned: ref, for shared end / far end, used or reason, links, ends_overflow, breaks_left, crossings_left, wraps_left, links_under, no_spot, pins with slot, knee, bends, via, under) and end_paths (laid, refused, taken_out); the corridor answers end_slots. false: every end as pcb_fanout_ports plans it"},
+                        "end_plan":{"type":"boolean","default":true,"description":"bus_paths: the parts two corridors or more end at are planned by pcb_end_plan (the corridors as links), and so are the moved buses' and moved singles' far parts with that layer kept; a plan is used where a bus (or a moved single) changes layer (at a shared end two buses or more). Each pin of a used plan, corridor members and singles alike, starts (ends) at its slot: its path pad, via, knee, bends, slot laid before the first route along a corridor, the route going on from the slot (its length cap counting the path), taken out when that route fails or never runs (kept when another route of its net ended on it); a single inside buses' runs on both layers keeps its fan-out. Answer bus_paths.end_plans (per part planned: ref, for shared end / far end, used or reason, links, ends_overflow, breaks_left, crossings_left, wraps_left, links_under, no_spot, pins with slot, knee, bends, via, under) and end_paths (laid, refused, taken_out); the corridor answers end_slots. A bus between two parts whose ends go round them in the same direction (orders_across: first_clockwise, last_anticlockwise) is reversed unless a strip as wide as it runs under one of them on its layer (orders_across.passes_under: its lanes reach the slots there from behind, no corridor corner round that part); a reversed bus's far part is planned again in the order it arrives in (ordered_at), then its members still out of order leave for the other layer when they are in order among themselves (off_bus: net to layer), else they stay (order_left). false: every end as pcb_fanout_ports plans it"},
                         "stage":{"type":"string","enum":["full","global","detail"],"default":"full","description":"engine grid: full lays the grid's copper; detail: the global stage, then the grid's copper of each net cut into branches between its junctions (ends, points where three ways meet), each branch by pns along its corridor (read as bus_paths reads one: the lane's corners and via gates as waypoints; bundles first, then branches between two ends, then onto a junction, shorter first; one that does not route tries its via sites alone, then the grid's copper of it through the guard): rows engine pns with detail branches, or engine grid with pns_detail (why pns did not); grid.detail {branches, by_corridor, by_via_sites, already_joined, to_grid_copper}; global only finds each connection's way on a coarse grid (cell half a track pitch), nothing laid: per connection from, to, found, corridor (the shared corridor type, docs corridor.md: {name, net, from, to, points_mm: gates at the corners {at_mm, along, lo_mm = hi_mm, layer, rooms_mm}, via gates {at_mm, via: {from_layer, to_layer}, layer}, the last a free point}; rooms are runs of free cells widened up to 1 mm, other nets' never overlap; bus_paths takes it as given), vias_mm (where it changes layer), layers, length_mm; answer connections, covered, vias, grid (variant, cell_mm, rounds, build_ms, route_ms, variant_stats)"},
                         "race_wait":{"type":"number","default":0.25,"description":"grid: once the first variant is done, the others get this share of its time again (race_wait_min_s at least); stages global and detail 0.1 (a time policy: their grid result is a plan the detail stage refines)"},"race_wait_min_s":{"type":"number","default":2,"minimum":0,"description":"grid: the least time the other variants get once the first is done (seconds)"},"corridor_try_budget_s":{"type":"number","minimum":0,"description":"seconds one member's try along its corridor gets at the turn of the corridor's first connection (a time policy: the try is a soft goal, the member keeps its own turn and budget after); default first_pass_budget_s / 10, 3 when that is 0"},"detail_branch_budget_s":{"type":"number","minimum":0,"description":"stage detail: seconds pns gets for one branch along its corridor (a time policy: a branch is one of many and has the grid's copper as its fallback); default first_pass_budget_s / 10, 3 when that is 0"},
                         "via_keepout_mm":{"type":"number","default":5,"description":"grid: only a chip's own nets put vias this far around it (pads on four sides, or an array outside its balls) while the board routes; other nets left short and, once all are joined, the via-saving pass may use it; 0 off"},

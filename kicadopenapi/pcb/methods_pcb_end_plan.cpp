@@ -92,6 +92,8 @@ struct LINK
     int              layer = 0;      ///< chosen: 0 F, 1 B
     int              homeSide = 0;
     std::vector<std::string> farParts;
+    std::vector<std::string> order;   ///< given: its nets in the order their slots should come clockwise round the part
+    int              orderInversions = 0;   ///< pairs of its slots against that order
 };
 
 
@@ -629,6 +631,14 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
                         return KOPENAPI_RESULT::Error( 400, "links[].layer: F.Cu or B.Cu, not " + layer );
 
                     link->fixedLayer = layer == "B.Cu" ? 1 : 0;
+                }
+
+                for( const nlohmann::json& n : given.value( "order", nlohmann::json::array() ) )
+                {
+                    if( !n.is_string() || !link->nets.count( n.get<std::string>() ) )
+                        return KOPENAPI_RESULT::Error( 400, "links[].order: net names of the link's nets" );
+
+                    link->order.push_back( n.get<std::string>() );
                 }
             }
         }
@@ -1423,7 +1433,61 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
                 }
             }
 
-            std::rotate( item.pins.begin(), item.pins.begin() + ( at + 1 ) % item.pins.size(), item.pins.end() );
+            size_t first = ( at + 1 ) % item.pins.size();
+
+            // an order given: the start round the part whose slots go most nearly in that order (the band
+            // round the part the other way), the widest gap's when as good; a start only where the pins break
+            // (a corner, or a gap wider than their pitch), never inside a row, which would wrap the band round
+            if( !links[l].order.empty() && item.pins.size() >= 2 )
+            {
+                const size_t n = item.pins.size();
+                const size_t widest = first;
+                double       pitch = 1e18;
+
+                for( size_t k = 0; k < n; ++k )
+                    pitch = std::min( pitch, ahead( pins[item.pins[( k + n - 1 ) % n]].s, pins[item.pins[k]].s ) );
+
+                auto breaksAt = [&]( size_t k )
+                {
+                    const int a = item.pins[( k + n - 1 ) % n], b = item.pins[k];
+                    return k == widest || pins[a].side != pins[b].side || ahead( pins[a].s, pins[b].s ) > 1.5 * pitch;
+                };
+
+                std::map<std::string, int> place;
+
+                for( size_t k = 0; k < links[l].order.size(); ++k )
+                    place[links[l].order[k]] = (int) k;
+
+                auto against = [&]( size_t aFirst )
+                {
+                    std::vector<int> seq;
+
+                    for( size_t k = 0; k < item.pins.size(); ++k )
+                    {
+                        auto it = place.find( pins[item.pins[( aFirst + k ) % item.pins.size()]].net );
+
+                        if( it != place.end() )
+                            seq.push_back( it->second );
+                    }
+
+                    return inversions( seq );
+                };
+
+                int best = against( first );
+
+                for( size_t k = 0; k < n; ++k )
+                {
+                    if( const int inv = breaksAt( k ) ? against( k ) : best; inv < best )
+                    {
+                        best = inv;
+                        first = k;
+                    }
+                }
+
+                links[l].orderInversions += best;
+            }
+
+            std::rotate( item.pins.begin(), item.pins.begin() + first, item.pins.end() );
             const double from = line.distanceOf( pins[item.pins.front()].s );
             double       span = line.distanceOf( pins[item.pins.back()].s ) - from;
 
@@ -1896,6 +1960,9 @@ KOPENAPI_RESULT h_pcb_end_plan( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aA
                               { "layer", link.layer == 0 ? "F.Cu" : "B.Cu" }, { "vias", vias },
                               { "home_side", SIDE_NAMES[link.homeSide] }, { "pitch_mm", toMm( link.pitch ) },
                               { "slots_mm", slots }, { "room_mm", roomOut } } );
+
+        if( !link.order.empty() )
+            linksOut.back()["order_inversions"] = link.orderInversions;
     }
 
     nlohmann::json sides = nlohmann::json::object();
@@ -1979,7 +2046,8 @@ KOPENAPI_REGISTER( "pcb_end_plan",
                             "name":{"type":"string"},
                             "nets":{"type":"array","items":{"type":"string"}},
                             "from_mm":{"type":"array","items":{"type":"number"},"description":"[x, y]: where the link arrives from (default: its far pads' centre)"},
-                            "layer":{"type":"string","enum":["F.Cu","B.Cu"],"description":"a bus's layer fixed (e.g. the layer its other end's plan chose): not searched, its pins on the other layer through vias"}}},
+                            "layer":{"type":"string","enum":["F.Cu","B.Cu"],"description":"a bus's layer fixed (e.g. the layer its other end's plan chose): not searched, its pins on the other layer through vias"},
+                            "order":{"type":"array","items":{"type":"string"},"description":"its nets in the order their slots should come clockwise round the part (e.g. the order the bus arrives in from its other end): its band starts round the part where its slots go most nearly so, at a break of its pins only (a corner, or a gap wider than their pitch; never inside a row, which would wrap the band round the part) (order_inversions: the pairs still against it)"}}},
                             "description":"these links instead of pcb_layout_graph's buses; the part's other signal nets go alone"},
                         "max_links":{"type":"integer","default":10,"minimum":1,"maximum":14,"description":"buses whose layer choices are all tried; more: one at a time"},
                         "lanes":{"type":"boolean","default":false,"description":"per pin path_mm: pad, via, knee, bends, slot"}}})json"_json,
