@@ -1463,6 +1463,7 @@ struct ROUTE_PROFILE
     int    ripUpsSkipped = 0;     ///< rip-ups not repeated: nothing changed since the same one failed
     int    ripUpsWalled = 0;      ///< rip-ups not made: no plan even through the routes of this call
     int    ripUpsPlanned = 0;     ///< rip-ups whose routes to take out a plan chose (the rest: the nearest in the corridor)
+    int    loopsCut = 0;          ///< bus_paths: loops a route along made on one layer, cut at their crossing
     std::map<std::string, int> ripUpsFailedAt;   ///< failed rip-ups by what failed: the route, a victim, a cut one
     int    cutByRoutes = 0;       ///< routed connections a later route cut (moving their net's copper), opened again
     int    ripUpsSecond = 0;      ///< victims with no way back that took out routes in turn
@@ -1470,8 +1471,10 @@ struct ROUTE_PROFILE
     int    frontRetries = 0;      ///< tries refused for walling in a port, made again last with the ways out as obstacles
     int    frontRetriesWon = 0;   ///< ... routed so
 
-    /// @brief While a connection is tried: its first try refused for walling in a port, to make again last
+    /// @brief While a connection is tried: its first try refused for walling in a port (in a call routing buses
+    /// along corridors, any pin's way out), to make again last
     std::optional<ROUTE_REQUEST>* wallRefused = nullptr;
+    bool                          wallsAnyRetried = false;
     nlohmann::json*               wallRefusedAt = nullptr;
     int    padExitsTried = 0;     ///< starts stuck in their pad that tried a corner out of a free side
     int    padExitsWon = 0;       ///< ... routed that way
@@ -3333,8 +3336,7 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     }
 
     if( !ok && profile.wallRefused && !*profile.wallRefused && aReq.fronts && !aReq.frontsInWorld && !aReq.diffPair
-        && padToPad
-        && aOut.contains( "walls_in" ) && aOut["walls_in"].value( "port", false ) )
+        && padToPad && aOut.contains( "walls_in" ) && ( aOut["walls_in"].value( "port", false ) || profile.wallsAnyRetried ) )
     {
         ROUTE_REQUEST again = aReq;
         again.frontsInWorld = true;
@@ -9926,6 +9928,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                 "[{name, nets, points_mm}]" );
         }
 
+        profile.wallsAnyRetried = !corridors.empty();
+
         if( grid && !corridors.empty() )
         {
             corridorOut.push_back( { { "skipped", "engine grid: its bundles route the members side by side" } } );
@@ -11415,6 +11419,175 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     };
 
+    // a loop a route along makes on one layer (its end path and its run meeting from opposite sides, a run
+    // coming back across itself): the two tracks that cross are cut at the crossing, what lies between them taken
+    // out, where nothing else of the net (pad, via, branch) touches that part
+    auto cutLoops = [&]( int aNet )
+    {
+        const std::set<KIID> mine( added.begin(), added.end() );
+
+        for( bool again = true; again; )
+        {
+            again = false;
+            std::vector<PCB_TRACK*> segs, net;
+
+            for( PCB_TRACK* t : board->Tracks() )
+            {
+                if( t->GetNetCode() != aNet )
+                    continue;
+
+                net.push_back( t );
+
+                if( t->Type() == PCB_TRACE_T && mine.count( t->m_Uuid ) && !t->IsLocked() )
+                    segs.push_back( t );
+            }
+
+            std::vector<PAD*> pads;
+
+            for( FOOTPRINT* fp : board->Footprints() )
+            {
+                for( PAD* pad : fp->Pads() )
+                {
+                    if( pad->GetNetCode() == aNet )
+                        pads.push_back( pad );
+                }
+            }
+
+            // the other tracks of the layer at a point, none when a via, a pad or a branch is there
+            auto onlyNext = [&]( PCB_TRACK* aFrom, const VECTOR2I& aAt ) -> PCB_TRACK*
+            {
+                PCB_TRACK* next = nullptr;
+
+                for( PCB_TRACK* t : net )
+                {
+                    if( t == aFrom )
+                        continue;
+
+                    if( t->Type() == PCB_VIA_T && t->HitTest( aAt, 0 ) )
+                        return nullptr;
+
+                    if( t->Type() != PCB_TRACE_T || t->GetLayer() != aFrom->GetLayer() || !t->HitTest( aAt, 0 ) )
+                        continue;
+
+                    if( next || ( t->GetStart() != aAt && t->GetEnd() != aAt ) )
+                        return nullptr;
+
+                    next = t;
+                }
+
+                for( PAD* pad : pads )
+                {
+                    if( pad->IsOnLayer( aFrom->GetLayer() ) && pad->HitTest( aAt, 0 ) )
+                        return nullptr;
+                }
+
+                return next;
+            };
+
+            // nothing of the net touches a part taken out but at its ends
+            auto untouched = [&]( const SEG& aPart, PCB_LAYER_ID aLayer, const std::set<PCB_TRACK*>& aChain )
+            {
+                for( PCB_TRACK* t : net )
+                {
+                    if( aChain.count( t ) || ( t->Type() == PCB_TRACE_T && t->GetLayer() != aLayer ) )
+                        continue;
+
+                    for( const VECTOR2I& at : { t->GetStart(), t->GetEnd() } )
+                    {
+                        if( at != aPart.A && at != aPart.B && aPart.Distance( at ) <= t->GetWidth() / 2 )
+                            return false;
+                    }
+                }
+
+                for( PAD* pad : pads )
+                {
+                    if( pad->IsOnLayer( aLayer ) && pad->HitTest( aPart.A, 0 ) == false && pad->HitTest( aPart.B, 0 ) == false
+                        && pad->GetEffectiveShape( aLayer )->Collide( aPart, 0 ) )
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            };
+
+            for( size_t i = 0; i < segs.size() && !again; ++i )
+            {
+                for( size_t j = 0; j < segs.size() && !again; ++j )
+                {
+                    PCB_TRACK* a = segs[i];
+                    PCB_TRACK* b = segs[j];
+
+                    if( i == j || a->GetLayer() != b->GetLayer() )
+                        continue;
+
+                    const SEG                     sa( a->GetStart(), a->GetEnd() ), sb( b->GetStart(), b->GetEnd() );
+                    const std::optional<VECTOR2I> at = sa.Intersect( sb );
+
+                    if( !at || *at == sa.A || *at == sa.B || *at == sb.A || *at == sb.B )
+                        continue;
+
+                    // the chain from one end of a to one end of b through tracks only
+                    for( int ea = 0; ea < 2 && !again; ++ea )
+                    {
+                        const VECTOR2I        from = ea ? sa.B : sa.A;
+                        std::vector<PCB_TRACK*> chain;
+                        std::set<PCB_TRACK*>  seen = { a };
+                        PCB_TRACK*            cur = a;
+                        VECTOR2I              tip = from;
+                        bool                  reached = false;
+
+                        while( chain.size() < 64 )
+                        {
+                            PCB_TRACK* next = onlyNext( cur, tip );
+
+                            if( !next || seen.count( next ) || !mine.count( next->m_Uuid ) )
+                                break;
+
+                            if( next == b )
+                            {
+                                reached = true;
+                                break;
+                            }
+
+                            seen.insert( next );
+                            chain.push_back( next );
+                            tip = next->GetStart() == tip ? next->GetEnd() : next->GetStart();
+                            cur = next;
+                        }
+
+                        if( !reached || chain.empty() )
+                            continue;
+
+                        std::set<PCB_TRACK*> loop( chain.begin(), chain.end() );
+                        loop.insert( a );
+                        loop.insert( b );
+                        bool clear = untouched( SEG( from, *at ), a->GetLayer(), loop ) && untouched( SEG( tip, *at ), b->GetLayer(), loop );
+
+                        for( PCB_TRACK* t : chain )
+                            clear = clear && untouched( SEG( t->GetStart(), t->GetEnd() ), t->GetLayer(), loop );
+
+                        if( !clear )
+                            continue;
+
+                        BOARD_COMMIT commit( context->GetToolManager() );
+                        commit.Modify( a );
+                        commit.Modify( b );
+                        ( a->GetStart() == from ? a->SetStart( *at ) : a->SetEnd( *at ) );
+                        ( b->GetStart() == tip ? b->SetStart( *at ) : b->SetEnd( *at ) );
+
+                        for( PCB_TRACK* t : chain )
+                            commit.Remove( t );
+
+                        commit.Push( _( "Route loop cut (API)" ) );
+                        profile.loopsCut++;
+                        again = true;
+                    }
+                }
+            }
+        }
+    };
+
     auto tryAlong = [&]( size_t aIndex, int aOrder )
     {
         JOB& job = jobs[aIndex];
@@ -11542,6 +11715,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
 
         keepEnds( job, ok );
+
+        if( ok )
+            cutLoops( job.from->GetNetCode() );
 
         tryDeadline.reset();
         job.ms += msSince( alongStarted );
@@ -15490,6 +15666,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                              { "via_spots", viaSpotsJson() },
                                              { "rip_ups_skipped", profile.ripUpsSkipped },
                                              { "rip_ups_planned", profile.ripUpsPlanned },
+                                             { "loops_cut", profile.loopsCut },
                                              { "rip_ups_walled", profile.ripUpsWalled },
                                              { "rip_ups_failed_at", profile.ripUpsFailedAt },
                                              { "rip_ups_second", profile.ripUpsSecond },
@@ -21635,11 +21812,11 @@ KOPENAPI_REGISTER( "pcb_route",
                    "copper it laid, the same on every platform: two runs part at the first try whose hash differs) and "
                    "profile (attempts; clearance_lookups / rule_evaluations: the router's clearances past its caches and the design "
                    "rule evaluations they took; dead_legs_skipped / via_spots_blocked / via_spots_in_escapes / rip_ups_skipped / rip_ups_walled: tries not made; "
-                   "rip_ups_planned: rip-ups whose routes a plan chose; rip_ups_second: routes taken out that had no way back "
+                   "rip_ups_planned: rip-ups whose routes a plan chose; loops_cut: loops a route along a corridor made on one layer, cut at their crossing where nothing else of the net touches them; rip_ups_second: routes taken out that had no way back "
                    "and moved others in turn; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at); "
                    "a row whose end is shut in has boxed_in (end, which, by: other nets' copper nearer than a track of its width needs (for a pin on its part's outline, on its outward side), and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
-                   "pairs_stuck: pair tries ended when nothing was placed after 3 steps; front_retries: tries refused for walling in another pin's port (a port try's first, else the first), made again as the connection's last try with the ways out as obstacles to the search (tried / won; the row's try says walls_in_first); pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way; plans_stopped: ended by job_cancel, a budget or stop_on_plateau_s); sync_ms: building the router's world for each; move_ms: the path search; "
+                   "pairs_stuck: pair tries ended when nothing was placed after 3 steps; front_retries: tries refused for walling in a port (with bus_paths, any pin's way out; a port try's first, else the first), made again as the connection's last try with the ways out as obstacles to the search (tried / won; the row's try says walls_in_first); pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way; plans_stopped: ended by job_cancel, a budget or stop_on_plateau_s); sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
                    "rip_up, gaps); "
