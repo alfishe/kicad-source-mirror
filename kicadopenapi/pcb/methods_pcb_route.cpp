@@ -1245,6 +1245,8 @@ struct ESCAPE_FRONT
     int                 partner = -1;  ///< the pad's diff pair partner net: it leaves beside it, not walled out
     bool                supply = false; ///< a supply or ground pin (pcb_net_roles): a pair walls it in no more than any other route
     const char*         kind = "edge"; ///< edge (a fine-pitch pad's way out), inward, port, port_via, bus_via
+    int                 other = -1;    ///< a row end pin's other way out (index in the call's fronts): either one keeps it open
+    bool                spare = false; ///< the other way out of a row end pin (toward the free side): held once its main one is shut
 
     bool walls( int aNet ) const
     {
@@ -1308,6 +1310,36 @@ static BOARD_CONNECTED_ITEM* frontShut( BOARD* aBoard, const ESCAPE_FRONT& aFron
     }
 
     return nullptr;
+}
+
+
+/// @brief Whether a way out is held open for its pad: a main one always, a spare one once its main one is shut
+static bool frontHeld( BOARD* aBoard, const std::vector<ESCAPE_FRONT>& aAll, const ESCAPE_FRONT& aFront )
+{
+    return !aFront.spare || aFront.other < 0 || frontShut( aBoard, aAll[aFront.other], -1, aFront.partner ) != nullptr;
+}
+
+
+/// @brief Whether a pad walled in at aFront keeps its other way out: none of aItems (another net's) in it, no
+/// copper of a third net shutting it
+static bool frontSpared( BOARD* aBoard, const std::vector<ESCAPE_FRONT>& aAll, const ESCAPE_FRONT& aFront,
+                         const std::vector<BOARD_CONNECTED_ITEM*>& aItems )
+{
+    if( aFront.other < 0 )
+        return false;
+
+    const ESCAPE_FRONT& other = aAll[aFront.other];
+
+    for( BOARD_CONNECTED_ITEM* item : aItems )
+    {
+        if( other.walls( item->GetNetCode() ) && item->IsOnLayer( other.layer )
+            && item->GetEffectiveShape( other.layer )->Collide( &other.shape, std::max( item->GetOwnClearance( other.layer ) - 1, 0 ) ) )
+        {
+            return false;
+        }
+    }
+
+    return !frontShut( aBoard, other, -1, other.partner );
 }
 
 
@@ -1599,7 +1631,7 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
             BOX2I nearBox = front.shape.BBox();
             nearBox.Inflate( aBase + clearance );
 
-            if( !front.walls( netCode ) || !nearBox.Intersects( box ) )
+            if( !front.walls( netCode ) || !nearBox.Intersects( box ) || !frontHeld( aBoard, *aReq.fronts, front ) )
                 continue;
 
             fronts.push_back( &front );
@@ -2106,7 +2138,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
             for( const ESCAPE_FRONT& front : *aReq.fronts )
             {
                 // a pair's tail is held to the supply pins' ways out only, those still open
-                if( !front.walls( aReq.from->GetNetCode() )
+                if( !front.walls( aReq.from->GetNetCode() ) || !frontHeld( board, *aReq.fronts, front )
                     || ( aReq.pairTail && ( !front.supply || frontShut( board, front, aReq.from->GetNetCode(), front.partner ) ) ) )
                 {
                     continue;
@@ -2636,6 +2668,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
                 if( pairWay && frontShut( board, front, item->GetNetCode(), front.partner, changedSet ) )
                     continue;
 
+                if( frontSpared( board, *aReq.fronts, front, changed ) )
+                    continue;
+
                 const std::string key = copperKey( item );
                 const VECTOR2I    at = item->GetEffectiveShape( front.layer )->Centre();
 
@@ -2653,6 +2688,9 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
                 if( front.port )
                     aOut["walls_in"]["port"] = true;
 
+                if( front.supply )
+                    aOut["walls_in"]["supply"] = true;
+
                 iface->Staged().Revert();
                 return false;
             }
@@ -2667,6 +2705,7 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         aOut["reason"] = aReq.softCorners ? "longer than its corridor's lanes and their band" : "too long round the ways out kept open";
         aOut["length_mm"] = toMm( length );
         aOut["max_length_mm"] = toMm( aReq.maxLength );
+        aOut["segments"] = segments;
         return false;
     }
 
@@ -3191,7 +3230,8 @@ bool layExact( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
         for( const ESCAPE_FRONT& front : *aReq.fronts )
         {
             if( !front.walls( item->GetNetCode() ) || !item->IsOnLayer( front.layer )
-                || !item->GetEffectiveShape( front.layer )->Collide( &front.shape, std::max( item->GetOwnClearance( front.layer ) - 1, 0 ) ) )
+                || !item->GetEffectiveShape( front.layer )->Collide( &front.shape, std::max( item->GetOwnClearance( front.layer ) - 1, 0 ) )
+                || frontSpared( board, *aReq.fronts, front, mine ) )
             {
                 continue;
             }
@@ -3208,6 +3248,9 @@ bool layExact( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
 
             if( front.port )
                 aOut["walls_in"]["port"] = true;
+
+            if( front.supply )
+                aOut["walls_in"]["supply"] = true;
 
             return false;
         }
@@ -3274,9 +3317,10 @@ bool routeOne( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     ROUTE_PROFILE  scratch;
     ROUTE_PROFILE& profile = ROUTE_PROFILES::Of( aContext.GetBoard(), scratch );
 
-    // a pair's tail refused for walling in a supply pin: made again at once with the supply pins' ways
-    // out as obstacles to the search
-    if( !ok && !aReq.exact && aReq.pairTail && aReq.fronts && !aReq.frontsInWorld && aOut.contains( "walls_in" ) )
+    // a pair's tail refused for walling in a supply pin, or a route along a corridor for walling in a supply
+    // pin's way out: made again at once with the ways out as obstacles to the search
+    if( !ok && !aReq.exact && aReq.fronts && !aReq.frontsInWorld && aOut.contains( "walls_in" )
+        && ( aReq.pairTail || ( aReq.softCorners && !aReq.diffPair && aOut["walls_in"].value( "supply", false ) ) ) )
     {
         ROUTE_REQUEST  again = aReq;
         nlohmann::json out = nlohmann::json::object();
@@ -5197,6 +5241,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         /// bus_paths, an end plan's pin that changes layer: its via spot, the pad's layer and the slot's
         std::optional<std::tuple<VECTOR2I, PCB_LAYER_ID, PCB_LAYER_ID>> fanStartVia, fanEndVia;
         std::optional<VECTOR2I> fanStartKnee, fanEndKnee;   ///< an end plan's knee between its via (pad) and slot
+        std::vector<VECTOR2I>   fanStartBends, fanEndBends;   ///< ... and its corners between the knee and the slot
         std::optional<BOX2I>    fanStartPort, fanEndPort;   ///< an end plan's port line: no lane corner inside it
         bool                  laneFrom = false, laneTo = false;   ///< bus_paths with lanes: its corridor from / to its laid lane's end
         /// bus_paths, an end plan's pin at its from (0) / to (1) end: pad, via, knee, slot (the via's index, -1
@@ -5821,7 +5866,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( const ESCAPE_FRONT& front : fronts )
         {
-            if( front.walls( aEnd->GetNetCode() ) && front.shape.Collide( &via, clearance - 1 ) )
+            if( front.walls( aEnd->GetNetCode() ) && front.shape.Collide( &via, clearance - 1 ) && frontHeld( board, fronts, front ) )
                 return true;
         }
 
@@ -6193,7 +6238,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( const ESCAPE_FRONT& front : fronts )
         {
-            if( front.walls( aFrom->GetNetCode() ) && !pairTail( aTo ) )
+            if( front.walls( aFrom->GetNetCode() ) && !pairTail( aTo ) && frontHeld( board, fronts, front ) )
                 req.keepOut.emplace_back( front.layer, front.shape );
         }
 
@@ -6731,7 +6776,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                             for( const ESCAPE_FRONT& front : fronts )
                             {
-                                if( !front.walls( way.from->GetNetCode() ) || !nearBox.Intersects( front.shape.BBox() ) )
+                                if( !front.walls( way.from->GetNetCode() ) || !nearBox.Intersects( front.shape.BBox() )
+                                    || !frontHeld( board, fronts, front ) )
                                 {
                                     continue;
                                 }
@@ -8536,6 +8582,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         BOARD_CONNECTED_ITEM* item = nullptr;   ///< its first end (the class's pitch, the layer it starts on)
         VECTOR2I              padStart, padEnd;   ///< its pads, when fanned out from them
         bool                  fanStart = false, fanEnd = false;
+        bool                  slotStart = false, slotEnd = false;   ///< its ends at an end plan's slots
         int                   corridor = -1;     ///< bus_paths: the corridor it belongs to (index in corridorOut)
         std::optional<PCB_LAYER_ID> startOn;     ///< the layer its ribbon starts on when an end plan moves it
     };
@@ -9345,6 +9392,24 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         for( MEMBER& m : members )
             m.lateral = VECTOR2D( m.start - line.front() ).Dot( left0 );
 
+        // only the far end planned: its slots give the order, the lanes taking them as they come in
+        // across the port line (the way from the slots to their pads, on its main axis)
+        if( !members.empty()
+            && std::all_of( members.begin(), members.end(), []( const MEMBER& m ) { return m.slotEnd && !m.slotStart; } ) )
+        {
+            VECTOR2D into( 0, 0 );
+
+            for( const MEMBER& m : members )
+                into += VECTOR2D( m.padEnd - m.end );
+
+            into = std::abs( into.x ) >= std::abs( into.y ) ? VECTOR2D( into.x >= 0 ? 1 : -1, 0 )
+                                                             : VECTOR2D( 0, into.y >= 0 ? 1 : -1 );
+            const VECTOR2D leftEnd( into.y, -into.x );
+
+            for( MEMBER& m : members )
+                m.lateral = VECTOR2D( m.end ).Dot( leftEnd );
+        }
+
         std::stable_sort( members.begin(), members.end(), []( const MEMBER& x, const MEMBER& y ) { return x.lateral > y.lateral; } );
 
         // the corners: the line's vertices but its ends on the end blocks' sides (the members leave
@@ -9534,9 +9599,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             for( const auto& g : lanes.vias )
                 j.corridorVia.push_back( g ? std::make_optional( members[k].forward ? g->second : g->first ) : std::nullopt );
 
-            // the lanes start (end) at an end plan's slot: corners on the part's side of its port line go
-            const std::optional<BOX2I>& portAtStart = j.fanStartPort;
-            const std::optional<BOX2I>& portAtEnd = j.fanEndPort;
+            // the lanes start (end) at an end plan's slot: corners on the part's side of its port line go, and
+            // those along it (the floorplan's gates beside the part, a lane's offset from it)
+            std::optional<BOX2I> portAtStart = j.fanStartPort, portAtEnd = j.fanEndPort;
+
+            for( std::optional<BOX2I>* port : { &portAtStart, &portAtEnd } )
+            {
+                if( *port )
+                    ( *port )->Inflate( pcbIUScale.mmToIU( 1.0 ) );
+            }
 
             while( portAtStart && !j.corridor.empty() && portAtStart->Contains( j.corridor.front() ) && !j.corridorVia.front() )
             {
@@ -9549,10 +9620,90 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 j.corridor.pop_back();
                 j.corridorVia.pop_back();
             }
+        }
+
+        // the lanes come to an end plan's slots from outside its port line: a lane still on the part's side of
+        // it there is taken out past it, a pitch for every lane inside its own (their order kept)
+        int pitch = 0;
+
+        for( const MEMBER& m : members )
+            pitch = std::max( pitch, pitchOfNet( m.item ) );
+
+        auto outward = []( const BOX2I& aPort, const VECTOR2I& aSlot )
+        {
+            const int d[4] = { std::abs( aSlot.x - aPort.GetLeft() ), std::abs( aSlot.x - aPort.GetRight() ),
+                               std::abs( aSlot.y - aPort.GetTop() ), std::abs( aSlot.y - aPort.GetBottom() ) };
+            const VECTOR2I way[4] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+            return way[std::min_element( d, d + 4 ) - d];
+        };
+
+        for( const bool atEnd : { false, true } )
+        {
+            std::vector<std::pair<int64_t, int>> inside;
+
+            for( int k = 0; k < n; ++k )
+            {
+                const JOB&                     j = jobs[members[k].job];
+                const std::optional<BOX2I>&    port = atEnd ? j.fanEndPort : j.fanStartPort;
+                const std::optional<VECTOR2I>& slot = atEnd ? j.fanEnd : j.fanStart;
+
+                if( !port || !slot || j.corridor.empty() || ( atEnd ? members[k].slotEnd : members[k].slotStart ) == false )
+                    continue;
+
+                const VECTOR2I c = atEnd ? j.corridor.back() : j.corridor.front();
+                const VECTOR2I way = outward( *port, *slot );
+                inside.emplace_back( (int64_t) c.x * way.x + (int64_t) c.y * way.y, k );
+            }
+
+            std::sort( inside.begin(), inside.end() );
+
+            for( size_t rank = 0; rank < inside.size(); ++rank )
+            {
+                JOB&           j = jobs[members[inside[rank].second].job];
+                const VECTOR2I slot = atEnd ? *j.fanEnd : *j.fanStart;
+                const VECTOR2I way = outward( atEnd ? *j.fanEndPort : *j.fanStartPort, slot );
+                const VECTOR2I c = atEnd ? j.corridor.back() : j.corridor.front();
+                const int64_t  out = (int64_t) ( c - slot ).x * way.x + (int64_t) ( c - slot ).y * way.y;
+                const int64_t  need = (int64_t) pitch * (int64_t) ( rank + 1 );
+
+                if( out >= need )
+                    continue;
+
+                const VECTOR2I gate = c + way * (int) ( need - out );
+                const size_t   last = j.corridor.size() - 1;
+                const VECTOR2I before = j.corridor.size() > 1 ? ( atEnd ? j.corridor[last - 1] : j.corridor[1] ) : c;
+                const VECTOR2I run = c - before;
+                const bool     inLine = (int64_t) run.x * way.y - (int64_t) run.y * way.x == 0;
+                const bool     via = atEnd ? j.corridorVia.back().has_value() : j.corridorVia.front().has_value();
+
+                if( j.corridor.size() > 1 && inLine && !via )
+                    ( atEnd ? j.corridor.back() : j.corridor.front() ) = gate;
+                else if( atEnd )
+                {
+                    j.corridor.push_back( gate );
+                    j.corridorVia.push_back( std::nullopt );
+                }
+                else
+                {
+                    j.corridor.insert( j.corridor.begin(), gate );
+                    j.corridorVia.insert( j.corridorVia.begin(), std::nullopt );
+                }
+            }
+        }
+
+        for( int k = 0; k < n; ++k )
+        {
+            JOB& j = jobs[members[k].job];
 
             if( j.fanStart )
             {
                 j.corridor.insert( j.corridor.begin(), *j.fanStart );
+                j.corridorVia.insert( j.corridorVia.begin(), std::nullopt );
+            }
+
+            for( auto b = j.fanStartBends.rbegin(); b != j.fanStartBends.rend(); ++b )
+            {
+                j.corridor.insert( j.corridor.begin(), *b );
                 j.corridorVia.insert( j.corridorVia.begin(), std::nullopt );
             }
 
@@ -9573,6 +9724,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             if( j.fanEnd )
             {
                 j.corridor.push_back( *j.fanEnd );
+                j.corridorVia.push_back( std::nullopt );
+            }
+
+            for( auto b = j.fanEndBends.rbegin(); b != j.fanEndBends.rend(); ++b )
+            {
+                j.corridor.push_back( *b );
                 j.corridorVia.push_back( std::nullopt );
             }
 
@@ -9806,6 +9963,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         {
             VECTOR2I                slot, knee;
             std::optional<VECTOR2I> via;
+            std::vector<VECTOR2I>   bends;  ///< between the knee and the slot, none at the slot
             BOX2I                   port;   ///< the plan's port line round the part
             PCB_LAYER_ID            padLayer = F_Cu, layer = F_Cu;
         };
@@ -9824,19 +9982,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         if( withEndPlan && endPlanner )
         {
-            std::set<std::string> corridorNets;
-
-            for( const CORRIDOR& c : corridors )
-                corridorNets.insert( c.nets.begin(), c.nets.end() );
-
             for( FOOTPRINT* fp : board->Footprints() )
             {
                 for( PAD* pad : fp->Pads() )
                 {
-                    const std::string net = str( UnescapeString( pad->GetNetname() ) );
-
-                    if( corridorNets.count( net ) )
-                        partsOfNet[net].insert( fp );
+                    if( pad->GetNetCode() > 0 )
+                        partsOfNet[str( UnescapeString( pad->GetNetname() ) )].insert( fp );
                 }
             }
         }
@@ -9860,9 +10011,24 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( nets.empty() || c.points.empty() )
                     continue;
 
+                // where it comes from: its first point from this end past the part's ways out (the gates nearer lie
+                // in the part's own fan-out and say nothing of the side it arrives at)
                 const VECTOR2I centre = aFp->GetPosition();
-                const VECTOR2I gate = ( c.points.front().at - centre ).EuclideanNorm() <= ( c.points.back().at - centre ).EuclideanNorm()
-                                              ? c.points.front().at : c.points.back().at;
+                const bool     fromFront = ( c.points.front().at - centre ).EuclideanNorm() <= ( c.points.back().at - centre ).EuclideanNorm();
+                BOX2I          around = aFp->GetBoundingBox( false );
+                around.Inflate( pcbIUScale.mmToIU( 2.5 ) );
+                VECTOR2I gate = fromFront ? c.points.front().at : c.points.back().at;
+
+                for( size_t k = 0; k < c.points.size(); ++k )
+                {
+                    const VECTOR2I& at = c.points[fromFront ? k : c.points.size() - 1 - k].at;
+
+                    if( !around.Contains( at ) )
+                    {
+                        gate = at;
+                        break;
+                    }
+                }
                 given.emplace_back( ci, nlohmann::json{ { "name", c.name + "#" + std::to_string( ci ) }, { "nets", nets },
                                                         { "from_mm", { pcbIUScale.IUTomm( gate.x ), pcbIUScale.IUTomm( gate.y ) } } } );
             }
@@ -9914,54 +10080,70 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
             }
 
-            if( !shared && !fixed )
-                return plan;
-
+            // a single that a plan made before moves to the other layer: its pin here leaves on that layer too
             nlohmann::json links = nlohmann::json::array();
+            std::set<std::string> inCorridors, movedSingles;
 
             for( const auto& [ci, link] : given )
+            {
                 links.push_back( link );
+
+                for( const nlohmann::json& n : link["nets"] )
+                    inCorridors.insert( n.get<std::string>() );
+            }
+
+            for( PAD* pad : aFp->Pads() )
+            {
+                const std::string net = pad->GetNetCode() > 0 ? str( UnescapeString( pad->GetNetname() ) ) : std::string();
+                auto              parts = net.empty() || inCorridors.count( net ) ? partsOfNet.end() : partsOfNet.find( net );
+
+                if( parts == partsOfNet.end() )
+                    continue;
+
+                for( FOOTPRINT* other : parts->second )
+                {
+                    if( other == aFp || !endPlans.count( other ) )
+                        continue;
+
+                    for( const auto& [otherPad, es] : planOf( other ).slots )
+                    {
+                        if( es.via && otherPad->GetNetCode() == pad->GetNetCode() && !inCorridors.count( net ) )
+                        {
+                            links.push_back( { { "name", net }, { "nets", { net } }, { "layer", es.layer == B_Cu ? "B.Cu" : "F.Cu" } } );
+                            inCorridors.insert( net );
+                            movedSingles.insert( net );
+                            fixed = true;
+                        }
+                    }
+                }
+            }
+
+            if( !shared && !fixed )
+                return plan;
 
             const KOPENAPI_RESULT r = endPlanner->handler( aCtx, { { "ref", str( aFp->GetReference() ) }, { "links", links } } );
             int buses = 0, vias = 0;
 
             for( const nlohmann::json& l : r.status == 200 ? r.body.value( "links", nlohmann::json::array() ) : nlohmann::json::array() )
             {
-                if( l.value( "kind", std::string() ) != "bus" )
+                if( l.value( "kind", std::string() ) == "bus" )
+                    buses++;
+                else if( !movedSingles.count( l.value( "name", std::string() ) ) )
                     continue;
 
-                buses++;
                 vias += l.value( "vias", 0 );
             }
 
-            // a side where a bus member moves to its via and another signal pin keeps its own fan-out: the
-            // plan's vias would take that pin's way out
-            std::set<std::string> movedSides, singleSides;
-
-            for( const nlohmann::json& row : r.status == 200 ? r.body.value( "pins", nlohmann::json::array() ) : nlohmann::json::array() )
-            {
-                const bool corridorPin = row.value( "link", std::string() ).find( '#' ) != std::string::npos;
-
-                if( corridorPin && row.contains( "via_mm" ) )
-                    movedSides.insert( row.value( "side", std::string() ) );
-                else if( !corridorPin && !row.value( "net", std::string() ).empty() )
-                    singleSides.insert( row.value( "side", std::string() ) );
-            }
-
-            const bool crowded = std::any_of( movedSides.begin(), movedSides.end(),
-                                              [&]( const std::string& aSide ) { return singleSides.count( aSide ) > 0; } );
-
-            // planned when a bus changes layer there (a shared end: two buses or more), else each pin's own fan-out
-            const bool used = r.status == 200 && vias > 0 && ( !shared || buses >= 2 ) && !crowded;
+            // planned when a bus or a moved single changes layer there (a shared end: two buses or more), else each
+            // pin's own fan-out
+            const bool used = r.status == 200 && vias > 0 && ( !shared || buses >= 2 );
             nlohmann::json report = { { "ref", str( aFp->GetReference() ) }, { "used", used },
                                       { "for", shared ? "shared end" : "far end" } };
 
             if( r.status != 200 )
                 report["reason"] = r.Message();
             else if( !used )
-                report["reason"] = vias == 0 ? "no bus changes layer there"
-                                   : crowded ? "a moved bus shares a side with pins on their own fan-out"
-                                             : "fewer than two buses in the plan";
+                report["reason"] = vias == 0 ? "no bus changes layer there" : "fewer than two buses in the plan";
 
             if( r.status == 200 )
             {
@@ -9972,6 +10154,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                  { "layer", l.value( "layer", std::string() ) }, { "vias", l.value( "vias", 0 ) } } );
 
                 report["ends_overflow"] = r.body.value( "ends_overflow", nlohmann::json::array() );
+
+                for( const char* key : { "breaks_left", "crossings_left", "wraps_left", "links_under", "no_spot" } )
+                {
+                    if( r.body.contains( key ) )
+                        report[key] = r.body[key];
+                }
+
                 report["pins"] = nlohmann::json::array();
 
                 for( const nlohmann::json& row : r.body.value( "pins", nlohmann::json::array() ) )
@@ -9979,11 +10168,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     nlohmann::json pin = { { "pad", row.value( "pad", std::string() ) }, { "link", row.value( "link", std::string() ) },
                                            { "layer", row.value( "layer", std::string() ) } };
 
-                    for( const char* key : { "slot_mm", "knee_mm", "via_mm" } )
+                    for( const char* key : { "slot_mm", "knee_mm", "bends_mm", "via_mm" } )
                     {
                         if( row.contains( key ) )
                             pin[key] = row[key];
                     }
+
+                    if( row.value( "under", false ) )
+                        pin["under"] = true;
 
                     report["pins"].push_back( pin );
                 }
@@ -10032,6 +10224,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
             }
 
+            const std::set<std::string> boxed = r.body.value( "singles_boxed", std::set<std::string>() );
+
             for( const nlohmann::json& row : r.body.value( "pins", nlohmann::json::array() ) )
             {
                 const std::string name = row.value( "pad", std::string() );
@@ -10047,13 +10241,20 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( !pad || !row.contains( "slot_mm" ) )
                     continue;
 
-                // only the corridors' pins: the singles keep their own fan-out
-                if( row.value( "link", std::string() ).find( '#' ) == std::string::npos )
+                // a single inside buses' runs on both layers crosses one of them on its way to a slot
+                if( boxed.count( row.value( "link", std::string() ) ) )
                     continue;
 
                 END_SLOT es;
                 es.slot = mmPoint( row["slot_mm"] );
                 es.knee = row.contains( "knee_mm" ) ? mmPoint( row["knee_mm"] ) : es.slot;
+
+                for( const nlohmann::json& b : row.value( "bends_mm", nlohmann::json::array() ) )
+                {
+                    if( mmPoint( b ) != es.slot )
+                        es.bends.push_back( mmPoint( b ) );
+                }
+
                 es.port = port;
                 es.layer = row.value( "layer", std::string( "F.Cu" ) ) == "B.Cu" ? B_Cu : F_Cu;
                 es.padLayer = pad->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
@@ -10067,6 +10268,29 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             }
 
             return plan;
+        };
+
+        // pad, via, knee, bends, slot
+        auto plannedEnd = []( const PAD* aPad, const END_SLOT& aSlot )
+        {
+            JOB::PLANNED_END path;
+            path.pts.push_back( aPad->GetPosition() );
+
+            if( aSlot.via )
+            {
+                path.via = (int) path.pts.size();
+                path.pts.push_back( *aSlot.via );
+            }
+
+            if( aSlot.knee != aSlot.slot )
+                path.pts.push_back( aSlot.knee );
+
+            path.pts.insert( path.pts.end(), aSlot.bends.begin(), aSlot.bends.end() );
+
+            path.pts.push_back( aSlot.slot );
+            path.padLayer = aSlot.padLayer;
+            path.slotLayer = aSlot.layer;
+            return path;
         };
 
         auto endSlotOf = [&]( const PAD* aPad ) -> const END_SLOT*
@@ -10233,6 +10457,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         const bool atStart = ( end == j.from ) == m.forward;
                         ( atStart ? m.padStart : m.padEnd ) = atStart ? m.start : m.end;
                         ( atStart ? m.fanStart : m.fanEnd ) = true;
+                        ( atStart ? m.slotStart : m.slotEnd ) = true;
                         ( atStart ? m.start : m.end ) = es->slot;
                         ( atStart ? j.fanStart : j.fanEnd ) = es->slot;
 
@@ -10242,25 +10467,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         if( es->knee != es->slot )
                             ( atStart ? j.fanStartKnee : j.fanEndKnee ) = es->knee;
 
+                        ( atStart ? j.fanStartBends : j.fanEndBends ) = es->bends;
+
                         if( es->port.GetWidth() > 0 && es->port.GetHeight() > 0 )
                             ( atStart ? j.fanStartPort : j.fanEndPort ) = es->port;
 
-                        JOB::PLANNED_END path;
-                        path.pts.push_back( pad->GetPosition() );
-
-                        if( es->via )
-                        {
-                            path.via = (int) path.pts.size();
-                            path.pts.push_back( *es->via );
-                        }
-
-                        if( es->knee != es->slot )
-                            path.pts.push_back( es->knee );
-
-                        path.pts.push_back( es->slot );
-                        path.padLayer = es->padLayer;
-                        path.slotLayer = es->layer;
-                        j.endPath[end == j.from ? 0 : 1] = path;
+                        j.endPath[end == j.from ? 0 : 1] = plannedEnd( pad, *es );
 
                         if( atStart && es->layer != es->padLayer )
                             m.startOn = es->layer;
@@ -10431,6 +10643,38 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             layLanes( *plan, 0 );
         }
 
+        // the other connections at a used plan's pins (its singles): each pad's path on its first connection
+        std::set<const PAD*> pathed;
+
+        for( JOB& j : jobs )
+        {
+            if( j.endPath[0] && j.from )
+                pathed.insert( j.from );
+
+            if( j.endPath[1] && j.to && j.to->Type() == PCB_PAD_T )
+                pathed.insert( static_cast<const PAD*>( j.to.get() ) );
+        }
+
+        for( JOB& j : jobs )
+        {
+            if( corridors.empty() )
+                break;
+
+            for( int side = 0; side < 2; ++side )
+            {
+                BOARD_CONNECTED_ITEM* end = side == 0 ? static_cast<BOARD_CONNECTED_ITEM*>( j.from ) : j.to.get();
+                const PAD*            pad = end && end->Type() == PCB_PAD_T ? static_cast<const PAD*>( end ) : nullptr;
+
+                if( !pad || j.endPath[side] || pathed.count( pad ) )
+                    continue;
+
+                if( const END_SLOT* es = endSlotOf( pad ) )
+                {
+                    j.endPath[side] = plannedEnd( pad, *es );
+                    pathed.insert( pad );
+                }
+            }
+        }
     }
 
     jobs.insert( jobs.begin(), trunks.begin(), trunks.end() );
@@ -10552,7 +10796,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             const BOX2I    box = aPad->GetBoundingBox();
             const VECTOR2I d = aPad->GetPosition() - ring.Centre();
-            const bool     horizontal = (double) std::abs( d.x ) * ring.GetHeight() >= (double) std::abs( d.y ) * ring.GetWidth();
+                        const bool     horizontal = (double) std::abs( d.x ) * ring.GetHeight() >= (double) std::abs( d.y ) * ring.GetWidth();
             const VECTOR2I in = horizontal ? VECTOR2I( d.x >= 0 ? -1 : 1, 0 ) : VECTOR2I( 0, d.y >= 0 ? -1 : 1 );
             const int      half = horizontal ? box.GetWidth() / 2 : box.GetHeight() / 2;
             const VECTOR2I end = box.Centre() + in * half;   // the pad's inner end
@@ -10706,7 +10950,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             const BOX2I    box = aPad->GetBoundingBox();
             const VECTOR2I d = aPad->GetPosition() - ring.Centre();
-            const bool     horizontal = (double) std::abs( d.x ) * ring.GetHeight() >= (double) std::abs( d.y ) * ring.GetWidth();
+                        const bool     horizontal = (double) std::abs( d.x ) * ring.GetHeight() >= (double) std::abs( d.y ) * ring.GetWidth();
             const VECTOR2I dir = horizontal ? VECTOR2I( d.x >= 0 ? 1 : -1, 0 ) : VECTOR2I( 0, d.y >= 0 ? 1 : -1 );
             const int      half = horizontal ? box.GetWidth() / 2 : box.GetHeight() / 2;
             const int      across = horizontal ? box.GetHeight() : box.GetWidth();
@@ -10721,6 +10965,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             // as wide as the net's track, not the pad: the neighbours' tracks leave between the rooms
             const int width = std::min( across, KopenapiRuleTrack( board, aPad->GetNetCode(), tip, padLayer ).opt );
 
+            // a row's end pin leaves toward the free side as well: either way keeps it open
+            const VECTOR2I side = horizontal ? VECTOR2I( 0, d.y >= 0 ? 1 : -1 ) : VECTOR2I( d.x >= 0 ? 1 : -1, 0 );
+            const int      sideHalf = horizontal ? box.GetHeight() / 2 : box.GetWidth() / 2;
+            const int      sideAcross = horizontal ? box.GetWidth() : box.GetHeight();
+            const int      sideEdge = horizontal ? ( side.y > 0 ? ring.GetBottom() - box.GetBottom() : box.GetTop() - ring.GetTop() )
+                                                 : ( side.x > 0 ? ring.GetRight() - box.GetRight() : box.GetLeft() - ring.GetLeft() );
+            const bool     rowEnd = ( d.x != 0 && d.y != 0 ) && sideEdge <= pitch / 2 && depth > sideAcross;
+
             for( PCB_LAYER_ID layer : layers )
             {
                 if( !aPad->IsOnLayer( layer ) || !aPad->FlashLayer( layer ) )
@@ -10734,8 +10986,22 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( aJob )
                     front.jobs.push_back( *aJob );
 
+                const int main = (int) fronts.size();
                 frontsOf[aPad].push_back( fronts.size() );
                 fronts.push_back( std::move( front ) );
+
+                if( rowEnd )
+                {
+                    const VECTOR2I sideTip = box.Centre() + side * sideHalf;
+                    const int      sideWidth = std::min( sideAcross, width );
+                    ESCAPE_FRONT   spare = fronts[main];
+                    spare.shape = SHAPE_SEGMENT( sideTip + side * ( sideWidth / 2 ), sideTip + side * ( depth - sideWidth / 2 ), sideWidth );
+                    spare.spare = true;
+                    spare.other = main;
+                    fronts[main].other = (int) fronts.size();
+                    frontsOf[aPad].push_back( fronts.size() );
+                    fronts.push_back( std::move( spare ) );
+                }
             }
         };
 
@@ -10961,6 +11227,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // from its slot, one that fails takes its paths out again
     bool endsLaid = false;
     int  endPathsLaid = 0, endPathsRefused = 0, endPathsTakenOut = 0;
+    nlohmann::json endPathsWhy = nlohmann::json::array();   // the refused paths: pad, first violation
 
     auto layEnds = [&]()
     {
@@ -11018,8 +11285,16 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     items.push_back( std::move( track ) );
                 }
 
-                if( items.empty() || items.back()->Type() != PCB_TRACE_T || !guard( board, mine, {}, false, &staged ).empty() )
+                const nlohmann::json violations = items.empty() || items.back()->Type() != PCB_TRACE_T
+                                                          ? nlohmann::json::array( { "no track to the slot" } )
+                                                          : guard( board, mine, {}, false, &staged );
+
+                if( !violations.empty() )
                 {
+                    if( endPathsWhy.size() < 32 )
+                        endPathsWhy.push_back( { { "pad", str( pad->GetParentFootprint()->GetReference() ) + "." + str( pad->GetNumber() ) },
+                                                 { "violation", violations[0] } } );
+
                     endPathsRefused++;
                     continue;
                 }
@@ -11069,6 +11344,38 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     };
 
+    // the track at the slot of each laid end path of a connection
+    auto endTracksOf = [&]( const JOB& aJob, PCB_TRACK* aTracks[2] )
+    {
+        for( int side = 0; side < 2; ++side )
+        {
+            aTracks[side] = aJob.endLaid[side].empty()
+                                    ? nullptr
+                                    : dynamic_cast<PCB_TRACK*>( board->ResolveItem( aJob.endLaid[side].back(), true ) );
+        }
+    };
+
+    // a route that went on from its end paths owns them; one that failed takes them out
+    auto keepEnds = [&]( JOB& aJob, bool aOk )
+    {
+        if( !aOk )
+        {
+            takeEndsOut( aJob );
+            return;
+        }
+
+        for( std::vector<KIID>& laid : aJob.endLaid )
+        {
+            for( const KIID& id : laid )
+            {
+                profile.laid[id] = { profile.pass, profile.job, profile.attempts };
+                added.push_back( id );
+            }
+
+            laid.clear();
+        }
+    };
+
     auto tryAlong = [&]( size_t aIndex, int aOrder )
     {
         JOB& job = jobs[aIndex];
@@ -11095,13 +11402,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         req.softCorners = true;
 
         // an end plan's path laid: the route goes on from its slot, past its via and knee corners
-        PCB_TRACK* endTrack[2] = { nullptr, nullptr };
-
-        for( int side = 0; side < 2; ++side )
-        {
-            if( !job.endLaid[side].empty() )
-                endTrack[side] = dynamic_cast<PCB_TRACK*>( board->ResolveItem( job.endLaid[side].back(), true ) );
-        }
+        PCB_TRACK* endTrack[2];
+        endTracksOf( job, endTrack );
 
         const size_t skipFront = endTrack[0] ? job.endPath[0]->pts.size() - 1 : 0;
         const size_t skipBack = endTrack[1] ? job.endPath[1]->pts.size() - 1 : 0;
@@ -11155,16 +11457,26 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         // along its lanes or not at all: a route that passes corners and goes round elsewhere is no ribbon (at
         // either end it may cross the band and come back)
         {
-            VECTOR2I at = req.fromPos ? *req.fromPos : job.from->GetPosition();
+            // the end paths count too: the route merges with their copper
+            VECTOR2I at = endTrack[0] || !req.fromPos ? job.from->GetPosition() : *req.fromPos;
             double   planned = 0;
 
-            for( const auto& [corner, layer] : req.vias )
+            auto pass = [&]( const VECTOR2I& aCorner )
             {
-                planned += ( corner - at ).EuclideanNorm();
-                at = corner;
-            }
+                planned += ( aCorner - at ).EuclideanNorm();
+                at = aCorner;
+            };
 
-            planned += ( req.toPos - at ).EuclideanNorm();
+            for( size_t k = 0; k < skipFront; ++k )
+                pass( job.corridor[k] );
+
+            for( const auto& [corner, layer] : req.vias )
+                pass( corner );
+
+            for( size_t k = job.corridor.size() - skipBack; k < job.corridor.size(); ++k )
+                pass( job.corridor[k] );
+
+            pass( endTrack[1] ? job.toPos : req.toPos );
             const nlohmann::json& c = corridorOut[job.corridorOf];
             const double band = c.value( "pitch_mm", 0.0 ) * std::max<size_t>( c.value( "nets", nlohmann::json::array() ).size(), 1 );
             req.maxLength = planned + 4.0 * pcbIUScale.mmToIU( band );
@@ -11190,23 +11502,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             job.laneRouted = true;
         }
 
-        // the end plan's paths it went on from: its copper now, else taken out
-        for( std::vector<KIID>& laid : job.endLaid )
-        {
-            if( !ok )
-                break;
-
-            for( const KIID& id : laid )
-            {
-                profile.laid[id] = { profile.pass, profile.job, profile.attempts };
-                added.push_back( id );
-            }
-
-            laid.clear();
-        }
-
-        if( !ok )
-            takeEndsOut( job );
+        keepEnds( job, ok );
 
         tryDeadline.reset();
         job.ms += msSince( alongStarted );
@@ -11232,7 +11528,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             for( const VECTOR2I& at : job.corridor )
                 alongRow[aIndex]["corners_mm"].push_back( { toMm( at.x ), toMm( at.y ) } );
 
-            for( const char* key : { "stopped_at_mm", "toward_mm", "blocked_by", "walls_in", "length_mm", "max_length_mm" } )
+            for( const char* key : { "stopped_at_mm", "toward_mm", "blocked_by", "walls_in", "length_mm", "max_length_mm", "segments" } )
             {
                 if( attempt.contains( key ) )
                     alongRow[aIndex][key] = attempt[key];
@@ -11289,8 +11585,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     // a first pass bounded per connection: the plateau waits until each connection has had its try
     plateauHeld = firstBudgetS > 0 ? 1 : 0;
+    layEnds();
 
-    for( size_t index = 0; index < jobs.size(); ++index )
+    auto corridorTurn = [&]( size_t index )
     {
         JOB& job = jobs[index];
 
@@ -11324,6 +11621,19 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             for( size_t k = 0; k < members.size(); ++k )
                 tryAlong( members[k], (int) k );
         }
+    };
+
+    // end paths laid: every corridor's turn before the first connection, so no other net takes the run its slots wait for
+    if( endPathsLaid > 0 )
+    {
+        for( size_t index = 0; index < jobs.size(); ++index )
+            corridorTurn( index );
+    }
+
+    for( size_t index = 0; index < jobs.size(); ++index )
+    {
+        JOB& job = jobs[index];
+        corridorTurn( index );
 
         if( grid && partner[index] < 0 )
             continue;   // on the grid below
@@ -11649,6 +11959,47 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             }
         }
 
+        // a connection at an end plan's pins that has not gone along a corridor: from its slots first, else
+        // from its pads as any other
+        bool fromSlots = false;
+
+        if( !ok && alongTried[index] == 0 && ( !job.endLaid[0].empty() || !job.endLaid[1].empty() ) )
+        {
+            PCB_TRACK* endTrack[2];
+            endTracksOf( job, endTrack );
+
+            if( doneOf )
+                refreshFronts();
+
+            const PCB_LAYER_ID padLayer = job.from->IsOnLayer( F_Cu ) ? F_Cu : job.from->IsOnLayer( B_Cu ) ? B_Cu
+                                                                                                         : job.from->GetLayerSet().CuStack().front();
+            ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
+            req.fronts = &fronts;
+            req.neckWidth = neckFor( job.from, job.to );
+            req.pairTail = pairTail( job.to );
+
+            if( endTrack[0] )
+            {
+                req.from = endTrack[0];
+                req.fromPos = endTrack[0]->GetEnd();
+                req.layer = endTrack[0]->GetLayer();
+            }
+
+            if( endTrack[1] )
+            {
+                req.to = endTrack[1];
+                req.toPos = endTrack[1]->GetEnd();
+            }
+
+            const long outer = profile.job;
+            profile.job = (long) index;
+            attempt = nlohmann::json::object();
+            tries++;
+            ok = fromSlots = routeOne( *context, req, attempt, added );
+            profile.job = outer;
+            keepEnds( job, ok );
+        }
+
         if( !ok )
             ok = tryRoute( job, attempt, tries, true, false );
 
@@ -11675,6 +12026,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         if( corridorRow.is_object() )
             row["corridor"] = corridorRow;
+
+        if( fromSlots )
+            row["from_end_plan"] = true;
 
         // GUI, for watching: each accepted route is drawn before the next one starts
         if( ok && stepMs > 0 && !aQuiet && !aCtx.headless && aCtx.kiway )
@@ -12034,7 +12388,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( const ESCAPE_FRONT& front : fronts )
         {
-            if( front.jobs.empty() && !front.only )
+            if( front.jobs.empty() && !front.only && !front.spare )
                 params.keepOpen.push_back( { front.layer, front.shape, front.pad->GetNetCode() } );
         }
         params.viaAway = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_away_mm", 7.0 ), 0.0, 30.0 ) );
@@ -15038,7 +15392,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "bus_paths", { { "corridors", corridorOut }, { "members", corridorMembers },
                                                { "routed_along", corridorRoutedCount }, { "ring_lanes", ringLanesOut },
                                                { "end_plans", endPlansOut },
-                                               { "end_paths", { { "laid", endPathsLaid }, { "refused", endPathsRefused },
+                                               { "end_paths", { { "laid", endPathsLaid }, { "refused", endPathsRefused }, { "refused_why", endPathsWhy },
                                                                 { "taken_out", endPathsTakenOut } } } } },
                               { "rip_up", { { "tried", rippedTried }, { "won", rippedOk }, { "scope", ripScope },
                                             { "earlier_routes_movable", foreignJobs },
@@ -15115,6 +15469,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         for( const ESCAPE_FRONT& front : fronts )
         {
+            if( front.spare )
+                continue;
+
             const FOOTPRINT* fp = front.pad ? front.pad->GetParentFootprint() : nullptr;
             auto& [count, pads] = byPart[{ fp ? str( fp->GetReference() ) : std::string(), front.kind }];
             count++;
@@ -21269,7 +21626,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "engine":{"type":"string","enum":["pns","grid"],"default":"pns","description":"grid: every net at once on one grid of the board, negotiated congestion (PathFinder) in parallel variants, the best legal result committed (diff-pair trunks still by pns, their rows say engine pns; no rip_up / clean_up passes; with dry_run the same search and guard, rows / totals / grid answered, nothing put on the board, the fills counted out as zones: refill would, the trunks not routed: their rows say not_simulated with the reason and the pairs' airwires are in the grid search; with from: 400; a fine-pitch end the grid walls in tries a lattice half a cell off at its pad: row half_cell_exits, grid.half_cell {tried, won, ms}); pns: one connection at a time with the push-and-shove router"},
                         "max_rounds":{"type":"integer","default":40,"description":"grid: negotiation rounds before the nets still crowding each other are routed apart or left out"},
                         "cell_mm":{"type":"number","default":0,"description":"grid: the cell, 0 a third of the finest track pitch (width + clearance) on a 0.025 mm step (stage global: half the pitch)"},
-                        "end_plan":{"type":"boolean","default":true,"description":"bus_paths: the parts two corridors or more end at are planned by pcb_end_plan (the corridors as links), and so are the moved buses' far parts with the bus's layer kept; a plan is used where a bus changes layer (at a shared end two buses or more) and no side of a moved member has a signal pin on its own fan-out. Each corridor pin of a used plan starts (ends) at its slot: its path pad, via, knee, slot laid before the first route along a corridor, the route going on from the slot, taken out when that route fails or never runs; the singles keep their fan-out. Answer bus_paths.end_plans (per part planned: ref, for shared end / far end, used or reason, links, ends_overflow, pins with slot, knee, via) and end_paths (laid, refused, taken_out); the corridor answers end_slots. false: every end as pcb_fanout_ports plans it"},
+                        "end_plan":{"type":"boolean","default":true,"description":"bus_paths: the parts two corridors or more end at are planned by pcb_end_plan (the corridors as links), and so are the moved buses' and moved singles' far parts with that layer kept; a plan is used where a bus (or a moved single) changes layer (at a shared end two buses or more). Each pin of a used plan, corridor members and singles alike, starts (ends) at its slot: its path pad, via, knee, bends, slot laid before the first route along a corridor, the route going on from the slot (its length cap counting the path), taken out when that route fails or never runs; a single inside buses' runs on both layers keeps its fan-out. Answer bus_paths.end_plans (per part planned: ref, for shared end / far end, used or reason, links, ends_overflow, breaks_left, crossings_left, wraps_left, links_under, no_spot, pins with slot, knee, bends, via, under) and end_paths (laid, refused, taken_out); the corridor answers end_slots. false: every end as pcb_fanout_ports plans it"},
                         "stage":{"type":"string","enum":["full","global","detail"],"default":"full","description":"engine grid: full lays the grid's copper; detail: the global stage, then the grid's copper of each net cut into branches between its junctions (ends, points where three ways meet), each branch by pns along its corridor (read as bus_paths reads one: the lane's corners and via gates as waypoints; bundles first, then branches between two ends, then onto a junction, shorter first; one that does not route tries its via sites alone, then the grid's copper of it through the guard): rows engine pns with detail branches, or engine grid with pns_detail (why pns did not); grid.detail {branches, by_corridor, by_via_sites, already_joined, to_grid_copper}; global only finds each connection's way on a coarse grid (cell half a track pitch), nothing laid: per connection from, to, found, corridor (the shared corridor type, docs corridor.md: {name, net, from, to, points_mm: gates at the corners {at_mm, along, lo_mm = hi_mm, layer, rooms_mm}, via gates {at_mm, via: {from_layer, to_layer}, layer}, the last a free point}; rooms are runs of free cells widened up to 1 mm, other nets' never overlap; bus_paths takes it as given), vias_mm (where it changes layer), layers, length_mm; answer connections, covered, vias, grid (variant, cell_mm, rounds, build_ms, route_ms, variant_stats)"},
                         "race_wait":{"type":"number","default":0.25,"description":"grid: once the first variant is done, the others get this share of its time again (race_wait_min_s at least); stages global and detail 0.1 (a time policy: their grid result is a plan the detail stage refines)"},"race_wait_min_s":{"type":"number","default":2,"minimum":0,"description":"grid: the least time the other variants get once the first is done (seconds)"},"corridor_try_budget_s":{"type":"number","minimum":0,"description":"seconds one member's try along its corridor gets at the turn of the corridor's first connection (a time policy: the try is a soft goal, the member keeps its own turn and budget after); default first_pass_budget_s / 10, 3 when that is 0"},"detail_branch_budget_s":{"type":"number","minimum":0,"description":"stage detail: seconds pns gets for one branch along its corridor (a time policy: a branch is one of many and has the grid's copper as its fallback); default first_pass_budget_s / 10, 3 when that is 0"},
                         "via_keepout_mm":{"type":"number","default":5,"description":"grid: only a chip's own nets put vias this far around it (pads on four sides, or an array outside its balls) while the board routes; other nets left short and, once all are joined, the via-saving pass may use it; 0 off"},
