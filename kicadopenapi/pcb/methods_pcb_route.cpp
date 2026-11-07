@@ -91,6 +91,48 @@ std::string str( const wxString& aText )
     return aText.ToStdString( wxConvUTF8 );
 }
 
+// parts and pads in a stable order (reference, pad number, uuid): pointer order follows the heap, other in each
+// process, and a container walked in it makes the result depend on what ran before
+struct FP_ORDER
+{
+    bool operator()( const FOOTPRINT* aA, const FOOTPRINT* aB ) const
+    {
+        if( aA == aB )
+            return false;
+
+        if( const int c = StrNumCmp( aA->GetReference(), aB->GetReference() ); c != 0 )
+            return c < 0;
+
+        return aA->m_Uuid < aB->m_Uuid;
+    }
+};
+
+struct PAD_ORDER
+{
+    bool operator()( const PAD* aA, const PAD* aB ) const
+    {
+        if( aA == aB )
+            return false;
+
+        const FOOTPRINT* fa = aA->GetParentFootprint();
+        const FOOTPRINT* fb = aB->GetParentFootprint();
+
+        if( fa != fb && fa && fb )
+        {
+            if( FP_ORDER()( fa, fb ) )
+                return true;
+
+            if( FP_ORDER()( fb, fa ) )
+                return false;
+        }
+
+        if( const int c = StrNumCmp( aA->GetNumber(), aB->GetNumber() ); c != 0 )
+            return c < 0;
+
+        return aA->m_Uuid < aB->m_Uuid;
+    }
+};
+
 
 double toMm( double aIU )
 {
@@ -5805,7 +5847,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     std::function<void( const nlohmann::json& aMovedNets, const std::string& aBy )> reopenCut;
 
     // the planned ports of signal pins (ports), filled once the jobs are final
-    std::map<const PAD*, PORT_GOAL> portGoals;
+    std::map<const PAD*, PORT_GOAL, PAD_ORDER> portGoals;
 
     // of two parts joined by planned lanes, the one whose lanes set the order of the connections between them:
     // summed over those connections, the lanes that turn more round their part (their ranks nest in the ring),
@@ -5916,7 +5958,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     // inward_escapes: parts whose row pads may also leave inward, through a via in the ring between
     // the row and the exposed pad (the largest pad, inside the row) where the ring is wide enough
-    std::map<const FOOTPRINT*, PAD*> inwardParts;
+    std::map<const FOOTPRINT*, PAD*, FP_ORDER> inwardParts;
 
     if( aArgs.contains( "inward_escapes" ) )
     {
@@ -7876,7 +7918,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // a package's signal pins' ports from its plan (pcb_fanout_ports' ports): the way out on the pin's
     // side to past the courtyard on the pad's layer, or to the other layer (its nets in aViaNets); an
     // edge connector's fingers (CONN pads) as its SMD pads, on the side away from the board edge
-    auto goalsFrom = [&]( FOOTPRINT* fp, const nlohmann::json& aPorts, std::map<const PAD*, PORT_GOAL>& aGoals,
+    auto goalsFrom = [&]( FOOTPRINT* fp, const nlohmann::json& aPorts, std::map<const PAD*, PORT_GOAL, PAD_ORDER>& aGoals,
                           std::vector<std::string>& aViaNets )
     {
         const BOX2I courtyard = fp->GetCourtyard( fp->GetLayer() == B_Cu ? B_CrtYd : F_CrtYd ).OutlineCount()
@@ -9960,7 +10002,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         // per package of 8 SMD pads (or edge fingers) or more its plan's ports, asked once; a pin's tip on
         // its pad's layer
-        std::map<const FOOTPRINT*, std::map<const PAD*, PORT_GOAL>> fanPlans;
+        std::map<const FOOTPRINT*, std::map<const PAD*, PORT_GOAL, PAD_ORDER>, FP_ORDER> fanPlans;
         std::optional<KOPENAPI_METHOD>                               fanPlanner = KOPENAPI_REGISTRY::Get().Find( "pcb_fanout_ports" );
         int                                                          fannedOut = 0;
 
@@ -9990,7 +10032,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         struct END_PLAN
         {
-            std::map<const PAD*, END_SLOT> slots;
+            std::map<const PAD*, END_SLOT, PAD_ORDER> slots;
             std::map<size_t, std::string>  layerOf;   ///< per corridor: the layer its bus leaves this part on
         };
 
@@ -10408,7 +10450,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( plan == fanPlans.end() )
             {
-                plan = fanPlans.emplace( fp, std::map<const PAD*, PORT_GOAL>() ).first;
+                plan = fanPlans.emplace( fp, std::map<const PAD*, PORT_GOAL, PAD_ORDER>() ).first;
                 const size_t smd = std::count_if( fp->Pads().begin(), fp->Pads().end(),
                                                   []( PAD* p ) { return p->GetAttribute() == PAD_ATTRIB::SMD
                                                                         || p->GetAttribute() == PAD_ATTRIB::CONN; } );
@@ -16409,7 +16451,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     std::vector<ESCAPE>              escapes;
     std::set<const PAD*>             finePads;
-    std::map<const PAD*, VECTOR2I>   outward;
+    std::map<const PAD*, VECTOR2I, PAD_ORDER> outward;
     nlohmann::json                   pairLanes = nlohmann::json::array();       ///< pin, to
     nlohmann::json                   pairLanesNone = nlohmann::json::array();   ///< pin, why
 
@@ -16665,7 +16707,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     }
 
     // the exposed pads of quad packages (pads inside the rows): their vias go in them
-    std::set<PAD*> exposedPads;
+    std::set<PAD*, PAD_ORDER> exposedPads;
 
     for( const UNDER_PART& u : ringAreas )
     {
@@ -16734,7 +16776,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         const char* from;   ///< rail_plan, fan_out, straight_in
     };
 
-    std::map<const PAD*, PLANNED> plannedVia;
+    std::map<const PAD*, PLANNED, PAD_ORDER> plannedVia;
     std::set<const PAD*>          runSkipped;
     std::set<const PAD*>          railPins;
     std::vector<LANE>             lanes;
@@ -16789,7 +16831,7 @@ static KOPENAPI_RESULT pcbStitch( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         options.minViaDia = minViaDia;
         options.minViaDrill = minViaDrill;
 
-        std::set<const FOOTPRINT*> packages;
+        std::set<const FOOTPRINT*, FP_ORDER> packages;
 
         for( const UNDER_PART& u : ringAreas )
         {
