@@ -6929,7 +6929,16 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         if( !ok && aShove )
         {
             const nlohmann::json before = aAttempt;   // what the plan's try (or the walkaround) found
+
+            // a plan through vias waits for the shove: the shove gets half the budget left, the plan's try
+            // (cheap, a walk along its corners) the rest
+            const std::optional<std::chrono::steady_clock::time_point> whole = tryDeadline;
+
+            if( later && tryDeadline && clockNow() < *tryDeadline )
+                tryDeadline = clockNow() + ( *tryDeadline - clockNow() ) / 2;
+
             onLayers( PNS::RM_Shove );
+            tryDeadline = whole;
 
             if( !ok && !before.is_null() )
                 aAttempt = before;
