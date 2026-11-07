@@ -1467,6 +1467,8 @@ struct ROUTE_PROFILE
     std::map<std::string, int> ripUpsFailedAt;   ///< failed rip-ups by what failed: the route, a victim, a cut one
     int    cutByRoutes = 0;       ///< routed connections a later route cut (moving their net's copper), opened again
     int    ripUpsSecond = 0;      ///< victims with no way back that took out routes in turn
+    int    rerouteAlong = 0;      ///< corridor members routed again (rip-up) along their lanes first
+    int    rerouteAlongOk = 0;    ///< of those, along their lanes
     int    pairsStuck = 0;        ///< pair tries ended early: nothing placed after the first steps
     int    frontRetries = 0;      ///< tries refused for walling in a port, made again last with the ways out as obstacles
     int    frontRetriesWon = 0;   ///< ... routed so
@@ -10006,7 +10008,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         std::optional<KOPENAPI_METHOD> endPlanner = KOPENAPI_REGISTRY::Get().Find( "pcb_end_plan" );
         const bool                     withEndPlan = aArgs.value( "end_plan", true );
         int                            endSlotted = 0;
-        std::map<std::string, std::set<FOOTPRINT*>> partsOfNet;
+        std::map<std::string, std::vector<FOOTPRINT*>> partsOfNet;   ///< in the board's order
 
         if( withEndPlan && endPlanner )
         {
@@ -10014,8 +10016,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 for( PAD* pad : fp->Pads() )
                 {
-                    if( pad->GetNetCode() > 0 )
-                        partsOfNet[str( UnescapeString( pad->GetNetname() ) )].insert( fp );
+                    if( pad->GetNetCode() <= 0 )
+                        continue;
+
+                    std::vector<FOOTPRINT*>& parts = partsOfNet[str( UnescapeString( pad->GetNetname() ) )];
+
+                    if( parts.empty() || parts.back() != fp )
+                        parts.push_back( fp );
                 }
             }
         }
@@ -10032,7 +10039,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 for( const std::string& n : c.nets )
                 {
-                    if( auto it = partsOfNet.find( n ); it != partsOfNet.end() && it->second.count( const_cast<FOOTPRINT*>( aFp ) ) )
+                    if( auto it = partsOfNet.find( n ); it != partsOfNet.end()
+                        && std::find( it->second.begin(), it->second.end(), aFp ) != it->second.end() )
                         nets.push_back( n );
                 }
 
@@ -10065,17 +10073,32 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         };
 
         // the other parts a corridor's nets reach
+        // in the board's order: the plans are made in it (pointer order follows the heap, other in each process)
         auto partsBeyond = [&]( size_t aCorridor, const FOOTPRINT* aFp )
         {
-            std::set<FOOTPRINT*> parts;
+            std::set<const FOOTPRINT*> seen = { aFp };
+            std::vector<FOOTPRINT*>    hit;
 
             for( const std::string& n : corridors[aCorridor].nets )
             {
                 if( auto it = partsOfNet.find( n ); it != partsOfNet.end() )
-                    parts.insert( it->second.begin(), it->second.end() );
+                {
+                    for( FOOTPRINT* fp : it->second )
+                    {
+                        if( seen.insert( fp ).second )
+                            hit.push_back( fp );
+                    }
+                }
             }
 
-            parts.erase( const_cast<FOOTPRINT*>( aFp ) );
+            std::vector<FOOTPRINT*> parts;
+
+            for( FOOTPRINT* fp : board->Footprints() )
+            {
+                if( std::find( hit.begin(), hit.end(), fp ) != hit.end() )
+                    parts.push_back( fp );
+            }
+
             return parts;
         };
 
@@ -11972,7 +11995,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     };
 
-    auto tryAlong = [&]( size_t aIndex, int aOrder )
+    // aAgain: a member routed again (retry, rip-up) along its lanes: the attempt there, no along row or count
+    auto tryAlong = [&]( size_t aIndex, int aOrder, nlohmann::json* aAgain = nullptr ) -> bool
     {
         JOB& job = jobs[aIndex];
         layEnds();
@@ -11980,7 +12004,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
 
         if( !job.from || !job.to )
-            return;
+            return false;
 
         const PCB_LAYER_ID padLayer = job.from->IsOnLayer( F_Cu ) ? F_Cu : job.from->IsOnLayer( B_Cu ) ? B_Cu
                                                                                                      : job.from->GetLayerSet().CuStack().front();
@@ -12107,6 +12131,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         job.ms += msSince( alongStarted );
         profile.job = outer;
 
+        if( aAgain )
+        {
+            *aAgain = std::move( attempt );
+            return ok;
+        }
+
         job.corridorRouted = ok;
         corridorRoutedCount += ok;
         done[aIndex] = done[aIndex] || ok;
@@ -12133,6 +12163,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     alongRow[aIndex][key] = attempt[key];
             }
         }
+
+        return ok;
     };
 
     // an end track gone since (a route onto it merged with it, a shove replaced it): the net's track through
@@ -14672,6 +14704,28 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     };
 
+    // a corridor member routed again goes along its lanes first: routed free it takes the others' lanes
+    auto reroute = [&]( size_t aIndex, nlohmann::json& aAttempt, int& aTries )
+    {
+        JOB& j = jobs[aIndex];
+
+        if( !grid && j.corridorOf >= 0 && j.corridor.size() >= 2 && j.bus < 0 && alongTried[aIndex] != 0 )
+        {
+            aTries++;
+            profile.rerouteAlong++;
+
+            if( tryAlong( aIndex, j.corridorRank, &aAttempt ) )
+            {
+                profile.rerouteAlongOk++;
+                return true;
+            }
+
+            aAttempt = nlohmann::json::object();
+        }
+
+        return tryRoute( j, aAttempt, aTries, false, true );
+    };
+
     plateauInRipUp = true;
 
     for( int round = 0; round < ripRounds && !KopenapiJobCancelled() && !plateauPassCut; ++round )
@@ -14986,7 +15040,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 nlohmann::json attempt;
                 int            tries = 0;
                 profile.pass = "rip_up";
-                bool           ok = tryRoute( job, attempt, tries, false, true );
+                bool           ok = reroute( index, attempt, tries );
                 nlohmann::json victimAttempts = nlohmann::json::array();
                 const char*    failedAt = ok ? nullptr : "route";
 
@@ -15009,7 +15063,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     nlohmann::json again;
                     int            againTries = 0;
 
-                    ok = victim.from && victim.to && tryRoute( victim, again, againTries, false, true );
+                    ok = victim.from && victim.to && reroute( v, again, againTries );
 
                     // a victim with no way back: a plan for it chooses routes it may move in turn (not
                     // the new route, not the others taken out); they go back after it
@@ -16054,6 +16108,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                              { "rip_ups_walled", profile.ripUpsWalled },
                                              { "rip_ups_failed_at", profile.ripUpsFailedAt },
                                              { "rip_ups_second", profile.ripUpsSecond },
+                                             { "reroutes_along", { { "tried", profile.rerouteAlong }, { "routed", profile.rerouteAlongOk } } },
                                              { "cut_by_routes", profile.cutByRoutes },
                                              { "pairs_stuck", profile.pairsStuck },
                                              { "front_retries", { { "tried", profile.frontRetries }, { "won", profile.frontRetriesWon } } },
@@ -22197,7 +22252,8 @@ KOPENAPI_REGISTER( "pcb_route",
                    "profile (attempts; clearance_lookups / rule_evaluations: the router's clearances past its caches and the design "
                    "rule evaluations they took; dead_legs_skipped / via_spots_blocked / via_spots_in_escapes / rip_ups_skipped / rip_ups_walled: tries not made; "
                    "rip_ups_planned: rip-ups whose routes a plan chose; loops_cut: loops a route along a corridor made on one layer, cut at their crossing where nothing else of the net touches them; rip_ups_second: routes taken out that had no way back "
-                   "and moved others in turn; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
+                   "and moved others in turn; reroutes_along: corridor members a rip-up routes again (taken out or the one it is for), "
+                   "tried along their lanes first (tried, routed), else free; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at); "
                    "a row whose end is shut in has boxed_in (end, which, by: other nets' copper nearer than a track of its width needs (for a pin on its part's outline, on its outward side), and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
                    "pairs_stuck: pair tries ended when nothing was placed after 3 steps; front_retries: tries refused for walling in a port (with bus_paths, any pin's way out; a port try's first, else the first), made again as the connection's last try with the ways out as obstacles to the search (tried / won; the row's try says walls_in_first); pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way; plans_stopped: ended by job_cancel, a budget or stop_on_plateau_s); sync_ms: building the router's world for each; move_ms: the path search; "
