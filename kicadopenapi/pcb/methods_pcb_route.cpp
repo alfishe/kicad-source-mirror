@@ -10256,6 +10256,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     continue;
 
                 std::vector<CROSSING> points;
+                const PCB_LAYER_ID    layer = l.value( "layer", std::string( "B.Cu" ) ) == "F.Cu" ? F_Cu : B_Cu;
 
                 for( const nlohmann::json& pt : l["line_mm"] )
                 {
@@ -10263,7 +10264,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     x.at = mmPt( pt );
                     x.lo = -bigIU;
                     x.hi = bigIU;
-                    x.layer = B_Cu;
+                    x.layer = layer;
                     points.push_back( x );
                 }
 

@@ -18,6 +18,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <map>
 #include <set>
 #include <vector>
@@ -53,10 +54,30 @@ std::string netOf( const PAD* aPad )
 }
 
 // a long pad (a connector's finger): reached straight along it, whatever side of the part it is on
-bool isFinger( const PAD* aPad )
+// an edge finger: a long pad whose outer end lies within its length of the board's outline
+bool isFinger( const PAD* aPad, const SHAPE_POLY_SET& aOutline )
 {
     const VECTOR2I size = aPad->GetSize( PADSTACK::ALL_LAYERS );
-    return std::max( size.x, size.y ) > 3 * std::min( size.x, size.y );
+
+    if( std::max( size.x, size.y ) <= 3 * std::min( size.x, size.y ) || aOutline.OutlineCount() == 0 )
+        return false;
+
+    const BOX2I    bb = aPad->GetBoundingBox();
+    const bool     wide = bb.GetWidth() > bb.GetHeight();
+    const int      reach = std::max( bb.GetWidth(), bb.GetHeight() );
+    const VECTOR2I ends[2] = { wide ? VECTOR2I( bb.GetLeft(), bb.GetCenter().y ) : VECTOR2I( bb.GetCenter().x, bb.GetTop() ),
+                               wide ? VECTOR2I( bb.GetRight(), bb.GetCenter().y ) : VECTOR2I( bb.GetCenter().x, bb.GetBottom() ) };
+
+    for( const VECTOR2I& end : ends )
+    {
+        for( int i = 0; i < aOutline.OutlineCount(); ++i )
+        {
+            if( aOutline.COutline( i ).SquaredDistance( end, true ) < (SEG::ecoord) reach * reach )
+                return true;
+        }
+    }
+
+    return false;
 }
 
 // a two-row part: its pads on two lines only (two x for rows west and east, two y for north and south); -1 else,
@@ -100,9 +121,9 @@ int padSide( const PAD* aPad )
     }
 }
 
-const char* entryOf( const PAD* aPad, int aFrom )
+const char* entryOf( const PAD* aPad, int aFrom, const SHAPE_POLY_SET& aOutline )
 {
-    if( isFinger( aPad ) )
+    if( isFinger( aPad, aOutline ) )
         return "direct";
 
     const FOOTPRINT* fp = aPad->GetParentFootprint();
@@ -193,6 +214,10 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
 {
     std::map<std::string, std::vector<PAD*>> netPads;
     std::map<std::string, FOOTPRINT*>        byRef;
+    SHAPE_POLY_SET                           outline;
+
+    if( !aBoard->GetBoardPolygonOutlines( outline, false ) )
+        outline.RemoveAllContours();
 
     for( FOOTPRINT* fp : aBoard->Footprints() )
     {
@@ -542,7 +567,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 FOOTPRINT* fp = pad->GetParentFootprint();
 
                 if( fp == plan.a || fp == plan.b )
-                    d.direct = d.direct && std::string( entryOf( pad, fp == plan.a ? d.from[0] : d.from[1] ) ) == "direct";
+                    d.direct = d.direct && std::string( entryOf( pad, fp == plan.a ? d.from[0] : d.from[1], outline ) ) == "direct";
             }
         }
 
@@ -2026,8 +2051,34 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         const int      fromA = d.from[0], fromB = d.from[1];
         const char*    layer = d.direct ? "F.Cu" : "B.Cu";
         nlohmann::json entries = nlohmann::json::array();
-        bool           covered = !d.direct;
+        bool           covered = true;
+        std::string    whyNot;
         std::vector<VECTOR2I> ends[2];
+        std::vector<std::pair<double, std::string>> across[2];   ///< per end its pins left to right on the way
+
+        // on F.Cu a pin entered from outside its row has its slot just past its pad, a finger past its inner end (the
+        // one toward the board's middle); the way out of the pad with it
+        const VECTOR2D middle( aBoard->GetBoardEdgesBoundingBox().GetCenter() );
+
+        auto directSlot = [&]( const PAD* aPad, int aFrom ) -> std::optional<std::pair<VECTOR2I, VECTOR2D>>
+        {
+            const BOX2I    bb = aPad->GetBoundingBox();
+            const VECTOR2D at( aPad->GetPosition() );
+            VECTOR2D       u = unitOf( aFrom );
+
+            if( isFinger( aPad, outline ) )
+            {
+                const bool wide = bb.GetWidth() > bb.GetHeight();
+                u = wide ? VECTOR2D( middle.x >= at.x ? 1 : -1, 0 ) : VECTOR2D( 0, middle.y >= at.y ? 1 : -1 );
+            }
+            else if( padSide( aPad ) != aFrom )
+            {
+                return std::nullopt;
+            }
+
+            const double reach = ( u.x != 0 ? bb.GetWidth() : bb.GetHeight() ) / 2.0 + clr + halfTrack;
+            return std::make_pair( VECTOR2I( at + u * reach ), u );
+        };
 
         for( const std::string& net : plan.link->nets )
         {
@@ -2040,9 +2091,26 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
 
                 const int      from = fp == plan.a ? fromA : fromB;
                 nlohmann::json e = { { "pad", str( fp->GetReference() ) + "." + str( pad->GetNumber() ) }, { "net", net },
-                                     { "entry", d.direct ? entryOf( pad, from ) : viaEntryOf( pad, from ) } };
+                                     { "entry", d.direct ? entryOf( pad, from, outline ) : viaEntryOf( pad, from ) } };
 
-                if( auto it = slots.find( pad ); it != slots.end() && !d.direct )
+                if( d.direct )
+                {
+                    if( auto at = directSlot( pad, from ) )
+                    {
+                        e["slot_mm"] = mm( at->first );
+                        ends[fp == plan.a ? 0 : 1].push_back( at->first );
+
+                        // left of the way: out of a, into b
+                        const VECTOR2D way = fp == plan.a ? at->second : at->second * -1.0;
+                        across[fp == plan.a ? 0 : 1].emplace_back( VECTOR2D( at->first ).Dot( VECTOR2D( way.y, -way.x ) ), net );
+                    }
+                    else
+                    {
+                        covered = false;
+                        whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + " not entered from outside its row";
+                    }
+                }
+                else if( auto it = slots.find( pad ); it != slots.end() )
                 {
                     e["pad_bends_mm"] = nlohmann::json::array();
 
@@ -2061,10 +2129,25 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 else
                 {
                     covered = false;
+                    whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + " has no slot in a stack";
                 }
 
                 entries.push_back( e );
             }
+        }
+
+        // on one layer the ribbon keeps its order: the same left to right at both ends
+        if( d.direct && covered )
+        {
+            for( auto& side : across )
+                std::sort( side.begin(), side.end(), []( const auto& x, const auto& y ) { return x.first > y.first; } );
+
+            covered = across[0].size() == across[1].size()
+                      && std::equal( across[0].begin(), across[0].end(), across[1].begin(),
+                                     []( const auto& x, const auto& y ) { return x.second == y.second; } );
+
+            if( !covered )
+                whyNot = "its pins are in other orders at its two ends";
         }
 
         nlohmann::json round = nlohmann::json::array();
@@ -2081,6 +2164,9 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
 
         if( plan.side >= 0 )
             row["side"] = SIDES[plan.side];
+
+        if( !covered && !whyNot.empty() )
+            row["not_covered"] = whyNot;
 
         // its centreline: from the middle of its slots at a to theirs at b, along its run; a detour out to its
         // band beside the parts between
@@ -2239,11 +2325,39 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
 
             line.push_back( pb );
             line.erase( std::unique( line.begin(), line.end() ), line.end() );
-            laid.emplace_back( line, ( ends[0].size() - 1 ) / 2.0 * laneSpacing + halfTrack );
-            row["line_mm"] = nlohmann::json::array();
 
-            for( const VECTOR2I& p : line )
-                row["line_mm"].push_back( mm( p ) );
+            // the ribbon clear of the rule areas without tracks on its layer
+            const PCB_LAYER_ID onLayer = d.direct ? F_Cu : B_Cu;
+            const int          ribbon = KiROUND( ( ends[0].size() - 1 ) * laneSpacing + aRules.trackWidth );
+            std::string        blocked;
+
+            for( size_t k = 1; k < line.size() && blocked.empty(); ++k )
+            {
+                const SHAPE_SEGMENT seg( line[k - 1], line[k], ribbon );
+
+                for( ZONE* zone : aBoard->Zones() )
+                {
+                    if( zone->GetIsRuleArea() && zone->GetDoNotAllowTracks() && zone->IsOnLayer( onLayer ) && zone->Outline()->Collide( &seg, 0 ) )
+                    {
+                        blocked = zone->GetZoneName().ToStdString();
+                        break;
+                    }
+                }
+            }
+
+            if( !blocked.empty() )
+            {
+                row["covered"] = false;
+                row["not_covered"] = "its line crosses the rule area " + blocked;
+            }
+            else
+            {
+                laid.emplace_back( line, ( ends[0].size() - 1 ) / 2.0 * laneSpacing + halfTrack );
+                row["line_mm"] = nlohmann::json::array();
+
+                for( const VECTOR2I& p : line )
+                    row["line_mm"].push_back( mm( p ) );
+            }
         }
         else
         {
