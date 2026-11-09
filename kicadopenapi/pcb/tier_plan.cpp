@@ -839,12 +839,31 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
     // tracks, vias, pads and zones of other nets and of rule areas without tracks or vias
     std::string lastHit;   ///< what clearOf last found in the way
 
+    std::set<const PAD*> readyVias;   ///< the ready pins whose via past their copper's end is planned
+
     auto hitsOf = [&]( const PAD* aPad, const SHAPE& aShape, PCB_LAYER_ID aLayer, bool aVia )
     {
         const int net = aPad->GetNetCode();
         const int gap = aRules.clearance;
         BOX2I around = aShape.BBox();
         around.Inflate( gap + 1 );
+
+        for( const PAD* other : readyVias )
+        {
+            if( other->GetNetCode() == net )
+                continue;
+
+            const SLOT&         sl = slots[other];
+            const SHAPE_CIRCLE  via( sl.via, aRules.viaDiameter / 2 );
+            const SHAPE_SEGMENT leg( sl.padBends[0], sl.via, aRules.trackWidth );
+
+            if( aShape.Collide( &via, gap ) || ( aLayer == F_Cu && aShape.Collide( &leg, gap ) ) )
+            {
+                lastHit = str( aPad->GetParentFootprint()->GetReference() ) + "." + str( aPad->GetNumber() ) + ": the planned via of "
+                          + str( other->GetParentFootprint()->GetReference() ) + "." + str( other->GetNumber() );
+                return true;
+            }
+        }
 
         for( PCB_TRACK* item : aBoard->Tracks() )
         {
@@ -951,6 +970,27 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         const SHAPE_CIRCLE via( aAt, aRules.viaDiameter / 2 );
         return !hitsOf( aPad, via, F_Cu, true ) && !hitsOf( aPad, via, B_Cu, true );
     };
+
+    // the ready vias that fit, before the stacks: the stacks' copper keeps clear of them
+    std::map<const PAD*, std::string> readyMiss;
+
+    for( const PAD* pad : offLayer )
+    {
+        const SLOT&         sl = slots[pad];
+        const SHAPE_SEGMENT leg( sl.padBends[0], sl.via, aRules.trackWidth );
+        const std::string   name = str( pad->GetParentFootprint()->GetReference() ) + "." + str( pad->GetNumber() );
+
+        if( auto c = crowded.find( pad ); c != crowded.end() )
+            readyMiss[pad] = name + ": its own copper ends on F.Cu, its via there too near " + c->second;
+        else if( sl.via == sl.padBends[0] || !viaClear( pad, sl.via ) || hitsOf( pad, leg, F_Cu, false ) )
+            readyMiss[pad] = name + ": its own copper ends on F.Cu, no room for a via there (" + lastHit + ")";
+    }
+
+    for( const PAD* pad : offLayer )
+    {
+        if( !readyMiss.count( pad ) )
+            readyVias.insert( pad );
+    }
 
     // the stacks out of a part's end first (their order is the least free), then the larger ones; a link's order at
     // its other end is then the order of its slots there
@@ -2276,15 +2316,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 {
                     const SLOT& sl = slots[pad];
 
-                    const SHAPE_SEGMENT leg( sl.padBends[0], sl.via, aRules.trackWidth );
-
-                    if( auto c = crowded.find( pad ); c != crowded.end() )
-                    {
-                        covered = false;
-                        whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + ": its own copper ends on F.Cu, its via there too near "
-                                 + c->second;
-                    }
-                    else if( sl.via != sl.padBends[0] && viaClear( pad, sl.via ) && !hitsOf( pad, leg, F_Cu, false ) )
+                    if( readyVias.count( pad ) )
                     {
                         e["copper_end_mm"] = mm( sl.padBends[0] );
                         e["entry"] = "ready";
@@ -2295,8 +2327,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                     else
                     {
                         covered = false;
-                        whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + ": its own copper ends on F.Cu, no room for a via there ("
-                                 + lastHit + ")";
+                        whyNot = readyMiss[pad];
                     }
                 }
                 else if( auto r = ready.find( pad ); r != ready.end() )
