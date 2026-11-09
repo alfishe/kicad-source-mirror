@@ -17,6 +17,7 @@
 #include <cmath>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <optional>
 #include <map>
@@ -642,6 +643,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
     std::map<const PAD*, SLOT>                                          slots;
     std::map<const PAD*, bool>                                          ready;   ///< pins whose own copper leaves them: true when it reaches another part
     std::set<const PAD*>                                                offLayer;   ///< ready pins whose copper ends off the link's layer
+    std::set<const PAD*>                                                fingers;    ///< edge fingers on a B.Cu link: out of their inner ends
     std::map<std::pair<const FOOTPRINT*, int>, std::vector<STACK_PIN>> stackPins;
     std::map<std::pair<const FOOTPRINT*, int>, std::vector<PASSENGER>> passengers;
     nlohmann::json                                                      stacksWhy = nlohmann::json::array();
@@ -786,6 +788,23 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                         slots[here] = SLOT{ { own->at }, via, via, {} };
                         offLayer.insert( here );
                     }
+                    else if( isFinger( here, outline ) )
+                    {
+                        // out of its inner end toward the board's middle; on F.Cu a via just past that end takes it on
+                        // to B.Cu, its slot a via's width further (a route cannot place a via where it arrives)
+                        const BOX2I    bb = here->GetBoundingBox();
+                        const VECTOR2D at( here->GetPosition() );
+                        const VECTOR2D middle( aBoard->GetBoardEdgesBoundingBox().GetCenter() );
+                        const bool     wide = bb.GetWidth() > bb.GetHeight();
+                        const VECTOR2D u = wide ? VECTOR2D( middle.x >= at.x ? 1 : -1, 0 ) : VECTOR2D( 0, middle.y >= at.y ? 1 : -1 );
+                        const double   half = ( wide ? bb.GetWidth() : bb.GetHeight() ) / 2.0;
+                        const bool     front = !here->IsOnLayer( B_Cu );
+                        SLOT           sl;
+                        sl.via = VECTOR2I( at + u * ( half + aRules.clearance + ( front ? aRules.viaDiameter : aRules.trackWidth ) / 2.0 ) );
+                        sl.slot = front ? VECTOR2I( VECTOR2D( sl.via ) + u * (double) aRules.viaDiameter ) : sl.via;
+                        slots[here] = sl;
+                        fingers.insert( here );
+                    }
                     else
                     {
                         stackPins[{ fp, side }].push_back( { here, i, 0, there } );
@@ -857,9 +876,9 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
 
             const SLOT&         sl = slots[other];
             const SHAPE_CIRCLE  via( sl.via, aRules.viaDiameter / 2 );
-            const SHAPE_SEGMENT leg( sl.padBends[0], sl.via, aRules.trackWidth );
+            const SHAPE_SEGMENT leg( sl.padBends.empty() ? sl.via : sl.padBends[0], sl.via, aRules.trackWidth );
 
-            if( aShape.Collide( &via, gap ) || ( aLayer == F_Cu && aShape.Collide( &leg, gap ) ) )
+            if( aShape.Collide( &via, gap ) || ( aLayer == F_Cu && !sl.padBends.empty() && aShape.Collide( &leg, gap ) ) )
             {
                 lastHit = str( aPad->GetParentFootprint()->GetReference() ) + "." + str( aPad->GetNumber() ) + ": the planned via of "
                           + str( other->GetParentFootprint()->GetReference() ) + "." + str( other->GetNumber() );
@@ -992,9 +1011,25 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
             readyMiss[pad] = name + ": its own copper ends on F.Cu, no room for a via there (" + lastHit + ")";
     }
 
+    for( const PAD* pad : fingers )
+    {
+        const std::string name = str( pad->GetParentFootprint()->GetReference() ) + "." + str( pad->GetNumber() );
+        const SLOT&         sl = slots[pad];
+        const SHAPE_SEGMENT out( pad->IsOnLayer( B_Cu ) ? pad->GetPosition() : sl.via, sl.slot, aRules.trackWidth );
+
+        if( hitsOf( pad, out, B_Cu, false ) || ( !pad->IsOnLayer( B_Cu ) && !viaClear( pad, sl.via ) ) )
+            readyMiss[pad] = name + ": no room past the finger's inner end (" + lastHit + ")";
+    }
+
     for( const PAD* pad : offLayer )
     {
         if( !readyMiss.count( pad ) )
+            readyVias.insert( pad );
+    }
+
+    for( const PAD* pad : fingers )
+    {
+        if( !readyMiss.count( pad ) && !pad->IsOnLayer( B_Cu ) )
             readyVias.insert( pad );
     }
 
@@ -2529,6 +2564,22 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                         whyNot = readyMiss[pad];
                     }
                 }
+                else if( fingers.count( pad ) )
+                {
+                    if( auto miss = readyMiss.find( pad ); miss != readyMiss.end() )
+                    {
+                        covered = false;
+                        whyNot = miss->second;
+                    }
+
+                    e["entry"] = "finger";
+                    e["slot_mm"] = mm( slots[pad].slot );
+
+                    if( !pad->IsOnLayer( B_Cu ) )
+                        e["via_mm"] = mm( slots[pad].via );
+
+                    ends[fp == plan.a ? 0 : 1].push_back( slots[pad].slot );
+                }
                 else if( auto r = ready.find( pad ); r != ready.end() )
                 {
                     // its own copper is its way out: the route goes on from where it ends
@@ -2785,10 +2836,26 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 }
             }
 
+            // a ribbon round far more than the way between its ends costs more than its members routed free
+            double length = 0;
+
+            for( size_t k = 1; k < line.size(); ++k )
+                length += ( VECTOR2D( line[k] ) - VECTOR2D( line[k - 1] ) ).EuclideanNorm();
+
+            const double between = ( VECTOR2D( line.back() ) - VECTOR2D( line.front() ) ).EuclideanNorm();
+
             if( !blocked.empty() )
             {
                 row["covered"] = false;
                 row["not_covered"] = "its line crosses the rule area " + blocked;
+            }
+            else if( length > 2 * between + pcbIUScale.mmToIU( 5 ) )
+            {
+                row["covered"] = false;
+                char why[96];
+                std::snprintf( why, sizeof( why ), "its line runs round: %.1f mm for %.1f mm between its ends", pcbIUScale.IUTomm( length ),
+                               pcbIUScale.IUTomm( between ) );
+                row["not_covered"] = std::string( why );
             }
             else
             {
