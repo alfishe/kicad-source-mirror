@@ -10070,6 +10070,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         std::map<const FOOTPRINT*, END_PLAN> endPlans;
         const bool                           withTiers = aArgs.value( "tiers", true );
         std::map<const PAD*, END_SLOT, PAD_ORDER> tierSlots;   ///< tiers: the covered links' pins
+        std::map<VECTOR2I, END_SLOT>              tierEnds;    ///< tiers: the ready pins' copper ends that take a via
         std::set<size_t>                     tierCovered;   ///< tiers: the corridors they cover
 
         // a bus whose slots at its two ends are in other orders: at its far part the order it arrives in
@@ -10209,6 +10210,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             auto tierPin = [&]( const nlohmann::json& e )
             {
                 const std::string entry = e.value( "entry", std::string() );
+
+                // a pin fanned out already: only a via at its copper's F.Cu end, the member's end there
+                if( entry == "ready" && e.contains( "via_mm" ) )
+                {
+                    END_SLOT es;
+                    es.slot = mmPt( e["slot_mm"] );
+                    es.knee = es.slot;
+                    es.via = mmPt( e["via_mm"] );
+                    es.padLayer = F_Cu;
+                    es.layer = B_Cu;
+                    tierEnds[mmPt( e["copper_end_mm"] )] = es;
+                }
 
                 if( entry == "ready" || entry == "routed" )
                     return;
@@ -10762,6 +10775,31 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     for( BOARD_CONNECTED_ITEM* end : { static_cast<BOARD_CONNECTED_ITEM*>( j.from ), j.to.get() } )
                     {
                         const PAD* pad = end && end->Type() == PCB_PAD_T ? static_cast<const PAD*>( end ) : nullptr;
+
+                        // a ready pin's copper end: the member goes on from a via there
+                        if( auto tracked = end && !pad && ( end->Type() == PCB_TRACE_T || end->Type() == PCB_VIA_T )
+                                                   ? std::optional<const PCB_TRACK*>( static_cast<const PCB_TRACK*>( end ) )
+                                                   : std::nullopt )
+                        {
+                            auto it = tierEnds.find( ( *tracked )->GetStart() );
+
+                            if( it == tierEnds.end() )
+                                it = tierEnds.find( ( *tracked )->GetEnd() );
+
+                            if( it != tierEnds.end() )
+                            {
+                                const END_SLOT& es = it->second;
+                                const bool      atStart = ( end == j.from ) == m.forward;
+                                ( atStart ? m.start : m.end ) = es.slot;
+                                ( atStart ? j.fanStartVia : j.fanEndVia ) = std::make_tuple( *es.via, es.padLayer, es.layer );
+
+                                if( atStart )
+                                    m.startOn = es.layer;
+
+                                endSlotted++;
+                                continue;
+                            }
+                        }
 
                         if( const END_SLOT* es = pad ? endSlotOf( pad ) : nullptr )
                         {

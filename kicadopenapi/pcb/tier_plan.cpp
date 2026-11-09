@@ -660,6 +660,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         VECTOR2I at;
         bool     other;   ///< it reaches a pad of another part
         LSET     on;
+        VECTOR2D way;     ///< the way its last track goes at its end
     };
 
     auto copperEnd = [&]( const PAD* aPad ) -> std::optional<OWN_END>
@@ -675,7 +676,8 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                    || ( aOn->IsOnLayer( B_Cu ) && aOn->GetEffectiveShape( B_Cu )->Collide( p, 0 ) );
         };
 
-        std::map<VECTOR2I, double> reached;
+        std::map<VECTOR2I, double>   reached;
+        std::map<VECTOR2I, VECTOR2I> before;
         std::vector<VECTOR2I>      todo;
 
         for( PCB_TRACK* item : it->second )
@@ -714,6 +716,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 if( !reached.count( q ) || reached[q] > d + 1 )
                 {
                     reached[q] = d;
+                    before[q] = p;
                     todo.push_back( q );
                 }
             }
@@ -733,7 +736,12 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 on |= item->Type() == PCB_VIA_T ? LSET( { F_Cu, B_Cu } ) : LSET( { item->GetLayer() } );
         }
 
-        return OWN_END{ farthest->first, other, on };
+        VECTOR2D way( 0, 0 );
+
+        if( before.count( farthest->first ) )
+            way = ( VECTOR2D( farthest->first ) - VECTOR2D( before[farthest->first] ) ).Resize( 1.0 );
+
+        return OWN_END{ farthest->first, other, on, way };
     };
 
     for( size_t i = 0; i < plans.size(); ++i )
@@ -772,9 +780,10 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                     }
                     else if( own )
                     {
-                        // its own copper ends on F.Cu: no way on to B.Cu there
+                        // its own copper ends on F.Cu: a via a via's width on along its way takes it on to B.Cu
+                        const VECTOR2I via( VECTOR2D( own->at ) + own->way * (double) aRules.viaDiameter );
                         ready[here] = false;
-                        slots[here] = SLOT{ {}, own->at, own->at, {} };
+                        slots[here] = SLOT{ { own->at }, via, via, {} };
                         offLayer.insert( here );
                     }
                     else
@@ -830,63 +839,65 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
     // tracks, vias, pads and zones of other nets and of rule areas without tracks or vias
     std::string lastHit;   ///< what clearOf last found in the way
 
-    auto clearOf = [&]( const PAD* aPad, const SLOT& aSlot, bool aVia = true )
+    auto hitsOf = [&]( const PAD* aPad, const SHAPE& aShape, PCB_LAYER_ID aLayer, bool aVia )
     {
         const int net = aPad->GetNetCode();
-        const int width = aRules.trackWidth;
         const int gap = aRules.clearance;
+        BOX2I around = aShape.BBox();
+        around.Inflate( gap + 1 );
 
-        auto hits = [&]( const SHAPE& aShape, PCB_LAYER_ID aLayer, bool aVia )
+        for( PCB_TRACK* item : aBoard->Tracks() )
         {
-            BOX2I around = aShape.BBox();
-            around.Inflate( gap + 1 );
+            if( !around.Intersects( item->GetBoundingBox() ) )
+                continue;
 
-            for( PCB_TRACK* item : aBoard->Tracks() )
+            if( item->GetNetCode() != net && item->IsOnLayer( aLayer ) && item->GetEffectiveShape( aLayer )->Collide( &aShape, gap ) )
             {
-                if( !around.Intersects( item->GetBoundingBox() ) )
-                    continue;
+                lastHit = str( aPad->GetParentFootprint()->GetReference() ) + "." + str( aPad->GetNumber() ) + ": " + item->GetNetname().ToStdString()
+                          + ( item->Type() == PCB_VIA_T ? " via" : " track" ) + " on " + aBoard->GetLayerName( aLayer ).ToStdString();
+                return true;
+            }
+        }
 
-                if( item->GetNetCode() != net && item->IsOnLayer( aLayer ) && item->GetEffectiveShape( aLayer )->Collide( &aShape, gap ) )
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            if( !around.Intersects( fp->GetBoundingBox( false ) ) )
+                continue;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                if( pad->GetNetCode() != net && pad->IsOnLayer( aLayer ) && pad->GetEffectiveShape( aLayer )->Collide( &aShape, gap ) )
                 {
-                    lastHit = str( aPad->GetParentFootprint()->GetReference() ) + "." + str( aPad->GetNumber() ) + ": " + item->GetNetname().ToStdString()
-                              + ( item->Type() == PCB_VIA_T ? " via" : " track" ) + " on " + aBoard->GetLayerName( aLayer ).ToStdString();
+                    lastHit = str( aPad->GetParentFootprint()->GetReference() ) + "." + str( aPad->GetNumber() ) + ": pad " + str( fp->GetReference() ) + "."
+                              + str( pad->GetNumber() ) + " on " + aBoard->GetLayerName( aLayer ).ToStdString();
                     return true;
                 }
             }
+        }
 
-            for( FOOTPRINT* fp : aBoard->Footprints() )
+        for( ZONE* zone : aBoard->Zones() )
+        {
+            if( !zone->IsOnLayer( aLayer ) )
+                continue;
+
+            const bool rule = zone->GetIsRuleArea() && ( aVia ? zone->GetDoNotAllowVias() : zone->GetDoNotAllowTracks() );
+
+            if( rule && zone->Outline()->Collide( &aShape, 0 ) )
             {
-                if( !around.Intersects( fp->GetBoundingBox( false ) ) )
-                    continue;
-
-                for( PAD* pad : fp->Pads() )
-                {
-                    if( pad->GetNetCode() != net && pad->IsOnLayer( aLayer ) && pad->GetEffectiveShape( aLayer )->Collide( &aShape, gap ) )
-                    {
-                        lastHit = str( aPad->GetParentFootprint()->GetReference() ) + "." + str( aPad->GetNumber() ) + ": pad " + str( fp->GetReference() ) + "."
-                                  + str( pad->GetNumber() ) + " on " + aBoard->GetLayerName( aLayer ).ToStdString();
-                        return true;
-                    }
-                }
+                lastHit = str( aPad->GetParentFootprint()->GetReference() ) + "." + str( aPad->GetNumber() ) + ": rule area "
+                          + zone->GetZoneName().ToStdString() + " on " + aBoard->GetLayerName( aLayer ).ToStdString();
+                return true;
             }
+        }
 
-            for( ZONE* zone : aBoard->Zones() )
-            {
-                if( !zone->IsOnLayer( aLayer ) )
-                    continue;
+        return false;
+    };
 
-                const bool rule = zone->GetIsRuleArea() && ( aVia ? zone->GetDoNotAllowVias() : zone->GetDoNotAllowTracks() );
+    auto clearOf = [&]( const PAD* aPad, const SLOT& aSlot, bool aVia = true )
+    {
+        const int width = aRules.trackWidth;
 
-                if( rule && zone->Outline()->Collide( &aShape, 0 ) )
-                {
-                    lastHit = str( aPad->GetParentFootprint()->GetReference() ) + "." + str( aPad->GetNumber() ) + ": rule area "
-                              + zone->GetZoneName().ToStdString() + " on " + aBoard->GetLayerName( aLayer ).ToStdString();
-                    return true;
-                }
-            }
-
-            return false;
-        };
+        auto hits = [&]( const SHAPE& aShape, PCB_LAYER_ID aLayer, bool aVia ) { return hitsOf( aPad, aShape, aLayer, aVia ); };
 
         std::vector<VECTOR2I> front = { aPad->GetPosition() };
         front.insert( front.end(), aSlot.padBends.begin(), aSlot.padBends.end() );
@@ -913,6 +924,32 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
 
         const SHAPE_CIRCLE via( aSlot.via, aRules.viaDiameter / 2 );
         return !aVia || ( !hits( via, F_Cu, true ) && !hits( via, B_Cu, true ) );
+    };
+
+    // the ready pins' vias and their F.Cu legs clear of each other: a pin whose via or leg comes too near another's
+    std::map<const PAD*, std::string> crowded;
+
+    for( const PAD* x : offLayer )
+    {
+        for( const PAD* y : offLayer )
+        {
+            if( x == y || x->GetNetCode() == y->GetNetCode() )
+                continue;
+
+            const SLOT& a = slots[x];
+            const SLOT& b = slots[y];
+            const SEG   legB( b.padBends[0], b.via );
+
+            if( ( VECTOR2D( a.via ) - VECTOR2D( b.via ) ).EuclideanNorm() < viaGap || legB.Distance( a.via ) < viaTrack )
+                crowded[x] = str( y->GetParentFootprint()->GetReference() ) + "." + str( y->GetNumber() ) + "'s";
+        }
+    }
+
+    // a via of the pin's net there clear of the board's copper of other nets on both layers
+    auto viaClear = [&]( const PAD* aPad, const VECTOR2I& aAt )
+    {
+        const SHAPE_CIRCLE via( aAt, aRules.viaDiameter / 2 );
+        return !hitsOf( aPad, via, F_Cu, true ) && !hitsOf( aPad, via, B_Cu, true );
     };
 
     // the stacks out of a part's end first (their order is the least free), then the larger ones; a link's order at
@@ -2237,8 +2274,30 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 }
                 else if( offLayer.count( pad ) )
                 {
-                    covered = false;
-                    whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + ": its own copper ends on F.Cu";
+                    const SLOT& sl = slots[pad];
+
+                    const SHAPE_SEGMENT leg( sl.padBends[0], sl.via, aRules.trackWidth );
+
+                    if( auto c = crowded.find( pad ); c != crowded.end() )
+                    {
+                        covered = false;
+                        whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + ": its own copper ends on F.Cu, its via there too near "
+                                 + c->second;
+                    }
+                    else if( sl.via != sl.padBends[0] && viaClear( pad, sl.via ) && !hitsOf( pad, leg, F_Cu, false ) )
+                    {
+                        e["copper_end_mm"] = mm( sl.padBends[0] );
+                        e["entry"] = "ready";
+                        e["slot_mm"] = mm( sl.slot );
+                        e["via_mm"] = mm( sl.via );
+                        ends[fp == plan.a ? 0 : 1].push_back( sl.slot );
+                    }
+                    else
+                    {
+                        covered = false;
+                        whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + ": its own copper ends on F.Cu, no room for a via there ("
+                                 + lastHit + ")";
+                    }
                 }
                 else if( auto r = ready.find( pad ); r != ready.end() )
                 {
