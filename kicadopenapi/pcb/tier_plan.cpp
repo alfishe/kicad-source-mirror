@@ -17,6 +17,7 @@
 #include <cmath>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -381,6 +382,24 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         for( FOOTPRINT* fp : plan.between )
             fits = fits && parts[fp].lanes[axis] >= need;
 
+        // an end part with a neighbour in the band closer than a via row leaves no room for its stack there
+        const int room = aRules.viaDiameter + 2 * aRules.clearance;
+
+        for( FOOTPRINT* end : { plan.a, plan.b } )
+        {
+            const BOX2I eb = end->GetBoundingBox( false );
+
+            for( FOOTPRINT* fp : plan.between )
+            {
+                const BOX2I fb = fp->GetBoundingBox( false );
+                const int   gap = axis == 0 ? std::max( fb.GetLeft() - eb.GetRight(), eb.GetLeft() - fb.GetRight() )
+                                            : std::max( fb.GetTop() - eb.GetBottom(), eb.GetTop() - fb.GetBottom() );
+
+                if( gap < room )
+                    fits = false;
+            }
+        }
+
         if( fits )
         {
             for( FOOTPRINT* fp : plan.between )
@@ -428,6 +447,26 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                     cost += 1000;
             }
 
+            // a detour on that side walls in another's end: one end among the parts it passes round, the other
+            // beyond them
+            for( size_t j : order )
+            {
+                const PLAN& other = plans[j];
+
+                if( j == i || other.side != side )
+                    continue;
+
+                auto walls = [&]( const PLAN& aOuter, const PLAN& aInner )
+                {
+                    auto inside = [&]( FOOTPRINT* aFp ) { return std::find( aOuter.between.begin(), aOuter.between.end(), aFp ) != aOuter.between.end(); };
+                    auto within = [&]( FOOTPRINT* aFp ) { return inside( aFp ) || aFp == aOuter.a || aFp == aOuter.b; };
+                    return ( inside( aInner.a ) && !within( aInner.b ) ) || ( inside( aInner.b ) && !within( aInner.a ) );
+                };
+
+                if( walls( plan, other ) || walls( other, plan ) )
+                    cost += 1e7;
+            }
+
             if( best < 0 || cost < bestCost )
                 best = side, bestCost = cost;
         }
@@ -466,12 +505,26 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
             if( plan.side < 0 || plan.between.empty() )
                 return aToward;
 
+            // a straight link through under the part takes the way toward the run: a two-row part with an end
+            // toward the detour leaves by that end
+            if( rowsOf( aEnd ) >= 0 && plan.side % 2 == rowsOf( aEnd ) )
+            {
+                for( const PLAN& other : plans )
+                {
+                    if( other.side < 0 && std::find( other.between.begin(), other.between.end(), aEnd ) != other.between.end() )
+                        return plan.side;
+                }
+            }
+
             FOOTPRINT*   next = aEnd == plan.a ? plan.between.front() : plan.between.back();
             const BOX2I& e = aEnd->GetBoundingBox( false );
             const BOX2I& n = next->GetBoundingBox( false );
             const int    gap = axisOf( aToward ) == 0 ? std::max( n.GetLeft() - e.GetRight(), e.GetLeft() - n.GetRight() )
                                                       : std::max( n.GetTop() - e.GetBottom(), e.GetTop() - n.GetBottom() );
-            const int stack = parts[aEnd].signals * std::max( parts[aEnd].pitch, pcbIUScale.mmToIU( 0.4 ) ) + pcbIUScale.mmToIU( 1.0 );
+            // the stack's vias and sort zone, then its ribbon turning: a lane per signal at the via spacing
+            const double lane = std::max<double>( aRules.trackWidth + aRules.clearance, aRules.viaDiameter / 2.0 + aRules.clearance + aRules.trackWidth / 2.0 );
+            const int    stack = KiROUND( parts[aEnd].signals * std::max<double>( lane, std::max( parts[aEnd].pitch, pcbIUScale.mmToIU( 0.4 ) ) )
+                                          + 2.0 * ( aRules.viaDiameter + aRules.clearance ) ) + pcbIUScale.mmToIU( 1.0 );
             return gap < stack ? plan.side : aToward;
         };
 
@@ -490,6 +543,51 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
 
                 if( fp == plan.a || fp == plan.b )
                     d.direct = d.direct && std::string( entryOf( pad, fp == plan.a ? d.from[0] : d.from[1] ) ) == "direct";
+            }
+        }
+
+        // into a two-row part's end with pins on both rows: the rows come out on either side, in no order the other
+        // end shares; through a stack
+        for( int end = 0; end < 2 && d.direct; ++end )
+        {
+            FOOTPRINT* fp = end == 0 ? plan.a : plan.b;
+            std::set<int> rows;
+
+            for( const std::string& net : plan.link->nets )
+            {
+                for( PAD* pad : netPads[net] )
+                {
+                    if( pad->GetParentFootprint() == fp )
+                        rows.insert( padSide( pad ) );
+                }
+            }
+
+            if( rowsOf( fp ) >= 0 && d.from[end] % 2 == rowsOf( fp ) && rows.size() > 1 )
+                d.direct = false;
+        }
+    }
+
+    // one stack per part side: a link through a stack takes every link leaving there with it
+    for( bool changed = true; changed; )
+    {
+        changed = false;
+        std::set<std::pair<const FOOTPRINT*, int>> stacked;
+
+        for( size_t i = 0; i < plans.size(); ++i )
+        {
+            if( !decided[i].direct )
+            {
+                stacked.insert( { plans[i].a, decided[i].from[0] } );
+                stacked.insert( { plans[i].b, decided[i].from[1] } );
+            }
+        }
+
+        for( size_t i = 0; i < plans.size(); ++i )
+        {
+            if( decided[i].direct && ( stacked.count( { plans[i].a, decided[i].from[0] } ) || stacked.count( { plans[i].b, decided[i].from[1] } ) ) )
+            {
+                decided[i].direct = false;
+                changed = true;
             }
         }
     }
@@ -682,14 +780,37 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         return !aVia || ( !hits( via, F_Cu, true ) && !hits( via, B_Cu, true ) );
     };
 
-    // the larger stacks first; a link's order at its other end is then the order of its slots there
+    // the stacks out of a part's end first (their order is the least free), then the larger ones; a link's order at
+    // its other end is then the order of its slots there
     std::vector<std::pair<const FOOTPRINT*, int>> stackOrder;
 
     for( const auto& [key, pins] : stackPins )
         stackOrder.push_back( key );
 
+    auto atEnd = []( const std::pair<const FOOTPRINT*, int>& aKey )
+    {
+        const int rows = rowsOf( aKey.first );
+        return rows >= 0 && aKey.second % 2 == rows;
+    };
+
+    // a pin's place in the ribbon from its link's other end: the slots there across the way that end leaves by, seen
+    // from this end (a ribbon keeps its order); -1e18 while that end has no slots
+    auto farSlotT = [&]( const STACK_PIN& aPin, const FOOTPRINT* aHere )
+    {
+        auto it = slots.find( aPin.there );
+
+        if( it == slots.end() )
+            return -1e18;
+
+        const int otherSide = decided[aPin.link].from[plans[aPin.link].a == aHere ? 1 : 0];
+        return -dot( VECTOR2D( it->second.slot ), unitOf( ( otherSide + 1 ) % 4 ) );
+    };
+
     std::stable_sort( stackOrder.begin(), stackOrder.end(), [&]( const auto& x, const auto& y )
     {
+        if( atEnd( x ) != atEnd( y ) )
+            return atEnd( x );
+
         if( stackPins[x].size() != stackPins[y].size() )
             return stackPins[x].size() > stackPins[y].size();
 
@@ -753,6 +874,450 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
             }
         }
 
+        // an end of the part: the pins leave along the rows, out of their rows or into the channel between them on
+        // F.Cu to a via past the end, or through a via beside or under their pad on B.Cu (under the body, or on across
+        // under the other row to its outside); each pin's way is a leg at its row to its column, then up the column
+        // past the end; the columns stand in the stack's order
+        if( !rowsOk && faceOut < -1e17 && farIn < -1e17 )
+        {
+            const int leftSide = ( side + 3 ) % 4;
+            double    lOut = 1e18, lIn = -1e18, rIn = 1e18, rOut = -1e18, uEnd = -1e18;
+
+            for( PAD* pad : fp->Pads() )
+            {
+                const BOX2I bb = pad->GetBoundingBox();
+
+                for( const VECTOR2I& corner : { bb.GetOrigin(), bb.GetEnd(), VECTOR2I( bb.GetLeft(), bb.GetBottom() ), VECTOR2I( bb.GetRight(), bb.GetTop() ) } )
+                {
+                    const double a = along( VECTOR2D( corner ) ), x = across( VECTOR2D( corner ) );
+                    uEnd = std::max( uEnd, a );
+
+                    if( padSide( pad ) == leftSide )
+                        lOut = std::min( lOut, x ), lIn = std::max( lIn, x );
+                    else
+                        rIn = std::min( rIn, x ), rOut = std::max( rOut, x );
+                }
+            }
+
+            // the order: the links turning left first, then those turning right; leaving into its detour, a longer
+            // link runs in an outer tier, so it lies away from the side it turns to; inside a link its pins in the
+            // order they arrive at its other end after the turn
+            auto towardOf = [&]( const STACK_PIN& aPin )
+            {
+                const PLAN& plan = plans[aPin.link];
+                return plan.a == fp ? plan.runs : ( plan.runs + 2 ) % 4;
+            };
+
+            auto endClass = [&]( const STACK_PIN& aPin )
+            {
+                const int toward = towardOf( aPin );
+                return toward == leftSide ? 0 : toward == ( side + 1 ) % 4 ? 2 : 1;
+            };
+
+            // inside a link whose other end has no slots yet, the order this end's rows leave in without crossing
+            // into the channel: the left row's pins nearest the end last, the right row's first; the other end
+            // follows these slots
+            std::set<size_t> farFree;
+
+            for( STACK_PIN& sp : pins )
+            {
+                const double slotT = farSlotT( sp, fp );
+                sp.farT = slotT > -1e17 ? slotT : dot( VECTOR2D( sp.there->GetPosition() ), unitOf( ( towardOf( sp ) + 1 ) % 4 ) );
+
+                if( slotT < -1e17 )
+                    farFree.insert( sp.link );
+            }
+
+            std::map<size_t, std::pair<double, int>> linkT;   ///< per link its pins' farT sum and count
+
+            for( const STACK_PIN& sp : pins )
+            {
+                linkT[sp.link].first += sp.farT;
+                linkT[sp.link].second++;
+            }
+
+            auto meanT = [&]( size_t aLink ) { return linkT[aLink].first / linkT[aLink].second; };
+
+            auto rowKey = [&]( const STACK_PIN& aPin )
+            {
+                const double a = along( VECTOR2D( aPin.pad->GetPosition() ) );
+                return padSide( aPin.pad ) == leftSide ? std::make_pair( 0, -a ) : std::make_pair( 1, a );
+            };
+
+            const size_t n = pins.size();
+
+            if( n > 10 )
+            {
+                refuse( "more than 10 pins at an end" );
+                continue;
+            }
+
+            nlohmann::json endMisses = nlohmann::json::array();
+            bool           endPlaced = false;
+
+            // per link whose other end is free: in the order its pins come in there, else the one the rows leave in
+            // without crossing; fewer links by their rows first
+            std::vector<size_t> freeLinks( farFree.begin(), farFree.end() );
+            std::vector<int>    masks;
+
+            for( int mask = 0; mask < ( 1 << std::min<size_t>( freeLinks.size(), 4 ) ); ++mask )
+                masks.push_back( mask );
+
+            auto bits = []( int aMask )
+            {
+                int count = 0;
+
+                for( ; aMask; aMask &= aMask - 1 )
+                    ++count;
+
+                return count;
+            };
+
+            std::stable_sort( masks.begin(), masks.end(), [&]( int x, int y ) { return bits( x ) < bits( y ); } );
+
+            for( size_t pass = 0; pass < masks.size() && !endPlaced; ++pass )
+            {
+                auto byRows = [&]( size_t aLink )
+                {
+                    for( size_t f = 0; f < freeLinks.size() && f < 4; ++f )
+                    {
+                        if( freeLinks[f] == aLink )
+                            return ( masks[pass] >> f & 1 ) != 0;
+                    }
+
+                    return true;
+                };
+                std::stable_sort( pins.begin(), pins.end(), [&]( const STACK_PIN& x, const STACK_PIN& y )
+                {
+                    const int cx = endClass( x ), cy = endClass( y );
+
+                    if( cx != cy )
+                        return cx < cy;
+
+                    const double lx = plans[x.link].length, ly = plans[y.link].length;
+
+                    if( x.link != y.link && std::abs( lx - ly ) > pcbIUScale.mmToIU( 0.5 ) )
+                        return cx == 2 ? lx > ly : lx < ly;
+
+                    if( x.link != y.link )
+                        return std::make_pair( meanT( x.link ), x.link ) < std::make_pair( meanT( y.link ), y.link );
+
+                    if( farFree.count( x.link ) && byRows( x.link ) )
+                        return rowKey( x ) < rowKey( y );
+
+                    return x.farT < y.farT;
+                } );
+
+
+                std::vector<double> v( n );
+                std::vector<bool>   onLeft( n );
+
+                for( size_t k = 0; k < n; ++k )
+                {
+                    v[k] = along( VECTOR2D( pins[k].pad->GetPosition() ) );
+                    onLeft[k] = padSide( pins[k].pad ) == leftSide;
+                }
+
+                // per pin 0 out of its row on F.Cu, 1 into the channel on F.Cu, 2 a via beside its pad, 3 a via under the
+                // body, 4 a via under the body and across under the other row; the region its column stands in: 0 left
+                // of the rows, 1 between them, 2 right of them
+                auto regionOf = [&]( size_t k, int aKind )
+                {
+                    if( aKind == 1 || aKind == 3 )
+                        return 1;
+
+                    return ( aKind == 4 ) != (bool) onLeft[k] ? 0 : 2;
+                };
+
+                // out of its row on F.Cu, a pin's leg walls in the routed pads of that row nearer the end that are not in
+                // the stack
+                auto wallsIn = [&]( size_t k )
+                {
+                    for( PAD* pad : fp->Pads() )
+                    {
+                        if( padSide( pad ) != padSide( pins[k].pad ) || along( VECTOR2D( pad->GetPosition() ) ) <= v[k] + 1
+                            || !aRules.routed.count( netOf( pad ) ) )
+                            continue;
+
+                        if( std::none_of( pins.begin(), pins.end(), [&]( const STACK_PIN& sp ) { return sp.pad == pad; } ) )
+                            return true;
+                    }
+
+                    return false;
+                };
+
+                struct END_TRY
+                {
+                    int              cost;
+                    std::vector<int> kinds;
+                };
+
+                std::vector<END_TRY> tries;
+                std::vector<int>     kindOf( n );
+
+                std::function<void( size_t, int, int )> walk = [&]( size_t k, int aRegion, int aCost )
+                {
+                    if( tries.size() >= 20000 )
+                        return;
+
+                    if( k == n )
+                    {
+                        tries.push_back( { aCost, kindOf } );
+                        return;
+                    }
+
+                    for( int kind = 0; kind < 5; ++kind )
+                    {
+                        const int region = regionOf( k, kind );
+
+                        if( region < aRegion || ( kind == 0 && wallsIn( k ) ) )
+                            continue;
+
+                        kindOf[k] = kind;
+                        walk( k + 1, region, aCost + ( kind == 4 ? 2 : 1 ) );
+                    }
+                };
+
+                walk( 0, 0, 0 );
+                std::stable_sort( tries.begin(), tries.end(), []( const END_TRY& x, const END_TRY& y ) { return x.cost < y.cost; } );
+
+                const double   width = aRules.trackWidth;
+
+                for( size_t tried = 0; tried < std::min<size_t>( tries.size(), 4096 ) && !endPlaced; ++tried )
+                {
+                    const std::vector<int>& kind = tries[tried].kinds;
+                    auto isF = [&]( size_t k ) { return kind[k] <= 1; };
+
+                    // the vias beside and under the pads, staggered along a row
+                    std::vector<double> viaT( n, 0 );
+
+                    for( int zone = 0; zone < 4; ++zone )   ///< left outside, left under, right under, right outside
+                    {
+                        const bool   left = zone < 2, outside = zone == 0 || zone == 3;
+                        const double base = outside ? ( left ? lOut - clr - viaR : rOut + clr + viaR ) : ( left ? lIn + clr + viaR : rIn - clr - viaR );
+                        const double away = outside == left ? -1 : 1;   ///< the way the stagger goes
+                        std::vector<size_t> idx;
+
+                        for( size_t k = 0; k < n; ++k )
+                        {
+                            if( onLeft[k] == left && ( outside ? kind[k] == 2 : kind[k] >= 3 ) )
+                                idx.push_back( k );
+                        }
+
+                        std::sort( idx.begin(), idx.end(), [&]( size_t x, size_t y ) { return v[x] < v[y]; } );
+                        double lastV = -1e18, lastT = 1e18;
+
+                        for( size_t k : idx )
+                        {
+                            const double dv = v[k] - lastV;
+                            viaT[k] = dv < viaGap && std::abs( lastT - base ) < 1 ? base + away * ( std::sqrt( std::max( 0.0, viaGap * viaGap - dv * dv ) ) + pcbIUScale.mmToIU( 0.05 ) ) : base;
+                            lastV = v[k];
+                            lastT = viaT[k];
+                        }
+                    }
+
+                    // the regions' bounds: clear of the pads and of the vias in them
+                    double leftMax = lOut - clr - halfTrack, insideMin = lIn + clr + halfTrack, insideMax = rIn - clr - halfTrack, rightMin = rOut + clr + halfTrack;
+
+                    for( size_t k = 0; k < n; ++k )
+                    {
+                        if( kind[k] == 2 && onLeft[k] )
+                            leftMax = std::min( leftMax, viaT[k] - viaTrack );
+                        else if( kind[k] == 2 )
+                            rightMin = std::max( rightMin, viaT[k] + viaTrack );
+                        else if( kind[k] >= 3 && onLeft[k] )
+                            insideMin = std::max( insideMin, viaT[k] + viaTrack );
+                        else if( kind[k] >= 3 )
+                            insideMax = std::min( insideMax, viaT[k] - viaTrack );
+                    }
+
+                    // the columns in the stack's order; next to an F.Cu column (its via past the end) a track needs room
+                    // for a via
+                    auto gapOf = [&]( size_t a, size_t b ) { return isF( a ) || isF( b ) ? viaTrack : pitchT; };
+                    std::vector<double> col( n, 0 );
+                    std::vector<size_t> byRegion[3];
+
+                    for( size_t k = 0; k < n; ++k )
+                        byRegion[regionOf( k, kind[k] )].push_back( k );
+
+                    for( size_t g = byRegion[0].size(); g-- > 0; )
+                        col[byRegion[0][g]] = g + 1 == byRegion[0].size() ? leftMax : col[byRegion[0][g + 1]] - gapOf( byRegion[0][g], byRegion[0][g + 1] );
+
+                    for( size_t g = 0; g < byRegion[2].size(); ++g )
+                        col[byRegion[2][g]] = g == 0 ? rightMin : col[byRegion[2][g - 1]] + gapOf( byRegion[2][g - 1], byRegion[2][g] );
+
+                    bool fits = true;
+
+                    if( !byRegion[1].empty() )
+                    {
+                        double span = 0;
+
+                        for( size_t g = 1; g < byRegion[1].size(); ++g )
+                            span += gapOf( byRegion[1][g - 1], byRegion[1][g] );
+
+                        double at0 = ( insideMin + insideMax - span ) / 2;
+                        fits = at0 >= insideMin - 1;
+
+                        for( size_t g = 0; g < byRegion[1].size(); ++g )
+                        {
+                            col[byRegion[1][g]] = at0;
+
+                            if( g + 1 < byRegion[1].size() )
+                                at0 += gapOf( byRegion[1][g], byRegion[1][g + 1] );
+                        }
+                    }
+
+                    if( !fits )
+                        continue;
+
+                    // the F.Cu columns' vias past the end, neighbours staggered
+                    const double uVia = uEnd + clr + viaR;
+                    const double stagger = std::sqrt( std::max( 0.0, viaGap * viaGap - viaTrack * viaTrack ) ) + pcbIUScale.mmToIU( 0.05 );
+                    const double uSlot = uVia + stagger + viaR + clr + halfTrack;
+                    std::vector<double> viaU( n, uVia );
+                    bool                up = false;
+
+                    for( size_t k = 0; k < n; ++k )
+                    {
+                        if( !isF( k ) )
+                        {
+                            up = false;
+                            continue;
+                        }
+
+                        viaU[k] = up ? uVia + stagger : uVia;
+                        up = !up && k + 1 < n && isF( k + 1 ) && col[k + 1] - col[k] < viaGap;
+                    }
+
+                    std::map<const PAD*, SLOT> local;
+
+                    for( size_t k = 0; k < n; ++k )
+                    {
+                        SLOT sl;
+
+                        if( isF( k ) )
+                        {
+                            sl.padBends.push_back( at( v[k], col[k] ) );
+                            sl.via = at( viaU[k], col[k] );
+                        }
+                        else
+                        {
+                            sl.via = at( v[k], viaT[k] );
+                            sl.bends.push_back( at( v[k], col[k] ) );
+                        }
+
+                        sl.slot = at( uSlot, col[k] );
+                        local[pins[k].pad] = sl;
+                    }
+
+                    // the stack's own copper apart: tracks on one layer, vias from everything
+                    auto pathOf = [&]( size_t k, bool aFront )
+                    {
+                        const SLOT&           sl = local[pins[k].pad];
+                        std::vector<VECTOR2I> pts;
+
+                        if( aFront )
+                        {
+                            pts.push_back( pins[k].pad->GetPosition() );
+                            pts.insert( pts.end(), sl.padBends.begin(), sl.padBends.end() );
+                            pts.push_back( sl.via );
+                        }
+                        else
+                        {
+                            pts.push_back( sl.via );
+                            pts.insert( pts.end(), sl.bends.begin(), sl.bends.end() );
+                            pts.push_back( sl.slot );
+                        }
+
+                        std::vector<SEG> segs;
+
+                        for( size_t i = 1; i < pts.size(); ++i )
+                        {
+                            if( pts[i] != pts[i - 1] )
+                                segs.emplace_back( pts[i - 1], pts[i] );
+                        }
+
+                        return segs;
+                    };
+
+                    std::string selfHit;
+
+                    for( size_t a = 0; a < n && selfHit.empty(); ++a )
+                    {
+                        for( size_t b = a + 1; b < n && selfHit.empty(); ++b )
+                        {
+                            const VECTOR2I va = local[pins[a].pad].via, vb = local[pins[b].pad].via;
+
+                            if( ( va - vb ).EuclideanNorm() < viaGap - 1 )
+                                selfHit = "vias";
+
+                            for( bool front : { true, false } )
+                            {
+                                for( const SEG& sa : pathOf( a, front ) )
+                                {
+                                    if( sa.Distance( vb ) < viaTrack - 1 )
+                                        selfHit = "a via";
+
+                                    for( const SEG& sb : pathOf( b, front ) )
+                                    {
+                                        if( sa.Distance( sb ) < width + clr - 1 )
+                                            selfHit = front ? "F.Cu tracks" : "B.Cu tracks";
+                                    }
+                                }
+
+                                for( const SEG& sb : pathOf( b, front ) )
+                                {
+                                    if( sb.Distance( va ) < viaTrack - 1 )
+                                        selfHit = "a via";
+                                }
+                            }
+                        }
+                    }
+
+                    bool clear = selfHit.empty();
+
+                    if( !clear )
+                        lastHit = "the stack's own " + selfHit;
+
+                    for( const auto& [pad, sl] : local )
+                        clear = clear && clearOf( pad, sl );
+
+                    if( !clear )
+                    {
+                        std::string kinds;
+
+                        for( int kk : kind )
+                            kinds += "OIWVX"[kk];
+
+                        if( endMisses.size() < 32 )
+                            endMisses.push_back( { { "kinds", kinds }, { "hit", lastHit } } );
+
+                        continue;
+                    }
+
+                    slots.insert( local.begin(), local.end() );
+                    endPlaced = true;
+                }
+
+                if( !endPlaced && pass + 1 == masks.size() )
+                {
+                    refuse( tries.empty() ? "no order at its end" : "its copper would hit the board's" );
+                    nlohmann::json order = nlohmann::json::array();
+
+                    for( size_t k = 0; k < n; ++k )
+                        order.push_back( { { "pad", str( fp->GetReference() ) + "." + str( pins[k].pad->GetNumber() ) }, { "net", netOf( pins[k].pad ) },
+                                           { "row", pcbIUScale.IUTomm( v[k] ) }, { "left", (bool) onLeft[k] }, { "turn", endClass( pins[k] ) } } );
+
+                    stacksWhy.back()["order"] = order;
+
+                    if( !endMisses.empty() )
+                        stacksWhy.back()["tried"] = endMisses;
+                }
+            }
+
+            continue;
+        }
+
         if( !rowsOk || faceOut < -1e17 || farIn < -1e17 )
         {
             refuse( "left along its rows" );
@@ -766,8 +1331,8 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
 
         for( STACK_PIN& sp : pins )
         {
-            auto it = slots.find( sp.there );
-            sp.farT = dot( VECTOR2D( it != slots.end() ? it->second.slot : sp.there->GetPosition() ), t );
+            const double slotT = farSlotT( sp, fp );
+            sp.farT = slotT > -1e17 ? slotT : dot( VECTOR2D( sp.there->GetPosition() ), t );
         }
 
         auto classOf = [&]( const STACK_PIN& aPin )
@@ -1396,11 +1961,57 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
 
     std::vector<size_t> lineOrder;
 
-    for( size_t i = 0; i < plans.size(); ++i )
+    // the detours inner first: the shorter ones, outer tiers past them
+    for( size_t i : order )
     {
         if( plans[i].side >= 0 )
             lineOrder.push_back( i );
     }
+
+    // of the same length, the one starting farther from the side is inner: the outer turns out first and in last
+    auto startAcross = [&]( size_t i )
+    {
+        const PLAN& plan = plans[i];
+        double      sum = 0;
+        int         count = 0;
+
+        for( const std::string& net : plan.link->nets )
+        {
+            for( PAD* pad : netPads[net] )
+            {
+                if( pad->GetParentFootprint() != plan.a )
+                    continue;
+
+                auto it = slots.find( pad );
+                sum += dot( VECTOR2D( it != slots.end() ? it->second.slot : pad->GetPosition() ), unitOf( plan.side ) );
+                count++;
+            }
+        }
+
+        return count ? sum / count : 0.0;
+    };
+
+    for( size_t g = 0; g < lineOrder.size(); )
+    {
+        size_t e = g + 1;
+
+        while( e < lineOrder.size() && plans[lineOrder[e]].side == plans[lineOrder[g]].side
+               && std::abs( plans[lineOrder[e]].length - plans[lineOrder[g]].length ) <= pcbIUScale.mmToIU( 0.5 ) )
+            ++e;
+
+        std::stable_sort( lineOrder.begin() + g, lineOrder.begin() + e, [&]( size_t x, size_t y ) { return startAcross( x ) < startAcross( y ); } );
+        g = e;
+    }
+
+    struct BAND
+    {
+        int side;
+        int from, to;   ///< along the run's axis
+        int at;         ///< across: the band's outer edge
+        int low, high;  ///< along: its turns out of and into the band, the outer edges of the turning ribbons
+    };
+
+    std::vector<BAND> bands;
 
     for( size_t i = 0; i < plans.size(); ++i )
     {
@@ -1522,27 +2133,79 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 }
 
                 const VECTOR2D us = unitOf( plan.side );
+                const int      half = KiROUND( ( ends[0].size() - 1 ) / 2.0 * laneSpacing + halfTrack );
                 const int      off = plan.depth / 2 + clr;
-                const int      bandAt = us.y < 0 ? span.GetTop() - off : us.y > 0 ? span.GetBottom() + off
-                                                                                 : us.x < 0 ? span.GetLeft() - off : span.GetRight() + off;
                 const int      ua = axisOf( plan.runs );
+                const double   sign = us.x + us.y;   ///< +1 when the side lies toward larger coordinates
+                int            bandAt = us.y < 0 ? span.GetTop() - off : us.y > 0 ? span.GetBottom() + off
+                                                                         : us.x < 0 ? span.GetLeft() - off : span.GetRight() + off;
+
+                // outside the bands laid on that side along the same stretch
+                const int from = ua == 0 ? std::min( pa.x, pb.x ) : std::min( pa.y, pb.y );
+                const int to = ua == 0 ? std::max( pa.x, pb.x ) : std::max( pa.y, pb.y );
+
+                // past the ends' slots that leave toward the side
+                for( int end = 0; end < 2; ++end )
+                {
+                    if( ( end == 0 ? fromA : fromB ) != plan.side )
+                        continue;
+
+                    for( const VECTOR2I& p : ends[end] )
+                    {
+                        const int c = us.x != 0 ? p.x : p.y;
+                        bandAt = sign > 0 ? std::max<int>( bandAt, c + half + clr ) : std::min<int>( bandAt, c - half - clr );
+                    }
+                }
+
+                int lowMax = 1 << 30, highMin = -( 1 << 30 );
+
+                for( const BAND& b : bands )
+                {
+                    if( b.side == plan.side && b.from < to && from < b.to )
+                    {
+                        bandAt = sign > 0 ? std::max<int>( bandAt, b.at + half + clr ) : std::min<int>( bandAt, b.at - half - clr );
+                        lowMax = std::min<int>( lowMax, b.low - half - clr );
+                        highMin = std::max<int>( highMin, b.high + half + clr );
+                    }
+                }
+
+                auto nest = [&]( int aLow, int aHigh )
+                {
+                    bands.push_back( { plan.side, from, to, KiROUND( bandAt + sign * half ), std::min( aLow, lowMax ) - half,
+                                       std::max( aHigh, highMin ) + half } );
+                    return std::make_pair( std::min( aLow, lowMax ), std::max( aHigh, highMin ) );
+                };
 
                 if( ua == 0 )
                 {
                     const int x0 = plan.runs == 1 ? span.GetLeft() - plan.depth : span.GetRight() + plan.depth;
                     const int x1 = plan.runs == 1 ? span.GetRight() + plan.depth : span.GetLeft() - plan.depth;
-                    line.push_back( VECTOR2I( fromA == plan.side ? pa.x : x0, pa.y ) );
+                    const int turn = half + KiROUND( clr );   ///< the ribbon turns past its slots
+                    int       ta = plan.runs == 1 ? std::max( x0, pa.x + turn ) : std::min( x0, pa.x - turn );
+                    int       tb = plan.runs == 1 ? std::min( x1, pb.x - turn ) : std::max( x1, pb.x + turn );
+                    const auto [lo, hi] = nest( std::min( fromA == plan.side ? pa.x : ta, fromB == plan.side ? pb.x : tb ),
+                                                std::max( fromA == plan.side ? pa.x : ta, fromB == plan.side ? pb.x : tb ) );
+                    ( plan.runs == 1 ? ta : tb ) = lo;
+                    ( plan.runs == 1 ? tb : ta ) = hi;
+                    line.push_back( VECTOR2I( fromA == plan.side ? pa.x : ta, pa.y ) );
                     line.push_back( VECTOR2I( line.back().x, bandAt ) );
-                    line.push_back( VECTOR2I( fromB == plan.side ? pb.x : x1, bandAt ) );
+                    line.push_back( VECTOR2I( fromB == plan.side ? pb.x : tb, bandAt ) );
                     line.push_back( VECTOR2I( line.back().x, pb.y ) );
                 }
                 else
                 {
                     const int y0 = plan.runs == 2 ? span.GetTop() - plan.depth : span.GetBottom() + plan.depth;
                     const int y1 = plan.runs == 2 ? span.GetBottom() + plan.depth : span.GetTop() - plan.depth;
-                    line.push_back( VECTOR2I( pa.x, fromA == plan.side ? pa.y : y0 ) );
+                    const int turn = half + KiROUND( clr );
+                    int       ta = plan.runs == 2 ? std::max( y0, pa.y + turn ) : std::min( y0, pa.y - turn );
+                    int       tb = plan.runs == 2 ? std::min( y1, pb.y - turn ) : std::max( y1, pb.y + turn );
+                    const auto [lo, hi] = nest( std::min( fromA == plan.side ? pa.y : ta, fromB == plan.side ? pb.y : tb ),
+                                                std::max( fromA == plan.side ? pa.y : ta, fromB == plan.side ? pb.y : tb ) );
+                    ( plan.runs == 2 ? ta : tb ) = lo;
+                    ( plan.runs == 2 ? tb : ta ) = hi;
+                    line.push_back( VECTOR2I( pa.x, fromA == plan.side ? pa.y : ta ) );
                     line.push_back( VECTOR2I( bandAt, line.back().y ) );
-                    line.push_back( VECTOR2I( bandAt, fromB == plan.side ? pb.y : y1 ) );
+                    line.push_back( VECTOR2I( bandAt, fromB == plan.side ? pb.y : tb ) );
                     line.push_back( VECTOR2I( pb.x, line.back().y ) );
                 }
             }
@@ -1575,6 +2238,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
             }
 
             line.push_back( pb );
+            line.erase( std::unique( line.begin(), line.end() ), line.end() );
             laid.emplace_back( line, ( ends[0].size() - 1 ) / 2.0 * laneSpacing + halfTrack );
             row["line_mm"] = nlohmann::json::array();
 

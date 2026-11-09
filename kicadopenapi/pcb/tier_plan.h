@@ -38,8 +38,10 @@ struct TIER_RULES
 /// A link on B.Cu gets its pins' vias and slots per stack (a part's side, every link leaving there):
 /// a facing-row pin a via just outside its pad, a far-row pin a via under the body with a leg across
 /// on B.Cu at its row, or the nearest free row when a facing via stands at it; vias closer than the
-/// rules allow are staggered; the slots stand in a column past the vias.  Only two-row SMD parts left
-/// across their rows get them; a link with slots at both ends is "covered" and has a centreline.
+/// rules allow are staggered; the slots stand in a column past the vias.  Two-row SMD parts left across
+/// their rows get them; a part left by its end gets an end stack (pins out of their row or into the
+/// channel on F.Cu to vias past the end, or through vias beside or under their pads on B.Cu).  A link
+/// with slots at both ends is "covered" and has a centreline; detours on one side nest.
 /// @param aPitch a pad's track width plus clearance
 /// @return {links: [...], parts: [...]}: per link its route, side, the parts it passes round or
 /// under, the side it leaves each end by, its layer, pin entries (with via, bends, slot when
