@@ -10208,6 +10208,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             auto tierPin = [&]( const nlohmann::json& e )
             {
+                const std::string entry = e.value( "entry", std::string() );
+
+                if( entry == "ready" || entry == "routed" )
+                    return;
+
                 const std::string name = e.value( "pad", std::string() );
                 const std::string ref = name.substr( 0, name.find( '.' ) );
                 const std::string number = name.substr( name.find( '.' ) + 1 );

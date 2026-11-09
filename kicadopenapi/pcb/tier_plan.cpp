@@ -640,11 +640,101 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
     };
 
     std::map<const PAD*, SLOT>                                          slots;
+    std::map<const PAD*, bool>                                          ready;   ///< pins whose own copper leaves them: true when it reaches another part
+    std::set<const PAD*>                                                offLayer;   ///< ready pins whose copper ends off the link's layer
     std::map<std::pair<const FOOTPRINT*, int>, std::vector<STACK_PIN>> stackPins;
     std::map<std::pair<const FOOTPRINT*, int>, std::vector<PASSENGER>> passengers;
     nlohmann::json                                                      stacksWhy = nlohmann::json::array();
     nlohmann::json                                                      passengersOut = nlohmann::json::array();
     auto mmOf = []( const VECTOR2I& p ) { return nlohmann::json::array( { pcbIUScale.IUTomm( p.x ), pcbIUScale.IUTomm( p.y ) } ); };
+
+    // a pin's own copper already on the board: its tracks and vias from the pad on, as far as they go (the end
+    // farthest along them), and whether they reach a pad of another part
+    std::map<int, std::vector<PCB_TRACK*>> netCopper;
+
+    for( PCB_TRACK* item : aBoard->Tracks() )
+        netCopper[item->GetNetCode()].push_back( item );
+
+    struct OWN_END
+    {
+        VECTOR2I at;
+        bool     other;   ///< it reaches a pad of another part
+        LSET     on;
+    };
+
+    auto copperEnd = [&]( const PAD* aPad ) -> std::optional<OWN_END>
+    {
+        auto it = netCopper.find( aPad->GetNetCode() );
+
+        if( it == netCopper.end() || aPad->GetNetCode() <= 0 )
+            return std::nullopt;
+
+        auto onPad = [&]( const PAD* aOn, const VECTOR2I& p )
+        {
+            return ( aOn->IsOnLayer( F_Cu ) && aOn->GetEffectiveShape( F_Cu )->Collide( p, 0 ) )
+                   || ( aOn->IsOnLayer( B_Cu ) && aOn->GetEffectiveShape( B_Cu )->Collide( p, 0 ) );
+        };
+
+        std::map<VECTOR2I, double> reached;
+        std::vector<VECTOR2I>      todo;
+
+        for( PCB_TRACK* item : it->second )
+        {
+            for( const VECTOR2I& p : { item->GetStart(), item->GetEnd() } )
+            {
+                if( onPad( aPad, p ) && !reached.count( p ) )
+                {
+                    reached[p] = 0;
+                    todo.push_back( p );
+                }
+            }
+        }
+
+        if( todo.empty() )
+            return std::nullopt;
+
+        bool other = false;
+
+        while( !todo.empty() )
+        {
+            const VECTOR2I p = todo.back();
+            todo.pop_back();
+
+            for( const PAD* there : netPads[netOf( aPad )] )
+                other = other || ( there->GetParentFootprint() != aPad->GetParentFootprint() && onPad( there, p ) );
+
+            for( PCB_TRACK* item : it->second )
+            {
+                if( item->Type() == PCB_VIA_T || ( item->GetStart() != p && item->GetEnd() != p ) )
+                    continue;
+
+                const VECTOR2I q = item->GetStart() == p ? item->GetEnd() : item->GetStart();
+                const double   d = reached[p] + ( VECTOR2D( q ) - VECTOR2D( p ) ).EuclideanNorm();
+
+                if( !reached.count( q ) || reached[q] > d + 1 )
+                {
+                    reached[q] = d;
+                    todo.push_back( q );
+                }
+            }
+        }
+
+        auto farthest = std::max_element( reached.begin(), reached.end(), []( const auto& x, const auto& y ) { return x.second < y.second; } );
+
+        if( farthest->second <= 0 )
+            return std::nullopt;
+
+        // the layers it ends on: a via's both, else its last track's
+        LSET on;
+
+        for( PCB_TRACK* item : it->second )
+        {
+            if( item->Type() == PCB_VIA_T ? item->GetPosition() == farthest->first : item->GetStart() == farthest->first || item->GetEnd() == farthest->first )
+                on |= item->Type() == PCB_VIA_T ? LSET( { F_Cu, B_Cu } ) : LSET( { item->GetLayer() } );
+        }
+
+        return OWN_END{ farthest->first, other, on };
+    };
 
     for( size_t i = 0; i < plans.size(); ++i )
     {
@@ -671,7 +761,27 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 }
 
                 if( here && there )
-                    stackPins[{ fp, side }].push_back( { here, i, 0, there } );
+                {
+                    if( auto own = copperEnd( here ); own && ( own->other || own->on.Contains( B_Cu ) ) )
+                    {
+                        ready[here] = own->other;
+                        SLOT sl;
+                        sl.via = own->at;
+                        sl.slot = own->at;
+                        slots[here] = sl;
+                    }
+                    else if( own )
+                    {
+                        // its own copper ends on F.Cu: no way on to B.Cu there
+                        ready[here] = false;
+                        slots[here] = SLOT{ {}, own->at, own->at, {} };
+                        offLayer.insert( here );
+                    }
+                    else
+                    {
+                        stackPins[{ fp, side }].push_back( { here, i, 0, there } );
+                    }
+                }
             }
         }
     }
@@ -2093,7 +2203,22 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 nlohmann::json e = { { "pad", str( fp->GetReference() ) + "." + str( pad->GetNumber() ) }, { "net", net },
                                      { "entry", d.direct ? entryOf( pad, from, outline ) : viaEntryOf( pad, from ) } };
 
-                if( d.direct )
+                std::optional<OWN_END> own = d.direct ? copperEnd( pad ) : std::nullopt;
+
+                if( own && !own->other && !own->on.Contains( F_Cu ) )
+                {
+                    covered = false;
+                    whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + ": its own copper ends on B.Cu";
+                }
+                else if( own )
+                {
+                    e["entry"] = own->other ? "routed" : "ready";
+                    e["slot_mm"] = mm( own->at );
+
+                    if( !own->other )
+                        ends[fp == plan.a ? 0 : 1].push_back( own->at );
+                }
+                else if( d.direct )
                 {
                     if( auto at = directSlot( pad, from ) )
                     {
@@ -2109,6 +2234,20 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                         covered = false;
                         whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + " not entered from outside its row";
                     }
+                }
+                else if( offLayer.count( pad ) )
+                {
+                    covered = false;
+                    whyNot = str( fp->GetReference() ) + "." + str( pad->GetNumber() ) + ": its own copper ends on F.Cu";
+                }
+                else if( auto r = ready.find( pad ); r != ready.end() )
+                {
+                    // its own copper is its way out: the route goes on from where it ends
+                    e["entry"] = r->second ? "routed" : "ready";
+                    e["slot_mm"] = mm( slots[pad].slot );
+
+                    if( !r->second )
+                        ends[fp == plan.a ? 0 : 1].push_back( slots[pad].slot );
                 }
                 else if( auto it = slots.find( pad ); it != slots.end() )
                 {
@@ -2139,8 +2278,20 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         // on one layer the ribbon keeps its order: the same left to right at both ends
         if( d.direct && covered )
         {
-            for( auto& side : across )
-                std::sort( side.begin(), side.end(), []( const auto& x, const auto& y ) { return x.first > y.first; } );
+            // the pins with a slot at both ends
+            std::set<std::string> both[2];
+
+            for( int end = 0; end < 2; ++end )
+            {
+                for( const auto& [t, net] : across[end] )
+                    both[end].insert( net );
+            }
+
+            for( int end = 0; end < 2; ++end )
+            {
+                std::erase_if( across[end], [&]( const auto& x ) { return !both[1 - end].count( x.second ); } );
+                std::sort( across[end].begin(), across[end].end(), []( const auto& x, const auto& y ) { return x.first > y.first; } );
+            }
 
             covered = across[0].size() == across[1].size()
                       && std::equal( across[0].begin(), across[0].end(), across[1].begin(),
@@ -2362,6 +2513,9 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         else
         {
             row["covered"] = false;
+
+            if( covered )
+                row["not_covered"] = "its pins at one end are all routed already";
         }
 
         stacks[plan.a][fromA].push_back( linksOut.size() );
