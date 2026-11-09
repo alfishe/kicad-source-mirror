@@ -838,6 +838,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
     // a stack pin's copper (its pad to the via on the pad's layer, the via, B.Cu on to the slot) clear of the board's
     // tracks, vias, pads and zones of other nets and of rule areas without tracks or vias
     std::string lastHit;   ///< what clearOf last found in the way
+    std::optional<std::pair<VECTOR2I, int>> lastVia;   ///< the via it found there, its centre and radius
 
     std::set<const PAD*> readyVias;   ///< the ready pins whose via past their copper's end is planned
 
@@ -847,6 +848,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         const int gap = aRules.clearance;
         BOX2I around = aShape.BBox();
         around.Inflate( gap + 1 );
+        lastVia.reset();
 
         for( const PAD* other : readyVias )
         {
@@ -874,6 +876,10 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
             {
                 lastHit = str( aPad->GetParentFootprint()->GetReference() ) + "." + str( aPad->GetNumber() ) + ": " + item->GetNetname().ToStdString()
                           + ( item->Type() == PCB_VIA_T ? " via" : " track" ) + " on " + aBoard->GetLayerName( aLayer ).ToStdString();
+
+                if( item->Type() == PCB_VIA_T )
+                    lastVia = std::make_pair( item->GetPosition(), item->GetEffectiveShape( aLayer )->BBox().GetWidth() / 2 );
+
                 return true;
             }
         }
@@ -991,6 +997,167 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         if( !readyMiss.count( pad ) )
             readyVias.insert( pad );
     }
+
+    // a stack pin's copper clear of the stack's other pins' copper: tracks on each layer, vias
+    auto stackClear = [&]( const PAD* aPad, const SLOT& aSlot, const std::map<const PAD*, SLOT>& aStack )
+    {
+        auto chains = []( const PAD* aOwner, const SLOT& aSl, std::vector<SEG>& aFront, std::vector<SEG>& aBack )
+        {
+            std::vector<VECTOR2I> f = { aOwner->GetPosition() };
+            f.insert( f.end(), aSl.padBends.begin(), aSl.padBends.end() );
+            f.push_back( aSl.via );
+            std::vector<VECTOR2I> b = { aSl.via };
+            b.insert( b.end(), aSl.bends.begin(), aSl.bends.end() );
+            b.push_back( aSl.slot );
+
+            for( size_t k = 1; k < f.size(); ++k )
+                aFront.emplace_back( f[k - 1], f[k] );
+
+            for( size_t k = 1; k < b.size(); ++k )
+                aBack.emplace_back( b[k - 1], b[k] );
+        };
+
+        std::vector<SEG> mine[2];
+        chains( aPad, aSlot, mine[0], mine[1] );
+        const int slack = pcbIUScale.mmToIU( 0.001 );
+        const int track = aRules.trackWidth + clr - slack;
+
+        for( const auto& [pad, sl] : aStack )
+        {
+            if( pad == aPad )
+                continue;
+
+            std::vector<SEG> theirs[2];
+            chains( pad, sl, theirs[0], theirs[1] );
+
+            if( ( VECTOR2D( sl.via ) - VECTOR2D( aSlot.via ) ).EuclideanNorm() < viaGap - slack )
+                return false;
+
+            for( int l = 0; l < 2; ++l )
+            {
+                for( const SEG& m : mine[l] )
+                {
+                    if( m.Distance( sl.via ) < viaTrack - slack )
+                        return false;
+
+                    for( const SEG& o : theirs[l] )
+                    {
+                        if( m.Distance( o ) < track )
+                            return false;
+                    }
+                }
+
+                for( const SEG& o : theirs[l] )
+                {
+                    if( o.Distance( aSlot.via ) < viaTrack - slack )
+                        return false;
+                }
+            }
+        }
+
+        return true;
+    };
+
+    // a stack pin's copper that hits the board's moved out of the way, clear of the stack's other copper: its B.Cu
+    // track bent round a via in its way at 45 degrees, or its via moved along the track it comes in on (further on, the
+    // pad's layer on to it; back, the other layer on from it)
+    std::string repairMiss;   ///< why the last repair failed
+
+    auto repaired = [&]( const PAD* aPad, const SLOT& aSlot, const std::map<const PAD*, SLOT>& aStack ) -> std::optional<SLOT>
+    {
+        SLOT sl = aSlot;
+        repairMiss = "no via in the way";
+
+        for( int round = 0; round < 4; ++round )
+        {
+            if( clearOf( aPad, sl ) )
+            {
+                if( stackClear( aPad, sl, aStack ) )
+                    return sl;
+
+                repairMiss = "bent into the stack's own copper";
+                break;
+            }
+
+            repairMiss = lastHit;
+
+            if( !lastVia || !aPad->IsOnLayer( F_Cu ) )
+                break;
+
+            const auto [centre, radius] = *lastVia;
+            const double need = radius + clr + halfTrack + pcbIUScale.mmToIU( 0.01 );
+            std::vector<VECTOR2I> back = { sl.via };
+            back.insert( back.end(), sl.bends.begin(), sl.bends.end() );
+            back.push_back( sl.slot );
+            bool bent = false;
+
+            for( size_t k = 1; k < back.size() && !bent; ++k )
+            {
+                const SEG seg( back[k - 1], back[k] );
+
+                if( seg.Distance( centre ) >= need - halfTrack || seg.Length() < 1 )
+                    continue;
+
+                const VECTOR2D a( seg.A ), d = VECTOR2D( seg.B - seg.A ).Resize( 1.0 );
+                const VECTOR2D nrm( -d.y, d.x );
+                const double   len = seg.Length();
+                const double   t = ( VECTOR2D( centre ) - a ).Dot( d );
+                const double   side = ( VECTOR2D( centre ) - a ).Dot( nrm );
+                const double   off = ( side > 0 ? -1.0 : 1.0 ) * ( need - std::abs( side ) );
+                const double   flat = std::sqrt( std::max( 0.0, need * need - ( need - std::abs( off ) ) * ( need - std::abs( off ) ) ) );
+                const double   t0 = t - flat - std::abs( off ), t1 = t + flat + std::abs( off );
+
+                if( t0 < 0 || t1 > len || std::abs( off ) > pcbIUScale.mmToIU( 0.3 ) )
+                {
+                    repairMiss = "no room to bend round " + lastHit;
+                    break;
+                }
+
+                const std::vector<VECTOR2I> detour = { VECTOR2I( a + d * t0 ), VECTOR2I( a + d * ( t0 + std::abs( off ) ) + nrm * off ),
+                                                       VECTOR2I( a + d * ( t1 - std::abs( off ) ) + nrm * off ), VECTOR2I( a + d * t1 ) };
+                back.insert( back.begin() + k, detour.begin(), detour.end() );
+                sl.bends.assign( back.begin() + 1, back.end() - 1 );
+                bent = true;
+            }
+
+            if( !bent )
+                break;
+        }
+
+        const VECTOR2I prev = aSlot.padBends.empty() ? aPad->GetPosition() : aSlot.padBends.back();
+        const VECTOR2D in = VECTOR2D( aSlot.via ) - VECTOR2D( prev );
+        const double   length = in.EuclideanNorm();
+
+        if( length < 1 )
+            return std::nullopt;
+
+        const VECTOR2D dir = in / length;
+
+        for( int step = 1; step <= 4; ++step )
+        {
+            const double d = step * pcbIUScale.mmToIU( 0.25 );
+
+            for( int way : { 1, -1 } )
+            {
+                if( way < 0 && d > length - viaR - clr )
+                    continue;
+
+                SLOT           moved = aSlot;
+                const VECTOR2I at( VECTOR2D( aSlot.via ) + dir * ( d * way ) );
+
+                if( way > 0 )
+                    moved.padBends.push_back( aSlot.via );
+
+                moved.bends.insert( moved.bends.begin(), aSlot.via );
+                moved.via = at;
+
+                if( clearOf( aPad, moved ) && stackClear( aPad, moved, aStack ) )
+                    return moved;
+            }
+        }
+
+        return std::nullopt;
+    };
 
     // the stacks out of a part's end first (their order is the least free), then the larger ones; a link's order at
     // its other end is then the order of its slots there
@@ -2080,10 +2247,42 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
             return false;
         };
 
-        bool clear = true;
+        bool           clear = true;
+        nlohmann::json missed;   ///< the pin whose copper hit the board's: its copper, the via it hit
 
-        for( const auto& [pad, sl] : local )
-            clear = clear && clearOf( pad, sl );
+        for( auto& [pad, sl] : local )
+        {
+            if( !clear || clearOf( pad, sl ) )
+                continue;
+
+            const std::string hit = lastHit;
+            const auto        hitVia = lastVia;
+            std::optional<SLOT> moved = repaired( pad, sl, local );
+            clear = moved.has_value();
+
+            if( moved )
+            {
+                sl = *moved;
+                continue;
+            }
+
+            lastHit = hit;
+            nlohmann::json pts = nlohmann::json::array();
+
+            for( const VECTOR2I& p : sl.padBends )
+                pts.push_back( mmOf( p ) );
+
+            missed = { { "pad_bends_mm", pts }, { "via_mm", mmOf( sl.via ) }, { "slot_mm", mmOf( sl.slot ) }, { "repair", repairMiss } };
+            pts = nlohmann::json::array();
+
+            for( const VECTOR2I& p : sl.bends )
+                pts.push_back( mmOf( p ) );
+
+            missed["bends_mm"] = pts;
+
+            if( hitVia )
+                missed["hit_via_mm"] = mmOf( hitVia->first );
+        }
 
         for( const auto& [pad, sl] : legsOf )
         {
@@ -2105,7 +2304,7 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 kinds += "*";
 
             if( misses.size() < 32 && push == 0 )
-                misses.push_back( { { "kinds", kinds }, { "push_mm", pcbIUScale.IUTomm( push ) }, { "hit", lastHit } } );
+                misses.push_back( { { "kinds", kinds }, { "push_mm", pcbIUScale.IUTomm( push ) }, { "hit", lastHit }, { "copper", missed } } );
             continue;
         }
 
