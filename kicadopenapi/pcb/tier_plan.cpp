@@ -2481,7 +2481,87 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
         // one toward the board's middle); the way out of the pad with it
         const VECTOR2D middle( aBoard->GetBoardEdgesBoundingBox().GetCenter() );
 
-        auto directSlot = [&]( const PAD* aPad, int aFrom ) -> std::optional<std::pair<VECTOR2I, VECTOR2D>>
+        // a two-row part entered from its end: its rows' pins of the link out of their row, each on its own lane
+        // (the one nearest the end innermost), then along the row to their slots past the end; a pin of another net
+        // between them and the end would be walled in
+        struct TURN
+        {
+            std::vector<VECTOR2I> bends;
+            VECTOR2I              slot;
+        };
+
+        std::map<const PAD*, TURN> turns;
+        std::string                walled;
+
+        for( FOOTPRINT* fp : { plan.a, plan.b } )
+        {
+            const int      from = fp == plan.a ? fromA : fromB;
+            const VECTOR2D w = unitOf( from );
+
+            if( !d.direct || rowsOf( fp ) < 0 )
+                continue;
+
+            double endEdge = -1e18;
+
+            for( PAD* p : fp->Pads() )
+            {
+                const BOX2I bb = p->GetBoundingBox();
+                endEdge = std::max( endEdge, VECTOR2D( bb.Centre() ).Dot( w ) + ( w.x != 0 ? bb.GetWidth() : bb.GetHeight() ) / 2.0 );
+            }
+
+            for( int side : { ( from + 1 ) % 4, ( from + 3 ) % 4 } )
+            {
+                std::vector<std::pair<double, PAD*>> mine;
+                std::set<std::string>                nets( plan.link->nets.begin(), plan.link->nets.end() );
+
+                for( PAD* p : fp->Pads() )
+                {
+                    if( padSide( p ) == side && nets.count( netOf( p ) ) && !copperEnd( p ) )
+                        mine.emplace_back( endEdge - VECTOR2D( p->GetPosition() ).Dot( w ), p );
+                }
+
+                if( mine.empty() )
+                    continue;
+
+                std::sort( mine.begin(), mine.end(), []( const auto& x, const auto& y ) { return x.first < y.first; } );
+
+                for( PAD* p : fp->Pads() )
+                {
+                    const double nest = endEdge - VECTOR2D( p->GetPosition() ).Dot( w );
+
+                    if( walled.empty() && padSide( p ) == side && p->GetNetCode() > 0 && !nets.count( netOf( p ) ) && nest < mine.back().first
+                        && !copperEnd( p ) )
+                    {
+                        walled = str( fp->GetReference() ) + "." + str( p->GetNumber() ) + " would be walled in by the pins turning past it";
+                    }
+                }
+
+                const VECTOR2D u = unitOf( side );
+                const double   lane = aRules.trackWidth + clr;
+
+                for( size_t k = 0; k < mine.size(); ++k )
+                {
+                    PAD*           p = mine[k].second;
+                    const BOX2I    bb = p->GetBoundingBox();
+                    const VECTOR2D at( p->GetPosition() );
+                    const VECTOR2D bend = at + u * ( ( u.x != 0 ? bb.GetWidth() : bb.GetHeight() ) / 2.0 + clr + halfTrack + k * lane );
+                    TURN           t;
+                    t.bends.push_back( VECTOR2I( bend ) );
+                    t.slot = VECTOR2I( bend + w * ( endEdge + clr + halfTrack - bend.Dot( w ) ) );
+
+                    for( const SEG& seg : { SEG( p->GetPosition(), t.bends[0] ), SEG( t.bends[0], t.slot ) } )
+                    {
+                        if( walled.empty() && seg.A != seg.B && hitsOf( p, SHAPE_SEGMENT( seg.A, seg.B, aRules.trackWidth ), F_Cu, false ) )
+                            walled = lastHit;
+                    }
+
+                    turns[p] = t;
+                }
+            }
+        }
+
+        // the slot, the way out of the pad, its bends (a pin turning to the part's end)
+        auto directSlot = [&]( const PAD* aPad, int aFrom ) -> std::optional<std::tuple<VECTOR2I, VECTOR2D, std::vector<VECTOR2I>>>
         {
             const BOX2I    bb = aPad->GetBoundingBox();
             const VECTOR2D at( aPad->GetPosition() );
@@ -2492,14 +2572,24 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 const bool wide = bb.GetWidth() > bb.GetHeight();
                 u = wide ? VECTOR2D( middle.x >= at.x ? 1 : -1, 0 ) : VECTOR2D( 0, middle.y >= at.y ? 1 : -1 );
             }
+            else if( auto t = turns.find( aPad ); t != turns.end() )
+            {
+                return std::make_tuple( t->second.slot, unitOf( aFrom ), t->second.bends );
+            }
             else if( padSide( aPad ) != aFrom )
             {
                 return std::nullopt;
             }
 
             const double reach = ( u.x != 0 ? bb.GetWidth() : bb.GetHeight() ) / 2.0 + clr + halfTrack;
-            return std::make_pair( VECTOR2I( at + u * reach ), u );
+            return std::make_tuple( VECTOR2I( at + u * reach ), u, std::vector<VECTOR2I>() );
         };
+
+        if( !walled.empty() )
+        {
+            covered = false;
+            whyNot = walled;
+        }
 
         for( const std::string& net : plan.link->nets )
         {
@@ -2533,12 +2623,21 @@ nlohmann::json PlanTiers( BOARD* aBoard, const std::vector<TIER_LINK>& aLinks,
                 {
                     if( auto at = directSlot( pad, from ) )
                     {
-                        e["slot_mm"] = mm( at->first );
-                        ends[fp == plan.a ? 0 : 1].push_back( at->first );
+                        const auto& [slot, out, bends] = *at;
+                        e["slot_mm"] = mm( slot );
+                        ends[fp == plan.a ? 0 : 1].push_back( slot );
+
+                        if( !bends.empty() )
+                        {
+                            e["pad_bends_mm"] = nlohmann::json::array();
+
+                            for( const VECTOR2I& b : bends )
+                                e["pad_bends_mm"].push_back( mm( b ) );
+                        }
 
                         // left of the way: out of a, into b
-                        const VECTOR2D way = fp == plan.a ? at->second : at->second * -1.0;
-                        across[fp == plan.a ? 0 : 1].emplace_back( VECTOR2D( at->first ).Dot( VECTOR2D( way.y, -way.x ) ), net );
+                        const VECTOR2D way = fp == plan.a ? out : out * -1.0;
+                        across[fp == plan.a ? 0 : 1].emplace_back( VECTOR2D( slot ).Dot( VECTOR2D( way.y, -way.x ) ), net );
                     }
                     else
                     {

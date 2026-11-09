@@ -11620,6 +11620,22 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                  : ( side.x > 0 ? ring.GetRight() - box.GetRight() : box.GetLeft() - ring.GetLeft() );
             const bool     rowEnd = ( d.x != 0 && d.y != 0 ) && sideEdge <= pitch / 2 && depth > sideAcross;
 
+            // a planned turn out of the pad: its way out ends there
+            int reach = depth - width / 2;
+
+            for( const auto* bends : aJob ? std::vector<const std::vector<VECTOR2I>*>{ &jobs[*aJob].fanStartPadBends, &jobs[*aJob].fanEndPadBends }
+                                          : std::vector<const std::vector<VECTOR2I>*>() )
+            {
+                if( bends->empty() )
+                    continue;
+
+                const VECTOR2I rel = bends->front() - tip;
+                const int      along = horizontal ? rel.x * dir.x : rel.y * dir.y;
+
+                if( std::abs( horizontal ? rel.y : rel.x ) <= width / 2 && along > width / 2 && along < reach )
+                    reach = along;
+            }
+
             for( PCB_LAYER_ID layer : layers )
             {
                 if( !aPad->IsOnLayer( layer ) || !aPad->FlashLayer( layer ) )
@@ -11628,7 +11644,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 ESCAPE_FRONT front;
                 front.pad = aPad;
                 front.layer = layer;
-                front.shape = SHAPE_SEGMENT( tip + dir * ( width / 2 ), tip + dir * ( depth - width / 2 ), width );
+                front.shape = SHAPE_SEGMENT( tip + dir * ( width / 2 ), tip + dir * reach, width );
 
                 if( aJob )
                     front.jobs.push_back( *aJob );
