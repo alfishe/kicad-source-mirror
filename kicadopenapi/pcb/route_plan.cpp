@@ -296,7 +296,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
 
     const LSET copper = LSET::AllCuMask( board->GetCopperLayerCount() );
 
-    // copper of other nets near the ends, kept with its clearance for the exact way out of each end
+    // copper of other nets, kept with its clearance for the exact way out of each end
     struct NEAR_END
     {
         std::shared_ptr<SHAPE> shape;
@@ -306,13 +306,8 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
     };
 
     std::vector<NEAR_END> nearEnds;
-    const int             reach = pcbIUScale.mmToIU( 1.0 );
-    BOX2I                 endBoxes[2] = { aReq.from->GetBoundingBox(), aReq.to->GetBoundingBox() };
-
-    for( BOX2I& box : endBoxes )
-        box.Inflate( reach + pcbIUScale.mmToIU( 1.0 ) );
-
-    auto nearAnEnd = [&]( const BOX2I& aBox ) { return aBox.Intersects( endBoxes[0] ) || aBox.Intersects( endBoxes[1] ); };
+    // no way out of an end runs further than the other end
+    const int reach = std::max( (int) ( fromPos - aReq.toPos ).EuclideanNorm(), 1 );
 
     // copper of another net (or of none) on the routing layers and, for vias, on every copper layer
     auto copperObstacle = [&]( BOARD_ITEM* aItem, const std::function<std::shared_ptr<SHAPE>( PCB_LAYER_ID )>& aShape )
@@ -332,8 +327,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                 const int clearance = rule( CLEARANCE_CONSTRAINT, &probeTrack, aItem, layer, floor );
                 put( *s, clearance + halfWidth + slack, track, trackSoft, (size_t) l * cells );
 
-                if( nearAnEnd( s->BBox() ) )
-                    nearEnds.push_back( { s, clearance, l, softNow } );
+                nearEnds.push_back( { s, clearance, l, softNow } );
             }
         }
 
@@ -542,8 +536,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
 
             grid.Mark( shape, halfWidth + slack, track, (size_t) l * cells );
 
-            if( nearAnEnd( shape.BBox() ) )
-                nearEnds.push_back( { std::make_shared<SHAPE_SEGMENT>( shape ), 0, l, -1 } );
+            nearEnds.push_back( { std::make_shared<SHAPE_SEGMENT>( shape ), 0, l, -1 } );
         }
 
         // a through via stands in the way out on every layer, at the clearance the rules ask of our
@@ -634,9 +627,10 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         }
     }
 
-    // The way out of a pad end on the grid can be shut by the grid alone (a fine-pitch pad's way out
-    // between its neighbours, off the cell centres): along each axis of the pad, the first free cell
-    // a straight run from the pad's centre reaches with its clearance to every other net's copper
+    // The way out of an end on the grid can be shut by the grid alone (a fine-pitch pad's way out
+    // between its neighbours, a track ending between two others at a track and its clearance, off the
+    // cell centres): along each axis of a pad, or on along a track past its end, the first free cell a
+    // straight run from the end reaches with its clearance to every other net's copper
     struct ESCAPE
     {
         VECTOR2I         at;
@@ -649,8 +643,98 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
         std::vector<std::pair<int, ESCAPE>> out;   // state, escape
         PAD*                                pad = dynamic_cast<PAD*>( aEnd );
 
+        // a track's end: the way out goes on along the track past its end
+        auto runFrom = [&]( int aLayer, const VECTOR2D& aDir, double aFrom )
+        {
+            // the copper beside the whole run, once; each step then checks the piece it adds
+            const VECTOR2I runEnd = aPos + VECTOR2I( KiROUND( aDir.x * ( aFrom + reach ) ), KiROUND( aDir.y * ( aFrom + reach ) ) );
+            BOX2I          lane( aPos, VECTOR2I( 0, 0 ) );
+            lane.Merge( runEnd );
+            lane.Inflate( aReq.trackWidth / 2 + 1 );
+            std::vector<const NEAR_END*> beside;
+
+            for( const NEAR_END& n : nearEnds )
+            {
+                // not BBox( clearance ): a compound shape (a pad) leaves its clearance out
+                BOX2I box = n.shape->BBox();
+                box.Inflate( n.clearance );
+
+                if( n.layer == aLayer && box.Intersects( lane ) )
+                    beside.push_back( &n );
+            }
+
+            std::vector<int> owners;
+            VECTOR2I         last = aPos;
+
+            for( double d = aFrom; d <= aFrom + reach; d += cell )
+            {
+                const VECTOR2I at = aPos + VECTOR2I( KiROUND( aDir.x * d ), KiROUND( aDir.y * d ) );
+                int            x, y;
+
+                if( !grid.CellOf( at, x, y ) )
+                    break;
+
+                const SHAPE_SEGMENT run( last, at, aReq.trackWidth );
+                bool                clean = true;
+                last = at;
+
+                for( const NEAR_END* np : beside )
+                {
+                    const NEAR_END& n = *np;
+
+                    if( !n.shape->Collide( &run, n.clearance ) )
+                        continue;
+
+                    if( n.owner < 0 )
+                    {
+                        clean = false;
+                        break;
+                    }
+
+                    if( std::find( owners.begin(), owners.end(), n.owner ) == owners.end() )
+                        owners.push_back( n.owner );
+                }
+
+                if( !clean )
+                    break;   // a longer run holds this one
+
+                const size_t state = (size_t) aLayer * cells + grid.Index( x, y );
+
+                if( track[state] )
+                    continue;
+
+                int cost = (int) ( 10.0 * d / cell );
+
+                for( int o : owners )
+                    cost += aReq.soft[o].cellCost * 8;
+
+                out.push_back( { (int) state, ESCAPE{ at, cost, owners } } );
+                break;
+            }
+        };
+
         if( !pad )
+        {
+            if( aEnd->Type() != PCB_TRACE_T )
+                return out;
+
+            const PCB_TRACK* t = static_cast<const PCB_TRACK*>( aEnd );
+            const bool       atEnd = ( t->GetEnd() - aPos ).EuclideanNorm() <= ( t->GetStart() - aPos ).EuclideanNorm();
+            const VECTOR2I   along = atEnd ? t->GetEnd() - t->GetStart() : t->GetStart() - t->GetEnd();
+
+            if( along == VECTOR2I( 0, 0 ) )
+                return out;
+
+            const VECTOR2D dir = VECTOR2D( along ) / along.EuclideanNorm();
+
+            for( int l = 0; l < L; ++l )
+            {
+                if( aReq.layers[l] == t->GetLayer() )
+                    runFrom( l, dir, cell );
+            }
+
             return out;
+        }
 
         for( int l = 0; l < L; ++l )
         {
@@ -667,49 +751,7 @@ ROUTE_PLAN PlanRoute( const ROUTE_PLAN_REQUEST& aReq )
                 const double half = ( axis < 2 ? size.x : size.y ) / 2.0;
                 RotatePoint( dir, pad->GetOrientation() );
 
-                for( double d = half; d <= half + reach; d += cell )
-                {
-                    const VECTOR2I at = aPos + VECTOR2I( KiROUND( dir.x * d ), KiROUND( dir.y * d ) );
-                    int            x, y;
-
-                    if( !grid.CellOf( at, x, y ) )
-                        break;
-
-                    const SHAPE_SEGMENT run( aPos, at, aReq.trackWidth );
-                    bool                clean = true;
-                    std::vector<int>    owners;
-
-                    for( const NEAR_END& n : nearEnds )
-                    {
-                        if( n.layer != l || !n.shape->Collide( &run, n.clearance ) )
-                            continue;
-
-                        if( n.owner < 0 )
-                        {
-                            clean = false;
-                            break;
-                        }
-
-                        if( std::find( owners.begin(), owners.end(), n.owner ) == owners.end() )
-                            owners.push_back( n.owner );
-                    }
-
-                    if( !clean )
-                        break;   // a longer run holds this one
-
-                    const size_t state = (size_t) l * cells + grid.Index( x, y );
-
-                    if( track[state] )
-                        continue;
-
-                    int cost = (int) ( 10.0 * d / cell );
-
-                    for( int o : owners )
-                        cost += aReq.soft[o].cellCost * 8;
-
-                    out.push_back( { (int) state, ESCAPE{ at, cost, owners } } );
-                    break;
-                }
+                runFrom( l, dir, half );
             }
         }
 

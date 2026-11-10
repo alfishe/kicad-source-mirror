@@ -1291,6 +1291,8 @@ struct ESCAPE_FRONT
     const char*         kind = "edge"; ///< edge (a fine-pitch pad's way out), inward, port, port_via, bus_via
     int                 other = -1;    ///< a row end pin's other way out (index in the call's fronts): either one keeps it open
     bool                spare = false; ///< the other way out of a row end pin (toward the free side): held once its main one is shut
+    VECTOR2I            outward;       ///< edge: the way out's direction
+    int64_t             corridor = 0;  ///< edge: how far past its end it may go on between copper beside it (to the other end)
 
     bool walls( int aNet ) const
     {
@@ -1384,6 +1386,97 @@ static bool frontSpared( BOARD* aBoard, const std::vector<ESCAPE_FRONT>& aAll, c
     }
 
     return !frontShut( aBoard, other, -1, other.partner );
+}
+
+
+/// @brief Whether aNew shuts an edge way out's corridor: past the way out's end, between copper a track and its
+/// clearance to either side (a fan-out's stubs, the neighbours' routes), the way goes on until a track can turn
+/// aside; open before the route (aGone still there, aNew not yet), shut on its own line after it before any side
+/// opens
+static bool corridorShut( BOARD* aBoard, const ESCAPE_FRONT& aFront, const std::vector<BOARD_CONNECTED_ITEM*>& aNew,
+                          const std::set<BOARD_ITEM*>& aGone )
+{
+    if( aFront.corridor <= 0 || aFront.outward == VECTOR2I( 0, 0 ) )
+        return false;
+
+    const int          width = aFront.shape.GetWidth();
+    const PCB_LAYER_ID layer = aFront.layer;
+    const int          clearance = aFront.pad->GetOwnClearance( layer );
+    const int          over = width + clearance;
+    const int          step = std::max( over / 2, 1 );
+    const VECTOR2I     from = aFront.shape.GetSeg().B;
+    const VECTOR2I     dir = aFront.outward;
+    const VECTOR2I     across( -dir.y, dir.x );
+    BOX2I              lane( from, VECTOR2I( 0, 0 ) );
+    lane.Merge( from + dir * (int) aFront.corridor );
+    lane.Inflate( over + width + clearance );
+
+    bool touched = false;
+
+    for( const BOARD_ITEM* item : aNew )
+        touched = touched || ( item->IsOnLayer( layer ) && item->GetBoundingBox().Intersects( lane ) );
+
+    if( !touched )
+        return false;
+
+    // per piece of copper whether it stands before the route, after it
+    struct BESIDE { std::shared_ptr<SHAPE> shape; int clearance; bool before, after; };
+    std::vector<BESIDE>                   beside;
+    const std::set<const BOARD_ITEM*>     fresh( aNew.begin(), aNew.end() );
+
+    auto take = [&]( BOARD_CONNECTED_ITEM* aItem, bool aBefore, bool aAfter )
+    {
+        if( aItem->GetNetCode() == aFront.pad->GetNetCode() || !aItem->IsOnLayer( layer ) || !aItem->GetBoundingBox().Intersects( lane ) )
+            return;
+
+        if( std::shared_ptr<SHAPE> shape = aItem->GetEffectiveShape( layer ) )
+            beside.push_back( { shape, std::max( clearance, aItem->GetOwnClearance( layer ) ), aBefore, aAfter } );
+    };
+
+    for( PCB_TRACK* t : aBoard->Tracks() )
+    {
+        if( !fresh.count( t ) )
+            take( t, true, !aGone.count( t ) );
+    }
+
+    for( BOARD_CONNECTED_ITEM* item : aNew )
+        take( item, false, true );
+
+    for( FOOTPRINT* f : aBoard->Footprints() )
+    {
+        if( f->GetBoundingBox().Intersects( lane ) )
+        {
+            for( PAD* q : f->Pads() )
+                take( q, true, true );
+        }
+    }
+
+    // open: a side free before its own line is shut, or the other end reached
+    auto open = [&]( bool aWithNew )
+    {
+        auto shut = [&]( const VECTOR2I& aAt )
+        {
+            const SHAPE_CIRCLE probe( aAt, width / 2 );
+
+            return std::any_of( beside.begin(), beside.end(), [&]( const BESIDE& b )
+                                { return ( aWithNew ? b.after : b.before ) && b.shape->Collide( &probe, b.clearance - 1 ); } );
+        };
+
+        for( int64_t d = 0; d <= aFront.corridor; d += step )
+        {
+            const VECTOR2I at = from + dir * (int) d;
+
+            if( shut( at ) )
+                return false;
+
+            if( !shut( at + across * over ) || !shut( at - across * over ) )
+                return true;
+        }
+
+        return true;
+    };
+
+    return !open( true ) && open( false );
 }
 
 
@@ -2743,6 +2836,24 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
                 iface->Staged().Revert();
                 return false;
             }
+        }
+
+        for( const ESCAPE_FRONT& front : *aReq.fronts )
+        {
+            if( ( pairWay && !front.supply ) || !front.walls( aReq.from->GetNetCode() ) || !corridorShut( board, front, changed, iface->m_removed ) )
+                continue;
+
+            const std::string at = str( front.pad->GetParentFootprint()->GetReference() ) + "." + str( front.pad->GetNumber() );
+            aOut["routed"] = false;
+            aOut["reason"] = "refused: the route would wall in the way out of " + at + " along the copper beside it";
+            aOut["walls_in"] = { { "pad", at },
+                                 { "layer", str( board->GetLayerName( front.layer ) ) },
+                                 { "corridor", true },
+                                 { "way_out_mm", { { toMm( front.shape.GetSeg().A.x ), toMm( front.shape.GetSeg().A.y ) },
+                                                   { toMm( front.shape.GetSeg().B.x ), toMm( front.shape.GetSeg().B.y ) } } },
+                                 { "route_mm", toMm( length ) } };
+            iface->Staged().Revert();
+            return false;
         }
     }
     const double         direct = ( target - start ).EuclideanNorm();
@@ -11412,6 +11523,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // array are left to the fan-out): from the pad's end outward, room for a track or a via.  The
     // call's pads, and the pads of other nets with an open connection: a later call routes them
     const bool escapesOn = aArgs.value( "escapes", true );
+    const bool corridorGuard = aArgs.value( "corridor_guard", false );
 
     if( ( escapesOn || !portGoals.empty() ) && !rail )
     {
@@ -11637,6 +11749,15 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     reach = along;
             }
 
+            // a way out on along a corridor of copper beside it: to the other end at most
+            int64_t corridor = 0;
+
+            if( corridorGuard && aJob && reach >= depth - width / 2 )
+            {
+                const VECTOR2I other = jobs[*aJob].from == aPad ? jobs[*aJob].toPos : jobs[*aJob].from->GetPosition();
+                corridor = std::max<int64_t>( ( other - tip ).EuclideanNorm() - reach, 0 );
+            }
+
             for( PCB_LAYER_ID layer : layers )
             {
                 if( !aPad->IsOnLayer( layer ) || !aPad->FlashLayer( layer ) )
@@ -11646,6 +11767,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 front.pad = aPad;
                 front.layer = layer;
                 front.shape = SHAPE_SEGMENT( tip + dir * ( width / 2 ), tip + dir * reach, width );
+                front.outward = dir;
+                front.corridor = corridor;
 
                 if( aJob )
                     front.jobs.push_back( *aJob );
@@ -15168,8 +15291,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 return out;
             };
 
+            bool pickedByPlan = false;
+
             auto pickVictims = [&]() -> std::vector<size_t>
             {
+                pickedByPlan = false;
+
                 const std::vector<std::pair<size_t, std::vector<PCB_TRACK*>>> movable = movableFor( job, {} );
 
                 if( movable.empty() )
@@ -15189,6 +15316,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     if( !planned->empty() )
                     {
                         profile.ripUpsPlanned++;
+                        pickedByPlan = true;
                         return *planned;
                     }
                 }
@@ -15548,7 +15676,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     takenOut.push_back( jobs[v].net + " " + str( jobs[v].from->GetParentFootprint()->GetReference() ) + "."
                                      + str( jobs[v].from->GetNumber() ) );
 
-                results[rowOf[index]]["rip_ups_failed"].push_back( { { "taken_out", takenOut }, { "failed_at", failedAt } } );
+                nlohmann::json failure = { { "taken_out", takenOut }, { "failed_at", failedAt }, { "picked_by", pickedByPlan ? "plan" : "corridor" } };
+                const nlohmann::json* why = std::string( failedAt ) == "route" ? &attempt
+                                            : std::string( failedAt ) == "victim" && !victimAttempts.empty() ? &victimAttempts.back()
+                                                                                                              : nullptr;
+
+                if( why && why->contains( "reason" ) && ( *why )["reason"].is_string() )
+                    failure["reason"] = ( *why )["reason"].get<std::string>().substr( 0, 300 );
+
+                if( std::string( failedAt ) == "victim" && victimAttempts.size() <= victims.size() && !victimAttempts.empty() )
+                    failure["victim"] = takenOut[victimAttempts.size() - 1];
+
+                results[rowOf[index]]["rip_ups_failed"].push_back( std::move( failure ) );
             }
         }
 
@@ -20540,6 +20679,10 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
     auto skip = [&]( PAD* aPad, const std::string& aWhy, const std::string& aKind )
     {
         skipped.push_back( { { "pad", name( aPad ) }, { "reason", aWhy } } );
+
+        if( aPad->GetNetCode() > 0 )
+            skipped.back()["net"] = str( aPad->GetNetname() );
+
         why[aKind]++;
     };
 
@@ -20934,14 +21077,16 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                 std::vector<bool>                                  joinedOk;
                 int                                                bad = 0;
                 int64_t                                            lo = 0, hi = 0, reach = 0;
+                bool                                               fan = false;   ///< a diverging fan: 45 degree legs, knees as deep as they can
             };
 
             // one escape's copper at a spot: pad centre, straight past the pad tip, the leg to the spot's column, then
             // straight to the via (or past the line, on the pad's layer)
-            auto build = [&]( const ESC& e, int64_t aX, int64_t aDepth, bool aJoin, std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>>& aOut )
+            // (in a fan: straight on to where a 45 degree leg reaches the spot's column)
+            auto build = [&]( const ESC& e, int64_t aX, int64_t aDepth, bool aJoin, bool aFan, std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>>& aOut )
             {
                 const VECTOR2I start = e.pad->GetPosition();
-                const VECTOR2I knee = at( e.pin, tip + neck );
+                const VECTOR2I knee = at( e.pin, aFan ? aDepth - run - std::abs( aX - e.pin ) : tip + neck );
                 const VECTOR2I bend = at( aX, aDepth - run );
                 const VECTOR2I end = at( aX, e.via ? aDepth : aDepth + run );
                 std::vector<VECTOR2I> pts = { start };
@@ -20999,8 +21144,8 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
             };
 
             // the spans of the line an escape's centre may not take at a depth, per kind of escape: a via's disc and
-            // the straight run before it, or the track's run across the line
-            auto blockedAt = [&]( const ESC& e, int64_t aDepth, int64_t aLo, int64_t aHi, std::vector<std::string>* aBy = nullptr )
+            // the straight run before it, or the track's run across the line; in a fan its whole leg from the pad
+            auto blockedAt = [&]( const ESC& e, int64_t aDepth, int64_t aLo, int64_t aHi, std::vector<std::string>* aBy = nullptr, bool aFan = false )
             {
                 std::vector<std::pair<int64_t, int64_t>> spans;
                 const int64_t windowLo = e.pin - ( aHi - aLo ), windowHi = e.pin + ( aHi - aLo );
@@ -21021,11 +21166,12 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                     const int64_t od1 = std::max( (int64_t) o.box.GetLeft() * dir.x + (int64_t) o.box.GetTop() * dir.y,
                                                   (int64_t) o.box.GetRight() * dir.x + (int64_t) o.box.GetBottom() * dir.y );
 
-                    if( od1 < aDepth - run - reachOut || od0 > aDepth + run + reachOut )
+                    if( od1 < ( aFan ? tip : aDepth - run ) - reachOut || od0 > aDepth + run + reachOut )
                         continue;
 
-                    const int64_t to = std::min( aHi, oa1 + reachOut );
-                    const int64_t from = aLo + ( std::max( (int64_t) 0, oa0 - reachOut - aLo ) + step - 1 ) / step * step;
+                    // a fan's leg crosses the columns between its pin and its spot
+                    const int64_t to = aFan ? aHi : std::min( aHi, oa1 + reachOut );
+                    const int64_t from = aFan ? aLo : aLo + ( std::max( (int64_t) 0, oa0 - reachOut - aLo ) + step - 1 ) / step * step;
                     std::optional<int64_t> runStart;
 
                     for( int64_t x = from; x <= to + step; x += step )
@@ -21038,6 +21184,15 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
 
                             for( const std::shared_ptr<SHAPE>& s : o.onLayer )
                                 hit = hit || s->Collide( straight, e.width / 2 + e.clearance - 1 );
+
+                            if( aFan && !hit && std::abs( x - e.pin ) <= aDepth - run - tip )
+                            {
+                                const VECTOR2I knee = at( e.pin, aDepth - run - std::abs( x - e.pin ) );
+                                const SEG      out( at( e.pin, tip ), knee ), leg( knee, at( x, aDepth - run ) );
+
+                                for( const std::shared_ptr<SHAPE>& s : o.onLayer )
+                                    hit = hit || s->Collide( out, e.width / 2 + e.clearance - 1 ) || s->Collide( leg, e.width / 2 + e.clearance - 1 );
+                            }
 
                             if( e.via )
                             {
@@ -21088,6 +21243,7 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                     s.clearance = e.clearance;
                     s.reach = reach;
                     s.blocked = blockedAt( e, depth, lo, hi );
+                    s.laneHalf = e.width / 2;
                     slots.push_back( std::move( s ) );
                 }
 
@@ -21097,6 +21253,44 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                 t.hi = hi;
                 t.reach = reach;
                 t.fit = PartFanAssign( slots, lo, hi, step );
+
+                // Pins left out with parallel legs: the side as a diverging fan, split at each place along it, the
+                // pins below the split moving down the line, those above it up, each by a 45 degree leg
+                if( t.fit.left > 0 && legRoom > reach )
+                {
+                    const int64_t fanLo = std::max( minPin - legRoom, lowTip ? -*lowTip - legRoom + margin : minPin - legRoom );
+                    const int64_t fanHi = std::min( maxPin + legRoom, highTip ? *highTip + legRoom - margin : maxPin + legRoom );
+                    std::vector<PART_FAN_SLOT> fanSlots = slots;
+
+                    for( size_t k = 0; k < escs.size(); ++k )
+                    {
+                        fanSlots[k].reach = 0;
+                        fanSlots[k].fanReach = legRoom;
+                        fanSlots[k].blocked = blockedAt( escs[k], depth, fanLo, fanHi, nullptr, true );
+                    }
+
+                    std::optional<PART_FAN_ASSIGNMENT> fanBest;
+
+                    for( size_t split = 0; split <= escs.size(); ++split )
+                    {
+                        for( size_t k = 0; k < escs.size(); ++k )
+                            fanSlots[k].way = k < split ? -1 : 1;
+
+                        PART_FAN_ASSIGNMENT f = PartFanAssign( fanSlots, fanLo, fanHi, step );
+
+                        if( !fanBest || f.left < fanBest->left || ( f.left == fanBest->left && f.moved < fanBest->moved ) )
+                            fanBest = std::move( f );
+                    }
+
+                    if( fanBest && fanBest->left < t.fit.left )
+                    {
+                        t.fit = std::move( *fanBest );
+                        t.fan = true;
+                        t.lo = fanLo;
+                        t.hi = fanHi;
+                        t.reach = legRoom;
+                    }
+                }
                 t.items.resize( escs.size() );
                 t.fail.assign( escs.size(), "" );
                 t.joinedOk.assign( escs.size(), true );
@@ -21107,7 +21301,7 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                 for( size_t k = 0; k < escs.size(); ++k )
                 {
                     if( t.fit.at[k] )
-                        build( escs[k], *t.fit.at[k], depth, true, t.items[k] );
+                        build( escs[k], *t.fit.at[k], depth, true, t.fan, t.items[k] );
                     else
                         t.fail[k] = "-";
                 }
@@ -21130,7 +21324,7 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                     if( !v.empty() && joinsOf.count( escs[k].pad ) && !joinsOf[escs[k].pad].empty() )
                     {
                         std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> plain;
-                        build( escs[k], *t.fit.at[k], depth, false, plain );
+                        build( escs[k], *t.fit.at[k], depth, false, t.fan, plain );
                         std::vector<BOARD_CONNECTED_ITEM*> plainMine;
 
                         for( const auto& item : plain )
@@ -21170,7 +21364,7 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                     // what takes its reach on the line: the copper and pads there, else its neighbours' spots
                     std::vector<std::string> by;
                     const int64_t            lo = std::max( best->lo, e.pin - best->reach ), hi = std::min( best->hi, e.pin + best->reach );
-                    blockedAt( e, best->depth, lo, hi, &by );
+                    blockedAt( e, best->depth, lo, hi, &by, best->fan );
                     std::string list;
 
                     for( size_t i = 0; i < by.size() && i < 6; ++i )
@@ -23403,7 +23597,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "rip_ups_planned: rip-ups whose routes a plan chose; loops_cut: loops a route along a corridor made on one layer, cut at their crossing where nothing else of the net touches them; rip_ups_second: routes taken out that had no way back "
                    "and moved others in turn; reroutes_along: corridor members a rip-up routes again (taken out or the one it is for), "
                    "tried along their lanes first (tried, routed), else free; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
-                   "failed lists its rip_ups_failed (taken_out, failed_at); "
+                   "failed lists its rip_ups_failed (taken_out, failed_at, picked_by plan or corridor, reason: why the route or the victim (victim) failed then); "
                    "a row whose end is shut in has boxed_in (end, which, by: other nets' copper nearer than a track of its width needs (for a pin on its part's outline, on its outward side), and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
                    "pairs_stuck: pair tries ended when nothing was placed after 3 steps; front_retries: tries refused for walling in a port (with bus_paths, any pin's way out; a port try's first, else the first), made again as the connection's last try with the ways out as obstacles to the search (tried / won; the row's try says walls_in_first); pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way; plans_stopped: ended by job_cancel, a budget or stop_on_plateau_s); sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
@@ -23479,7 +23673,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (as dense_first says) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
-                        "inward_escapes":{"type":"array","items":{"type":"string"},"description":"footprint references of packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). 404 an unknown reference, 400 a part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},
+                        "inward_escapes":{"type":"array","items":{"type":"string"},"description":"footprint references of packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). 404 an unknown reference, 400 a part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},"corridor_guard":{"type":"boolean","default":false,"description":"with escapes: past such a way out, while other copper stands a track and its clearance to both sides of it (a corridor between stubs), a route that shuts the corridor before either side opens is refused as well (reason: wall in ... along the copper beside it)"},
                         "via_cost_mm":{"type":"number","minimum":0,"description":"mm of track a via costs the plan, the grid and the clean-up; default from the rules: the routing room a via of the default class takes on each signal layer, as track (the answer's via_cost_mm)"},
                         "plan":{"type":"boolean","default":true,"description":"a connection the router does not find on a layer is planned over the free space (grid search with vias, the board's clearances), the router follows the plan; no plan found: no escape-spot tries either (row plan tells)"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
@@ -23722,7 +23916,7 @@ KOPENAPI_REGISTER( "pcb_fanout",
                         "vias":{"type":"boolean","default":true,"description":"ring packages: false gives the stubs only, ending just outside the courtyard"},
                         "ports":{"type":"boolean","default":false,"description":"ring packages: follow the layout plan (pcb_fanout_ports): a via only for rails, for pins whose far end's order moves them to the other layer and for pins that yield to lanes (the plan's yields, the route leaving from that end); the rest stubs out past the courtyard on the pad's layer; each pin answers its port (kind, layer, to) and its via (at_mm, layers, laid); via_spots: the via spot of every signal pin of the package, laid or not (where its via goes should it leave by one: the package's pins fanned as vias in pin order, whatever nets are asked), each pad, net, side, at_mm, layers, from_layer, laid, path_mm (the fan's legs from the pad to it) - the one source of these spots for pcb_fanout_ports lanes, pcb_route ports and pcb_stitch"},
                         "stubs":{"type":"boolean","default":true,"description":"with ports: false lays only the planned vias (rails, pins to the other layer); the other pins are left to pcb_route"},
-                        "part":{"type":"boolean","default":false,"description":"ring packages: one plan for every pin of the part at once (implies ports): the unlocked supply copper at its rail pins that ends near it (stubs, their vias, joins to other parts' pads) is taken out; per side every pin with a far end gets a spot on one via line, all spots assigned together in pin order at the rules' widths and clearances, clear of the copper and pads there, the line as near the pads as lets every pin fit; rails and pins the ports plan moves to the other layer end on a via there, the rest run past the line on the pad's layer; a rail pin's removed joins are laid again from its via when clear. Answers pattern part, pins (pad, net, side, kind rail / via / stub, end_mm, line_mm, laid, via, port), skipped_pins with the blocker, via_spots, relaid {removed, laid, joined, unjoined, kept}; nets: plan all, lay only these; stubs false: lay only the vias (the stubs' spots stay in the plan)"},
+                        "part":{"type":"boolean","default":false,"description":"ring packages: one plan for every pin of the part at once (implies ports): the unlocked supply copper at its rail pins that ends near it (stubs, their vias, joins to other parts' pads) is taken out; per side every pin with a far end gets a spot on one via line, all spots assigned together in pin order at the rules' widths and clearances, clear of the copper and pads there, the line as near the pads as lets every pin fit; where parallel legs leave pins out (the pitch at a track and its clearance) the side fans out instead, split at a pin, each half's legs at 45 degrees away from it, a pin left out keeping its straight way out; rails and pins the ports plan moves to the other layer end on a via there, the rest run past the line on the pad's layer; a rail pin's removed joins are laid again from its via when clear. Answers pattern part, pins (pad, net, side, kind rail / via / stub, end_mm, line_mm, laid, via, port), skipped_pins (pad, net, reason with the blocker), via_spots, relaid {removed, laid, joined, unjoined, kept}; nets: plan all, lay only these; stubs false: lay only the vias (the stubs' spots stay in the plan)"},
                         "direction":{"type":"string","enum":["inward","up","down","left","right"],"description":"stubs straight this way (edge mode); inward: away from the board edge the pads sit on (found by itself for card-edge fingers)"},
                         "stub_mm":{"type":"number","description":"edge mode: stub length from the pad centre"},
                         "via":{"type":"string","enum":["none","always","stagger"],"default":"none","description":"edge mode: a via at each stub end, stagger: on two alternating lines"},

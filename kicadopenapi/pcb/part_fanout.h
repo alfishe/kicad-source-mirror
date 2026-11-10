@@ -14,6 +14,9 @@ struct PART_FAN_SLOT
     int                                      clearance = 0;   ///< what it keeps to its neighbours
     int64_t                                  reach = 0;       ///< how far along its leg may take it from its pin
     std::vector<std::pair<int64_t, int64_t>> blocked;         ///< spans its centre may not take (open intervals)
+    int                                      laneHalf = 0;    ///< half its track: left out, the straight way out it keeps (0: none)
+    int                                      way = 0;         ///< a fan's half: -1 it moves only down the line, +1 only up, 0 either within reach
+    int64_t                                  fanReach = 0;    ///< ... how far it may move that way (a 45 degree leg)
 };
 
 /// @brief The spots of a side's escapes on its via line, in pin order
@@ -26,6 +29,9 @@ struct PART_FAN_ASSIGNMENT
 
 /// @brief The spots of every slot of a side at once: in pin order (no two cross), each two placed neighbours
 /// their halves plus the larger clearance apart and no nearer than their pins (their legs never converge), each
-/// within its reach of its pin and inside [aLo, aHi], none in a blocked span; as few left out as can be, then the
-/// least total move.  Exact on a grid of aStep along the line (dynamic programming over the slots and the grid)
+/// within its reach of its pin and inside [aLo, aHi], none in a blocked span; a slot left out keeps its straight
+/// way out (a track laneHalf wide on its pin) clear of its placed neighbours. In a fan (way set) a slot may stay on
+/// its pin or move its way by up to fanReach; two neighbours moving the same way run on parallel 45 degree legs, so
+/// their spots stand their tracks and clearance times sqrt 2 apart. As few left out as can be, then the least
+/// total move.  Exact on a grid of aStep along the line (dynamic programming over the slots and the grid)
 PART_FAN_ASSIGNMENT PartFanAssign( const std::vector<PART_FAN_SLOT>& aSlots, int64_t aLo, int64_t aHi, int aStep );
