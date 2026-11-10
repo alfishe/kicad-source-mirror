@@ -10,6 +10,7 @@
 /// and metrics of what the router would do, for comparing variants.
 #include <advanced_config.h>
 #include "tier_plan.h"
+#include "part_fanout.h"
 #include "kopenapi_pcb.h"
 #include "route_grid.h"
 #include "route_timeline.h"
@@ -20498,6 +20499,855 @@ static KOPENAPI_RESULT h_pcb_via_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::js
 /// side at the pitch they stagger over rows; on each side the pin nearest the way its far ends lie
 /// takes the nearest row, so the tracks leaving the vias towards them do not cross the other vias.
 /// Exposed pads are left to their own vias.  vias false: the stubs only, out past the courtyard.
+/// @brief What peripheralFanout read of a ring package for the part plan
+struct PART_FAN_INPUT
+{
+    std::map<int, std::vector<PAD*>>               sides;   ///< per side its pads in order along it
+    std::vector<PAD*>                              inside;  ///< pads inside the ring (an exposed pad)
+    std::map<int, VECTOR2I>                        dir, tangent;
+    std::map<int, int64_t>                         tip;     ///< the pads' outer ends, across
+    std::function<bool( PAD* )>                    takesVia, rail;
+    std::function<std::optional<VECTOR2I>( PAD* )> farEnd;
+    std::function<nlohmann::json( PAD* )>          port;
+    std::set<int>                                  onlyNets;
+    int                                            pitch = 0, viaDia = 0, viaDrill = 0;
+    const char* const*                             sideName = nullptr;
+};
+
+
+/// @brief The part plan (docs: router-architecture/part-fanout.md): every pin of a ring package at once. The
+/// unlocked supply copper at its rail pins that ends nearby the part (stubs, their vias, joins to other parts'
+/// pads) comes out; per side every pin with a far end gets a spot on one via line, all spots of the side
+/// assigned together (PartFanAssign: pin order, the rules' widths and clearances apart, legs no steeper than the
+/// neighbours' clearance allows, clear of the copper and pads there); a pin that takes a via (rails, pins the
+/// ports plan moves to the other layer) ends on a via there, the others run past the line on the pad's layer.
+/// The line moves out until every pin fits and the guard passes; a rail pin's removed joins are laid again from
+/// its new via when clear.
+static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, BOARD* aBoard, FOOTPRINT* aFp,
+                                  const nlohmann::json& aArgs, const PART_FAN_INPUT& aIn )
+{
+    const bool         dryRun = aArgs.value( "dry_run", false );
+    const bool         refill = aArgs.value( "zones", std::string( "refill" ) ) == "refill";
+    const PCB_LAYER_ID layer = aFp->GetLayer() == B_Cu ? B_Cu : F_Cu;
+    const std::string  ref = str( aFp->GetReference() );
+    const int          tol = std::max( aBoard->GetDesignSettings().m_MaxError, 1 );
+
+    auto name = [&]( PAD* aPad ) { return ref + "." + str( aPad->GetNumber() ); };
+
+    nlohmann::json             placed = nlohmann::json::array(), skipped = nlohmann::json::array();
+    std::map<std::string, int> why;
+
+    auto skip = [&]( PAD* aPad, const std::string& aWhy, const std::string& aKind )
+    {
+        skipped.push_back( { { "pad", name( aPad ) }, { "reason", aWhy } } );
+        why[aKind]++;
+    };
+
+    for( PAD* pad : aIn.inside )
+        skip( pad, "inside the ring (exposed pad): its own vias", "inside the ring (exposed pad): its own vias" );
+
+    // per pin its rules: track width, via, clearance
+    struct ESC
+    {
+        PAD*    pad = nullptr;
+        int     side = 0;
+        bool    via = false;
+        int     width = 0, viaDia = 0, viaDrill = 0, clearance = 0;
+        int     viaHalf = 0;   ///< what a via keeps to a neighbour's track beyond the clearance: its ring or its hole's clearance
+        int64_t pin = 0;
+    };
+
+    std::map<PAD*, ESC> escOf;
+    int                 widest = 0, maxClr = 0, maxVia = 0;
+    size_t              mostOnSide = 0;
+
+    for( const auto& [side, list] : aIn.sides )
+    {
+        mostOnSide = std::max( mostOnSide, list.size() );
+
+        for( PAD* pad : list )
+        {
+            if( pad->GetNetCode() <= 0 )
+                continue;
+
+            ESC e;
+            e.pad = pad;
+            e.side = side;
+            e.via = aIn.takesVia( pad );
+            const KOPENAPI_RULE_TRACK tr = KopenapiRuleTrack( aBoard, pad->GetNetCode(), pad->GetPosition(), layer );
+            const KOPENAPI_RULE_VIA   rv = KopenapiRuleVia( aBoard, pad->GetNetCode(), pad->GetPosition(), layer );
+            e.width = std::max( tr.opt, tr.min );
+            e.clearance = std::max( rv.clearance, 1 );
+            e.viaDia = std::max( aIn.viaDia, rv.dia );
+            e.viaDrill = std::max( aIn.viaDrill, rv.drill );
+            e.viaHalf = std::max( e.viaDia / 2, e.viaDrill / 2 + aBoard->GetDesignSettings().m_HoleClearance - e.clearance );
+            e.pin = (int64_t) pad->GetPosition().x * aIn.tangent.at( side ).x + (int64_t) pad->GetPosition().y * aIn.tangent.at( side ).y;
+            widest = std::max( widest, e.width );
+            maxClr = std::max( maxClr, e.clearance );
+            maxVia = std::max( maxVia, 2 * e.viaHalf );
+            escOf[pad] = e;
+        }
+    }
+
+    // how far out the via line may go: the most pins of a side spread to a via plus clearance each, at 45 degrees
+    const int     run = maxVia / 2 + maxClr;
+    const int     neck = maxClr;
+    const int64_t horizon = neck + run + (int64_t) mostOnSide * ( maxVia + maxClr ) / 2;
+    BOX2I         region = aFp->GetBoundingBox( false );
+    region.Inflate( (int) horizon + run + maxVia );
+
+    // the supply copper at the rail pins: unlocked tracks and vias from the pad that stay in the region, end at
+    // other pads (joins, laid again) or at vias with nothing else on them
+    std::vector<PCB_TRACK*> nearby;
+
+    for( PCB_TRACK* t : aBoard->Tracks() )
+    {
+        if( t->GetBoundingBox().Intersects( region ) )
+            nearby.push_back( t );
+    }
+
+    std::set<BOARD_ITEM*>             removed;
+    std::map<PAD*, std::vector<PAD*>> joinsOf;
+    std::map<PAD*, std::vector<PCB_TRACK*>> chainOf;
+    nlohmann::json                    kept = nlohmann::json::array();
+    int                               removedTracks = 0, removedVias = 0;
+
+    auto connectsAt = [&]( PCB_TRACK* aItem, const VECTOR2I& aAt )
+    {
+        if( aItem->Type() == PCB_VIA_T )
+            return ( aItem->GetPosition() - aAt ).EuclideanNorm() <= static_cast<PCB_VIA*>( aItem )->GetWidth( F_Cu ) / 2;
+
+        return ( aItem->GetStart() - aAt ).EuclideanNorm() <= tol || ( aItem->GetEnd() - aAt ).EuclideanNorm() <= tol
+               || SEG( aItem->GetStart(), aItem->GetEnd() ).Distance( aAt ) <= tol;
+    };
+
+    for( const auto& [pad, e] : escOf )
+    {
+        if( !aIn.rail( pad ) )
+            continue;
+
+        std::vector<PCB_TRACK*> chain, todo;
+        std::set<PCB_TRACK*>    seen;
+        std::vector<PAD*>       joins;
+        bool                    ok = true;
+
+        for( PCB_TRACK* t : nearby )
+        {
+            if( t->GetNetCode() != pad->GetNetCode() )
+                continue;
+
+            const bool at = t->Type() == PCB_VIA_T ? pad->HitTest( t->GetPosition(), tol )
+                                                   : t->IsOnLayer( layer ) && ( pad->HitTest( t->GetStart(), tol ) || pad->HitTest( t->GetEnd(), tol ) );
+
+            if( at && seen.insert( t ).second )
+                todo.push_back( t );
+        }
+
+        while( !todo.empty() && ok )
+        {
+            PCB_TRACK* t = todo.back();
+            todo.pop_back();
+            chain.push_back( t );
+
+            if( t->IsLocked() || !region.Contains( t->GetBoundingBox() ) )
+            {
+                ok = false;
+                break;
+            }
+
+            std::vector<VECTOR2I> ends = t->Type() == PCB_VIA_T ? std::vector<VECTOR2I>{ t->GetPosition() }
+                                                                : std::vector<VECTOR2I>{ t->GetStart(), t->GetEnd() };
+
+            // an end on a pad: the pin's own (where the chain starts), another part's (a join: the chain stops
+            // there and is laid again from the new via), or another pin of the part (the chain stops)
+            auto padAt = [&]( const VECTOR2I& aPt ) -> PAD*
+            {
+                for( FOOTPRINT* fp : aBoard->Footprints() )
+                {
+                    if( !fp->GetBoundingBox( false ).Contains( aPt ) )
+                        continue;
+
+                    for( PAD* q : fp->Pads() )
+                    {
+                        if( q->GetNetCode() == pad->GetNetCode() && q->HitTest( aPt, tol ) )
+                            return q;
+                    }
+                }
+
+                return nullptr;
+            };
+
+            std::vector<VECTOR2I> open;
+
+            for( const VECTOR2I& pt : ends )
+            {
+                PAD* q = padAt( pt );
+
+                if( !q || ( q == pad && t->Type() == PCB_VIA_T ) )
+                    open.push_back( pt );
+                else if( q != pad && q->GetParentFootprint() != aFp && std::find( joins.begin(), joins.end(), q ) == joins.end() )
+                    joins.push_back( q );
+            }
+
+            for( PCB_TRACK* u : nearby )
+            {
+                if( seen.count( u ) || u->GetNetCode() != pad->GetNetCode() )
+                    continue;
+
+                bool touch = false;
+
+                for( const VECTOR2I& pt : open )
+                {
+                    if( u->Type() == PCB_VIA_T )
+                        touch = touch || ( t->Type() != PCB_VIA_T && connectsAt( u, pt ) );
+                    else if( t->Type() == PCB_VIA_T )
+                        touch = touch || connectsAt( t, u->GetStart() ) || connectsAt( t, u->GetEnd() );
+                    else
+                        touch = touch || ( u->GetLayer() == t->GetLayer() && connectsAt( u, pt ) );
+                }
+
+                // a via on the track's middle
+                if( !touch && t->Type() != PCB_VIA_T && u->Type() == PCB_VIA_T )
+                    touch = SEG( t->GetStart(), t->GetEnd() ).Distance( u->GetPosition() ) <= t->GetWidth() / 2;
+
+                if( touch )
+                {
+                    seen.insert( u );
+                    todo.push_back( u );
+                }
+            }
+        }
+
+        if( chain.empty() )
+            continue;
+
+        if( !ok )
+        {
+            kept.push_back( name( pad ) );
+            continue;
+        }
+
+        for( PCB_TRACK* t : chain )
+        {
+            if( removed.insert( t ).second )
+                ( t->Type() == PCB_VIA_T ? removedVias : removedTracks )++;
+        }
+
+        joinsOf[pad] = joins;
+        chainOf[pad] = chain;
+    }
+
+    // the pins with copper that stays: left as they are
+    auto hasCopper = [&]( PAD* aPad )
+    {
+        for( PCB_TRACK* t : nearby )
+        {
+            if( removed.count( t ) || t->GetNetCode() != aPad->GetNetCode() )
+                continue;
+
+            if( t->Type() == PCB_VIA_T ? aPad->HitTest( t->GetPosition() )
+                                       : t->IsOnLayer( layer ) && ( aPad->HitTest( t->GetStart() ) || aPad->HitTest( t->GetEnd() ) ) )
+            {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    // the copper the plan keeps clear of: pads of other parts, tracks and vias left on the board, then what
+    // earlier sides planned
+    struct OBST
+    {
+        int                                 net = 0;
+        BOX2I                               box;
+        std::vector<std::shared_ptr<SHAPE>> onLayer, any;
+        std::string                         what;
+    };
+
+    std::vector<OBST>                  obstacles;
+    std::vector<BOARD_CONNECTED_ITEM*> staged;   ///< every side's accepted copper, laid or not
+
+    BOARD_COMMIT                                       commit( aContext.GetToolManager() );
+    std::vector<KIID>                                  added;
+    std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> owned;
+    std::vector<BOARD_CONNECTED_ITEM*>                 toLay;
+    nlohmann::json                                     viaSpotsOut, joined, unjoined;
+    int                                                laidVias = 0, laidTracks = 0;
+    const nlohmann::json                               skippedBefore = skipped;
+    const std::map<std::string, int>                   whyBefore = why;
+
+    // a rail pin the plan finds no place for keeps its old copper, which the others then keep clear of: planned
+    // again until every pin whose copper is taken out has its place
+    for( ;; )
+    {
+        placed = nlohmann::json::array();
+        skipped = skippedBefore;
+        why = whyBefore;
+        obstacles.clear();
+        staged.clear();
+        toLay.clear();
+        owned.clear();
+        viaSpotsOut = nlohmann::json::array();
+        joined = nlohmann::json::array();
+        unjoined = nlohmann::json::array();
+        laidVias = laidTracks = 0;
+
+        for( FOOTPRINT* fp : aBoard->Footprints() )
+        {
+            if( fp == aFp || !fp->GetBoundingBox( false ).Intersects( region ) )
+                continue;
+
+            for( PAD* q : fp->Pads() )
+            {
+                if( !q->GetBoundingBox().Intersects( region ) )
+                    continue;
+
+                OBST o;
+                o.net = q->GetNetCode();
+                o.box = q->GetBoundingBox();
+                o.what = str( fp->GetReference() ) + "." + str( q->GetNumber() );
+
+                for( PCB_LAYER_ID l : q->GetLayerSet().CuStack() )
+                {
+                    std::shared_ptr<SHAPE> s = q->GetEffectiveShape( l );
+                    o.any.push_back( s );
+
+                    if( l == layer )
+                        o.onLayer.push_back( s );
+                }
+
+                obstacles.push_back( std::move( o ) );
+            }
+        }
+
+        auto addObstacle = [&]( BOARD_CONNECTED_ITEM* aItem )
+        {
+            OBST o;
+            o.net = aItem->GetNetCode();
+            o.box = aItem->GetBoundingBox();
+            o.what = str( UnescapeString( aItem->GetNetname() ) ) + ( aItem->Type() == PCB_VIA_T ? " via" : " track" )
+                     + ( std::find( staged.begin(), staged.end(), aItem ) != staged.end() ? " (this plan)" : "" );
+
+            if( aItem->Type() == PCB_VIA_T )
+            {
+                std::shared_ptr<SHAPE> s = aItem->GetEffectiveShape( layer );
+                o.any.push_back( s );
+                o.onLayer.push_back( s );
+            }
+            else
+            {
+                std::shared_ptr<SHAPE> s = aItem->GetEffectiveShape( aItem->GetLayer() );
+                o.any.push_back( s );
+
+                if( aItem->GetLayer() == layer )
+                    o.onLayer.push_back( s );
+            }
+
+            obstacles.push_back( std::move( o ) );
+        };
+
+        for( PCB_TRACK* t : nearby )
+        {
+            if( !removed.count( t ) )
+                addObstacle( t );
+        }
+
+        for( const auto& [side, list] : aIn.sides )
+        {
+            const VECTOR2I dir = aIn.dir.at( side ), tangent = aIn.tangent.at( side );
+            const int64_t  tip = aIn.tip.at( side );
+
+            auto at = [&]( int64_t aAlong, int64_t aOut ) { return VECTOR2I( (int) ( tangent.x * aAlong + dir.x * aOut ), (int) ( tangent.y * aAlong + dir.y * aOut ) ); };
+
+            std::vector<ESC> escs;
+
+            for( PAD* pad : list )
+            {
+                auto it = escOf.find( pad );
+
+                if( it == escOf.end() )
+                {
+                    skip( pad, "no net", "no net" );
+                    continue;
+                }
+
+                if( hasCopper( pad ) )
+                {
+                    skip( pad, "a track or via already leaves it (kept)", "already has copper" );
+                    continue;
+                }
+
+                if( !aIn.farEnd( pad ) )
+                {
+                    skip( pad, "no other pad on its net", "no other pad on its net" );
+                    continue;
+                }
+
+                escs.push_back( it->second );
+            }
+
+            if( escs.empty() )
+                continue;
+
+            int sideWidest = 0, sideClr = 0, sideVia = 0;
+
+            for( const ESC& e : escs )
+            {
+                sideWidest = std::max( sideWidest, e.width );
+                sideClr = std::max( sideClr, e.clearance );
+                sideVia = std::max( sideVia, 2 * e.viaHalf );
+            }
+
+            // the steepest leg two neighbours' tracks keep their clearance at, starting a pitch apart
+            const double cosMax = double( sideWidest + sideClr ) / std::max( aIn.pitch, 1 );
+            const double tanMax = cosMax >= 1.0 ? 0.0 : std::min( 1.0, std::sqrt( 1.0 - cosMax * cosMax ) / cosMax );
+
+            // the corners: the diagonal from the adjacent side's tip, kept by half a clearance and the widest half
+            std::optional<int64_t> lowTip, highTip;
+
+            for( const auto& [other, d] : aIn.dir )
+            {
+                if( d == VECTOR2I( -tangent.x, -tangent.y ) )
+                    lowTip = aIn.tip.at( other );
+                else if( d == tangent )
+                    highTip = aIn.tip.at( other );
+            }
+
+            const int64_t margin = (int64_t) std::ceil( ( std::max( sideVia, sideWidest ) / 2 + sideClr / 2.0 ) * std::sqrt( 2.0 ) );
+            const int     step = std::max( 1, std::min( aIn.pitch, sideClr ) / 10 );
+            const int     dStep = std::max( 1, ( sideWidest + sideClr ) / 2 );
+            int64_t       minPin = escs.front().pin, maxPin = escs.front().pin;
+
+            for( const ESC& e : escs )
+            {
+                minPin = std::min( minPin, e.pin );
+                maxPin = std::max( maxPin, e.pin );
+            }
+
+            struct TRY
+            {
+                int64_t                                            depth = 0;
+                PART_FAN_ASSIGNMENT                                fit;
+                std::vector<std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>>> items;
+                std::vector<std::string>                           fail;   ///< per escape: why it is not laid ("" laid)
+                std::vector<bool>                                  joinedOk;
+                int                                                bad = 0;
+                int64_t                                            lo = 0, hi = 0, reach = 0;
+            };
+
+            // one escape's copper at a spot: pad centre, straight past the pad tip, the leg to the spot's column, then
+            // straight to the via (or past the line, on the pad's layer)
+            auto build = [&]( const ESC& e, int64_t aX, int64_t aDepth, bool aJoin, std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>>& aOut )
+            {
+                const VECTOR2I start = e.pad->GetPosition();
+                const VECTOR2I knee = at( e.pin, tip + neck );
+                const VECTOR2I bend = at( aX, aDepth - run );
+                const VECTOR2I end = at( aX, e.via ? aDepth : aDepth + run );
+                std::vector<VECTOR2I> pts = { start };
+
+                if( aX != e.pin )
+                {
+                    pts.push_back( knee );
+                    pts.push_back( bend );
+                }
+
+                pts.push_back( end );
+
+                for( size_t k = 1; k < pts.size(); ++k )
+                {
+                    if( pts[k] == pts[k - 1] )
+                        continue;
+
+                    auto leg = std::make_unique<PCB_TRACK>( aBoard );
+                    leg->SetStart( pts[k - 1] );
+                    leg->SetEnd( pts[k] );
+                    leg->SetWidth( e.width );
+                    leg->SetLayer( layer );
+                    leg->SetNet( e.pad->GetNet() );
+                    aOut.push_back( std::move( leg ) );
+                }
+
+                if( e.via )
+                {
+                    auto via = std::make_unique<PCB_VIA>( aBoard );
+                    via->SetViaType( VIATYPE::THROUGH );
+                    via->SetPosition( end );
+                    via->SetWidth( PADSTACK::ALL_LAYERS, e.viaDia );
+                    via->SetDrill( e.viaDrill );
+                    via->SetLayerPair( F_Cu, B_Cu );
+                    via->SetNet( e.pad->GetNet() );
+                    aOut.push_back( std::move( via ) );
+
+                    if( aJoin && joinsOf.count( e.pad ) )
+                    {
+                        for( PAD* q : joinsOf[e.pad] )
+                        {
+                            if( !q->IsOnLayer( layer ) )
+                                continue;
+
+                            auto leg = std::make_unique<PCB_TRACK>( aBoard );
+                            leg->SetStart( end );
+                            leg->SetEnd( q->GetPosition() );
+                            leg->SetWidth( e.width );
+                            leg->SetLayer( layer );
+                            leg->SetNet( e.pad->GetNet() );
+                            aOut.push_back( std::move( leg ) );
+                        }
+                    }
+                }
+            };
+
+            // the spans of the line an escape's centre may not take at a depth, per kind of escape: a via's disc and
+            // the straight run before it, or the track's run across the line
+            auto blockedAt = [&]( const ESC& e, int64_t aDepth, int64_t aLo, int64_t aHi, std::vector<std::string>* aBy = nullptr )
+            {
+                std::vector<std::pair<int64_t, int64_t>> spans;
+                const int64_t windowLo = e.pin - ( aHi - aLo ), windowHi = e.pin + ( aHi - aLo );
+                const int half = e.via ? e.viaHalf : e.width / 2;
+                const int reachOut = half + e.clearance;
+
+                for( const OBST& o : obstacles )
+                {
+                    if( o.net == e.pad->GetNetCode() && o.net > 0 )
+                        continue;
+
+                    const int64_t oa0 = std::min( (int64_t) o.box.GetLeft() * tangent.x + (int64_t) o.box.GetTop() * tangent.y,
+                                                  (int64_t) o.box.GetRight() * tangent.x + (int64_t) o.box.GetBottom() * tangent.y );
+                    const int64_t oa1 = std::max( (int64_t) o.box.GetLeft() * tangent.x + (int64_t) o.box.GetTop() * tangent.y,
+                                                  (int64_t) o.box.GetRight() * tangent.x + (int64_t) o.box.GetBottom() * tangent.y );
+                    const int64_t od0 = std::min( (int64_t) o.box.GetLeft() * dir.x + (int64_t) o.box.GetTop() * dir.y,
+                                                  (int64_t) o.box.GetRight() * dir.x + (int64_t) o.box.GetBottom() * dir.y );
+                    const int64_t od1 = std::max( (int64_t) o.box.GetLeft() * dir.x + (int64_t) o.box.GetTop() * dir.y,
+                                                  (int64_t) o.box.GetRight() * dir.x + (int64_t) o.box.GetBottom() * dir.y );
+
+                    if( od1 < aDepth - run - reachOut || od0 > aDepth + run + reachOut )
+                        continue;
+
+                    const int64_t to = std::min( aHi, oa1 + reachOut );
+                    const int64_t from = aLo + ( std::max( (int64_t) 0, oa0 - reachOut - aLo ) + step - 1 ) / step * step;
+                    std::optional<int64_t> runStart;
+
+                    for( int64_t x = from; x <= to + step; x += step )
+                    {
+                        bool hit = false;
+
+                        if( x <= to )
+                        {
+                            const SEG straight( at( x, aDepth - run ), at( x, e.via ? aDepth : aDepth + run ) );
+
+                            for( const std::shared_ptr<SHAPE>& s : o.onLayer )
+                                hit = hit || s->Collide( straight, e.width / 2 + e.clearance - 1 );
+
+                            if( e.via )
+                            {
+                                const SEG disc( at( x, aDepth ), at( x, aDepth ) );
+
+                                for( const std::shared_ptr<SHAPE>& s : o.any )
+                                    hit = hit || s->Collide( disc, e.viaHalf + e.clearance - 1 );
+                            }
+                        }
+
+                        if( hit && !runStart )
+                            runStart = x;
+                        else if( !hit && runStart )
+                        {
+                            spans.emplace_back( *runStart - step, x );
+                            runStart.reset();
+
+                            if( aBy && x > windowLo && spans.back().first < windowHi
+                                && std::find( aBy->begin(), aBy->end(), o.what ) == aBy->end() )
+                            {
+                                aBy->push_back( o.what );
+                            }
+                        }
+                    }
+                }
+
+                return spans;
+            };
+
+            const int64_t first = tip + neck + run;
+            const int64_t last = tip + horizon;
+            std::optional<TRY> best;
+
+            for( int64_t depth = first; depth <= last; depth += dStep )
+            {
+                const int64_t legRoom = depth - run - tip - neck;
+                const int64_t reach = (int64_t) ( legRoom * tanMax );
+                const int64_t lo = std::max( minPin - reach, lowTip ? -*lowTip - legRoom + margin : minPin - reach );
+                const int64_t hi = std::min( maxPin + reach, highTip ? *highTip + legRoom - margin : maxPin + reach );
+
+                std::vector<PART_FAN_SLOT> slots;
+
+                for( const ESC& e : escs )
+                {
+                    PART_FAN_SLOT s;
+                    s.pin = e.pin;
+                    s.half = e.via ? e.viaHalf : e.width / 2;
+                    s.clearance = e.clearance;
+                    s.reach = reach;
+                    s.blocked = blockedAt( e, depth, lo, hi );
+                    slots.push_back( std::move( s ) );
+                }
+
+                TRY t;
+                t.depth = depth;
+                t.lo = lo;
+                t.hi = hi;
+                t.reach = reach;
+                t.fit = PartFanAssign( slots, lo, hi, step );
+                t.items.resize( escs.size() );
+                t.fail.assign( escs.size(), "" );
+                t.joinedOk.assign( escs.size(), true );
+
+                if( best && t.fit.left > best->bad )
+                    continue;
+
+                for( size_t k = 0; k < escs.size(); ++k )
+                {
+                    if( t.fit.at[k] )
+                        build( escs[k], *t.fit.at[k], depth, true, t.items[k] );
+                    else
+                        t.fail[k] = "-";
+                }
+
+                for( size_t k = 0; k < escs.size(); ++k )
+                {
+                    if( !t.fit.at[k] )
+                        continue;
+
+                    std::vector<BOARD_CONNECTED_ITEM*> mine, others = staged;
+
+                    for( size_t i = 0; i < escs.size(); ++i )
+                    {
+                        for( const auto& item : t.items[i] )
+                            ( i == k ? mine : others ).push_back( item.get() );
+                    }
+
+                    nlohmann::json v = guard( aBoard, mine, removed, refill, &others );
+
+                    if( !v.empty() && joinsOf.count( escs[k].pad ) && !joinsOf[escs[k].pad].empty() )
+                    {
+                        std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> plain;
+                        build( escs[k], *t.fit.at[k], depth, false, plain );
+                        std::vector<BOARD_CONNECTED_ITEM*> plainMine;
+
+                        for( const auto& item : plain )
+                            plainMine.push_back( item.get() );
+
+                        if( guard( aBoard, plainMine, removed, refill, &others ).empty() )
+                        {
+                            t.items[k] = std::move( plain );
+                            t.joinedOk[k] = false;
+                            v = nlohmann::json::array();
+                        }
+                    }
+
+                    if( !v.empty() )
+                        t.fail[k] = "the escape touches other copper (" + v[0]["other"].dump() + ", " + v[0].value( "distance_mm", nlohmann::json() ).dump()
+                                    + " mm of " + v[0].value( "required_mm", nlohmann::json() ).dump() + " mm, from " + v[0]["new"].dump() + ")";
+                }
+
+                t.bad = (int) std::count_if( t.fail.begin(), t.fail.end(), []( const std::string& s ) { return !s.empty(); } );
+
+                if( !best || t.bad < best->bad )
+                    best = std::move( t );
+
+                if( best->bad == 0 )
+                    break;
+            }
+
+            if( !best )
+                continue;
+
+            for( size_t k = 0; k < escs.size(); ++k )
+            {
+                const ESC& e = escs[k];
+
+                if( best->fail[k] == "-" )
+                {
+                    // what takes its reach on the line: the copper and pads there, else its neighbours' spots
+                    std::vector<std::string> by;
+                    const int64_t            lo = std::max( best->lo, e.pin - best->reach ), hi = std::min( best->hi, e.pin + best->reach );
+                    blockedAt( e, best->depth, lo, hi, &by );
+                    std::string list;
+
+                    for( size_t i = 0; i < by.size() && i < 6; ++i )
+                        list += ( i ? ", " : "" ) + by[i];
+
+                    char where[160];
+                    std::snprintf( where, sizeof( where ), "no spot on the via line %.3f mm out within %.3f mm of its pin", toMm( best->depth - tip ),
+                                   toMm( best->reach ) );
+                    best->fail[k] = std::string( where ) + ( list.empty() ? ": its neighbours' spots fill it" : ": blocked by " + list );
+                    skip( e.pad, best->fail[k].substr( 0, 400 ), "no spot on the via line" );
+                    continue;
+                }
+
+                if( !best->fail[k].empty() )
+                {
+                    skip( e.pad, best->fail[k].substr( 0, 400 ), "touches other copper" );
+                    continue;
+                }
+
+                const bool lay = ( aIn.onlyNets.empty() || aIn.onlyNets.count( e.pad->GetNetCode() ) ) && ( e.via || aArgs.value( "stubs", true ) );
+                const VECTOR2I end = at( *best->fit.at[k], e.via ? best->depth : best->depth + run );
+                nlohmann::json path = nlohmann::json::array();
+
+                for( auto& item : best->items[k] )
+                {
+                    if( item->Type() == PCB_TRACE_T )
+                    {
+                        PCB_TRACK* tr = static_cast<PCB_TRACK*>( item.get() );
+
+                        if( path.empty() )
+                            path.push_back( { toMm( tr->GetStart().x ), toMm( tr->GetStart().y ) } );
+
+                        path.push_back( { toMm( tr->GetEnd().x ), toMm( tr->GetEnd().y ) } );
+                    }
+
+                    staged.push_back( item.get() );
+                    addObstacle( item.get() );
+
+                    if( lay )
+                    {
+                        ( item->Type() == PCB_VIA_T ? laidVias : laidTracks )++;
+                        toLay.push_back( item.get() );
+                    }
+
+                    owned.push_back( std::move( item ) );
+                }
+
+                nlohmann::json row = { { "pad", name( e.pad ) },
+                                       { "net", str( UnescapeString( e.pad->GetNetname() ) ) },
+                                       { "side", aIn.sideName[side] },
+                                       { "kind", aIn.rail( e.pad ) ? "rail" : e.via ? "via" : "stub" },
+                                       { "end_mm", { toMm( end.x ), toMm( end.y ) } },
+                                       { "line_mm", toMm( best->depth - tip ) },
+                                       { "laid", lay } };
+
+                if( const std::optional<VECTOR2I> farPos = aIn.farEnd( e.pad ) )
+                    row["far_end_mm"] = { toMm( farPos->x ), toMm( farPos->y ) };
+
+                if( e.via )
+                {
+                    row["row"] = 0;
+                    row["via"] = { { "at_mm", { toMm( end.x ), toMm( end.y ) } }, { "layers", { "F.Cu", "B.Cu" } }, { "laid", lay } };
+                    viaSpotsOut.push_back( { { "pad", name( e.pad ) },
+                                             { "net", str( UnescapeString( e.pad->GetNetname() ) ) },
+                                             { "side", aIn.sideName[side] },
+                                             { "at_mm", { toMm( end.x ), toMm( end.y ) } },
+                                             { "layers", { "F.Cu", "B.Cu" } },
+                                             { "from_layer", e.pad->IsOnLayer( F_Cu ) ? "F.Cu" : "B.Cu" },
+                                             { "laid", lay },
+                                             { "path_mm", path } } );
+                }
+
+                if( nlohmann::json port = aIn.port( e.pad ); !port.is_null() )
+                    row["port"] = port;
+
+                for( PAD* q : joinsOf.count( e.pad ) ? joinsOf[e.pad] : std::vector<PAD*>() )
+                    ( best->joinedOk[k] ? joined : unjoined ).push_back( { { "pad", name( e.pad ) }, { "to", str( q->GetParentFootprint()->GetReference() ) + "." + str( q->GetNumber() ) } } );
+
+                placed.push_back( row );
+            }
+        }
+
+        std::vector<PAD*> unplaced;
+
+        for( const auto& [pad, chain] : chainOf )
+        {
+            const std::string n = name( pad );
+
+            if( std::none_of( placed.begin(), placed.end(), [&]( const nlohmann::json& r ) { return r["pad"] == n; } ) )
+                unplaced.push_back( pad );
+        }
+
+        if( unplaced.empty() )
+            break;
+
+        for( PAD* pad : unplaced )
+        {
+            kept.push_back( name( pad ) );
+            std::vector<PCB_TRACK*> chain = chainOf[pad];
+            chainOf.erase( pad );
+            joinsOf.erase( pad );
+
+            for( PCB_TRACK* t : chain )
+            {
+                const bool shared = std::any_of( chainOf.begin(), chainOf.end(), [&]( const auto& c )
+                                                 { return std::find( c.second.begin(), c.second.end(), t ) != c.second.end(); } );
+
+                if( !shared && removed.erase( t ) )
+                    ( t->Type() == PCB_VIA_T ? removedVias : removedTracks )--;
+            }
+        }
+    }
+
+    if( !dryRun && ( !toLay.empty() || !removed.empty() ) )
+    {
+        for( BOARD_ITEM* item : removed )
+            commit.Remove( item );
+
+        for( auto& item : owned )
+        {
+            if( std::find( toLay.begin(), toLay.end(), item.get() ) == toLay.end() )
+                continue;
+
+            added.push_back( item->m_Uuid );
+            commit.Add( item.release() );
+        }
+
+        commit.Push( _( "Fan out the part (API)" ) );
+
+        if( refill )
+            refillPours( aContext, aBoard );
+
+        aBoard->BuildConnectivity();
+        aBoard->GetConnectivity()->RecalculateRatsnest();
+        showRoutes( aCtx, added );
+    }
+    else
+    {
+        commit.Revert();
+    }
+
+    nlohmann::json reasons = nlohmann::json::object();
+
+    for( const auto& [w, n] : why )
+        reasons[w] = n;
+
+    int planVias = 0;
+
+    for( const nlohmann::json& row : placed )
+        planVias += row.contains( "row" );
+
+    nlohmann::json answer = { { "ref", ref },
+                              { "package", "peripheral" },
+                              { "pitch_mm", toMm( aIn.pitch ) },
+                              { "pattern", "part" },
+                              { "stagger_rows", 1 },
+                              { "fanned", placed.size() },
+                              { "skipped", skipped.size() },
+                              { "skipped_by_reason", reasons },
+                              { "dry_run", dryRun },
+                              { "applied", !dryRun && ( !added.empty() || !removed.empty() ) },
+                              { "ports", { { "planned", placed.size() }, { "vias", planVias } } },
+                              { "via", { { "diameter_mm", toMm( aIn.viaDia ) }, { "drill_mm", toMm( aIn.viaDrill ) } } },
+                              { "relaid", { { "removed", { { "tracks", removedTracks }, { "vias", removedVias } } },
+                                            { "laid", { { "tracks", laidTracks }, { "vias", laidVias } } },
+                                            { "joined", joined },
+                                            { "unjoined", unjoined },
+                                            { "kept", kept } } } };
+
+    const KOPENAPI_LIST_CAP cap( aArgs, 20 );
+    cap.Put( answer, "pins", placed );
+    cap.Put( answer, "skipped_pins", skipped );
+    cap.Put( answer, "via_spots", viaSpotsOut );
+    return KOPENAPI_RESULT::Ok( answer );
+}
+
+
 static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext, BOARD* aBoard, FOOTPRINT* aFp,
                                          const nlohmann::json& aArgs )
 {
@@ -20531,7 +21381,7 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
         std::string kind, layer, to;
     };
 
-    const bool                 withPorts = aArgs.value( "ports", false );
+    const bool                 withPorts = aArgs.value( "ports", false ) || aArgs.value( "part", false );
     const bool                 portStubs = aArgs.value( "stubs", true );
     std::map<std::string, PORT_PLAN> plan;
 
@@ -20861,6 +21711,53 @@ static KOPENAPI_RESULT peripheralFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aC
                 }
             }
         }
+    }
+
+    if( aArgs.value( "part", false ) )
+    {
+        PART_FAN_INPUT in;
+        in.pitch = pitch;
+        in.viaDia = viaDia;
+        in.viaDrill = viaDrill;
+        in.onlyNets = onlyNets;
+        in.sideName = sideName;
+        in.takesVia = takesVia;
+        in.farEnd = [&]( PAD* aPad ) { return farCached( aPad ); };
+        in.rail = [&]( PAD* aPad )
+        {
+            const auto it = plan.find( str( aPad->GetNumber() ) );
+            return it != plan.end() && it->second.kind == "rail";
+        };
+        in.port = [&]( PAD* aPad ) -> nlohmann::json
+        {
+            const auto it = plan.find( str( aPad->GetNumber() ) );
+
+            if( it == plan.end() )
+                return nullptr;
+
+            nlohmann::json port = { { "kind", it->second.kind }, { "layer", it->second.layer } };
+
+            if( !it->second.to.empty() )
+                port["to"] = it->second.to;
+
+            return port;
+        };
+
+        for( auto& [sideKey, list] : bySide )
+        {
+            if( sideKey == INSIDE )
+            {
+                in.inside = list;
+                continue;
+            }
+
+            in.sides[sideKey] = list;
+            in.dir[sideKey] = rowGeom[sideKey].dir;
+            in.tangent[sideKey] = rowGeom[sideKey].tangent;
+            in.tip[sideKey] = rowGeom[sideKey].tip;
+        }
+
+        return partFanout( aCtx, aContext, aBoard, aFp, aArgs, in );
     }
 
     for( auto& [sideKey, list] : bySide )
@@ -22825,6 +23722,7 @@ KOPENAPI_REGISTER( "pcb_fanout",
                         "vias":{"type":"boolean","default":true,"description":"ring packages: false gives the stubs only, ending just outside the courtyard"},
                         "ports":{"type":"boolean","default":false,"description":"ring packages: follow the layout plan (pcb_fanout_ports): a via only for rails, for pins whose far end's order moves them to the other layer and for pins that yield to lanes (the plan's yields, the route leaving from that end); the rest stubs out past the courtyard on the pad's layer; each pin answers its port (kind, layer, to) and its via (at_mm, layers, laid); via_spots: the via spot of every signal pin of the package, laid or not (where its via goes should it leave by one: the package's pins fanned as vias in pin order, whatever nets are asked), each pad, net, side, at_mm, layers, from_layer, laid, path_mm (the fan's legs from the pad to it) - the one source of these spots for pcb_fanout_ports lanes, pcb_route ports and pcb_stitch"},
                         "stubs":{"type":"boolean","default":true,"description":"with ports: false lays only the planned vias (rails, pins to the other layer); the other pins are left to pcb_route"},
+                        "part":{"type":"boolean","default":false,"description":"ring packages: one plan for every pin of the part at once (implies ports): the unlocked supply copper at its rail pins that ends near it (stubs, their vias, joins to other parts' pads) is taken out; per side every pin with a far end gets a spot on one via line, all spots assigned together in pin order at the rules' widths and clearances, clear of the copper and pads there, the line as near the pads as lets every pin fit; rails and pins the ports plan moves to the other layer end on a via there, the rest run past the line on the pad's layer; a rail pin's removed joins are laid again from its via when clear. Answers pattern part, pins (pad, net, side, kind rail / via / stub, end_mm, line_mm, laid, via, port), skipped_pins with the blocker, via_spots, relaid {removed, laid, joined, unjoined, kept}; nets: plan all, lay only these; stubs false: lay only the vias (the stubs' spots stay in the plan)"},
                         "direction":{"type":"string","enum":["inward","up","down","left","right"],"description":"stubs straight this way (edge mode); inward: away from the board edge the pads sit on (found by itself for card-edge fingers)"},
                         "stub_mm":{"type":"number","description":"edge mode: stub length from the pad centre"},
                         "via":{"type":"string","enum":["none","always","stagger"],"default":"none","description":"edge mode: a via at each stub end, stagger: on two alternating lines"},
