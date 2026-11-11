@@ -3090,8 +3090,9 @@ static std::string mmText( double aMm )
 }
 
 
-/// @brief A route end by name: REF.PAD for a pad, else its kind and where it is
-static std::string endName( BOARD_CONNECTED_ITEM* aItem )
+/// @brief A route end by name: REF.PAD for a pad, else its kind and where it is (aAt: the point the route
+/// takes on it, such as a stub's free end; else the item's own position)
+static std::string endName( BOARD_CONNECTED_ITEM* aItem, std::optional<VECTOR2I> aAt = std::nullopt )
 {
     if( !aItem )
         return "?";
@@ -3102,7 +3103,7 @@ static std::string endName( BOARD_CONNECTED_ITEM* aItem )
         return str( pad->GetParentFootprint() ? pad->GetParentFootprint()->GetReference() : wxString( "?" ) ) + "." + str( pad->GetNumber() );
     }
 
-    const VECTOR2I at = aItem->GetPosition();
+    const VECTOR2I at = aAt.value_or( aItem->GetPosition() );
     const std::string kind = aItem->Type() == PCB_VIA_T ? "via" : aItem->Type() == PCB_ZONE_T ? "pour" : "track";
     return kind + " at (" + mmText( toMm( at.x ) ) + ", " + mmText( toMm( at.y ) ) + ")";
 }
@@ -6957,7 +6958,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     }
                 }
 
-                aAttempt["boxed_in"] = { { "end", endName( end ) },
+                aAttempt["boxed_in"] = { { "end", endName( end, at ) },
                                          { "which", plan.boxedEnd == 1 ? "start" : "target" },
                                          { "room_cells", plan.boxedRoom },
                                          { "by", by } };
@@ -6965,7 +6966,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( !causeKind.empty() )
                     aAttempt["boxed_in"]["cause"] = causeKind;
 
-                aAttempt["boxed_reason"] = std::string( plan.boxedEnd == 1 ? "start " : "target " ) + endName( end )
+                aAttempt["boxed_reason"] = std::string( plan.boxedEnd == 1 ? "start " : "target " ) + endName( end, at )
                                            + " is boxed in: no way out of it at this width and clearance"
                                            + ( cause.empty() ? std::string() : ": " + cause )
                                            + ( list.empty() ? std::string() : ", by " + list );
@@ -13044,6 +13045,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         // a failed try's rollback may have taken the copper it was to end on
         if( const PAD* toPad = dynamic_cast<const PAD*>( job.to.get() ) )
             row["to"] = str( toPad->GetParentFootprint()->GetReference() ) + "." + str( toPad->GetNumber() );
+        else
+            row["to_at_mm"] = { toMm( job.toPos.x ), toMm( job.toPos.y ) };
 
         if( busRow.is_object() )
             row["bus"] = busRow;
@@ -14213,7 +14216,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     detailOf[index] = 1;
                     done[index] = true;
                     rowOf[index] = (int) results.size();
-                    results.push_back( { { "net", job.net }, { "from", endName( job.from ) }, { "to", endName( job.to ) },
+                    results.push_back( { { "net", job.net }, { "from", endName( job.from ) }, { "to", endName( job.to.get(), job.toPos ) },
                                          { "routed", true }, { "tries", 1 }, { "engine", "pns" }, { "detail", "branches" } } );
                 }
             }
@@ -14484,7 +14487,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 const auto [a, b] = endsOfJob[index];
                 const bool reached = r && a < r->reached.size() && b < r->reached.size() && r->reached[a] && r->reached[b];
                 const bool ok = detailStage ? netOk[k] && joinedNow( index ) : netOk[k] && reached;
-                nlohmann::json row = { { "net", jobs[index].net }, { "from", endName( jobs[index].from ) }, { "to", endName( jobs[index].to ) },
+                nlohmann::json row = { { "net", jobs[index].net }, { "from", endName( jobs[index].from ) }, { "to", endName( jobs[index].to.get(), jobs[index].toPos ) },
                                        { "routed", ok }, { "tries", 1 }, { "engine", "grid" },
                                        { "via_list", nlohmann::json::array() } };
 
@@ -14539,7 +14542,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                             continue;
 
                         BOARD_CONNECTED_ITEM* end = w.end == a ? static_cast<BOARD_CONNECTED_ITEM*>( jobs[index].from ) : jobs[index].to.get();
-                        std::string           name = endName( end );
+                        std::string           name = w.end == a ? endName( end ) : endName( end, jobs[index].toPos );
                         nlohmann::json        by = nlohmann::json::array();
                         std::string           list;
 
@@ -21144,13 +21147,16 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
             };
 
             // the spans of the line an escape's centre may not take at a depth, per kind of escape: a via's disc and
-            // the straight run before it, or the track's run across the line; in a fan its whole leg from the pad
+            // the straight run before it, or the track's run across the line and on past its end as far as a track
+            // must go before it turns past its neighbours' ends (a track and its clearance); and the leg from the pad
+            // to the spot's column, as build lays it
             auto blockedAt = [&]( const ESC& e, int64_t aDepth, int64_t aLo, int64_t aHi, std::vector<std::string>* aBy = nullptr, bool aFan = false )
             {
                 std::vector<std::pair<int64_t, int64_t>> spans;
                 const int64_t windowLo = e.pin - ( aHi - aLo ), windowHi = e.pin + ( aHi - aLo );
                 const int half = e.via ? e.viaHalf : e.width / 2;
                 const int reachOut = half + e.clearance;
+                const int64_t outEnd = e.via ? aDepth : aDepth + run + e.width + e.clearance;
 
                 for( const OBST& o : obstacles )
                 {
@@ -21166,12 +21172,16 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                     const int64_t od1 = std::max( (int64_t) o.box.GetLeft() * dir.x + (int64_t) o.box.GetTop() * dir.y,
                                                   (int64_t) o.box.GetRight() * dir.x + (int64_t) o.box.GetBottom() * dir.y );
 
-                    if( od1 < ( aFan ? tip : aDepth - run ) - reachOut || od0 > aDepth + run + reachOut )
+                    if( od1 < tip - reachOut || od0 > std::max( aDepth + run, outEnd ) + reachOut )
                         continue;
 
-                    // a fan's leg crosses the columns between its pin and its spot
-                    const int64_t to = aFan ? aHi : std::min( aHi, oa1 + reachOut );
-                    const int64_t from = aFan ? aLo : aLo + ( std::max( (int64_t) 0, oa0 - reachOut - aLo ) + step - 1 ) / step * step;
+                    // a leg crosses the columns between its pin and its spot: an obstacle beside the pin holds the
+                    // spots past it, one across the pin's column every spot
+                    const bool    onLegs = od0 <= aDepth - run + reachOut;
+                    const bool    pastHigh = oa0 - reachOut > e.pin, pastLow = oa1 + reachOut < e.pin;
+                    const int64_t spanLo = onLegs && !pastHigh ? aLo : oa0 - reachOut;
+                    const int64_t to = onLegs && !pastLow ? aHi : std::min( aHi, oa1 + reachOut );
+                    const int64_t from = aLo + ( std::max( (int64_t) 0, spanLo - aLo ) + step - 1 ) / step * step;
                     std::optional<int64_t> runStart;
 
                     for( int64_t x = from; x <= to + step; x += step )
@@ -21180,14 +21190,14 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
 
                         if( x <= to )
                         {
-                            const SEG straight( at( x, aDepth - run ), at( x, e.via ? aDepth : aDepth + run ) );
+                            const SEG straight( at( x, aDepth - run ), at( x, outEnd ) );
 
                             for( const std::shared_ptr<SHAPE>& s : o.onLayer )
                                 hit = hit || s->Collide( straight, e.width / 2 + e.clearance - 1 );
 
-                            if( aFan && !hit && std::abs( x - e.pin ) <= aDepth - run - tip )
+                            if( onLegs && !hit && x != e.pin && ( !aFan || std::abs( x - e.pin ) <= aDepth - run - tip ) )
                             {
-                                const VECTOR2I knee = at( e.pin, aDepth - run - std::abs( x - e.pin ) );
+                                const VECTOR2I knee = at( e.pin, aFan ? aDepth - run - std::abs( x - e.pin ) : tip + neck );
                                 const SEG      out( at( e.pin, tip ), knee ), leg( knee, at( x, aDepth - run ) );
 
                                 for( const std::shared_ptr<SHAPE>& s : o.onLayer )
@@ -23598,7 +23608,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "and moved others in turn; reroutes_along: corridor members a rip-up routes again (taken out or the one it is for), "
                    "tried along their lanes first (tried, routed), else free; rip_ups_failed_at: failed rip-ups by what failed (route, victim, cut); a row left "
                    "failed lists its rip_ups_failed (taken_out, failed_at, picked_by plan or corridor, reason: why the route or the victim (victim) failed then); "
-                   "a row whose end is shut in has boxed_in (end, which, by: other nets' copper nearer than a track of its width needs (for a pin on its part's outline, on its outward side), and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
+                   "a row whose target is copper, not a pad, has to_at_mm (the point it is routed to, a stub's free end); a row whose end is shut in has boxed_in (end: REF.PAD, or the copper and the point the route takes on it, which, by: other nets' copper nearer than a track of its width needs (for a pin on its part's outline, on its outward side), and pads; cause pad_clearance: the clearance to its own row neighbours leaves no track of the board minimum, escapes_kept: the ways out kept open for other nets' fine-pitch pads shut it, the reason names them); "
                    "pairs_stuck: pair tries ended when nothing was placed after 3 steps; front_retries: tries refused for walling in a port (with bus_paths, any pin's way out; a port try's first, else the first), made again as the connection's last try with the ways out as obstacles to the search (tried / won; the row's try says walls_in_first); pad_exits: starts stuck in their pad that tried / won a corner out of a free side (row left_pad_by_mm); plans / plans_found / plan_ms: global plans (plans_whole_board: searched again over the whole board when the box round the ends cut the way; plans_stopped: ended by job_cancel, a budget or stop_on_plateau_s); sync_ms: building the router's world for each; move_ms: the path search; "
                    "route_ms: all but the world; by_kind: tries / routed / ms on a layer (walkaround, shove), "
                    "through one via, two vias; failed_by: failed tries by reason; by_pass: first, retry from both ends, "
