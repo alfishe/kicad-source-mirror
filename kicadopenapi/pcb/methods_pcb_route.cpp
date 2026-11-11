@@ -6073,49 +6073,78 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     };
 
     // inward_escapes: parts whose row pads may also leave inward, through a via in the ring between
-    // the row and the exposed pad (the largest pad, inside the row) where the ring is wide enough
+    // the row and the exposed pad where the ring is wide enough.  The exposed pad is the largest pad;
+    // pads within its box (its copy on another layer, paste or thermal via pads) are not row pads
     std::map<const FOOTPRINT*, PAD*, FP_ORDER> inwardParts;
 
-    if( aArgs.contains( "inward_escapes" ) )
+    auto exposedPad = []( FOOTPRINT* aFp ) -> PAD*
     {
-        if( !aArgs["inward_escapes"].is_array() )
-            return KOPENAPI_RESULT::Error( 400, "inward_escapes: [footprint references]" );
+        PAD*   ep = nullptr;
+        double epArea = 0;
 
-        for( const nlohmann::json& r : aArgs["inward_escapes"] )
+        for( PAD* q : aFp->Pads() )
+        {
+            const double area = (double) q->GetBoundingBox().GetWidth() * q->GetBoundingBox().GetHeight();
+
+            if( area > epArea )
+            {
+                epArea = area;
+                ep = q;
+            }
+        }
+
+        if( !ep )
+            return nullptr;
+
+        const BOX2I epBox = ep->GetBoundingBox();
+        double      rowArea = 0;
+        int         rowPads = 0;
+        BOX2I       ring;
+
+        for( PAD* q : aFp->Pads() )
+        {
+            const BOX2I box = q->GetBoundingBox();
+
+            if( q == ep || epBox.Contains( box ) )
+                continue;
+
+            rowArea = std::max( rowArea, (double) box.GetWidth() * box.GetHeight() );
+            ring.Merge( box );
+            rowPads++;
+        }
+
+        if( rowPads < 4 || epArea < 4 * rowArea || !ring.Contains( epBox ) )
+            return nullptr;
+
+        return ep;
+    };
+
+    const nlohmann::json inwardArg = aArgs.value( "inward_escapes", nlohmann::json( "auto" ) );
+
+    if( inwardArg == "auto" )
+    {
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            if( PAD* ep = exposedPad( fp ) )
+                inwardParts[fp] = ep;
+        }
+    }
+    else if( !inwardArg.is_array() )
+    {
+        return KOPENAPI_RESULT::Error( 400, "inward_escapes: \"auto\" or [footprint references]" );
+    }
+    else
+    {
+        for( const nlohmann::json& r : inwardArg )
         {
             FOOTPRINT* fp = r.is_string() ? board->FindFootprintByReference( wxString::FromUTF8( r.get<std::string>() ) ) : nullptr;
 
             if( !fp )
                 return KOPENAPI_RESULT::Error( 404, "inward_escapes: no footprint " + ( r.is_string() ? r.get<std::string>() : r.dump() ) );
 
-            PAD*   ep = nullptr;
-            double epArea = 0, rowArea = 0;
+            PAD* ep = exposedPad( fp );
 
-            for( PAD* q : fp->Pads() )
-            {
-                const double area = (double) q->GetBoundingBox().GetWidth() * q->GetBoundingBox().GetHeight();
-
-                if( area > epArea )
-                {
-                    rowArea = std::max( rowArea, epArea );
-                    epArea = area;
-                    ep = q;
-                }
-                else
-                {
-                    rowArea = std::max( rowArea, area );
-                }
-            }
-
-            BOX2I ring;
-
-            for( PAD* q : fp->Pads() )
-            {
-                if( q != ep )
-                    ring.Merge( q->GetBoundingBox() );
-            }
-
-            if( !ep || fp->Pads().size() < 5 || epArea < 4 * rowArea || !ring.Contains( ep->GetBoundingBox() ) )
+            if( !ep )
             {
                 return KOPENAPI_RESULT::Error( 400, "inward_escapes: " + str( fp->GetReference() )
                                                             + " has no exposed pad inside its pad row" );
@@ -23683,7 +23712,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (as dense_first says) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
-                        "inward_escapes":{"type":"array","items":{"type":"string"},"description":"footprint references of packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). 404 an unknown reference, 400 a part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},"corridor_guard":{"type":"boolean","default":false,"description":"with escapes: past such a way out, while other copper stands a track and its clearance to both sides of it (a corridor between stubs), a route that shuts the corridor before either side opens is refused as well (reason: wall in ... along the copper beside it)"},
+                        "inward_escapes":{"default":"auto","description":"packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). auto (default): every package whose pad row rings its exposed pad (pads inside the exposed pad's box, as its copy on another layer, are not row pads); a list of footprint references: only those ([]: none). 404 an unknown reference, 400 a listed part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},"corridor_guard":{"type":"boolean","default":false,"description":"with escapes: past such a way out, while other copper stands a track and its clearance to both sides of it (a corridor between stubs), a route that shuts the corridor before either side opens is refused as well (reason: wall in ... along the copper beside it)"},
                         "via_cost_mm":{"type":"number","minimum":0,"description":"mm of track a via costs the plan, the grid and the clean-up; default from the rules: the routing room a via of the default class takes on each signal layer, as track (the answer's via_cost_mm)"},
                         "plan":{"type":"boolean","default":true,"description":"a connection the router does not find on a layer is planned over the free space (grid search with vias, the board's clearances), the router follows the plan; no plan found: no escape-spot tries either (row plan tells)"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
