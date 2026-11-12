@@ -1480,6 +1480,176 @@ static bool corridorShut( BOARD* aBoard, const ESCAPE_FRONT& aFront, const std::
 }
 
 
+/// @brief A pin of a package row a route would cut off, and the stretch of the row no route of the net may cross
+struct ROW_CUT
+{
+    const ESCAPE_FRONT* front = nullptr;   ///< the cut off pin's way out
+    SHAPE_SEGMENT       band;              ///< along the row's centre line, from the nearest open pin to past the row's end
+};
+
+
+/// @brief Whether aNew (net aNet) cuts off a pin of a package row: it crosses the row's centre line (under the pads on
+/// another layer, or between them) away from the net's own pin there, that pin's copper leaves its pad both inward and
+/// outward, and between the pin and the crossing stands a pin whose way out is still open
+static std::optional<ROW_CUT> rowCutOff( BOARD* aBoard, const std::vector<ESCAPE_FRONT>& aFronts,
+                                         const std::vector<BOARD_CONNECTED_ITEM*>& aNew, int aNet )
+{
+    std::set<std::pair<FOOTPRINT*, std::pair<int, int>>> rows;
+
+    for( const ESCAPE_FRONT& f : aFronts )
+    {
+        if( std::strcmp( f.kind, "edge" ) == 0 && !f.spare && ( f.outward.x == 0 ) != ( f.outward.y == 0 ) && f.pad->GetParentFootprint() )
+            rows.insert( { f.pad->GetParentFootprint(), { f.outward.x, f.outward.y } } );
+    }
+
+    for( const auto& [fp, o] : rows )
+    {
+        const VECTOR2I d( o.first, o.second ), t( -d.y, d.x );
+        auto acrossOf = [&]( const VECTOR2I& p ) { return (int64_t) p.x * d.x + (int64_t) p.y * d.y; };
+        auto alongOf = [&]( const VECTOR2I& p ) { return (int64_t) p.x * t.x + (int64_t) p.y * t.y; };
+
+        std::vector<const ESCAPE_FRONT*> row;
+        int64_t inner = std::numeric_limits<int64_t>::max(), tip = std::numeric_limits<int64_t>::min();
+        int64_t lo = std::numeric_limits<int64_t>::max(), hi = std::numeric_limits<int64_t>::min();
+
+        for( const ESCAPE_FRONT& f : aFronts )
+        {
+            if( f.pad->GetParentFootprint() != fp || f.outward != d || f.spare || std::strcmp( f.kind, "edge" ) != 0 )
+                continue;
+
+            const BOX2I   box = f.pad->GetBoundingBox();
+            const int64_t half = ( d.x != 0 ? box.GetWidth() : box.GetHeight() ) / 2;
+            const int64_t c = acrossOf( f.pad->GetPosition() );
+            inner = std::min( inner, c - half );
+            tip = std::max( tip, c + half );
+            row.push_back( &f );
+        }
+
+        if( row.empty() )
+            continue;
+
+        const int64_t mid = ( inner + tip ) / 2;
+
+        for( PAD* q : fp->Pads() )
+        {
+            if( acrossOf( q->GetPosition() ) >= inner && acrossOf( q->GetPosition() ) <= tip )
+            {
+                lo = std::min( lo, alongOf( q->GetPosition() ) );
+                hi = std::max( hi, alongOf( q->GetPosition() ) );
+            }
+        }
+
+        // the net's pins on the row
+        std::vector<PAD*> own;
+
+        for( PAD* q : fp->Pads() )
+        {
+            const int64_t c = acrossOf( q->GetPosition() ), a = alongOf( q->GetPosition() );
+
+            if( q->GetNetCode() == aNet && c >= inner && c <= tip && a >= lo && a <= hi )
+                own.push_back( q );
+        }
+
+        if( own.empty() )
+            continue;
+
+        for( const BOARD_CONNECTED_ITEM* item : aNew )
+        {
+            if( item->Type() != PCB_TRACE_T && item->Type() != PCB_ARC_T )
+                continue;
+
+            const PCB_TRACK* tr = static_cast<const PCB_TRACK*>( item );
+            const int64_t    c0 = acrossOf( tr->GetStart() ) - mid, c1 = acrossOf( tr->GetEnd() ) - mid;
+
+            if( ( c0 < 0 ) == ( c1 < 0 ) || c0 == 0 || c1 == 0 )
+                continue;
+
+            const double  k = double( -c0 ) / double( c1 - c0 );
+            const int64_t a = alongOf( tr->GetStart() ) + (int64_t) std::llround( k * double( alongOf( tr->GetEnd() ) - alongOf( tr->GetStart() ) ) );
+
+            if( a < lo || a > hi )
+                continue;
+
+            for( PAD* p : own )
+            {
+                const BOX2I   pb = p->GetBoundingBox();
+                const int64_t pa = alongOf( p->GetPosition() );
+                const int64_t padHalf = ( d.x != 0 ? pb.GetHeight() : pb.GetWidth() ) / 2;
+
+                if( std::abs( a - pa ) <= padHalf )
+                    continue;
+
+                // the pin's copper inward and outward
+                bool in = false, out = false;
+
+                auto look = [&]( const BOARD_CONNECTED_ITEM* aItem )
+                {
+                    if( aItem->GetNetCode() != aNet || ( aItem->Type() != PCB_TRACE_T && aItem->Type() != PCB_ARC_T ) || !p->IsOnLayer( aItem->GetLayer() ) )
+                        return;
+
+                    const PCB_TRACK* u = static_cast<const PCB_TRACK*>( aItem );
+
+                    for( const auto& [at, other] : { std::pair( u->GetStart(), u->GetEnd() ), std::pair( u->GetEnd(), u->GetStart() ) } )
+                    {
+                        if( p->HitTest( at, 1 ) )
+                        {
+                            in = in || acrossOf( other ) < inner;
+                            out = out || acrossOf( other ) > tip;
+                        }
+                    }
+                };
+
+                for( const BOARD_CONNECTED_ITEM* u : aNew )
+                    look( u );
+
+                for( PCB_TRACK* u : aBoard->Tracks() )
+                {
+                    if( u->GetBoundingBox().Intersects( pb ) )
+                        look( u );
+                }
+
+                if( !in || !out )
+                    continue;
+
+                // the nearest open pin on the crossing's side, if the crossing is at or past it
+                const int64_t       side = a > pa ? 1 : -1;
+                const ESCAPE_FRONT* nearest = nullptr;
+                int64_t             nearAt = 0, nearHalf = 0;
+
+                for( const ESCAPE_FRONT* f : row )
+                {
+                    const BOX2I   fb = f->pad->GetBoundingBox();
+                    const int64_t fa = alongOf( f->pad->GetPosition() );
+                    const int64_t fHalf = ( d.x != 0 ? fb.GetHeight() : fb.GetWidth() ) / 2;
+
+                    if( f->pad == p || !f->walls( aNet ) || side * ( fa - pa ) <= 0 || side * ( a - fa ) <= 0 )
+                        continue;
+
+                    if( !nearest || side * ( fa - nearAt ) < 0 )
+                    {
+                        nearest = f;
+                        nearAt = fa;
+                        nearHalf = fHalf;
+                    }
+                }
+
+                if( !nearest )
+                    continue;
+
+                const int64_t width = tip - inner;
+                const int64_t from = nearAt - side * nearHalf + side * width / 2;
+                const int64_t to = std::max( from * side, ( side > 0 ? hi : lo ) * side + width ) * side;
+                auto          point = [&]( int64_t aAlong ) { return VECTOR2I( t.x * aAlong + d.x * mid, t.y * aAlong + d.y * mid ); };
+
+                return ROW_CUT{ nearest, SHAPE_SEGMENT( point( from ), point( to ), (int) width ) };
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+
 /// @brief A signal pin's port from the layout plan (pcb_fanout_ports): its way out on its side, to past
 /// the courtyard on the pad's layer, or to a via onto the other layer
 struct PORT_GOAL
@@ -2836,6 +3006,22 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
                 iface->Staged().Revert();
                 return false;
             }
+        }
+
+        if( const std::optional<ROW_CUT> cut = pairWay ? std::nullopt : rowCutOff( board, *aReq.fronts, changed, aReq.from->GetNetCode() ) )
+        {
+            const std::string at = str( cut->front->pad->GetParentFootprint()->GetReference() ) + "." + str( cut->front->pad->GetNumber() );
+            const SEG&        band = cut->band.GetSeg();
+            aOut["routed"] = false;
+            aOut["reason"] = "refused: the route would wall in the way out of " + at + " (it crosses the pad row past it, its pin's copper on both sides)";
+            aOut["walls_in"] = { { "pad", at },
+                                 { "layer", str( board->GetLayerName( cut->front->layer ) ) },
+                                 { "row", true },
+                                 { "band_mm", { { toMm( band.A.x ), toMm( band.A.y ) }, { toMm( band.B.x ), toMm( band.B.y ) } } },
+                                 { "band_width_mm", toMm( cut->band.GetWidth() ) },
+                                 { "route_mm", toMm( length ) } };
+            iface->Staged().Revert();
+            return false;
         }
 
         for( const ESCAPE_FRONT& front : *aReq.fronts )
@@ -6831,6 +7017,34 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             aAttempt = nlohmann::json::object();
             aTries++;
             ok = routeOne( *context, req, aAttempt, added );
+
+            // refused for cutting off a pin of a package row: the plan again, the row's stretch past it kept out
+            if( ok || aTries >= maxTries || overTime() || !aAttempt.contains( "walls_in" ) || !aAttempt["walls_in"].contains( "band_mm" ) )
+                return;
+
+            const nlohmann::json& w = aAttempt["walls_in"];
+            auto                  mmPoint = [&]( const nlohmann::json& aAt )
+            { return VECTOR2I( pcbIUScale.mmToIU( aAt[0].get<double>() ), pcbIUScale.mmToIU( aAt[1].get<double>() ) ); };
+            const SHAPE_SEGMENT band( mmPoint( w["band_mm"][0] ), mmPoint( w["band_mm"][1] ), pcbIUScale.mmToIU( w["band_width_mm"].get<double>() ) );
+            ROUTE_PLAN_REQUEST  asked = planRequest( aWay.from, aWay.to, aWay.toPos );
+
+            for( PCB_LAYER_ID layer : layers )
+                asked.keepOut.emplace_back( layer, band );
+
+            const ROUTE_PLAN again = makePlan( asked );
+
+            if( !again.found )
+                return;
+
+            const nlohmann::json refused = aAttempt;
+            req.vias = again.points;
+            req.layer = again.startLayer;
+            aAttempt = nlohmann::json::object();
+            aTries++;
+            ok = routeOne( *context, req, aAttempt, added );
+
+            if( !ok )
+                aAttempt["walls_in_first"] = refused["walls_in"];
         };
 
         auto planTry = [&]()
