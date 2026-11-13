@@ -378,8 +378,15 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
 
             if( vias )
             {
+                // hole to hole for any net; another net's hole also keeps hole clearance from the via's ring
                 const int h2h = clearance( &probeVia, o.item, aLayers[0], HOLE_TO_HOLE_CONSTRAINT, ds.m_HoleToHoleMin );
                 mark( -1, -1, h2h + aProbe.viaDrill / 2, shape );
+
+                if( !( owner == aSkipNet && aSkipNet > 0 ) )
+                {
+                    const int hv = clearance( &probeVia, o.item, aLayers[0], HOLE_CLEARANCE_CONSTRAINT, ds.m_HoleClearance );
+                    mark( owner, -1, hv + aProbe.viaDia / 2, shape );
+                }
             }
 
             continue;
