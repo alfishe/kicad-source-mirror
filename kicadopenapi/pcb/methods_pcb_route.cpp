@@ -1359,6 +1359,25 @@ static BOARD_CONNECTED_ITEM* frontShut( BOARD* aBoard, const ESCAPE_FRONT& aFron
 }
 
 
+/// @brief The side a pad of its package's outline faces: by the pad's row and its long side at a corner
+/// (rail_plan outwardOf), else by where it lies in the pads' box
+static VECTOR2I padRowOutward( const PAD* aPad, const BOX2I& aRing )
+{
+    const FOOTPRINT* fp = aPad->GetParentFootprint();
+    BOX2I            centres( fp->Pads().front()->GetPosition(), VECTOR2I( 0, 0 ) );
+
+    for( const PAD* q : fp->Pads() )
+        centres.Merge( q->GetPosition() );
+
+    if( const std::optional<VECTOR2I> out = outwardOf( aPad, centres ) )
+        return *out;
+
+    const VECTOR2I d = aPad->GetPosition() - aRing.Centre();
+    const bool     horizontal = (double) std::abs( d.x ) * aRing.GetHeight() >= (double) std::abs( d.y ) * aRing.GetWidth();
+    return horizontal ? VECTOR2I( d.x >= 0 ? 1 : -1, 0 ) : VECTOR2I( 0, d.y >= 0 ? 1 : -1 );
+}
+
+
 /// @brief Whether a way out is held open for its pad: a main one always, a spare one once its main one is shut
 static bool frontHeld( BOARD* aBoard, const std::vector<ESCAPE_FRONT>& aAll, const ESCAPE_FRONT& aFront )
 {
@@ -11799,9 +11818,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 ring.Merge( q->GetBoundingBox() );
 
             const BOX2I    box = aPad->GetBoundingBox();
-            const VECTOR2I d = aPad->GetPosition() - ring.Centre();
-                        const bool     horizontal = (double) std::abs( d.x ) * ring.GetHeight() >= (double) std::abs( d.y ) * ring.GetWidth();
-            const VECTOR2I in = horizontal ? VECTOR2I( d.x >= 0 ? -1 : 1, 0 ) : VECTOR2I( 0, d.y >= 0 ? -1 : 1 );
+            const VECTOR2I in = -padRowOutward( aPad, ring );
+            const bool     horizontal = in.x != 0;
             const int      half = horizontal ? box.GetWidth() / 2 : box.GetHeight() / 2;
             const VECTOR2I end = box.Centre() + in * half;   // the pad's inner end
             NETCLASS*      netclass = aPad->GetEffectiveNetClass();
@@ -11954,7 +11972,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             const BOX2I    box = aPad->GetBoundingBox();
             const VECTOR2I d = aPad->GetPosition() - ring.Centre();
-                        const bool     horizontal = (double) std::abs( d.x ) * ring.GetHeight() >= (double) std::abs( d.y ) * ring.GetWidth();
+            const bool     horizontal = (double) std::abs( d.x ) * ring.GetHeight() >= (double) std::abs( d.y ) * ring.GetWidth();
             const VECTOR2I dir = horizontal ? VECTOR2I( d.x >= 0 ? 1 : -1, 0 ) : VECTOR2I( 0, d.y >= 0 ? 1 : -1 );
             const int      half = horizontal ? box.GetWidth() / 2 : box.GetHeight() / 2;
             const int      across = horizontal ? box.GetHeight() : box.GetWidth();
