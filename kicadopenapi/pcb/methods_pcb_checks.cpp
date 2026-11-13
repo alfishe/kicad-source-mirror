@@ -19,6 +19,8 @@
 #include <tool/actions.h>
 #include <tools/drc_tool.h>
 #include <board_commit.h>
+#include <board_connected_item.h>
+#include <string_utils.h>
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
 #include <drc/drc_item.h>
@@ -350,6 +352,30 @@ static KOPENAPI_RESULT h_pcb_drc( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
 
     for( const nlohmann::json& v : full.value( "unconnected_items", nlohmann::json::array() ) )
         unrouted.push_back( v );
+
+    // each item's net by name (the report has it only inside the description)
+    auto addNets = [&]( std::vector<nlohmann::json>& aRows )
+    {
+        for( nlohmann::json& v : aRows )
+        {
+            if( !v.contains( "items" ) || !v["items"].is_array() )
+                continue;
+
+            for( nlohmann::json& item : v["items"] )
+            {
+                BOARD_ITEM* bi = board->ResolveItem( KIID( item.value( "uuid", std::string() ) ), true );
+
+                if( BOARD_CONNECTED_ITEM* ci = dynamic_cast<BOARD_CONNECTED_ITEM*>( bi ) )
+                {
+                    if( ci->GetNetCode() > 0 )
+                        item["net"] = UnescapeString( ci->GetNetname() ).ToStdString( wxConvUTF8 );
+                }
+            }
+        }
+    };
+
+    addNets( violations );
+    addNets( unrouted );
 
     nlohmann::json result = KopenapiCheckResult( violations, unrouted, full.value( "ignored_checks", nlohmann::json::array() ), aArgs );
 
