@@ -694,6 +694,64 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
                 }
             }
         }
+
+        // hole to hole, any net (own net too), as DRC's hole_to_hole: drilled holes too close or at
+        // one place
+        std::shared_ptr<SHAPE_SEGMENT> hole = item->HasHole() ? item->GetEffectiveHoleShape() : nullptr;
+
+        if( !hole )
+            continue;
+
+        BOX2I holeReach = hole->BBox();
+        holeReach.Inflate( std::max( ds.m_HoleToHoleMin, 0 ) + widest );
+
+        for( BOARD_CONNECTED_ITEM* other : others )
+        {
+            if( other == item || !other->HasHole() || !holeReach.Intersects( other->GetBoundingBox() ) )
+                continue;
+
+            // a pair of changed items is reported once
+            if( std::find( aChanged.begin(), aChanged.end(), other ) != aChanged.end() && other < item )
+                continue;
+
+            if( item->Type() == PCB_VIA_T && other->Type() == PCB_VIA_T
+                && ( item->GetLayerSet() & other->GetLayerSet() & LSET::AllCuMask() ).none() )
+            {
+                continue;
+            }
+
+            std::shared_ptr<SHAPE_SEGMENT> otherHole = other->GetEffectiveHoleShape();
+
+            if( !otherHole )
+                continue;
+
+            int need = ds.m_HoleToHoleMin;
+
+            if( drc )
+            {
+                DRC_CONSTRAINT c = drc->EvalRules( HOLE_TO_HOLE_CONSTRAINT, item, other, UNDEFINED_LAYER );
+
+                if( c.GetSeverity() == RPT_SEVERITY_IGNORE )
+                    continue;
+
+                if( c.GetValue().HasMin() )
+                    need = c.GetValue().Min();
+            }
+
+            const int actual = std::max( 0, hole->GetSeg().Distance( otherHole->GetSeg() ) - hole->GetWidth() / 2
+                                                    - otherHole->GetWidth() / 2 );
+            const bool colocated = ( hole->GetCenter() - otherHole->GetCenter() ).SquaredEuclideanNorm()
+                                   < SEG::Square( ds.GetDRCEpsilon() );
+
+            if( colocated || ( need > 0 && actual < std::max( 0, need - ds.GetDRCEpsilon() ) ) )
+            {
+                violations.push_back( { { "new", describe( item ) },
+                                        { "other", describe( other ) },
+                                        { "hole_to_hole", true },
+                                        { "distance_mm", toMm( actual ) },
+                                        { "required_mm", toMm( need ) } } );
+            }
+        }
     }
 
     return violations;
@@ -20820,7 +20878,7 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     if( !violations.empty() )
     {
-        KOPENAPI_RESULT rejected = KOPENAPI_RESULT::Error( 422, "rejected by the guard: this copper would touch another net or enter a keep-out" );
+        KOPENAPI_RESULT rejected = KOPENAPI_RESULT::Error( 422, "rejected by the guard: this copper would touch another net, drill a hole too close to another hole or enter a keep-out" );
         rejected.body["violations"] = violations;
         rejected.body["segments"] = segments;
         return rejected;
@@ -24118,7 +24176,8 @@ KOPENAPI_REGISTER( "pcb_track_add",
                    "centres) through points in mm; a point with via continues on that layer through a via. "
                    "Width and via size as KiCad's rules size them for the net (a track_width / via_diameter / hole_size rule's opt, else the net class's) unless given; without width_mm the "
                    "segments at the from / to pads are necked as in pcb_via_add (answer necked). The same guard as the "
-                   "router: copper that would touch another net or enter a keep-out is refused (422 with the "
+                   "router: copper that would touch another net, a via drilled closer than hole to hole to any other hole (own net too) or "
+                   "copper in a keep-out is refused (422 with the "
                    "violations), nothing is added then. One undo step; dry_run checks only",
                    R"json({"type":"object","properties":{
                         "from":{"type":"string","description":"REF.PAD: start at its centre, on its net"},

@@ -544,6 +544,26 @@ static KOPENAPI_RESULT h_pcb_open( KOPENAPI_CONTEXT& aCtx, const nlohmann::json&
     if( result.status == 200 && !answered.asked.empty() )
         result.body["warnings"] = answered.asked;
 
+    // net classes and custom rules live beside the board: without them DRC and the router silently
+    // work to the defaults
+    if( result.status == 200 && board.GetExt() == FILEEXT::KiCadPcbFileExtension )
+    {
+        wxFileName pro( board );
+        pro.SetExt( FILEEXT::ProjectFileExtension );
+        result.body["project_file"] = pro.FileExists() ? nlohmann::json( pro.GetFullPath().ToStdString() )
+                                                       : nlohmann::json();
+
+        if( !pro.FileExists() )
+        {
+            if( !result.body["warnings"].is_array() )
+                result.body["warnings"] = nlohmann::json::array();
+
+            result.body["warnings"].push_back( "no " + pro.GetFullName().ToStdString()
+                                               + " beside the board: net classes and project rules are "
+                                                 "not loaded, DRC and routing use the defaults" );
+        }
+    }
+
     // the editor offers these in its infobar
     if( result.status == 200 )
     {
@@ -1284,7 +1304,8 @@ KOPENAPI_REGISTER( "pcb_open",
                    "autosaves lists auto-saved copies newer than the file (the editor offers them in its infobar; pcb_autosave). "
                    "The reader's questions (the editor asks them, e.g. rescue items on layers the file does not define to "
                    "User.Comments) are answered by accept_queries: yes by default (each one in warnings), no stops the open "
-                   "(409 with the question)",
+                   "(409 with the question). project_file: the .kicad_pro beside the board, null (with a warning) when "
+                   "there is none: net classes and project rules are then not loaded and DRC uses the defaults",
                    R"json({"type":"object","required":["path"],"properties":{
                         "path":{"type":"string"},
                         "accept_queries":{"type":"boolean","default":true},

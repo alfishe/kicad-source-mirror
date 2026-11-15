@@ -13,6 +13,7 @@
 #include <api/pcb_context.h>
 #include <base_units.h>
 #include <board.h>
+#include <string_utils.h>
 #include <board_design_settings.h>
 #include <connectivity/connectivity_data.h>
 #include <drc/drc_engine.h>
@@ -468,7 +469,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
     // a net alone: its first pad whose island is not the whole net
     if( !from && aArgs.contains( "net" ) && !aArgs.contains( "from" ) )
     {
-        const NETINFO_ITEM* info = board->FindNet( wxString::FromUTF8( aArgs["net"].get<std::string>() ) );
+        const NETINFO_ITEM* info = KopenapiFindNet( board, aArgs["net"].get<std::string>() );
 
         if( !info || info->GetNetCode() <= 0 )
             return KOPENAPI_RESULT::Error( 404, "no net " + aArgs["net"].get<std::string>() );
@@ -705,7 +706,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
     seeds( islandA, PES, START_PES );
     seeds( islandB, PES, GOAL_PES );
 
-    nlohmann::json out = { { "net", str( from->GetNetname() ) },
+    nlohmann::json out = { { "net", str( UnescapeString( from->GetNetname() ) ) },
                            { "from", itemName( from ) },
                            { "to", to ? nlohmann::json( itemName( to ) ) : nlohmann::json( "the net's other islands" ) },
                            { "width_mm", pcbIUScale.IUTomm( width ) },
@@ -858,7 +859,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
                     by[key] += hits;
 
                     if( BOARD_CONNECTED_ITEM* bci = dynamic_cast<BOARD_CONNECTED_ITEM*>( o.item ) )
-                        byNet[key] = str( bci->GetNetname() );
+                        byNet[key] = str( UnescapeString( bci->GetNetname() ) );
                 }
             }
 
@@ -914,6 +915,56 @@ KOPENAPI_REGISTER( "pcb_route_oracle",
  * grows (PathFinder). When no cell is shared, the paths are a joint route: laid together they keep the
  * rules' clearances, each track and via kept out of the others by its own and the widest one's room.
  */
+/// @brief An order of copper items that does not depend on where they lie in memory or on uuids made at
+/// load (a file may hold none for pads): kind, then a pad's footprint reference and number, then place
+/// and layers, the uuid last
+static bool stableItemOrder( const BOARD_CONNECTED_ITEM* a, const BOARD_CONNECTED_ITEM* b )
+{
+    auto before = []( const VECTOR2I& p, const VECTOR2I& q )
+    {
+        return p.x != q.x ? p.x < q.x : p.y < q.y;
+    };
+
+    if( a->Type() != b->Type() )
+        return a->Type() < b->Type();
+
+    if( a->Type() == PCB_PAD_T )
+    {
+        const PAD*       pa = static_cast<const PAD*>( a );
+        const PAD*       pb = static_cast<const PAD*>( b );
+        const FOOTPRINT* fa = pa->GetParentFootprint();
+        const FOOTPRINT* fb = pb->GetParentFootprint();
+        const int        byRef = ( fa ? fa->GetReference() : wxString() ).Cmp( fb ? fb->GetReference() : wxString() );
+
+        if( byRef != 0 )
+            return byRef < 0;
+
+        if( const int byNumber = pa->GetNumber().Cmp( pb->GetNumber() ); byNumber != 0 )
+            return byNumber < 0;
+    }
+
+    if( const PCB_TRACK* ta = dynamic_cast<const PCB_TRACK*>( a ) )
+    {
+        const PCB_TRACK* tb = static_cast<const PCB_TRACK*>( b );
+
+        if( ta->GetStart() != tb->GetStart() )
+            return before( ta->GetStart(), tb->GetStart() );
+
+        if( ta->GetEnd() != tb->GetEnd() )
+            return before( ta->GetEnd(), tb->GetEnd() );
+    }
+    else if( a->GetPosition() != b->GetPosition() )
+    {
+        return before( a->GetPosition(), b->GetPosition() );
+    }
+
+    if( a->GetLayerSet() != b->GetLayerSet() )
+        return a->GetLayerSet().FmtHex() < b->GetLayerSet().FmtHex();
+
+    return a->m_Uuid < b->m_Uuid;
+}
+
+
 static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
@@ -939,7 +990,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     {
         for( const nlohmann::json& n : aArgs["nets"] )
         {
-            const NETINFO_ITEM* info = board->FindNet( wxString::FromUTF8( n.get<std::string>() ) );
+            const NETINFO_ITEM* info = KopenapiFindNet( board, n.get<std::string>() );
 
             if( !info || info->GetNetCode() <= 0 )
                 return KOPENAPI_RESULT::Error( 404, "no net " + n.get<std::string>() );
@@ -997,11 +1048,15 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         if( code <= 0 || ( !only.empty() && !only.count( code ) ) )
             continue;
 
-        const std::vector<BOARD_CONNECTED_ITEM*> items =
+        std::vector<BOARD_CONNECTED_ITEM*> items =
                 conn->GetNetItems( code, { PCB_PAD_T, PCB_TRACE_T, PCB_ARC_T, PCB_VIA_T, PCB_ZONE_T } );
 
         if( items.size() < 2 )
             continue;
+
+        // the connectivity's order follows memory addresses: in a fixed order the islands and the order
+        // they are joined in are the same on every load of the board
+        std::sort( items.begin(), items.end(), stableItemOrder );
 
         JOB                                     job;
         std::map<const BOARD_CONNECTED_ITEM*, int> islandOf;
@@ -1028,6 +1083,11 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
 
         if( job.islands.size() < 2 )
             continue;
+
+        for( std::vector<BOARD_CONNECTED_ITEM*>& island : job.islands )
+        {
+            std::sort( island.begin(), island.end(), stableItemOrder );
+        }
 
         job.net = code;
         job.probe.net = code;
@@ -1576,7 +1636,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     {
         JOB& job = jobs[j];
 
-        if( !KopenapiJobStep( "round 0", (int) j, (int) jobs.size(), str( board->FindNet( job.net )->GetNetname() ),
+        if( !KopenapiJobStep( "round 0", (int) j, (int) jobs.size(), str( UnescapeString( board->FindNet( job.net )->GetNetname() ) ),
                               { { "work_m", work / 1e6 } } ) )
         {
             stopped = true;
@@ -1641,7 +1701,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                 continue;
 
             if( !KopenapiJobStep( "round " + std::to_string( round + 1 ), done++, todo,
-                                  str( board->FindNet( job.net )->GetNetname() ),
+                                  str( UnescapeString( board->FindNet( job.net )->GetNetname() ) ),
                                   { { "cells_shared", lastShared }, { "work_m", work / 1e6 } } ) )
             {
                 stopped = true;
@@ -1699,7 +1759,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         unjoined += !whole;
         sharing += job.conflicts > 0;
 
-        nlohmann::json n = { { "net", str( board->FindNet( job.net )->GetNetname() ) },
+        nlohmann::json n = { { "net", str( UnescapeString( board->FindNet( job.net )->GetNetname() ) ) },
                              { "islands", job.islands.size() },
                              { "joined", whole },
                              { "cells_shared", job.conflicts },
@@ -1757,7 +1817,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
             nlohmann::json netsThere = nlohmann::json::array();
 
             for( int n : spots[ranked[j].second].second )
-                netsThere.push_back( str( board->FindNet( n )->GetNetname() ) );
+                netsThere.push_back( str( UnescapeString( board->FindNet( n )->GetNetname() ) ) );
 
             hotAt.emplace_back( ranked[j].second.first * bin + bin / 2, ranked[j].second.second * bin + bin / 2 );
             hot.push_back( { { "at_mm", { ranked[j].second.first + 0.5, ranked[j].second.second + 0.5 } },
@@ -1937,7 +1997,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                 perLayer[str( board->GetLayerName( layers[l] ) )] = best.perLayer[l];
 
             for( int j : best.nets )
-                demanded.push_back( str( board->FindNet( jobs[j].net )->GetNetname() ) );
+                demanded.push_back( str( UnescapeString( board->FindNet( jobs[j].net )->GetNetname() ) ) );
 
             out["cut"] = { { "box_mm", { pcbIUScale.IUTomm( best.box.GetLeft() ), pcbIUScale.IUTomm( best.box.GetTop() ),
                                          pcbIUScale.IUTomm( best.box.GetRight() ), pcbIUScale.IUTomm( best.box.GetBottom() ) } },
