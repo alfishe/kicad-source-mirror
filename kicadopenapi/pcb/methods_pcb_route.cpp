@@ -1822,6 +1822,10 @@ struct ROUTE_REQUEST
     /// @brief A narrower track than the net's class gives (> 0): the connection meets a fine-pitch pad
     int neckWidth = 0;
 
+    /// @brief neckWidth is the rules' narrowest for the whole route (a last try): it is widened back to
+    /// the class wherever the guard lets it, its ends' courtyards included
+    bool narrowest = false;
+
     /// @brief A net's tail from its pad to its pair's line split back: the pair's own way, not held to
     /// other pads' ways out (as the pair is not)
     bool pairTail = false;
@@ -2025,6 +2029,75 @@ static double msSince( std::chrono::steady_clock::time_point aFrom,
 }
 
 
+/// @brief A narrow track that does not take aWide whole: its ends widened as far as aFits lets them
+/// (10 µm steps), only its middle left narrow. The wide ends come back new in aMade (the caller owns
+/// them), aPiece keeps the middle. Answers the length left narrow
+static int64_t splitToFit( PCB_TRACK* aPiece, int aWide, const std::function<bool( const PCB_TRACK* )>& aFits,
+                           std::vector<PCB_TRACK*>& aMade )
+{
+    const VECTOR2I a = aPiece->GetStart(), b = aPiece->GetEnd();
+    const int64_t  len = ( b - a ).EuclideanNorm();
+    const int64_t  step = pcbIUScale.mmToIU( 0.01 );
+
+    auto wideFits = [&]( const VECTOR2I& aP, const VECTOR2I& aQ )
+    {
+        std::unique_ptr<PCB_TRACK> probe( static_cast<PCB_TRACK*>( aPiece->Duplicate( false ) ) );
+        probe->SetStart( aP );
+        probe->SetEnd( aQ );
+        probe->SetWidth( aWide );
+        return aFits( probe.get() );
+    };
+
+    auto reach = [&]( const VECTOR2I& aFrom, const VECTOR2I& aTo ) -> int64_t
+    {
+        int64_t lo = 0, hi = len;
+
+        if( !wideFits( aFrom, aFrom ) )
+            return 0;
+
+        while( hi - lo > step )
+        {
+            const int64_t m = ( lo + hi ) / 2;
+            ( wideFits( aFrom, aFrom + ( aTo - aFrom ).Resize( m ) ) ? lo : hi ) = m;
+        }
+
+        return lo;
+    };
+
+    if( len <= 0 )
+        return 0;
+
+    const int64_t fromA = reach( a, b );
+    const int64_t fromB = reach( b, a );
+
+    if( fromA + fromB >= len )
+        return len;
+
+    const VECTOR2I pa = a + ( b - a ).Resize( fromA );
+    const VECTOR2I pb = b + ( a - b ).Resize( fromB );
+
+    if( fromA > 0 )
+    {
+        PCB_TRACK* head = static_cast<PCB_TRACK*>( aPiece->Duplicate( false ) );
+        head->SetEnd( pa );
+        head->SetWidth( aWide );
+        aMade.push_back( head );
+        aPiece->SetStart( pa );
+    }
+
+    if( fromB > 0 )
+    {
+        PCB_TRACK* tail = static_cast<PCB_TRACK*>( aPiece->Duplicate( false ) );
+        tail->SetStart( pb );
+        tail->SetWidth( aWide );
+        aMade.push_back( tail );
+        aPiece->SetEnd( pb );
+    }
+
+    return aPiece->GetLength();
+}
+
+
 /// @brief The route's tracks at the width the rules give where each piece lies, as DRC sees it:
 /// split where they cross a courtyard, a piece under a custom track_width rule at its opt (else its
 /// min, not below the board minimum), else at aBase, or at the neck width inside the courtyards of
@@ -2032,7 +2105,7 @@ static double msSince( std::chrono::steady_clock::time_point aFrom,
 /// clearance (guard) or run over a way out kept open for another net's pad (split where it comes
 /// near one).  Answers widths_mm when more than one, narrow_kept_mm
 static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const ROUTE_REQUEST& aReq, int aBase,
-                                nlohmann::json& aOut )
+                                nlohmann::json& aOut, std::optional<VECTOR2I>* aBelowRule = nullptr )
 {
     std::shared_ptr<DRC_ENGINE> drc = aBoard->GetDesignSettings().m_DRCEngine;
     const int                   netCode = aReq.from->GetNetCode();
@@ -2098,7 +2171,7 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
 
     for( FOOTPRINT* fp : aBoard->Footprints() )
     {
-        const bool atEnd = aReq.neckWidth > 0
+        const bool atEnd = aReq.neckWidth > 0 && !aReq.narrowest
                            && ( fp == aReq.from->GetParentFootprint() || ( aReq.to && fp == aReq.to->GetParentFootprint() ) );
 
         for( PCB_LAYER_ID side : { F_CrtYd, B_CrtYd } )
@@ -2188,8 +2261,33 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
             staged.push_back( c );
     }
 
-    int64_t       narrowKept = 0;
-    std::set<int> widths;
+    int64_t                 narrowKept = 0;
+    std::set<int>           widths;
+    std::vector<PCB_TRACK*> splitOff;
+    std::set<PCB_TRACK*>    split;
+
+    // the narrowest route: a piece that does not widen whole keeps narrow only its middle (splitToFit)
+    auto splitNarrow = [&]( PCB_TRACK* aPiece, int aWide )
+    {
+        auto fits = [&]( const PCB_TRACK* aProbe )
+        {
+            return !overFront( const_cast<PCB_TRACK*>( aProbe ) )
+                   && guard( aBoard, { const_cast<PCB_TRACK*>( aProbe ) }, aIface.m_removed, false, &staged ).empty();
+        };
+
+        std::vector<PCB_TRACK*> made;
+        narrowKept += splitToFit( aPiece, aWide, fits, made );
+
+        if( !made.empty() )
+            split.insert( aPiece );
+
+        for( PCB_TRACK* piece : made )
+        {
+            aIface.Staged().Add( piece );
+            aIface.m_added.push_back( piece );
+            splitOff.push_back( piece );
+        }
+    };
 
     for( PCB_TRACK* piece : pieces )
     {
@@ -2208,6 +2306,7 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
         probe.SetEnd( mid );
 
         const DRC_CONSTRAINT c = drc->EvalRules( TRACK_WIDTH_CONSTRAINT, &probe, nullptr, piece->GetLayer() );
+        const int            ruleMin = c.GetValue().HasMin() ? c.GetValue().Min() : 0;
 
         if( c.GetParentRule() && !c.GetParentRule()->IsImplicit() && ( c.GetValue().HasOpt() || c.GetValue().HasMin() ) )
         {
@@ -2229,19 +2328,37 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
         {
             piece->SetWidth( want );
 
-            if( want > routed && ( overFront( piece ) || !guard( aBoard, { piece }, aIface.m_removed, false, &staged ).empty() ) )
+            auto refused = [&]()
+            { return overFront( piece ) || !guard( aBoard, { piece }, aIface.m_removed, false, &staged ).empty(); };
+
+            if( want > routed && refused() )
             {
-                piece->SetWidth( routed );
-                narrowKept += piece->GetLength();
+                // the rule's min there when its opt does not fit
+                piece->SetWidth( ruleMin );
+
+                if( ruleMin <= routed || ruleMin >= want || refused() )
+                    piece->SetWidth( routed );
+
+                if( aReq.narrowest && piece->GetWidth() == routed )
+                    splitNarrow( piece, want );
+                else
+                    narrowKept += piece->GetLength();
             }
         }
 
+        if( aBelowRule && !*aBelowRule && piece->GetWidth() < ruleMin )
+            *aBelowRule = ( piece->GetStart() + piece->GetEnd() ) / 2;
     }
+
+    pieces.insert( pieces.end(), splitOff.begin(), splitOff.end() );
 
     // DRC tests a piece's whole shape against a courtyard: the piece outside one ends where its
     // round end clears it, the piece inside takes the rest
     for( const JOINT& joint : joints )
     {
+        if( split.count( joint.before ) || split.count( joint.after ) )
+            continue;
+
         auto inside = [&]( PCB_TRACK* aPiece )
         {
             return joint.courtyard->Contains( ( aPiece->GetStart() + aPiece->GetEnd() ) / 2 );
@@ -2286,6 +2403,34 @@ static void resolveRouteWidths( KOPENAPI_PNS_IFACE& aIface, BOARD* aBoard, const
         {
             in->SetWidth( routedWidth[in] );
             narrowKept += in->GetLength();
+        }
+    }
+
+    // as DRC sees the pieces once cut: the rule over each piece's whole shape (a piece touching a
+    // courtyard is under its rule), widened to its min where the guard lets it
+    for( PCB_TRACK* piece : aBelowRule && !*aBelowRule ? pieces : std::vector<PCB_TRACK*>() )
+    {
+        const bool flagged = !piece->HasFlag( ROUTER_TRANSIENT );
+
+        if( flagged )
+            piece->SetFlags( ROUTER_TRANSIENT );
+
+        const DRC_CONSTRAINT c = drc->EvalRules( TRACK_WIDTH_CONSTRAINT, piece, nullptr, piece->GetLayer() );
+
+        if( flagged )
+            piece->ClearFlags( ROUTER_TRANSIENT );
+
+        if( !c.GetValue().HasMin() || piece->GetWidth() >= c.GetValue().Min() )
+            continue;
+
+        const int was = piece->GetWidth();
+        piece->SetWidth( c.GetValue().Min() );
+
+        if( overFront( piece ) || !guard( aBoard, { piece }, aIface.m_removed, false, &staged ).empty() )
+        {
+            piece->SetWidth( was );
+            *aBelowRule = ( piece->GetStart() + piece->GetEnd() ) / 2;
+            break;
         }
     }
 
@@ -3033,7 +3178,17 @@ bool routeOneImpl( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::j
         const int base = aReq.width > 0 ? aReq.width
                          : nc && nc->HasTrackWidth() ? nc->GetTrackWidth()
                                                      : board->GetDesignSettings().GetCurrentTrackWidth();
-        resolveRouteWidths( *iface, board, aReq, base, aOut );
+        std::optional<VECTOR2I> belowRule;
+        resolveRouteWidths( *iface, board, aReq, base, aOut, aReq.narrowest ? &belowRule : nullptr );
+
+        if( belowRule )
+        {
+            aOut["routed"] = false;
+            aOut["reason"] = "refused: a piece of the narrowest route stays narrower than the track_width rule there";
+            aOut["narrow_at_mm"] = { toMm( belowRule->x ), toMm( belowRule->y ) };
+            iface->Staged().Revert();
+            return false;
+        }
     }
 
     trimOverOwnCopper( *iface, board );
@@ -3647,6 +3802,32 @@ nlohmann::json wallClosers( BOARD* aBoard, const GRID_WALL& aWall, const std::ve
 }
 
 
+/// @brief The first way out kept open for another net's pad that copper in aMine runs over (aBy: the piece)
+static const ESCAPE_FRONT* frontWalled( BOARD* aBoard, const std::vector<ESCAPE_FRONT>& aFronts,
+                                        const std::vector<BOARD_CONNECTED_ITEM*>& aMine, BOARD_CONNECTED_ITEM** aBy = nullptr )
+{
+    for( BOARD_CONNECTED_ITEM* item : aMine )
+    {
+        for( const ESCAPE_FRONT& front : aFronts )
+        {
+            if( !front.walls( item->GetNetCode() ) || !item->IsOnLayer( front.layer )
+                || !item->GetEffectiveShape( front.layer )->Collide( &front.shape, std::max( item->GetOwnClearance( front.layer ) - 1, 0 ) )
+                || frontSpared( aBoard, aFronts, front, aMine ) )
+            {
+                continue;
+            }
+
+            if( aBy )
+                *aBy = item;
+
+            return &front;
+        }
+    }
+
+    return nullptr;
+}
+
+
 /// @brief routeOneImpl, and for a route that stopped short what stands there (blocked_by)
 /// @brief The route laid as given (ROUTE_REQUEST::exact): straight from its start through its corners to
 /// toPos on its layer, no search; refused as a searched one is (ways out kept open, the guard)
@@ -3698,35 +3879,28 @@ bool layExact( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
         made.push_back( std::move( track ) );
     }
 
-    for( BOARD_CONNECTED_ITEM* item : aReq.fronts ? mine : std::vector<BOARD_CONNECTED_ITEM*>() )
+    BOARD_CONNECTED_ITEM* item = nullptr;
+
+    if( const ESCAPE_FRONT* walled = aReq.fronts ? frontWalled( board, *aReq.fronts, mine, &item ) : nullptr )
     {
-        for( const ESCAPE_FRONT& front : *aReq.fronts )
-        {
-            if( !front.walls( item->GetNetCode() ) || !item->IsOnLayer( front.layer )
-                || !item->GetEffectiveShape( front.layer )->Collide( &front.shape, std::max( item->GetOwnClearance( front.layer ) - 1, 0 ) )
-                || frontSpared( board, *aReq.fronts, front, mine ) )
-            {
-                continue;
-            }
+        const ESCAPE_FRONT& front = *walled;
+        const std::string at = str( front.pad->GetParentFootprint()->GetReference() ) + "." + str( front.pad->GetNumber() );
+        aOut["routed"] = false;
+        aOut["reason"] = "refused: the route would wall in the way out of " + at;
+        aOut["walls_in"] = { { "pad", at },
+                             { "layer", str( board->GetLayerName( front.layer ) ) },
+                             { "by", copperKey( item ) },
+                             { "way_out_mm", { { toMm( front.shape.GetSeg().A.x ), toMm( front.shape.GetSeg().A.y ) },
+                                               { toMm( front.shape.GetSeg().B.x ), toMm( front.shape.GetSeg().B.y ) } } },
+                             { "route_mm", toMm( length ) } };
 
-            const std::string at = str( front.pad->GetParentFootprint()->GetReference() ) + "." + str( front.pad->GetNumber() );
-            aOut["routed"] = false;
-            aOut["reason"] = "refused: the route would wall in the way out of " + at;
-            aOut["walls_in"] = { { "pad", at },
-                                 { "layer", str( board->GetLayerName( front.layer ) ) },
-                                 { "by", copperKey( item ) },
-                                 { "way_out_mm", { { toMm( front.shape.GetSeg().A.x ), toMm( front.shape.GetSeg().A.y ) },
-                                                   { toMm( front.shape.GetSeg().B.x ), toMm( front.shape.GetSeg().B.y ) } } },
-                                 { "route_mm", toMm( length ) } };
+        if( front.port )
+            aOut["walls_in"]["port"] = true;
 
-            if( front.port )
-                aOut["walls_in"]["port"] = true;
+        if( front.supply )
+            aOut["walls_in"]["supply"] = true;
 
-            if( front.supply )
-                aOut["walls_in"]["supply"] = true;
-
-            return false;
-        }
+        return false;
     }
 
     const nlohmann::json violations = guard( board, mine, {} );
@@ -3761,6 +3935,142 @@ bool layExact( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
     aOut["routed"] = true;
     aOut["applied"] = true;
     return true;
+}
+
+
+/// @brief A grid path (pcb_route_oracle's: corners at cell centres, a layer change a via) as the router's
+/// waypoints: on each layer from a corner straight to the farthest later one a line at 0/45/90° (one bend)
+/// reaches clear of the guard and of the ways out kept open, else the next corner. Without the path's
+/// first point; its last point ends it. nullopt when no line leaves a corner (aRefusedAt)
+static std::optional<std::vector<std::pair<VECTOR2I, std::optional<PCB_LAYER_ID>>>>
+smoothGridPath( BOARD* aBoard, NETINFO_ITEM* aNet, int aWidth, const std::vector<std::pair<VECTOR2I, PCB_LAYER_ID>>& aPath,
+                const std::vector<ESCAPE_FRONT>* aFronts, VECTOR2I* aRefusedAt )
+{
+    std::vector<std::pair<VECTOR2I, std::optional<PCB_LAYER_ID>>> out;
+
+    // the lines from aA to aB with at most one bend, at 0/45/90°: straight, or diagonal first, or last
+    auto lines = []( const VECTOR2I& aA, const VECTOR2I& aB )
+    {
+        const VECTOR2I d = aB - aA;
+        std::vector<std::vector<VECTOR2I>> ways;
+
+        if( d.x == 0 || d.y == 0 || std::abs( d.x ) == std::abs( d.y ) )
+        {
+            ways.push_back( { aB } );
+            return ways;
+        }
+
+        const int      m = std::min( std::abs( d.x ), std::abs( d.y ) );
+        const VECTOR2I diag( d.x > 0 ? m : -m, d.y > 0 ? m : -m );
+        ways.push_back( { aA + diag, aB } );
+        ways.push_back( { aB - diag, aB } );
+        return ways;
+    };
+
+    auto clear = [&]( const VECTOR2I& aFrom, const std::vector<VECTOR2I>& aWay, PCB_LAYER_ID aLayer )
+    {
+        std::vector<std::unique_ptr<PCB_TRACK>> made;
+        std::vector<BOARD_CONNECTED_ITEM*>      mine;
+        VECTOR2I                                at = aFrom;
+
+        for( const VECTOR2I& to : aWay )
+        {
+            auto track = std::make_unique<PCB_TRACK>( aBoard );
+            track->SetStart( at );
+            track->SetEnd( to );
+            track->SetWidth( aWidth );
+            track->SetLayer( aLayer );
+            track->SetNet( aNet );
+            mine.push_back( track.get() );
+            made.push_back( std::move( track ) );
+            at = to;
+        }
+
+        return !( aFronts && frontWalled( aBoard, *aFronts, mine ) ) && guard( aBoard, mine, {}, true ).empty();
+    };
+
+    // the corner is dropped where the line goes on straight
+    auto push = [&]( const VECTOR2I& aAt )
+    {
+        if( out.size() >= 1 && !out.back().second )
+        {
+            const VECTOR2I prev = out.size() >= 2 ? out[out.size() - 2].first : aPath.front().first;
+            const VECTOR2I d1 = out.back().first - prev, d2 = aAt - out.back().first;
+
+            if( (int64_t) d1.x * d2.y == (int64_t) d1.y * d2.x && (int64_t) d1.x * d2.x + (int64_t) d1.y * d2.y > 0 )
+                out.back().first = aAt;
+            else
+                out.emplace_back( aAt, std::nullopt );
+        }
+        else
+        {
+            out.emplace_back( aAt, std::nullopt );
+        }
+    };
+
+    size_t r = 0;
+
+    while( r < aPath.size() )
+    {
+        const PCB_LAYER_ID    layer = aPath[r].second;
+        std::vector<VECTOR2I> corners = { aPath[r].first };
+
+        while( r + 1 < aPath.size() && aPath[r + 1].second == layer )
+        {
+            if( aPath[++r].first != corners.back() )
+                corners.push_back( aPath[r].first );
+        }
+
+        const bool viaAfter = r + 1 < aPath.size();
+
+        for( size_t i = 0; i + 1 < corners.size(); )
+        {
+            const size_t          misses = 12;
+            size_t                best = 0, missed = 0;
+            std::vector<VECTOR2I> bestWay;
+
+            for( size_t j = i + 1; j < corners.size() && missed < misses; ++j )
+            {
+                bool found = false;
+
+                for( const std::vector<VECTOR2I>& way : lines( corners[i], corners[j] ) )
+                {
+                    if( clear( corners[i], way, layer ) )
+                    {
+                        best = j;
+                        bestWay = way;
+                        found = true;
+                        break;
+                    }
+                }
+
+                missed = found ? 0 : missed + 1;
+            }
+
+            if( !best )
+            {
+                if( aRefusedAt )
+                    *aRefusedAt = corners[i];
+
+                return std::nullopt;
+            }
+
+            for( const VECTOR2I& at : bestWay )
+            {
+                if( !( viaAfter && at == corners.back() ) )
+                    push( at );
+            }
+
+            i = best;
+        }
+
+        if( viaAfter )
+            out.emplace_back( aPath[r + 1].first, aPath[r + 1].second );
+
+        ++r;
+    }
+
+    return out;
 }
 
 
@@ -6062,8 +6372,14 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // tail leaves its line no wider than the line
     std::set<KIID> pairLineEnds;
 
+    // the narrowest pass: every route of the connection at this width (> 0)
+    int forcedNeck = 0;
+
     auto neckFor = [&]( BOARD_CONNECTED_ITEM* aFrom, BOARD_CONNECTED_ITEM* aTo ) -> int
     {
+        if( forcedNeck > 0 )
+            return forcedNeck;
+
         if( aTo && aTo->Type() == PCB_TRACE_T && pairLineEnds.count( aTo->m_Uuid ) )
             return static_cast<PCB_TRACK*>( aTo )->GetWidth();
 
@@ -7024,6 +7340,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 req.fronts = &fronts;
                 req.tried = keepTries ? &aJob.tried : nullptr;
                 req.neckWidth = neckFor( a, b );
+                req.narrowest = forcedNeck > 0;
                 req.pairTail = pairTail( b );
                 req.vias = p;
                 req.noDoubleBack = true;
@@ -7143,6 +7460,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             req.fronts = &fronts;
             req.tried = keepTries ? &aJob.tried : nullptr;
             req.neckWidth = neckFor( aWay.from, aWay.to );
+            req.narrowest = forcedNeck > 0;
             req.pairTail = pairTail( aWay.to );
             req.vias = aPlan.points;
             req.planned = true;
@@ -7380,6 +7698,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     req.fronts = &fronts;
                     req.tried = keepTries ? &aJob.tried : nullptr;
                     req.neckWidth = neckFor( way.from, way.to );
+                    req.narrowest = forcedNeck > 0;
                     req.pairTail = pairTail( way.to );
                     aAttempt = nlohmann::json::object();
                     aTries++;
@@ -7507,6 +7826,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 req.fronts = &fronts;
                 req.tried = keepTries ? &aJob.tried : nullptr;
                 req.neckWidth = neckFor( way.from, way.to );
+                req.narrowest = forcedNeck > 0;
                 req.pairTail = pairTail( way.to );
                 req.vias = { { corner, std::nullopt } };
                 req.noDoubleBack = true;
@@ -7662,6 +7982,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     req.fronts = &fronts;
                     req.tried = keepTries ? &aJob.tried : nullptr;
                     req.neckWidth = neckFor( way.from, way.to );
+                    req.narrowest = forcedNeck > 0;
                     req.pairTail = pairTail( way.to );
                     req.vias = { { v, fromHere ? arrive : cross } };
                     aAttempt = nlohmann::json::object();
@@ -7699,6 +8020,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         req.fronts = &fronts;
                         req.tried = keepTries ? &aJob.tried : nullptr;
                         req.neckWidth = neckFor( way.from, way.to );
+                        req.narrowest = forcedNeck > 0;
                         req.pairTail = pairTail( way.to );
                         req.vias = { { v, arrive } };
                         aAttempt = nlohmann::json::object();
@@ -7758,6 +8080,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         req.fronts = &fronts;
                         req.tried = keepTries ? &aJob.tried : nullptr;
                         req.neckWidth = neckFor( way.from, way.to );
+                        req.narrowest = forcedNeck > 0;
                         req.pairTail = pairTail( way.to );
                         req.vias = { { va, cross }, { vb, arrive } };
                         aAttempt = nlohmann::json::object();
@@ -12769,6 +13092,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
         req.fronts = &fronts;
         req.neckWidth = neckFor( job.from, job.to );
+        req.narrowest = forcedNeck > 0;
         req.pairTail = pairTail( job.to );
         req.softCorners = true;
 
@@ -13331,6 +13655,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
             req.fronts = &fronts;
             req.neckWidth = neckFor( job.from, job.to );
+            req.narrowest = forcedNeck > 0;
             req.pairTail = pairTail( job.to );
             req.vias = { { *job.busVia, *busLayer } };
             attempt = nlohmann::json::object();
@@ -13375,6 +13700,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             ROUTE_REQUEST req{ job.from, job.to, job.toPos, padLayer, PNS::RM_Walkaround, dryRun, {} };
             req.fronts = &fronts;
             req.neckWidth = neckFor( job.from, job.to );
+            req.narrowest = forcedNeck > 0;
             req.pairTail = pairTail( job.to );
 
             if( endTrack[0] )
@@ -16193,6 +16519,392 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     }
 
+    // The narrowest pass: a connection still open tries once more at the narrowest track the rules allow
+    // the net at its start (a pinch the class width does not pass); its pieces are widened back to the
+    // class wherever the guard lets them
+    // a net of a differential pair: named to the router, found by pcb_net_roles, or by its suffix with the
+    // other side on the board
+    bool          pairNetsKnown = false;
+    std::set<int> pairNets;
+
+    auto pairNet = [&]( const PAD* aPad )
+    {
+        if( !pairNetsKnown )
+        {
+            pairNetsKnown = true;
+
+            for( const auto& [p, n] : explicitPairs )
+            {
+                pairNets.insert( p );
+                pairNets.insert( n );
+            }
+
+            if( std::optional<KOPENAPI_METHOD> roles = KOPENAPI_REGISTRY::Get().Find( "pcb_net_roles" ) )
+            {
+                const KOPENAPI_RESULT r = roles->handler( aCtx, nlohmann::json::object() );
+
+                if( r.status < 400 && r.body.contains( "pairs" ) && r.body["pairs"].is_array() )
+                {
+                    for( const nlohmann::json& pr : r.body["pairs"] )
+                    {
+                        for( const char* side : { "p", "n" } )
+                        {
+                            if( pr.is_object() && pr.value( side, nlohmann::json() ).is_string() )
+                            {
+                                if( NETINFO_ITEM* info = KopenapiFindNet( board, pr[side].get<std::string>() ) )
+                                    pairNets.insert( info->GetNetCode() );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        wxString complement, base;
+        auto     onBoard = [&]( const wxString& aName ) { return aName != aPad->GetNetname() && board->FindNet( aName ); };
+
+        if( pairNets.count( aPad->GetNetCode() ) > 0
+            || ( DRC_ENGINE::MatchDpSuffix( aPad->GetNetname(), complement, base, onBoard ) != 0 && onBoard( complement ) ) )
+        {
+            return true;
+        }
+
+        // USB-style names KiCad's suffix rule does not know: DP / DM, D+ / D- (a closing bracket kept)
+        const wxString name = aPad->GetNetname();
+        const size_t   end = name.EndsWith( wxS( ")" ) ) ? name.length() - 1 : name.length();
+
+        if( end < 2 )
+            return false;
+
+        const wxString tail = name.Mid( end - 2, 2 ).Upper();
+        const wxString rest = name.Mid( end );
+
+        for( const auto& [a, b] : { std::pair( wxS( "DP" ), wxS( "DM" ) ), std::pair( wxS( "D+" ), wxS( "D-" ) ) } )
+        {
+            if( tail != a && tail != b )
+                continue;
+
+            const wxString other = tail == a ? wxString( b ) : wxString( a );
+            const wxString orig = name.Mid( end - 2, 2 );
+            // the other side in the name's own case
+            const wxString otherCased = orig == orig.Lower() ? other.Lower() : other;
+
+            if( onBoard( name.Left( end - 2 ) + otherCased + rest ) )
+                return true;
+        }
+
+        return false;
+    };
+
+    // the narrowest width the rules allow a connection: the lesser of their min at its ends (a piece
+    // inside a custom track_width rule is widened to that rule's min, or the try is refused)
+    auto narrowestFor = [&]( const JOB& aJob )
+    {
+        return std::max( std::min( KopenapiRuleTrack( board, aJob.from->GetNetCode(), aJob.from->GetPosition(),
+                                                      aJob.from->GetPrincipalLayer() ).min,
+                                   KopenapiRuleTrack( board, aJob.from->GetNetCode(), aJob.toPos,
+                                                      aJob.from->GetPrincipalLayer() ).min ), 1 );
+    };
+
+    auto classWidthOf = [&]( const PAD* aPad )
+    {
+        NETCLASS* nc = aPad->GetEffectiveNetClass();
+        return nc && nc->HasTrackWidth() ? nc->GetTrackWidth() : board->GetDesignSettings().GetCurrentTrackWidth();
+    };
+
+    if( !KopenapiJobCancelled() && !plateauPassCut && !dryRun && !grid && !rail )
+    {
+        bool started = false;
+
+        for( size_t index = 0; index < jobs.size() && !KopenapiJobCancelled(); ++index )
+        {
+            JOB& job = jobs[index];
+
+            if( done[index] || rowOf[index] < 0 || job.trunk )
+                continue;
+
+            job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
+            job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+            if( !job.from || !job.to )
+                continue;
+
+            auto neckIt = neckPerNet.find( job.from->GetNetname() );
+
+            if( !( neckIt == neckPerNet.end() ? neckDefault : neckIt->second ) )
+                continue;
+
+            // a pair's line keeps its width (its impedance)
+            if( pairNet( job.from ) )
+                continue;
+
+            const int classWidth = classWidthOf( job.from );
+            const int narrowest = narrowestFor( job );
+            const int usual = neckFor( job.from, job.to );
+
+            if( narrowest >= ( usual > 0 ? std::min( usual, classWidth ) : classWidth ) )
+                continue;
+
+            if( !started )
+            {
+                profile.pass = "narrowest";
+                started = true;
+            }
+
+            if( !KopenapiJobStep( "narrowest", (int) index, (int) jobs.size(), job.net, progressCounts( "narrowest" ) ) )
+                break;
+
+            if( ripBudgetS > 0 )
+                setDeadline( ripBudgetS );
+
+            nlohmann::json attempt;
+            int            tries = 0;
+
+            forcedNeck = narrowest;
+            const bool ok = tryRoute( job, attempt, tries, false, true, true );
+            forcedNeck = 0;
+
+            if( !ok )
+            {
+                results[rowOf[index]]["narrowest_reason"] = attempt.value( "reason", std::string() );
+                continue;
+            }
+
+            boardVersion++;
+            done[index] = true;
+
+            nlohmann::json& row = results[rowOf[index]];
+            row["routed"] = true;
+
+            for( const char* key : { "reason", "violations", "stopped_at_mm", "blocked_by", "blocked_end", "budget", "boxed_in" } )
+                row.erase( key );
+
+            row["retried"] = true;
+            row["narrowest_mm"] = toMm( narrowest );
+            row["engine"] = "pns";
+            row["layer"] = attempt["layer"];
+            row["mode"] = attempt["mode"];
+            row["length_mm"] = attempt["metrics"]["length_mm"];
+            row["vias"] = attempt["metrics"].value( "vias", 0 );
+            row["detour"] = attempt["metrics"]["detour"];
+
+            for( const char* key : { "widths_mm", "narrow_kept_mm", "inward_via_mm" } )
+            {
+                if( attempt.contains( key ) )
+                    row[key] = attempt[key];
+            }
+        }
+    }
+
+    // the oracle's pass: a connection still open is routed along the path pcb_route_oracle proves at the
+    // narrowest width the rules allow it, smoothed and laid by the router through its corners
+    if( aArgs.value( "oracle_pass", true ) && !KopenapiJobCancelled() && !plateauPassCut && !dryRun && !grid && !rail )
+    {
+        std::optional<KOPENAPI_METHOD> oracle = KOPENAPI_REGISTRY::Get().Find( "pcb_route_oracle" );
+        bool                           started = false;
+
+        auto padName = []( const BOARD_CONNECTED_ITEM* aItem ) -> std::string
+        {
+            const PAD* pad = dynamic_cast<const PAD*>( aItem );
+            return pad && pad->GetParentFootprint() ? str( pad->GetParentFootprint()->GetReference() ) + "." + str( pad->GetNumber() )
+                                                    : std::string();
+        };
+
+        for( size_t index = 0; oracle && index < jobs.size() && !KopenapiJobCancelled(); ++index )
+        {
+            JOB& job = jobs[index];
+
+            if( done[index] || rowOf[index] < 0 || job.trunk )
+                continue;
+
+            job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
+            job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+            if( !job.from || !job.to || padName( job.from ).empty() || pairNet( job.from ) )
+                continue;
+
+            auto       neckIt = neckPerNet.find( job.from->GetNetname() );
+            const bool neck = neckIt == neckPerNet.end() ? neckDefault : neckIt->second;
+            const int  classWidth = classWidthOf( job.from );
+            const int  width = neck ? std::min( narrowestFor( job ), classWidth ) : classWidth;
+
+            if( !started )
+            {
+                profile.pass = "oracle";
+                started = true;
+            }
+
+            if( !KopenapiJobStep( "oracle", (int) index, (int) jobs.size(), job.net, progressCounts( "oracle" ) ) )
+                break;
+
+            nlohmann::json& row = results[rowOf[index]];
+            nlohmann::json  args = { { "from", padName( job.from ) }, { "width_mm", toMm( width ) }, { "vias", viasAllowed },
+                                     { "fewest_vias", true } };
+
+            args["layers"] = nlohmann::json::array();
+
+            for( PCB_LAYER_ID l : layers )
+                args["layers"].push_back( str( board->GetLayerName( l ) ) );
+
+            if( !padName( job.to ).empty() )
+                args["to"] = padName( job.to );
+
+            // no via in a chip's ring of pins (as the plan): an end inside the ring or a part the call opens
+            // (inward_escapes) keeps it open
+            if( viasAllowed )
+            {
+                nlohmann::json noVia = nlohmann::json::array();
+
+                for( FOOTPRINT* fp : board->Footprints() )
+                {
+                    if( inwardParts.count( fp ) || fp->Pads().empty() )
+                        continue;
+
+                    int edge = INT_MAX;
+
+                    for( PAD* pad : fp->Pads() )
+                        edge = std::min( edge, (int) std::min( pad->GetBoundingBox().GetWidth(), pad->GetBoundingBox().GetHeight() ) );
+
+                    const std::optional<BOX2I> inside = KopenapiPadRingInside( fp, std::max( edge / 2, 1 ) );
+
+                    if( !inside || inside->Contains( job.from->GetPosition() ) || inside->Contains( job.toPos ) )
+                        continue;
+
+                    BOX2I rows = fp->Pads().front()->GetBoundingBox();
+
+                    for( PAD* pad : fp->Pads() )
+                        rows.Merge( pad->GetBoundingBox() );
+
+                    noVia.push_back( { toMm( rows.GetLeft() ), toMm( rows.GetTop() ), toMm( rows.GetRight() ), toMm( rows.GetBottom() ) } );
+                }
+
+                if( !noVia.empty() )
+                    args["no_via_mm"] = noVia;
+            }
+
+            const KOPENAPI_RESULT verdict = oracle->handler( aCtx, args );
+            const std::string     said = verdict.body.value( "verdict", std::string() );
+
+            if( verdict.status >= 400 || said != "routable" || !verdict.body.contains( "path" ) )
+            {
+                row["oracle_verdict"] = verdict.status >= 400 ? std::string( "error" ) : said;
+                row["oracle_reason"] = verdict.body.value( "reason", verdict.body.value( "error", std::string() ) );
+                continue;
+            }
+
+            row["oracle_verdict"] = said;
+
+            std::vector<std::pair<VECTOR2I, PCB_LAYER_ID>> path;
+            bool                                           offLayers = false;
+
+            for( const nlohmann::json& at : verdict.body["path"] )
+            {
+                const PCB_LAYER_ID layer = board->GetLayerID( wxString::FromUTF8( at["layer"].get<std::string>() ) );
+                offLayers |= std::find( layers.begin(), layers.end(), layer ) == layers.end();
+                path.emplace_back( VECTOR2I( pcbIUScale.mmToIU( at["at"][0].get<double>() ), pcbIUScale.mmToIU( at["at"][1].get<double>() ) ),
+                                   layer );
+            }
+
+            if( offLayers || path.size() < 2 )
+            {
+                row["oracle_reason"] = offLayers ? "the path runs on a layer this call does not route on" : "no path";
+                continue;
+            }
+
+            // its ends lie on the islands' copper: the start on the from pad's, the end off it
+            std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
+            std::set<const BOARD_ITEM*>        startIsland = { job.from };
+
+            for( BOARD_CONNECTED_ITEM* item : conn->GetConnectedItems( job.from ) )
+                startIsland.insert( item );
+
+            auto copperAt = [&]( const std::pair<VECTOR2I, PCB_LAYER_ID>& aAt, bool aStart ) -> BOARD_CONNECTED_ITEM*
+            {
+                BOARD_CONNECTED_ITEM* best = nullptr;
+                int                   bestRank = 3;
+
+                for( BOARD_CONNECTED_ITEM* item : conn->GetNetItems( job.from->GetNetCode(), { PCB_PAD_T, PCB_VIA_T, PCB_TRACE_T, PCB_ARC_T } ) )
+                {
+                    const int rank = item->Type() == PCB_PAD_T ? 0 : item->Type() == PCB_VIA_T ? 1 : 2;
+
+                    if( rank < bestRank && startIsland.count( item ) == (size_t) aStart && item->IsOnLayer( aAt.second )
+                        && item->GetEffectiveShape( aAt.second )->Collide( aAt.first, 0 ) )
+                    {
+                        best = item;
+                        bestRank = rank;
+                    }
+                }
+
+                return best;
+            };
+
+            BOARD_CONNECTED_ITEM* startItem = copperAt( path.front(), true );
+            BOARD_CONNECTED_ITEM* endItem = copperAt( path.back(), false );
+            VECTOR2I              refusedAt;
+
+            if( doneOf )
+                refreshFronts();
+
+            auto waypoints = startItem && endItem ? smoothGridPath( board, job.from->GetNet(), width, path, &fronts, &refusedAt )
+                                                  : std::nullopt;
+
+            if( !waypoints || waypoints->empty() )
+            {
+                row["oracle_reason"] = !startItem || !endItem ? std::string( "the path's ends are on no copper of the net" )
+                                                              : "the guard refuses the path from (" + std::to_string( toMm( refusedAt.x ) )
+                                                                        + ", " + std::to_string( toMm( refusedAt.y ) ) + ")";
+                continue;
+            }
+
+            const VECTOR2I endAt = waypoints->back().first;
+            waypoints->pop_back();
+
+            if( ripBudgetS > 0 )
+                setDeadline( ripBudgetS );
+
+            ROUTE_REQUEST req{ startItem, endItem, endAt, path.front().second, PNS::RM_Walkaround, false, *waypoints };
+            req.fromPos = path.front().first;
+            req.fronts = &fronts;
+            req.neckWidth = width < classWidth ? width : 0;
+            req.narrowest = width < classWidth;
+            req.width = width < classWidth ? 0 : width;
+            req.noDoubleBack = true;
+
+            nlohmann::json attempt;
+
+            if( !routeOne( *context, req, attempt, added ) )
+            {
+                row["oracle_reason"] = attempt.value( "reason", std::string() );
+                continue;
+            }
+
+            boardVersion++;
+            done[index] = true;
+            row["routed"] = true;
+
+            for( const char* key : { "reason", "violations", "stopped_at_mm", "blocked_by", "blocked_end", "budget", "boxed_in" } )
+                row.erase( key );
+
+            row["retried"] = true;
+            row["engine"] = "oracle";
+
+            if( width < classWidth )
+                row["narrowest_mm"] = toMm( width );
+
+            row["layer"] = attempt["layer"];
+            row["mode"] = attempt["mode"];
+            row["length_mm"] = attempt["metrics"]["length_mm"];
+            row["vias"] = attempt["metrics"].value( "vias", 0 );
+            row["detour"] = attempt["metrics"]["detour"];
+
+            for( const char* key : { "widths_mm", "narrow_kept_mm", "inward_via_mm" } )
+            {
+                if( attempt.contains( key ) )
+                    row[key] = attempt[key];
+            }
+        }
+    }
+
     // a plateau that ran out with the pass's last turns (skipped ones try nothing) still counts
     plateauCheck( clockNow() );
     plateauInRipUp = false;
@@ -16479,6 +17191,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 ROUTE_REQUEST req{ job.from, job.to, job.toPos, viaPlan.startLayer, PNS::RM_Walkaround, false, {} };
                 req.fronts = &fronts;
                 req.neckWidth = neckFor( job.from, job.to );
+                req.narrowest = forcedNeck > 0;
                 req.pairTail = pairTail( job.to );
                 req.vias = viaPlan.points;
                 req.planned = true;
@@ -16506,6 +17219,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     ROUTE_REQUEST req{ from, to, toPos, layer, PNS::RM_Walkaround, false, {} };
                     req.fronts = &fronts;
                     req.neckWidth = neckFor( from, to );
+                    req.narrowest = forcedNeck > 0;
                     req.pairTail = pairTail( to );
                     attempt = nlohmann::json::object();
                     ok = routeOne( *context, req, attempt, added );
@@ -24174,7 +24888,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "variants":{"type":"integer","default":0,"description":"grid: how many of the built-in variants (pcb_route_strategies) run in parallel; 0 one per two cores, as many as half the available memory holds (grid.lane_mb, grid.lanes_memory_allows)"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
-                        "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (as dense_first says) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
+                        "oracle_pass":{"type":"boolean","default":true,"description":"a connection still open after every pass (not a differential pair's nets) gets a last try along the path pcb_route_oracle proves at the narrowest track the rules allow the net at either end (the class width with neck_down off): smoothed to lines at 0/45/90 degrees where the guard lets them, laid by the router through those corners and widened back as the narrowest try is (profile.pass oracle); the oracle's path has the fewest vias, on the call's layers, none in a chip's ring of pins (as the plan). The row says engine oracle when it routes; oracle_verdict (routable, unknown, unroutable) and oracle_reason when not"},
+                        "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (as dense_first says) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. auto also gives a connection still open after the rip-up rounds one last try (profile.pass narrowest; not a differential pair's nets) at the narrowest track the rules allow the net at either end (a pinch the class width does not pass), its pieces widened back to the class (else to a custom rule's min there) wherever the guard lets them; a piece left below a track_width rule's min refuses the try; the row says narrowest_mm (widths_mm, narrow_kept_mm) when it routes, narrowest_reason when not. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
                         "inward_escapes":{"default":"auto","description":"packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). auto (default): every package whose pad row rings its exposed pad (pads inside the exposed pad's box, as its copy on another layer, are not row pads); a list of footprint references: only those ([]: none). 404 an unknown reference, 400 a listed part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad); after the rip-up rounds, a connection still open that such a way out refused, or with an end near one kept for a pad whose connections are given up, tries once more without those ways out (row ways_out_given_up when it routes, given_up_reason when not). false: no such room kept"},"corridor_guard":{"type":"boolean","default":false,"description":"with escapes: past such a way out, while other copper stands a track and its clearance to both sides of it (a corridor between stubs), a route that shuts the corridor before either side opens is refused as well (reason: wall in ... along the copper beside it)"},
                         "via_cost_mm":{"type":"number","minimum":0,"description":"mm of track a via costs the plan, the grid and the clean-up; default from the rules: the routing room a via of the default class takes on each signal layer, as track (the answer's via_cost_mm)"},
                         "plan":{"type":"boolean","default":true,"description":"a connection the router does not find on a layer is planned over the free space (grid search with vias, the board's clearances), the router follows the plan; no plan found: no escape-spot tries either (row plan tells)"},
