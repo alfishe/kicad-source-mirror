@@ -33,15 +33,98 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <map>
+#include <functional>
 #include <queue>
 #include <set>
 
 
 namespace
 {
+
+/// A min-queue of (cost, state) that pops in the same order as a binary heap of the pairs. Entries go to
+/// buckets by the leading bits of the cost (monotone in a non-negative float), and only the lowest bucket
+/// in use is kept as a heap, so most pushes are appends.
+class COST_QUEUE
+{
+public:
+    using ENTRY = std::pair<float, uint32_t>;
+
+    COST_QUEUE() : m_buckets( LAST + 1 ) {}
+
+    bool empty() const { return m_size == 0; }
+
+    void push( float aCost, uint32_t aState )
+    {
+        const uint32_t b = bucket( aCost );
+
+        if( m_size == 0 )
+            m_cur = m_hi = b;
+
+        if( b <= m_cur )
+        {
+            m_heap.emplace_back( aCost, aState );
+            std::push_heap( m_heap.begin(), m_heap.end(), std::greater<ENTRY>() );
+        }
+        else
+        {
+            m_buckets[b].emplace_back( aCost, aState );
+            m_hi = std::max( m_hi, b );
+        }
+
+        m_size++;
+    }
+
+    ENTRY pop()
+    {
+        if( m_heap.empty() )
+        {
+            while( m_buckets[++m_cur].empty() )
+                ;
+
+            m_heap.swap( m_buckets[m_cur] );
+            std::make_heap( m_heap.begin(), m_heap.end(), std::greater<ENTRY>() );
+        }
+
+        std::pop_heap( m_heap.begin(), m_heap.end(), std::greater<ENTRY>() );
+        const ENTRY e = m_heap.back();
+        m_heap.pop_back();
+        m_size--;
+        return e;
+    }
+
+    void clear()
+    {
+        if( m_size )
+        {
+            for( uint32_t b = m_cur + 1; b <= m_hi; ++b )
+                m_buckets[b].clear();
+        }
+
+        m_heap.clear();
+        m_size = 0;
+    }
+
+private:
+    static constexpr int      SHIFT = 12;
+    static constexpr uint32_t LAST = 0x7F800000u >> SHIFT;
+
+    static uint32_t bucket( float aCost )
+    {
+        uint32_t bits;
+        std::memcpy( &bits, &aCost, sizeof( bits ) );
+        return std::min( bits >> SHIFT, LAST );
+    }
+
+    std::vector<std::vector<ENTRY>> m_buckets;
+    std::vector<ENTRY>              m_heap;
+    size_t                          m_size = 0;
+    uint32_t                        m_cur = 0;
+    uint32_t                        m_hi = 0;
+};
 
 enum : uint8_t
 {
@@ -1324,6 +1407,8 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     const double workCap = aArgs.value( "max_work_m", 20000.0 ) * 1e6;
     double       work = 0;
 
+    COST_QUEUE open;
+
     // joins a net's islands one by one, from the tree joined so far to the nearest island left
     auto route = [&]( JOB& aJob, float aPresent ) -> bool
     {
@@ -1451,107 +1536,172 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                 break;
             }
 
-            std::fill( g.begin(), g.end(), std::numeric_limits<float>::max() );
-            std::fill( prev.begin(), prev.end(), -1 );
+            // a path whose own vias come nearer each other than hole to hole is searched again with no
+            // other via round the first of them
+            const int           viaGap = ( aJob.probe.viaDrill + h2h + slack + grid.cell - 1 ) / grid.cell;
+            std::vector<size_t> path;
+            int64_t             reached = -1;
 
-            using ENTRY = std::pair<float, uint32_t>;
-            std::priority_queue<ENTRY, std::vector<ENTRY>, std::greater<ENTRY>> open;
-
-            auto h = [&]( size_t s )
+            for( int attempt = 0;; ++attempt )
             {
-                const size_t i = s % wc;
-                const int    x = (int) ( i % wx ), y = (int) ( i / wx );
-                const int    dx = std::max( { 0, target.GetLeft() - x, x - target.GetRight() } );
-                const int    dy = std::max( { 0, target.GetTop() - y, y - target.GetBottom() } );
-                return (float) ( std::max( dx, dy ) + ( M_SQRT2 - 1 ) * std::min( dx, dy ) );
-            };
+                std::fill( g.begin(), g.end(), std::numeric_limits<float>::max() );
+                std::fill( prev.begin(), prev.end(), -1 );
 
-            for( size_t s = 0; s < wc * L; ++s )
-            {
-                if( tree[s] )
+                open.clear();
+
+                auto h = [&]( size_t s )
                 {
-                    g[s] = 0;
-                    open.emplace( h( s ), (uint32_t) s );
+                    const size_t i = s % wc;
+                    const int    x = (int) ( i % wx ), y = (int) ( i / wx );
+                    const int    dx = std::max( { 0, target.GetLeft() - x, x - target.GetRight() } );
+                    const int    dy = std::max( { 0, target.GetTop() - y, y - target.GetBottom() } );
+                    return (float) ( std::max( dx, dy ) + ( M_SQRT2 - 1 ) * std::min( dx, dy ) );
+                };
+
+                for( size_t s = 0; s < wc * L; ++s )
+                {
+                    if( tree[s] )
+                    {
+                        g[s] = 0;
+                        open.push( h( s ), (uint32_t) s );
+                    }
                 }
-            }
 
-            int64_t reached = -1;
+                reached = -1;
 
-            while( !open.empty() )
-            {
-                const auto [f, s] = open.top();
-                open.pop();
-                work++;
-
-                if( f - h( s ) > g[s] + 1e-3f )
-                    continue;
-
-                if( island[s] >= 0 && !joined[island[s]] )
+                while( !open.empty() )
                 {
-                    reached = s;
+                    const auto [f, s] = open.pop();
+                    work++;
+
+                    if( f - h( s ) > g[s] + 1e-3f )
+                        continue;
+
+                    if( island[s] >= 0 && !joined[island[s]] )
+                    {
+                        reached = s;
+                        break;
+                    }
+
+                    const int    l = (int) ( s / wc );
+                    const size_t i = s % wc;
+                    const int    x = (int) ( i % wx ), y = (int) ( i / wx );
+
+                    for( int d = 0; d < 8; ++d )
+                    {
+                        const int nx = x + DX[d], ny = y + DY[d];
+
+                        if( nx < 0 || ny < 0 || nx >= wx || ny >= wy )
+                            continue;
+
+                        const size_t n = (size_t) l * wc + (size_t) ny * wx + nx;
+                        const size_t k = global( n );
+
+                        if( own[k] != 0 && own[k] != me )
+                            continue;
+
+                        const float c = g[s] + STEP[d] * ( 1.f + history[k] ) * ( 1.f + aPresent * claimT[k] );
+
+                        if( c < g[n] )
+                        {
+                            g[n] = c;
+                            prev[n] = (int32_t) s;
+                            open.push( c + h( n ), (uint32_t) n );
+                        }
+                    }
+
+                    if( !vias )
+                        continue;
+
+                    const size_t gi = global( s ) % cells;
+
+                    if( ( ownV[gi] != 0 && ownV[gi] != me ) || viaNear[i] )
+                        continue;
+
+                    int share = 0;
+
+                    for( int m = 0; m < L; ++m )
+                        share += claimV[(size_t) m * cells + gi];
+
+                    for( int m = 0; m < L; ++m )
+                    {
+                        if( m == l )
+                            continue;
+
+                        const size_t n = (size_t) m * wc + i;
+                        const size_t k = (size_t) m * cells + gi;
+
+                        if( own[k] != 0 && own[k] != me )
+                            continue;
+
+                        const float c = g[s] + viaCost * ( 1.f + historyVia[gi] ) * ( 1.f + aPresent * share );
+
+                        if( c < g[n] )
+                        {
+                            g[n] = c;
+                            prev[n] = (int32_t) s;
+                            open.push( c + h( n ), (uint32_t) n );
+                        }
+                    }
+                }
+
+                if( reached < 0 )
                     break;
+
+                // the path back to the tree, then the island it reached joins the tree
+                path.clear();
+
+                for( int64_t s = reached; s >= 0; s = prev[s] )
+                {
+                    path.push_back( global( (size_t) s ) );
+
+                    if( tree[s] )
+                        break;
                 }
 
-                const int    l = (int) ( s / wc );
-                const size_t i = s % wc;
-                const int    x = (int) ( i % wx ), y = (int) ( i / wx );
+                std::reverse( path.begin(), path.end() );
 
-                for( int d = 0; d < 8; ++d )
+                if( reached < 0 || !vias || attempt >= 8 )
+                    break;
+
+                std::vector<size_t> pv;
+
+                for( size_t j = 1; j < path.size(); ++j )
                 {
-                    const int nx = x + DX[d], ny = y + DY[d];
+                    if( path[j] % cells == path[j - 1] % cells )
+                        pv.push_back( local( path[j] ) % wc );
+                }
 
-                    if( nx < 0 || ny < 0 || nx >= wx || ny >= wy )
-                        continue;
+                int64_t tooNear = -1;
 
-                    const size_t n = (size_t) l * wc + (size_t) ny * wx + nx;
-                    const size_t k = global( n );
-
-                    if( own[k] != 0 && own[k] != me )
-                        continue;
-
-                    const float c = g[s] + STEP[d] * ( 1.f + history[k] ) * ( 1.f + aPresent * claimT[k] );
-
-                    if( c < g[n] )
+                for( size_t u = 0; u < pv.size() && tooNear < 0; ++u )
+                {
+                    for( size_t v = u + 1; v < pv.size(); ++v )
                     {
-                        g[n] = c;
-                        prev[n] = (int32_t) s;
-                        open.emplace( c + h( n ), (uint32_t) n );
+                        const int ddx = (int) ( pv[u] % wx ) - (int) ( pv[v] % wx );
+                        const int ddy = (int) ( pv[u] / wx ) - (int) ( pv[v] / wx );
+
+                        if( pv[u] != pv[v] && (int64_t) ddx * ddx + (int64_t) ddy * ddy <= (int64_t) viaGap * viaGap )
+                        {
+                            tooNear = (int64_t) pv[u];
+                            break;
+                        }
                     }
                 }
 
-                if( !vias )
-                    continue;
+                if( tooNear < 0 )
+                    break;
 
-                const size_t gi = global( s ) % cells;
+                const int     vx = (int) ( tooNear % wx ), vy = (int) ( tooNear / wx );
+                const uint8_t keep = viaNear[tooNear];
 
-                if( ( ownV[gi] != 0 && ownV[gi] != me ) || viaNear[i] )
-                    continue;
-
-                int share = 0;
-
-                for( int m = 0; m < L; ++m )
-                    share += claimV[(size_t) m * cells + gi];
-
-                for( int m = 0; m < L; ++m )
+                for( const auto& [dx, dy] : disc( aJob.probe.viaDrill + h2h + slack ) )
                 {
-                    if( m == l )
-                        continue;
-
-                    const size_t n = (size_t) m * wc + i;
-                    const size_t k = (size_t) m * cells + gi;
-
-                    if( own[k] != 0 && own[k] != me )
-                        continue;
-
-                    const float c = g[s] + viaCost * ( 1.f + historyVia[gi] ) * ( 1.f + aPresent * share );
-
-                    if( c < g[n] )
-                    {
-                        g[n] = c;
-                        prev[n] = (int32_t) s;
-                        open.emplace( c + h( n ), (uint32_t) n );
-                    }
+                    if( vx + dx >= 0 && vy + dy >= 0 && vx + dx < wx && vy + dy < wy )
+                        viaNear[(size_t) ( vy + dy ) * wx + vx + dx] = 1;
                 }
+
+                viaNear[tooNear] = keep;
             }
 
             if( reached < 0 )
@@ -1559,19 +1709,6 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                 all = false;
                 break;
             }
-
-            // the path back to the tree, then the island it reached joins the tree
-            std::vector<size_t> path;
-
-            for( int64_t s = reached; s >= 0; s = prev[s] )
-            {
-                path.push_back( global( (size_t) s ) );
-
-                if( tree[s] )
-                    break;
-            }
-
-            std::reverse( path.begin(), path.end() );
 
             // new copper: the path off the islands' copper, and its vias
             for( size_t j = 0; j < path.size(); ++j )
@@ -1713,7 +1850,8 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
             claim( job, 1 );
         }
 
-        present *= presentGrowth;
+        // finite: an infinite factor times a free cell's zero claim is NaN, and no step would be taken
+        present = std::min( present * presentGrowth, 1e30f );
     }
 
     // the paths as the single oracle gives them: corners where the step changes, a via where the layer does
