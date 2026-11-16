@@ -1436,6 +1436,55 @@ static VECTOR2I padRowOutward( const PAD* aPad, const BOX2I& aRing )
 }
 
 
+/// @brief Where other copper of its net joins a track between its ends (a route that ends on its middle, a
+/// via or pad on it), the joint nearest aFree, its dangling end; none: nothing joins it there
+static std::optional<VECTOR2I> innerJoint( const std::shared_ptr<CONNECTIVITY_DATA>& aConn, PCB_TRACK* aTrack, const VECTOR2I& aFree )
+{
+    const std::list<CN_ITEM*>& items = aConn->GetConnectivityAlgo()->ItemEntry( aTrack ).GetItems();
+
+    if( items.empty() || !items.front()->Valid() )
+        return std::nullopt;
+
+    const SEG      seg( aTrack->GetStart(), aTrack->GetEnd() );
+    const VECTOR2I other = aFree == aTrack->GetStart() ? aTrack->GetEnd() : aTrack->GetStart();
+    const int      reach = aTrack->GetWidth() / 2;
+    std::optional<VECTOR2I> best;
+
+    for( CN_ITEM* connected : items.front()->ConnectedItems() )
+    {
+        BOARD_CONNECTED_ITEM* item = connected->Parent();
+        VECTOR2I              at;
+
+        if( ( item->GetFlags() & IS_DELETED ) || item->Type() == PCB_ZONE_T || item->Type() == PCB_ARC_T )
+            continue;
+
+        if( item->Type() == PCB_TRACE_T )
+        {
+            const PCB_TRACK* t = static_cast<const PCB_TRACK*>( item );
+
+            if( seg.Distance( t->GetStart() ) <= reach )
+                at = t->GetStart();
+            else if( seg.Distance( t->GetEnd() ) <= reach )
+                at = t->GetEnd();
+            else
+                continue;
+        }
+        else
+        {
+            at = seg.NearestPoint( item->GetPosition() );
+        }
+
+        if( ( at - other ).EuclideanNorm() <= reach || ( at - aFree ).EuclideanNorm() <= reach )
+            continue;
+
+        if( !best || ( at - aFree ).EuclideanNorm() < ( *best - aFree ).EuclideanNorm() )
+            best = at;
+    }
+
+    return best;
+}
+
+
 /// @brief Whether a way out is held open for its pad: a main one always, a spare one once its main one is shut
 static bool frontHeld( BOARD* aBoard, const std::vector<ESCAPE_FRONT>& aAll, const ESCAPE_FRONT& aFront )
 {
@@ -6658,12 +6707,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     const double viaCostMm = KopenapiViaCostMm( board, aArgs );
     const bool keepTries = aArgs.value( "attempts", false );
 
+    // once every turn is over, a way out kept for a pad whose connections are given up walls in nothing
+    bool givenUp = false;
+
     auto refreshFronts = [&]()
     {
         for( ESCAPE_FRONT& front : fronts )
         {
             if( !front.jobs.empty() )
-                front.open = std::any_of( front.jobs.begin(), front.jobs.end(), [&]( size_t k ) { return !( *doneOf )[k]; } );
+            {
+                front.open = !givenUp
+                             && std::any_of( front.jobs.begin(), front.jobs.end(), [&]( size_t k ) { return !( *doneOf )[k]; } );
+            }
         }
     };
 
@@ -15387,9 +15442,28 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 if( !aAll && ( track->Type() == PCB_VIA_T || ringItems.count( track ) ) )
                     continue;
 
-                if( conn->TestTrackEndpointDangling( track, true ) )
+                VECTOR2I freeEnd;
+
+                if( conn->TestTrackEndpointDangling( track, true, &freeEnd ) )
                 {
-                    sweep.Remove( track );
+                    // copper of the net joins it between its ends: cut back to that joint, else out
+                    const std::optional<VECTOR2I> joint = track->Type() == PCB_TRACE_T ? innerJoint( conn, track, freeEnd )
+                                                                                       : std::nullopt;
+
+                    if( joint )
+                    {
+                        sweep.Modify( track );
+
+                        if( track->GetStart() == freeEnd )
+                            track->SetStart( *joint );
+                        else
+                            track->SetEnd( *joint );
+                    }
+                    else
+                    {
+                        sweep.Remove( track );
+                    }
+
                     stubs++;
                     again = true;
                 }
@@ -16018,6 +16092,105 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
         if( !progress )
             break;
+    }
+
+    // Connections still open after the rip-up rounds that a kept way out refused, or with an end near a way out
+    // still kept for another net's pad: that pad is routed by now or given up too, so each such connection
+    // tries once more without them
+    if( !KopenapiJobCancelled() && !plateauPassCut && doneOf )
+    {
+        refreshFronts();
+
+        std::vector<size_t> walled;
+
+        for( size_t index = 0; index < jobs.size(); ++index )
+        {
+            if( done[index] || rowOf[index] < 0 || jobs[index].trunk )
+                continue;
+
+            const BOARD_ITEM* ends[2] = { board->ResolveItem( jobs[index].fromId, true ),
+                                          board->ResolveItem( jobs[index].toId, true ) };
+            const auto* fromPad = dynamic_cast<const BOARD_CONNECTED_ITEM*>( ends[0] );
+            const int   net = fromPad ? fromPad->GetNetCode() : -1;
+            bool        nearFront = false;
+
+            for( const BOARD_ITEM* end : ends )
+            {
+                if( !end || nearFront )
+                    continue;
+
+                BOX2I box = end->GetBoundingBox();
+                box.Inflate( pcbIUScale.mmToIU( 1.5 ) );
+
+                nearFront = std::any_of( fronts.begin(), fronts.end(),
+                                    [&]( const ESCAPE_FRONT& f )
+                                    { return !f.jobs.empty() && f.walls( net ) && box.Intersects( f.shape.BBox() ); } );
+            }
+
+            const std::string text = results[rowOf[index]].dump();
+
+            if( nearFront || text.find( "wall in the way out of" ) != std::string::npos
+                || text.find( "ways out kept open for other nets" ) != std::string::npos )
+            {
+                walled.push_back( index );
+            }
+        }
+
+        if( !walled.empty() )
+        {
+            givenUp = true;
+            refreshFronts();
+            profile.pass = "given_up";
+        }
+
+        for( size_t index : walled )
+        {
+            JOB& job = jobs[index];
+            job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
+            job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+            if( !job.from || !job.to || done[index] )
+                continue;
+
+            if( !KopenapiJobStep( "given_up", (int) index, (int) jobs.size(), job.net, progressCounts( "given_up" ) ) )
+                break;
+
+            if( ripBudgetS > 0 )
+                setDeadline( ripBudgetS );
+
+            nlohmann::json attempt;
+            int            tries = 0;
+
+            if( !tryRoute( job, attempt, tries, false, true, true ) )
+            {
+                results[rowOf[index]]["given_up_reason"] = attempt.value( "reason", std::string() );
+                continue;
+            }
+
+            boardVersion++;
+            done[index] = true;
+
+            nlohmann::json& row = results[rowOf[index]];
+            row["routed"] = true;
+            row.erase( "reason" );
+            row.erase( "violations" );
+            row.erase( "stopped_at_mm" );
+            row.erase( "blocked_by" );
+            row.erase( "blocked_end" );
+            row.erase( "budget" );
+            row.erase( "boxed_in" );
+            row["retried"] = true;
+            row["ways_out_given_up"] = true;
+            row["engine"] = "pns";
+            row["layer"] = attempt["layer"];
+            row["mode"] = attempt["mode"];
+            row["length_mm"] = attempt["metrics"]["length_mm"];
+            row["vias"] = attempt["metrics"].value( "vias", 0 );
+            row["detour"] = attempt["metrics"]["detour"];
+
+            if( attempt.contains( "inward_via_mm" ) )
+                row["inward_via_mm"] = attempt["inward_via_mm"];
+        }
     }
 
     // a plateau that ran out with the pass's last turns (skipped ones try nothing) still counts
@@ -23910,8 +24083,8 @@ KOPENAPI_REGISTER( "pcb_route",
                    "taken out again; the grid timeline stays to branch from); the retry / rip-up pass gives each "
                    "connection rip_up_budget_s; a cancel or a spent budget stops a router try within its walkaround / shove "
                    "steps (the row's reason says so; profile tries_stopped); "
-                   "every route passes the net-merge guard; copper of this call that ends nowhere is removed "
-                   "(stubs_removed); copper of nets outside the call that shove pushed aside is listed "
+                   "every route passes the net-merge guard; copper of this call that ends nowhere is removed, or cut back "
+                   "to where other copper of its net joins it between its ends (stubs_removed counts both); copper of nets outside the call that shove pushed aside is listed "
                    "(other_nets_moved: pieces and length before / after); a row still routed at the end is "
                    "joined by copper; per connection "
                    "routed / reason and ms (every try for it), via_list (the row's vias as laid, dry run too, either engine: at_mm, layers, "
@@ -24002,7 +24175,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (as dense_first says) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
-                        "inward_escapes":{"default":"auto","description":"packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). auto (default): every package whose pad row rings its exposed pad (pads inside the exposed pad's box, as its copy on another layer, are not row pads); a list of footprint references: only those ([]: none). 404 an unknown reference, 400 a listed part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad). false: no such room kept"},"corridor_guard":{"type":"boolean","default":false,"description":"with escapes: past such a way out, while other copper stands a track and its clearance to both sides of it (a corridor between stubs), a route that shuts the corridor before either side opens is refused as well (reason: wall in ... along the copper beside it)"},
+                        "inward_escapes":{"default":"auto","description":"packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). auto (default): every package whose pad row rings its exposed pad (pads inside the exposed pad's box, as its copy on another layer, are not row pads); a list of footprint references: only those ([]: none). 404 an unknown reference, 400 a listed part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad); after the rip-up rounds, a connection still open that such a way out refused, or with an end near one kept for a pad whose connections are given up, tries once more without those ways out (row ways_out_given_up when it routes, given_up_reason when not). false: no such room kept"},"corridor_guard":{"type":"boolean","default":false,"description":"with escapes: past such a way out, while other copper stands a track and its clearance to both sides of it (a corridor between stubs), a route that shuts the corridor before either side opens is refused as well (reason: wall in ... along the copper beside it)"},
                         "via_cost_mm":{"type":"number","minimum":0,"description":"mm of track a via costs the plan, the grid and the clean-up; default from the rules: the routing room a via of the default class takes on each signal layer, as track (the answer's via_cost_mm)"},
                         "plan":{"type":"boolean","default":true,"description":"a connection the router does not find on a layer is planned over the free space (grid search with vias, the board's clearances), the router follows the plan; no plan found: no escape-spot tries either (row plan tells)"},
                         "max_tries":{"type":"integer","default":120,"minimum":1,"description":"router attempts per connection and pass (layers x modes x escape spots); a big board pays about a second per attempt"},
