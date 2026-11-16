@@ -597,6 +597,27 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
     const LSET                   copper = LSET::AllCuMask( board->GetCopperLayerCount() );
     const std::vector<PCB_LAYER_ID> layers = copper.Seq();
     const int                    L = (int) layers.size();
+    // layers the path may use: the rest stay obstacles to a via, shut to a track
+    std::vector<bool>            shutLayer( L, false );
+
+    if( aArgs.contains( "layers" ) )
+    {
+        int open = 0;
+
+        for( int l = 0; l < L; ++l )
+        {
+            bool asked = false;
+
+            for( const nlohmann::json& name : aArgs["layers"] )
+                asked |= name.is_string() && board->GetLayerID( wxString::FromUTF8( name.get<std::string>() ) ) == layers[l];
+
+            shutLayer[l] = !asked;
+            open += asked;
+        }
+
+        if( !open )
+            return KOPENAPI_RESULT::Error( 400, "layers: copper layers of the board" );
+    }
 
     const KOPENAPI_RULE_TRACK rt = KopenapiRuleTrack( board, net, from->GetPosition(), from->GetPrincipalLayer() );
     const KOPENAPI_RULE_VIA   rv = KopenapiRuleVia( board, net, from->GetPosition(), from->GetPrincipalLayer() );
@@ -681,6 +702,37 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
                     track[(size_t) aLayer * cells + aCell] |= aMode;
             } );
 
+    for( int l = 0; l < L; ++l )
+    {
+        if( shutLayer[l] )
+            std::fill( track.begin() + (size_t) l * cells, track.begin() + (size_t) ( l + 1 ) * cells, (uint8_t) ( OPT | PES ) );
+    }
+
+    // boxes no via may overlap (a chip's ring of pins the router keeps for its pins' ways out)
+    for( const nlohmann::json& b : aArgs.value( "no_via_mm", nlohmann::json::array() ) )
+    {
+        if( !b.is_array() || b.size() != 4 )
+            continue;
+
+        const VECTOR2I a( pcbIUScale.mmToIU( b[0].get<double>() ), pcbIUScale.mmToIU( b[1].get<double>() ) );
+        const VECTOR2I c( pcbIUScale.mmToIU( b[2].get<double>() ), pcbIUScale.mmToIU( b[3].get<double>() ) );
+        BOX2I          box( a, c - a );
+        box.Normalize();
+
+        for( const uint8_t mode : { OPT, PES } )
+        {
+            BOX2I grown = box;
+            grown.Inflate( mode == PES ? viaDia / 2 + diag : std::max( viaDia / 2 - diag, 0 ) );
+            SHAPE_POLY_SET poly;
+            poly.NewOutline();
+            poly.Append( grown.GetLeft(), grown.GetTop() );
+            poly.Append( grown.GetRight(), grown.GetTop() );
+            poly.Append( grown.GetRight(), grown.GetBottom() );
+            poly.Append( grown.GetLeft(), grown.GetBottom() );
+            grid.Fill( poly, [&]( size_t i ) { via[i] |= mode; } );
+        }
+    }
+
     // the ends: cells whose centre lies on the island's copper on a layer (optimistic: within the cell's
     // reach of it; pessimistic: inside it by that reach, so a track from that centre touches it)
     auto seeds = [&]( const std::set<const BOARD_ITEM*>& aIsland, uint8_t aMode, uint8_t aBit )
@@ -718,10 +770,13 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
     const int DX[8] = { 1, -1, 0, 0, 1, 1, -1, -1 };
     const int DY[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
 
-    auto search = [&]( uint8_t aMode, uint8_t aStart, uint8_t aGoal )
+    // aFewestVias: in rounds, round k a breadth-first search on the layers from the states k vias reach,
+    // so the path found has the fewest vias, the shortest way per round
+    auto search = [&]( uint8_t aMode, uint8_t aStart, uint8_t aGoal, bool aFewestVias = false )
     {
         SEARCH             s;
         std::deque<size_t> open;
+        std::vector<std::pair<size_t, uint8_t>> next;   // a via's far state, its step in
         s.from.assign( cells * L, 0 );
 
         for( size_t k = 0; k < cells * L; ++k )
@@ -733,8 +788,23 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
             }
         }
 
-        while( !open.empty() )
+        while( !open.empty() || !next.empty() )
         {
+            if( open.empty() )
+            {
+                for( const auto& [n, step] : next )
+                {
+                    if( !s.from[n] )
+                    {
+                        s.from[n] = step;
+                        open.push_back( n );
+                    }
+                }
+
+                next.clear();
+                continue;
+            }
+
             const size_t k = open.front();
             open.pop_front();
             s.reached++;
@@ -774,8 +844,15 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
 
                     if( m != l && !s.from[n] && !( track[n] & aMode ) )
                     {
-                        s.from[n] = (uint8_t) ( 11 + l );
-                        open.push_back( n );
+                        if( aFewestVias )
+                        {
+                            next.emplace_back( n, (uint8_t) ( 11 + l ) );
+                        }
+                        else
+                        {
+                            s.from[n] = (uint8_t) ( 11 + l );
+                            open.push_back( n );
+                        }
                     }
                 }
             }
@@ -798,7 +875,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
                            { "cell_mm", pcbIUScale.IUTomm( grid.cell ) },
                            { "obstacles", obstacles.size() } };
 
-    const SEARCH pes = search( PES, START_PES, GOAL_PES );
+    const SEARCH pes = search( PES, START_PES, GOAL_PES, aArgs.value( "fewest_vias", false ) );
 
     if( pes.found )
     {
@@ -985,6 +1062,9 @@ KOPENAPI_REGISTER( "pcb_route_oracle",
                         "via_mm":{"type":"number","exclusiveMinimum":0},
                         "drill_mm":{"type":"number","exclusiveMinimum":0},
                         "vias":{"type":"boolean","default":true},
+                        "layers":{"type":"array","items":{"type":"string"},"description":"copper layers the path may use (default all)"},
+                        "fewest_vias":{"type":"boolean","default":false,"description":"the path with the fewest vias (else the fewest cells, a via one)"},
+                        "no_via_mm":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"description":"boxes [x0, y0, x1, y1] no via may overlap"},
                         "cell_mm":{"type":"number","default":0.025,"minimum":0.005},
                         "max_cells_m":{"type":"number","default":20,"description":"millions of cells per layer at most: the cell grows to fit"}},
                         "required":[]})json"_json,
