@@ -226,6 +226,33 @@ struct GRID_RESULT
     };
 
     std::vector<VARIANT_STATS> variantStats;
+
+    /// @brief The winner's search effort per stage (rounds, legalising, the short again, fewer vias,
+    /// pulling tight) and the rounds' share
+    struct SEARCH_STATS
+    {
+        struct COUNTS
+        {
+            int64_t searches = 0;        ///< tree to an end left
+            int64_t windows = 0;         ///< windows searched (a search widens its window when it fails)
+            int64_t wholeBoard = 0;      ///< windows that took the whole board
+            int64_t overBudget = 0;      ///< windows that ran out of states
+            int64_t failed = 0;          ///< searches that reached no end
+            int64_t seeds = 0;           ///< tree states a window starts from
+            int64_t expanded = 0;        ///< states of all windows
+            int64_t expandedLost = 0;    ///< states of windows whose path was not taken
+            int64_t floods = 0;          ///< reachability floods over the board
+            int64_t floodsShut = 0;      ///< floods that found no end
+            int64_t floodVisited = 0;    ///< states those floods visited
+        };
+
+        std::vector<COUNTS>  byStage = std::vector<COUNTS>( 5 );
+        std::vector<int>     todoByRound;       ///< nets routed in each round
+        std::vector<int64_t> expandedByRound;   ///< states searched in each round
+        std::vector<double>  msByRound;         ///< each round's time
+    };
+
+    SEARCH_STATS searchStats;
     std::vector<int>             crowdedByRound;   ///< the winner's nets still crowded after each round
     std::vector<CROWDING>        crowdedAtEnd;     ///< still crowded when its rounds ended
     std::vector<int64_t>         expandedByStage;   ///< the winner's: rounds, legalising, the short again, fewer vias

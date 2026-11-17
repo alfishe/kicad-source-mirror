@@ -1684,7 +1684,9 @@ public:
                 }
             }
 
-            int taken = 0;
+            int                     taken = 0;
+            const int64_t           roundFrom = m_expanded;
+            const CLOCK::time_point roundAt = CLOCK::now();
 
             for( int n : todo )
             {
@@ -1696,6 +1698,10 @@ public:
                 route( n, pf, false );
                 markNet( n );
             }
+
+            m_stats.todoByRound.push_back( (int) todo.size() );
+            m_stats.expandedByRound.push_back( m_expanded - roundFrom );
+            m_stats.msByRound.push_back( std::chrono::duration<double, std::milli>( CLOCK::now() - roundAt ).count() );
 
             // places fought over cost more from now on
             int          left = 0;
@@ -2160,6 +2166,8 @@ public:
     const std::vector<int64_t>&   ExpandedBy() const { return m_expandedBy; }
     const std::vector<int64_t>&   ExpandedByStage() const { return m_byStage; }
     const std::vector<int>&       ByRound() const { return m_byRound; }
+    const GRID_RESULT::SEARCH_STATS& SearchStats() const { return m_stats; }
+    GRID_RESULT::SEARCH_STATS::COUNTS& counts() { return m_stats.byStage[std::min( (int) m_stage, 4 )]; }
     const std::vector<CROWDING>&  Crowded() const { return m_crowded; }
 
 private:
@@ -3162,6 +3170,7 @@ private:
         const size_t      cells = m_w.cells;
 
         m_stamp++;
+        counts().searches++;
 
         for( int e : aLeft )
         {
@@ -3200,6 +3209,7 @@ private:
         std::vector<uint32_t> best;
         bool                  widened = false;
         bool                  flooded = false;
+        int64_t               bestStates = 0;
         int       margin = std::max( (int) ( pcbIUScale.mmToIU( 2.0 ) / g.cell ), m_oneWindow ? span : span * 3 / 10 );
 
         // far apart: the tiles' distance to the ends guides the search round what is in the way
@@ -3211,13 +3221,26 @@ private:
             const int  x1 = std::min( g.nx - 1, bx1 + margin ), y1 = std::min( g.ny - 1, by1 + margin );
             const bool whole = x0 == 0 && y0 == 0 && x1 == g.nx - 1 && y1 == g.ny - 1;
 
-            const int end = searchIn( aNet, aTree, aLeft, aPf, aHard, x0, y0, x1, y1, aPath );
+            const int64_t windowFrom = m_expanded;
+            const int     end = searchIn( aNet, aTree, aLeft, aPf, aHard, x0, y0, x1, y1, aPath );
+            const int64_t windowStates = m_expanded - windowFrom;
+
+            counts().windows++;
+            counts().expanded += windowStates;
+            counts().wholeBoard += whole;
+            counts().overBudget += m_overBudget;
 
             if( end >= 0 && m_lastCost < bestCost )
             {
+                counts().expandedLost += bestStates;
+                bestStates = windowStates;
                 bestEnd = end;
                 bestCost = m_lastCost;
                 best = aPath;
+            }
+            else
+            {
+                counts().expandedLost += windowStates;
             }
 
             // a path through vias may only be the window's: a detour around it is tried once (not
@@ -3238,6 +3261,8 @@ private:
                     return bestEnd;
                 }
 
+                counts().failed++;
+
                 // a via the keep-out refused is no fixed copper: the stage without it tries again
                 m_walledIn = ( whole || closed ) && !aHard && !m_overBudget && !m_keepRefused && !stopped();
 
@@ -3253,8 +3278,16 @@ private:
                 flooded = true;
                 bool keepRefused = false;
 
-                if( !reachable( aNet, aTree, aHard, keepRefused ) )
+                const int64_t floodFrom = m_expanded;
+                const bool    reached = reachable( aNet, aTree, aLeft, aHard, keepRefused );
+
+                counts().floods++;
+                counts().floodVisited += m_expanded - floodFrom;
+
+                if( !reached )
                 {
+                    counts().floodsShut++;
+                    counts().failed++;
                     // as the whole board's search would have found it: fixed copper alone, or with the keep-out
                     m_walledIn = !aHard && !keepRefused;
                     m_keepWalledIn = !aHard && keepRefused && m_keepOut;
@@ -3378,12 +3411,186 @@ private:
         return m_guides.emplace( std::move( key ), std::move( out ) ).first->second;
     }
 
+    /// @brief reachable() with other nets' copper closed, flooded from the tree and from the ends at
+    /// once, a state from the side with less waiting each time: the side that runs out first decides,
+    /// so an end walled in a pocket costs the pocket, not the board.  The steps from the ends are the
+    /// tree's steps reversed (a state is entered only if open, the corner and via rules are symmetric)
+    bool reachableBoth( int aNet, const std::vector<uint32_t>& aTree, const std::vector<int>& aLeft )
+    {
+        const WORLD::NET& wn = m_w.nets[aNet];
+        const PLAN_GRID&  g = m_w.grid;
+        const size_t      cells = m_w.cells;
+        const int         k = wn.sizes;
+        const int         L = m_w.L;
+        const uint32_t    stamp = m_stamp;
+        const size_t      states = (size_t) L * cells;
+
+        m_flooded.assign( states, false );
+        m_floodedBack.assign( states, false );
+        m_floodTree.assign( states, false );
+        m_floodQueue.clear();
+        m_floodBackQueue.clear();
+
+        auto target = [&]( uint32_t n ) { return m_node[n].target == stamp; };
+
+        auto open = [&]( uint32_t n )
+        {
+            if( target( n ) )
+                return true;
+
+            if( !m_w.TrackOk( k, n, wn.code ) )
+                return false;
+
+            return m_w.InOwnEnd( n, wn.code ) || !m_occTrack[k][n];
+        };
+
+        auto viaPasses = [&]( int i )
+        {
+            return wn.vias && L > 1 && m_w.ViaOk( k, (uint32_t) i, wn.code )
+                   && !( m_keepOut && ( m_w.keep[i] & ~wn.chips ) ) && !m_occVia[k][i];
+        };
+
+        for( uint32_t s : aTree )
+        {
+            if( target( s ) )
+                return true;
+
+            m_floodTree[s] = true;
+
+            if( !m_flooded[s] )
+            {
+                m_flooded[s] = true;
+                m_floodQueue.push_back( s );
+            }
+        }
+
+        for( int e : aLeft )
+        {
+            for( uint32_t s : wn.ends[e] )
+            {
+                if( target( s ) && !m_floodedBack[s] )
+                {
+                    m_floodedBack[s] = true;
+                    m_floodBackQueue.push_back( s );
+                }
+            }
+        }
+
+        // aBack: a step from the ends, to a state the tree may step from
+        auto steps = [&]( uint32_t s, bool aBack, auto&& aTo )
+        {
+            const int l = (int) ( s / cells );
+            const int i = (int) ( s % cells );
+            const int x = i % g.nx, y = i / g.nx;
+
+            for( int d = 0; d < 8; ++d )
+            {
+                const int nx = x + DX[d], ny = y + DY[d];
+
+                if( nx < 0 || ny < 0 || nx >= g.nx || ny >= g.ny )
+                    continue;
+
+                const uint32_t n = (uint32_t) ( (size_t) l * cells + g.Index( nx, ny ) );
+
+                if( d & 1 )
+                {
+                    const uint32_t a = (uint32_t) ( (size_t) l * cells + g.Index( nx, y ) );
+                    const uint32_t b = (uint32_t) ( (size_t) l * cells + g.Index( x, ny ) );
+
+                    if( !m_w.TrackOk( k, a, wn.code ) && !m_w.TrackOk( k, b, wn.code ) )
+                        continue;
+                }
+
+                if( aBack ? ( m_floodTree[n] || open( n ) ) : open( n ) )
+                {
+                    if( aTo( n ) )
+                        return true;
+                }
+            }
+
+            if( viaPasses( i ) )
+            {
+                for( int to = 0; to < L; ++to )
+                {
+                    const uint32_t n = (uint32_t) ( (size_t) to * cells + i );
+
+                    if( to != l && ( aBack ? ( m_floodTree[n] || open( n ) ) : open( n ) ) && aTo( n ) )
+                        return true;
+                }
+            }
+
+            return false;
+        };
+
+        int64_t visited = 0;
+
+        for( size_t qf = 0, qb = 0; qf < m_floodQueue.size() && qb < m_floodBackQueue.size(); )
+        {
+            if( ( ++visited & 65535 ) == 0 && stopped() )
+                break;
+
+            const bool back = m_floodBackQueue.size() - qb < m_floodQueue.size() - qf;
+            bool       met = false;
+
+            if( back )
+            {
+                met = steps( m_floodBackQueue[qb++], true,
+                             [&]( uint32_t n )
+                             {
+                                 if( m_flooded[n] || m_floodTree[n] )
+                                     return true;
+
+                                 if( !m_floodedBack[n] )
+                                 {
+                                     m_floodedBack[n] = true;
+                                     m_floodBackQueue.push_back( n );
+                                 }
+
+                                 return false;
+                             } );
+            }
+            else
+            {
+                met = steps( m_floodQueue[qf++], false,
+                             [&]( uint32_t n )
+                             {
+                                 if( m_floodedBack[n] )
+                                     return true;
+
+                                 if( !m_flooded[n] )
+                                 {
+                                     m_flooded[n] = true;
+                                     m_floodQueue.push_back( n );
+                                 }
+
+                                 return false;
+                             } );
+            }
+
+            if( met )
+            {
+                m_expanded += visited;
+                return true;
+            }
+        }
+
+        m_expanded += visited;
+
+        // stopped: as if reachable, the search itself stops
+        return stopped();
+    }
+
     /// @brief Whether any end marked as a target of the current search can be reached from aTree over
     /// the whole board (aHard: other nets' copper closed).  Its moves are a superset of the A*'s (the
     /// same cells, corners and vias, no turn rule), so false means no window of the search reaches one.  aKeepRefused: it met
     /// a via spot only the chips' keep-out closed
-    bool reachable( int aNet, const std::vector<uint32_t>& aTree, bool aHard, bool& aKeepRefused )
+    bool reachable( int aNet, const std::vector<uint32_t>& aTree, const std::vector<int>& aLeft, bool aHard,
+                    bool& aKeepRefused )
     {
+        // with others' copper closed only the answer counts (no keep-out verdict): from both sides
+        if( aHard )
+            return reachableBoth( aNet, aTree, aLeft );
+
         const WORLD::NET& wn = m_w.nets[aNet];
         const PLAN_GRID&  g = m_w.grid;
         const size_t      cells = m_w.cells;
@@ -3502,7 +3709,15 @@ private:
         const int         L = m_w.L;
         const uint32_t    stamp = m_stamp;
 
-        std::priority_queue<OPEN> open;
+        // a heap as std::priority_queue keeps it (the same push_heap / pop_heap), its storage reused
+        std::vector<OPEN>& open = m_open;
+        open.clear();
+
+        auto push = [&]( const OPEN& aOpen )
+        {
+            open.push_back( aOpen );
+            std::push_heap( open.begin(), open.end() );
+        };
 
         const size_t tiles = (size_t) m_w.tnx * m_w.tny;
 
@@ -3591,7 +3806,8 @@ private:
             m_node[s].g = 0;
             m_node[s].parent = -1;
             m_dir[s] = NO_DIR;
-            open.push( { h( x, y, (int) ( s / cells ) ), 0, s } );
+            push( { h( x, y, (int) ( s / cells ) ), 0, s } );
+            counts().seeds++;
         }
 
         const int64_t budget = 4LL * ( x1 - x0 + 1 ) * ( y1 - y0 + 1 ) * L;
@@ -3599,38 +3815,55 @@ private:
         m_overBudget = false;
         m_hitEdge = false;
 
-        auto cellCost = [&]( uint32_t s ) -> float
+        const int32_t*  track = m_w.track[k].data();
+        const int32_t*  endOf = m_w.endOf.data();
+        const uint16_t* occTrack = m_occTrack[k].data();
+        const float*    hist = m_hist.data();
+        const uint8_t*  rowsAt = m_w.rows.empty() ? nullptr : m_w.rows.data();
+        const uint8_t*  bodyAt = m_w.body.empty() ? nullptr : m_w.body.data();
+        const bool      band = wn.group >= 0 && !m_band.empty();
+        const int32_t   code = wn.code;
+        NODE*           node = m_node.data();
+        uint8_t*        dirs = m_dir.data();
+
+        auto trackOk = [&]( uint32_t aState )
         {
-            if( m_w.InOwnEnd( s, wn.code ) )
+            const int32_t id = track[aState];
+            return id == 0 || id == code;
+        };
+
+        // aCell: the state's cell
+        auto cellCost = [&]( uint32_t s, uint32_t aCell ) -> float
+        {
+            if( endOf[s] == code )
                 return 1.0f;
 
-            const uint16_t occ = m_occTrack[k][s];
-            const float    hug = !occ && wn.group >= 0 && !m_band.empty() && m_band[s] && m_bandGroup[s] == wn.group + 1
-                                         ? m_params.hug
-                                         : 1.0f;
+            const uint16_t occ = occTrack[s];
+            const float    hug = !occ && band && m_band[s] && m_bandGroup[s] == wn.group + 1 ? m_params.hug : 1.0f;
 
-            const float rows = ( !m_w.rows.empty() && m_w.rows[s % cells] ? m_params.rowsCost : 1.0f )
-                               * ( !m_w.body.empty() && m_w.body[s % cells] ? m_params.bodyCost : 1.0f );
+            const float rows = ( rowsAt && rowsAt[aCell] ? m_params.rowsCost : 1.0f )
+                               * ( bodyAt && bodyAt[aCell] ? m_params.bodyCost : 1.0f );
 
             if( aHard )
                 return occ ? -1.0f : hug * rows;
 
-            return ( 1.0f + m_hist[s] ) * ( 1.0f + aPf * occ ) * hug * rows;
+            return ( 1.0f + hist[s] ) * ( 1.0f + aPf * occ ) * hug * rows;
         };
 
         while( !open.empty() )
         {
-            const OPEN top = open.top();
-            open.pop();
+            const OPEN top = open.front();
+            std::pop_heap( open.begin(), open.end() );
+            open.pop_back();
 
-            if( top.g > m_node[top.s].g )
+            if( top.g > node[top.s].g )
                 continue;
 
-            if( m_node[top.s].target == stamp )
+            if( node[top.s].target == stamp )
             {
                 aPath.clear();
 
-                for( int64_t s = top.s; s >= 0; s = m_node[s].parent )
+                for( int64_t s = top.s; s >= 0; s = node[s].parent )
                     aPath.push_back( (uint32_t) s );
 
                 std::reverse( aPath.begin(), aPath.end() );
@@ -3649,21 +3882,24 @@ private:
             const int      l = (int) ( s / cells );
             const int      i = (int) ( s % cells );
             const int      x = i % g.nx, y = i / g.nx;
-            const int      dir = m_dir[s];
+            const int      dir = dirs[s];
+            const size_t   layerAt = (size_t) l * cells;
             const int      pref = m_v.direction.empty() ? 0 : m_v.direction[l];
 
             auto relax = [&]( uint32_t n, float cost, int nd, int nx, int ny, int nl )
             {
                 const float ng = top.g + cost;
 
-                if( m_node[n].seen == stamp && ng >= m_node[n].g )
+                NODE& to = node[n];
+
+                if( to.seen == stamp && ng >= to.g )
                     return;
 
-                m_node[n].seen = stamp;
-                m_node[n].g = ng;
-                m_node[n].parent = (int32_t) s;
-                m_dir[n] = (uint8_t) nd;
-                open.push( { ng + h( nx, ny, nl ), ng, n } );
+                to.seen = stamp;
+                to.g = ng;
+                to.parent = (int32_t) s;
+                dirs[n] = (uint8_t) nd;
+                push( { ng + h( nx, ny, nl ), ng, n } );
             };
 
             for( int d = 0; d < 8; ++d )
@@ -3688,23 +3924,24 @@ private:
                         continue;
                 }
 
-                const uint32_t n = (uint32_t) ( (size_t) l * cells + g.Index( nx, ny ) );
-                const bool     target = m_node[n].target == stamp;
+                const uint32_t cell = (uint32_t) g.Index( nx, ny );
+                const uint32_t n = (uint32_t) ( layerAt + cell );
+                const bool     target = node[n].target == stamp;
 
-                if( !target && !m_w.TrackOk( k, n, wn.code ) )
+                if( !target && !trackOk( n ) )
                     continue;
 
                 // a diagonal step may not cut the corner between two closed cells
                 if( d & 1 )
                 {
-                    const uint32_t a = (uint32_t) ( (size_t) l * cells + g.Index( x + DX[d], y ) );
-                    const uint32_t b = (uint32_t) ( (size_t) l * cells + g.Index( x, y + DY[d] ) );
+                    const uint32_t a = (uint32_t) ( layerAt + g.Index( x + DX[d], y ) );
+                    const uint32_t b = (uint32_t) ( layerAt + g.Index( x, y + DY[d] ) );
 
-                    if( !m_w.TrackOk( k, a, wn.code ) && !m_w.TrackOk( k, b, wn.code ) )
+                    if( !trackOk( a ) && !trackOk( b ) )
                         continue;
                 }
 
-                const float c = target ? 1.0f : cellCost( n );
+                const float c = target ? 1.0f : cellCost( n, cell );
 
                 if( c < 0 )
                     continue;
@@ -3742,10 +3979,12 @@ private:
 
                     const uint32_t n = (uint32_t) ( (size_t) to * cells + i );
 
-                    if( m_node[n].target != stamp && !m_w.TrackOk( k, n, wn.code ) )
+                    const bool target = node[n].target == stamp;
+
+                    if( !target && !trackOk( n ) )
                         continue;
 
-                    const float c = m_node[n].target == stamp ? 1.0f : cellCost( n );
+                    const float c = target ? 1.0f : cellCost( n, (uint32_t) i );
 
                     if( c < 0 )
                         continue;
@@ -3820,8 +4059,12 @@ private:
 
     END_INDEX             m_endIndex;
     std::vector<NODE>     m_node;
+    std::vector<OPEN>     m_open;   ///< searchIn's heap
     std::vector<bool>     m_flooded;      ///< reachable(): states reached
     std::vector<uint32_t> m_floodQueue;
+    std::vector<bool>     m_floodedBack;     ///< reachableBoth(): states reached from the ends
+    std::vector<bool>     m_floodTree;       ///< reachableBoth(): the tree's states
+    std::vector<uint32_t> m_floodBackQueue;
     std::vector<uint8_t>  m_dir;
     std::vector<int>      m_targetEnd;
     uint32_t              m_stamp = 0;
@@ -3891,6 +4134,7 @@ private:
     std::vector<int64_t>   m_byStage;      ///< search states: rounds, legalising, the short again, fewer vias
     std::vector<CROWDING>  m_crowded;   ///< nets still crowded when the rounds ended
     int64_t                m_expanded = 0;
+    GRID_RESULT::SEARCH_STATS m_stats;
 
     const GRID_TIMELINE*   m_timeline = nullptr;
     GRID_LANE*             m_lane = nullptr;
@@ -4725,6 +4969,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     result.crowdedAtEnd = win.Crowded();
 
     result.expandedByStage = win.ExpandedByStage();
+    result.searchStats = win.SearchStats();
 
     for( size_t n = 0; n < world.nets.size(); ++n )
         result.costliest.emplace_back( world.nets[n].code, win.ExpandedBy()[n] );
