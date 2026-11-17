@@ -15550,6 +15550,32 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     { "half_cell", { { "tried", gr.halfCellTried }, { "won", gr.halfCellWon }, { "ms", std::round( gr.halfCellMs * 10 ) / 10 } } },
                     { "guard_ms", std::round( msSince( guardFrom ) ) }, { "rejected", rejected },
                     { "costliest", costliest }, { "expanded_by_stage", gr.expandedByStage }, { "bundles", bundlesUsed },
+                    { "search", [&]()
+                      {
+                          const GRID_RESULT::SEARCH_STATS& st = gr.searchStats;
+                          std::vector<double>              ms;
+
+                          for( double v : st.msByRound )
+                              ms.push_back( std::round( v ) );
+
+                          static const char* const stages[] = { "rounds", "legalise", "short_again", "fewer_vias",
+                                                                "pull_tight" };
+                          nlohmann::json byStage = nlohmann::json::object();
+
+                          for( size_t i = 0; i < st.byStage.size(); ++i )
+                          {
+                              const GRID_RESULT::SEARCH_STATS::COUNTS& c = st.byStage[i];
+                              byStage[stages[i]] = { { "searches", c.searches }, { "windows", c.windows },
+                                                     { "whole_board", c.wholeBoard }, { "over_budget", c.overBudget },
+                                                     { "failed", c.failed }, { "seeds", c.seeds },
+                                                     { "expanded", c.expanded }, { "expanded_lost", c.expandedLost },
+                                                     { "floods", c.floods }, { "floods_shut", c.floodsShut },
+                                                     { "flood_visited", c.floodVisited } };
+                          }
+
+                          return nlohmann::json{ { "by_stage", byStage }, { "todo_by_round", st.todoByRound },
+                                                 { "expanded_by_round", st.expandedByRound }, { "ms_by_round", ms } };
+                      }() },
                     { "timeline", timelineOut } };
 
         if( detailStage )
@@ -24874,7 +24900,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "via_near_hole_mm":{"type":"number","default":2.5,"description":"grid: a via nearer a through-hole pad or via of its own net than this costs more, linearly to the hole (the hole is on every layer: start on the layer needed there); 0 off"},
                         "via_near_hole_cost_mm":{"type":"number","default":6,"description":"grid: a via at its own net's through hole costs as much more as this length of track"},
                         "hug":{"type":"number","default":1,"description":"grid: cost factor of a cell beside the copper of the net's own bundle (1: no pull; below 1 so far lowers cohesion, adds vias and time)"},
-                        "astar":{"type":"number","default":1.2,"description":"grid: weight of the distance left in the search (1: cheapest paths; more: fewer states searched, paths a little longer)"},
+                        "astar":{"type":"number","default":1.2,"description":"grid: weight of the distance left in the search (1: cheapest paths; more: fewer states on an open board, but more where it is crowded: picogus 1.5 searched 2.6 times the states)"},
                         "pf_start":{"type":"number","default":1.0,"description":"grid: price of sharing a cell in the first negotiation round"},
                         "pf_growth":{"type":"number","default":1.6,"description":"grid: how much that price grows each round (more: fewer rounds, longer detours)"},
                         "record":{"type":"boolean","default":false,"description":"grid: keep every variant's steps for pcb_route_timeline"},
