@@ -3158,7 +3158,17 @@ private:
         float    g;
         uint32_t s;
 
-        bool operator<( const OPEN& o ) const { return f != o.f ? f > o.f : g < o.g; }
+        // a total order: the cheapest first, then the deepest, then the lowest state
+        bool operator<( const OPEN& o ) const
+        {
+            if( f != o.f )
+                return f > o.f;
+
+            if( g != o.g )
+                return g < o.g;
+
+            return s > o.s;
+        }
     };
 
     /// @brief A* from the tree to the nearest of the ends left, in a window that grows when it fails
@@ -3709,7 +3719,7 @@ private:
         const int         L = m_w.L;
         const uint32_t    stamp = m_stamp;
 
-        // a heap as std::priority_queue keeps it (the same push_heap / pop_heap), its storage reused
+        // OPEN's order is total: any queue pops the same
         std::vector<OPEN>& open = m_open;
         open.clear();
 
