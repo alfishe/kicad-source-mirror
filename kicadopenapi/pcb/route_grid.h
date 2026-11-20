@@ -244,6 +244,10 @@ struct GRID_RESULT
             int64_t floods = 0;          ///< reachability floods over the board
             int64_t floodsShut = 0;      ///< floods that found no end
             int64_t floodVisited = 0;    ///< states those floods visited
+            int64_t widenedEmpty = 0;    ///< states of windows that found nothing and were widened
+            int64_t widenedThrough = 0;  ///< states of windows whose via path was tried again wider
+            int64_t detours = 0;         ///< wider windows tried after a via path
+            int64_t detoursWon = 0;      ///< of them, the ones that found a cheaper path
         };
 
         std::vector<COUNTS>  byStage = std::vector<COUNTS>( 5 );

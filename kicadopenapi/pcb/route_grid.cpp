@@ -3240,8 +3240,11 @@ private:
             counts().wholeBoard += whole;
             counts().overBudget += m_overBudget;
 
+            counts().detours += widened;
+
             if( end >= 0 && m_lastCost < bestCost )
             {
+                counts().detoursWon += widened;
                 counts().expandedLost += bestStates;
                 bestStates = windowStates;
                 bestEnd = end;
@@ -3254,10 +3257,12 @@ private:
             }
 
             // a path through vias may only be the window's: a detour around it is tried once (not
-            // when the search never met the window's edge: a wider one finds the same)
-            bool through = false;
+            // when the search never met the window's edge: a wider one finds the same).  In the rounds
+            // only in the last: each round before routes the net again anyway
+            const bool detour = m_stage != STAGE_ROUNDS || m_round >= m_firstRound + m_params.maxRounds - 1;
+            bool       through = false;
 
-            for( size_t k = 1; end >= 0 && k < aPath.size() && !through; ++k )
+            for( size_t k = 1; detour && end >= 0 && k < aPath.size() && !through; ++k )
                 through = aPath[k] % cells == aPath[k - 1] % cells;
 
             // a search that never reached the window's edge is the whole board's
@@ -3305,6 +3310,7 @@ private:
                 }
             }
 
+            ( end >= 0 ? counts().widenedThrough : counts().widenedEmpty ) += windowStates;
             widened = widened || end >= 0;
 
             margin = margin * 2 + 1;
