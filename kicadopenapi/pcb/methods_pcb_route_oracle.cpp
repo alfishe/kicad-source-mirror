@@ -416,7 +416,12 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
             obstacles.push_back( { t, UNDEFINED_LAYER, 0, 0 } );
     }
 
-    for( ZONE* zone : aBoard->Zones() )
+    std::vector<ZONE*> zones( aBoard->Zones().begin(), aBoard->Zones().end() );
+
+    for( FOOTPRINT* fp : aBoard->Footprints() )
+        zones.insert( zones.end(), fp->Zones().begin(), fp->Zones().end() );
+
+    for( ZONE* zone : zones )
     {
         if( zone->GetIsRuleArea() )
         {
@@ -483,7 +488,7 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
         {
             if( ruleArea )
             {
-                aPoly = *static_cast<ZONE*>( o.item )->Outline();
+                aPoly = static_cast<ZONE*>( o.item )->GetBoardOutline();
 
                 if( aGrow > 0 )
                     aPoly.Inflate( aGrow, CORNER_STRATEGY::ROUND_ALL_CORNERS, aMaxError );
@@ -1000,7 +1005,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
                 SHAPE_POLY_SET poly;
 
                 if( o.item->Type() == PCB_ZONE_T && static_cast<ZONE*>( o.item )->GetIsRuleArea() )
-                    poly = *static_cast<ZONE*>( o.item )->Outline();
+                    poly = static_cast<ZONE*>( o.item )->GetBoardOutline();
                 else
                     o.item->TransformShapeToPolygon( poly, o.layer, std::max( o.trackReach - diag, 0 ), maxError, ERROR_INSIDE );
 
