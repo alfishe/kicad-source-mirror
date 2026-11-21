@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -847,13 +848,99 @@ static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     const int DY[8] = { 0, 0, 1, -1, 1, -1, 1, -1 };
 
     // aFewestVias: in rounds, round k a breadth-first search on the layers from the states k vias reach,
-    // so the path found has the fewest vias, the shortest way per round
-    auto search = [&]( uint8_t aMode, uint8_t aStart, uint8_t aGoal, bool aFewestVias = false )
+    // so the path found has the fewest vias, the shortest way per round. aViaCost >= 0: the least cost,
+    // a straight step 5, a diagonal 7, a via aViaCost (a bucket queue)
+    auto search = [&]( uint8_t aMode, uint8_t aStart, uint8_t aGoal, bool aFewestVias = false, int aViaCost = -1 )
     {
         SEARCH             s;
         std::deque<size_t> open;
         std::vector<std::pair<size_t, uint8_t>> next;   // a via's far state, its step in
         s.from.assign( cells * L, 0 );
+
+        if( aViaCost >= 0 )
+        {
+            const uint32_t                   viaStep = (uint32_t) std::max( aViaCost, 1 );
+            const size_t                     ring = std::max<size_t>( 7, viaStep ) + 1;
+            std::vector<uint32_t>            dist( cells * L, UINT32_MAX );
+            std::vector<std::vector<size_t>> buckets( ring );
+            size_t                           pending = 0;
+
+            for( size_t k = 0; k < cells * L; ++k )
+            {
+                if( ( track[k] & aStart ) && !( track[k] & aMode ) )
+                {
+                    dist[k] = 0;
+                    s.from[k] = 10;
+                    buckets[0].push_back( k );
+                    pending++;
+                }
+            }
+
+            auto relax = [&]( size_t aState, uint32_t aCost, uint8_t aStep )
+            {
+                if( aCost < dist[aState] && s.from[aState] != 10 )
+                {
+                    dist[aState] = aCost;
+                    s.from[aState] = aStep;
+                    buckets[aCost % ring].push_back( aState );
+                    pending++;
+                }
+            };
+
+            for( uint32_t cost = 0; pending; ++cost )
+            {
+                std::vector<size_t>& bucket = buckets[cost % ring];
+
+                while( !bucket.empty() )
+                {
+                    const size_t k = bucket.back();
+                    bucket.pop_back();
+                    pending--;
+
+                    if( dist[k] != cost )
+                        continue;
+
+                    s.reached++;
+
+                    if( track[k] & aGoal )
+                    {
+                        s.found = true;
+                        s.goalState = k;
+                        return s;
+                    }
+
+                    const int    l = (int) ( k / cells );
+                    const size_t i = k % cells;
+                    const int    x = (int) ( i % grid.nx ), y = (int) ( i / grid.nx );
+
+                    for( int d = 0; d < 8; ++d )
+                    {
+                        const int nx = x + DX[d], ny = y + DY[d];
+
+                        if( nx < 0 || ny < 0 || nx >= grid.nx || ny >= grid.ny )
+                            continue;
+
+                        const size_t n = (size_t) l * cells + (size_t) ny * grid.nx + nx;
+
+                        if( !( track[n] & aMode ) )
+                            relax( n, cost + ( d < 4 ? 5 : 7 ), (uint8_t) ( d + 1 ) );
+                    }
+
+                    if( vias && !( via[i] & aMode ) )
+                    {
+                        for( int m = 0; m < L; ++m )
+                        {
+                            const size_t n = (size_t) m * cells + i;
+
+                            if( m != l && !( track[n] & aMode ) )
+                                relax( n, cost + viaStep, (uint8_t) ( 11 + l ) );
+                        }
+                    }
+                }
+            }
+
+            return s;
+        }
 
         for( size_t k = 0; k < cells * L; ++k )
         {
@@ -1235,7 +1322,10 @@ static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         return nlohmann::json( { { "stretches", stretches }, { "first", list } } );
     };
 
-    const SEARCH pes = search( PES, START_PES, GOAL_PES, aArgs.value( "fewest_vias", false ) );
+    const int    viaCost = aArgs.contains( "via_cost_mm" )
+                               ? (int) std::lround( aArgs["via_cost_mm"].get<double>() * pcbIUScale.mmToIU( 1 ) / grid.cell * 5 )
+                               : -1;
+    const SEARCH pes = search( PES, START_PES, GOAL_PES, aArgs.value( "fewest_vias", false ), viaCost );
 
     // the path from a seed to aState in aSearch's tree: corners where the step changes, a via where the
     // layer does
@@ -1577,6 +1667,7 @@ KOPENAPI_REGISTER( "pcb_route_oracle",
                         "vias":{"type":"boolean","default":true},
                         "layers":{"type":"array","items":{"type":"string"},"description":"copper layers the path may use (default all)"},
                         "fewest_vias":{"type":"boolean","default":false,"description":"the path with the fewest vias (else the fewest cells, a via one)"},
+                        "via_cost_mm":{"type":"number","minimum":0,"description":"the path of the least length plus this per via (a diagonal step its length); before fewest_vias"},
                         "no_via_mm":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"description":"boxes [x0, y0, x1, y1] no via may overlap"},
                         "kept_ways":{"type":"array","items":{"type":"object","properties":{"layer":{"type":"string"},"a":{"type":"array","items":{"type":"number"}},"b":{"type":"array","items":{"type":"number"}},"width_mm":{"type":"number"},"clearance_mm":{"type":"number"}}},"description":"ways out kept open for other pads: segments a to b of that width on that layer, which no copper of this net may come within clearance_mm of"},
                         "cell_mm":{"type":"number","default":0.025,"minimum":0.005},

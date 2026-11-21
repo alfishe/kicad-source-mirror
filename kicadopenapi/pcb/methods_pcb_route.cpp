@@ -16829,7 +16829,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             nlohmann::json& row = results[rowOf[index]];
             nlohmann::json  args = { { "from", padName( job.from ) }, { "width_mm", toMm( width ) }, { "vias", viasAllowed },
-                                     { "fewest_vias", true },
+                                     { "via_cost_mm", aArgs.value( "oracle_via_cost_mm", 2.0 ) },
                                      { "zones_yield", aArgs.value( "zones", std::string( "refill" ) ) == "refill" } };
 
             args["layers"] = nlohmann::json::array();
@@ -16946,6 +16946,28 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 row["oracle_reason"] = offLayers ? "the path runs on a layer this call does not route on" : "no path";
                 continue;
+            }
+
+            // a path many times the straight way is no route to lay (a loop round half the board)
+            {
+                double length = 0;
+
+                for( size_t k = 1; k < path.size(); ++k )
+                    length += ( path[k].first - path[k - 1].first ).EuclideanNorm();
+
+                const double direct = std::max( (double) ( path.back().first - path.front().first ).EuclideanNorm(),
+                                                (double) pcbIUScale.mmToIU( 1 ) );
+                const double cap = aArgs.value( "oracle_max_detour", 5.0 );
+                row["oracle_detour"] = std::round( length / direct * 100.0 ) / 100.0;
+
+                if( cap > 0 && length > cap * direct )
+                {
+                    char said[128];
+                    std::snprintf( said, sizeof( said ), "the oracle's path is %.2f times the straight way (oracle_max_detour %.2f)",
+                                   length / direct, cap );
+                    row["oracle_reason"] = std::string( said );
+                    continue;
+                }
             }
 
             // its ends lie on the islands' copper: the start on the from pad's, the end off it
@@ -25092,6 +25114,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
                         "oracle_pass":{"type":"boolean","default":true,"description":"a connection still open after every pass, the grid engine's too (not a differential pair's nets) gets a last try along the path pcb_route_oracle proves at the narrowest track the rules allow the net at either end (the class width with neck_down off): smoothed to lines at 0/45/90 degrees where the guard lets them, laid by the router through those corners and widened back as the narrowest try is (profile.pass oracle); the oracle's path has the fewest vias, on the call's layers, none in a chip's ring of pins (as the plan). The row says engine oracle when it routes; oracle_verdict (routable, unknown, unroutable) and oracle_reason when not; oracle_args, the arguments it asked pcb_route_oracle with; oracle_refused, why the guard refused the path's line on from where it stopped (walls_way_out_of a pad, or the guard's violations)"},
                         "oracle_exact":{"type":"boolean","default":false,"description":"the oracle's pass lays its smoothed path as it is (tracks through its corners, a through via at each layer change), not through the router first; the router's line is laid that way anyway when the guard rejects it"},
+                        "oracle_via_cost_mm":{"type":"number","minimum":0,"default":2,"description":"the oracle's pass asks for the path of the least length plus this per via"},
+                        "oracle_max_detour":{"type":"number","minimum":0,"default":5,"description":"the oracle's pass leaves a connection open when its path is longer than this many times the straight way between its ends (0: no cap)"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (as dense_first says) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. auto also gives a connection still open after the rip-up rounds one last try (profile.pass narrowest; not a differential pair's nets) at the narrowest track the rules allow the net at either end (a pinch the class width does not pass), its pieces widened back to the class (else to a custom rule's min there) wherever the guard lets them; a piece left below a track_width rule's min refuses the try; the row says narrowest_mm (widths_mm, narrow_kept_mm) when it routes, narrowest_reason when not. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
                         "inward_escapes":{"default":"auto","description":"packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). auto (default): every package whose pad row rings its exposed pad (pads inside the exposed pad's box, as its copy on another layer, are not row pads); a list of footprint references: only those ([]: none). 404 an unknown reference, 400 a listed part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad); after the rip-up rounds, a connection still open that such a way out refused, or with an end near one kept for a pad whose connections are given up, tries once more without those ways out (row ways_out_given_up when it routes, given_up_reason when not). false: no such room kept"},"corridor_guard":{"type":"boolean","default":false,"description":"with escapes: past such a way out, while other copper stands a track and its clearance to both sides of it (a corridor between stubs), a route that shuts the corridor before either side opens is refused as well (reason: wall in ... along the copper beside it)"},
                         "via_cost_mm":{"type":"number","minimum":0,"description":"mm of track a via costs the plan, the grid and the clean-up; default from the rules: the routing room a via of the default class takes on each signal layer, as track (the answer's via_cost_mm)"},
