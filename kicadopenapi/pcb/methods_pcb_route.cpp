@@ -15574,7 +15574,11 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                                      { "widened_empty", c.widenedEmpty },
                                                      { "widened_through", c.widenedThrough },
                                                      { "detours", c.detours },
-                                                     { "detours_won", c.detoursWon } };
+                                                     { "detours_won", c.detoursWon },
+                                                     { "redone", c.redone }, { "kept", c.kept },
+                                                     { "none_saved", c.noneSaved }, { "joined_less", c.joinedLess },
+                                                     { "too_long", c.tooLong }, { "kept_states", c.keptStates },
+                                                     { "dropped_states", c.droppedStates } };
                           }
 
                           return nlohmann::json{ { "by_stage", byStage }, { "todo_by_round", st.todoByRound },

@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <climits>
 #include <cstdio>
+#include <functional>
 #include <future>
 #include <limits>
 #include <map>
@@ -1875,18 +1876,40 @@ public:
             const double oldLength = length( old );
             const long   oldReached = std::count( old.reached.begin(), old.reached.end(), true );
 
+            const int64_t redoFrom = m_expanded;
+
+            // the rest only adds vias and length: dropped for sure once no via is saved, or once longer
+            // than the vias it may still save allow
+            auto giveUp = [&]( const NET_STATE& aNow )
+            {
+                if( aNow.vias.size() >= old.vias.size() )
+                    return true;
+
+                return length( aNow ) - oldLength > perVia * (double) ( old.vias.size() - aNow.vias.size() );
+            };
+
             unmark( n );
             m_viaScale = 6.0f;
             m_oneWindow = true;
-            route( n, 0, true );
+            route( n, 0, true, giveUp );
             m_oneWindow = false;
             m_viaScale = 1.0f;
 
             const NET_STATE& now = m_nets[n];
             const size_t     saved = old.vias.size() > now.vias.size() ? old.vias.size() - now.vias.size() : 0;
+            const bool       joinedLess = std::count( now.reached.begin(), now.reached.end(), true ) < oldReached;
+            const bool       tooLong = length( now ) - oldLength > perVia * saved;
 
-            if( saved == 0 || std::count( now.reached.begin(), now.reached.end(), true ) < oldReached
-                || length( now ) - oldLength > perVia * saved )
+            const bool       drop = saved == 0 || joinedLess || tooLong;
+
+            counts().redone++;
+            counts().noneSaved += saved == 0;
+            counts().joinedLess += saved > 0 && joinedLess;
+            counts().tooLong += saved > 0 && !joinedLess && tooLong;
+            counts().kept += !drop;
+            ( drop ? counts().droppedStates : counts().keptStates ) += m_expanded - redoFrom;
+
+            if( drop )
             {
                 m_nets[n].paths = std::move( old.paths );
                 m_nets[n].vias = std::move( old.vias );
@@ -3074,20 +3097,21 @@ private:
             touchChanged( aNet );
     }
 
-    void route( int aNet, float aPf, bool aHard )
+    /// @param aGiveUp asked after each connection: true stops the net there (its copper is not wanted)
+    void route( int aNet, float aPf, bool aHard, const std::function<bool( const NET_STATE& )>& aGiveUp = {} )
     {
         const int64_t before = m_expanded;
 
         if( replaying() )
             takeRecorded( aNet );
         else
-            routeTree( aNet, aPf, aHard );
+            routeTree( aNet, aPf, aHard, aGiveUp );
 
         m_expandedBy[aNet] += m_expanded - before;
     }
 
     /// @brief The net as a tree: from its first end, each time to the nearest end left
-    void routeTree( int aNet, float aPf, bool aHard )
+    void routeTree( int aNet, float aPf, bool aHard, const std::function<bool( const NET_STATE& )>& aGiveUp )
     {
         const WORLD::NET& wn = m_w.nets[aNet];
         NET_STATE&        net = m_nets[aNet];
@@ -3149,6 +3173,9 @@ private:
             tree.insert( tree.end(), path.begin(), path.end() );
             tree.insert( tree.end(), wn.ends[end].begin(), wn.ends[end].end() );
             net.paths.push_back( std::move( path ) );
+
+            if( aGiveUp && !left.empty() && aGiveUp( net ) )
+                break;
         }
     }
 
