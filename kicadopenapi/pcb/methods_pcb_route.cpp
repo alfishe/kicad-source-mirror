@@ -16773,7 +16773,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             nlohmann::json& row = results[rowOf[index]];
             nlohmann::json  args = { { "from", padName( job.from ) }, { "width_mm", toMm( width ) }, { "vias", viasAllowed },
-                                     { "fewest_vias", true } };
+                                     { "fewest_vias", true },
+                                     { "zones_yield", aArgs.value( "zones", std::string( "refill" ) ) == "refill" } };
 
             args["layers"] = nlohmann::json::array();
 

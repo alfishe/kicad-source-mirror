@@ -37,6 +37,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <optional>
 #include <functional>
 #include <queue>
 #include <set>
@@ -228,6 +229,7 @@ struct OBSTACLE
     PCB_LAYER_ID layer;     // UNDEFINED_LAYER: a hole (every layer)
     int          trackReach;
     int          viaReach;
+    bool         anyNet = false;    // shuts every net, its own too
 };
 
 
@@ -403,6 +405,16 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
         {
             addCopper( pad );
 
+            // no via in a pad without a hole, of its own net neither
+            if( vias && !pad->HasHole() && ( aSkipNet <= 0 || pad->GetNetCode() == aSkipNet ) )
+            {
+                for( const PCB_LAYER_ID layer : aLayers )
+                {
+                    if( pad->IsOnLayer( layer ) && pad->FlashLayer( layer ) )
+                        obstacles.push_back( { pad, layer, -1, viaRadius, true } );
+                }
+            }
+
             if( pad->HasHole() )
                 obstacles.push_back( { pad, UNDEFINED_LAYER, 0, 0 } );
         }
@@ -438,7 +450,7 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
         }
     }
 
-    for( const OBSTACLE& o : obstacles )
+    for( OBSTACLE& o : obstacles )
     {
         if( o.layer == UNDEFINED_LAYER )
         {
@@ -460,6 +472,7 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
             if( !( owner == aSkipNet && aSkipNet > 0 ) )
             {
                 const int hc = clearance( &probeTrack, o.item, aLayers[0], HOLE_CLEARANCE_CONSTRAINT, ds.m_HoleClearance );
+                o.trackReach = hc + halfWidth;
 
                 for( int l = 0; l < L; ++l )
                     mark( owner, l, hc + halfWidth, shape );
@@ -469,11 +482,13 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
             {
                 // hole to hole for any net; another net's hole also keeps hole clearance from the via's ring
                 const int h2h = clearance( &probeVia, o.item, aLayers[0], HOLE_TO_HOLE_CONSTRAINT, ds.m_HoleToHoleMin );
+                o.viaReach = h2h + aProbe.viaDrill / 2;
                 mark( -1, -1, h2h + aProbe.viaDrill / 2, shape );
 
                 if( !( owner == aSkipNet && aSkipNet > 0 ) )
                 {
                     const int hv = clearance( &probeVia, o.item, aLayers[0], HOLE_CLEARANCE_CONSTRAINT, ds.m_HoleClearance );
+                    o.viaReach = std::max( o.viaReach, hv + aProbe.viaDia / 2 );
                     mark( owner, -1, hv + aProbe.viaDia / 2, shape );
                 }
             }
@@ -499,7 +514,7 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
             o.item->TransformShapeToPolygon( aPoly, o.layer, aGrow, aMaxError, aLoc );
         };
 
-        const int owner = ruleArea ? -1 : ownerOf( o.item );
+        const int owner = ruleArea || o.anyNet ? -1 : ownerOf( o.item );
 
         if( o.trackReach >= 0 )
             mark( owner, l, o.trackReach, shape );
@@ -514,7 +529,21 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
 } // namespace
 
 
-static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+/// A finer search over a window of a connection the whole-board grids leave undecided: the coarse grid
+/// and its pessimistic rooms of the start and of the goal (per state) seed the window's ends; path: the
+/// window's path, corners and layer indices, when found
+struct ORACLE_WINDOW
+{
+    BOX2I                                         box;
+    int                                           cell = 0;
+    ORACLE_GRID                                   coarse;
+    const std::vector<uint8_t>*                   startRoom = nullptr;
+    const std::vector<uint8_t>*                   goalRoom = nullptr;
+    mutable std::vector<std::pair<VECTOR2I, int>> path;
+};
+
+
+static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ORACLE_WINDOW* aWindow )
 {
     std::shared_ptr<PCB_CONTEXT> context = KopenapiPcbContext( aCtx );
 
@@ -641,8 +670,8 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
 
     // the grid over the whole board: the asked cell, coarser when it would pass the cell budget
     ORACLE_GRID grid;
-    const BOX2I edges = outline.BBox();
-    grid.cell = pcbIUScale.mmToIU( std::max( 0.005, aArgs.value( "cell_mm", 0.025 ) ) );
+    const BOX2I edges = aWindow ? aWindow->box : outline.BBox();
+    grid.cell = aWindow ? aWindow->cell : pcbIUScale.mmToIU( std::max( 0.005, aArgs.value( "cell_mm", 0.025 ) ) );
     const double budget = aArgs.value( "max_cells_m", 20.0 ) * 1e6;
 
     while( (double) edges.GetWidth() / grid.cell * edges.GetHeight() / grid.cell > budget )
@@ -651,6 +680,9 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
     grid.origin = edges.GetOrigin();
     grid.nx = edges.GetWidth() / grid.cell + 1;
     grid.ny = edges.GetHeight() / grid.cell + 1;
+
+    if( aWindow && grid.cell >= aWindow->coarse.cell )
+        return KOPENAPI_RESULT::Ok( { { "verdict", "unknown" } } );
 
     const size_t cells = grid.Cells();
     const int    maxError = std::max( 1, grid.cell / 8 );
@@ -698,7 +730,8 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
     probe.viaDrill = viaDrill;
     probe.vias = vias;
 
-    const std::vector<OBSTACLE> obstacles = rasteriseObstacles( board, layers, grid, outline, diag, maxError, probe, net, { OPT, PES }, false,
+    const std::vector<OBSTACLE> obstacles = rasteriseObstacles( board, layers, grid, outline, diag, maxError, probe, net, { OPT, PES },
+                                                                aArgs.value( "zones_yield", true ),
             [&]( int, int aLayer, size_t aCell, uint8_t aMode )
             {
                 if( aLayer < 0 )
@@ -871,6 +904,37 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
     seeds( islandA, PES, START_PES );
     seeds( islandB, PES, GOAL_PES );
 
+    // a window: its cells inside the coarse grid's rooms are ends too (a coarse pessimistic cell is clear
+    // at every point, so a fine cell in it is)
+    if( aWindow )
+    {
+        const ORACLE_GRID& c = aWindow->coarse;
+        const size_t       coarseCells = c.Cells();
+
+        for( int l = 0; l < L; ++l )
+        {
+            for( int y = 0; y < grid.ny; ++y )
+            {
+                for( int x = 0; x < grid.nx; ++x )
+                {
+                    const VECTOR2I at = grid.Centre( x, y ) - c.origin;
+
+                    if( at.x < 0 || at.y < 0 || at.x / c.cell >= c.nx || at.y / c.cell >= c.ny )
+                        continue;
+
+                    const size_t ck = (size_t) l * coarseCells + (size_t) ( at.y / c.cell ) * c.nx + at.x / c.cell;
+                    const size_t k = (size_t) l * cells + (size_t) y * grid.nx + x;
+
+                    if( ( *aWindow->startRoom )[ck] )
+                        track[k] |= START_PES;
+
+                    if( ( *aWindow->goalRoom )[ck] )
+                        track[k] |= GOAL_PES;
+                }
+            }
+        }
+    }
+
     nlohmann::json out = { { "net", str( UnescapeString( from->GetNetname() ) ) },
                            { "from", itemName( from ) },
                            { "to", to ? nlohmann::json( itemName( to ) ) : nlohmann::json( "the net's other islands" ) },
@@ -880,22 +944,272 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
                            { "cell_mm", pcbIUScale.IUTomm( grid.cell ) },
                            { "obstacles", obstacles.size() } };
 
+    // where a path of the optimistic grid crosses cells the pessimistic one shuts: per stretch its narrowest gap,
+    // and the items nearest it with their exact room there (distance less the reach the rules ask)
+    auto edgeDistance = []( const SHAPE_POLY_SET& aPoly, const VECTOR2I& aAt )
+    {
+        if( !aPoly.Contains( aAt ) )
+            return 0;
+
+        SEG::ecoord best = VECTOR2I::ECOORD_MAX;
+
+        for( auto it = aPoly.CIterateSegmentsWithHoles(); it; ++it )
+            best = std::min( best, ( *it ).SquaredDistance( aAt ) );
+
+        return (int) std::sqrt( (double) best );
+    };
+
+    // aFromStart / aFromGoal: the pessimistic grid's rooms of the start and of the goal; only the part of
+    // the path from where it last leaves the start's room to where it first enters the goal's is a gap
+    auto pinches = [&]( const SEARCH& aSearch, const SEARCH& aFromStart, const SEARCH& aFromGoal, std::optional<BOX2I>& aGap )
+    {
+        struct STEP { size_t state; bool via; bool shut; };
+        struct ROOM { int room; std::string name; VECTOR2I toward; };
+        std::vector<STEP> walk;
+
+        for( size_t k = aSearch.goalState;; )
+        {
+            const uint8_t step = aSearch.from[k];
+            const size_t  i = k % cells;
+            const bool    isVia = step >= 11;
+            walk.push_back( { k, isVia, isVia ? ( via[i] & PES ) != 0 : ( track[k] & PES ) != 0 } );
+
+            if( step == 10 )
+                break;
+
+            if( isVia )
+            {
+                k = (size_t) ( step - 11 ) * cells + i;
+                continue;
+            }
+
+            const int d = step - 1, x = (int) ( i % grid.nx ), y = (int) ( i / grid.nx );
+            k = ( k / cells ) * cells + (size_t) ( y - DY[d] ) * grid.nx + ( x - DX[d] );
+        }
+
+        std::reverse( walk.begin(), walk.end() );
+
+        size_t leave = 0, enter = walk.size();
+
+        for( size_t j = 0; j < walk.size(); ++j )
+        {
+            if( aFromStart.from[walk[j].state] )
+                leave = j;
+        }
+
+        for( size_t j = leave; j < walk.size(); ++j )
+        {
+            if( aFromGoal.from[walk[j].state] )
+            {
+                enter = j;
+                break;
+            }
+        }
+
+        for( size_t j = 0; j < walk.size(); ++j )
+        {
+            walk[j].shut = walk[j].shut && j > leave && ( j < enter || ( j == enter && walk[j].via ) );
+
+            if( j >= leave && j <= std::min( enter, walk.size() - 1 ) )
+            {
+                const size_t   i = walk[j].state % cells;
+                const VECTOR2I at = grid.Centre( (int) ( i % grid.nx ), (int) ( i / grid.nx ) );
+
+                if( aGap )
+                    aGap->Merge( at );
+                else
+                    aGap = BOX2I( at, VECTOR2I( 0, 0 ) );
+            }
+        }
+
+        const int edgeClr = std::max( board->GetDesignSettings().m_CopperEdgeClearance, 0 );
+        const int halfWidth = width / 2, viaRadius = viaDia / 2;
+        const bool zonesYield = aArgs.value( "zones_yield", true );
+        nlohmann::json list = nlohmann::json::array();
+        int stretches = 0;
+
+        for( size_t a = 0; a < walk.size(); )
+        {
+            if( !walk[a].shut )
+            {
+                ++a;
+                continue;
+            }
+
+            size_t b = a;
+
+            while( b + 1 < walk.size() && walk[b + 1].shut && walk[b + 1].via == walk[a].via )
+                ++b;
+
+            ++stretches;
+
+            if( list.size() < 8 )
+            {
+                // the items round a cell of the path and their room there, tightest first
+                auto roomAt = [&]( const STEP& mid )
+                {
+                    const size_t   i = mid.state % cells;
+                    const int      l = (int) ( mid.state / cells );
+                    const VECTOR2I at = grid.Centre( (int) ( i % grid.nx ), (int) ( i / grid.nx ) );
+                    std::vector<ROOM> room;
+
+                    {
+                        const int reach = edgeClr + ( mid.via ? viaRadius : halfWidth );
+                        VECTOR2I  near = at;
+                        SEG::ecoord best = VECTOR2I::ECOORD_MAX;
+
+                        for( auto it = outline.CIterateSegmentsWithHoles(); it; ++it )
+                        {
+                            if( ( *it ).SquaredDistance( at ) < best )
+                            {
+                                best = ( *it ).SquaredDistance( at );
+                                near = ( *it ).NearestPoint( at );
+                            }
+                        }
+
+                        room.push_back( { edgeDistance( outline, at ) - reach, "board edge", near - at } );
+                    }
+
+                    for( const OBSTACLE& o : obstacles )
+                    {
+                        const int reach = mid.via ? o.viaReach : o.trackReach;
+                        const bool hole = o.layer == UNDEFINED_LAYER;
+
+                        if( reach < 0 || ( !mid.via && !hole && o.layer != layers[l] ) )
+                            continue;
+
+                        const BOARD_CONNECTED_ITEM* bci = dynamic_cast<const BOARD_CONNECTED_ITEM*>( o.item );
+                        const bool ruleArea = o.item->Type() == PCB_ZONE_T && static_cast<ZONE*>( o.item )->GetIsRuleArea();
+
+                        if( !ruleArea && !o.anyNet && bci && bci->GetNetCode() == net && !( hole && mid.via ) )
+                            continue;
+
+                        if( mid.via && zonesYield && !ruleArea && o.item->Type() == PCB_ZONE_T )
+                            continue;
+
+                        BOX2I box = o.item->GetBoundingBox();
+                        box.Inflate( reach + pcbIUScale.mmToIU( 1.0 ) );
+
+                        if( !box.Contains( at ) )
+                            continue;
+
+                        int      dist = 0;
+                        VECTOR2I near = at;
+
+                        if( ruleArea )
+                        {
+                            const SHAPE_POLY_SET area = static_cast<ZONE*>( o.item )->GetBoardOutline();
+                            dist = area.Contains( at ) ? 0 : (int) std::sqrt( (double) area.SquaredDistance( at, false, &near ) );
+                        }
+                        else if( hole )
+                        {
+                            std::shared_ptr<SHAPE_SEGMENT> h = o.item->Type() == PCB_PAD_T ? static_cast<PAD*>( o.item )->GetEffectiveHoleShape()
+                                                                                           : static_cast<PCB_VIA*>( o.item )->GetEffectiveHoleShape();
+                            if( !h )
+                                continue;
+
+                            h->Collide( at, std::numeric_limits<int>::max() / 2, &dist, &near );
+                        }
+                        else
+                        {
+                            const PCB_LAYER_ID layer = mid.via ? ( o.layer == UNDEFINED_LAYER ? layers[0] : o.layer ) : layers[l];
+                            o.item->GetEffectiveShape( layer )->Collide( at, std::numeric_limits<int>::max() / 2, &dist, &near );
+                        }
+
+                        std::string name = itemName( o.item ) + ( hole ? " hole" : ruleArea ? " rule area" : "" ) + " ("
+                                           + ( hole ? std::string( "all" ) : str( board->GetLayerName( o.layer ) ) ) + ")";
+
+                        if( bci && !ruleArea )
+                            name += " " + str( UnescapeString( bci->GetNetname() ) );
+
+                        room.push_back( { dist - reach, name, near - at } );
+                    }
+
+                    std::sort( room.begin(), room.end(), []( const ROOM& x, const ROOM& y ) { return x.room < y.room; } );
+                    return room;
+                };
+
+                // a gap: two items on opposite sides of the cell, its room the sum of theirs
+                auto gapAt = [&]( const std::vector<ROOM>& aRoom ) -> std::optional<std::pair<size_t, size_t>>
+                {
+                    std::optional<std::pair<size_t, size_t>> best;
+
+                    for( size_t x = 0; x < aRoom.size() && x < 24; ++x )
+                    {
+                        for( size_t y = x + 1; y < aRoom.size() && y < 24; ++y )
+                        {
+                            const VECTOR2L dx = VECTOR2L( aRoom[x].toward ), dy = VECTOR2L( aRoom[y].toward );
+
+                            if( dx.Dot( dy ) >= 0 && dx != VECTOR2L( 0, 0 ) && dy != VECTOR2L( 0, 0 ) )
+                                continue;
+
+                            if( !best || aRoom[x].room + aRoom[y].room < aRoom[best->first].room + aRoom[best->second].room )
+                                best = std::pair( x, y );
+                        }
+                    }
+
+                    return best;
+                };
+
+                // the stretch's narrowest gap
+                size_t pick = ( a + b ) / 2;
+                int    best = std::numeric_limits<int>::max();
+                const size_t stride = std::max<size_t>( 1, ( b - a + 1 ) / 200 );
+
+                for( size_t j = a; j <= b; j += stride )
+                {
+                    const std::vector<ROOM> r = roomAt( walk[j] );
+
+                    if( const auto g = gapAt( r ); g && r[g->first].room + r[g->second].room < best )
+                    {
+                        best = r[g->first].room + r[g->second].room;
+                        pick = j;
+                    }
+                }
+
+                const STEP&    mid = walk[pick];
+                const size_t   i = mid.state % cells;
+                const int      l = (int) ( mid.state / cells );
+                const VECTOR2I at = grid.Centre( (int) ( i % grid.nx ), (int) ( i / grid.nx ) );
+                const std::vector<ROOM> room = roomAt( mid );
+                nlohmann::json nearest = nlohmann::json::array();
+
+                for( size_t j = 0; j < room.size() && j < 4; ++j )
+                    nearest.push_back( { { "item", room[j].name }, { "room_mm", pcbIUScale.IUTomm( room[j].room ) } } );
+
+                nlohmann::json between;
+
+                if( const auto g = gapAt( room ) )
+                    between = { { "items", { room[g->first].name, room[g->second].name } },
+                                { "room_mm", pcbIUScale.IUTomm( room[g->first].room + room[g->second].room ) } };
+
+                list.push_back( { { "at", { pcbIUScale.IUTomm( at.x ), pcbIUScale.IUTomm( at.y ) } },
+                                  { "layer", mid.via ? std::string( "via" ) : str( board->GetLayerName( layers[l] ) ) },
+                                  { "cells", b - a + 1 }, { "nearest", nearest }, { "gap", between } } );
+            }
+
+            a = b + 1;
+        }
+
+        return nlohmann::json( { { "stretches", stretches }, { "first", list } } );
+    };
+
     const SEARCH pes = search( PES, START_PES, GOAL_PES, aArgs.value( "fewest_vias", false ) );
 
-    if( pes.found )
+    // the path from a seed to aState in aSearch's tree: corners where the step changes, a via where the
+    // layer does
+    auto trace = [&]( const SEARCH& aSearch, size_t aState )
     {
-        // the path back from the goal: corners where the step changes, vias where the layer does
-        nlohmann::json path = nlohmann::json::array();
-        size_t         k = pes.goalState;
-        int            lastStep = -1;
         std::vector<std::pair<VECTOR2I, int>> points;
+        size_t k = aState;
+        int    lastStep = -1;
 
         while( true )
         {
-            const int    l = (int) ( k / cells );
-            const size_t i = k % cells;
-            const int    x = (int) ( i % grid.nx ), y = (int) ( i / grid.nx );
-            const uint8_t step = pes.from[k];
+            const int     l = (int) ( k / cells );
+            const size_t  i = k % cells;
+            const int     x = (int) ( i % grid.nx ), y = (int) ( i / grid.nx );
+            const uint8_t step = aSearch.from[k];
 
             if( step != lastStep || step >= 10 )
                 points.emplace_back( grid.Centre( x, y ), l );
@@ -918,19 +1232,39 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
         }
 
         std::reverse( points.begin(), points.end() );
+        return points;
+    };
 
-        for( size_t j = 0; j < points.size(); ++j )
+    auto pathJson = [&]( const std::vector<std::pair<VECTOR2I, int>>& aPoints )
+    {
+        nlohmann::json path = nlohmann::json::array();
+
+        for( size_t j = 0; j < aPoints.size(); ++j )
         {
-            if( j > 0 && points[j].first == points[j - 1].first && points[j].second == points[j - 1].second )
+            if( j > 0 && aPoints[j] == aPoints[j - 1] )
                 continue;
 
-            path.push_back( { { "at", { pcbIUScale.IUTomm( points[j].first.x ), pcbIUScale.IUTomm( points[j].first.y ) } },
-                              { "layer", str( board->GetLayerName( layers[points[j].second] ) ) } } );
+            path.push_back( { { "at", { pcbIUScale.IUTomm( aPoints[j].first.x ), pcbIUScale.IUTomm( aPoints[j].first.y ) } },
+                              { "layer", str( board->GetLayerName( layers[aPoints[j].second] ) ) } } );
         }
 
+        return path;
+    };
+
+    if( pes.found )
+    {
+        const std::vector<std::pair<VECTOR2I, int>> points = trace( pes, pes.goalState );
+
+        if( aWindow )
+            aWindow->path = points;
+
         out["verdict"] = "routable";
-        out["path"] = path;
+        out["path"] = pathJson( points );
         out["reached_cells"] = pes.reached;
+    }
+    else if( aWindow )
+    {
+        out["verdict"] = "unknown";
     }
     else
     {
@@ -941,6 +1275,73 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
             out["verdict"] = "unknown";
             out["reason"] = "a way exists in the optimistic grid only: a finer cell_mm decides";
             out["reached_cells"] = opt.reached;
+            const SEARCH         back = search( PES, GOAL_PES, START_PES );
+            std::optional<BOX2I> gap;
+            out["pinches"] = pinches( opt, pes, back, gap );
+
+            // the gap searched again on a finer grid over a window round it, its ends the coarse rooms
+            if( gap && aArgs.value( "refine", true ) )
+            {
+                ORACLE_WINDOW window;
+                window.box = *gap;
+                window.box.Inflate( grid.cell * 8 + viaDia );
+                window.box = window.box.Intersect( outline.BBox() );
+                window.cell = grid.cell / 4;
+                window.coarse = grid;
+                window.startRoom = &pes.from;
+                window.goalRoom = &back.from;
+
+                // finer by 4 each try while undecided, down to 0.001 mm or the cell budget
+                nlohmann::json tries = nlohmann::json::array();
+
+                while( window.cell >= pcbIUScale.mmToIU( 0.001 ) )
+                {
+                    const KOPENAPI_RESULT fine = oracleRun( aCtx, aArgs, &window );
+                    const double          ran = fine.body.value( "cell_mm", 0.0 );
+                    tries.push_back( { { "cell_mm", ran }, { "verdict", fine.body.value( "verdict", std::string() ) } } );
+
+                    if( !window.path.empty() || ran <= 0 || pcbIUScale.mmToIU( ran ) > window.cell )
+                        break;
+
+                    window.cell /= 4;
+                }
+
+                out["refined"] = { { "window_mm", { pcbIUScale.IUTomm( window.box.GetLeft() ), pcbIUScale.IUTomm( window.box.GetTop() ),
+                                                    pcbIUScale.IUTomm( window.box.GetRight() ), pcbIUScale.IUTomm( window.box.GetBottom() ) } },
+                                   { "tries", tries } };
+
+                if( !window.path.empty() )
+                {
+                    // the coarse way to the window's entry, the window's path, the coarse way on to the goal
+                    auto coarseState = [&]( const std::pair<VECTOR2I, int>& aAt ) -> std::optional<size_t>
+                    {
+                        const VECTOR2I d = aAt.first - grid.origin;
+
+                        if( d.x < 0 || d.y < 0 || d.x / grid.cell >= grid.nx || d.y / grid.cell >= grid.ny )
+                            return std::nullopt;
+
+                        return (size_t) aAt.second * cells + (size_t) ( d.y / grid.cell ) * grid.nx + d.x / grid.cell;
+                    };
+
+                    const std::optional<size_t> entry = coarseState( window.path.front() ), exit = coarseState( window.path.back() );
+                    std::vector<std::pair<VECTOR2I, int>> points;
+
+                    if( entry && pes.from[*entry] )
+                        points = trace( pes, *entry );
+
+                    points.insert( points.end(), window.path.begin(), window.path.end() );
+
+                    if( exit && back.from[*exit] )
+                    {
+                        const std::vector<std::pair<VECTOR2I, int>> rest = trace( back, *exit );
+                        points.insert( points.end(), rest.rbegin(), rest.rend() );
+                    }
+
+                    out["verdict"] = "routable";
+                    out["reason"] = "decided on a finer grid over the gap";
+                    out["path"] = pathJson( points );
+                }
+            }
         }
         else
         {
@@ -1048,6 +1449,12 @@ static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohman
 }
 
 
+static KOPENAPI_RESULT h_pcb_route_oracle( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )
+{
+    return oracleRun( aCtx, aArgs, nullptr );
+}
+
+
 KOPENAPI_REGISTER( "pcb_route_oracle",
                    "Whether a connection can be routed at all on the board as it is, decided apart from the router: "
                    "two grids over the whole board bound the free space under KiCad's rules (clearance, hole "
@@ -1057,7 +1464,14 @@ KOPENAPI_REGISTER( "pcb_route_oracle",
                    "layer change is a via), unroutable (no path even in the optimistic grid, every obstacle shrunk "
                    "by a cell: no route exists at that width and via; start / target room in cells, the room's "
                    "area, shut_by: the obstacles round the smaller room), unknown (the grids disagree: a finer "
-                   "cell_mm decides), connected. Other copper of the net is no obstacle; "
+                   "cell_mm decides; with refine (default) the gap is searched again over a window round it on a "
+                   "grid 4x finer each try, down to 0.001 mm or the cell budget: refined {window_mm, tries "
+                   "[{cell_mm, verdict}]}, and a path found there is the routable verdict's path; pinches: where the optimistic path, between the pessimistic grid's room of the start and the "
+                   "goal's, crosses cells the pessimistic grid shuts, "
+                   "per stretch its narrowest gap: at, the nearest items with room_mm (their distance less the "
+                   "reach the rules ask, negative: too near there) and gap {items on opposite sides, room_mm the "
+                   "sum of theirs}), connected. Other copper of the net is no obstacle; with zones_yield (default) a zone fill shuts no "
+                   "via, as a refill clears round it; "
                    "rules_width_mm: the rules' min and opt width for the net",
                    R"json({"type":"object","properties":{
                         "from":{"type":"string","description":"pad REF.NUMBER"},
@@ -1071,7 +1485,9 @@ KOPENAPI_REGISTER( "pcb_route_oracle",
                         "fewest_vias":{"type":"boolean","default":false,"description":"the path with the fewest vias (else the fewest cells, a via one)"},
                         "no_via_mm":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"description":"boxes [x0, y0, x1, y1] no via may overlap"},
                         "cell_mm":{"type":"number","default":0.025,"minimum":0.005},
-                        "max_cells_m":{"type":"number","default":20,"description":"millions of cells per layer at most: the cell grows to fit"}},
+                        "max_cells_m":{"type":"number","default":20,"description":"millions of cells per layer at most: the cell grows to fit"},
+                        "zones_yield":{"type":"boolean","default":true,"description":"zone fills shut no via (a refill clears round it); tracks keep out of them"},
+                        "refine":{"type":"boolean","default":true,"description":"an undecided gap searched again over a window round it, 4x finer each try"}},
                         "required":[]})json"_json,
                    false, h_pcb_route_oracle, 300 );
 
