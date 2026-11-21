@@ -771,6 +771,44 @@ static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
         }
     }
 
+    // ways out kept open for other pads: segments [layer, a, b, width, clearance] no copper of this net comes near
+    for( const nlohmann::json& w : aArgs.value( "kept_ways", nlohmann::json::array() ) )
+    {
+        if( !w.is_object() || !w.contains( "a" ) || !w.contains( "b" ) )
+            continue;
+
+        const int l = (int) ( std::find_if( layers.begin(), layers.end(),
+                                            [&]( PCB_LAYER_ID aId ) { return str( board->GetLayerName( aId ) ) == w.value( "layer", std::string() ); } )
+                              - layers.begin() );
+
+        if( l >= L )
+            continue;
+
+        const VECTOR2I a( pcbIUScale.mmToIU( w["a"][0].get<double>() ), pcbIUScale.mmToIU( w["a"][1].get<double>() ) );
+        const VECTOR2I b( pcbIUScale.mmToIU( w["b"][0].get<double>() ), pcbIUScale.mmToIU( w["b"][1].get<double>() ) );
+        const int      half = pcbIUScale.mmToIU( w.value( "width_mm", 0.0 ) ) / 2;
+        const int      clr = pcbIUScale.mmToIU( w.value( "clearance_mm", 0.0 ) );
+
+        for( const uint8_t mode : { OPT, PES } )
+        {
+            const int by = mode == PES ? diag : -diag;
+
+            for( const auto& [reach, isVia] : { std::pair( half + clr + width / 2, false ), std::pair( half + clr + viaDia / 2, true ) } )
+            {
+                if( isVia && !vias )
+                    continue;
+
+                SHAPE_POLY_SET poly;
+                TransformOvalToPolygon( poly, a, b, 2 * std::max( reach + by, 1 ), maxError, mode == PES ? ERROR_OUTSIDE : ERROR_INSIDE );
+
+                if( isVia )
+                    grid.Fill( poly, [&]( size_t i ) { via[i] |= mode; } );
+                else
+                    grid.Fill( poly, [&]( size_t i ) { track[(size_t) l * cells + i] |= mode; } );
+            }
+        }
+    }
+
     // the ends: cells whose centre lies on the island's copper on a layer (optimistic: within the cell's
     // reach of it; pessimistic: inside it by that reach, so a track from that centre touches it)
     auto seeds = [&]( const std::set<const BOARD_ITEM*>& aIsland, uint8_t aMode, uint8_t aBit )
@@ -964,7 +1002,7 @@ static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
     auto pinches = [&]( const SEARCH& aSearch, const SEARCH& aFromStart, const SEARCH& aFromGoal, std::optional<BOX2I>& aGap )
     {
         struct STEP { size_t state; bool via; bool shut; };
-        struct ROOM { int room; std::string name; VECTOR2I toward; };
+        struct ROOM { int room; std::string name; VECTOR2I toward; const BOARD_ITEM* item; };
         std::vector<STEP> walk;
 
         for( size_t k = aSearch.goalState;; )
@@ -1067,7 +1105,7 @@ static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                             }
                         }
 
-                        room.push_back( { edgeDistance( outline, at ) - reach, "board edge", near - at } );
+                        room.push_back( { edgeDistance( outline, at ) - reach, "board edge", near - at, nullptr } );
                     }
 
                     for( const OBSTACLE& o : obstacles )
@@ -1122,7 +1160,7 @@ static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                         if( bci && !ruleArea )
                             name += " " + str( UnescapeString( bci->GetNetname() ) );
 
-                        room.push_back( { dist - reach, name, near - at } );
+                        room.push_back( { dist - reach, name, near - at, o.item } );
                     }
 
                     std::sort( room.begin(), room.end(), []( const ROOM& x, const ROOM& y ) { return x.room < y.room; } );
@@ -1139,6 +1177,9 @@ static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                         for( size_t y = x + 1; y < aRoom.size() && y < 24; ++y )
                         {
                             const VECTOR2L dx = VECTOR2L( aRoom[x].toward ), dy = VECTOR2L( aRoom[y].toward );
+
+                            if( aRoom[x].item && aRoom[x].item == aRoom[y].item )
+                                continue;
 
                             if( dx.Dot( dy ) >= 0 && dx != VECTOR2L( 0, 0 ) && dy != VECTOR2L( 0, 0 ) )
                                 continue;
@@ -1279,36 +1320,50 @@ static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
             std::optional<BOX2I> gap;
             out["pinches"] = pinches( opt, pes, back, gap );
 
-            // the gap searched again on a finer grid over a window round it, its ends the coarse rooms
-            if( gap && aArgs.value( "refine", true ) )
+            // the gap searched again on a finer grid over a window round it, its ends the coarse rooms; a
+            // window with no way through has its uncertain cells shut in the optimistic grid and the next
+            // optimistic way's gap is tried, a few at most. Only a path found decides
+            SEARCH       way = opt;
+            const int    ways = aArgs.value( "refine", true ) ? 6 : 0;
+            int          tried = 0;
+            nlohmann::json windows = nlohmann::json::array();
+
+            for( ; gap && tried < ways; ++tried )
             {
                 ORACLE_WINDOW window;
-                window.box = *gap;
-                window.box.Inflate( grid.cell * 8 + viaDia );
-                window.box = window.box.Intersect( outline.BBox() );
-                window.cell = grid.cell / 4;
                 window.coarse = grid;
                 window.startRoom = &pes.from;
                 window.goalRoom = &back.from;
-
-                // finer by 4 each try while undecided, down to 0.001 mm or the cell budget
                 nlohmann::json tries = nlohmann::json::array();
 
-                while( window.cell >= pcbIUScale.mmToIU( 0.001 ) )
+                // a window 8 cells round the gap, then wider: a way round it may leave the first one
+                for( const int round : { 8, 24, 56 } )
                 {
-                    const KOPENAPI_RESULT fine = oracleRun( aCtx, aArgs, &window );
-                    const double          ran = fine.body.value( "cell_mm", 0.0 );
-                    tries.push_back( { { "cell_mm", ran }, { "verdict", fine.body.value( "verdict", std::string() ) } } );
+                    window.box = *gap;
+                    window.box.Inflate( grid.cell * round + viaDia );
+                    window.box = window.box.Intersect( outline.BBox() );
+                    window.cell = grid.cell / 4;
 
-                    if( !window.path.empty() || ran <= 0 || pcbIUScale.mmToIU( ran ) > window.cell )
+                    // finer by 4 each try while undecided, down to 0.001 mm or the cell budget
+                    while( window.cell >= pcbIUScale.mmToIU( 0.001 ) )
+                    {
+                        const KOPENAPI_RESULT fine = oracleRun( aCtx, aArgs, &window );
+                        const double          ran = fine.body.value( "cell_mm", 0.0 );
+                        tries.push_back( { { "cell_mm", ran }, { "verdict", fine.body.value( "verdict", std::string() ) } } );
+
+                        if( !window.path.empty() || ran <= 0 || pcbIUScale.mmToIU( ran ) > window.cell )
+                            break;
+
+                        window.cell /= 4;
+                    }
+
+                    if( !window.path.empty() )
                         break;
-
-                    window.cell /= 4;
                 }
 
-                out["refined"] = { { "window_mm", { pcbIUScale.IUTomm( window.box.GetLeft() ), pcbIUScale.IUTomm( window.box.GetTop() ),
-                                                    pcbIUScale.IUTomm( window.box.GetRight() ), pcbIUScale.IUTomm( window.box.GetBottom() ) } },
-                                   { "tries", tries } };
+                windows.push_back( { { "window_mm", { pcbIUScale.IUTomm( window.box.GetLeft() ), pcbIUScale.IUTomm( window.box.GetTop() ),
+                                                      pcbIUScale.IUTomm( window.box.GetRight() ), pcbIUScale.IUTomm( window.box.GetBottom() ) } },
+                                     { "tries", tries } } );
 
                 if( !window.path.empty() )
                 {
@@ -1340,7 +1395,44 @@ static KOPENAPI_RESULT oracleRun( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& 
                     out["verdict"] = "routable";
                     out["reason"] = "decided on a finer grid over the gap";
                     out["path"] = pathJson( points );
+                    break;
                 }
+
+                const int x0 = std::max( 0, ( window.box.GetLeft() - grid.origin.x ) / grid.cell );
+                const int y0 = std::max( 0, ( window.box.GetTop() - grid.origin.y ) / grid.cell );
+                const int x1 = std::min( grid.nx - 1, ( window.box.GetRight() - grid.origin.x ) / grid.cell );
+                const int y1 = std::min( grid.ny - 1, ( window.box.GetBottom() - grid.origin.y ) / grid.cell );
+
+                for( int y = y0; y <= y1; ++y )
+                {
+                    for( int x = x0; x <= x1; ++x )
+                    {
+                        const size_t i = (size_t) y * grid.nx + x;
+
+                        if( via[i] & PES )
+                            via[i] |= OPT;
+
+                        for( int l = 0; l < L; ++l )
+                        {
+                            uint8_t& t = track[(size_t) l * cells + i];
+
+                            if( ( t & PES ) && !( t & ( START_OPT | GOAL_OPT ) ) )
+                                t |= OPT;
+                        }
+                    }
+                }
+
+                way = search( OPT, START_OPT, GOAL_OPT );
+                gap.reset();
+
+                if( way.found )
+                    pinches( way, pes, back, gap );
+            }
+
+            if( !windows.empty() )
+            {
+                out["refined"] = windows.back();
+                out["refined"]["gaps_tried"] = (int) windows.size();
             }
         }
         else
@@ -1465,8 +1557,10 @@ KOPENAPI_REGISTER( "pcb_route_oracle",
                    "by a cell: no route exists at that width and via; start / target room in cells, the room's "
                    "area, shut_by: the obstacles round the smaller room), unknown (the grids disagree: a finer "
                    "cell_mm decides; with refine (default) the gap is searched again over a window round it on a "
-                   "grid 4x finer each try, down to 0.001 mm or the cell budget: refined {window_mm, tries "
-                   "[{cell_mm, verdict}]}, and a path found there is the routable verdict's path; pinches: where the optimistic path, between the pessimistic grid's room of the start and the "
+                   "grid 4x finer each try, down to 0.001 mm or the cell budget, the window 8, 24 then 56 cells round "
+                   "the gap; a window with no way through has its "
+                   "uncertain cells shut on the optimistic grid and the next optimistic way's gap is tried, 6 at most: "
+                   "refined {window_mm, tries [{cell_mm, verdict}], gaps_tried} of the last, and a path found there is the routable verdict's path; pinches: where the optimistic path, between the pessimistic grid's room of the start and the "
                    "goal's, crosses cells the pessimistic grid shuts, "
                    "per stretch its narrowest gap: at, the nearest items with room_mm (their distance less the "
                    "reach the rules ask, negative: too near there) and gap {items on opposite sides, room_mm the "
@@ -1484,6 +1578,7 @@ KOPENAPI_REGISTER( "pcb_route_oracle",
                         "layers":{"type":"array","items":{"type":"string"},"description":"copper layers the path may use (default all)"},
                         "fewest_vias":{"type":"boolean","default":false,"description":"the path with the fewest vias (else the fewest cells, a via one)"},
                         "no_via_mm":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"description":"boxes [x0, y0, x1, y1] no via may overlap"},
+                        "kept_ways":{"type":"array","items":{"type":"object","properties":{"layer":{"type":"string"},"a":{"type":"array","items":{"type":"number"}},"b":{"type":"array","items":{"type":"number"}},"width_mm":{"type":"number"},"clearance_mm":{"type":"number"}}},"description":"ways out kept open for other pads: segments a to b of that width on that layer, which no copper of this net may come within clearance_mm of"},
                         "cell_mm":{"type":"number","default":0.025,"minimum":0.005},
                         "max_cells_m":{"type":"number","default":20,"description":"millions of cells per layer at most: the cell grows to fit"},
                         "zones_yield":{"type":"boolean","default":true,"description":"zone fills shut no via (a refill clears round it); tracks keep out of them"},
