@@ -3832,54 +3832,79 @@ static const ESCAPE_FRONT* frontWalled( BOARD* aBoard, const std::vector<ESCAPE_
 
 /// @brief routeOneImpl, and for a route that stopped short what stands there (blocked_by)
 /// @brief The route laid as given (ROUTE_REQUEST::exact): straight from its start through its corners to
-/// toPos on its layer, no search; refused as a searched one is (ways out kept open, the guard)
+/// toPos, a through via where a point has a layer (and at toPos with endViaLayer), no search; refused as a
+/// searched one is (ways out kept open, the guard)
 bool layExact( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json& aOut, std::vector<KIID>& aAdded )
 {
-    BOARD*                board = aContext.GetBoard();
-    std::vector<VECTOR2I> pts = { aReq.fromPos.value_or( aReq.from->GetPosition() ) };
+    BOARD*     board = aContext.GetBoard();
+    NETCLASS*  netclass = aReq.from->GetEffectiveNetClass();
+    const BOARD_DESIGN_SETTINGS& ds = board->GetDesignSettings();
+    const int  width = aReq.width > 0 ? aReq.width
+                       : netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth()
+                                                               : ds.GetCurrentTrackWidth();
+    const int  viaDia = aReq.viaDiameter > 0 ? aReq.viaDiameter
+                        : netclass && netclass->HasViaDiameter() ? netclass->GetViaDiameter()
+                                                                 : ds.GetCurrentViaSize();
+    const int  viaDrill = aReq.viaDrill > 0 ? aReq.viaDrill
+                          : netclass && netclass->HasViaDrill() ? netclass->GetViaDrill()
+                                                                : ds.GetCurrentViaDrill();
 
-    for( const auto& [at, layer] : aReq.vias )
+    std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> made;
+    std::vector<BOARD_CONNECTED_ITEM*>                 mine;
+    nlohmann::json                                     segments = nlohmann::json::array();
+    double                                             length = 0;
+    int                                                vias = 0;
+    VECTOR2I                                           at = aReq.fromPos.value_or( aReq.from->GetPosition() );
+    PCB_LAYER_ID                                       layer = aReq.layer;
+
+    auto trackTo = [&]( const VECTOR2I& aTo )
     {
-        if( layer )
-        {
-            aOut["routed"] = false;
-            aOut["reason"] = "laid as given: a layer change is not laid";
-            return false;
-        }
-
-        pts.push_back( at );
-    }
-
-    pts.push_back( aReq.toPos );
-
-    NETCLASS*                               netclass = aReq.from->GetEffectiveNetClass();
-    const int                               width = aReq.width > 0 ? aReq.width
-                                                    : netclass && netclass->HasTrackWidth() ? netclass->GetTrackWidth()
-                                                                                            : board->GetDesignSettings().GetCurrentTrackWidth();
-    std::vector<std::unique_ptr<PCB_TRACK>> made;
-    std::vector<BOARD_CONNECTED_ITEM*>      mine;
-    nlohmann::json                          segments = nlohmann::json::array();
-    double                                  length = 0;
-
-    for( size_t i = 1; i < pts.size(); ++i )
-    {
-        if( pts[i] == pts[i - 1] )
-            continue;
+        if( aTo == at )
+            return;
 
         auto track = std::make_unique<PCB_TRACK>( board );
-        track->SetStart( pts[i - 1] );
-        track->SetEnd( pts[i] );
+        track->SetStart( at );
+        track->SetEnd( aTo );
         track->SetWidth( width );
-        track->SetLayer( aReq.layer );
+        track->SetLayer( layer );
         track->SetNet( aReq.from->GetNet() );
         length += track->GetLength();
-        segments.push_back( { { "from", { toMm( pts[i - 1].x ), toMm( pts[i - 1].y ) } },
-                              { "to", { toMm( pts[i].x ), toMm( pts[i].y ) } },
-                              { "layer", str( board->GetLayerName( aReq.layer ) ) },
+        segments.push_back( { { "from", { toMm( at.x ), toMm( at.y ) } },
+                              { "to", { toMm( aTo.x ), toMm( aTo.y ) } },
+                              { "layer", str( board->GetLayerName( layer ) ) },
                               { "width_mm", toMm( width ) } } );
         mine.push_back( track.get() );
         made.push_back( std::move( track ) );
+        at = aTo;
+    };
+
+    auto viaTo = [&]( PCB_LAYER_ID aLayer )
+    {
+        auto via = std::make_unique<PCB_VIA>( board );
+        via->SetViaType( VIATYPE::THROUGH );
+        via->SetPosition( at );
+        via->SetWidth( PADSTACK::ALL_LAYERS, viaDia );
+        via->SetDrill( viaDrill );
+        via->SetLayerPair( F_Cu, B_Cu );
+        via->SetNet( aReq.from->GetNet() );
+        mine.push_back( via.get() );
+        made.push_back( std::move( via ) );
+        layer = aLayer;
+        vias++;
+    };
+
+    for( const auto& [pt, toLayer] : aReq.vias )
+    {
+        trackTo( pt );
+
+        if( toLayer && *toLayer != layer )
+            viaTo( *toLayer );
     }
+
+    trackTo( aReq.toPos );
+
+    if( aReq.endViaLayer && *aReq.endViaLayer != layer )
+        viaTo( *aReq.endViaLayer );
 
     BOARD_CONNECTED_ITEM* item = nullptr;
 
@@ -3907,7 +3932,12 @@ bool layExact( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
 
     const nlohmann::json violations = guard( board, mine, {} );
     aOut["segments"] = segments;
-    aOut["metrics"] = { { "length_mm", toMm( length ) }, { "segments", segments.size() }, { "vias", 0 } };
+    const double direct = ( aReq.toPos - aReq.fromPos.value_or( aReq.from->GetPosition() ) ).EuclideanNorm();
+    aOut["layer"] = str( board->GetLayerName( aReq.layer ) );
+    aOut["mode"] = "exact";
+    aOut["metrics"] = { { "length_mm", toMm( length ) }, { "direct_mm", toMm( direct ) },
+                        { "detour", direct > 0 ? std::round( length / direct * 100.0 ) / 100.0 : 1.0 },
+                        { "segments", segments.size() }, { "vias", vias } };
 
     if( !violations.empty() )
     {
@@ -3926,10 +3956,10 @@ bool layExact( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
 
     BOARD_COMMIT commit( aContext.GetToolManager() );
 
-    for( std::unique_ptr<PCB_TRACK>& track : made )
+    for( std::unique_ptr<BOARD_CONNECTED_ITEM>& item : made )
     {
-        aAdded.push_back( track->m_Uuid );
-        commit.Add( track.release() );
+        aAdded.push_back( item->m_Uuid );
+        commit.Add( item.release() );
     }
 
     commit.Push( _( "Route (API)" ) );
@@ -16758,7 +16788,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
     // the oracle's pass: a connection still open is routed along the path pcb_route_oracle proves at the
     // narrowest width the rules allow it, smoothed and laid by the router through its corners
-    if( aArgs.value( "oracle_pass", true ) && !KopenapiJobCancelled() && !plateauPassCut && !dryRun && !grid && !rail )
+    if( aArgs.value( "oracle_pass", true ) && !KopenapiJobCancelled() && !plateauPassCut && !dryRun && !rail )
     {
         std::optional<KOPENAPI_METHOD> oracle = KOPENAPI_REGISTRY::Get().Find( "pcb_route_oracle" );
         bool                           started = false;
@@ -16878,6 +16908,20 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             row["oracle_args"].erase( "kept_ways" );
             row["oracle_args"]["kept_ways"] = kept.size();
 
+            if( verdict.body.contains( "refined" ) )
+                row["oracle_refined"] = verdict.body["refined"];
+
+            if( verdict.body.contains( "pinches" ) && verdict.body["pinches"].contains( "first" ) )
+            {
+                nlohmann::json gaps = nlohmann::json::array();
+
+                for( const nlohmann::json& pinch : verdict.body["pinches"]["first"] )
+                    gaps.push_back( { { "at", pinch.value( "at", nlohmann::json() ) }, { "layer", pinch.value( "layer", std::string() ) },
+                                      { "gap", pinch.value( "gap", nlohmann::json() ) } } );
+
+                row["oracle_pinches"] = gaps;
+            }
+
             if( verdict.status >= 400 || said != "routable" || !verdict.body.contains( "path" ) )
             {
                 row["oracle_verdict"] = verdict.status >= 400 ? std::string( "error" ) : said;
@@ -16935,6 +16979,31 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             BOARD_CONNECTED_ITEM* endItem = copperAt( path.back(), false );
             VECTOR2I              refusedAt;
 
+            // the router places no via where it starts: a path that starts in a via on a track of the start
+            // starts beside it on that track (a short run over its own copper, then the via)
+            std::optional<VECTOR2I> startAt;
+
+            if( path.size() >= 3 && path[0].first == path[1].first && path[0].second != path[1].second && startItem
+                && ( startItem->Type() == PCB_TRACE_T || startItem->Type() == PCB_ARC_T ) )
+            {
+                const PCB_TRACK* track = static_cast<const PCB_TRACK*>( startItem );
+                const SEG        axis( track->GetStart(), track->GetEnd() );
+                VECTOR2I         at = axis.NearestPoint( path[0].first );
+
+                if( ( at - path[0].first ).EuclideanNorm() < pcbIUScale.mmToIU( 0.01 ) && axis.Length() > 0 )
+                {
+                    const VECTOR2I far = ( axis.A - at ).EuclideanNorm() > ( axis.B - at ).EuclideanNorm() ? axis.A : axis.B;
+                    const int      step = std::min( (int) pcbIUScale.mmToIU( 0.05 ), (int) ( far - at ).EuclideanNorm() );
+                    at += ( far - at ).Resize( step );
+                }
+
+                if( at != path[0].first )
+                {
+                    startAt = at;
+                    row["oracle_start_beside_via"] = true;
+                }
+            }
+
             if( doneOf )
                 refreshFronts();
 
@@ -16968,7 +17037,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 setDeadline( ripBudgetS );
 
             ROUTE_REQUEST req{ startItem, endItem, endAt, path.front().second, PNS::RM_Walkaround, false, *waypoints };
-            req.fromPos = path.front().first;
+            req.fromPos = startAt ? *startAt : path.front().first;
             req.endViaLayer = endVia;
             req.fronts = &fronts;
             req.neckWidth = width < classWidth ? width : 0;
@@ -16978,9 +17047,36 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             nlohmann::json attempt;
 
-            if( !routeOne( *context, req, attempt, added ) )
+            if( aArgs.value( "oracle_exact", false ) )
+            {
+                req.exact = true;
+                req.width = width;
+            }
+
+            bool laid = routeOne( *context, req, attempt, added );
+
+            // the router's line may leave the path where rules differ along it (one clearance per
+            // obstacle for a line partly in a courtyard): the smoothed path, clear of the guard at this
+            // width, is laid as it is
+            if( !laid && !req.exact && attempt.contains( "violations" ) )
+            {
+                row["oracle_violations"] = attempt["violations"];
+                req.exact = true;
+                req.width = width;
+                attempt = nlohmann::json::object();
+                laid = routeOne( *context, req, attempt, added );
+            }
+
+            if( laid && req.exact )
+                row["oracle_laid_exact"] = true;
+
+            if( !laid )
             {
                 row["oracle_reason"] = attempt.value( "reason", std::string() );
+
+                if( attempt.contains( "violations" ) )
+                    row["oracle_violations"] = attempt["violations"];
+
                 continue;
             }
 
@@ -24994,7 +25090,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "variants":{"type":"integer","default":0,"description":"grid: how many of the built-in variants (pcb_route_strategies) run in parallel; 0 one per two cores, as many as half the available memory holds (grid.lane_mb, grid.lanes_memory_allows)"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
-                        "oracle_pass":{"type":"boolean","default":true,"description":"a connection still open after every pass (not a differential pair's nets) gets a last try along the path pcb_route_oracle proves at the narrowest track the rules allow the net at either end (the class width with neck_down off): smoothed to lines at 0/45/90 degrees where the guard lets them, laid by the router through those corners and widened back as the narrowest try is (profile.pass oracle); the oracle's path has the fewest vias, on the call's layers, none in a chip's ring of pins (as the plan). The row says engine oracle when it routes; oracle_verdict (routable, unknown, unroutable) and oracle_reason when not; oracle_args, the arguments it asked pcb_route_oracle with; oracle_refused, why the guard refused the path's line on from where it stopped (walls_way_out_of a pad, or the guard's violations)"},
+                        "oracle_pass":{"type":"boolean","default":true,"description":"a connection still open after every pass, the grid engine's too (not a differential pair's nets) gets a last try along the path pcb_route_oracle proves at the narrowest track the rules allow the net at either end (the class width with neck_down off): smoothed to lines at 0/45/90 degrees where the guard lets them, laid by the router through those corners and widened back as the narrowest try is (profile.pass oracle); the oracle's path has the fewest vias, on the call's layers, none in a chip's ring of pins (as the plan). The row says engine oracle when it routes; oracle_verdict (routable, unknown, unroutable) and oracle_reason when not; oracle_args, the arguments it asked pcb_route_oracle with; oracle_refused, why the guard refused the path's line on from where it stopped (walls_way_out_of a pad, or the guard's violations)"},
+                        "oracle_exact":{"type":"boolean","default":false,"description":"the oracle's pass lays its smoothed path as it is (tracks through its corners, a through via at each layer change), not through the router first; the router's line is laid that way anyway when the guard rejects it"},
                         "neck_down":{"oneOf":[{"type":"string","enum":["auto","off"]},{"type":"object","additionalProperties":{"type":"string","enum":["auto","off"]}}],"default":"auto","description":"auto: a connection with an end on a fine-pitch pad (as dense_first says) is routed no wider than a track centred on the pad leaving between its neighbours at the clearance DRC asks to each, not below the narrowest track KiCad's rules allow the net at the pad (track_width min, the board minimum); the rest of its net at its class width (grid: narrow only inside the courtyard of the fine-pitch footprint (the pad entry), the rest of the net widened to its class width where clearance allows (else neck_width_mm stays there and the row says narrow_outside_mm); a custom track_width rule at the pad sets the neck lower, its opt else min, not below the board minimum); the row says necked_from_mm. auto also gives a connection still open after the rip-up rounds one last try (profile.pass narrowest; not a differential pair's nets) at the narrowest track the rules allow the net at either end (a pinch the class width does not pass), its pieces widened back to the class (else to a custom rule's min there) wherever the guard lets them; a piece left below a track_width rule's min refuses the try; the row says narrowest_mm (widths_mm, narrow_kept_mm) when it routes, narrowest_reason when not. Per net: {\"VBUS\": \"off\", \"*\": \"auto\"}"},
                         "inward_escapes":{"default":"auto","description":"packages with an exposed pad whose row pads may also leave inward: a via in the ring between the pad row and the exposed pad, tried before the outward spots, only where the ring holds it with clearance and never in the straight way from a pad of the exposed pad's net to it; a row through one names it (inward_via_mm). auto (default): every package whose pad row rings its exposed pad (pads inside the exposed pad's box, as its copy on another layer, are not row pads); a list of footprint references: only those ([]: none). 404 an unknown reference, 400 a listed part without an exposed pad inside its row"},"escapes":{"type":"boolean","default":true,"description":"the way out of each fine-pitch pad (as dense_first says) on the edge of its package that runs beside other-net pads of its row (not either pad of a two-pad part) is kept open while its connection waits, and so is that of such a pad of a net outside the call with an open connection (a later call routes it): room for a track and a via in front of it; a route of another net across it is refused (reason names the pad); after the rip-up rounds, a connection still open that such a way out refused, or with an end near one kept for a pad whose connections are given up, tries once more without those ways out (row ways_out_given_up when it routes, given_up_reason when not). false: no such room kept"},"corridor_guard":{"type":"boolean","default":false,"description":"with escapes: past such a way out, while other copper stands a track and its clearance to both sides of it (a corridor between stubs), a route that shuts the corridor before either side opens is refused as well (reason: wall in ... along the copper beside it)"},
                         "via_cost_mm":{"type":"number","minimum":0,"description":"mm of track a via costs the plan, the grid and the clean-up; default from the rules: the routing room a via of the default class takes on each signal layer, as track (the answer's via_cost_mm)"},
