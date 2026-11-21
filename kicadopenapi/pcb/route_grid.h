@@ -248,6 +248,13 @@ struct GRID_RESULT
             int64_t widenedThrough = 0;  ///< states of windows whose via path was tried again wider
             int64_t detours = 0;         ///< wider windows tried after a via path
             int64_t detoursWon = 0;      ///< of them, the ones that found a cheaper path
+            int64_t redone = 0;          ///< nets routed again (fewer vias)
+            int64_t kept = 0;            ///< of them, kept
+            int64_t noneSaved = 0;       ///< dropped: no via fewer
+            int64_t joinedLess = 0;      ///< dropped: fewer ends joined
+            int64_t tooLong = 0;         ///< dropped: longer than the vias saved allow
+            int64_t keptStates = 0;      ///< states of the kept ones
+            int64_t droppedStates = 0;   ///< states of the dropped ones
         };
 
         std::vector<COUNTS>  byStage = std::vector<COUNTS>( 5 );
