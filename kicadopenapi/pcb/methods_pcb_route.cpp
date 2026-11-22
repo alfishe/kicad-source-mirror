@@ -758,6 +758,48 @@ nlohmann::json guard( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& a
 }
 
 
+/// @brief Each track of aItems narrower than the track_width rule over its whole shape (as DRC sees it:
+/// a track touching a courtyard is under that courtyard's rule) made as wide as the rule's min.
+/// Answers the tracks widened: [{from_mm, to_mm, layer, width_mm, rule}]
+static nlohmann::json widenToRuleMin( BOARD* aBoard, const std::vector<BOARD_CONNECTED_ITEM*>& aItems )
+{
+    nlohmann::json              widened = nlohmann::json::array();
+    std::shared_ptr<DRC_ENGINE> drc = aBoard->GetDesignSettings().m_DRCEngine;
+
+    if( !drc )
+        return widened;
+
+    for( BOARD_CONNECTED_ITEM* item : aItems )
+    {
+        if( item->Type() != PCB_TRACE_T )
+            continue;
+
+        PCB_TRACK* track = static_cast<PCB_TRACK*>( item );
+        const bool flagged = !track->HasFlag( ROUTER_TRANSIENT );
+
+        if( flagged )
+            track->SetFlags( ROUTER_TRANSIENT );
+
+        const DRC_CONSTRAINT c = drc->EvalRules( TRACK_WIDTH_CONSTRAINT, track, nullptr, track->GetLayer() );
+
+        if( flagged )
+            track->ClearFlags( ROUTER_TRANSIENT );
+
+        if( !c.GetValue().HasMin() || track->GetWidth() >= c.GetValue().Min() )
+            continue;
+
+        track->SetWidth( c.GetValue().Min() );
+        widened.push_back( { { "from_mm", { toMm( track->GetStart().x ), toMm( track->GetStart().y ) } },
+                             { "to_mm", { toMm( track->GetEnd().x ), toMm( track->GetEnd().y ) } },
+                             { "layer", str( aBoard->GetLayerName( track->GetLayer() ) ) },
+                             { "width_mm", toMm( track->GetWidth() ) },
+                             { "rule", c.GetParentRule() ? str( c.GetParentRule()->m_Name ) : std::string() } } );
+    }
+
+    return widened;
+}
+
+
 /// @brief A stub's neck at a pad: the width it may have there and why it is narrower than asked
 struct STUB_NECK
 {
@@ -3869,10 +3911,6 @@ bool layExact( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
         track->SetLayer( layer );
         track->SetNet( aReq.from->GetNet() );
         length += track->GetLength();
-        segments.push_back( { { "from", { toMm( at.x ), toMm( at.y ) } },
-                              { "to", { toMm( aTo.x ), toMm( aTo.y ) } },
-                              { "layer", str( board->GetLayerName( layer ) ) },
-                              { "width_mm", toMm( width ) } } );
         mine.push_back( track.get() );
         made.push_back( std::move( track ) );
         at = aTo;
@@ -3905,6 +3943,23 @@ bool layExact( PCB_CONTEXT& aContext, const ROUTE_REQUEST& aReq, nlohmann::json&
 
     if( aReq.endViaLayer && *aReq.endViaLayer != layer )
         viaTo( *aReq.endViaLayer );
+
+    const nlohmann::json widened = widenToRuleMin( board, mine );
+
+    for( BOARD_CONNECTED_ITEM* piece : mine )
+    {
+        if( piece->Type() != PCB_TRACE_T )
+            continue;
+
+        const PCB_TRACK* track = static_cast<PCB_TRACK*>( piece );
+        segments.push_back( { { "from", { toMm( track->GetStart().x ), toMm( track->GetStart().y ) } },
+                              { "to", { toMm( track->GetEnd().x ), toMm( track->GetEnd().y ) } },
+                              { "layer", str( board->GetLayerName( track->GetLayer() ) ) },
+                              { "width_mm", toMm( track->GetWidth() ) } } );
+    }
+
+    if( !widened.empty() )
+        aOut["rule_widened"] = widened;
 
     BOARD_CONNECTED_ITEM* item = nullptr;
 
@@ -21893,7 +21948,8 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     if( zoneMode != "refill" && zoneMode != "keep" )
         return KOPENAPI_RESULT::Error( 400, "zones: refill (pour fills give way, refilled after) or keep" );
 
-    nlohmann::json violations = guard( board, changed, {}, zoneMode == "refill" );
+    const nlohmann::json widened = widenToRuleMin( board, changed );
+    nlohmann::json       violations = guard( board, changed, {}, zoneMode == "refill" );
 
     // a pad stub too wide for the clearances there narrows to the widest that keeps them
     if( !violations.empty() && !padStubs.empty() )
@@ -21979,6 +22035,9 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     nlohmann::json out = { { "net", str( UnescapeString( net->GetNetname() ) ) }, { "segments", segments },
                            { "length_mm", toMm( length ) }, { "vias", vias }, { "width_mm", toMm( width ) },
                            { "applied", false } };
+
+    if( !widened.empty() )
+        out["rule_widened"] = widened;
 
     if( !necked.empty() )
     {
@@ -25290,7 +25349,9 @@ KOPENAPI_REGISTER( "pcb_track_add",
                    "Lay a track by hand along given points (no router): from a pad and / or to a pad (their "
                    "centres) through points in mm; a point with via continues on that layer through a via. "
                    "Width and via size as KiCad's rules size them for the net (a track_width / via_diameter / hole_size rule's opt, else the net class's) unless given; without width_mm the "
-                   "segments at the from / to pads are necked as in pcb_via_add (answer necked). The same guard as the "
+                   "segments at the from / to pads are necked as in pcb_via_add (answer necked). A track narrower than the "
+                   "track_width rule over its whole shape (as DRC sees it, e.g. a courtyard's rule) is widened to that "
+                   "min (answer rule_widened). The same guard as the "
                    "router: copper that would touch another net, a via drilled closer than hole to hole to any other hole (own net too) or "
                    "copper in a keep-out is refused (422 with the "
                    "violations), nothing is added then. One undo step; dry_run checks only",
