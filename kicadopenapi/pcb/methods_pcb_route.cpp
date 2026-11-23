@@ -1504,10 +1504,11 @@ static std::optional<VECTOR2I> innerJoint( const std::shared_ptr<CONNECTIVITY_DA
         {
             const PCB_TRACK* t = static_cast<const PCB_TRACK*>( item );
 
+            // on the track's own line: an end that joins it off its centre would turn it
             if( seg.Distance( t->GetStart() ) <= reach )
-                at = t->GetStart();
+                at = seg.NearestPoint( t->GetStart() );
             else if( seg.Distance( t->GetEnd() ) <= reach )
-                at = t->GetEnd();
+                at = seg.NearestPoint( t->GetEnd() );
             else
                 continue;
         }
@@ -4407,6 +4408,13 @@ std::optional<PCB_LAYER_ID> parseLayer( BOARD* aBoard, const std::string& aName 
 
 /// @brief The board's pours (filled, not rule areas) refilled in one undo step: after copper was
 /// laid through fills that gave way
+std::optional<VECTOR2I> KopenapiInnerJoint( const std::shared_ptr<CONNECTIVITY_DATA>& aConn, PCB_TRACK* aTrack,
+                                            const VECTOR2I& aFree )
+{
+    return innerJoint( aConn, aTrack, aFree );
+}
+
+
 void refillPours( PCB_CONTEXT& aContext, BOARD* aBoard )
 {
     std::vector<ZONE*> zones;
@@ -21945,11 +21953,13 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
     const std::string zoneMode = aArgs.value( "zones", std::string( "refill" ) );
 
-    if( zoneMode != "refill" && zoneMode != "keep" )
-        return KOPENAPI_RESULT::Error( 400, "zones: refill (pour fills give way, refilled after) or keep" );
+    if( zoneMode != "refill" && zoneMode != "keep" && zoneMode != "defer" )
+        return KOPENAPI_RESULT::Error( 400, "zones: refill (pour fills give way, refilled after), defer (they give way, "
+                                            "the caller refills) or keep" );
 
+    const bool           fillsGiveWay = zoneMode != "keep";
     const nlohmann::json widened = widenToRuleMin( board, changed );
-    nlohmann::json       violations = guard( board, changed, {}, zoneMode == "refill" );
+    nlohmann::json       violations = guard( board, changed, {}, fillsGiveWay );
 
     // a pad stub too wide for the clearances there narrows to the widest that keeps them
     if( !violations.empty() && !padStubs.empty() )
@@ -21966,8 +21976,8 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
 
             const int before = stub.track->GetWidth();
 
-            if( !guard( board, { stub.track }, {}, zoneMode == "refill", &rest ).empty()
-                && neckToFit( board, stub.track, rest, zoneMode == "refill",
+            if( !guard( board, { stub.track }, {}, fillsGiveWay, &rest ).empty()
+                && neckToFit( board, stub.track, rest, fillsGiveWay,
                               stubMinWidth( board, stub.pad, net->GetNetCode(), stub.track->GetLayer() ) )
                 && stub.track->GetWidth() < before )
             {
@@ -21976,7 +21986,7 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
             }
         }
 
-        violations = guard( board, changed, {}, zoneMode == "refill" );
+        violations = guard( board, changed, {}, fillsGiveWay );
     }
 
     // a stub that kept the full width joins the rest of its segment again
@@ -22072,7 +22082,33 @@ static KOPENAPI_RESULT h_pcb_track_add( KOPENAPI_CONTEXT& aCtx, const nlohmann::
     board->BuildConnectivity();
     board->GetConnectivity()->RecalculateRatsnest();
 
-    if( zoneMode == "refill" )
+    if( zoneMode == "defer" )
+    {
+        // the pours the new copper crosses are out of date until the caller refills
+        nlohmann::json stale = nlohmann::json::array();
+
+        for( ZONE* zone : board->Zones() )
+        {
+            if( zone->GetIsRuleArea() || !zone->IsFilled() )
+                continue;
+
+            for( const KIID& id : added )
+            {
+                BOARD_ITEM* item = board->ResolveItem( id, true );
+
+                if( item && ( zone->GetLayerSet() & item->GetLayerSet() ).any()
+                    && zone->GetBoundingBox().Intersects( item->GetBoundingBox() ) )
+                {
+                    zone->SetNeedRefill( true );
+                    stale.push_back( str( zone->m_Uuid.AsString() ) );
+                    break;
+                }
+            }
+        }
+
+        out["zones_stale"] = stale;
+    }
+    else if( zoneMode == "refill" )
     {
         refillPours( *context, board );
         out["zones_refilled"] = std::any_of( board->Zones().begin(), board->Zones().end(),
@@ -25460,7 +25496,7 @@ KOPENAPI_REGISTER( "pcb_track_add",
                         "layer":{"type":"string","description":"start layer; default F.Cu (B.Cu from a bottom SMD pad)"},
                         "width_mm":{"type":"number"},
                         "via_diameter_mm":{"type":"number","description":"via size of this call (default the rules' for the net)"},"via_drill_mm":{"type":"number"},
-                        "zones":{"type":"string","enum":["refill","keep"],"default":"refill","description":"refill: pour fills of other nets give way (the guard does not count them) and are refilled around the track; keep: the track must clear the fills"},
+                        "zones":{"type":"string","enum":["refill","keep","defer"],"default":"refill","description":"refill: pour fills of other nets give way (the guard does not count them) and are refilled around the track; defer: they give way, not refilled (the pours the track crosses marked stale, answer zones_stale their uuids; the caller refills once after several tracks); keep: the track must clear the fills"},
                         "dry_run":{"type":"boolean","default":false}}})json"_json,
                    false, h_pcb_track_add );
 

@@ -12,6 +12,7 @@
 #include <kicadopenapi_util.h>
 #include <kiway.h>
 #include <local_history.h>
+#include <pcb_track.h>
 #include <pgm_base.h>
 #include <pcb_io/pcb_io_mgr.h>
 #include <project.h>
@@ -153,6 +154,49 @@ nlohmann::json snapshotJson( const LOCAL_HISTORY_SNAPSHOT_INFO& aSnapshot, int a
 }
 
 } // namespace
+
+
+bool KopenapiBoardCopperIds( BOARD* aLive, const std::string& aPath, std::set<KIID>& aOut, std::string& aError )
+{
+    wxFileName otherFn( wxString::FromUTF8( aPath ) );
+
+    if( !otherFn.IsAbsolute() || !otherFn.FileExists() )
+    {
+        aError = "no such board file (an absolute path)";
+        return false;
+    }
+
+    wxFileName projectFn = otherFn;
+    projectFn.SetExt( FILEEXT::ProjectFileExtension );
+
+    wxFileName  liveProjectFn( aLive->GetProject() ? aLive->GetProject()->GetProjectFullName() : wxString() );
+    wxString    boardPath = otherFn.GetFullPath();
+    wxString    projectPath = projectFn.GetFullPath();
+    OTHER_BOARD other;
+
+    // a board of the live project loads from a temporary copy, as for the comparison
+    if( !liveProjectFn.GetFullName().IsEmpty() && projectFn.SameAs( liveProjectFn ) )
+    {
+        other.tempDir = newTempDir( wxS( "ids" ) );
+        boardPath = other.tempDir + wxFileName::GetPathSeparator() + otherFn.GetFullName();
+        projectPath = other.tempDir + wxFileName::GetPathSeparator() + projectFn.GetFullName();
+
+        if( !wxCopyFile( otherFn.GetFullPath(), boardPath )
+            || ( projectFn.FileExists() && !wxCopyFile( projectFn.GetFullPath(), projectPath ) ) )
+        {
+            aError = "could not copy the board";
+            return false;
+        }
+    }
+
+    if( !loadOther( other, boardPath, projectPath, aError ) )
+        return false;
+
+    for( PCB_TRACK* t : other.board->Tracks() )
+        aOut.insert( t->m_Uuid );
+
+    return true;
+}
 
 
 static KOPENAPI_RESULT h_pcb_compare( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs )

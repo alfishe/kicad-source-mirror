@@ -16,6 +16,7 @@
 #include <functional>
 #include <string>
 
+#include <kiid.h>
 #include <layer_ids.h>
 #include <math/box2.h>
 #include <wx/string.h>
@@ -45,6 +46,10 @@ std::shared_ptr<PCB_CONTEXT> KopenapiPcbContext( KOPENAPI_CONTEXT& aCtx );
 
 /// @brief 409 "no board open" result for methods that need one
 KOPENAPI_RESULT KopenapiNoBoard();
+
+/// @brief The uuids of the tracks, arcs and vias of the board file aPath (loaded with its project
+/// as pcb_compare loads one); false and aError when it cannot be read
+bool KopenapiBoardCopperIds( BOARD* aLive, const std::string& aPath, std::set<KIID>& aOut, std::string& aError );
 
 class FOOTPRINT;
 

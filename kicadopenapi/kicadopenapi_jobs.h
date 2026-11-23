@@ -25,6 +25,20 @@ KICOMMON_API bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTo
                                    const std::string& aItem = std::string(),
                                    const nlohmann::json& aCounts = nlohmann::json() );
 
+/// @brief A call made from inside a running call (in process): while the scope is open its progress
+/// is reported as progress.inner (with aMethod, the nested call's name), the outer call's own progress
+/// stays as it is
+KICOMMON_API void KopenapiJobNest( bool aEnter, const std::string& aMethod = std::string() );
+
+class KOPENAPI_JOB_NESTED
+{
+public:
+    explicit KOPENAPI_JOB_NESTED( const std::string& aMethod = std::string() ) { KopenapiJobNest( true, aMethod ); }
+    ~KOPENAPI_JOB_NESTED() { KopenapiJobNest( false ); }
+    KOPENAPI_JOB_NESTED( const KOPENAPI_JOB_NESTED& ) = delete;
+    KOPENAPI_JOB_NESTED& operator=( const KOPENAPI_JOB_NESTED& ) = delete;
+};
+
 /// @brief Progress inside work whose worker threads may be running (DRC tests, zone fills): records
 /// it like KopenapiJobStep and keeps the windows painted, but runs no API calls and never pauses.
 /// False once the job is asked to stop.  Any thread records; the UI only on the main thread

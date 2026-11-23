@@ -57,6 +57,9 @@ struct JOB
     int               stepN = 0;
     uint64_t          stepServed = 0;      ///< the last request the main thread went on for
     uint64_t          rev = 0;             ///< grows with every change of state or progress (job_get since)
+    int               nest = 0;            ///< KOPENAPI_JOB_NESTED scopes open: progress goes to inner
+    nlohmann::json    inner;               ///< the nested call's progress
+    std::string       innerMethod;         ///< the innermost nested call's name
 
     std::string Id() const { return "job-" + std::to_string( seq ); }
     bool        Finished() const { return state == "done" || state == "failed" || state == "cancelled"; }
@@ -118,6 +121,9 @@ nlohmann::json describe( const JOB& aJob, bool aWithResult )
         const double spent = std::chrono::duration<double>( now - aJob.phaseStarted ).count();
         progress["phase_eta_s"] = std::round( spent / aJob.done * ( aJob.total - aJob.done ) * 10 ) / 10;
     }
+
+    if( aJob.nest > 0 && !aJob.inner.is_null() )
+        progress["inner"] = aJob.inner;
 
     progress["elapsed_s"] = j["elapsed_s"];
 
@@ -283,6 +289,25 @@ namespace
 void record( JOB& aJob, const std::string& aPhase, int aDone, int aTotal, const std::string& aItem,
              const nlohmann::json& aCounts )
 {
+    if( aJob.nest > 0 )
+    {
+        aJob.inner = { { "phase", aPhase }, { "done", aDone }, { "total", aTotal } };
+
+        if( !aJob.innerMethod.empty() )
+            aJob.inner["method"] = aJob.innerMethod;
+
+        if( !aItem.empty() )
+            aJob.inner["item"] = aItem;
+
+        if( !aCounts.is_null() )
+            aJob.inner["counts"] = aCounts;
+
+        aJob.rev++;
+        KopenapiEventNotify( "job" );
+        KopenapiEventNotify( "progress" );
+        return;
+    }
+
     if( aJob.phase != aPhase )
         aJob.phaseStarted = CLOCK::now();
 
@@ -313,6 +338,31 @@ std::string jobTitle( const JOB& aJob, const std::string& aPhase, int aDone, int
 }
 
 } // namespace
+
+
+void KopenapiJobNest( bool aEnter, const std::string& aMethod )
+{
+    std::lock_guard<std::mutex> lock( g_mutex );
+    JOB*                        job = g_current ? g_current.get() : g_call.get();
+
+    if( !job )
+        return;
+
+    job->nest = std::max( 0, job->nest + ( aEnter ? 1 : -1 ) );
+
+    if( aEnter && !aMethod.empty() )
+    {
+        job->innerMethod = aMethod;
+        job->inner = { { "method", aMethod } };
+        job->rev++;
+    }
+
+    if( job->nest == 0 )
+    {
+        job->inner = nlohmann::json();
+        job->innerMethod.clear();
+    }
+}
 
 
 bool KopenapiJobStep( const std::string& aPhase, int aDone, int aTotal, const std::string& aItem,
