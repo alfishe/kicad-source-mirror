@@ -22567,6 +22567,7 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                 std::vector<std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>>> items;
                 std::vector<std::string>                           fail;   ///< per escape: why it is not laid ("" laid)
                 std::vector<bool>                                  joinedOk;
+                std::vector<std::string>                           inwardWhy;   ///< per escape: why no via inward either
                 int                                                bad = 0;
                 int64_t                                            lo = 0, hi = 0, reach = 0;
                 bool                                               fan = false;   ///< a diverging fan: 45 degree legs, knees as deep as they can
@@ -22854,9 +22855,99 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
             if( !best )
                 continue;
 
+            // a rail pin with no spot out and no copper of its own: a stub inward from its pad to a via inside the
+            // ring, on its own column, as near its pad as the guard lets it, short of the ring's middle
+            const std::optional<BOX2I> ring = KopenapiPadRingInside( aFp, std::max( aIn.pitch / 2, 1 ) );
+            std::vector<std::optional<VECTOR2I>> inwardEnd( escs.size() );
+
+            auto inward = [&]( const ESC& e, std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>>& aOut ) -> std::string
+            {
+                if( !ring )
+                    return "the part has no ring inside its pads";
+
+                const BOX2I pb = e.pad->GetBoundingBox();
+                const int64_t inner = std::min( (int64_t) pb.GetLeft() * dir.x + (int64_t) pb.GetTop() * dir.y,
+                                                (int64_t) pb.GetRight() * dir.x + (int64_t) pb.GetBottom() * dir.y );
+                const int64_t ringLo = std::min( (int64_t) ring->GetLeft() * dir.x + (int64_t) ring->GetTop() * dir.y,
+                                                 (int64_t) ring->GetRight() * dir.x + (int64_t) ring->GetBottom() * dir.y );
+                const int64_t deepest = ( inner + ringLo ) / 2;
+                std::string   last = "no room before the ring's middle";
+
+                for( int64_t d = inner - e.viaHalf; d - e.viaHalf >= deepest; d -= step )
+                {
+                    std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> items;
+                    const VECTOR2I spot = at( e.pin, d );
+                    auto leg = std::make_unique<PCB_TRACK>( aBoard );
+                    leg->SetStart( e.pad->GetPosition() );
+                    leg->SetEnd( spot );
+                    leg->SetWidth( e.width );
+                    leg->SetLayer( layer );
+                    leg->SetNet( e.pad->GetNet() );
+                    items.push_back( std::move( leg ) );
+                    auto via = std::make_unique<PCB_VIA>( aBoard );
+                    via->SetViaType( VIATYPE::THROUGH );
+                    via->SetPosition( spot );
+                    via->SetWidth( PADSTACK::ALL_LAYERS, e.viaDia );
+                    via->SetDrill( e.viaDrill );
+                    via->SetLayerPair( F_Cu, B_Cu );
+                    via->SetNet( e.pad->GetNet() );
+                    items.push_back( std::move( via ) );
+
+                    std::vector<BOARD_CONNECTED_ITEM*> mine, others = staged;
+
+                    for( const auto& item : items )
+                        mine.push_back( item.get() );
+
+                    for( size_t i = 0; i < escs.size(); ++i )
+                    {
+                        if( best->fail[i].empty() )
+                        {
+                            for( const auto& item : best->items[i] )
+                                others.push_back( item.get() );
+                        }
+                    }
+
+                    const nlohmann::json v = guard( aBoard, mine, removed, refill, &others );
+
+                    if( v.empty() )
+                    {
+                        aOut = std::move( items );
+                        return std::string();
+                    }
+
+                    last = "inside the ring it touches " + v[0]["other"].dump();
+                }
+
+                return last;
+            };
+
+            for( size_t k = 0; k < escs.size(); ++k )
+            {
+                if( best->fail[k].empty() || !escs[k].via || !aIn.rail( escs[k].pad ) || chainOf.count( escs[k].pad )
+                    || !aArgs.value( "inward_rails", false ) )
+                {
+                    continue;
+                }
+
+                std::vector<std::unique_ptr<BOARD_CONNECTED_ITEM>> items;
+                const std::string                                  inWhy = inward( escs[k], items );
+
+                if( items.empty() )
+                {
+                    best->inwardWhy.resize( escs.size() );
+                    best->inwardWhy[k] = inWhy;
+                    continue;
+                }
+
+                inwardEnd[k] = items.back()->GetPosition();
+                best->items[k] = std::move( items );
+                best->fail[k].clear();
+            }
+
             for( size_t k = 0; k < escs.size(); ++k )
             {
                 const ESC& e = escs[k];
+                const std::string inWhy = k < best->inwardWhy.size() && !best->inwardWhy[k].empty() ? "; inward: " + best->inwardWhy[k] : "";
 
                 if( best->fail[k] == "-" )
                 {
@@ -22872,19 +22963,19 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                     char where[160];
                     std::snprintf( where, sizeof( where ), "no spot on the via line %.3f mm out within %.3f mm of its pin", toMm( best->depth - tip ),
                                    toMm( best->reach ) );
-                    best->fail[k] = std::string( where ) + ( list.empty() ? ": its neighbours' spots fill it" : ": blocked by " + list );
-                    skip( e.pad, best->fail[k].substr( 0, 400 ), "no spot on the via line" );
+                    best->fail[k] = std::string( where ) + ( list.empty() ? ": its neighbours' spots fill it" : ": blocked by " + list ) + inWhy;
+                    skip( e.pad, best->fail[k].substr( 0, 500 ), "no spot on the via line" );
                     continue;
                 }
 
                 if( !best->fail[k].empty() )
                 {
-                    skip( e.pad, best->fail[k].substr( 0, 400 ), "touches other copper" );
+                    skip( e.pad, ( best->fail[k] + inWhy ).substr( 0, 500 ), "touches other copper" );
                     continue;
                 }
 
                 const bool lay = ( aIn.onlyNets.empty() || aIn.onlyNets.count( e.pad->GetNetCode() ) ) && ( e.via || aArgs.value( "stubs", true ) );
-                const VECTOR2I end = at( *best->fit.at[k], e.via ? best->depth : best->depth + run );
+                const VECTOR2I end = inwardEnd[k] ? *inwardEnd[k] : at( *best->fit.at[k], e.via ? best->depth : best->depth + run );
                 nlohmann::json path = nlohmann::json::array();
 
                 for( auto& item : best->items[k] )
@@ -22919,12 +23010,18 @@ static KOPENAPI_RESULT partFanout( KOPENAPI_CONTEXT& aCtx, PCB_CONTEXT& aContext
                                        { "line_mm", toMm( best->depth - tip ) },
                                        { "laid", lay } };
 
+                if( inwardEnd[k] )
+                {
+                    row.erase( "line_mm" );
+                    row["inward"] = true;
+                }
+
                 if( const std::optional<VECTOR2I> farPos = aIn.farEnd( e.pad ) )
                     row["far_end_mm"] = { toMm( farPos->x ), toMm( farPos->y ) };
 
                 if( e.via )
                 {
-                    row["row"] = 0;
+                    row["row"] = inwardEnd[k] ? 1 : 0;
                     row["via"] = { { "at_mm", { toMm( end.x ), toMm( end.y ) } }, { "layers", { "F.Cu", "B.Cu" } }, { "laid", lay } };
                     viaSpotsOut.push_back( { { "pad", name( e.pad ) },
                                              { "net", str( UnescapeString( e.pad->GetNetname() ) ) },
@@ -25423,6 +25520,7 @@ KOPENAPI_REGISTER( "pcb_fanout",
                         "ports":{"type":"boolean","default":false,"description":"ring packages: follow the layout plan (pcb_fanout_ports): a via only for rails, for pins whose far end's order moves them to the other layer and for pins that yield to lanes (the plan's yields, the route leaving from that end); the rest stubs out past the courtyard on the pad's layer; each pin answers its port (kind, layer, to) and its via (at_mm, layers, laid); via_spots: the via spot of every signal pin of the package, laid or not (where its via goes should it leave by one: the package's pins fanned as vias in pin order, whatever nets are asked), each pad, net, side, at_mm, layers, from_layer, laid, path_mm (the fan's legs from the pad to it) - the one source of these spots for pcb_fanout_ports lanes, pcb_route ports and pcb_stitch"},
                         "stubs":{"type":"boolean","default":true,"description":"with ports: false lays only the planned vias (rails, pins to the other layer); the other pins are left to pcb_route"},
                         "part":{"type":"boolean","default":false,"description":"ring packages: one plan for every pin of the part at once (implies ports): the unlocked supply copper at its rail pins that ends near it (stubs, their vias, joins to other parts' pads) is taken out; per side every pin with a far end gets a spot on one via line, all spots assigned together in pin order at the rules' widths and clearances, clear of the copper and pads there, the line as near the pads as lets every pin fit; where parallel legs leave pins out (the pitch at a track and its clearance) the side fans out instead, split at a pin, each half's legs at 45 degrees away from it, a pin left out keeping its straight way out; rails and pins the ports plan moves to the other layer end on a via there, the rest run past the line on the pad's layer; a rail pin's removed joins are laid again from its via when clear. Answers pattern part, pins (pad, net, side, kind rail / via / stub, end_mm, line_mm, laid, via, port), skipped_pins (pad, net, reason with the blocker), via_spots, relaid {removed, laid, joined, unjoined, kept}; nets: plan all, lay only these; stubs false: lay only the vias (the stubs' spots stay in the plan)"},
+                        "inward_rails":{"type":"boolean","default":false,"description":"part: a rail pin with no spot out and no copper of its own gets a via inside the ring on its own column (pins answer inward)"},
                         "direction":{"type":"string","enum":["inward","up","down","left","right"],"description":"stubs straight this way (edge mode); inward: away from the board edge the pads sit on (found by itself for card-edge fingers)"},
                         "stub_mm":{"type":"number","description":"edge mode: stub length from the pad centre"},
                         "via":{"type":"string","enum":["none","always","stagger"],"default":"none","description":"edge mode: a via at each stub end, stagger: on two alternating lines"},

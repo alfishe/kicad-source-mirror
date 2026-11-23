@@ -367,9 +367,16 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
 
     std::vector<OBSTACLE> obstacles;
 
+    // an item farther from the grid than any reach marks no cell of it
+    BOX2I reachBox( aGrid.origin, VECTOR2I( (int64_t) aGrid.nx * aGrid.cell, (int64_t) aGrid.ny * aGrid.cell ) );
+    reachBox.Inflate( ds.GetBiggestClearanceValue() + std::max( halfWidth, viaRadius ) + aProbe.viaDrill + 2 * aDiag
+                      + pcbIUScale.mmToIU( 0.1 ) );
+
+    auto far = [&]( BOARD_ITEM* aItem ) { return !aItem->GetBoundingBox().Intersects( reachBox ); };
+
     auto addCopper = [&]( BOARD_CONNECTED_ITEM* aItem )
     {
-        if( aItem->GetNetCode() == aSkipNet && aSkipNet > 0 )
+        if( ( aItem->GetNetCode() == aSkipNet && aSkipNet > 0 ) || far( aItem ) )
             return;
 
         for( int l = 0; l < L; ++l )
@@ -416,7 +423,7 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
                 }
             }
 
-            if( pad->HasHole() )
+            if( pad->HasHole() && !far( pad ) )
                 obstacles.push_back( { pad, UNDEFINED_LAYER, 0, 0 } );
         }
     }
@@ -425,7 +432,7 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
     {
         addCopper( t );
 
-        if( t->Type() == PCB_VIA_T )
+        if( t->Type() == PCB_VIA_T && !far( t ) )
             obstacles.push_back( { t, UNDEFINED_LAYER, 0, 0 } );
     }
 
@@ -438,6 +445,9 @@ std::vector<OBSTACLE> rasteriseObstacles( BOARD* aBoard, const std::vector<PCB_L
     {
         if( zone->GetIsRuleArea() )
         {
+            if( far( zone ) )
+                continue;
+
             for( int l = 0; l < L; ++l )
             {
                 if( zone->IsOnLayer( aLayers[l] ) )
@@ -1774,13 +1784,53 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     if( !board->GetBoardPolygonOutlines( outline, true ) || outline.OutlineCount() == 0 )
         return KOPENAPI_RESULT::Error( 422, "the board has no outline" );
 
+    // region: the grid covers the boxes only; the copper outside is fixed, a net joins its islands that
+    // reach a box, inside the boxes
+    std::vector<BOX2I> region;
+
+    for( const nlohmann::json& b : aArgs.value( "region", nlohmann::json::array() ) )
+    {
+        if( !b.is_array() || b.size() != 4 )
+            return KOPENAPI_RESULT::Error( 400, "region: boxes as [x0, y0, x1, y1] in mm" );
+
+        const VECTOR2I a( pcbIUScale.mmToIU( b[0].get<double>() ), pcbIUScale.mmToIU( b[1].get<double>() ) );
+        const VECTOR2I c( pcbIUScale.mmToIU( b[2].get<double>() ), pcbIUScale.mmToIU( b[3].get<double>() ) );
+        BOX2I          box( a, c - a );
+        box.Normalize();
+        box = box.Intersect( outline.BBox() );
+
+        if( box.GetWidth() <= 0 || box.GetHeight() <= 0 )
+            return KOPENAPI_RESULT::Error( 422, "region: a box " + b.dump() + " lies off the board" );
+
+        region.push_back( box );
+    }
+
     ORACLE_GRID grid;
-    const BOX2I edges = outline.BBox();
+    BOX2I       edges = outline.BBox();
+
+    if( !region.empty() )
+    {
+        edges = region[0];
+
+        for( const BOX2I& box : region )
+            edges.Merge( box );
+    }
+
     grid.cell = pcbIUScale.mmToIU( std::max( 0.005, aArgs.value( "cell_mm", 0.05 ) ) );
     const double cellBudget = aArgs.value( "max_cells_m", 6.0 ) * 1e6;
 
     while( (double) edges.GetWidth() / grid.cell * edges.GetHeight() / grid.cell > cellBudget )
         grid.cell = grid.cell * 5 / 4 + 1;
+
+    if( !region.empty() )
+    {
+        // the region's cells are the whole board's cells: the same rasterising, the same answer where the
+        // ways stay inside
+        const VECTOR2I o = outline.BBox().GetOrigin();
+        const VECTOR2I a( o.x + ( edges.GetLeft() - o.x ) / grid.cell * grid.cell, o.y + ( edges.GetTop() - o.y ) / grid.cell * grid.cell );
+        edges.SetSize( edges.GetRight() - a.x, edges.GetBottom() - a.y );
+        edges.SetOrigin( a );
+    }
 
     grid.origin = edges.GetOrigin();
     grid.nx = edges.GetWidth() / grid.cell + 1;
@@ -1804,6 +1854,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         std::vector<size_t>                             trackStates;
         std::vector<size_t>                             viaCells;
         int                                             joined = 0;
+        int                                             outside = 0;     // islands that reach no box of the region
         size_t                                          conflicts = 0;
     };
 
@@ -1849,6 +1900,26 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                     job.islands[k].push_back( other );
                 }
             }
+        }
+
+        if( !region.empty() )
+        {
+            auto reaches = [&]( const std::vector<BOARD_CONNECTED_ITEM*>& aIsland )
+            {
+                return std::any_of( aIsland.begin(), aIsland.end(), [&]( BOARD_CONNECTED_ITEM* aItem )
+                                    { return std::any_of( region.begin(), region.end(), [&]( const BOX2I& aBox )
+                                                          { return aBox.Intersects( aItem->GetBoundingBox() ); } ); } );
+            };
+
+            const size_t had = job.islands.size();
+            job.islands.erase( std::remove_if( job.islands.begin(), job.islands.end(),
+                                               [&]( const auto& aIsland ) { return !reaches( aIsland ); } ),
+                               job.islands.end() );
+            job.outside = (int) ( had - job.islands.size() );
+            items.clear();
+
+            for( const std::vector<BOARD_CONNECTED_ITEM*>& island : job.islands )
+                items.insert( items.end(), island.begin(), island.end() );
         }
 
         if( job.islands.size() < 2 )
@@ -1933,6 +2004,34 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                     o = o == 0 ? v : ( o == v ? o : 0xFFFF );
                 } );
     }
+
+    if( region.size() > 1 )
+    {
+        std::vector<uint8_t> in( cells, 0 );
+
+        for( size_t i = 0; i < cells; ++i )
+        {
+            const VECTOR2I at = grid.Centre( (int) ( i % grid.nx ), (int) ( i / grid.nx ) );
+            in[i] = std::any_of( region.begin(), region.end(), [&]( const BOX2I& aBox ) { return aBox.Contains( at ); } );
+        }
+
+        for( size_t c = 0; c < classes.size(); ++c )
+        {
+            for( size_t i = 0; i < cells; ++i )
+            {
+                if( in[i] )
+                    continue;
+
+                for( int l = 0; l < L; ++l )
+                    ownTrack[c][(size_t) l * cells + i] = 0xFFFF;
+
+                if( vias )
+                    ownVia[c][i] = 0xFFFF;
+            }
+        }
+    }
+
+    const double buildMs = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
 
     // per class: the largest clearance of its nets
     std::vector<int> classClearance( classes.size(), ds.m_MinClearance );
@@ -2574,6 +2673,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         return pts;
     };
 
+    const double   negotiateMs = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count() - buildMs;
     nlohmann::json nets = nlohmann::json::array();
     size_t         unjoined = 0, sharing = 0;
 
@@ -2588,6 +2688,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                              { "islands", job.islands.size() },
                              { "joined", whole },
                              { "cells_shared", job.conflicts },
+                             { "islands_outside", job.outside },
                              { "width_mm", pcbIUScale.IUTomm( job.probe.width ) },
                              { "via_mm", vias ? nlohmann::json( { pcbIUScale.IUTomm( job.probe.viaDia ), pcbIUScale.IUTomm( job.probe.viaDrill ) } )
                                               : nlohmann::json() } };
@@ -2841,6 +2942,12 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     out["work_m"] = work / 1e6;
     out["result"] = nets;
     out["ms"] = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
+    out["build_ms"] = buildMs;
+    out["negotiate_ms"] = negotiateMs;
+
+    if( !region.empty() )
+        out["region"] = { { "boxes", region.size() }, { "cells", cells } };
+
     return KOPENAPI_RESULT::Ok( out );
 }
 
@@ -2853,9 +2960,11 @@ KOPENAPI_REGISTER( "pcb_route_oracle_joint",
                    "converged: every net joined and no cell shared, so the paths laid together keep the rules' "
                    "clearances (lay them and run DRC to prove it). Otherwise per net: joined, cells_shared. "
                    "result[]: net, islands, joined, cells_shared, width_mm, via_mm, paths (per joined island: "
-                   "[{at, layer}], a layer change is a via); rounds[]: nets_sharing, cells_shared, nets_unjoined",
+                   "[{at, layer}], a layer change is a via); rounds[]: nets_sharing, cells_shared, nets_unjoined; "
+                   "build_ms (the grids), negotiate_ms",
                    R"json({"type":"object","properties":{
                         "nets":{"type":"array","items":{"type":"string"},"description":"only these nets (default every net with more than one island)"},
+                        "region":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"description":"boxes [x0, y0, x1, y1] mm: the grid covers them only, the copper outside stays fixed; a net joins its islands that reach a box (result islands_outside: those that do not), its paths inside the boxes; answer region {boxes, cells}"},
                         "vias":{"type":"boolean","default":true},
                         "zones_yield":{"type":"boolean","default":true,"description":"zone fills shut no via (a refill clears round it); tracks keep out of them"},
                         "cell_mm":{"type":"number","default":0.05,"minimum":0.005},
