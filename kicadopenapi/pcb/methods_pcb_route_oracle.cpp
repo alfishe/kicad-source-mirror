@@ -2544,6 +2544,8 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     const int maxRounds = aArgs.value( "rounds", 40 );
     float     present = (float) aArgs.value( "present", 0.5 );
     const float presentGrowth = (float) aArgs.value( "present_growth", 1.6 );
+    // capped: beyond it a cell step of 1 is lost in a float cost and the search stops telling ways apart
+    const float presentMax = (float) aArgs.value( "present_max", 1000.0 );
     const float historyStep = (float) aArgs.value( "history", 1.0 );
     // every net each round, so one in the way of another moves too; else only the nets that share
     const bool  rerouteAll = aArgs.value( "reroute", std::string( "all" ) ) == "all";
@@ -2553,6 +2555,19 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     bool           stopped = false;
     int            round = 0;
     size_t         lastShared = 0;
+
+    // the best round seen (fewest nets unjoined, then fewest cells shared): the answer when none converges
+    struct KEPT
+    {
+        std::vector<std::vector<size_t>> paths;
+        std::vector<size_t>              trackStates, viaCells;
+        int                              joined = 0;
+        bool                             wide = false;
+    };
+
+    std::vector<KEPT>             best;
+    std::pair<size_t, size_t>     bestScore{ SIZE_MAX, SIZE_MAX };
+    int                           bestRound = -1;
 
     // the first round: every net alone in its window, the whole board where the window is too small
     for( size_t j = 0; j < jobs.size() && !stopped; ++j )
@@ -2605,6 +2620,16 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         rounds.push_back( { { "round", round }, { "nets_sharing", nets }, { "cells_shared", shared }, { "nets_unjoined", unjoined },
                             { "work_m", work / 1e6 } } );
 
+        if( std::make_pair( unjoined, shared ) < bestScore )
+        {
+            bestScore = { unjoined, shared };
+            bestRound = round;
+            best.clear();
+
+            for( const JOB& job : jobs )
+                best.push_back( { job.paths, job.trackStates, job.viaCells, job.joined, job.wide } );
+        }
+
         if( !nets )
         {
             converged = unjoined == 0;
@@ -2637,7 +2662,23 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         }
 
         // finite: an infinite factor times a free cell's zero claim is NaN, and no step would be taken
-        present = std::min( present * presentGrowth, 1e30f );
+        present = std::min( present * presentGrowth, presentMax );
+    }
+
+    const int lastRound = rounds.empty() ? -1 : rounds.back().value( "round", -1 );
+
+    if( !converged && bestRound >= 0 && bestRound != lastRound && best.size() == jobs.size() )
+    {
+        for( size_t j = 0; j < jobs.size(); ++j )
+        {
+            claim( jobs[j], -1 );
+            jobs[j].paths = std::move( best[j].paths );
+            jobs[j].trackStates = std::move( best[j].trackStates );
+            jobs[j].viaCells = std::move( best[j].viaCells );
+            jobs[j].joined = best[j].joined;
+            jobs[j].wide = best[j].wide;
+            claim( jobs[j], 1 );
+        }
     }
 
     // the paths as the single oracle gives them: corners where the step changes, a via where the layer does
@@ -2755,6 +2796,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     }
 
     out["converged"] = converged && !unjoined && !sharing;
+    out["best_round"] = bestRound;
 
     // a proof that not all fit: a rectangle round a hot square whose boundary more nets must cross (copper
     // inside and outside, none of it on the boundary) than tracks fit along it. The room is an upper
@@ -2974,6 +3016,7 @@ KOPENAPI_REGISTER( "pcb_route_oracle_joint",
                         "rounds":{"type":"integer","default":40},
                         "present":{"type":"number","default":0.5},
                         "present_growth":{"type":"number","default":1.6},
+                        "present_max":{"type":"number","default":1000,"description":"the present factor grows to this at most"},
                         "history":{"type":"number","default":1},
                         "reroute":{"type":"string","enum":["all","sharing"],"default":"all","description":"each round reroute every net, or only those that share"},
                         "max_work_m":{"type":"number","default":20000,"description":"millions of search steps at most"},
