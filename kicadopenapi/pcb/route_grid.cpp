@@ -6272,23 +6272,144 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     // closes none of it either: it sits on that track, anywhere along it in its tile
     std::vector<float> viaOwnE( N, 0 ), viaOwnS( N, 0 );
 
-    auto loadE = [&]( size_t i )
+    // a side's share of the vias of its two tiles, as if each via sat in the middle of its tile
+    auto baseLoad = [&]( size_t i, bool aEast )
     {
         const size_t t = i % tiles;
+        const bool   next = aEast ? (int) ( t % tnx ) + 1 < tnx : t + tnx < tiles;
 
-        if( wallE[i] )
+        if( aEast ? wallE[i] : wallS[i] )
             return 0.0f;
 
-        return viaLoad * std::max( 0.0f, useV[t] + ( (int) ( t % tnx ) + 1 < tnx ? useV[t + 1] : 0.0f ) - viaOwnE[i] );
+        return viaLoad * std::max( 0.0f, useV[t] + ( next ? useV[t + ( aEast ? 1 : tnx )] : 0.0f ) - ( aEast ? viaOwnE[i] : viaOwnS[i] ) );
+    };
+
+    // a via sits anywhere in its tile: it moves away from a side its load would put over, toward the opposite
+    // side of its tile, as far as that side's slack allows; a side's slack goes first to the side before it
+    auto sideUse = [&]( size_t i, bool aEast ) { return aEast ? useE[i] : useS[i]; };
+    auto sideCap = [&]( size_t i, bool aEast ) { return aEast ? refRoom.capE[i] : refRoom.capS[i]; };
+
+    auto slack = [&]( size_t i, bool aEast )
+    {
+        return std::max( 0.0f, sideCap( i, aEast ) - sideUse( i, aEast ) - baseLoad( i, aEast ) );
+    };
+
+    auto overOf = [&]( size_t i, bool aEast )
+    {
+        if( sideUse( i, aEast ) <= 0 )
+            return 0.0f;
+
+        const float base = baseLoad( i, aEast );
+        return std::max( 0.0f, std::min( base, sideUse( i, aEast ) + base - sideCap( i, aEast ) ) );
+    };
+
+    // the load side i (at pos along its axis) sends through its second tile to the side after it
+    auto sentAfter = [&]( size_t i, bool aEast, int aPos, int aSpan )
+    {
+        const size_t step = aEast ? 1 : tnx;
+
+        if( aPos + 2 >= aSpan || useV[i % tiles + step] <= 0 )
+            return 0.0f;
+
+        const float over = overOf( i, aEast );
+        return over > 0 ? std::min( { over, viaLoad * useV[i % tiles + step], slack( i + step, aEast ) } ) : 0.0f;
+    };
+
+    // the load side i sends through its first tile to the side before it, after what it sent after it
+    auto sentBefore = [&]( size_t i, bool aEast, int aPos, int aSpan, float aOver, float aAfter )
+    {
+        const size_t step = aEast ? 1 : tnx;
+
+        if( aPos < 1 || aOver <= aAfter || useV[i % tiles] <= 0 )
+            return 0.0f;
+
+        const float room = slack( i - step, aEast ) - ( aPos >= 2 ? sentAfter( i - 2 * step, aEast, aPos - 2, aSpan ) : 0.0f );
+        return std::max( 0.0f, std::min( { aOver - aAfter, viaLoad * useV[i % tiles], room } ) );
+    };
+
+    auto load = [&]( size_t i, bool aEast )
+    {
+        const size_t t = i % tiles;
+        const size_t step = aEast ? 1 : tnx;
+        const int    pos = aEast ? (int) ( t % tnx ) : (int) ( t / tnx );
+        const int    span = aEast ? tnx : tny;
+
+        // only the vias of its own two tiles load a side, wherever they sit in them
+        if( ( aEast ? wallE[i] : wallS[i] ) || ( useV[t] <= 0 && ( pos + 1 >= span || useV[t + step] <= 0 ) ) )
+            return 0.0f;
+
+        float out = baseLoad( i, aEast );
+
+        if( pos + 1 < span )
+        {
+            // what it sends away
+            if( const float over = overOf( i, aEast ); over > 0 )
+            {
+                const float after = sentAfter( i, aEast, pos, span );
+                out -= after + sentBefore( i, aEast, pos, span, over, after );
+            }
+
+            // what the side after it sends through their shared tile
+            if( pos + 2 < span && useV[t + step] > 0 )
+            {
+                if( const float over = overOf( i + step, aEast ); over > 0 )
+                    out += sentBefore( i + step, aEast, pos + 1, span, over, sentAfter( i + step, aEast, pos + 1, span ) );
+            }
+        }
+
+        // what the side before it sends through their shared tile
+        if( pos >= 1 && useV[t] > 0 )
+            out += sentAfter( i - step, aEast, pos - 1, span );
+
+        return std::max( 0.0f, out );
+    };
+
+    // the loads asked for, kept until a via or track within reach of the side changes
+    std::vector<float>   loadKept( 2 * N, 0.0f );
+    std::vector<uint8_t> loadValid( 2 * N, 0 );
+
+    auto loadE = [&]( size_t i )
+    {
+        if( !loadValid[i] )
+        {
+            loadKept[i] = load( i, true );
+            loadValid[i] = 1;
+        }
+
+        return loadKept[i];
     };
     auto loadS = [&]( size_t i )
     {
-        const size_t t = i % tiles;
+        if( !loadValid[N + i] )
+        {
+            loadKept[N + i] = load( i, false );
+            loadValid[N + i] = 1;
+        }
 
-        if( wallS[i] )
-            return 0.0f;
+        return loadKept[N + i];
+    };
 
-        return viaLoad * std::max( 0.0f, useV[t] + ( t + tnx < tiles ? useV[t + tnx] : 0.0f ) - viaOwnS[i] );
+    // a change in tile t reaches the loads of the sides three tiles along its row and column
+    auto loadsChanged = [&]( size_t t )
+    {
+        const int x = (int) ( t % tnx ), y = (int) ( t / tnx );
+
+        for( int d = -3; d <= 3; ++d )
+        {
+            for( int k = 0; k < 2; ++k )
+            {
+                const int tx = k ? x : x + d, ty = k ? y + d : y;
+
+                if( tx < 0 || tx >= tnx || ty < 0 || ty >= tny )
+                    continue;
+
+                for( int l = 0; l < L; ++l )
+                {
+                    const size_t i = (size_t) l * tiles + (size_t) ty * tnx + tx;
+                    loadValid[i] = loadValid[N + i] = 0;
+                }
+            }
+        }
     };
     float              pf = 0.5f;
 
@@ -6348,6 +6469,9 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     {
         const float w = aSign * weight[aLink.net];
         const std::vector<uint32_t>& p = aLink.nodes;
+
+        for( uint32_t n : p )
+            loadsChanged( n % tiles );
 
         for( size_t j = 1; j < p.size(); ++j )
         {
@@ -6955,6 +7079,8 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     for( auto* v : { &useE, &useS, &useV, &thrH, &thrV, &viaOwnE, &viaOwnS } )
         std::fill( v->begin(), v->end(), 0.0f );
 
+    std::fill( loadValid.begin(), loadValid.end(), 0 );
+
     for( const GRID_CAPACITY::LINK& link : out.links )
         apply( link, 1.0f );
 
@@ -7165,10 +7291,14 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             {
                 const int x = (int) ( n % tiles % tnx ), y = (int) ( n % tiles / tnx );
 
-                for( int dy = -1; dy <= 1; ++dy )
+                // the tiles round the path, and along its row and column as far as a via's load moves
+                for( int dy = -3; dy <= 3; ++dy )
                 {
-                    for( int dx = -1; dx <= 1; ++dx )
+                    for( int dx = -3; dx <= 3; ++dx )
                     {
+                        if( ( std::abs( dx ) > 1 || std::abs( dy ) > 1 ) && dx != 0 && dy != 0 )
+                            continue;
+
                         if( x + dx < 0 || x + dx >= tnx || y + dy < 0 || y + dy >= tny )
                             continue;
 
@@ -7589,6 +7719,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
     useE = bestE;
     useS = bestS;
+    std::fill( loadValid.begin(), loadValid.end(), 0 );
     markOwners();
 
     for( size_t i = 0; i < N; ++i )
