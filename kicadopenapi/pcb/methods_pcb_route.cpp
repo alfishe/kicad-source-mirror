@@ -14467,7 +14467,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 for( const nlohmann::json& p : ca["paths"] )
                 {
                     NETINFO_ITEM* ni = p.is_object() && p.contains( "net" ) && p["net"].is_string()
-                                               ? board->FindNet( wxString::FromUTF8( p["net"].get<std::string>() ) )
+                                               ? KopenapiFindNet( board, p["net"].get<std::string>() )
                                                : nullptr;
 
                     if( !ni || !p.contains( "nodes" ) || !p["nodes"].is_array() )

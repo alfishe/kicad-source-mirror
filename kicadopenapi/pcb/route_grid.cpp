@@ -6646,13 +6646,30 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         return aTo == aFrom + 1 ? 0.0f : aTo == aFrom + tnx ? 90.0f : aTo + 1 == aFrom ? 180.0f : 270.0f; // y down
     };
 
-    // the arm of a link's end in its end tile: towards the end's cells there, NaN in the tile's middle
+    // the arm of a link's end in its end tile: towards the end's cells there, NaN in the tile's middle. A given
+    // route has no ends of its own: the one end of its net in that tile, if there is exactly one
     auto endAngle = [&]( const GRID_CAPACITY::LINK& aLink, int aEnd, uint32_t aNode )
     {
         const int    l = (int) ( aNode / tiles );
         const size_t t = aNode % tiles;
         double       sx = 0, sy = 0;
         int          n = 0;
+
+        if( aEnd < 0 && aLink.a < 0 )
+        {
+            for( size_t e = 0; e < endNodes[aLink.net].size(); ++e )
+            {
+                const std::vector<uint32_t>& nodes = endNodes[aLink.net][e];
+
+                if( std::find( nodes.begin(), nodes.end(), aNode ) != nodes.end() )
+                {
+                    if( aEnd >= 0 )
+                        return std::numeric_limits<float>::quiet_NaN();
+
+                    aEnd = (int) e;
+                }
+            }
+        }
 
         if( aEnd < 0 )
             return std::numeric_limits<float>::quiet_NaN();
