@@ -401,6 +401,8 @@ struct GRID_CAPACITY
     std::vector<std::vector<std::array<int32_t, 2>>> probeCells; ///< per class: the probed side's cell pairs (inside, outside): 0 free, net code, -1 closed
     std::vector<float>        probeRoom, probeOwn; ///< per class: the probed side's room and own room
     std::vector<int32_t>      probeOwner;      ///< per class: the probed side's owner (0 none, -1 several)
+    std::vector<std::vector<int32_t>> probeVia; ///< per class: the probed tile's via cells row by row: 0 free, net code, -1 closed
+    std::vector<float>        probeViaRoom;    ///< per class: the probed tile's via room
     std::vector<float>        useE, useS;     ///< and the best round's use (in reference tracks; a via in a tile beside takes half a via pitch)
     std::vector<float>        viaCap, viaUse; ///< per tile
     std::vector<float>        crossH, crossV; ///< per layer * tiles: tracks through west-east / north-south

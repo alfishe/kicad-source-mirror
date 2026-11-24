@@ -5993,8 +5993,8 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         }
     };
 
-    // vias of class c: the free via cells over the area one via takes with its room (pitch squared); for the
-    // one net whose own copper covers the rest of the tile, its cells count too
+    // vias of class c: the free via cells over the area one via takes with its room (sqrt(3)/2 pitch squared,
+    // the densest packing); for the one net whose own copper covers the rest of the tile, its cells count too
     std::vector<double> viaArea( C, 1.0 );
     double              viaPitchRef = 0;
 
@@ -6002,7 +6002,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     {
         const SIZES& sz = world.sizes[c];
         const double viaPitch = std::max( 2.0 * sz.viaRadius + sz.clearance, (double) sz.viaDrill + world.h2h );
-        viaArea[c] = std::max( 1.0, viaPitch * viaPitch / ( (double) g.cell * g.cell ) );
+        viaArea[c] = std::max( 1.0, std::sqrt( 3.0 ) / 2.0 * viaPitch * viaPitch / ( (double) g.cell * g.cell ) );
         ROOM& r = room[c];
         r.capE.assign( L * tiles, 0.0f );
         r.capS.assign( L * tiles, 0.0f );
@@ -6053,8 +6053,9 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
         for( size_t t = 0; t < tiles; ++t )
         {
-            // one legal via place holds a via however small the free area is
-            auto vias = [&]( int aCells ) { return aCells > 0 ? std::max( 1.0f, (float) std::floor( aCells / viaArea[c] ) ) : 0.0f; };
+            // vias packed densest, summed over tiles as a share of the area each takes; one legal via place holds
+            // a via however small the free area is
+            auto vias = [&]( int aCells ) { return aCells > 0 ? std::max( 1.0f, (float) ( aCells / viaArea[c] ) ) : 0.0f; };
             r.via[t] = vias( freeCells[t] );
             r.viaOwn[t] = r.viaOwner[t] > 0 ? vias( freeCells[t] + ownCells[t] ) : r.via[t];
         }
@@ -6084,6 +6085,16 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             }
 
             out.probeCells.push_back( std::move( cells ) );
+            std::vector<int32_t> viaCells;
+
+            for( int y = pr[2] * T; y < std::min( g.ny, ( pr[2] + 1 ) * T ); ++y )
+            {
+                for( int x = pr[1] * T; x < std::min( g.nx, ( pr[1] + 1 ) * T ); ++x )
+                    viaCells.push_back( world.sizes[c].viaRadius > 0 ? world.via[c][g.Index( x, y )] : -1 );
+            }
+
+            out.probeVia.push_back( std::move( viaCells ) );
+            out.probeViaRoom.push_back( room[c].via[(size_t) pr[2] * tnx + pr[1]] );
             out.probeRoom.push_back( east ? room[c].capE[i] : room[c].capS[i] );
             const OWNS& owns = east ? room[c].ownsE[i] : room[c].ownsS[i];
             out.probeOwn.push_back( east ? room[c].ownE[i] : room[c].ownS[i] );
