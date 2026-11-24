@@ -6134,6 +6134,64 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         }
     }
 
+    // given routes (the copper of a routed board) are measured, not searched: no ends, so no end steps
+    const bool given = !aParams.capacityPaths.empty();
+
+    if( given )
+    {
+        out.links.clear();
+        std::unordered_map<int, int> netOf;
+
+        for( size_t n = 0; n < world.nets.size(); ++n )
+            netOf[world.nets[n].code] = (int) n;
+
+        for( const auto& [code, tilesOf] : aParams.capacityPaths )
+        {
+            auto it = netOf.find( code );
+
+            if( it == netOf.end() || tilesOf.empty() )
+                continue;
+
+            GRID_CAPACITY::LINK link{ it->second, code, -1, -1, {}, false };
+            bool                ok = true;
+
+            for( const std::array<int, 3>& v : tilesOf )
+            {
+                ok = ok && v[0] >= 0 && v[0] < L && v[1] >= 0 && v[1] < tnx && v[2] >= 0 && v[2] < tny;
+
+                if( !ok )
+                    break;
+
+                const uint32_t node = (uint32_t) ( v[0] * tiles + (size_t) v[2] * tnx + v[1] );
+
+                if( !link.nodes.empty() )
+                {
+                    const uint32_t p = link.nodes.back();
+                    const int      d = std::abs( (int) ( p % tiles % tnx ) - v[1] ) + std::abs( (int) ( p % tiles / tnx ) - v[2] );
+
+                    if( p == node )
+                        continue;
+
+                    // one step: to a side neighbour on the layer, or a via in the tile
+                    ok = ( p / tiles == node / tiles && d == 1 ) || ( p / tiles != node / tiles && d == 0 );
+                }
+
+                if( !ok )
+                    break;
+
+                link.nodes.push_back( node );
+            }
+
+            if( !ok )
+            {
+                out.error = "a given route of net " + std::to_string( code ) + " leaves the tiles or skips a tile";
+                return out;
+            }
+
+            out.links.push_back( std::move( link ) );
+        }
+    }
+
     // negotiated congestion over the tiles: sides per layer, vias per tile, and crossings: one net through a
     // tile west to east and another north to south on the same layer must cross there, which needs a via
     const size_t       N = (size_t) L * tiles;
@@ -6143,7 +6201,10 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
     // a via closes a lane through its tile on every layer: half a via pitch of room on each side of it
     const float viaLoad = (float) ( 0.5 * viaPitchRef / out.refPitch );
-    // a side no track passes (a wall) has no lane a via could close
+    // a side no track passes (a wall) has no lane a via could close; a via on the track that crosses the side
+    // closes none of it either: it sits on that track, anywhere along it in its tile
+    std::vector<float> viaOwnE( N, 0 ), viaOwnS( N, 0 );
+
     auto loadE = [&]( size_t i )
     {
         const size_t t = i % tiles;
@@ -6151,7 +6212,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         if( wallE[i] )
             return 0.0f;
 
-        return viaLoad * ( useV[t] + ( (int) ( t % tnx ) + 1 < tnx ? useV[t + 1] : 0.0f ) );
+        return viaLoad * std::max( 0.0f, useV[t] + ( (int) ( t % tnx ) + 1 < tnx ? useV[t + 1] : 0.0f ) - viaOwnE[i] );
     };
     auto loadS = [&]( size_t i )
     {
@@ -6160,7 +6221,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         if( wallS[i] )
             return 0.0f;
 
-        return viaLoad * ( useV[t] + ( t + tnx < tiles ? useV[t + tnx] : 0.0f ) );
+        return viaLoad * std::max( 0.0f, useV[t] + ( t + tnx < tiles ? useV[t + tnx] : 0.0f ) - viaOwnS[i] );
     };
     float              pf = 0.5f;
 
@@ -6170,16 +6231,34 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         return aBase * ( 1.0f + aHist ) * ( 1.0f + pf * over );
     };
 
-    // a crossing costs at least the two vias that would take one of the nets around it
+    // a layer's direction: 1 west-east, 2 north-south, 0 any
+    std::vector<int> dirOf( L, 0 );
+
+    for( int l = 0; l < L; ++l )
+    {
+        if( aParams.capacityDirections == "hv" )
+            dirOf[l] = l % 2 ? 2 : 1;
+        else if( aParams.capacityDirections == "vh" )
+            dirOf[l] = l % 2 ? 1 : 2;
+    }
+
+    // a crossing costs at least the two vias that would take one of the nets around it, never more than three:
+    // two vias always resolve it, so a crossing's price may not grow into a wall
+    const float crossCap = 3.0f * viaStep;
+
     auto crossPrice = [&]( float aOther, float aHist )
     {
-        return aOther > 0 ? 2.0f * viaStep * ( 1.0f + aHist ) * ( 1.0f + pf * aOther ) : 0.0f;
+        return aOther > 0 ? std::min( crossCap, 2.0f * viaStep * ( 1.0f + aHist ) * ( 1.0f + pf * aOther ) ) : 0.0f;
     };
 
     auto isEnd = [&]( const GRID_CAPACITY::LINK& aLink, uint32_t aNode )
     {
-        for( int e : { aLink.a, aLink.b } )
+        // a given route has no ends of its own: any end of its net counts
+        for( size_t e = 0; e < endNodes[aLink.net].size(); ++e )
         {
+            if( aLink.a >= 0 && (int) e != aLink.a && (int) e != aLink.b )
+                continue;
+
             const std::vector<uint32_t>& nodes = endNodes[aLink.net][e];
 
             if( std::find( nodes.begin(), nodes.end(), aNode ) != nodes.end() )
@@ -6215,6 +6294,27 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                 useE[std::min( a, b )] += w;
             else
                 useS[std::min( a, b )] += w;
+        }
+
+        // the steps of the link into and out of each of its vias
+        auto own = [&]( uint32_t a, uint32_t b )
+        {
+            if( horizontal( a, b ) )
+                viaOwnE[std::min( a, b )] += aSign;
+            else if( vertical( a, b ) )
+                viaOwnS[std::min( a, b )] += aSign;
+        };
+
+        for( size_t j = 1; j < p.size(); ++j )
+        {
+            if( p[j - 1] / tiles == p[j] / tiles )
+                continue;
+
+            if( j >= 2 )
+                own( p[j - 2], p[j - 1] );
+
+            if( j + 1 < p.size() )
+                own( p[j], p[j + 1] );
         }
 
         for( size_t j = 1; j + 1 < p.size(); ++j )
@@ -6332,13 +6432,19 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
             auto side = [&]( uint32_t v, float aUse, float aCap, float aHist )
             {
-                const float crossed = histX[v] > 0 ? viaStep * histX[v] * pf : 0.0f;
+                const float crossed = histX[v] > 0 ? std::min( crossCap, viaStep * histX[v] * pf ) : 0.0f;
 
+                // a step out of or into the link's own end tiles is its fan-out: no room counted, yet the
+                // crossings found there before still cost
                 if( start[u] || goal[v] )
-                    return 1.0f;
+                    return 1.0f + crossed;
+
+                // a step across the layer's direction costs as the grid engine's does
+                const int   axis = v == u + 1 || v + 1 == u ? 1 : 2;
+                const float base = dirOf[l] != 0 && dirOf[l] != axis ? 1.6f : 1.0f;
 
                 // no track of the reference class passes: a wall, not a price
-                return aCap <= 0 ? std::numeric_limits<float>::infinity() : crossed + price( aUse, aCap, aHist, w, 1.0f );
+                return aCap <= 0 ? std::numeric_limits<float>::infinity() : crossed + price( aUse, aCap, aHist, w, base );
             };
 
             if( x + 1 < tnx )
@@ -6478,6 +6584,9 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         const size_t t = aNode % tiles;
         double       sx = 0, sy = 0;
         int          n = 0;
+
+        if( aEnd < 0 )
+            return std::numeric_limits<float>::quiet_NaN();
 
         for( uint32_t st : world.nets[aLink.net].ends[aEnd] )
         {
@@ -6652,20 +6761,21 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
     auto overNow = [&]()
     {
-        double over = 0;
+        std::array<double, 3> kinds{ 0, 0, 0 };
         markOwners();
         findCrossings( false );
 
         for( size_t i = 0; i < N; ++i )
         {
-            over += sideOver( useE[i], loadE( i ), roomE( i ) ) + sideOver( useS[i], loadS( i ), roomS( i ) );
-            over += crossAt[i];
+            kinds[0] += sideOver( useE[i], loadE( i ), roomE( i ) ) + sideOver( useS[i], loadS( i ), roomS( i ) );
+            kinds[2] += crossAt[i];
         }
 
         for( size_t t = 0; t < tiles; ++t )
-            over += std::max( 0.0f, useV[t] - roomV( t ) );
+            kinds[1] += std::max( 0.0f, useV[t] - roomV( t ) );
 
-        return over;
+        out.overKindsByRound.push_back( kinds );
+        return kinds[0] + kinds[1] + kinds[2];
     };
 
     double                             bestOver = std::numeric_limits<double>::infinity();
@@ -6676,6 +6786,12 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     {
         for( GRID_CAPACITY::LINK& link : out.links )
         {
+            if( given )
+            {
+                apply( link, 1.0f );
+                continue;
+            }
+
             if( round > 0 )
                 apply( link, -1.0f );
 
@@ -6686,7 +6802,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         const double over = overNow();
         out.overByRound.push_back( over );
 
-        if( over < bestOver )
+        if( over < bestOver || ( aParams.capacityLast && round + 1 == std::max( 1, aRounds ) ) )
         {
             bestOver = over;
             out.bestRound = round;
@@ -6708,7 +6824,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             bestVt = thrV;
         }
 
-        if( over <= 0 || ( aParams.cancel && aParams.cancel->load() ) )
+        if( over <= 0 || given || ( aParams.cancel && aParams.cancel->load() ) )
             break;
 
         for( size_t i = 0; i < N; ++i )

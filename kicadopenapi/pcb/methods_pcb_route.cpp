@@ -14445,6 +14445,41 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             const int tile = pcbIUScale.mmToIU( std::clamp( ca.value( "tile_mm", 1.0 ), 0.2, 10.0 ) );
             const int rounds = std::clamp( ca.value( "rounds", 30 ), 1, 500 );
             const int viaCost = pcbIUScale.mmToIU( std::clamp( ca.value( "via_cost_mm", 2.0 ), 0.0, 50.0 ) );
+            params.capacityDirections = ca.value( "directions", std::string( "hv" ) );
+            params.capacityLast = ca.value( "answer", std::string( "best" ) ) == "last";
+
+            if( ca.contains( "paths" ) )
+            {
+                if( !ca["paths"].is_array() )
+                    return KOPENAPI_RESULT::Error( 400, "capacity: paths is an array of {net, nodes: [[layer, x, y], ...]}" );
+
+                for( const nlohmann::json& p : ca["paths"] )
+                {
+                    NETINFO_ITEM* ni = p.is_object() && p.contains( "net" ) && p["net"].is_string()
+                                               ? board->FindNet( wxString::FromUTF8( p["net"].get<std::string>() ) )
+                                               : nullptr;
+
+                    if( !ni || !p.contains( "nodes" ) || !p["nodes"].is_array() )
+                        return KOPENAPI_RESULT::Error( 400, "capacity: each path names a board net and its nodes [[layer, x, y], ...]" );
+
+                    std::vector<std::array<int, 3>> nodes;
+
+                    for( const nlohmann::json& n : p["nodes"] )
+                    {
+                        if( !n.is_array() || n.size() != 3 || !n[0].is_number_integer() || !n[1].is_number_integer()
+                            || !n[2].is_number_integer() )
+                            return KOPENAPI_RESULT::Error( 400, "capacity: a path node is [layer, x, y] (integers)" );
+
+                        nodes.push_back( { n[0].get<int>(), n[1].get<int>(), n[2].get<int>() } );
+                    }
+
+                    params.capacityPaths.emplace_back( ni->GetNetCode(), std::move( nodes ) );
+                }
+            }
+
+            if( params.capacityDirections != "" && params.capacityDirections != "hv" && params.capacityDirections != "vh" )
+                return KOPENAPI_RESULT::Error( 400, "capacity: directions is \"\", \"hv\" or \"vh\"" );
+
             GRID_CAPACITY cap;
             KopenapiCompute( [&]() { cap = GridCapacity( board, gridNets, params, tile, rounds, viaCost ); } );
 
@@ -25299,7 +25334,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "bus_paths":{"description":"pns: \"off\", \"floorplan\" (or {floorplan: {pcb_floorplan arguments}}): every bus link pcb_floorplan finds, along its corridor, the connections of its nets between the two blocks' parts; or [{name, nets, points_mm: [[x_mm, y_mm] (a free point) or {at_mm, along: x | y, lo_mm, hi_mm, into_mm: [x0, y0, x1, y1]} (a portal crossed into that region: the ribbon inside lo..hi, joined to the next portal by axis-parallel runs inside the region; rooms_mm: [[x0, y0, x1, y1], ...] the regions to the next gate, more than one: joined by the straight run, which lies inside them (docs corridor.md))]}]: the connections of those nets, from the end nearer the first point. A corridor is a soft goal: at the turn of its first connection each member gets one try along it, across it in order, in a tenth of first_pass_budget_s; the members it does not route keep their turn and their usual tries with their whole budget. The answer's corridors give the centre line (line_mm) the members run beside at their pitch. With floorplan, ports and lanes: a link whose ring pcb_floorplan gives (links rings) is laid first along it, one lane per net on the ring's layer from its row of vias at the pins' side round the part to the other row, nested innermost first, the pins taking those spots in their order by a 45 degree fan (the spots pushed out past the row when the fan needs it); that link's corridor is not used and the answer's ring_lanes give each lane (net, rank, polyline_mm, leg_mm, refused)","default":"off"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},
                         "corridor":{"type":"object","description":"grid engine: each net keeps to its coarse route (the capacity model's routes over the same map, a tile either side): a cell off it costs cost (4) times more; rounds (100) of the coarse routes"},
-                        "capacity":{"type":"object","description":"nothing routed: the room the connections need against the board's free space on a coarse grid of tiles over the grid engine's own map (tracks of each net's own class across each tile side per layer, vias per tile, a net's own copper counted as room for that net, weighed in tracks of the most common class), every connection routed over the tiles with negotiated congestion; answers the passes (sides over their room next to each other on one tile line, room and need summed), via tiles and crossings still over after the best round, worst first, with the nets through them. tile_mm (1), rounds (30), via_cost_mm (2), maps (false: the per-tile room and use arrays and each connection's tiles [layer, x, y]). Two nets on one layer that share a stretch of tiles and leave it on the other sides than they came in must cross there (kind crossing, pairs): one of them needs a via; a side no track passes is a wall, a side no track crosses is never over, and a connection walled off from its other end is listed in blocked; steps out of a connection's own end tiles are its fan-out and not counted"},
+                        "capacity":{"type":"object","description":"nothing routed: the room the connections need against the board's free space on a coarse grid of tiles over the grid engine's own map (tracks of each net's own class across each tile side per layer, vias per tile, a net's own copper counted as room for that net, weighed in tracks of the most common class), every connection routed over the tiles with negotiated congestion; answers the passes (sides over their room next to each other on one tile line, room and need summed), via tiles and crossings still over after the best round, worst first, with the nets through them. tile_mm (1), rounds (30), via_cost_mm (2), paths ([{net, nodes: [[layer, x, y], ...]}]: these routes measured as given, nothing searched, one round; a path's ends force no crossing, its steps out of or into its net's end tiles are fan-out, not counted; each step to a side neighbour on its layer or a via in its tile), answer (best: the round of least overflow; last: the last round, for analysis), directions (hv: as the grid engine's hv strategies, the first layer west-east, the next north-south and so on, a step across its layer's direction costs 1.6 steps; vh the other way round; \"\" any), maps (false: the per-tile room and use arrays and each connection's tiles [layer, x, y]). Two nets on one layer that share a stretch of tiles and leave it on the other sides than they came in must cross there (kind crossing, pairs): one of them needs a via; a side no track passes is a wall, a side no track crosses is never over, and a connection walled off from its other end is listed in blocked; steps out of a connection's own end tiles are its fan-out and not counted"},
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again, up to 3 choices of them per connection and round; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
@@ -25812,6 +25847,7 @@ nlohmann::json capacityJson( BOARD* aBoard, const std::vector<GRID_NET>& aNets, 
                                { "nets_over", names( netsOver ) },
                                { "blocked", blocked },
                                { "over_by_round", aCap.overByRound },
+                               { "over_kinds_by_round", aCap.overKindsByRound },
                                { "best_round", aCap.bestRound },
                                { "over", rows },
                                { "build_ms", aCap.buildMs },

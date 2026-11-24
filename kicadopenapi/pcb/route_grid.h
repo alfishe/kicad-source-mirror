@@ -5,6 +5,7 @@
 #include <math/box2.h>
 #include <math/vector2d.h>
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -90,6 +91,9 @@ struct GRID_PARAMS
     float                     hug = 1.0f;      ///< cost factor of a cell beside the copper of the net's own bundle; 1 none
     float                     corridorCost = 1.0f; ///< cost factor of a cell off the net's coarse route (GridCapacity over the same map, a tile either side); 1 none
     int                       corridorRounds = 100; ///< rounds of those coarse routes
+    std::vector<std::pair<int, std::vector<std::array<int, 3>>>> capacityPaths; ///< coarse routes given, not searched: net code, tiles [layer, x, y]
+    bool                      capacityLast = false; ///< coarse routes: answer the last round, not the best
+    std::string               capacityDirections = "hv"; ///< coarse routes: "" any, "hv" / "vh" a direction per layer from the first
     float                     astar = 1.2f;    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
     float                     pfStart = 1.0f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
     float                     pfGrowth = 1.6f; ///< and how much it grows each round (VPR's pres_fac_mult)
@@ -410,6 +414,7 @@ struct GRID_CAPACITY
 
     std::vector<LINK>   links;
     std::vector<double> overByRound;          ///< tracks (and vias) over the room, per round
+    std::vector<std::array<double, 3>> overKindsByRound; ///< of that: sides (passes), vias, crossings
     int                 bestRound = -1;
     double              buildMs = 0, routeMs = 0;
 };
