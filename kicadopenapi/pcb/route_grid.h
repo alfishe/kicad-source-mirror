@@ -94,6 +94,7 @@ struct GRID_PARAMS
     std::vector<std::pair<int, std::vector<std::array<int, 3>>>> capacityPaths; ///< coarse routes given, not searched: net code, tiles [layer, x, y]
     std::array<int, 4>        capacityProbe{ -1, 0, 0, 0 }; ///< a side to report cell by cell: layer, tile x, tile y, 1 east / 0 south
     bool                      capacityLast = false; ///< coarse routes: answer the last round, not the best
+    bool                      capacityRepair = true; ///< after the negotiation: keep the short moves (another layer over a conflict, a fresh route) that lower the exact total
     std::string               capacityDirections = "hv"; ///< coarse routes: "" any, "hv" / "vh" a direction per layer from the first
     float                     astar = 1.2f;    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
     float                     pfStart = 1.0f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
@@ -407,6 +408,9 @@ struct GRID_CAPACITY
     std::vector<float>        viaCap, viaUse; ///< per tile
     std::vector<float>        crossH, crossV; ///< per layer * tiles: tracks through west-east / north-south
     std::vector<float>        crossings;      ///< per layer * tiles: pairs of nets that must cross there
+    std::vector<uint8_t>      crossVerdict;   ///< per layer * tiles with a crossing left: 1 every way round it makes new conflicts, 2 no via room for a way round, 3 the other layers are walled there
+    int                       repairKept = 0; ///< moves the repair kept
+    double                    repairMs = 0;
     std::vector<std::vector<int>> netsE, netsS, netsVia, netsCross; ///< per side / tile over its room: net codes
 
     struct LINK

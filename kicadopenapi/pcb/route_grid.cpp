@@ -6929,6 +6929,281 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     for( size_t j = 0; j < out.links.size(); ++j )
         out.links[j].nodes = bestNodes[j];
 
+    // the state of the best round, rebuilt from its routes
+    for( auto* v : { &useE, &useS, &useV, &thrH, &thrV, &viaOwnE, &viaOwnS } )
+        std::fill( v->begin(), v->end(), 0.0f );
+
+    for( const GRID_CAPACITY::LINK& link : out.links )
+        apply( link, 1.0f );
+
+    // the exact total the negotiation is judged by: passes, vias and crossings over
+    auto total = [&]()
+    {
+        markOwners();
+        findCrossings( false );
+        double sum = 0;
+
+        for( size_t i = 0; i < N; ++i )
+            sum += sideOver( useE[i], loadE( i ), roomE( i ) ) + sideOver( useS[i], loadS( i ), roomS( i ) ) + crossAt[i];
+
+        for( size_t t = 0; t < tiles; ++t )
+            sum += std::max( 0.0f, useV[t] - roomV( t ) );
+
+        return sum;
+    };
+
+    // a link's part over a conflict on another layer: two vias, its tiles between them on layer aLayer. Why it
+    // cannot be: 0 it can, 2 no via room (or no vias for the net), 3 a side there is a wall on that layer
+    constexpr int HOP = 3;
+
+    auto hop = [&]( const GRID_CAPACITY::LINK& aLink, int aFrom, int aTo, int aLayer, std::vector<uint32_t>* aOut )
+    {
+        const std::vector<uint32_t>& p = aLink.nodes;
+        const int                    cls = world.nets[aLink.net].sizes;
+        const ROOM&                  r = room[cls];
+        const int32_t                code = world.nets[aLink.net].code;
+        const uint32_t               onL = (uint32_t) aLayer * tiles;
+
+        auto viaThere = [&]( int aAt, int aNext ) { return aNext >= 0 && aNext < (int) p.size() && p[aNext] == onL + p[aAt] % tiles; };
+        auto viaRoom = [&]( size_t t ) { return world.nets[aLink.net].vias && ( r.viaOwner[t] == code ? r.viaOwn[t] : r.via[t] ) - useV[t] >= 1.0f; };
+
+        if( ( !viaThere( aFrom, aFrom - 1 ) && !viaRoom( p[aFrom] % tiles ) ) || ( !viaThere( aTo, aTo + 1 ) && !viaRoom( p[aTo] % tiles ) ) )
+            return 2;
+
+        for( int q = aFrom; q < aTo; ++q )
+        {
+            const uint32_t a = onL + p[q] % tiles, b = onL + p[q + 1] % tiles, lo = std::min( a, b );
+            const float    cap = horizontal( a, b ) ? std::max( r.capE[lo], ownRoom( r.ownsE[lo], code ) )
+                                                    : std::max( r.capS[lo], ownRoom( r.ownsS[lo], code ) );
+
+            if( cap <= 0 )
+                return 3;
+        }
+
+        if( aOut )
+        {
+            aOut->assign( p.begin(), p.begin() + aFrom + 1 );
+
+            for( int q = aFrom; q <= aTo; ++q )
+                aOut->push_back( onL + p[q] % tiles );
+
+            aOut->insert( aOut->end(), p.begin() + aTo, p.end() );
+
+            std::vector<uint32_t> clean;
+
+            for( uint32_t n : *aOut )
+            {
+                if( !clean.empty() && clean.back() == n )
+                    continue;
+
+                // a via there and straight back
+                if( clean.size() >= 2 && clean[clean.size() - 2] == n && clean.back() % tiles == n % tiles )
+                {
+                    clean.pop_back();
+                    continue;
+                }
+
+                clean.push_back( n );
+            }
+
+            *aOut = std::move( clean );
+        }
+
+        return 0;
+    };
+
+    // the windows round node index aK of a link on its layer's stretch: each other layer, up to HOP tiles each way,
+    // two tiles at least (a via in the conflict's tile ends the stretch there)
+    auto windows = [&]( const GRID_CAPACITY::LINK& aLink, int aK, auto&& aEach )
+    {
+        const std::vector<uint32_t>& p = aLink.nodes;
+        const int                    l = (int) ( p[aK] / tiles );
+        int                          s = aK, e = aK;
+
+        while( s > 0 && (int) ( p[s - 1] / tiles ) == l )
+            s--;
+
+        while( e + 1 < (int) p.size() && (int) ( p[e + 1] / tiles ) == l )
+            e++;
+
+        for( int m = 0; m < L; ++m )
+        {
+            if( m == l )
+                continue;
+
+            for( int i = aK; i >= std::max( s, aK - HOP ); --i )
+            {
+                for( int j = std::max( aK, i + 1 ); j <= std::min( e, aK + HOP ); ++j )
+                    aEach( i, j, m );
+            }
+        }
+    };
+
+    // links through a conflict: their node indices there
+    auto hotNodes = [&]()
+    {
+        std::vector<uint8_t> hot( N, 0 );
+        markOwners();
+        findCrossings( false );
+
+        for( size_t i = 0; i < N; ++i )
+        {
+            const size_t t = i % tiles;
+
+            if( crossAt[i] > 0 )
+                hot[i] = 1;
+
+            if( sideOver( useE[i], loadE( i ), roomE( i ) ) > 0 )
+                hot[i] = hot[std::min( N - 1, i + 1 )] = 1;
+
+            if( sideOver( useS[i], loadS( i ), roomS( i ) ) > 0 )
+                hot[i] = hot[std::min( N - 1, i + tnx )] = 1;
+
+            if( useV[t] > roomV( t ) )
+                hot[i] = 1;
+        }
+
+        return hot;
+    };
+
+    const auto repairStart = CLOCK::now();
+
+    if( !given && aParams.capacityRepair )
+    {
+        double cur = total();
+
+        for( int pass = 0; pass < 8 && cur > 0 && !( aParams.cancel && aParams.cancel->load() ); ++pass )
+        {
+            const std::vector<uint8_t> hot = hotNodes();
+            bool                       kept = false;
+
+            for( GRID_CAPACITY::LINK& link : out.links )
+            {
+                std::vector<int> at;
+
+                for( int k = 0; k < (int) link.nodes.size() && at.size() < 6; ++k )
+                {
+                    if( hot[link.nodes[k]] )
+                        at.push_back( k );
+                }
+
+                if( at.empty() )
+                    continue;
+
+                std::vector<std::vector<uint32_t>> cands;
+
+                for( int k : at )
+                {
+                    windows( link, k,
+                             [&]( int i, int j, int m )
+                             {
+                                 std::vector<uint32_t> c;
+
+                                 if( hop( link, i, j, m, &c ) == 0 && c != link.nodes
+                                     && std::find( cands.begin(), cands.end(), c ) == cands.end() )
+                                 {
+                                     cands.push_back( std::move( c ) );
+                                 }
+                             } );
+                }
+
+                {
+                    GRID_CAPACITY::LINK fresh = link;
+                    apply( link, -1.0f );
+                    route( fresh );
+                    apply( link, 1.0f );
+
+                    if( !fresh.nodes.empty() && fresh.nodes != link.nodes )
+                        cands.push_back( std::move( fresh.nodes ) );
+                }
+
+                double                best = cur - 1e-3;
+                int                   pick = -1;
+                std::vector<uint32_t> old = link.nodes;
+
+                for( size_t ci = 0; ci < cands.size(); ++ci )
+                {
+                    apply( link, -1.0f );
+                    link.nodes = cands[ci];
+                    apply( link, 1.0f );
+                    const double v = total();
+                    apply( link, -1.0f );
+                    link.nodes = old;
+                    apply( link, 1.0f );
+
+                    if( v < best )
+                    {
+                        best = v;
+                        pick = (int) ci;
+                    }
+                }
+
+                if( pick >= 0 )
+                {
+                    apply( link, -1.0f );
+                    link.nodes = std::move( cands[pick] );
+                    apply( link, 1.0f );
+                    cur = total();
+                    kept = true;
+                    out.repairKept++;
+                }
+            }
+
+            if( !kept )
+                break;
+        }
+    }
+
+    out.repairMs = std::chrono::duration<double, std::milli>( CLOCK::now() - repairStart ).count();
+
+    // the state answered: use with the via load, crossing passes
+    bestE = useE;
+    bestS = useS;
+
+    for( size_t i = 0; i < N; ++i )
+    {
+        bestE[i] += loadE( i );
+        bestS[i] += loadS( i );
+    }
+
+    bestV = useV;
+    bestH = thrH;
+    bestVt = thrV;
+
+    // why each crossing left stays: the most hopeful reason among the links there (1 a way round exists by room
+    // yet makes new conflicts, 2 no via room for one, 3 walls on the other layers)
+    out.crossVerdict.assign( N, 0 );
+    findCrossings( false );
+
+    if( !given )
+    {
+        for( const GRID_CAPACITY::LINK& link : out.links )
+        {
+            for( int k = 0; k < (int) link.nodes.size(); ++k )
+            {
+                const uint32_t n = link.nodes[k];
+
+                if( crossAt[n] <= 0 )
+                    continue;
+
+                int why = 3;
+                bool any = false;
+                windows( link, k,
+                         [&]( int i, int j, int m )
+                         {
+                             const int w = hop( link, i, j, m, nullptr );
+                             why = std::min( why, w == 0 ? 1 : w );
+                             any = true;
+                         } );
+
+                if( !any )
+                    why = 3;
+
+                out.crossVerdict[n] = out.crossVerdict[n] == 0 ? (uint8_t) why : std::min( out.crossVerdict[n], (uint8_t) why );
+            }
+        }
+    }
+
     useE = bestE;
     useS = bestS;
     markOwners();
