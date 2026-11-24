@@ -6978,6 +6978,31 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     // cannot be: 0 it can, 2 no via room (or no vias for the net), 3 a side there is a wall on that layer
     constexpr int HOP = 3;
 
+    // a route made simple: a node passed again drops the loop since then; three layers in one tile, one via
+    auto simplify = [&]( std::vector<uint32_t>& aNodes )
+    {
+        std::vector<uint32_t> clean;
+
+        for( uint32_t n : aNodes )
+        {
+            if( auto it = std::find( clean.begin(), clean.end(), n ); it != clean.end() )
+            {
+                clean.erase( it + 1, clean.end() );
+                continue;
+            }
+
+            if( clean.size() >= 2 && clean.back() % tiles == n % tiles && clean[clean.size() - 2] % tiles == n % tiles )
+            {
+                clean.back() = n;
+                continue;
+            }
+
+            clean.push_back( n );
+        }
+
+        aNodes = std::move( clean );
+    };
+
     auto hop = [&]( const GRID_CAPACITY::LINK& aLink, int aFrom, int aTo, int aLayer, std::vector<uint32_t>* aOut )
     {
         const std::vector<uint32_t>& p = aLink.nodes;
@@ -7011,28 +7036,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
             aOut->insert( aOut->end(), p.begin() + aTo, p.end() );
 
-            std::vector<uint32_t> clean;
-
-            for( uint32_t n : *aOut )
-            {
-                // back at a node already passed: the loop since then goes
-                if( auto it = std::find( clean.begin(), clean.end(), n ); it != clean.end() )
-                {
-                    clean.erase( it + 1, clean.end() );
-                    continue;
-                }
-
-                // three layers in one tile: one via straight through
-                if( clean.size() >= 2 && clean.back() % tiles == n % tiles && clean[clean.size() - 2] % tiles == n % tiles )
-                {
-                    clean.back() = n;
-                    continue;
-                }
-
-                clean.push_back( n );
-            }
-
-            *aOut = std::move( clean );
+            simplify( *aOut );
         }
 
         return 0;
@@ -7232,6 +7236,126 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         enlist( li, true );
     };
 
+    // a link's part from node index aFrom to aTo routed afresh on layer aLayer inside the box of those tiles and
+    // two more round them: the fewest steps (across the layer's direction 1.6), a tile another net uses on that
+    // layer four more; vias at both ends when on another layer. False when there is no such way
+    auto detour = [&]( const GRID_CAPACITY::LINK& aLink, int aFrom, int aTo, int aLayer, std::vector<uint32_t>& aOut )
+    {
+        const std::vector<uint32_t>& p = aLink.nodes;
+        const int                    cls = world.nets[aLink.net].sizes;
+        const ROOM&                  r = room[cls];
+        const int32_t                code = world.nets[aLink.net].code;
+        const int                    l = (int) ( p[aFrom] / tiles );
+        const uint32_t               onL = (uint32_t) aLayer * tiles;
+        const uint32_t               t0 = p[aFrom] % tiles, t1 = p[aTo] % tiles;
+
+        if( aLayer != l )
+        {
+            auto viaRoom = [&]( size_t t ) { return world.nets[aLink.net].vias && ( r.viaOwner[t] == code ? r.viaOwn[t] : r.via[t] ) - useV[t] >= 1.0f; };
+
+            if( !viaRoom( t0 ) || !viaRoom( t1 ) )
+                return false;
+        }
+
+        int x0 = tnx, y0 = tny, x1 = -1, y1 = -1;
+
+        for( int q = aFrom; q <= aTo; ++q )
+        {
+            const int x = (int) ( p[q] % tiles % tnx ), y = (int) ( p[q] % tiles / tnx );
+            x0 = std::min( x0, x );
+            x1 = std::max( x1, x );
+            y0 = std::min( y0, y );
+            y1 = std::max( y1, y );
+        }
+
+        x0 = std::max( 0, x0 - 2 );
+        y0 = std::max( 0, y0 - 2 );
+        x1 = std::min( tnx - 1, x1 + 2 );
+        y1 = std::min( tny - 1, y1 + 2 );
+        const int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+
+        auto inBox = [&]( uint32_t t ) { const int x = (int) ( t % tnx ), y = (int) ( t / tnx ); return x >= x0 && x <= x1 && y >= y0 && y <= y1; };
+        auto at = [&]( uint32_t t ) { return (size_t) ( (int) ( t / tnx ) - y0 ) * bw + (size_t) ( (int) ( t % tnx ) - x0 ); };
+
+        std::vector<uint8_t> other( (size_t) bw * bh, 0 );
+
+        for( int y = y0; y <= y1; ++y )
+        {
+            for( int x = x0; x <= x1; ++x )
+            {
+                for( int li : tileLinks[(size_t) y * tnx + x] )
+                {
+                    if( out.links[li].net == aLink.net )
+                        continue;
+
+                    for( uint32_t n : out.links[li].nodes )
+                    {
+                        if( n / tiles == (uint32_t) aLayer && inBox( n % tiles ) )
+                            other[at( n % tiles )] = 1;
+                    }
+                }
+            }
+        }
+
+        std::vector<float>    cost( (size_t) bw * bh, std::numeric_limits<float>::infinity() );
+        std::vector<int32_t>  prev( (size_t) bw * bh, -1 );
+        using ITEM = std::pair<float, uint32_t>;
+        std::priority_queue<ITEM, std::vector<ITEM>, std::greater<ITEM>> open;
+        cost[at( t0 )] = 0;
+        open.push( { 0.0f, t0 } );
+
+        while( !open.empty() )
+        {
+            const auto [c, u] = open.top();
+            open.pop();
+
+            if( c > cost[at( u )] )
+                continue;
+
+            if( u == t1 )
+                break;
+
+            const int x = (int) ( u % tnx ), y = (int) ( u / tnx );
+
+            for( const auto& [dx, dy] : { std::pair{ 1, 0 }, std::pair{ -1, 0 }, std::pair{ 0, 1 }, std::pair{ 0, -1 } } )
+            {
+                if( x + dx < x0 || x + dx > x1 || y + dy < y0 || y + dy > y1 )
+                    continue;
+
+                const uint32_t v = (uint32_t) ( ( y + dy ) * tnx + x + dx ), lo = onL + std::min( u, v );
+                const float    cap = dx ? std::max( r.capE[lo], ownRoom( r.ownsE[lo], code ) ) : std::max( r.capS[lo], ownRoom( r.ownsS[lo], code ) );
+
+                if( cap <= 0 )
+                    continue;
+
+                const float step = ( dirOf[aLayer] != 0 && dirOf[aLayer] != ( dx ? 1 : 2 ) ? 1.6f : 1.0f )
+                                   + ( v != t1 && other[at( v )] ? 4.0f : 0.0f );
+
+                if( c + step < cost[at( v )] )
+                {
+                    cost[at( v )] = c + step;
+                    prev[at( v )] = (int32_t) u;
+                    open.push( { c + step, v } );
+                }
+            }
+        }
+
+        if( !std::isfinite( cost[at( t1 )] ) )
+            return false;
+
+        std::vector<uint32_t> way;
+
+        for( int32_t t = (int32_t) t1; t >= 0; t = prev[at( (uint32_t) t )] )
+            way.push_back( onL + (uint32_t) t );
+
+        std::reverse( way.begin(), way.end() );
+        aOut.assign( p.begin(), p.begin() + aFrom + 1 );
+        aOut.insert( aOut.end(), way.begin(), way.end() );
+        aOut.insert( aOut.end(), p.begin() + aTo, p.end() );
+        simplify( aOut );
+        return aOut != p;
+    };
+
     const auto repairStart = CLOCK::now();
 
     if( aParams.capacityRepair )
@@ -7272,6 +7396,35 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                                      cands.push_back( std::move( c ) );
                                  }
                              } );
+                }
+
+                // detours round each conflict: its stretch one, two and three tiles each way, on every layer
+                for( int k : at )
+                {
+                    const uint32_t lk = link.nodes[k] / tiles;
+                    int            s = k, e = k;
+
+                    while( s > 0 && link.nodes[s - 1] / tiles == lk )
+                        s--;
+
+                    while( e + 1 < (int) link.nodes.size() && link.nodes[e + 1] / tiles == lk )
+                        e++;
+
+                    for( int w = 1; w <= HOP; ++w )
+                    {
+                        const int i = std::max( s, k - w ), j = std::min( e, k + w );
+
+                        if( i >= j )
+                            continue;
+
+                        for( int m = 0; m < L; ++m )
+                        {
+                            std::vector<uint32_t> c;
+
+                            if( detour( link, i, j, m, c ) && std::find( cands.begin(), cands.end(), c ) == cands.end() )
+                                cands.push_back( std::move( c ) );
+                        }
+                    }
                 }
 
                 if( link.a >= 0 )
