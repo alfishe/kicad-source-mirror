@@ -92,6 +92,7 @@ struct GRID_PARAMS
     float                     corridorCost = 1.0f; ///< cost factor of a cell off the net's coarse route (GridCapacity over the same map, a tile either side); 1 none
     int                       corridorRounds = 100; ///< rounds of those coarse routes
     std::vector<std::pair<int, std::vector<std::array<int, 3>>>> capacityPaths; ///< coarse routes given, not searched: net code, tiles [layer, x, y]
+    std::array<int, 4>        capacityProbe{ -1, 0, 0, 0 }; ///< a side to report cell by cell: layer, tile x, tile y, 1 east / 0 south
     bool                      capacityLast = false; ///< coarse routes: answer the last round, not the best
     std::string               capacityDirections = "hv"; ///< coarse routes: "" any, "hv" / "vh" a direction per layer from the first
     float                     astar = 1.2f;    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
@@ -397,6 +398,9 @@ struct GRID_CAPACITY
     int                       refClass = 0;   ///< the class most nets have: room counted in its tracks
     int                       refPitch = 0;   ///< its track width plus clearance
     std::vector<float>        capE, capS;     ///< per layer * tiles: tracks across the east / south side
+    std::vector<std::vector<std::array<int32_t, 2>>> probeCells; ///< per class: the probed side's cell pairs (inside, outside): 0 free, net code, -1 closed
+    std::vector<float>        probeRoom, probeOwn; ///< per class: the probed side's room and own room
+    std::vector<int32_t>      probeOwner;      ///< per class: the probed side's owner (0 none, -1 several)
     std::vector<float>        useE, useS;     ///< and the best round's use (in reference tracks; a via in a tile beside takes half a via pitch)
     std::vector<float>        viaCap, viaUse; ///< per tile
     std::vector<float>        crossH, crossV; ///< per layer * tiles: tracks through west-east / north-south

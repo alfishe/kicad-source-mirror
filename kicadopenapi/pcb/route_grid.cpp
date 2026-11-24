@@ -5918,52 +5918,79 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         classW[c] = (float) pitch[c] / out.refPitch;
     }
 
-    // per class: the room, and the room for the one net whose own copper (pads, ends) lies on the side
+    // per class: the room, and for each net whose own copper (pads, ends) lies on a side, its room there: its
+    // own cells count too. ownE / ownS: the most any owner has (a side no owner passes either is a wall)
+    using OWNS = std::vector<std::pair<int32_t, float>>;
+
     struct ROOM
     {
         std::vector<float>   capE, capS, ownE, ownS, via, viaOwn;
-        std::vector<int32_t> ownerE, ownerS, viaOwner;
+        std::vector<OWNS>    ownsE, ownsS;
+        std::vector<int32_t> viaOwner;
     };
 
     std::vector<ROOM> room( C );
 
-    auto sideRoom = [&]( int c, int aLayer, bool aEast, int aFixed, int aFrom, int aTo, float& aCap, float& aOwn, int32_t& aOwner )
+    auto ownRoom = []( const OWNS& aOwns, int32_t aCode )
+    {
+        for( const auto& [code, r] : aOwns )
+        {
+            if( code == aCode )
+                return r;
+        }
+
+        return -1.0f;
+    };
+
+    auto sideRoom = [&]( int c, int aLayer, bool aEast, int aFixed, int aFrom, int aTo, float& aCap, float& aOwn, OWNS& aOwns )
     {
         auto at = [&]( int aX, int aY ) { return world.track[c][(size_t) aLayer * world.cells + g.Index( aX, aY )]; };
         auto runTracks = [&]( int aCells ) { return aCells <= 0 ? 0.0f : (float) ( (int64_t) ( aCells - 1 ) * g.cell / pitch[c] + 1 ); };
-        int  run = 0, runOwn = 0;
-        aCap = aOwn = 0;
+        auto cellPair = [&]( int v ) { return aEast ? std::make_pair( at( aFixed - 1, v ), at( aFixed, v ) ) : std::make_pair( at( v, aFixed - 1 ), at( v, aFixed ) ); };
+
+        // the runs of cells that are free or the given net's (0: free only)
+        auto runs = [&]( int32_t aNet )
+        {
+            int   run = 0;
+            float sum = 0;
+
+            for( int v = aFrom; v < aTo; ++v )
+            {
+                const auto [p, q] = cellPair( v );
+
+                if( ( p == 0 || ( aNet > 0 && p == aNet ) ) && ( q == 0 || ( aNet > 0 && q == aNet ) ) )
+                    run++;
+                else
+                {
+                    sum += runTracks( run );
+                    run = 0;
+                }
+            }
+
+            return sum + runTracks( run );
+        };
+
+        aOwns.clear();
 
         for( int v = aFrom; v < aTo; ++v )
         {
-            const int32_t p = aEast ? at( aFixed - 1, v ) : at( v, aFixed - 1 );
-            const int32_t q = aEast ? at( aFixed, v ) : at( v, aFixed );
+            const auto [p, q] = cellPair( v );
 
             for( int32_t o : { p, q } )
             {
-                if( o > 0 )
-                    aOwner = aOwner == 0 || aOwner == o ? o : -1;
-            }
-
-            if( p == 0 && q == 0 )
-                run++;
-            else
-            {
-                aCap += runTracks( run );
-                run = 0;
-            }
-
-            if( p >= 0 && q >= 0 && ( p == 0 || q == 0 || p == q ) )
-                runOwn++;
-            else
-            {
-                aOwn += runTracks( runOwn );
-                runOwn = 0;
+                if( o > 0 && ownRoom( aOwns, o ) < 0 )
+                    aOwns.push_back( { o, 0.0f } );
             }
         }
 
-        aCap += runTracks( run );
-        aOwn += runTracks( runOwn );
+        aCap = runs( 0 );
+        aOwn = aCap;
+
+        for( auto& [code, r] : aOwns )
+        {
+            r = runs( code );
+            aOwn = std::max( aOwn, r );
+        }
     };
 
     // vias of class c: the free via cells over the area one via takes with its room (pitch squared); for the
@@ -5981,8 +6008,8 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         r.capS.assign( L * tiles, 0.0f );
         r.ownE.assign( L * tiles, 0.0f );
         r.ownS.assign( L * tiles, 0.0f );
-        r.ownerE.assign( L * tiles, 0 );
-        r.ownerS.assign( L * tiles, 0 );
+        r.ownsE.assign( L * tiles, {} );
+        r.ownsS.assign( L * tiles, {} );
 
         for( int l = 0; l < L; ++l )
         {
@@ -5993,10 +6020,10 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                     const size_t i = l * tiles + (size_t) ty * tnx + tx;
 
                     if( tx + 1 < tnx && ( tx + 1 ) * T < g.nx )
-                        sideRoom( c, l, true, ( tx + 1 ) * T, ty * T, std::min( g.ny, ( ty + 1 ) * T ), r.capE[i], r.ownE[i], r.ownerE[i] );
+                        sideRoom( c, l, true, ( tx + 1 ) * T, ty * T, std::min( g.ny, ( ty + 1 ) * T ), r.capE[i], r.ownE[i], r.ownsE[i] );
 
                     if( ty + 1 < tny && ( ty + 1 ) * T < g.ny )
-                        sideRoom( c, l, false, ( ty + 1 ) * T, tx * T, std::min( g.nx, ( tx + 1 ) * T ), r.capS[i], r.ownS[i], r.ownerS[i] );
+                        sideRoom( c, l, false, ( ty + 1 ) * T, tx * T, std::min( g.nx, ( tx + 1 ) * T ), r.capS[i], r.ownS[i], r.ownsS[i] );
                 }
             }
         }
@@ -6035,6 +6062,35 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
     viaPitchRef = std::max( 2.0 * ref.viaRadius + ref.clearance, (double) ref.viaDrill + world.h2h );
     const ROOM& refRoom = room[k];
+    // a side reported cell by cell, for analysis
+    if( const auto& pr = aParams.capacityProbe; pr[0] >= 0 && pr[0] < L && pr[1] >= 0 && pr[1] < tnx && pr[2] >= 0 && pr[2] < tny )
+    {
+        const bool   east = pr[3] != 0;
+        const size_t i = (size_t) pr[0] * tiles + (size_t) pr[2] * tnx + pr[1];
+        const int    fixed = east ? ( pr[1] + 1 ) * T : ( pr[2] + 1 ) * T;
+        const int    from = east ? pr[2] * T : pr[1] * T, to = std::min( east ? g.ny : g.nx, from + T );
+
+        for( int c = 0; c < C; ++c )
+        {
+            std::vector<std::array<int32_t, 2>> cells;
+
+            if( fixed < ( east ? g.nx : g.ny ) )
+            {
+                for( int v = from; v < to; ++v )
+                {
+                    auto at = [&]( int aX, int aY ) { return world.track[c][(size_t) pr[0] * world.cells + g.Index( aX, aY )]; };
+                    cells.push_back( { east ? at( fixed - 1, v ) : at( v, fixed - 1 ), east ? at( fixed, v ) : at( v, fixed ) } );
+                }
+            }
+
+            out.probeCells.push_back( std::move( cells ) );
+            out.probeRoom.push_back( east ? room[c].capE[i] : room[c].capS[i] );
+            const OWNS& owns = east ? room[c].ownsE[i] : room[c].ownsS[i];
+            out.probeOwn.push_back( east ? room[c].ownE[i] : room[c].ownS[i] );
+            out.probeOwner.push_back( owns.empty() ? 0 : owns.size() == 1 ? owns[0].first : -1 );
+        }
+    }
+
     out.capE = refRoom.capE;
     out.capS = refRoom.capS;
     out.viaCap = refRoom.via;
@@ -6355,8 +6411,8 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
         const int   cls = world.nets[aLink.net].sizes;
         const ROOM& r = room[cls];
-        auto capE = [&]( uint32_t i ) { return ( r.ownerE[i] == code ? r.ownE[i] : r.capE[i] ) * classW[cls]; };
-        auto capS = [&]( uint32_t i ) { return ( r.ownerS[i] == code ? r.ownS[i] : r.capS[i] ) * classW[cls]; };
+        auto capE = [&]( uint32_t i ) { return std::max( r.capE[i], ownRoom( r.ownsE[i], code ) ) * classW[cls]; };
+        auto capS = [&]( uint32_t i ) { return std::max( r.capS[i], ownRoom( r.ownsS[i], code ) ) * classW[cls]; };
         auto viaCap = [&]( size_t t ) { return r.viaOwner[t] == code ? r.viaOwn[t] : r.via[t]; };
 
         // a via also takes room from its tile's sides on every layer: priced by the fullest of them
@@ -6479,11 +6535,12 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
     // the room of a side as its users see it: of each class among them, its room (its owner's own room when
     // the owner is among them) in reference tracks; the least of those. A side nobody uses: the reference room
-    std::vector<uint64_t> classesE( N, 0 ), classesS( N, 0 ), ownedE( N, 0 ), ownedS( N, 0 );
+    std::vector<uint64_t> classesE( N, 0 ), classesS( N, 0 );
+    std::vector<float>    ownSeenE( (size_t) C * N, -1.0f ), ownSeenS( (size_t) C * N, -1.0f );
     std::vector<uint64_t> classesV( tiles, 0 ), ownedV( tiles, 0 );
     auto bit = []( int c ) { return c < 64 ? uint64_t( 1 ) << c : 0; };
 
-    auto seen = [&]( size_t i, const std::vector<uint64_t>& aClasses, const std::vector<uint64_t>& aOwned, bool aEast )
+    auto seen = [&]( size_t i, const std::vector<uint64_t>& aClasses, const std::vector<float>& aOwnSeen, bool aEast )
     {
         if( !aClasses[i] )
             return aEast ? room[k].capE[i] : room[k].capS[i];
@@ -6495,7 +6552,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             if( aClasses[i] & bit( c ) )
             {
                 const ROOM& r = room[c];
-                const float v = aOwned[i] & bit( c ) ? ( aEast ? r.ownE[i] : r.ownS[i] ) : ( aEast ? r.capE[i] : r.capS[i] );
+                const float v = std::max( aEast ? r.capE[i] : r.capS[i], aOwnSeen[(size_t) c * N + i] );
                 least = std::min( least, v * classW[c] );
             }
         }
@@ -6503,8 +6560,8 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         return least;
     };
 
-    auto roomE = [&]( size_t i ) { return seen( i, classesE, ownedE, true ); };
-    auto roomS = [&]( size_t i ) { return seen( i, classesS, ownedS, false ); };
+    auto roomE = [&]( size_t i ) { return seen( i, classesE, ownSeenE, true ); };
+    auto roomS = [&]( size_t i ) { return seen( i, classesS, ownSeenS, false ); };
 
     auto roomV = [&]( size_t t )
     {
@@ -6524,8 +6581,11 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
     auto markOwners = [&]()
     {
-        for( auto* v : { &classesE, &classesS, &ownedE, &ownedS } )
+        for( auto* v : { &classesE, &classesS } )
             std::fill( v->begin(), v->end(), 0 );
+
+        std::fill( ownSeenE.begin(), ownSeenE.end(), -1.0f );
+        std::fill( ownSeenS.begin(), ownSeenS.end(), -1.0f );
 
         std::fill( classesV.begin(), classesV.end(), 0 );
         std::fill( ownedV.begin(), ownedV.end(), 0 );
@@ -6552,16 +6612,14 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                 else if( horizontal( a, q ) )
                 {
                     classesE[lo] |= b;
-
-                    if( r.ownerE[lo] == code )
-                        ownedE[lo] |= b;
+                    float& o = ownSeenE[(size_t) c * N + lo];
+                    o = std::max( o, ownRoom( r.ownsE[lo], code ) );
                 }
                 else
                 {
                     classesS[lo] |= b;
-
-                    if( r.ownerS[lo] == code )
-                        ownedS[lo] |= b;
+                    float& o = ownSeenS[(size_t) c * N + lo];
+                    o = std::max( o, ownRoom( r.ownsS[lo], code ) );
                 }
             }
         }
