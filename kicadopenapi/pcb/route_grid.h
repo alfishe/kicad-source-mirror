@@ -410,6 +410,7 @@ struct GRID_CAPACITY
     std::vector<float>        crossings;      ///< per layer * tiles: pairs of nets that must cross there
     std::vector<uint8_t>      crossVerdict;   ///< per layer * tiles with a crossing left: 1 every way round it makes new conflicts, 2 no via room for a way round, 3 the other layers are walled there
     int                       repairKept = 0; ///< moves the repair kept
+    int                       viasDropped = 0; ///< stretches between two vias the repair put on a neighbour layer
     double                    repairMs = 0;
     std::vector<std::vector<int>> netsE, netsS, netsVia, netsCross; ///< per side / tile over its room: net codes
 

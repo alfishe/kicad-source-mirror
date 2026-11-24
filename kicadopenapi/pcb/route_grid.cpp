@@ -7003,6 +7003,13 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                     continue;
                 }
 
+                // three layers in one tile: one via straight through
+                if( clean.size() >= 2 && clean.back() % tiles == n % tiles && clean[clean.size() - 2] % tiles == n % tiles )
+                {
+                    clean.back() = n;
+                    continue;
+                }
+
                 clean.push_back( n );
             }
 
@@ -7068,7 +7075,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
     const auto repairStart = CLOCK::now();
 
-    if( !given && aParams.capacityRepair )
+    if( aParams.capacityRepair )
     {
         double cur = total();
 
@@ -7107,6 +7114,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                              } );
                 }
 
+                if( link.a >= 0 )
                 {
                     GRID_CAPACITY::LINK fresh = link;
                     apply( link, -1.0f );
@@ -7152,6 +7160,92 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             if( !kept )
                 break;
         }
+
+        // vias that buy nothing: a stretch between two vias put on the layer before or after it, kept when the
+        // link costs less with no congestion and the total does not grow
+        // a link's cost with no congestion, as the search counts it: steps, steps across a layer's direction, vias
+        auto baseCost = [&]( const GRID_CAPACITY::LINK& aLink, const std::vector<uint32_t>& aNodes )
+        {
+            double sum = 0;
+
+            for( size_t j = 1; j < aNodes.size(); ++j )
+            {
+                const uint32_t a = aNodes[j - 1], b = aNodes[j];
+                const int      l = (int) ( a / tiles );
+
+                if( l != (int) ( b / tiles ) )
+                    sum += viaStep;
+                else if( isEnd( aLink, a ) || isEnd( aLink, b ) || dirOf[l] == 0 || dirOf[l] == ( horizontal( a, b ) ? 1 : 2 ) )
+                    sum += 1.0;
+                else
+                    sum += 1.6;
+            }
+
+            return sum;
+        };
+
+        for( int pass = 0; pass < 4 && !( aParams.cancel && aParams.cancel->load() ); ++pass )
+        {
+            bool kept = false;
+
+            for( GRID_CAPACITY::LINK& link : out.links )
+            {
+                for( int a = 1; a + 1 < (int) link.nodes.size(); ++a )
+                {
+                    const std::vector<uint32_t>& p = link.nodes;
+
+                    if( p[a] / tiles == p[a - 1] / tiles )
+                        continue;
+
+                    int b = a;
+
+                    while( b + 1 < (int) p.size() && p[b + 1] / tiles == p[a] / tiles )
+                        b++;
+
+                    if( b + 1 >= (int) p.size() )
+                        break;
+
+                    const double          before = baseCost( link, p ) - 1e-4;
+                    std::vector<uint32_t> pick;
+
+                    for( int m : { (int) ( p[a - 1] / tiles ), (int) ( p[b + 1] / tiles ) } )
+                    {
+                        std::vector<uint32_t> c;
+
+                        if( !pick.empty() || hop( link, a, b, m, &c ) != 0 || baseCost( link, c ) >= before )
+                            continue;
+
+                        std::vector<uint32_t> old = p;
+                        apply( link, -1.0f );
+                        link.nodes = c;
+                        apply( link, 1.0f );
+                        const double v = total();
+                        apply( link, -1.0f );
+                        link.nodes = std::move( old );
+                        apply( link, 1.0f );
+
+                        if( v <= cur + 1e-6 )
+                        {
+                            pick = std::move( c );
+                            cur = v;
+                        }
+                    }
+
+                    if( pick.empty() )
+                        continue;
+
+                    apply( link, -1.0f );
+                    link.nodes = std::move( pick );
+                    apply( link, 1.0f );
+                    kept = true;
+                    out.viasDropped++;
+                    a = 0;
+                }
+            }
+
+            if( !kept )
+                break;
+        }
     }
 
     out.repairMs = std::chrono::duration<double, std::milli>( CLOCK::now() - repairStart ).count();
@@ -7175,7 +7269,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     out.crossVerdict.assign( N, 0 );
     findCrossings( false );
 
-    if( !given )
+    if( !given || aParams.capacityRepair )
     {
         for( const GRID_CAPACITY::LINK& link : out.links )
         {
