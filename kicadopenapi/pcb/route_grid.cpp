@@ -169,6 +169,7 @@ struct WORLD
         int                                group = -1;
         int                                rank = 0;
         std::vector<EXIT>                  exits;
+        std::vector<uint8_t>               corridor;  ///< per layer * tile: 1 on its coarse route (GRID_PARAMS::corridorCost)
     };
 
     std::vector<NET> nets;
@@ -3866,6 +3867,7 @@ private:
         const uint8_t*  bodyAt = m_w.body.empty() ? nullptr : m_w.body.data();
         const bool      band = wn.group >= 0 && !m_band.empty();
         const int32_t   code = wn.code;
+        const uint8_t*  corridor = wn.corridor.empty() ? nullptr : wn.corridor.data();
         NODE*           node = m_node.data();
         uint8_t*        dirs = m_dir.data();
 
@@ -3884,8 +3886,16 @@ private:
             const uint16_t occ = occTrack[s];
             const float    hug = !occ && band && m_band[s] && m_bandGroup[s] == wn.group + 1 ? m_params.hug : 1.0f;
 
-            const float rows = ( rowsAt && rowsAt[aCell] ? m_params.rowsCost : 1.0f )
-                               * ( bodyAt && bodyAt[aCell] ? m_params.bodyCost : 1.0f );
+            float rows = ( rowsAt && rowsAt[aCell] ? m_params.rowsCost : 1.0f )
+                         * ( bodyAt && bodyAt[aCell] ? m_params.bodyCost : 1.0f );
+
+            if( corridor )
+            {
+                const size_t t = ( aCell / g.nx / m_w.tile ) * m_w.tnx + ( aCell % g.nx ) / m_w.tile;
+
+                if( !corridor[( s / cells ) * tiles + t] )
+                    rows *= m_params.corridorCost;
+            }
 
             if( aHard )
                 return occ ? -1.0f : hug * rows;
@@ -4453,6 +4463,71 @@ uint64_t rulesPrint( const WORLD& aWorld, const BOARD* aBoard, bool aNets )
 }
 
 
+namespace
+{
+GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT, int aRounds, int aViaCost,
+                          CLOCK::time_point started );
+
+/// @brief Each net's corridor: the tiles of its coarse routes (GridCapacity on the map) and the tiles next to
+/// them on the same layer; a via tile on both layers
+void buildCorridors( WORLD& aWorld, const GRID_PARAMS& aParams, GRID_RESULT& aResult )
+{
+    const auto          from = CLOCK::now();
+    const int           viaCost = aParams.viaCost > 0 ? aParams.viaCost : pcbIUScale.mmToIU( 2.0 );
+    const GRID_CAPACITY cap = capacityOn( aWorld, aParams, aWorld.tile, aParams.corridorRounds, viaCost, from );
+    const size_t        tiles = (size_t) aWorld.tnx * aWorld.tny;
+
+    for( WORLD::NET& net : aWorld.nets )
+        net.corridor.assign( (size_t) aWorld.L * tiles, 0 );
+
+    for( const GRID_CAPACITY::LINK& link : cap.links )
+    {
+        std::vector<uint8_t>& c = aWorld.nets[link.net].corridor;
+
+        for( uint32_t n : link.nodes )
+        {
+            const size_t l = n / tiles, t = n % tiles;
+            const int    x = (int) ( t % aWorld.tnx ), y = (int) ( t / aWorld.tnx );
+
+            for( int dy = -1; dy <= 1; ++dy )
+            {
+                for( int dx = -1; dx <= 1; ++dx )
+                {
+                    if( x + dx >= 0 && x + dx < aWorld.tnx && y + dy >= 0 && y + dy < aWorld.tny )
+                        c[l * tiles + (size_t) ( y + dy ) * aWorld.tnx + x + dx] = 1;
+                }
+            }
+        }
+    }
+
+    // a net with an end the coarse routes missed (walled off there) routes free
+    for( WORLD::NET& net : aWorld.nets )
+    {
+        for( const std::vector<uint32_t>& e : net.ends )
+        {
+            for( uint32_t st : e )
+            {
+                const size_t cell = st % aWorld.cells;
+                const size_t t = ( cell / aWorld.grid.nx / aWorld.tile ) * aWorld.tnx + ( cell % aWorld.grid.nx ) / aWorld.tile;
+
+                if( !net.corridor[( st / aWorld.cells ) * tiles + t] )
+                {
+                    net.corridor.clear();
+                    break;
+                }
+            }
+
+            if( net.corridor.empty() )
+                break;
+        }
+    }
+
+    aResult.corridorOver = cap.bestRound >= 0 ? cap.overByRound[cap.bestRound] : 0;
+    aResult.corridorMs = msSince( from );
+}
+} // namespace
+
+
 GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_PARAMS& aParams )
 {
     GRID_RESULT result;
@@ -4511,6 +4586,10 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     result.halfCellMs = msSince( halfFrom );
     std::vector<std::vector<MARK>>().swap( world.marks );
     buildTiles( world );
+
+    if( aParams.corridorCost > 1.0f )
+        buildCorridors( world, aParams, result );
+
     result.buildMs = msSince( started );
     result.cell = world.grid.cell;
 
@@ -5790,4 +5869,939 @@ std::vector<BOX2I> GRID_ROOMS::Rooms( int aNet, PCB_LAYER_ID aLayer, const VECTO
     }
 
     return out;
+}
+
+
+namespace
+{
+/// @brief GridCapacity over a map already built; aT: tile side in cells
+GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT, int aRounds, int aViaCost,
+                          CLOCK::time_point started )
+{
+    GRID_CAPACITY out;
+
+    // use and room are sums of track weights: over means past the room by more than rounding
+    constexpr float OVER = 1e-3f;
+
+    const PLAN_GRID& g = world.grid;
+    const int        L = world.L;
+    const int        T = aT;
+    const int        tnx = ( g.nx + T - 1 ) / T, tny = ( g.ny + T - 1 ) / T;
+    const size_t     tiles = (size_t) tnx * tny;
+
+    out.origin = g.origin;
+    out.tileSize = T * g.cell;
+    out.cell = g.cell;
+    out.tnx = tnx;
+    out.tny = tny;
+    out.layers = aParams.layers;
+
+    std::vector<int> classUse( world.sizes.size(), 0 );
+
+    for( const WORLD::NET& n : world.nets )
+        classUse[n.sizes]++;
+
+    const int     k = (int) ( std::max_element( classUse.begin(), classUse.end() ) - classUse.begin() );
+    const SIZES&  ref = world.sizes[k];
+    out.refClass = k;
+    out.refPitch = 2 * ref.halfWidth + ref.clearance;
+
+    // room per track class c, counted in its own tracks: a side's runs of cells free on both sides of it in the
+    // class's map; a run of n cells holds (n - 1) * cell / pitch + 1 tracks. In reference tracks: times w[c]
+    const int          C = (int) world.sizes.size();
+    std::vector<float> classW( C, 1.0f );
+    std::vector<int>   pitch( C, out.refPitch );
+
+    for( int c = 0; c < C; ++c )
+    {
+        pitch[c] = std::max( 1, 2 * world.sizes[c].halfWidth + world.sizes[c].clearance );
+        classW[c] = (float) pitch[c] / out.refPitch;
+    }
+
+    // per class: the room, and the room for the one net whose own copper (pads, ends) lies on the side
+    struct ROOM
+    {
+        std::vector<float>   capE, capS, ownE, ownS, via, viaOwn;
+        std::vector<int32_t> ownerE, ownerS, viaOwner;
+    };
+
+    std::vector<ROOM> room( C );
+
+    auto sideRoom = [&]( int c, int aLayer, bool aEast, int aFixed, int aFrom, int aTo, float& aCap, float& aOwn, int32_t& aOwner )
+    {
+        auto at = [&]( int aX, int aY ) { return world.track[c][(size_t) aLayer * world.cells + g.Index( aX, aY )]; };
+        auto runTracks = [&]( int aCells ) { return aCells <= 0 ? 0.0f : (float) ( (int64_t) ( aCells - 1 ) * g.cell / pitch[c] + 1 ); };
+        int  run = 0, runOwn = 0;
+        aCap = aOwn = 0;
+
+        for( int v = aFrom; v < aTo; ++v )
+        {
+            const int32_t p = aEast ? at( aFixed - 1, v ) : at( v, aFixed - 1 );
+            const int32_t q = aEast ? at( aFixed, v ) : at( v, aFixed );
+
+            for( int32_t o : { p, q } )
+            {
+                if( o > 0 )
+                    aOwner = aOwner == 0 || aOwner == o ? o : -1;
+            }
+
+            if( p == 0 && q == 0 )
+                run++;
+            else
+            {
+                aCap += runTracks( run );
+                run = 0;
+            }
+
+            if( p >= 0 && q >= 0 && ( p == 0 || q == 0 || p == q ) )
+                runOwn++;
+            else
+            {
+                aOwn += runTracks( runOwn );
+                runOwn = 0;
+            }
+        }
+
+        aCap += runTracks( run );
+        aOwn += runTracks( runOwn );
+    };
+
+    // vias of class c: the free via cells over the area one via takes with its room (pitch squared); for the
+    // one net whose own copper covers the rest of the tile, its cells count too
+    std::vector<double> viaArea( C, 1.0 );
+    double              viaPitchRef = 0;
+
+    for( int c = 0; c < C; ++c )
+    {
+        const SIZES& sz = world.sizes[c];
+        const double viaPitch = std::max( 2.0 * sz.viaRadius + sz.clearance, (double) sz.viaDrill + world.h2h );
+        viaArea[c] = std::max( 1.0, viaPitch * viaPitch / ( (double) g.cell * g.cell ) );
+        ROOM& r = room[c];
+        r.capE.assign( L * tiles, 0.0f );
+        r.capS.assign( L * tiles, 0.0f );
+        r.ownE.assign( L * tiles, 0.0f );
+        r.ownS.assign( L * tiles, 0.0f );
+        r.ownerE.assign( L * tiles, 0 );
+        r.ownerS.assign( L * tiles, 0 );
+
+        for( int l = 0; l < L; ++l )
+        {
+            for( int ty = 0; ty < tny; ++ty )
+            {
+                for( int tx = 0; tx < tnx; ++tx )
+                {
+                    const size_t i = l * tiles + (size_t) ty * tnx + tx;
+
+                    if( tx + 1 < tnx && ( tx + 1 ) * T < g.nx )
+                        sideRoom( c, l, true, ( tx + 1 ) * T, ty * T, std::min( g.ny, ( ty + 1 ) * T ), r.capE[i], r.ownE[i], r.ownerE[i] );
+
+                    if( ty + 1 < tny && ( ty + 1 ) * T < g.ny )
+                        sideRoom( c, l, false, ( ty + 1 ) * T, tx * T, std::min( g.nx, ( tx + 1 ) * T ), r.capS[i], r.ownS[i], r.ownerS[i] );
+                }
+            }
+        }
+
+        std::vector<int> freeCells( tiles, 0 ), ownCells( tiles, 0 );
+        r.viaOwner.assign( tiles, 0 );
+
+        if( sz.viaRadius > 0 )
+        {
+            for( size_t i = 0; i < world.cells; ++i )
+            {
+                const size_t  t = (size_t) ( i / g.nx / T ) * tnx + ( i % g.nx ) / T;
+                const int32_t v = world.via[c][i];
+
+                if( v == 0 )
+                    freeCells[t]++;
+                else if( v > 0 )
+                {
+                    r.viaOwner[t] = r.viaOwner[t] == 0 || r.viaOwner[t] == v ? v : -1;
+                    ownCells[t]++;
+                }
+            }
+        }
+
+        r.via.assign( tiles, 0.0f );
+        r.viaOwn.assign( tiles, 0.0f );
+
+        for( size_t t = 0; t < tiles; ++t )
+        {
+            // one legal via place holds a via however small the free area is
+            auto vias = [&]( int aCells ) { return aCells > 0 ? std::max( 1.0f, (float) std::floor( aCells / viaArea[c] ) ) : 0.0f; };
+            r.via[t] = vias( freeCells[t] );
+            r.viaOwn[t] = r.viaOwner[t] > 0 ? vias( freeCells[t] + ownCells[t] ) : r.via[t];
+        }
+    }
+
+    viaPitchRef = std::max( 2.0 * ref.viaRadius + ref.clearance, (double) ref.viaDrill + world.h2h );
+    const ROOM& refRoom = room[k];
+    out.capE = refRoom.capE;
+    out.capS = refRoom.capS;
+    out.viaCap = refRoom.via;
+    out.viaArea = (float) viaArea[k];
+
+    // a side no class's track passes (a wall)
+    std::vector<uint8_t> wallE( L * tiles, 1 ), wallS( L * tiles, 1 );
+
+    for( const ROOM& r : room )
+    {
+        for( size_t i = 0; i < L * tiles; ++i )
+        {
+            wallE[i] &= r.capE[i] <= 0 && r.ownE[i] <= 0;
+            wallS[i] &= r.capS[i] <= 0 && r.ownS[i] <= 0;
+        }
+    }
+
+    out.buildMs = std::chrono::duration<double, std::milli>( CLOCK::now() - started ).count();
+
+    // the links: each net's ends joined by a spanning tree (tile distance)
+    auto endNode = [&]( const std::vector<uint32_t>& aStates )
+    {
+        std::vector<uint32_t> nodes;
+
+        for( uint32_t s : aStates )
+        {
+            const size_t cellI = s % world.cells;
+            const int    l = (int) ( s / world.cells );
+            const uint32_t n = (uint32_t) ( l * tiles + ( cellI / g.nx / T ) * tnx + ( cellI % g.nx ) / T );
+
+            if( std::find( nodes.begin(), nodes.end(), n ) == nodes.end() )
+                nodes.push_back( n );
+        }
+
+        return nodes;
+    };
+
+    std::vector<std::vector<std::vector<uint32_t>>> endNodes( world.nets.size() );
+    std::vector<float>                              weight( world.nets.size(), 1.0f );
+
+    for( size_t n = 0; n < world.nets.size(); ++n )
+    {
+        const WORLD::NET& wn = world.nets[n];
+        const SIZES&      s = world.sizes[wn.sizes];
+        weight[n] = (float) ( 2 * s.halfWidth + s.clearance ) / out.refPitch;
+
+        for( const std::vector<uint32_t>& e : wn.ends )
+            endNodes[n].push_back( endNode( e ) );
+
+        const size_t E = endNodes[n].size();
+
+        if( E < 2 )
+            continue;
+
+        auto at = [&]( size_t aEnd )
+        {
+            const uint32_t t = endNodes[n][aEnd].empty() ? 0 : endNodes[n][aEnd][0] % tiles;
+            return std::make_pair( (int) ( t % tnx ), (int) ( t / tnx ) );
+        };
+
+        std::vector<bool> in( E, false );
+        std::vector<int>  best( E, INT_MAX ), from( E, 0 );
+        in[0] = true;
+
+        for( size_t j = 1; j < E; ++j )
+        {
+            best[j] = std::abs( at( j ).first - at( 0 ).first ) + std::abs( at( j ).second - at( 0 ).second );
+        }
+
+        for( size_t step = 1; step < E; ++step )
+        {
+            size_t pick = 0;
+            int    d = INT_MAX;
+
+            for( size_t j = 0; j < E; ++j )
+            {
+                if( !in[j] && best[j] < d )
+                {
+                    d = best[j];
+                    pick = j;
+                }
+            }
+
+            in[pick] = true;
+            out.links.push_back( { (int) n, wn.code, from[pick], (int) pick, {}, false } );
+
+            for( size_t j = 0; j < E; ++j )
+            {
+                const int dj = std::abs( at( j ).first - at( pick ).first ) + std::abs( at( j ).second - at( pick ).second );
+
+                if( !in[j] && dj < best[j] )
+                {
+                    best[j] = dj;
+                    from[j] = (int) pick;
+                }
+            }
+        }
+    }
+
+    // negotiated congestion over the tiles: sides per layer, vias per tile, and crossings: one net through a
+    // tile west to east and another north to south on the same layer must cross there, which needs a via
+    const size_t       N = (size_t) L * tiles;
+    std::vector<float> useE( N, 0 ), useS( N, 0 ), useV( tiles, 0 ), thrH( N, 0 ), thrV( N, 0 );
+    std::vector<float> histE( N, 0 ), histS( N, 0 ), histV( tiles, 0 ), histX( N, 0 );
+    const float        viaStep = std::max( 1.0f, (float) aViaCost / out.tileSize );
+
+    // a via closes a lane through its tile on every layer: half a via pitch of room on each side of it
+    const float viaLoad = (float) ( 0.5 * viaPitchRef / out.refPitch );
+    // a side no track passes (a wall) has no lane a via could close
+    auto loadE = [&]( size_t i )
+    {
+        const size_t t = i % tiles;
+
+        if( wallE[i] )
+            return 0.0f;
+
+        return viaLoad * ( useV[t] + ( (int) ( t % tnx ) + 1 < tnx ? useV[t + 1] : 0.0f ) );
+    };
+    auto loadS = [&]( size_t i )
+    {
+        const size_t t = i % tiles;
+
+        if( wallS[i] )
+            return 0.0f;
+
+        return viaLoad * ( useV[t] + ( t + tnx < tiles ? useV[t + tnx] : 0.0f ) );
+    };
+    float              pf = 0.5f;
+
+    auto price = [&]( float aUse, float aCap, float aHist, float aW, float aBase )
+    {
+        const float over = std::max( 0.0f, aUse + aW - aCap );
+        return aBase * ( 1.0f + aHist ) * ( 1.0f + pf * over );
+    };
+
+    // a crossing costs at least the two vias that would take one of the nets around it
+    auto crossPrice = [&]( float aOther, float aHist )
+    {
+        return aOther > 0 ? 2.0f * viaStep * ( 1.0f + aHist ) * ( 1.0f + pf * aOther ) : 0.0f;
+    };
+
+    auto isEnd = [&]( const GRID_CAPACITY::LINK& aLink, uint32_t aNode )
+    {
+        for( int e : { aLink.a, aLink.b } )
+        {
+            const std::vector<uint32_t>& nodes = endNodes[aLink.net][e];
+
+            if( std::find( nodes.begin(), nodes.end(), aNode ) != nodes.end() )
+                return true;
+        }
+
+        return false;
+    };
+
+    // a step from or into one of the link's own end tiles leaves a pad: the fan-out's room, not a passage
+    auto endStep = [&]( const GRID_CAPACITY::LINK& aLink, size_t aStep )
+    {
+        return isEnd( aLink, aLink.nodes[aStep - 1] ) || isEnd( aLink, aLink.nodes[aStep] );
+    };
+
+    auto horizontal = [&]( uint32_t a, uint32_t b ) { return a / tiles == b / tiles && ( a == b + 1 || b == a + 1 ); };
+    auto vertical = [&]( uint32_t a, uint32_t b ) { return a / tiles == b / tiles && ( a == b + tnx || b == a + tnx ); };
+
+    auto apply = [&]( const GRID_CAPACITY::LINK& aLink, float aSign )
+    {
+        const float w = aSign * weight[aLink.net];
+        const std::vector<uint32_t>& p = aLink.nodes;
+
+        for( size_t j = 1; j < p.size(); ++j )
+        {
+            const uint32_t a = p[j - 1], b = p[j];
+
+            if( a / tiles != b / tiles )
+                useV[a % tiles] += aSign;
+            else if( endStep( aLink, j ) )
+                continue;
+            else if( horizontal( a, b ) )
+                useE[std::min( a, b )] += w;
+            else
+                useS[std::min( a, b )] += w;
+        }
+
+        for( size_t j = 1; j + 1 < p.size(); ++j )
+        {
+            if( horizontal( p[j - 1], p[j] ) && horizontal( p[j], p[j + 1] ) )
+                thrH[p[j]] += w;
+            else if( vertical( p[j - 1], p[j] ) && vertical( p[j], p[j + 1] ) )
+                thrV[p[j]] += w;
+        }
+    };
+
+    auto route = [&]( GRID_CAPACITY::LINK& aLink )
+    {
+        const std::vector<uint32_t>& src = endNodes[aLink.net][aLink.a];
+        const std::vector<uint32_t>& dst = endNodes[aLink.net][aLink.b];
+        const float                  w = weight[aLink.net];
+        const int32_t                code = world.nets[aLink.net].code;
+
+        // a state: tile node * 3 + how it was entered (0 at an end or after a via, 1 west / east, 2 north / south)
+        std::vector<float>    cost( 3 * N, std::numeric_limits<float>::infinity() );
+        std::vector<int32_t>  prev( 3 * N, -1 );
+        std::vector<uint8_t>  goal( N, 0 ), start( N, 0 );
+
+        using ITEM = std::pair<float, uint32_t>;
+        std::priority_queue<ITEM, std::vector<ITEM>, std::greater<ITEM>> open;
+
+        for( uint32_t d : dst )
+            goal[d] = 1;
+
+        for( uint32_t s : src )
+        {
+            start[s] = 1;
+            cost[3 * s] = 0;
+            open.push( { 0.0f, 3 * s } );
+        }
+
+        uint32_t reached = UINT32_MAX;
+
+        const int   cls = world.nets[aLink.net].sizes;
+        const ROOM& r = room[cls];
+        auto capE = [&]( uint32_t i ) { return ( r.ownerE[i] == code ? r.ownE[i] : r.capE[i] ) * classW[cls]; };
+        auto capS = [&]( uint32_t i ) { return ( r.ownerS[i] == code ? r.ownS[i] : r.capS[i] ) * classW[cls]; };
+        auto viaCap = [&]( size_t t ) { return r.viaOwner[t] == code ? r.viaOwn[t] : r.via[t]; };
+
+        // a via also takes room from its tile's sides on every layer: priced by the fullest of them
+        auto viaPrice = [&]( size_t t )
+        {
+            const int x = (int) ( t % tnx ), y = (int) ( t / tnx );
+            float     worst = 0;
+
+            for( int m = 0; m < L; ++m )
+            {
+                const size_t i = (size_t) m * tiles + t;
+                auto         past = [&]( float aUse, float aCap )
+                {
+                    if( aCap > 0 )
+                        worst = std::max( worst, aUse + viaLoad - aCap );
+                };
+
+                if( x + 1 < tnx )
+                    past( useE[i] + loadE( i ), capE( (uint32_t) i ) );
+
+                if( x > 0 )
+                    past( useE[i - 1] + loadE( i - 1 ), capE( (uint32_t) ( i - 1 ) ) );
+
+                if( y + 1 < tny )
+                    past( useS[i] + loadS( i ), capS( (uint32_t) i ) );
+
+                if( y > 0 )
+                    past( useS[i - tnx] + loadS( i - tnx ), capS( (uint32_t) ( i - tnx ) ) );
+            }
+
+            return price( useV[t], viaCap( t ), histV[t], 1.0f, viaStep ) * ( 1.0f + pf * std::max( 0.0f, worst ) );
+        };
+
+        while( !open.empty() )
+        {
+            const auto [c, st] = open.top();
+            open.pop();
+
+            if( c > cost[st] )
+                continue;
+
+            const uint32_t u = st / 3;
+            const int      in = (int) ( st % 3 );
+
+            if( goal[u] )
+            {
+                reached = st;
+                break;
+            }
+
+            const int    l = (int) ( u / tiles );
+            const size_t t = u % tiles;
+            const int    x = (int) ( t % tnx ), y = (int) ( t / tnx );
+
+            auto relax = [&]( uint32_t v, int aIn, float aStep )
+            {
+                const uint32_t s = 3 * v + aIn;
+
+                if( !std::isfinite( aStep ) )
+                    return;
+
+                if( c + aStep < cost[s] )
+                {
+                    cost[s] = c + aStep;
+                    prev[s] = (int32_t) st;
+                    open.push( { cost[s], s } );
+                }
+            };
+
+            // going on in the axis it came in passes the tile through: a crossing with the other axis there
+            const float onH = in == 1 ? crossPrice( thrV[u], histX[u] ) : 0.0f;
+            const float onV = in == 2 ? crossPrice( thrH[u], histX[u] ) : 0.0f;
+
+            auto side = [&]( uint32_t v, float aUse, float aCap, float aHist )
+            {
+                const float crossed = histX[v] > 0 ? viaStep * histX[v] * pf : 0.0f;
+
+                if( start[u] || goal[v] )
+                    return 1.0f;
+
+                // no track of the reference class passes: a wall, not a price
+                return aCap <= 0 ? std::numeric_limits<float>::infinity() : crossed + price( aUse, aCap, aHist, w, 1.0f );
+            };
+
+            if( x + 1 < tnx )
+                relax( u + 1, 1, onH + side( u + 1, useE[u] + loadE( u ), capE( u ), histE[u] ) );
+
+            if( x > 0 )
+                relax( u - 1, 1, onH + side( u - 1, useE[u - 1] + loadE( u - 1 ), capE( u - 1 ), histE[u - 1] ) );
+
+            if( y + 1 < tny )
+                relax( u + tnx, 2, onV + side( u + tnx, useS[u] + loadS( u ), capS( u ), histS[u] ) );
+
+            if( y > 0 )
+                relax( u - tnx, 2, onV + side( u - tnx, useS[u - tnx] + loadS( u - tnx ), capS( u - tnx ), histS[u - tnx] ) );
+
+            if( world.nets[aLink.net].vias )
+            {
+                for( int m = 0; m < L; ++m )
+                {
+                    if( m != l && viaCap( t ) > 0 )
+                        relax( (uint32_t) ( m * tiles + t ), 0, viaPrice( t ) );
+                }
+            }
+        }
+
+        aLink.nodes.clear();
+
+        for( int32_t s = reached == UINT32_MAX ? -1 : (int32_t) reached; s >= 0; s = prev[s] )
+            aLink.nodes.push_back( (uint32_t) s / 3 );
+
+        std::reverse( aLink.nodes.begin(), aLink.nodes.end() );
+    };
+
+    // the room of a side as its users see it: of each class among them, its room (its owner's own room when
+    // the owner is among them) in reference tracks; the least of those. A side nobody uses: the reference room
+    std::vector<uint64_t> classesE( N, 0 ), classesS( N, 0 ), ownedE( N, 0 ), ownedS( N, 0 );
+    std::vector<uint64_t> classesV( tiles, 0 ), ownedV( tiles, 0 );
+    auto bit = []( int c ) { return c < 64 ? uint64_t( 1 ) << c : 0; };
+
+    auto seen = [&]( size_t i, const std::vector<uint64_t>& aClasses, const std::vector<uint64_t>& aOwned, bool aEast )
+    {
+        if( !aClasses[i] )
+            return aEast ? room[k].capE[i] : room[k].capS[i];
+
+        float least = std::numeric_limits<float>::infinity();
+
+        for( int c = 0; c < std::min( C, 64 ); ++c )
+        {
+            if( aClasses[i] & bit( c ) )
+            {
+                const ROOM& r = room[c];
+                const float v = aOwned[i] & bit( c ) ? ( aEast ? r.ownE[i] : r.ownS[i] ) : ( aEast ? r.capE[i] : r.capS[i] );
+                least = std::min( least, v * classW[c] );
+            }
+        }
+
+        return least;
+    };
+
+    auto roomE = [&]( size_t i ) { return seen( i, classesE, ownedE, true ); };
+    auto roomS = [&]( size_t i ) { return seen( i, classesS, ownedS, false ); };
+
+    auto roomV = [&]( size_t t )
+    {
+        if( !classesV[t] )
+            return room[k].via[t];
+
+        float least = std::numeric_limits<float>::infinity();
+
+        for( int c = 0; c < std::min( C, 64 ); ++c )
+        {
+            if( classesV[t] & bit( c ) )
+                least = std::min( least, ownedV[t] & bit( c ) ? room[c].viaOwn[t] : room[c].via[t] );
+        }
+
+        return least;
+    };
+
+    auto markOwners = [&]()
+    {
+        for( auto* v : { &classesE, &classesS, &ownedE, &ownedS } )
+            std::fill( v->begin(), v->end(), 0 );
+
+        std::fill( classesV.begin(), classesV.end(), 0 );
+        std::fill( ownedV.begin(), ownedV.end(), 0 );
+
+        for( const GRID_CAPACITY::LINK& link : out.links )
+        {
+            const int32_t  code = world.nets[link.net].code;
+            const int      c = world.nets[link.net].sizes;
+            const ROOM&    r = room[c];
+            const uint64_t b = bit( c );
+
+            for( size_t j = 1; j < link.nodes.size(); ++j )
+            {
+                const uint32_t a = link.nodes[j - 1], q = link.nodes[j], lo = std::min( a, q );
+
+                if( a / tiles != q / tiles )
+                {
+                    const size_t t = a % tiles;
+                    classesV[t] |= b;
+
+                    if( r.viaOwner[t] == code )
+                        ownedV[t] |= b;
+                }
+                else if( horizontal( a, q ) )
+                {
+                    classesE[lo] |= b;
+
+                    if( r.ownerE[lo] == code )
+                        ownedE[lo] |= b;
+                }
+                else
+                {
+                    classesS[lo] |= b;
+
+                    if( r.ownerS[lo] == code )
+                        ownedS[lo] |= b;
+                }
+            }
+        }
+    };
+
+    // exact crossings on one layer: two nets that share a stretch of tiles (or touch one tile) and leave it on
+    // the other sides than they came in must cross there. Each net's arms at the stretch are compared by angle
+    // round the tile: a neighbour tile's arm points at its side; at a pad end the arm points at the pad's place
+    // inside the tile. A stretch that starts or ends at a via (placed anywhere in its tile) or at a pad in the
+    // tile's middle forces nothing
+    auto angleTo = [&]( uint32_t aFrom, uint32_t aTo )
+    {
+        return aTo == aFrom + 1 ? 0.0f : aTo == aFrom + tnx ? 90.0f : aTo + 1 == aFrom ? 180.0f : 270.0f; // y down
+    };
+
+    // the arm of a link's end in its end tile: towards the end's cells there, NaN in the tile's middle
+    auto endAngle = [&]( const GRID_CAPACITY::LINK& aLink, int aEnd, uint32_t aNode )
+    {
+        const int    l = (int) ( aNode / tiles );
+        const size_t t = aNode % tiles;
+        double       sx = 0, sy = 0;
+        int          n = 0;
+
+        for( uint32_t st : world.nets[aLink.net].ends[aEnd] )
+        {
+            const size_t cell = st % world.cells;
+
+            if( (int) ( st / world.cells ) != l || ( cell / g.nx / T ) * tnx + ( cell % g.nx ) / T != t )
+                continue;
+
+            sx += (double) ( cell % g.nx ) + 0.5;
+            sy += (double) ( cell / g.nx ) + 0.5;
+            n++;
+        }
+
+        if( n == 0 )
+            return std::numeric_limits<float>::quiet_NaN();
+
+        const double dx = sx / n - ( ( t % tnx ) * T + T / 2.0 ), dy = sy / n - ( ( t / tnx ) * T + T / 2.0 );
+
+        if( std::hypot( dx, dy ) < 0.15 * T )
+            return std::numeric_limits<float>::quiet_NaN();
+
+        float a = (float) ( std::atan2( dy, dx ) * 57.29577951308232 );
+        return a < 0 ? a + 360.0f : a;
+    };
+
+    std::vector<float>            crossAt( N, 0 );
+    std::vector<std::vector<int>> crossNets( N );
+
+    auto findCrossings = [&]( bool aNames )
+    {
+        std::fill( crossAt.begin(), crossAt.end(), 0.0f );
+
+        if( aNames )
+            crossNets.assign( N, {} );
+
+        // same-layer stretches of every link, with the arm angle at a pad end (NaN at a via)
+        struct SEG
+        {
+            int                   link;
+            std::vector<uint32_t> nodes;
+            float                 first, last;
+        };
+
+        const float                                                    none = std::numeric_limits<float>::quiet_NaN();
+        std::vector<SEG>                                               segs;
+        std::unordered_map<uint32_t, std::vector<std::pair<int, int>>> at; // node -> (segment, index)
+
+        for( size_t li = 0; li < out.links.size(); ++li )
+        {
+            const GRID_CAPACITY::LINK&   link = out.links[li];
+            const std::vector<uint32_t>& p = link.nodes;
+            size_t                       from = 0;
+
+            for( size_t j = 1; j <= p.size(); ++j )
+            {
+                if( j == p.size() || p[j] / tiles != p[j - 1] / tiles )
+                {
+                    SEG seg{ (int) li, std::vector<uint32_t>( p.begin() + from, p.begin() + j ),
+                             from == 0 ? endAngle( link, link.a, p[0] ) : none,
+                             j == p.size() ? endAngle( link, link.b, p.back() ) : none };
+
+                    for( size_t q = from; q < j; ++q )
+                        at[p[q]].push_back( { (int) segs.size(), (int) ( q - from ) } );
+
+                    segs.push_back( std::move( seg ) );
+                    from = j;
+                }
+            }
+        }
+
+        // signed turn from aRef to aArm, clockwise positive, in (-180, 180]
+        auto turn = []( float aRef, float aArm )
+        {
+            float d = std::fmod( aArm - aRef + 540.0f, 360.0f ) - 180.0f;
+            return d <= -180.0f ? d + 360.0f : d;
+        };
+
+        for( size_t a = 0; a < segs.size(); ++a )
+        {
+            const SEG& P = segs[a];
+            const int  netA = out.links[P.link].net;
+
+            for( int i = 0; i < (int) P.nodes.size(); ++i )
+            {
+                for( const auto& [b, j] : at[P.nodes[i]] )
+                {
+                    const SEG& Q = segs[b];
+
+                    if( b <= (int) a || out.links[Q.link].net == netA )
+                        continue;
+
+                    auto pAt = [&]( int k ) { return k >= 0 && k < (int) P.nodes.size() ? (int64_t) P.nodes[k] : -1; };
+                    auto qAt = [&]( int k ) { return k >= 0 && k < (int) Q.nodes.size() ? (int64_t) Q.nodes[k] : -1; };
+
+                    // only at the start of a common stretch
+                    if( pAt( i - 1 ) >= 0 && ( pAt( i - 1 ) == qAt( j - 1 ) || pAt( i - 1 ) == qAt( j + 1 ) ) )
+                        continue;
+
+                    const int d = pAt( i + 1 ) >= 0 && pAt( i + 1 ) == qAt( j + 1 ) ? 1
+                                  : pAt( i + 1 ) >= 0 && pAt( i + 1 ) == qAt( j - 1 ) ? -1 : 0;
+                    int m = 0;
+
+                    while( d != 0 && pAt( i + m + 1 ) >= 0 && pAt( i + m + 1 ) == qAt( j + d * ( m + 1 ) ) )
+                        m++;
+
+                    const int      s = d == 0 ? 1 : d;
+                    const uint32_t c0 = P.nodes[i], c1 = P.nodes[i + m];
+
+                    // an arm: towards the neighbour tile, else the pad end's angle, else NaN
+                    auto arm = [&]( int64_t aNode, uint32_t aAt, float aEnd ) { return aNode >= 0 ? angleTo( aAt, (uint32_t) aNode ) : aEnd; };
+                    auto qEnd = [&]( int k ) { return k < 0 ? Q.first : k >= (int) Q.nodes.size() ? Q.last : none; };
+
+                    const float pIn = arm( pAt( i - 1 ), c0, i == 0 ? P.first : none );
+                    const float pOut = arm( pAt( i + m + 1 ), c1, i + m + 1 == (int) P.nodes.size() ? P.last : none );
+                    const float qIn = arm( qAt( j - s ), c0, qEnd( j - s ) );
+                    const float qOut = arm( qAt( j + s * ( m + 1 ) ), c1, qEnd( j + s * ( m + 1 ) ) );
+
+                    if( std::isnan( pIn ) || std::isnan( pOut ) || std::isnan( qIn ) || std::isnan( qOut ) )
+                        continue;
+
+                    bool cross = false;
+
+                    if( m == 0 )
+                    {
+                        // one tile: the four arms interleave round it
+                        auto between = [&]( float x ) { return std::fmod( x - pIn + 360.0f, 360.0f ) < std::fmod( pOut - pIn + 360.0f, 360.0f ); };
+
+                        if( qIn == pIn || qIn == pOut || qOut == pIn || qOut == pOut )
+                            continue;
+
+                        cross = between( qIn ) != between( qOut );
+                    }
+                    else
+                    {
+                        // along the stretch: which of the two is on the left at its start and at its end
+                        const float r0 = angleTo( P.nodes[i], P.nodes[i + 1] );
+                        const float rL = angleTo( P.nodes[i + m - 1], P.nodes[i + m] );
+                        auto        behind = [&]( float aArm ) { return std::fmod( aArm - r0 + 360.0f, 360.0f ); }; // larger: more left
+
+                        if( behind( pIn ) == behind( qIn ) || turn( rL, pOut ) == turn( rL, qOut ) )
+                            continue;
+
+                        const bool leftIn = behind( pIn ) > behind( qIn );
+                        const bool leftOut = turn( rL, pOut ) < turn( rL, qOut );
+                        cross = leftIn != leftOut;
+                    }
+
+                    if( !cross )
+                        continue;
+
+                    const uint32_t c = P.nodes[i + m / 2];
+                    crossAt[c] += 1.0f;
+
+                    if( aNames )
+                    {
+                        for( int code : { world.nets[netA].code, world.nets[out.links[Q.link].net].code } )
+                        {
+                            if( std::find( crossNets[c].begin(), crossNets[c].end(), code ) == crossNets[c].end() )
+                                crossNets[c].push_back( code );
+                        }
+
+                        out.links[P.link].over = true;
+                        out.links[Q.link].over = true;
+                    }
+                }
+            }
+        }
+    };
+
+    // vias only close lanes tracks would use: a side no track crosses is never over
+    auto sideOver = [&]( float aUse, float aLoad, float aRoom ) { return aUse > 0 ? std::max( 0.0f, aUse + aLoad - aRoom - OVER ) : 0.0f; };
+
+    auto overNow = [&]()
+    {
+        double over = 0;
+        markOwners();
+        findCrossings( false );
+
+        for( size_t i = 0; i < N; ++i )
+        {
+            over += sideOver( useE[i], loadE( i ), roomE( i ) ) + sideOver( useS[i], loadS( i ), roomS( i ) );
+            over += crossAt[i];
+        }
+
+        for( size_t t = 0; t < tiles; ++t )
+            over += std::max( 0.0f, useV[t] - roomV( t ) );
+
+        return over;
+    };
+
+    double                             bestOver = std::numeric_limits<double>::infinity();
+    std::vector<std::vector<uint32_t>> bestNodes;
+    std::vector<float>                 bestE, bestS, bestV, bestH, bestVt;
+
+    for( int round = 0; round < std::max( 1, aRounds ); ++round )
+    {
+        for( GRID_CAPACITY::LINK& link : out.links )
+        {
+            if( round > 0 )
+                apply( link, -1.0f );
+
+            route( link );
+            apply( link, 1.0f );
+        }
+
+        const double over = overNow();
+        out.overByRound.push_back( over );
+
+        if( over < bestOver )
+        {
+            bestOver = over;
+            out.bestRound = round;
+            bestNodes.clear();
+
+            for( const GRID_CAPACITY::LINK& link : out.links )
+                bestNodes.push_back( link.nodes );
+
+            bestE = useE;
+            bestS = useS;
+
+            for( size_t i = 0; i < N; ++i )
+            {
+                bestE[i] += loadE( i );
+                bestS[i] += loadS( i );
+            }
+            bestV = useV;
+            bestH = thrH;
+            bestVt = thrV;
+        }
+
+        if( over <= 0 || ( aParams.cancel && aParams.cancel->load() ) )
+            break;
+
+        for( size_t i = 0; i < N; ++i )
+        {
+            histE[i] += sideOver( useE[i], loadE( i ), roomE( i ) ) > 0 ? 1.0f : 0.0f;
+            histS[i] += sideOver( useS[i], loadS( i ), roomS( i ) ) > 0 ? 1.0f : 0.0f;
+            histX[i] += crossAt[i];
+        }
+
+        for( size_t t = 0; t < tiles; ++t )
+            histV[t] += useV[t] > roomV( t ) ? 1.0f : 0.0f;
+
+        pf = std::min( pf * 1.5f, 1000.0f );
+    }
+
+    for( size_t j = 0; j < out.links.size(); ++j )
+        out.links[j].nodes = bestNodes[j];
+
+    useE = bestE;
+    useS = bestS;
+    markOwners();
+
+    for( size_t i = 0; i < N; ++i )
+    {
+        out.capE[i] = roomE( i );
+        out.capS[i] = roomS( i );
+    }
+
+    for( size_t t = 0; t < tiles; ++t )
+        out.viaCap[t] = roomV( t );
+
+    out.useE = std::move( bestE );
+    out.useS = std::move( bestS );
+    out.viaUse = std::move( bestV );
+    out.crossH = std::move( bestH );
+    out.crossV = std::move( bestVt );
+    findCrossings( true );
+    out.crossings = crossAt;
+    out.netsE.assign( N, {} );
+    out.netsS.assign( N, {} );
+    out.netsVia.assign( tiles, {} );
+    out.netsCross = crossNets;
+
+    auto note = [&]( GRID_CAPACITY::LINK& aLink, std::vector<int>& aAt )
+    {
+        const int code = world.nets[aLink.net].code;
+        aLink.over = true;
+
+        if( std::find( aAt.begin(), aAt.end(), code ) == aAt.end() )
+            aAt.push_back( code );
+    };
+
+    for( GRID_CAPACITY::LINK& link : out.links )
+    {
+        const std::vector<uint32_t>& p = link.nodes;
+
+        for( size_t j = 1; j < p.size(); ++j )
+        {
+            const uint32_t a = p[j - 1], b = p[j], lo = std::min( a, b );
+
+            if( a / tiles != b / tiles )
+            {
+                if( out.viaUse[a % tiles] > out.viaCap[a % tiles] )
+                    note( link, out.netsVia[a % tiles] );
+            }
+            else if( endStep( link, j ) )
+                continue;
+            else if( horizontal( a, b ) ? out.useE[lo] > out.capE[lo] + OVER : out.useS[lo] > out.capS[lo] + OVER )
+                note( link, horizontal( a, b ) ? out.netsE[lo] : out.netsS[lo] );
+        }
+
+    }
+
+    out.routeMs = std::chrono::duration<double, std::milli>( CLOCK::now() - started ).count() - out.buildMs;
+    return out;
+}
+} // namespace
+
+
+GRID_CAPACITY GridCapacity( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_PARAMS& aParams, int aTileSize,
+                            int aRounds, int aViaCost )
+{
+    const auto started = CLOCK::now();
+
+    if( aNets.empty() || aParams.layers.empty() )
+    {
+        GRID_CAPACITY out;
+        out.error = "no nets or no routing layers";
+        return out;
+    }
+
+    WORLD world;
+    buildWorld( aBoard, aNets, aParams, world );
+    const int T = std::max( 2, (int) std::lround( (double) aTileSize / world.grid.cell ) );
+    return capacityOn( world, aParams, T, aRounds, aViaCost, started );
 }

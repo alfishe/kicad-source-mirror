@@ -5055,6 +5055,9 @@ static double splitPairBack( PCB_CONTEXT& aContext, BOARD* aBoard, const std::ve
 static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& aArgs, const ROUTE_BRANCH* aBranch,
                                  bool aQuiet = false );
 
+/// @brief The answer of pcb_route capacity: the sides and tiles over their room, worst first, and the totals
+nlohmann::json capacityJson( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_CAPACITY& aCap, bool aMaps );
+
 // rows of pcb_route listed by default (failed ones first when cut)
 constexpr size_t ROUTE_LIST_CAP = 100;
 
@@ -14248,6 +14251,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         params.viaNearHole = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_near_hole_mm", 2.5 ), 0.0, 30.0 ) );
         params.viaNearHoleCost = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_near_hole_cost_mm", 6.0 ), 0.0, 100.0 ) );
         params.hug = (float) std::clamp( aArgs.value( "hug", 1.0 ), 0.05, 1.0 );
+
+        if( aArgs.contains( "corridor" ) )
+        {
+            const nlohmann::json& co = aArgs["corridor"];
+            params.corridorCost = (float) std::clamp( co.value( "cost", 4.0 ), 1.0, 1000.0 );
+            params.corridorRounds = std::clamp( co.value( "rounds", 100 ), 1, 500 );
+        }
         params.astar = (float) std::clamp( aArgs.value( "astar", 1.2 ), 1.0, 3.0 );
         params.pfStart = (float) std::clamp( aArgs.value( "pf_start", 1.0 ), 0.01, 100.0 );
         params.pfGrowth = (float) std::clamp( aArgs.value( "pf_growth", 1.6 ), 1.01, 10.0 );
@@ -14427,6 +14437,22 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             GridTimelineKeep( aTimeline );
         };
+
+        // capacity: the room the connections need against what the board has, nothing routed
+        if( aArgs.contains( "capacity" ) )
+        {
+            const nlohmann::json& ca = aArgs["capacity"];
+            const int tile = pcbIUScale.mmToIU( std::clamp( ca.value( "tile_mm", 1.0 ), 0.2, 10.0 ) );
+            const int rounds = std::clamp( ca.value( "rounds", 30 ), 1, 500 );
+            const int viaCost = pcbIUScale.mmToIU( std::clamp( ca.value( "via_cost_mm", 2.0 ), 0.0, 50.0 ) );
+            GRID_CAPACITY cap;
+            KopenapiCompute( [&]() { cap = GridCapacity( board, gridNets, params, tile, rounds, viaCost ); } );
+
+            if( !cap.error.empty() )
+                return KOPENAPI_RESULT::Error( 400, "capacity: " + cap.error );
+
+            return KOPENAPI_RESULT::Ok( capacityJson( board, gridNets, cap, ca.value( "maps", false ) ) );
+        }
 
         // the grid search only reads the board: off the GUI thread, readers read alongside
         GRID_RESULT gr;
@@ -15667,6 +15693,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     { "dropped", gr.conflictsLeft }, { "crowded_left_out", gr.crowdedLeftOut }, { "cell_mm", toMm( gr.cell ) }, { "expanded", gr.expanded },
                     { "build_ms", std::round( gr.buildMs ) }, { "route_ms", std::round( gr.routeMs ) },
                     { "half_cell", { { "tried", gr.halfCellTried }, { "won", gr.halfCellWon }, { "ms", std::round( gr.halfCellMs * 10 ) / 10 } } },
+                    { "corridor", { { "ms", std::round( gr.corridorMs ) }, { "over", std::round( gr.corridorOver * 10 ) / 10 } } },
                     { "guard_ms", std::round( msSince( guardFrom ) ) }, { "rejected", rejected },
                     { "costliest", costliest }, { "expanded_by_stage", gr.expandedByStage }, { "bundles", bundlesUsed },
                     { "search", [&]()
@@ -25271,6 +25298,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "lanes":{"type":"boolean","default":false,"description":"with ports: each pin kept on its pad's layer runs its lane from pcb_fanout_ports lanes. The lanes round a package are laid as tracks before any route (where the guard lets them, at both ends of a connection); the leg between two lanes whose ends face each other is a straight run, one 45 degree jog and a straight run, the jogs of a bus staggered so its legs keep their pitch, laid as computed where it is clean, else routed from lane end to lane end. A lane its route did not use is taken out again. Routes so made are left as they are by clean_up. Rows routed so name port.lane (the rank), ring_laid, far_ring_laid; ports.lanes counts laid_tracks, refused, taken_out"},
                         "bus_paths":{"description":"pns: \"off\", \"floorplan\" (or {floorplan: {pcb_floorplan arguments}}): every bus link pcb_floorplan finds, along its corridor, the connections of its nets between the two blocks' parts; or [{name, nets, points_mm: [[x_mm, y_mm] (a free point) or {at_mm, along: x | y, lo_mm, hi_mm, into_mm: [x0, y0, x1, y1]} (a portal crossed into that region: the ribbon inside lo..hi, joined to the next portal by axis-parallel runs inside the region; rooms_mm: [[x0, y0, x1, y1], ...] the regions to the next gate, more than one: joined by the straight run, which lies inside them (docs corridor.md))]}]: the connections of those nets, from the end nearer the first point. A corridor is a soft goal: at the turn of its first connection each member gets one try along it, across it in order, in a tenth of first_pass_budget_s; the members it does not route keep their turn and their usual tries with their whole budget. The answer's corridors give the centre line (line_mm) the members run beside at their pitch. With floorplan, ports and lanes: a link whose ring pcb_floorplan gives (links rings) is laid first along it, one lane per net on the ring's layer from its row of vias at the pins' side round the part to the other row, nested innermost first, the pins taking those spots in their order by a 45 degree fan (the spots pushed out past the row when the fan needs it); that link's corridor is not used and the answer's ring_lanes give each lane (net, rank, polyline_mm, leg_mm, refused)","default":"off"},
                         "bus_layer":{"type":"string","description":"with bus: the members drop a through via each on a diagonal fan in front of the pad row (via pitch apart, the later members' spots kept free) and go on on this layer; a member the fan does not route is routed as any other (row bus.fan, fan_failed)"},
+                        "corridor":{"type":"object","description":"grid engine: each net keeps to its coarse route (the capacity model's routes over the same map, a tile either side): a cell off it costs cost (4) times more; rounds (100) of the coarse routes"},
+                        "capacity":{"type":"object","description":"nothing routed: the room the connections need against the board's free space on a coarse grid of tiles over the grid engine's own map (tracks of each net's own class across each tile side per layer, vias per tile, a net's own copper counted as room for that net, weighed in tracks of the most common class), every connection routed over the tiles with negotiated congestion; answers the passes (sides over their room next to each other on one tile line, room and need summed), via tiles and crossings still over after the best round, worst first, with the nets through them. tile_mm (1), rounds (30), via_cost_mm (2), maps (false: the per-tile room and use arrays and each connection's tiles [layer, x, y]). Two nets on one layer that share a stretch of tiles and leave it on the other sides than they came in must cross there (kind crossing, pairs): one of them needs a via; a side no track passes is a wall, a side no track crosses is never over, and a connection walled off from its other end is listed in blocked; steps out of a connection's own end tiles are its fan-out and not counted"},
                         "rip_up":{"type":"integer","default":2,"minimum":0,"maximum":6,"description":"rounds of rip-up and retry for failed connections (routes of this call in their way taken out and routed again, up to 3 choices of them per connection and round; all back if that fails)"},
                         "vias":{"type":"boolean","default":true,"description":"connections blocked on their side: escape through vias near both ends"},
                         "diff_pairs":{"type":"string","enum":["auto","off"],"default":"auto","description":"auto: pairs (USB_D+ / USB_D-, LVDS_P / LVDS_N) routed coupled; off: every net alone"},
@@ -25608,3 +25637,206 @@ KOPENAPI_REGISTER( "pcb_route_strategies",
 
 KOPENAPI_MARK_EDITING( "pcb_route_connection", "pcb_route", "pcb_stitch", "pcb_tracks_delete", "pcb_tracks_update", "pcb_tracks_cleanup", "pcb_track_add", "pcb_via_add", "pcb_fanout" );
 KOPENAPI_MARK_CONCURRENT_READS( "pcb_track_list", "pcb_via_list" );
+
+
+nlohmann::json capacityJson( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_CAPACITY& aCap, bool aMaps )
+{
+    const size_t tiles = (size_t) aCap.tnx * aCap.tny;
+    const double tmm = pcbIUScale.IUTomm( aCap.tileSize );
+
+    auto netName = [&]( int aCode )
+    {
+        NETINFO_ITEM* info = aBoard->FindNet( aCode );
+        return info ? str( UnescapeString( info->GetNetname() ) ) : std::to_string( aCode );
+    };
+
+    auto mm = [&]( double aX, double aY )
+    {
+        return nlohmann::json::array( { std::round( ( pcbIUScale.IUTomm( aCap.origin.x ) + aX * tmm ) * 1000 ) / 1000,
+                                        std::round( ( pcbIUScale.IUTomm( aCap.origin.y ) + aY * tmm ) * 1000 ) / 1000 } );
+    };
+
+    std::vector<std::pair<double, nlohmann::json>> over;
+
+    auto names = [&]( const std::vector<int>& aNetsAt )
+    {
+        nlohmann::json n = nlohmann::json::array();
+
+        for( int k : aNetsAt )
+            n.push_back( netName( k ) );
+
+        return n;
+    };
+
+    // sides over their room next to each other on one tile line are one pass: room and need summed
+    for( size_t l = 0; l < aCap.layers.size(); ++l )
+    {
+        for( int east = 0; east < 2; ++east )
+        {
+            const int lines = east ? aCap.tnx : aCap.tny, along = east ? aCap.tny : aCap.tnx;
+
+            for( int line = 0; line < lines; ++line )
+            {
+                for( int k = 0; k < along; )
+                {
+                    auto index = [&]( int aK ) { return l * tiles + ( east ? (size_t) aK * aCap.tnx + line : (size_t) line * aCap.tnx + aK ); };
+                    auto isOver = [&]( int aK )
+                    {
+                        const size_t i = index( aK );
+
+                        // vias only close lanes tracks would use: a side no track crosses is never over
+                        if( ( east ? aCap.netsE[i] : aCap.netsS[i] ).empty() )
+                            return false;
+
+                        return east ? aCap.useE[i] > aCap.capE[i] + 1e-3f : aCap.useS[i] > aCap.capS[i] + 1e-3f;
+                    };
+
+                    if( !isOver( k ) )
+                    {
+                        k++;
+                        continue;
+                    }
+
+                    double           room = 0, need = 0;
+                    std::vector<int> codes;
+                    const int        first = k;
+
+                    for( ; k < along && isOver( k ); ++k )
+                    {
+                        const size_t i = index( k );
+                        room += east ? aCap.capE[i] : aCap.capS[i];
+                        need += east ? aCap.useE[i] : aCap.useS[i];
+
+                        for( int code : east ? aCap.netsE[i] : aCap.netsS[i] )
+                        {
+                            if( std::find( codes.begin(), codes.end(), code ) == codes.end() )
+                                codes.push_back( code );
+                        }
+                    }
+
+                    // the pass as a segment on the tile line
+                    const nlohmann::json from = east ? mm( line + 1, first ) : mm( first, line + 1 );
+                    const nlohmann::json to = east ? mm( line + 1, k ) : mm( k, line + 1 );
+                    over.push_back( { need - room,
+                                      { { "kind", "pass" },
+                                        { "layer", str( aBoard->GetLayerName( aCap.layers[l] ) ) },
+                                        { "crossed", east ? "west-east" : "north-south" },
+                                        { "from_mm", from },
+                                        { "to_mm", to },
+                                        { "room", room },
+                                        { "need", std::round( need * 100 ) / 100 },
+                                        { "nets", names( codes ) } } } );
+                }
+            }
+        }
+    }
+
+    for( size_t l = 0; l < aCap.layers.size(); ++l )
+    {
+        for( size_t t = 0; t < tiles; ++t )
+        {
+            const size_t i = l * tiles + t;
+
+            if( aCap.crossings[i] <= 0 )
+                continue;
+
+            over.push_back( { aCap.crossings[i],
+                              { { "kind", "crossing" },
+                                { "layer", str( aBoard->GetLayerName( aCap.layers[l] ) ) },
+                                { "at_mm", mm( t % aCap.tnx + 0.5, t / aCap.tnx + 0.5 ) },
+                                { "pairs", aCap.crossings[i] },
+                                { "nets", names( aCap.netsCross[i] ) } } } );
+        }
+    }
+
+    for( size_t t = 0; t < tiles; ++t )
+    {
+        if( aCap.viaUse[t] <= aCap.viaCap[t] )
+            continue;
+
+        over.push_back( { aCap.viaUse[t] - aCap.viaCap[t],
+                          { { "kind", "vias" },
+                            { "at_mm", mm( t % aCap.tnx + 0.5, t / aCap.tnx + 0.5 ) },
+                            { "room", aCap.viaCap[t] },
+                            { "need", aCap.viaUse[t] },
+                            { "nets", names( aCap.netsVia[t] ) } } } );
+    }
+
+    std::stable_sort( over.begin(), over.end(), []( const auto& a, const auto& b ) { return a.first > b.first; } );
+    nlohmann::json rows = nlohmann::json::array();
+
+    for( const auto& o : over )
+        rows.push_back( o.second );
+
+    size_t           linksOver = 0;
+    std::vector<int> netsOver;
+
+    nlohmann::json blocked = nlohmann::json::array();
+
+    for( const GRID_CAPACITY::LINK& link : aCap.links )
+    {
+        linksOver += link.over ? 1 : 0;
+
+        if( link.nodes.empty() )
+            blocked.push_back( netName( link.code ) );
+    }
+
+    for( const auto& at : { &aCap.netsE, &aCap.netsS, &aCap.netsVia, &aCap.netsCross } )
+    {
+        for( const std::vector<int>& codes : *at )
+        {
+            for( int code : codes )
+            {
+                if( std::find( netsOver.begin(), netsOver.end(), code ) == netsOver.end() )
+                    netsOver.push_back( code );
+            }
+        }
+    }
+
+    nlohmann::json layers = nlohmann::json::array();
+
+    for( PCB_LAYER_ID l : aCap.layers )
+        layers.push_back( str( aBoard->GetLayerName( l ) ) );
+
+    nlohmann::json out = { { "applied", false },
+                           { "capacity",
+                             { { "tile_mm", tmm },
+                               { "cell_mm", pcbIUScale.IUTomm( aCap.cell ) },
+                               { "via_area_cells", aCap.viaArea },
+                               { "tiles", { aCap.tnx, aCap.tny } },
+                               { "origin_mm", mm( 0, 0 ) },
+                               { "layers", layers },
+                               { "reference_pitch_mm", pcbIUScale.IUTomm( aCap.refPitch ) },
+                               { "links", aCap.links.size() },
+                               { "links_over", linksOver },
+                               { "nets_over", names( netsOver ) },
+                               { "blocked", blocked },
+                               { "over_by_round", aCap.overByRound },
+                               { "best_round", aCap.bestRound },
+                               { "over", rows },
+                               { "build_ms", aCap.buildMs },
+                               { "route_ms", aCap.routeMs } } } };
+
+    if( aMaps )
+    {
+        out["capacity"]["maps"] = { { "cap_east", aCap.capE }, { "cap_south", aCap.capS }, { "use_east", aCap.useE },
+                                    { "use_south", aCap.useS }, { "via_cap", aCap.viaCap }, { "via_use", aCap.viaUse },
+                                    { "through_west_east", aCap.crossH }, { "through_north_south", aCap.crossV },
+                                    { "crossings", aCap.crossings } };
+        nlohmann::json paths = nlohmann::json::array();
+
+        for( const GRID_CAPACITY::LINK& link : aCap.links )
+        {
+            nlohmann::json nodes = nlohmann::json::array();
+
+            for( uint32_t n : link.nodes )
+                nodes.push_back( { n / tiles, ( n % tiles ) % aCap.tnx, ( n % tiles ) / aCap.tnx } );
+
+            paths.push_back( { { "net", netName( link.code ) }, { "nodes", nodes } } );
+        }
+
+        out["capacity"]["maps"]["paths"] = paths;
+    }
+
+    return out;
+}

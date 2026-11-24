@@ -88,6 +88,8 @@ struct GRID_PARAMS
     float                     rowsCost = 1.0f; ///< cost factor of a cell between the two pin rows of a connector; 1 none
     float                     bodyCost = 1.0f; ///< cost factor of a cell inside a fine-pitch package's ring of pins; 1 none
     float                     hug = 1.0f;      ///< cost factor of a cell beside the copper of the net's own bundle; 1 none
+    float                     corridorCost = 1.0f; ///< cost factor of a cell off the net's coarse route (GridCapacity over the same map, a tile either side); 1 none
+    int                       corridorRounds = 100; ///< rounds of those coarse routes
     float                     astar = 1.2f;    ///< the distance left counts this much more than it costs at least (VPR's astar_fac)
     float                     pfStart = 1.0f;  ///< the price of sharing a cell in the first round (VPR's initial_pres_fac)
     float                     pfGrowth = 1.6f; ///< and how much it grows each round (VPR's pres_fac_mult)
@@ -199,6 +201,8 @@ struct GRID_RESULT
     int                          halfCellTried = 0;   ///< walled fine-pitch ends tried on the half-cell lattice
     int                          halfCellWon = 0;     ///< ... let out there
     double                       halfCellMs = 0;      ///< their search (part of buildMs)
+    double                       corridorMs = 0;      ///< the coarse routes of corridorCost (part of buildMs)
+    double                       corridorOver = 0;    ///< what of them stayed over the room (GRID_CAPACITY)
     std::vector<std::string>     variantsTried;
     int64_t                      laneBytes = 0;       ///< one lane's search state (estimate)
     int                          lanesMemoryAllows = 0; ///< within GRID_PARAMS::memoryBudget
@@ -369,3 +373,46 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
 /// @brief The variants raced when GRID_PARAMS::strategies is empty, in the order lanes are dropped from
 /// the end: mixed net orders, layer directions and first-round prices (relative to aParams.pfStart)
 std::vector<GRID_STRATEGY> GridBuiltinStrategies( const GRID_PARAMS& aParams );
+
+/// @brief How much of the board's free space the connections need, on a coarse grid of tiles over
+/// the pass's own map (the same obstacles, per routing layer): per tile side and layer, how many
+/// tracks of the reference class cross it; per tile, how many vias fit. Every connection (each net's
+/// ends joined by a spanning tree) is routed over the tiles with negotiated congestion; the tile
+/// sides and tiles still over their room after the best round are the places that do not fit. Two nets on one
+/// layer that share a stretch of tiles and leave it on the other sides than they came in must cross there:
+/// one of them needs a via (kind crossing). Steps out of a connection's own end tiles are its fan-out and not counted against a side
+struct GRID_CAPACITY
+{
+    std::string               error;
+    VECTOR2I                  origin;
+    int                       tileSize = 0;   ///< board units
+    int                       cell = 0;       ///< the map's cell (board units); a tile is tileSize / cell cells
+    float                     viaArea = 0;    ///< cells one via takes with its room: a tile's via room is its free via cells over this
+    int                       tnx = 0, tny = 0;
+    std::vector<PCB_LAYER_ID> layers;
+    int                       refClass = 0;   ///< the class most nets have: room counted in its tracks
+    int                       refPitch = 0;   ///< its track width plus clearance
+    std::vector<float>        capE, capS;     ///< per layer * tiles: tracks across the east / south side
+    std::vector<float>        useE, useS;     ///< and the best round's use (in reference tracks; a via in a tile beside takes half a via pitch)
+    std::vector<float>        viaCap, viaUse; ///< per tile
+    std::vector<float>        crossH, crossV; ///< per layer * tiles: tracks through west-east / north-south
+    std::vector<float>        crossings;      ///< per layer * tiles: pairs of nets that must cross there
+    std::vector<std::vector<int>> netsE, netsS, netsVia, netsCross; ///< per side / tile over its room: net codes
+
+    struct LINK
+    {
+        int                   net = 0;        ///< net index of the pass's map
+        int                   code = 0;       ///< its net code
+        int                   a = 0, b = 0;   ///< its ends (GRID_NET::ends)
+        std::vector<uint32_t> nodes;          ///< layer * tiles + tile, from a to b; empty: walled off
+        bool                  over = false;   ///< passes a side or tile over its room
+    };
+
+    std::vector<LINK>   links;
+    std::vector<double> overByRound;          ///< tracks (and vias) over the room, per round
+    int                 bestRound = -1;
+    double              buildMs = 0, routeMs = 0;
+};
+
+GRID_CAPACITY GridCapacity( BOARD* aBoard, const std::vector<GRID_NET>& aNets, const GRID_PARAMS& aParams, int aTileSize,
+                            int aRounds, int aViaCost );
