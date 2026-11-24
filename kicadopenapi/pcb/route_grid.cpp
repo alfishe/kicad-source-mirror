@@ -6482,7 +6482,9 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             {
                 const uint32_t s = 3 * v + aIn;
 
-                if( !std::isfinite( aStep ) )
+                // never straight back to the node it came from: a step out and back (or a via there and back)
+                // only dodges the crossing price of the way it came in
+                if( !std::isfinite( aStep ) || ( prev[st] >= 0 && (uint32_t) prev[st] / 3 == v ) )
                     return;
 
                 if( c + aStep < cost[s] )
@@ -6590,6 +6592,44 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         return least;
     };
 
+    // a link's classes and own room on the sides and via tiles it uses; only those of tiles in aIn when given
+    auto markLink = [&]( const GRID_CAPACITY::LINK& link, const std::vector<uint8_t>* aIn )
+    {
+        const int32_t  code = world.nets[link.net].code;
+        const int      c = world.nets[link.net].sizes;
+        const ROOM&    r = room[c];
+        const uint64_t b = bit( c );
+
+        for( size_t j = 1; j < link.nodes.size(); ++j )
+        {
+            const uint32_t a = link.nodes[j - 1], q = link.nodes[j], lo = std::min( a, q );
+
+            if( aIn && !( *aIn )[( a / tiles != q / tiles ? a : lo ) % tiles] )
+                continue;
+
+            if( a / tiles != q / tiles )
+            {
+                const size_t t = a % tiles;
+                classesV[t] |= b;
+
+                if( r.viaOwner[t] == code )
+                    ownedV[t] |= b;
+            }
+            else if( horizontal( a, q ) )
+            {
+                classesE[lo] |= b;
+                float& o = ownSeenE[(size_t) c * N + lo];
+                o = std::max( o, ownRoom( r.ownsE[lo], code ) );
+            }
+            else
+            {
+                classesS[lo] |= b;
+                float& o = ownSeenS[(size_t) c * N + lo];
+                o = std::max( o, ownRoom( r.ownsS[lo], code ) );
+            }
+        }
+    };
+
     auto markOwners = [&]()
     {
         for( auto* v : { &classesE, &classesS } )
@@ -6602,38 +6642,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         std::fill( ownedV.begin(), ownedV.end(), 0 );
 
         for( const GRID_CAPACITY::LINK& link : out.links )
-        {
-            const int32_t  code = world.nets[link.net].code;
-            const int      c = world.nets[link.net].sizes;
-            const ROOM&    r = room[c];
-            const uint64_t b = bit( c );
-
-            for( size_t j = 1; j < link.nodes.size(); ++j )
-            {
-                const uint32_t a = link.nodes[j - 1], q = link.nodes[j], lo = std::min( a, q );
-
-                if( a / tiles != q / tiles )
-                {
-                    const size_t t = a % tiles;
-                    classesV[t] |= b;
-
-                    if( r.viaOwner[t] == code )
-                        ownedV[t] |= b;
-                }
-                else if( horizontal( a, q ) )
-                {
-                    classesE[lo] |= b;
-                    float& o = ownSeenE[(size_t) c * N + lo];
-                    o = std::max( o, ownRoom( r.ownsE[lo], code ) );
-                }
-                else
-                {
-                    classesS[lo] |= b;
-                    float& o = ownSeenS[(size_t) c * N + lo];
-                    o = std::max( o, ownRoom( r.ownsS[lo], code ) );
-                }
-            }
-        }
+            markLink( link, nullptr );
     };
 
     // exact crossings on one layer: two nets that share a stretch of tiles (or touch one tile) and leave it on
@@ -6701,9 +6710,12 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     std::vector<float>            crossAt( N, 0 );
     std::vector<std::vector<int>> crossNets( N );
 
-    auto findCrossings = [&]( bool aNames )
+    // aLinks given: those links only, the crossings in tiles of aIn summed into aSum, crossAt untouched
+    auto findCrossings = [&]( bool aNames, const std::vector<int>* aLinks = nullptr, const std::vector<uint8_t>* aIn = nullptr,
+                              double* aSum = nullptr )
     {
-        std::fill( crossAt.begin(), crossAt.end(), 0.0f );
+        if( !aSum )
+            std::fill( crossAt.begin(), crossAt.end(), 0.0f );
 
         if( aNames )
             crossNets.assign( N, {} );
@@ -6720,8 +6732,9 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         std::vector<SEG>                                               segs;
         std::unordered_map<uint32_t, std::vector<std::pair<int, int>>> at; // node -> (segment, index)
 
-        for( size_t li = 0; li < out.links.size(); ++li )
+        for( size_t n = 0; n < ( aLinks ? aLinks->size() : out.links.size() ); ++n )
         {
+            const size_t                 li = aLinks ? (size_t) ( *aLinks )[n] : n;
             const GRID_CAPACITY::LINK&   link = out.links[li];
             const std::vector<uint32_t>& p = link.nodes;
             size_t                       from = 0;
@@ -6824,6 +6837,15 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                         continue;
 
                     const uint32_t c = P.nodes[i + m / 2];
+
+                    if( aSum )
+                    {
+                        if( ( *aIn )[c % tiles] )
+                            *aSum += 1.0;
+
+                        continue;
+                    }
+
                     crossAt[c] += 1.0f;
 
                     if( aNames )
@@ -6993,13 +7015,10 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
             for( uint32_t n : *aOut )
             {
-                if( !clean.empty() && clean.back() == n )
-                    continue;
-
-                // a via there and straight back
-                if( clean.size() >= 2 && clean[clean.size() - 2] == n && clean.back() % tiles == n % tiles )
+                // back at a node already passed: the loop since then goes
+                if( auto it = std::find( clean.begin(), clean.end(), n ); it != clean.end() )
                 {
-                    clean.pop_back();
+                    clean.erase( it + 1, clean.end() );
                     continue;
                 }
 
@@ -7073,13 +7092,154 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         return hot;
     };
 
+    // the total is local: a link's move changes only the tiles along its old and new route and their neighbours.
+    // A move is judged by the total there before and after it, over the links through those tiles
+    std::vector<std::vector<int>> tileLinks( tiles );
+
+    auto enlist = [&]( int aLi, bool aIn )
+    {
+        for( uint32_t n : out.links[aLi].nodes )
+        {
+            std::vector<int>& v = tileLinks[n % tiles];
+
+            if( !aIn )
+                v.erase( std::remove( v.begin(), v.end(), aLi ), v.end() );
+            else if( std::find( v.begin(), v.end(), aLi ) == v.end() )
+                v.push_back( aLi );
+        }
+    };
+
+    std::vector<uint8_t> inRegion( tiles, 0 );
+    std::vector<int>     linkStamp( out.links.size(), -1 );
+    int                  stamp = 0;
+
+    auto localTotal = [&]( const std::vector<uint32_t>& aTiles, const std::vector<int>& aLinks )
+    {
+        for( uint32_t t : aTiles )
+        {
+            classesV[t] = 0;
+            ownedV[t] = 0;
+
+            for( int l = 0; l < L; ++l )
+            {
+                const size_t i = (size_t) l * tiles + t;
+                classesE[i] = classesS[i] = 0;
+
+                for( int c = 0; c < C; ++c )
+                    ownSeenE[(size_t) c * N + i] = ownSeenS[(size_t) c * N + i] = -1.0f;
+            }
+        }
+
+        for( int li : aLinks )
+            markLink( out.links[li], &inRegion );
+
+        double sum = 0;
+        findCrossings( false, &aLinks, &inRegion, &sum );
+
+        for( uint32_t t : aTiles )
+        {
+            for( int l = 0; l < L; ++l )
+            {
+                const size_t i = (size_t) l * tiles + t;
+                sum += sideOver( useE[i], loadE( i ), roomE( i ) ) + sideOver( useS[i], loadS( i ), roomS( i ) );
+            }
+
+            sum += std::max( 0.0f, useV[t] - roomV( t ) );
+        }
+
+        return sum;
+    };
+
+    // the change of the total if aLink took aNodes
+    auto delta = [&]( GRID_CAPACITY::LINK& aLink, const std::vector<uint32_t>& aNodes )
+    {
+        std::vector<uint32_t> region;
+
+        auto add = [&]( const std::vector<uint32_t>& aPath )
+        {
+            for( uint32_t n : aPath )
+            {
+                const int x = (int) ( n % tiles % tnx ), y = (int) ( n % tiles / tnx );
+
+                for( int dy = -1; dy <= 1; ++dy )
+                {
+                    for( int dx = -1; dx <= 1; ++dx )
+                    {
+                        if( x + dx < 0 || x + dx >= tnx || y + dy < 0 || y + dy >= tny )
+                            continue;
+
+                        const uint32_t t = (uint32_t) ( ( y + dy ) * tnx + x + dx );
+
+                        if( !inRegion[t] )
+                        {
+                            inRegion[t] = 1;
+                            region.push_back( t );
+                        }
+                    }
+                }
+            }
+        };
+
+        add( aLink.nodes );
+        add( aNodes );
+        stamp++;
+        std::vector<int> links;
+
+        auto take = [&]( int aLi )
+        {
+            if( linkStamp[aLi] != stamp )
+            {
+                linkStamp[aLi] = stamp;
+                links.push_back( aLi );
+            }
+        };
+
+        take( (int) ( &aLink - out.links.data() ) );
+
+        for( uint32_t t : region )
+        {
+            for( int li : tileLinks[t] )
+                take( li );
+        }
+
+        // the order the whole total takes them in
+        std::sort( links.begin(), links.end() );
+
+        const double          before = localTotal( region, links );
+        std::vector<uint32_t> old = aLink.nodes;
+        apply( aLink, -1.0f );
+        aLink.nodes = aNodes;
+        apply( aLink, 1.0f );
+        const double after = localTotal( region, links );
+        apply( aLink, -1.0f );
+        aLink.nodes = std::move( old );
+        apply( aLink, 1.0f );
+
+        for( uint32_t t : region )
+            inRegion[t] = 0;
+
+        return after - before;
+    };
+
+    // aLink takes aNodes for good
+    auto adopt = [&]( GRID_CAPACITY::LINK& aLink, std::vector<uint32_t>&& aNodes )
+    {
+        const int li = (int) ( &aLink - out.links.data() );
+        enlist( li, false );
+        apply( aLink, -1.0f );
+        aLink.nodes = std::move( aNodes );
+        apply( aLink, 1.0f );
+        enlist( li, true );
+    };
+
     const auto repairStart = CLOCK::now();
 
     if( aParams.capacityRepair )
     {
-        double cur = total();
+        for( int li = 0; li < (int) out.links.size(); ++li )
+            enlist( li, true );
 
-        for( int pass = 0; pass < 8 && cur > 0 && !( aParams.cancel && aParams.cancel->load() ); ++pass )
+        for( int pass = 0; pass < 8 && total() > 0 && !( aParams.cancel && aParams.cancel->load() ); ++pass )
         {
             const std::vector<uint8_t> hot = hotNodes();
             bool                       kept = false;
@@ -7125,19 +7285,12 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                         cands.push_back( std::move( fresh.nodes ) );
                 }
 
-                double                best = cur - 1e-3;
-                int                   pick = -1;
-                std::vector<uint32_t> old = link.nodes;
+                double best = -1e-3;
+                int    pick = -1;
 
                 for( size_t ci = 0; ci < cands.size(); ++ci )
                 {
-                    apply( link, -1.0f );
-                    link.nodes = cands[ci];
-                    apply( link, 1.0f );
-                    const double v = total();
-                    apply( link, -1.0f );
-                    link.nodes = old;
-                    apply( link, 1.0f );
+                    const double v = delta( link, cands[ci] );
 
                     if( v < best )
                     {
@@ -7148,10 +7301,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
                 if( pick >= 0 )
                 {
-                    apply( link, -1.0f );
-                    link.nodes = std::move( cands[pick] );
-                    apply( link, 1.0f );
-                    cur = total();
+                    adopt( link, std::move( cands[pick] ) );
                     kept = true;
                     out.repairKept++;
                 }
@@ -7161,8 +7311,6 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                 break;
         }
 
-        // vias that buy nothing: a stretch between two vias put on the layer before or after it, kept when the
-        // link costs less with no congestion and the total does not grow
         // a link's cost with no congestion, as the search counts it: steps, steps across a layer's direction, vias
         auto baseCost = [&]( const GRID_CAPACITY::LINK& aLink, const std::vector<uint32_t>& aNodes )
         {
@@ -7184,6 +7332,8 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             return sum;
         };
 
+        // vias that buy nothing: a stretch between two vias put on the layer before or after it, kept when the
+        // link costs less with no congestion and the total does not grow
         for( int pass = 0; pass < 4 && !( aParams.cancel && aParams.cancel->load() ); ++pass )
         {
             bool kept = false;
@@ -7215,28 +7365,14 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                         if( !pick.empty() || hop( link, a, b, m, &c ) != 0 || baseCost( link, c ) >= before )
                             continue;
 
-                        std::vector<uint32_t> old = p;
-                        apply( link, -1.0f );
-                        link.nodes = c;
-                        apply( link, 1.0f );
-                        const double v = total();
-                        apply( link, -1.0f );
-                        link.nodes = std::move( old );
-                        apply( link, 1.0f );
-
-                        if( v <= cur + 1e-6 )
-                        {
+                        if( delta( link, c ) <= 1e-6 )
                             pick = std::move( c );
-                            cur = v;
-                        }
                     }
 
                     if( pick.empty() )
                         continue;
 
-                    apply( link, -1.0f );
-                    link.nodes = std::move( pick );
-                    apply( link, 1.0f );
+                    adopt( link, std::move( pick ) );
                     kept = true;
                     out.viasDropped++;
                     a = 0;
