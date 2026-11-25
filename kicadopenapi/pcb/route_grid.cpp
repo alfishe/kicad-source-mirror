@@ -7366,28 +7366,21 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         enlist( li, true );
     };
 
-    // a link's part from node index aFrom to aTo routed afresh on layer aLayer inside the box of those tiles and
-    // two more round them: the fewest steps (across the layer's direction 1.6), a tile another net uses on that
-    // layer four more; vias at both ends when on another layer. False when there is no such way
-    auto detour = [&]( const GRID_CAPACITY::LINK& aLink, int aFrom, int aTo, int aLayer, std::vector<uint32_t>& aOut )
+    // a link's part from node index aFrom to aTo routed afresh round the other nets through its node aK (never
+    // entering their nodes) inside the box of those tiles and two more round them, on any layer: the fewest steps (across a layer's direction 1.6, into a tile another net
+    // uses on that layer four more) and vias (viaStep each, in any tile with via room for the net). Without
+    // aViaRoom a via may stand in any tile. False when there is no such way
+    auto detour = [&]( const GRID_CAPACITY::LINK& aLink, int aFrom, int aTo, int aK, bool aViaRoom, std::vector<uint32_t>* aOut )
     {
         const std::vector<uint32_t>& p = aLink.nodes;
         const int                    cls = world.nets[aLink.net].sizes;
         const ROOM&                  r = room[cls];
         const int32_t                code = world.nets[aLink.net].code;
-        const int                    l = (int) ( p[aFrom] / tiles );
-        const uint32_t               onL = (uint32_t) aLayer * tiles;
-        const uint32_t               t0 = p[aFrom] % tiles, t1 = p[aTo] % tiles;
+        const uint32_t               from = p[aFrom], to = p[aTo];
+        int                          x0 = tnx, y0 = tny, x1 = -1, y1 = -1;
 
-        if( aLayer != l )
-        {
-            auto viaRoom = [&]( size_t t ) { return world.nets[aLink.net].vias && ( r.viaOwner[t] == code ? r.viaOwn[t] : r.via[t] ) - useV[t] >= 1.0f; };
-
-            if( !viaRoom( t0 ) || !viaRoom( t1 ) )
-                return false;
-        }
-
-        int x0 = tnx, y0 = tny, x1 = -1, y1 = -1;
+        if( aK <= aFrom || aK >= aTo )
+            return false;
 
         for( int q = aFrom; q <= aTo; ++q )
         {
@@ -7402,12 +7395,18 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         y0 = std::max( 0, y0 - 2 );
         x1 = std::min( tnx - 1, x1 + 2 );
         y1 = std::min( tny - 1, y1 + 2 );
-        const int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+        const int    bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+        const size_t area = (size_t) bw * bh;
 
         auto inBox = [&]( uint32_t t ) { const int x = (int) ( t % tnx ), y = (int) ( t / tnx ); return x >= x0 && x <= x1 && y >= y0 && y <= y1; };
-        auto at = [&]( uint32_t t ) { return (size_t) ( (int) ( t / tnx ) - y0 ) * bw + (size_t) ( (int) ( t % tnx ) - x0 ); };
+        auto at = [&]( uint32_t n ) { const uint32_t t = n % tiles; return (size_t) ( n / tiles ) * area + (size_t) ( (int) ( t / tnx ) - y0 ) * bw + (size_t) ( (int) ( t % tnx ) - x0 ); };
+        auto viaOk = [&]( uint32_t t )
+        {
+            return world.nets[aLink.net].vias && ( !aViaRoom || ( r.viaOwner[t] == code ? r.viaOwn[t] : r.via[t] ) - useV[t] >= 1.0f );
+        };
 
-        std::vector<uint8_t> other( (size_t) bw * bh, 0 );
+        // tiles other nets use (1), and the nodes of the other nets through node aK, which a way round never enters (2)
+        std::vector<uint8_t> other( (size_t) L * area, 0 );
 
         for( int y = y0; y <= y1; ++y )
         {
@@ -7415,24 +7414,44 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             {
                 for( int li : tileLinks[(size_t) y * tnx + x] )
                 {
+                    const std::vector<uint32_t>& q = out.links[li].nodes;
+
                     if( out.links[li].net == aLink.net )
                         continue;
 
-                    for( uint32_t n : out.links[li].nodes )
+                    const uint8_t mark = std::find( q.begin(), q.end(), p[aK] ) != q.end() ? 2 : 1;
+
+                    for( uint32_t n : q )
                     {
-                        if( n / tiles == (uint32_t) aLayer && inBox( n % tiles ) )
-                            other[at( n % tiles )] = 1;
+                        if( inBox( n % tiles ) )
+                            other[at( n )] = std::max( other[at( n )], mark );
                     }
                 }
             }
         }
 
-        std::vector<float>    cost( (size_t) bw * bh, std::numeric_limits<float>::infinity() );
-        std::vector<int32_t>  prev( (size_t) bw * bh, -1 );
+        other[at( p[aK] )] = 2;
+
+        // a way round starts and ends off the other nets
+        if( other[at( from )] == 2 || other[at( to )] == 2 )
+            return false;
+
+        std::vector<float>    cost( (size_t) L * area, std::numeric_limits<float>::infinity() );
+        std::vector<int64_t>  prev( (size_t) L * area, -1 );
         using ITEM = std::pair<float, uint32_t>;
         std::priority_queue<ITEM, std::vector<ITEM>, std::greater<ITEM>> open;
-        cost[at( t0 )] = 0;
-        open.push( { 0.0f, t0 } );
+        cost[at( from )] = 0;
+        open.push( { 0.0f, from } );
+
+        auto relax = [&]( uint32_t u, uint32_t v, float c )
+        {
+            if( other[at( v )] == 2 || c >= cost[at( v )] )
+                return;
+
+            cost[at( v )] = c;
+            prev[at( v )] = u;
+            open.push( { c, v } );
+        };
 
         while( !open.empty() )
         {
@@ -7442,48 +7461,53 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             if( c > cost[at( u )] )
                 continue;
 
-            if( u == t1 )
+            if( u == to )
                 break;
 
-            const int x = (int) ( u % tnx ), y = (int) ( u / tnx );
+            const uint32_t t = u % tiles, onL = u - t;
+            const int      l = (int) ( u / tiles ), x = (int) ( t % tnx ), y = (int) ( t / tnx );
 
             for( const auto& [dx, dy] : { std::pair{ 1, 0 }, std::pair{ -1, 0 }, std::pair{ 0, 1 }, std::pair{ 0, -1 } } )
             {
                 if( x + dx < x0 || x + dx > x1 || y + dy < y0 || y + dy > y1 )
                     continue;
 
-                const uint32_t v = (uint32_t) ( ( y + dy ) * tnx + x + dx ), lo = onL + std::min( u, v );
+                const uint32_t v = onL + (uint32_t) ( ( y + dy ) * tnx + x + dx ), lo = std::min( u, v );
                 const float    cap = dx ? std::max( r.capE[lo], ownRoom( r.ownsE[lo], code ) ) : std::max( r.capS[lo], ownRoom( r.ownsS[lo], code ) );
 
                 if( cap <= 0 )
                     continue;
 
-                const float step = ( dirOf[aLayer] != 0 && dirOf[aLayer] != ( dx ? 1 : 2 ) ? 1.6f : 1.0f )
-                                   + ( v != t1 && other[at( v )] ? 4.0f : 0.0f );
+                relax( u, v, c + ( dirOf[l] != 0 && dirOf[l] != ( dx ? 1 : 2 ) ? 1.6f : 1.0f ) + ( v != to && other[at( v )] ? 4.0f : 0.0f ) );
+            }
 
-                if( c + step < cost[at( v )] )
+            if( viaOk( t ) )
+            {
+                for( int m = 0; m < L; ++m )
                 {
-                    cost[at( v )] = c + step;
-                    prev[at( v )] = (int32_t) u;
-                    open.push( { c + step, v } );
+                    if( m != l )
+                        relax( u, (uint32_t) m * tiles + t, c + viaStep );
                 }
             }
         }
 
-        if( !std::isfinite( cost[at( t1 )] ) )
+        if( !std::isfinite( cost[at( to )] ) )
             return false;
+
+        if( !aOut )
+            return true;
 
         std::vector<uint32_t> way;
 
-        for( int32_t t = (int32_t) t1; t >= 0; t = prev[at( (uint32_t) t )] )
-            way.push_back( onL + (uint32_t) t );
+        for( int64_t n = (int64_t) to; n >= 0; n = prev[at( (uint32_t) n )] )
+            way.push_back( (uint32_t) n );
 
         std::reverse( way.begin(), way.end() );
-        aOut.assign( p.begin(), p.begin() + aFrom + 1 );
-        aOut.insert( aOut.end(), way.begin(), way.end() );
-        aOut.insert( aOut.end(), p.begin() + aTo, p.end() );
-        simplify( aOut );
-        return aOut != p;
+        aOut->assign( p.begin(), p.begin() + aFrom );
+        aOut->insert( aOut->end(), way.begin(), way.end() );
+        aOut->insert( aOut->end(), p.begin() + aTo + 1, p.end() );
+        simplify( *aOut );
+        return *aOut != p;
     };
 
     const auto repairStart = CLOCK::now();
@@ -7528,32 +7552,16 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                              } );
                 }
 
-                // detours round each conflict: its stretch one, two and three tiles each way, on every layer
+                // detours round each conflict: the route one, two and three nodes each way of it
                 for( int k : at )
                 {
-                    const uint32_t lk = link.nodes[k] / tiles;
-                    int            s = k, e = k;
-
-                    while( s > 0 && link.nodes[s - 1] / tiles == lk )
-                        s--;
-
-                    while( e + 1 < (int) link.nodes.size() && link.nodes[e + 1] / tiles == lk )
-                        e++;
-
                     for( int w = 1; w <= HOP; ++w )
                     {
-                        const int i = std::max( s, k - w ), j = std::min( e, k + w );
+                        const int i = std::max( 0, k - w ), j = std::min( (int) link.nodes.size() - 1, k + w );
+                        std::vector<uint32_t> c;
 
-                        if( i >= j )
-                            continue;
-
-                        for( int m = 0; m < L; ++m )
-                        {
-                            std::vector<uint32_t> c;
-
-                            if( detour( link, i, j, m, c ) && std::find( cands.begin(), cands.end(), c ) == cands.end() )
-                                cands.push_back( std::move( c ) );
-                        }
+                        if( detour( link, i, j, k, true, &c ) && std::find( cands.begin(), cands.end(), c ) == cands.end() )
+                            cands.push_back( std::move( c ) );
                     }
                 }
 
@@ -7684,7 +7692,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     bestVt = thrV;
 
     // why each crossing left stays: the most hopeful reason among the links there (1 a way round exists by room
-    // yet makes new conflicts, 2 no via room for one, 3 walls on the other layers)
+    // yet makes new conflicts, 2 a way round needs a via where there is no via room, 3 walls on every way round)
     out.crossVerdict.assign( N, 0 );
     findCrossings( false );
 
@@ -7700,17 +7708,22 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                     continue;
 
                 int why = 3;
-                bool any = false;
                 windows( link, k,
                          [&]( int i, int j, int m )
                          {
                              const int w = hop( link, i, j, m, nullptr );
                              why = std::min( why, w == 0 ? 1 : w );
-                             any = true;
                          } );
 
-                if( !any )
-                    why = 3;
+                for( int w = 1; w <= HOP && why > 1; ++w )
+                {
+                    const int i = std::max( 0, k - w ), j = std::min( (int) link.nodes.size() - 1, k + w );
+
+                    if( detour( link, i, j, k, true, nullptr ) )
+                        why = 1;
+                    else if( detour( link, i, j, k, false, nullptr ) )
+                        why = std::min( why, 2 );
+                }
 
                 out.crossVerdict[n] = out.crossVerdict[n] == 0 ? (uint8_t) why : std::min( out.crossVerdict[n], (uint8_t) why );
             }
