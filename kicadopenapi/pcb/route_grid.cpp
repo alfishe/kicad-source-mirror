@@ -7779,6 +7779,196 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         return true;
     };
 
+    // the moves tried for a link through conflicts aAt its node indices aAt
+    auto candidatesOf = [&]( GRID_CAPACITY::LINK& aLink, const std::vector<int>& aAt )
+    {
+        std::vector<std::vector<uint32_t>> cands;
+
+        for( int k : aAt )
+        {
+            windows( aLink, k,
+                     [&]( int i, int j, int m )
+                     {
+                         std::vector<uint32_t> c;
+
+                         if( hop( aLink, i, j, m, &c ) == 0 && c != aLink.nodes
+                             && std::find( cands.begin(), cands.end(), c ) == cands.end() )
+                         {
+                             cands.push_back( std::move( c ) );
+                         }
+                     } );
+        }
+
+        // detours round each conflict: the route one, two and three nodes each way of it
+        for( int k : aAt )
+        {
+            for( int w = 1; w <= HOP; ++w )
+            {
+                const int i = std::max( 0, k - w ), j = std::min( (int) aLink.nodes.size() - 1, k + w );
+                std::vector<uint32_t> c;
+
+                if( detour( aLink, i, j, k, true, &c ) && std::find( cands.begin(), cands.end(), c ) == cands.end() )
+                    cands.push_back( std::move( c ) );
+            }
+        }
+
+        if( aLink.a >= 0 )
+        {
+            apply( aLink, -1.0f );
+
+            // the aLink routed afresh end to end and joined afresh from any node of its net's part on one
+            // side to any of the other; each also with its conflict tiles closed: the search prices a
+            // crossing only within a tile, not two passes swapping sides along a shared stretch
+            std::vector<uint32_t> from, to;
+            const bool            apart = partsApart( aLink, (int) ( &aLink - out.links.data() ), from, to );
+            std::vector<uint8_t>  closed( N, 0 );
+
+            for( int k : aAt )
+                closed[aLink.nodes[k]] = 1;
+
+            for( const std::vector<uint8_t>* shut : { (const std::vector<uint8_t>*) nullptr, (const std::vector<uint8_t>*) &closed } )
+            {
+                for( bool rejoin : { false, true } )
+                {
+                    if( rejoin && !apart )
+                        continue;
+
+                    GRID_CAPACITY::LINK fresh = aLink;
+                    route( fresh, rejoin ? &from : nullptr, rejoin ? &to : nullptr, shut );
+
+                    if( !fresh.nodes.empty() && fresh.nodes != aLink.nodes
+                        && std::find( cands.begin(), cands.end(), fresh.nodes ) == cands.end() )
+                    {
+                        cands.push_back( std::move( fresh.nodes ) );
+                    }
+                }
+            }
+
+            apply( aLink, 1.0f );
+        }
+
+        return cands;
+    };
+
+    // two moves at once: a link through a conflict takes one of its three least worsening moves (it may only move
+    // the conflict onto another net's links), then a link near its new route through a conflict takes its best;
+    // both kept when together they lower the total
+    auto pairMove = [&]()
+    {
+        const std::vector<uint8_t> hot = hotNodes();
+        std::vector<uint8_t>       seen( out.links.size(), 0 );
+
+        auto conflictsOf = [&]( const GRID_CAPACITY::LINK& aLink, const std::vector<uint8_t>& aHot )
+        {
+            std::vector<int> at;
+
+            for( int k = 0; k < (int) aLink.nodes.size() && at.size() < 6; ++k )
+            {
+                if( aHot[aLink.nodes[k]] )
+                    at.push_back( k );
+            }
+
+            return at;
+        };
+
+        for( GRID_CAPACITY::LINK& link : out.links )
+        {
+            const std::vector<int> at = conflictsOf( link, hot );
+
+            if( at.empty() )
+                continue;
+
+            const int                          li = (int) ( &link - out.links.data() );
+            const size_t                       partsNow = link.a >= 0 ? parts( link.net, joins( link.net, -1, -1, nullptr ) ) : 0;
+            std::vector<std::vector<uint32_t>> cands = candidatesOf( link, at );
+            std::vector<std::pair<double, int>> firsts;
+
+            for( int ci = 0; ci < (int) cands.size(); ++ci )
+            {
+                if( link.a < 0 || parts( link.net, joins( link.net, -1, li, &cands[ci] ) ) <= partsNow )
+                    firsts.emplace_back( delta( link, cands[ci] ), ci );
+            }
+
+            std::sort( firsts.begin(), firsts.end() );
+            firsts.resize( std::min<size_t>( firsts.size(), 3 ) );
+
+            for( const auto& [v, ci] : firsts )
+            {
+                std::vector<uint32_t> old = link.nodes;
+                adopt( link, std::vector<uint32_t>( cands[ci] ) );
+
+                const std::vector<uint8_t> hot2 = hotNodes();
+                std::vector<int>           near;
+
+                for( uint32_t n : link.nodes )
+                {
+                    const int x = (int) ( n % tiles % tnx ), y = (int) ( n % tiles / tnx );
+
+                    for( int dy = -2; dy <= 2; ++dy )
+                    {
+                        for( int dx = -2; dx <= 2; ++dx )
+                        {
+                            if( x + dx < 0 || x + dx >= tnx || y + dy < 0 || y + dy >= tny )
+                                continue;
+
+                            for( int oi : tileLinks[(size_t) ( ( y + dy ) * tnx + x + dx )] )
+                            {
+                                if( oi != li && !seen[oi] )
+                                {
+                                    seen[oi] = 1;
+                                    near.push_back( oi );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                std::sort( near.begin(), near.end() );
+
+                for( int oi : near )
+                    seen[oi] = 0;
+
+                double                best = -v - 1e-3;
+                int                   pickO = -1;
+                std::vector<uint32_t> pick;
+
+                for( int oi : near )
+                {
+                    GRID_CAPACITY::LINK&   o = out.links[oi];
+                    const std::vector<int> oat = conflictsOf( o, hot2 );
+
+                    if( oat.empty() )
+                        continue;
+
+                    const size_t oParts = o.a >= 0 ? parts( o.net, joins( o.net, -1, -1, nullptr ) ) : 0;
+
+                    for( std::vector<uint32_t>& c : candidatesOf( o, oat ) )
+                    {
+                        const double w = delta( o, c );
+
+                        if( w < best && ( o.a < 0 || parts( o.net, joins( o.net, -1, oi, &c ) ) <= oParts ) )
+                        {
+                            best = w;
+                            pickO = oi;
+                            pick = std::move( c );
+                        }
+                    }
+                }
+
+                if( pickO >= 0 )
+                {
+                    adopt( out.links[pickO], std::move( pick ) );
+                    out.repairKept += 2;
+                    return true;
+                }
+
+                adopt( link, std::move( old ) );
+            }
+        }
+
+        return false;
+    };
+
     const auto repairStart = CLOCK::now();
 
     if( aParams.capacityRepair )
@@ -7804,74 +7994,9 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                 if( at.empty() )
                     continue;
 
-                std::vector<std::vector<uint32_t>> cands;
-
-                for( int k : at )
-                {
-                    windows( link, k,
-                             [&]( int i, int j, int m )
-                             {
-                                 std::vector<uint32_t> c;
-
-                                 if( hop( link, i, j, m, &c ) == 0 && c != link.nodes
-                                     && std::find( cands.begin(), cands.end(), c ) == cands.end() )
-                                 {
-                                     cands.push_back( std::move( c ) );
-                                 }
-                             } );
-                }
-
-                // detours round each conflict: the route one, two and three nodes each way of it
-                for( int k : at )
-                {
-                    for( int w = 1; w <= HOP; ++w )
-                    {
-                        const int i = std::max( 0, k - w ), j = std::min( (int) link.nodes.size() - 1, k + w );
-                        std::vector<uint32_t> c;
-
-                        if( detour( link, i, j, k, true, &c ) && std::find( cands.begin(), cands.end(), c ) == cands.end() )
-                            cands.push_back( std::move( c ) );
-                    }
-                }
-
-                const int li = (int) ( &link - out.links.data() );
-                size_t    partsNow = 0;
-
-                if( link.a >= 0 )
-                {
-                    apply( link, -1.0f );
-
-                    // the link routed afresh end to end and joined afresh from any node of its net's part on one
-                    // side to any of the other; each also with its conflict tiles closed: the search prices a
-                    // crossing only within a tile, not two passes swapping sides along a shared stretch
-                    std::vector<uint32_t> from, to;
-                    const bool            apart = partsApart( link, li, from, to );
-                    std::vector<uint8_t>  closed( N, 0 );
-
-                    for( int k : at )
-                        closed[link.nodes[k]] = 1;
-
-                    for( const std::vector<uint8_t>* shut : { (const std::vector<uint8_t>*) nullptr, (const std::vector<uint8_t>*) &closed } )
-                    {
-                        for( bool rejoin : { false, true } )
-                        {
-                            if( rejoin && !apart )
-                                continue;
-
-                            GRID_CAPACITY::LINK fresh = link;
-                            route( fresh, rejoin ? &from : nullptr, rejoin ? &to : nullptr, shut );
-
-                            if( !fresh.nodes.empty() && fresh.nodes != link.nodes
-                                && std::find( cands.begin(), cands.end(), fresh.nodes ) == cands.end() )
-                            {
-                                cands.push_back( std::move( fresh.nodes ) );
-                            }
-                        }
-                    }
-
-                    apply( link, 1.0f );
-                    partsNow = parts( link.net, joins( link.net, -1, -1, nullptr ) );
-                }
+                std::vector<std::vector<uint32_t>> cands = candidatesOf( link, at );
+                const int                          li = (int) ( &link - out.links.data() );
+                const size_t                       partsNow = link.a >= 0 ? parts( link.net, joins( link.net, -1, -1, nullptr ) ) : 0;
 
                 double best = -1e-3;
                 int    pick = -1;
@@ -7895,6 +8020,9 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                     out.repairKept++;
                 }
             }
+
+            if( !kept )
+                kept = pairMove();
 
             if( !kept )
                 break;
