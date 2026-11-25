@@ -6508,11 +6508,21 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         return false;
     };
 
-    // a step from or into one of the link's own end tiles leaves a pad: the fan-out's room, not a passage. A
-    // tree's link starts and ends at any pad of its net's parts, as the search takes them
+    // a side no track passes on its layer
+    auto wallBetween = [&]( uint32_t a, uint32_t b )
+    {
+        const uint32_t lo = std::min( a, b );
+        return a / tiles == b / tiles && ( std::max( a, b ) == lo + 1 ? wallE[lo] : wallS[lo] );
+    };
+
+    // a step from or into one of the link's own end tiles leaves a pad: the fan-out's room, not a passage, unless
+    // a wall closes the side. A tree's link starts and ends at any pad of its net's parts, as the search takes them
     auto endStep = [&]( const GRID_CAPACITY::LINK& aLink, size_t aStep )
     {
         const std::vector<uint32_t>& p = aLink.nodes;
+
+        if( wallBetween( p[aStep - 1], p[aStep] ) )
+            return false;
 
         return isEnd( aLink, p[aStep - 1] ) || isEnd( aLink, p[aStep] ) || ( aStep == 1 && netEnd( aLink.net, p[0] ) )
                || ( aStep + 1 == p.size() && netEnd( aLink.net, p.back() ) );
@@ -6831,7 +6841,10 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                 const float crossed = histX[v] > 0 ? std::min( crossCap, viaStep * histX[v] * pf ) : 0.0f;
 
                 // a step out of or into the net's end tiles it joins is their fan-out: no room counted, yet the
-                // crossings found there before still cost
+                // crossings found there before still cost; a wall closes it
+                if( wallBetween( u, v ) )
+                    return std::numeric_limits<float>::infinity();
+
                 if( ( start[u] && pad[u] ) || ( goal[v] && pad[v] ) )
                     return 1.0f + crossed;
 
