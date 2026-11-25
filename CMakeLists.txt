@@ -1092,7 +1092,7 @@ if( KICAD_USE_SENTRY )
     add_compile_definitions( KICAD_USE_SENTRY )
 endif()
 
-find_package( nng REQUIRED )
+include( BuildNng )
 
 #
 # Allocator

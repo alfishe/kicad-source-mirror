@@ -20,7 +20,6 @@
 
 #include <kinng.h>
 #include <nng/nng.h>
-#include <nng/protocol/reqrep0/rep.h>
 #include <wx/log.h>
 
 
@@ -29,6 +28,19 @@
  * @ingroup trace_env_vars
  */
 static const wxChar TraceNng[] = wxT( "KINNG" );
+
+
+std::string KinngTransportUrl( const std::string& aSocketUrl )
+{
+#ifdef _WIN32
+    static const std::string ipc = "ipc://";
+
+    if( aSocketUrl.compare( 0, ipc.size(), ipc ) == 0 )
+        return "winpipe://" + aSocketUrl.substr( ipc.size() );
+#endif
+
+    return aSocketUrl;
+}
 
 
 KINNG_REQUEST_SERVER::KINNG_REQUEST_SERVER( const std::string& aSocketUrl ) :
@@ -93,6 +105,14 @@ void KINNG_REQUEST_SERVER::listenThread()
 
     wxLogTrace( TraceNng, wxS( "KINNG_REQUEST_SERVER starting" ) );
 
+    retCode = nng_init( nullptr );
+
+    if( retCode != 0 && retCode != NNG_EBUSY )
+    {
+        wxLogTrace( TraceNng, wxString::Format( wxS( "Got error code %d from nng_init!" ), retCode ) );
+        return;
+    }
+
     retCode = nng_rep0_open( &socket );
 
     if( retCode != 0 )
@@ -102,7 +122,7 @@ void KINNG_REQUEST_SERVER::listenThread()
         return;
     }
 
-    retCode = nng_listener_create( &listener, socket, m_socketUrl.c_str() );
+    retCode = nng_listener_create( &listener, socket, KinngTransportUrl( m_socketUrl ).c_str() );
 
     if( retCode != 0 )
     {
@@ -121,7 +141,7 @@ void KINNG_REQUEST_SERVER::listenThread()
         wxLogTrace( TraceNng,
                     wxString::Format( wxS( "Got error code %d from nng_listener_start!" ),
                                       retCode ) );
-        nng_close( socket );
+        nng_socket_close( socket );
         return;
     }
 
@@ -129,27 +149,22 @@ void KINNG_REQUEST_SERVER::listenThread()
 
     while( !m_shutdown.load() )
     {
-        char*    buf = nullptr;
-        size_t   sz = 0;
+        nng_msg* msg = nullptr;
 
-        retCode = nng_recv( socket, &buf, &sz, NNG_FLAG_ALLOC );
+        retCode = nng_recvmsg( socket, &msg, 0 );
 
         if( retCode == NNG_ETIMEDOUT )
             continue;
 
         if( retCode != 0 )
         {
-            if( buf )
-                nng_free( buf, sz );
-
             wxLogTrace( TraceNng,
-                        wxString::Format( wxS( "Got error code %d from nngc_recv!" ), retCode ) );
+                        wxString::Format( wxS( "Got error code %d from nng_recvmsg!" ), retCode ) );
             break;
         }
 
-        m_sharedMessage.assign( buf, sz );
-        nng_free( buf, sz );
-        buf = nullptr;
+        m_sharedMessage.assign( static_cast<const char*>( nng_msg_body( msg ) ), nng_msg_len( msg ) );
+        nng_msg_free( msg );
 
         if( m_callback )
             m_callback( &m_sharedMessage );
@@ -160,8 +175,7 @@ void KINNG_REQUEST_SERVER::listenThread()
         if( m_shutdown.load() )
             break;
 
-        retCode = nng_send( socket, const_cast<std::string::value_type*>( m_pendingReply.c_str() ),
-                            m_pendingReply.length(), 0 );
+        retCode = nng_send( socket, m_pendingReply.data(), m_pendingReply.length(), 0 );
 
         if( retCode != 0 )
         {
@@ -173,5 +187,5 @@ void KINNG_REQUEST_SERVER::listenThread()
 
     wxLogTrace( TraceNng, wxS( "KINNG_REQUEST_SERVER shutting down" ) );
 
-    nng_close( socket );
+    nng_socket_close( socket );
 }

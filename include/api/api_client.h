@@ -22,7 +22,6 @@
 
 #include <string>
 #include <nng/nng.h>
-#include <nng/protocol/reqrep0/req.h>
 #include <wx/string.h>
 
 #include <google/protobuf/message.h>

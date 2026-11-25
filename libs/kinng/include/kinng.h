@@ -25,7 +25,17 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
+
+
+/**
+ * The URL to hand nng for an API socket URL. KiCad names its sockets ipc://<path> on every platform, as
+ * nng 1.x did, where ipc:// on Windows was a named pipe (\\.\pipe\<path>). nng 2 names that pipe
+ * winpipe://<path> and means AF_UNIX by ipc:// there, so on Windows ipc:// becomes winpipe:// and clients
+ * built with nng 1.x keep reaching the same pipe.
+ */
+std::string KinngTransportUrl( const std::string& aSocketUrl );
 
 
 class KINNG_REQUEST_SERVER
