@@ -6465,6 +6465,95 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     auto horizontal = [&]( uint32_t a, uint32_t b ) { return a / tiles == b / tiles && ( a == b + 1 || b == a + 1 ); };
     auto vertical = [&]( uint32_t a, uint32_t b ) { return a / tiles == b / tiles && ( a == b + tnx || b == a + tnx ); };
 
+    // exact crossings on one layer: two nets that share a stretch of tiles (or touch one tile) and leave it on
+    // the other sides than they came in must cross there. Each net's arms at the stretch are compared by angle
+    // round the tile: a neighbour tile's arm points at its side; at a pad end the arm points at the pad's place
+    // inside the tile. A stretch that starts or ends at a via (placed anywhere in its tile) or at a pad in the
+    // tile's middle forces nothing
+    auto angleTo = [&]( uint32_t aFrom, uint32_t aTo )
+    {
+        return aTo == aFrom + 1 ? 0.0f : aTo == aFrom + tnx ? 90.0f : aTo + 1 == aFrom ? 180.0f : 270.0f; // y down
+    };
+
+    // the arm of a link's end in its end tile: towards the end's cells there, NaN in the tile's middle. A given
+    // route has no ends of its own: the one end of its net in that tile, if there is exactly one
+    auto endAngle = [&]( const GRID_CAPACITY::LINK& aLink, int aEnd, uint32_t aNode )
+    {
+        const int    l = (int) ( aNode / tiles );
+        const size_t t = aNode % tiles;
+        double       sx = 0, sy = 0;
+        int          n = 0;
+
+        if( aEnd >= 0 && std::find( endNodes[aLink.net][aEnd].begin(), endNodes[aLink.net][aEnd].end(), aNode )
+                                 == endNodes[aLink.net][aEnd].end() )
+        {
+            aEnd = -1;
+        }
+
+        if( aEnd < 0 )
+        {
+            for( size_t e = 0; e < endNodes[aLink.net].size(); ++e )
+            {
+                const std::vector<uint32_t>& nodes = endNodes[aLink.net][e];
+
+                if( std::find( nodes.begin(), nodes.end(), aNode ) != nodes.end() )
+                {
+                    if( aEnd >= 0 )
+                        return std::numeric_limits<float>::quiet_NaN();
+
+                    aEnd = (int) e;
+                }
+            }
+        }
+
+        if( aEnd < 0 )
+            return std::numeric_limits<float>::quiet_NaN();
+
+        for( uint32_t st : world.nets[aLink.net].ends[aEnd] )
+        {
+            const size_t cell = st % world.cells;
+
+            if( (int) ( st / world.cells ) != l || ( cell / g.nx / T ) * tnx + ( cell % g.nx ) / T != t )
+                continue;
+
+            sx += (double) ( cell % g.nx ) + 0.5;
+            sy += (double) ( cell / g.nx ) + 0.5;
+            n++;
+        }
+
+        if( n == 0 )
+            return std::numeric_limits<float>::quiet_NaN();
+
+        const double dx = sx / n - ( ( t % tnx ) * T + T / 2.0 ), dy = sy / n - ( ( t / tnx ) * T + T / 2.0 );
+
+        if( std::hypot( dx, dy ) < 0.15 * T )
+            return std::numeric_limits<float>::quiet_NaN();
+
+        float a = (float) ( std::atan2( dy, dx ) * 57.29577951308232 );
+        return a < 0 ? a + 360.0f : a;
+    };
+
+    // each link's arms in each tile it passes, angles round the tile in tenths of a degree (-1: none): what the
+    // search prices its own crossings by, with the same rule findCrossings judges them by
+    struct ARM
+    {
+        int     net;
+        int16_t in, out;
+    };
+
+    std::vector<std::vector<ARM>> arms( N );
+    auto tenths = []( float aAngle ) { return std::isnan( aAngle ) ? (int16_t) -1 : (int16_t) std::lround( aAngle * 10.0f ) % 3600; };
+
+    // two passes through one tile cross when the arms of one lie on both sides of the other's
+    auto interleave = []( int16_t aIn, int16_t aOut, int16_t bIn, int16_t bOut )
+    {
+        if( aIn < 0 || aOut < 0 || bIn < 0 || bOut < 0 || bIn == aIn || bIn == aOut || bOut == aIn || bOut == aOut )
+            return false;
+
+        auto between = [&]( int x ) { return ( x - aIn + 3600 ) % 3600 < ( aOut - aIn + 3600 ) % 3600; };
+        return between( bIn ) != between( bOut );
+    };
+
     auto apply = [&]( const GRID_CAPACITY::LINK& aLink, float aSign )
     {
         const float w = aSign * weight[aLink.net];
@@ -6508,6 +6597,32 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                 own( p[j], p[j + 1] );
         }
 
+        for( size_t j = 0; j < p.size(); ++j )
+        {
+            const bool    inLayer = j > 0 && p[j - 1] / tiles == p[j] / tiles;
+            const bool    outLayer = j + 1 < p.size() && p[j + 1] / tiles == p[j] / tiles;
+            const int16_t in = inLayer ? tenths( angleTo( p[j], p[j - 1] ) ) : j == 0 ? tenths( endAngle( aLink, aLink.a, p[j] ) ) : (int16_t) -1;
+            const int16_t out = outLayer ? tenths( angleTo( p[j], p[j + 1] ) )
+                                : j + 1 == p.size()     ? tenths( endAngle( aLink, aLink.b, p[j] ) ) : (int16_t) -1;
+            std::vector<ARM>& at = arms[p[j]];
+
+            if( aSign > 0 )
+            {
+                at.push_back( { aLink.net, in, out } );
+                continue;
+            }
+
+            for( size_t q = 0; q < at.size(); ++q )
+            {
+                if( at[q].net == aLink.net && at[q].in == in && at[q].out == out )
+                {
+                    at[q] = at.back();
+                    at.pop_back();
+                    break;
+                }
+            }
+        }
+
         for( size_t j = 1; j + 1 < p.size(); ++j )
         {
             if( horizontal( p[j - 1], p[j] ) && horizontal( p[j], p[j + 1] ) )
@@ -6517,20 +6632,29 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         }
     };
 
-    auto route = [&]( GRID_CAPACITY::LINK& aLink )
+    // aLink routed from its end a to its end b, or from any node of aFrom to any of aTo (its net's routed parts)
+    auto route = [&]( GRID_CAPACITY::LINK& aLink, const std::vector<uint32_t>* aFrom = nullptr,
+                      const std::vector<uint32_t>* aTo = nullptr )
     {
-        const std::vector<uint32_t>& src = endNodes[aLink.net][aLink.a];
-        const std::vector<uint32_t>& dst = endNodes[aLink.net][aLink.b];
+        const std::vector<uint32_t>& src = aFrom ? *aFrom : endNodes[aLink.net][aLink.a];
+        const std::vector<uint32_t>& dst = aTo ? *aTo : endNodes[aLink.net][aLink.b];
         const float                  w = weight[aLink.net];
         const int32_t                code = world.nets[aLink.net].code;
 
-        // a state: tile node * 3 + how it was entered (0 at an end or after a via, 1 west / east, 2 north / south)
-        std::vector<float>    cost( 3 * N, std::numeric_limits<float>::infinity() );
-        std::vector<int32_t>  prev( 3 * N, -1 );
-        std::vector<uint8_t>  goal( N, 0 ), start( N, 0 );
+        // a state: tile node * 5 + the side it was entered from (0 at an end or after a via, 1 east, 2 south,
+        // 3 west, 4 north)
+        std::vector<float>    cost( 5 * N, std::numeric_limits<float>::infinity() );
+        std::vector<int32_t>  prev( 5 * N, -1 );
+        std::vector<uint8_t>  goal( N, 0 ), start( N, 0 ), pad( N, 0 );
 
         using ITEM = std::pair<float, uint32_t>;
         std::priority_queue<ITEM, std::vector<ITEM>, std::greater<ITEM>> open;
+
+        for( const std::vector<uint32_t>& e : endNodes[aLink.net] )
+        {
+            for( uint32_t n : e )
+                pad[n] = 1;
+        }
 
         for( uint32_t d : dst )
             goal[d] = 1;
@@ -6538,8 +6662,8 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         for( uint32_t s : src )
         {
             start[s] = 1;
-            cost[3 * s] = 0;
-            open.push( { 0.0f, 3 * s } );
+            cost[5 * s] = 0;
+            open.push( { 0.0f, 5 * s } );
         }
 
         uint32_t reached = UINT32_MAX;
@@ -6589,8 +6713,8 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             if( c > cost[st] )
                 continue;
 
-            const uint32_t u = st / 3;
-            const int      in = (int) ( st % 3 );
+            const uint32_t u = st / 5;
+            const int      in = (int) ( st % 5 );
 
             if( goal[u] )
             {
@@ -6604,11 +6728,11 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
             auto relax = [&]( uint32_t v, int aIn, float aStep )
             {
-                const uint32_t s = 3 * v + aIn;
+                const uint32_t s = 5 * v + aIn;
 
                 // never straight back to the node it came from: a step out and back (or a via there and back)
                 // only dodges the crossing price of the way it came in
-                if( !std::isfinite( aStep ) || ( prev[st] >= 0 && (uint32_t) prev[st] / 3 == v ) )
+                if( !std::isfinite( aStep ) || ( prev[st] >= 0 && (uint32_t) prev[st] / 5 == v ) )
                     return;
 
                 if( c + aStep < cost[s] )
@@ -6619,17 +6743,42 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                 }
             };
 
-            // going on in the axis it came in passes the tile through: a crossing with the other axis there
-            const float onH = in == 1 ? crossPrice( thrV[u], histX[u] ) : 0.0f;
-            const float onV = in == 2 ? crossPrice( thrH[u], histX[u] ) : 0.0f;
+            // the arm it came in by: towards the tile it came from, at a start pad towards the pad, else none
+            const int16_t inArm = in > 0 ? (int16_t) ( ( in - 1 ) * 900 )
+                                  : prev[st] < 0 && pad[u] ? tenths( endAngle( aLink, aFrom ? -1 : aLink.a, u ) ) : (int16_t) -1;
+
+            // the passes of other nets its own pass in a tile crosses there
+            auto crossings = [&]( uint32_t aNode, int16_t aIn, int16_t aOut )
+            {
+                float n = 0;
+
+                for( const ARM& o : arms[aNode] )
+                {
+                    if( o.net != aLink.net && interleave( aIn, aOut, o.in, o.out ) )
+                        n += weight[o.net];
+                }
+
+                return n > 0 ? crossPrice( n, histX[aNode] ) : 0.0f;
+            };
+
+            // leaving the tile towards v; a goal pad tile also priced as passed into its pad
+            auto leave = [&]( uint32_t v, int16_t aOut )
+            {
+                float c = crossings( u, inArm, aOut );
+
+                if( goal[v] && pad[v] )
+                    c += crossings( v, (int16_t) ( ( aOut + 1800 ) % 3600 ), tenths( endAngle( aLink, aTo ? -1 : aLink.b, v ) ) );
+
+                return c;
+            };
 
             auto side = [&]( uint32_t v, float aUse, float aCap, float aHist )
             {
                 const float crossed = histX[v] > 0 ? std::min( crossCap, viaStep * histX[v] * pf ) : 0.0f;
 
-                // a step out of or into the link's own end tiles is its fan-out: no room counted, yet the
+                // a step out of or into the net's end tiles it joins is their fan-out: no room counted, yet the
                 // crossings found there before still cost
-                if( start[u] || goal[v] )
+                if( ( start[u] && pad[u] ) || ( goal[v] && pad[v] ) )
                     return 1.0f + crossed;
 
                 // a step across the layer's direction costs as the grid engine's does
@@ -6641,16 +6790,16 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
             };
 
             if( x + 1 < tnx )
-                relax( u + 1, 1, onH + side( u + 1, useE[u] + loadE( u ), capE( u ), histE[u] ) );
+                relax( u + 1, 3, leave( u + 1, 0 ) + side( u + 1, useE[u] + loadE( u ), capE( u ), histE[u] ) );
 
             if( x > 0 )
-                relax( u - 1, 1, onH + side( u - 1, useE[u - 1] + loadE( u - 1 ), capE( u - 1 ), histE[u - 1] ) );
+                relax( u - 1, 1, leave( u - 1, 1800 ) + side( u - 1, useE[u - 1] + loadE( u - 1 ), capE( u - 1 ), histE[u - 1] ) );
 
             if( y + 1 < tny )
-                relax( u + tnx, 2, onV + side( u + tnx, useS[u] + loadS( u ), capS( u ), histS[u] ) );
+                relax( u + tnx, 4, leave( u + tnx, 900 ) + side( u + tnx, useS[u] + loadS( u ), capS( u ), histS[u] ) );
 
             if( y > 0 )
-                relax( u - tnx, 2, onV + side( u - tnx, useS[u - tnx] + loadS( u - tnx ), capS( u - tnx ), histS[u - tnx] ) );
+                relax( u - tnx, 2, leave( u - tnx, 2700 ) + side( u - tnx, useS[u - tnx] + loadS( u - tnx ), capS( u - tnx ), histS[u - tnx] ) );
 
             if( world.nets[aLink.net].vias )
             {
@@ -6665,7 +6814,7 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         aLink.nodes.clear();
 
         for( int32_t s = reached == UINT32_MAX ? -1 : (int32_t) reached; s >= 0; s = prev[s] )
-            aLink.nodes.push_back( (uint32_t) s / 3 );
+            aLink.nodes.push_back( (uint32_t) s / 5 );
 
         std::reverse( aLink.nodes.begin(), aLink.nodes.end() );
     };
@@ -6767,68 +6916,6 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
         for( const GRID_CAPACITY::LINK& link : out.links )
             markLink( link, nullptr );
-    };
-
-    // exact crossings on one layer: two nets that share a stretch of tiles (or touch one tile) and leave it on
-    // the other sides than they came in must cross there. Each net's arms at the stretch are compared by angle
-    // round the tile: a neighbour tile's arm points at its side; at a pad end the arm points at the pad's place
-    // inside the tile. A stretch that starts or ends at a via (placed anywhere in its tile) or at a pad in the
-    // tile's middle forces nothing
-    auto angleTo = [&]( uint32_t aFrom, uint32_t aTo )
-    {
-        return aTo == aFrom + 1 ? 0.0f : aTo == aFrom + tnx ? 90.0f : aTo + 1 == aFrom ? 180.0f : 270.0f; // y down
-    };
-
-    // the arm of a link's end in its end tile: towards the end's cells there, NaN in the tile's middle. A given
-    // route has no ends of its own: the one end of its net in that tile, if there is exactly one
-    auto endAngle = [&]( const GRID_CAPACITY::LINK& aLink, int aEnd, uint32_t aNode )
-    {
-        const int    l = (int) ( aNode / tiles );
-        const size_t t = aNode % tiles;
-        double       sx = 0, sy = 0;
-        int          n = 0;
-
-        if( aEnd < 0 && aLink.a < 0 )
-        {
-            for( size_t e = 0; e < endNodes[aLink.net].size(); ++e )
-            {
-                const std::vector<uint32_t>& nodes = endNodes[aLink.net][e];
-
-                if( std::find( nodes.begin(), nodes.end(), aNode ) != nodes.end() )
-                {
-                    if( aEnd >= 0 )
-                        return std::numeric_limits<float>::quiet_NaN();
-
-                    aEnd = (int) e;
-                }
-            }
-        }
-
-        if( aEnd < 0 )
-            return std::numeric_limits<float>::quiet_NaN();
-
-        for( uint32_t st : world.nets[aLink.net].ends[aEnd] )
-        {
-            const size_t cell = st % world.cells;
-
-            if( (int) ( st / world.cells ) != l || ( cell / g.nx / T ) * tnx + ( cell % g.nx ) / T != t )
-                continue;
-
-            sx += (double) ( cell % g.nx ) + 0.5;
-            sy += (double) ( cell / g.nx ) + 0.5;
-            n++;
-        }
-
-        if( n == 0 )
-            return std::numeric_limits<float>::quiet_NaN();
-
-        const double dx = sx / n - ( ( t % tnx ) * T + T / 2.0 ), dy = sy / n - ( ( t / tnx ) * T + T / 2.0 );
-
-        if( std::hypot( dx, dy ) < 0.15 * T )
-            return std::numeric_limits<float>::quiet_NaN();
-
-        float a = (float) ( std::atan2( dy, dx ) * 57.29577951308232 );
-        return a < 0 ? a + 360.0f : a;
     };
 
     std::vector<float>            crossAt( N, 0 );
@@ -7016,19 +7103,44 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
     for( int round = 0; round < std::max( 1, aRounds ); ++round )
     {
-        for( GRID_CAPACITY::LINK& link : out.links )
+        // a net is routed whole as a growing tree: its first link from end to end, each next one from any node
+        // of the net routed so far to its own end
+        for( size_t li = 0; li < out.links.size(); )
         {
             if( given )
             {
-                apply( link, 1.0f );
+                apply( out.links[li++], 1.0f );
                 continue;
             }
 
-            if( round > 0 )
-                apply( link, -1.0f );
+            size_t lj = li;
 
-            route( link );
-            apply( link, 1.0f );
+            while( lj < out.links.size() && out.links[lj].net == out.links[li].net )
+                lj++;
+
+            if( round > 0 )
+            {
+                for( size_t q = li; q < lj; ++q )
+                    apply( out.links[q], -1.0f );
+            }
+
+            std::vector<uint32_t> tree = endNodes[out.links[li].net][out.links[li].a];
+
+            for( size_t q = li; q < lj; ++q )
+            {
+                GRID_CAPACITY::LINK& link = out.links[q];
+                route( link, &tree );
+                apply( link, 1.0f );
+
+                if( link.nodes.empty() )
+                    continue;
+
+                const std::vector<uint32_t>& b = endNodes[link.net][link.b];
+                tree.insert( tree.end(), b.begin(), b.end() );
+                tree.insert( tree.end(), link.nodes.begin(), link.nodes.end() );
+            }
+
+            li = lj;
         }
 
         const double over = overNow();
@@ -7078,6 +7190,9 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
     // the state of the best round, rebuilt from its routes
     for( auto* v : { &useE, &useS, &useV, &thrH, &thrV, &viaOwnE, &viaOwnS } )
         std::fill( v->begin(), v->end(), 0.0f );
+
+    for( std::vector<ARM>& at : arms )
+        at.clear();
 
     std::fill( loadValid.begin(), loadValid.end(), 0 );
 
@@ -7510,6 +7625,82 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         return *aOut != p;
     };
 
+    // each net's links (contiguous, a net's tree in order) and how its ends and links join through shared
+    // nodes: aSkip left out, aSwap's nodes replaced by aNodes. Elements: the ends, then the links; each
+    // element's root
+    std::vector<int> firstLink( world.nets.size(), -1 ), endLink( world.nets.size(), -1 );
+
+    for( int li = 0; li < (int) out.links.size(); ++li )
+    {
+        const int n = out.links[li].net;
+
+        if( firstLink[n] < 0 )
+            firstLink[n] = li;
+
+        endLink[n] = li + 1;
+    }
+
+    auto joins = [&]( int aNet, int aSkip, int aSwap, const std::vector<uint32_t>* aNodes )
+    {
+        const int        E = (int) endNodes[aNet].size(), f = firstLink[aNet], K = f < 0 ? 0 : endLink[aNet] - f;
+        std::vector<int> up( (size_t) ( E + K ) );
+
+        for( int i = 0; i < E + K; ++i )
+            up[i] = i;
+
+        auto find = [&]( int x )
+        {
+            while( up[x] != x )
+                x = up[x] = up[up[x]];
+
+            return x;
+        };
+
+        std::unordered_map<uint32_t, int> at;
+
+        auto put = [&]( uint32_t aNode, int aEl )
+        {
+            auto [it, fresh] = at.emplace( aNode, aEl );
+
+            if( !fresh )
+                up[find( aEl )] = find( it->second );
+        };
+
+        for( int e = 0; e < E; ++e )
+        {
+            for( uint32_t n : endNodes[aNet][e] )
+                put( n, e );
+        }
+
+        for( int q = 0; q < K; ++q )
+        {
+            if( f + q == aSkip )
+                continue;
+
+            for( uint32_t n : f + q == aSwap ? *aNodes : out.links[f + q].nodes )
+                put( n, E + q );
+        }
+
+        for( int i = 0; i < E + K; ++i )
+            up[i] = find( i );
+
+        return up;
+    };
+
+    // the parts a net's ends fall into
+    auto parts = [&]( int aNet, const std::vector<int>& aUp )
+    {
+        std::vector<int> roots;
+
+        for( size_t e = 0; e < endNodes[aNet].size(); ++e )
+        {
+            if( std::find( roots.begin(), roots.end(), aUp[e] ) == roots.end() )
+                roots.push_back( aUp[e] );
+        }
+
+        return roots.size();
+    };
+
     const auto repairStart = CLOCK::now();
 
     if( aParams.capacityRepair )
@@ -7565,15 +7756,55 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                     }
                 }
 
+                const int li = (int) ( &link - out.links.data() );
+                size_t    partsNow = 0;
+
                 if( link.a >= 0 )
                 {
                     GRID_CAPACITY::LINK fresh = link;
                     apply( link, -1.0f );
                     route( fresh );
-                    apply( link, 1.0f );
 
                     if( !fresh.nodes.empty() && fresh.nodes != link.nodes )
                         cands.push_back( std::move( fresh.nodes ) );
+
+                    // the link joined afresh: from any node of its net's part on one side to any of the other
+                    const std::vector<int> up = joins( link.net, li, -1, nullptr );
+                    const int              E = (int) endNodes[link.net].size(), f = firstLink[link.net];
+
+                    if( up[link.a] != up[link.b] )
+                    {
+                        std::vector<uint32_t> from, to;
+
+                        for( int e = 0; e < E; ++e )
+                        {
+                            std::vector<uint32_t>* side = up[e] == up[link.a] ? &from : up[e] == up[link.b] ? &to : nullptr;
+
+                            if( side )
+                                side->insert( side->end(), endNodes[link.net][e].begin(), endNodes[link.net][e].end() );
+                        }
+
+                        for( int q = f; q < endLink[link.net]; ++q )
+                        {
+                            const int r = up[E + q - f];
+                            std::vector<uint32_t>* side = q == li ? nullptr : r == up[link.a] ? &from : r == up[link.b] ? &to : nullptr;
+
+                            if( side )
+                                side->insert( side->end(), out.links[q].nodes.begin(), out.links[q].nodes.end() );
+                        }
+
+                        fresh = link;
+                        route( fresh, &from, &to );
+
+                        if( !fresh.nodes.empty() && fresh.nodes != link.nodes
+                            && std::find( cands.begin(), cands.end(), fresh.nodes ) == cands.end() )
+                        {
+                            cands.push_back( std::move( fresh.nodes ) );
+                        }
+                    }
+
+                    apply( link, 1.0f );
+                    partsNow = parts( link.net, joins( link.net, -1, -1, nullptr ) );
                 }
 
                 double best = -1e-3;
@@ -7583,7 +7814,8 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
                 {
                     const double v = delta( link, cands[ci] );
 
-                    if( v < best )
+                    // a move never parts the net: other links may join this one's route
+                    if( v < best && ( link.a < 0 || parts( link.net, joins( link.net, -1, li, &cands[ci] ) ) <= partsNow ) )
                     {
                         best = v;
                         pick = (int) ci;
@@ -7655,6 +7887,14 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
 
                         if( !pick.empty() || hop( link, a, b, m, &c ) != 0 || baseCost( link, c ) >= before )
                             continue;
+
+                        const int li = (int) ( &link - out.links.data() );
+
+                        if( link.a >= 0
+                            && parts( link.net, joins( link.net, -1, li, &c ) ) > parts( link.net, joins( link.net, -1, -1, nullptr ) ) )
+                        {
+                            continue;
+                        }
 
                         if( delta( link, c ) <= 1e-6 )
                             pick = std::move( c );
