@@ -6497,10 +6497,25 @@ GRID_CAPACITY capacityOn( const WORLD& world, const GRID_PARAMS& aParams, int aT
         return false;
     };
 
-    // a step from or into one of the link's own end tiles leaves a pad: the fan-out's room, not a passage
+    auto netEnd = [&]( int aNet, uint32_t aNode )
+    {
+        for( const std::vector<uint32_t>& nodes : endNodes[aNet] )
+        {
+            if( std::find( nodes.begin(), nodes.end(), aNode ) != nodes.end() )
+                return true;
+        }
+
+        return false;
+    };
+
+    // a step from or into one of the link's own end tiles leaves a pad: the fan-out's room, not a passage. A
+    // tree's link starts and ends at any pad of its net's parts, as the search takes them
     auto endStep = [&]( const GRID_CAPACITY::LINK& aLink, size_t aStep )
     {
-        return isEnd( aLink, aLink.nodes[aStep - 1] ) || isEnd( aLink, aLink.nodes[aStep] );
+        const std::vector<uint32_t>& p = aLink.nodes;
+
+        return isEnd( aLink, p[aStep - 1] ) || isEnd( aLink, p[aStep] ) || ( aStep == 1 && netEnd( aLink.net, p[0] ) )
+               || ( aStep + 1 == p.size() && netEnd( aLink.net, p.back() ) );
     };
 
     auto horizontal = [&]( uint32_t a, uint32_t b ) { return a / tiles == b / tiles && ( a == b + 1 || b == a + 1 ); };
