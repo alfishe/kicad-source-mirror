@@ -1658,8 +1658,36 @@ public:
         }
     }
 
+    /// @brief The crowded nets' line fitted over the later half of this run's rounds reaches none within
+    /// max_rounds
+    bool convergesInTime( size_t aBase ) const
+    {
+        const size_t done = m_byRound.size() - aBase;
+        const size_t from = aBase + done / 2;
+        const double k = (double) ( m_byRound.size() - from );
+        double       sx = 0, sy = 0, sxx = 0, sxy = 0;
+
+        for( size_t i = from; i < m_byRound.size(); ++i )
+        {
+            const double x = (double) ( i - from ), y = m_byRound[i];
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            sxy += x * y;
+        }
+
+        const double slope = ( k * sxy - sx * sy ) / ( k * sxx - sx * sx );
+
+        if( !( slope < 0 ) )
+            return false;
+
+        return (double) done + m_byRound.back() / -slope <= (double) m_params.maxRounds;
+    }
+
     void Run()
     {
+        m_roundsStop = "max_rounds";
+
         if( !m_warm )
             m_pf = m_v.strategy.pfStart;
 
@@ -1753,15 +1781,30 @@ public:
             pf = std::min( pf * growth(), 1e4f );
 
             if( left == 0 )
+            {
+                m_roundsStop = "converged";
                 break;
+            }
 
-            // no fewer for a while: the rest is left to the legalisation
+            if( m_round - m_firstRound + 1 <= STALL_AFTER )
+                continue;
+
+            // the trend of the crowding cannot reach none within the rounds allowed: the rest is left to
+            // the legalisation
+            if( !convergesInTime( base ) )
+            {
+                m_roundsStop = "trend";
+                break;
+            }
+
+            // no fewer for a while
             const size_t r = m_byRound.size();
 
-            if( m_round - m_firstRound + 1 > STALL_AFTER && r - base > STALL_ROUNDS
+            if( r - base > STALL_ROUNDS
                 && *std::min_element( m_byRound.end() - STALL_ROUNDS, m_byRound.end() )
                            >= *std::min_element( m_byRound.begin() + (long) base, m_byRound.end() - STALL_ROUNDS ) )
             {
+                m_roundsStop = "stalled";
                 break;
             }
         }
@@ -2190,6 +2233,7 @@ public:
     const std::vector<int64_t>&   ExpandedBy() const { return m_expandedBy; }
     const std::vector<int64_t>&   ExpandedByStage() const { return m_byStage; }
     const std::vector<int>&       ByRound() const { return m_byRound; }
+    const std::string&            RoundsStop() const { return m_roundsStop; }
     const GRID_RESULT::SEARCH_STATS& SearchStats() const { return m_stats; }
     GRID_RESULT::SEARCH_STATS::COUNTS& counts() { return m_stats.byStage[std::min( (int) m_stage, 4 )]; }
     const std::vector<CROWDING>&  Crowded() const { return m_crowded; }
@@ -4200,6 +4244,7 @@ private:
     double                 m_restoreMs = 0;
     bool                   m_restoring = false;   ///< a warm start marks the copper it took: no steps
     bool                   m_warm = false;
+    std::string            m_roundsStop;   ///< why the rounds ended: converged, trend, stalled, max_rounds
     int                    m_firstRound = 1;
     float                  m_pf = 1.0f;           ///< the present factor of the round
     std::vector<int>       m_firstTodo;           ///< a warm start's first round: the nets it broke
@@ -5088,6 +5133,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
     result.rounds = win.Round();
     result.conflictsLeft = win.Dropped();
     result.crowdedByRound = win.ByRound();
+    result.roundsStop = win.RoundsStop();
     result.crowdedAtEnd = win.Crowded();
 
     result.expandedByStage = win.ExpandedByStage();

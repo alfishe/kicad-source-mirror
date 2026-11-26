@@ -14748,7 +14748,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             return KOPENAPI_RESULT::Ok( { { "stage", "global" }, { "applied", false }, { "connections", connections },
                                           { "covered", covered }, { "vias", vias }, { "results", rows },
                                           { "grid", { { "variant", gr.variant }, { "cell_mm", toMm( gr.cell ) },
-                                                      { "rounds", gr.rounds }, { "crowded_by_round", gr.crowdedByRound },
+                                                      { "rounds", gr.rounds }, { "rounds_stop", gr.roundsStop }, { "crowded_by_round", gr.crowdedByRound },
                                                       { "dropped", gr.conflictsLeft }, { "expanded", gr.expanded },
                                                       { "build_ms", std::round( gr.buildMs ) }, { "route_ms", std::round( gr.routeMs ) },
                                                       { "variant_stats", variantStats } } },
@@ -15735,7 +15735,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                           }
 
                           return rows;
-                      }() }, { "rounds", gr.rounds },
+                      }() }, { "rounds", gr.rounds }, { "rounds_stop", gr.roundsStop },
                     { "crowded_by_round", gr.crowdedByRound }, { "crowded_at_end", crowdedNets },
                     { "dropped", gr.conflictsLeft }, { "crowded_left_out", gr.crowdedLeftOut }, { "cell_mm", toMm( gr.cell ) }, { "expanded", gr.expanded },
                     { "build_ms", std::round( gr.buildMs ) }, { "route_ms", std::round( gr.routeMs ) },

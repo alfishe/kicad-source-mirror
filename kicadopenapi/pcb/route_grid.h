@@ -275,6 +275,7 @@ struct GRID_RESULT
 
     SEARCH_STATS searchStats;
     std::vector<int>             crowdedByRound;   ///< the winner's nets still crowded after each round
+    std::string                  roundsStop;       ///< why its rounds ended: converged, trend, stalled, max_rounds
     std::vector<CROWDING>        crowdedAtEnd;     ///< still crowded when its rounds ended
     std::vector<int64_t>         expandedByStage;   ///< the winner's: rounds, legalising, the short again, fewer vias
     std::vector<std::pair<int, int64_t>> costliest;   ///< the winner's nets that took the most search states
