@@ -17538,8 +17538,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 bool          shut = false;
                 nlohmann::json unjoined = nlohmann::json::array(), sharing = nlohmann::json::array();
 
+                nlohmann::json blind = nlohmann::json::array();
+
                 for( const nlohmann::json& n : answer.body.value( "result", nlohmann::json::array() ) )
                 {
+                    for( const nlohmann::json& end : n.value( "islands_without_cells", nlohmann::json::array() ) )
+                        blind.push_back( end );
+
                     if( !n.value( "joined", false ) )
                         unjoined.push_back( n.value( "net", std::string() ) );
                     else if( n.value( "cells_shared", 0 ) > 0 )
@@ -17547,7 +17552,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
 
                 tries.push_back( { { "nets", solving.size() }, { "unjoined", unjoined }, { "sharing", sharing },
-                                   { "converged", solved } } );
+                                   { "ends_without_cells", blind }, { "converged", solved } } );
 
                 for( const nlohmann::json& n : answer.body.value( "result", nlohmann::json::array() ) )
                 {

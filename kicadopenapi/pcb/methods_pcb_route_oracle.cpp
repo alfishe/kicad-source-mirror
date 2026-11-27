@@ -1855,6 +1855,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         std::vector<size_t>                             viaCells;
         int                                             joined = 0;
         int                                             outside = 0;     // islands that reach no box of the region
+        std::vector<std::string>                        noCells;         // islands with no cell a track centre of the net may take
         size_t                                          conflicts = 0;
     };
 
@@ -2304,6 +2305,18 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                     } );
                 }
             }
+        }
+
+        aJob.noCells.clear();
+
+        for( size_t k = 0; k < aJob.islands.size(); ++k )
+        {
+            if( hasCells[k] || aJob.islands[k].empty() )
+                continue;
+
+            auto pad = std::find_if( aJob.islands[k].begin(), aJob.islands[k].end(),
+                                     []( BOARD_CONNECTED_ITEM* aItem ) { return aItem->Type() == PCB_PAD_T; } );
+            aJob.noCells.push_back( itemName( pad != aJob.islands[k].end() ? *pad : aJob.islands[k].front() ) );
         }
 
         aJob.paths.clear();
@@ -2758,6 +2771,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                              { "joined", whole },
                              { "cells_shared", job.conflicts },
                              { "islands_outside", job.outside },
+                             { "islands_without_cells", job.noCells },
                              { "width_mm", pcbIUScale.IUTomm( job.probe.width ) },
                              { "via_mm", vias ? nlohmann::json( { pcbIUScale.IUTomm( job.probe.viaDia ), pcbIUScale.IUTomm( job.probe.viaDrill ) } )
                                               : nlohmann::json() } };
@@ -3029,7 +3043,7 @@ KOPENAPI_REGISTER( "pcb_route_oracle_joint",
                    "(a cell another net's new track or via keeps out costs more each round it stays shared). "
                    "converged: every net joined and no cell shared, so the paths laid together keep the rules' "
                    "clearances (lay them and run DRC to prove it). Otherwise per net: joined, cells_shared. "
-                   "result[]: net, islands, joined, cells_shared, width_mm, via_mm, paths (per joined island: "
+                   "result[]: net, islands, joined, cells_shared, islands_without_cells (an island with no cell a track centre of the net may take on the pessimistic grid, named by its pad: never joined at this cell), width_mm, via_mm, paths (per joined island: "
                    "[{at, layer}], a layer change is a via); rounds[]: nets_sharing, cells_shared, nets_unjoined; "
                    "build_ms (the grids), negotiate_ms",
                    R"json({"type":"object","properties":{
