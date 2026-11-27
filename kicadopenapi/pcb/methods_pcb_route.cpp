@@ -14236,6 +14236,8 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         params.space = globalStage || detailStage;
         params.raceWait = (float) std::clamp( aArgs.value( "race_wait", globalStage || detailStage ? 0.1 : 0.25 ), 0.0, 4.0 );
         params.raceWaitMinS = (float) std::clamp( aArgs.value( "race_wait_min_s", 2.0 ), 0.0, 600.0 );
+        params.raceByWork = aArgs.value( "budgets", std::string( "time" ) ) == "work";
+        params.raceWorkPerS = std::clamp( aArgs.value( "race_work_per_s", 3e6 ), 1e3, 1e9 );
         params.viaKeepOut = pcbIUScale.mmToIU( std::clamp( aArgs.value( "via_keepout_mm", 5.0 ), 0.0, 20.0 ) );
 
         for( const ESCAPE_FRONT& front : fronts )
@@ -17372,6 +17374,19 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     continue;
                 }
 
+                // only what the joint oracle may lay again: copper on the call's layers, a via or an arc
+                // wholly inside (one the edge cuts holds the copper beyond it)
+                const bool straight = t->Type() == PCB_TRACE_T;
+
+                if( ( !straight && !box.Contains( t->GetBoundingBox() ) )
+                    || ( t->Type() != PCB_VIA_T && std::find( layers.begin(), layers.end(), t->GetLayer() ) == layers.end() ) )
+                {
+                    continue;
+                }
+
+                if( t->Type() == PCB_VIA_T && !viasAllowed )
+                    continue;
+
                 inBox.push_back( t );
                 nets.insert( n );
             }
@@ -17399,12 +17414,30 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             board->GetConnectivity()->RecalculateRatsnest();
 
             std::map<int, size_t>                                  openBefore;
+            std::map<int, nlohmann::json>                          edgesBefore;
             std::map<int, std::vector<std::unique_ptr<PCB_TRACK>>> saved;
             std::set<KIID>                                         danglingBefore;
             std::shared_ptr<CONNECTIVITY_DATA>                     conn = board->GetConnectivity();
 
+            auto edgesOf = [&]( int aNet )
+            {
+                nlohmann::json open = nlohmann::json::array();
+
+                if( RN_NET* rn = board->GetConnectivity()->GetRatsnestForNet( aNet ) )
+                {
+                    for( const CN_EDGE& e : rn->GetEdges() )
+                        open.push_back( { { toMm( e.GetSourcePos().x ), toMm( e.GetSourcePos().y ) },
+                                          { toMm( e.GetTargetPos().x ), toMm( e.GetTargetPos().y ) } } );
+                }
+
+                return open;
+            };
+
             for( int n : nets )
+            {
                 openBefore[n] = openOf( n );
+                edgesBefore[n] = edgesOf( n );
+            }
 
             for( PCB_TRACK* t : board->Tracks() )
             {
@@ -17666,6 +17699,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         refused = true;
                         why = "the guard refuses a path of " + n.value( "net", std::string() ) + ": "
                               + laid.body.value( "error", nlohmann::json::object() ).value( "message", laid.body.dump().substr( 0, 200 ) );
+
+                        if( !tries.empty() )
+                            tries.back()["refused"] = why;
+
                         break;
                     }
 
@@ -17703,6 +17740,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             }
 
             // copper the new paths no longer use (a cut piece, what hung on it) goes
+            nlohmann::json swept = nlohmann::json::object();
             for( bool again = ok; again; )
             {
                 again = false;
@@ -17716,6 +17754,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                         && now->TestTrackEndpointDangling( t, true ) )
                     {
                         sweep.Remove( t );
+                        swept[netName( t->GetNetCode() )].push_back(
+                                { toMm( t->GetStart().x ), toMm( t->GetStart().y ), toMm( t->GetEnd().x ), toMm( t->GetEnd().y ),
+                                  std::find( laidNow.begin(), laidNow.end(), t->m_Uuid ) != laidNow.end() } );
                         again = true;
                     }
                 }
@@ -17739,7 +17780,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 for( int n : nets )
                 {
                     if( ok && n != netCode && openOf( n ) > openBefore[n] )
+                    {
                         ok = false, why = "laid, " + netName( n ) + " has more open connections";
+
+                        if( !tries.empty() )
+                            tries.back()["open"] = { { "before", edgesBefore[n] }, { "after", edgesOf( n ) }, { "swept", swept } };
+                    }
                 }
             }
 
@@ -25871,7 +25917,7 @@ KOPENAPI_REGISTER( "pcb_route",
                         "tiers":{"type":"boolean","default":true,"description":"bus_paths: the tier plan (tier-planner.md) routes the links it covers: per link (corridor) straight under the parts between it and its far end when they have lanes left under them, else round them on one side; F.Cu when every pin is entered directly, else B.Cu with each pin's via (a facing-row pin's just outside its pad, a far-row pin's under the body with a leg across) and slot from the plan's stack on that side of the part, or, for a link leaving by a two-row part's end, from its end stack (each pin out of its row or into the channel between the rows on F.Cu to a via past the end, or through a via beside or under its pad on B.Cu); detours on one side nest, and a side that would wall in another link's end is not taken; a link covered (slots at both ends: two-row SMD parts) takes the plan's slots and centreline, and no end plan or reversal trial touches it. The plan is answered either way as bus_paths.tiers (links: route, side, round or under, leaves_a, leaves_b, layer, entries with via, bends, slot, covered, line_mm; parts: signals, lanes_left, stacks; stacks: per part side not covered the reason, the stack's order and the candidates tried with what each hit; passengers: the facing rows' other routed signals with their F.Cu legs)"},
                         "end_plan":{"type":"boolean","default":true,"description":"bus_paths: the parts two corridors or more end at are planned by pcb_end_plan (the corridors as links), and so are the moved buses' and moved singles' far parts with that layer kept; a plan is used where a bus (or a moved single) changes layer (at a shared end two buses or more). Each pin of a used plan, corridor members and singles alike, starts (ends) at its slot: its path pad, via, knee, bends, slot laid before the first route along a corridor, the route going on from the slot (its length cap counting the path), taken out when that route fails or never runs (kept when another route of its net ended on it); a single inside buses' runs on both layers keeps its fan-out. Answer bus_paths.end_plans (per part planned: ref, for shared end / far end, used or reason, links, ends_overflow, breaks_left, crossings_left, wraps_left, links_under, no_spot, pins with slot, knee, bends, via, under) and end_paths (laid, refused, taken_out); the corridor answers end_slots. A bus between two parts whose ends go round them in the same direction (orders_across: first_clockwise, last_anticlockwise) is reversed unless a strip as wide as it runs under one of them on its layer (orders_across.passes_under: its lanes reach the slots there from behind, no corridor corner round that part); a reversed bus's far part is planned again in the order it arrives in (ordered_at), then its members still out of order leave for the other layer when they are in order among themselves (off_bus: net to layer), else they stay (order_left). false: every end as pcb_fanout_ports plans it"},
                         "stage":{"type":"string","enum":["full","global","detail"],"default":"full","description":"engine grid: full lays the grid's copper; detail: the global stage, then the grid's copper of each net cut into branches between its junctions (ends, points where three ways meet), each branch by pns along its corridor (read as bus_paths reads one: the lane's corners and via gates as waypoints; bundles first, then branches between two ends, then onto a junction, shorter first; one that does not route tries its via sites alone, then the grid's copper of it through the guard): rows engine pns with detail branches, or engine grid with pns_detail (why pns did not); grid.detail {branches, by_corridor, by_via_sites, already_joined, to_grid_copper}; global only finds each connection's way on a coarse grid (cell half a track pitch), nothing laid: per connection from, to, found, corridor (the shared corridor type, docs corridor.md: {name, net, from, to, points_mm: gates at the corners {at_mm, along, lo_mm = hi_mm, layer, rooms_mm}, via gates {at_mm, via: {from_layer, to_layer}, layer}, the last a free point}; rooms are runs of free cells widened up to 1 mm, other nets' never overlap; bus_paths takes it as given), vias_mm (where it changes layer), layers, length_mm; answer connections, covered, vias, grid (variant, cell_mm, rounds, build_ms, route_ms, variant_stats)"},
-                        "race_wait":{"type":"number","default":0.25,"description":"grid: once the first variant is done, the others get this share of its time again (race_wait_min_s at least); stages global and detail 0.1 (a time policy: their grid result is a plan the detail stage refines)"},"race_wait_min_s":{"type":"number","default":2,"minimum":0,"description":"grid: the least time the other variants get once the first is done (seconds)"},"corridor_try_budget_s":{"type":"number","minimum":0,"description":"seconds one member's try along its corridor gets at the turn of the corridor's first connection (a time policy: the try is a soft goal, the member keeps its own turn and budget after); default first_pass_budget_s / 10, 3 when that is 0"},"detail_branch_budget_s":{"type":"number","minimum":0,"description":"stage detail: seconds pns gets for one branch along its corridor (a time policy: a branch is one of many and has the grid's copper as its fallback); default first_pass_budget_s / 10, 3 when that is 0"},
+                        "race_wait":{"type":"number","default":0.25,"description":"grid: once the first variant is done, the others get this share of its time again (race_wait_min_s at least; budgets work: of its work in states expanded, race_wait_min_s at race_work_per_s, and one that joined everything ends the others' rounds past its work, so the winner does not depend on the load); stages global and detail 0.1 (a time policy: their grid result is a plan the detail stage refines)"},"race_wait_min_s":{"type":"number","default":2,"minimum":0,"description":"grid: the least time the other variants get once the first is done (seconds)"},"race_work_per_s":{"type":"number","default":3000000,"description":"grid, budgets work: states expanded a second, race_wait_min_s counted in work"},"corridor_try_budget_s":{"type":"number","minimum":0,"description":"seconds one member's try along its corridor gets at the turn of the corridor's first connection (a time policy: the try is a soft goal, the member keeps its own turn and budget after); default first_pass_budget_s / 10, 3 when that is 0"},"detail_branch_budget_s":{"type":"number","minimum":0,"description":"stage detail: seconds pns gets for one branch along its corridor (a time policy: a branch is one of many and has the grid's copper as its fallback); default first_pass_budget_s / 10, 3 when that is 0"},
                         "via_keepout_mm":{"type":"number","default":5,"description":"grid: only a chip's own nets put vias this far around it (pads on four sides, or an array outside its balls) while the board routes; other nets left short and, once all are joined, the via-saving pass may use it; 0 off"},
                         "bundles":{"description":"grid: \"auto\" (pcb_net_roles' bundles), \"off\", or [{name, nets}] in member order: a bundle's nets between the same parts are routed first, side by side (the answer's grid.bundles: name, parts, nets)","default":"auto"},
                         "via_away_mm":{"type":"number","default":7,"description":"grid: a signal via nearer a chip's pads (not an array's) than this costs more, linearly to the pads; 0 off"},
