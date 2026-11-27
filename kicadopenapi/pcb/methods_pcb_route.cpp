@@ -16000,6 +16000,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             std::map<int, size_t>              openThen;
             std::map<int, std::vector<std::unique_ptr<PCB_TRACK>>>           taken;
             std::map<int, std::vector<std::tuple<KIID, VECTOR2I, VECTOR2I>>> trimmed;
+            std::map<int, std::vector<KIID>>                                 bridged;
 
             for( const KIID& id : added )
             {
@@ -16036,6 +16037,52 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     }
                     else
                     {
+                        // a via joining tracks on one layer only: the tracks' ends in it go on to its centre
+                        if( track->Type() == PCB_VIA_T )
+                        {
+                            std::map<std::tuple<int, int64_t, int64_t>, int> ends;   // (layer, x, y) -> widest track there
+                            int                                              touching = 0;
+
+                            for( BOARD_CONNECTED_ITEM* item : conn->GetConnectedItems( track ) )
+                            {
+                                PCB_TRACK* t = dynamic_cast<PCB_TRACK*>( item );
+
+                                if( !t || t->Type() != PCB_TRACE_T || t->GetNetCode() != n )
+                                    continue;
+
+                                if( t->GetStart() == track->GetPosition() || t->GetEnd() == track->GetPosition() )
+                                {
+                                    touching++;
+                                    continue;
+                                }
+
+                                for( const VECTOR2I& end : { t->GetStart(), t->GetEnd() } )
+                                {
+                                    if( track->HitTest( end ) )
+                                    {
+                                        touching++;
+                                        int& w = ends[{ (int) t->GetLayer(), end.x, end.y }];
+                                        w = std::max( w, t->GetWidth() );
+                                    }
+                                }
+                            }
+
+                            if( touching >= 2 )
+                            {
+                                for( const auto& [at, width] : ends )
+                                {
+                                    PCB_TRACK* bridge = new PCB_TRACK( board );
+                                    bridge->SetLayer( (PCB_LAYER_ID) std::get<0>( at ) );
+                                    bridge->SetStart( VECTOR2I( std::get<1>( at ), std::get<2>( at ) ) );
+                                    bridge->SetEnd( track->GetPosition() );
+                                    bridge->SetWidth( width );
+                                    bridge->SetNetCode( n );
+                                    sweep.Add( bridge );
+                                    bridged[n].push_back( bridge->m_Uuid );
+                                }
+                            }
+                        }
+
                         taken[n].emplace_back( static_cast<PCB_TRACK*>( track->Clone() ) );
                         sweep.Remove( track );
                     }
@@ -16044,6 +16091,9 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     again = true;
                 }
             }
+
+            for( auto& [n, ids] : bridged )
+                added.insert( added.end(), ids.begin(), ids.end() );
 
             if( !again )
             {
@@ -16066,6 +16116,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 for( std::unique_ptr<PCB_TRACK>& t : taken[n] )
                     undo.Add( t.release() );
+
+                for( const KIID& id : bridged[n] )
+                {
+                    if( BOARD_ITEM* b = board->ResolveItem( id, true ) )
+                        undo.Remove( b );
+                }
 
                 for( auto& [id, start, end] : trimmed[n] )
                 {
