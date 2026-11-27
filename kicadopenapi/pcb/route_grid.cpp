@@ -2180,20 +2180,38 @@ public:
             m_abandoned = true;
     }
 
-    bool Abandoned() const { return m_abandoned; }
+    /// @brief The race by work: past aCap states in all, or (not all joined) past aRoundsCap in its
+    /// rounds, the variant is out; caps only come down
+    void CapWork( int64_t aCap, int64_t aRoundsCap )
+    {
+        for( auto [cap, to] : { std::pair{ &m_workCap, aCap }, std::pair{ &m_roundsCap, aRoundsCap } } )
+        {
+            int64_t had = cap->load();
+
+            while( to < had && !cap->compare_exchange_weak( had, to ) )
+                ;
+        }
+    }
+
+    bool OverCap() const
+    {
+        const int64_t rounds = m_roundsWork >= 0 ? m_roundsWork : m_expanded;
+        return m_expanded > m_workCap.load( std::memory_order_relaxed )
+               || ( rounds > m_roundsCap.load( std::memory_order_relaxed ) && !( m_dropped == 0 && allReached() ) );
+    }
+
+    bool Abandoned() const { return m_abandoned || OverCap(); }
 
     /// @brief Run ended before its stages did, not by another variant's win (a cancelled job)
-    bool Halted() const { return m_stage != STAGE_DONE && !m_abandoned; }
+    bool Halted() const { return m_stage != STAGE_DONE && !Abandoned(); }
 
     /// @brief After Run: every end joined, no net dropped
     bool Complete() const
     {
-        if( m_abandoned || m_dropped > 0 )
+        if( Abandoned() || m_dropped > 0 )
             return false;
 
-        return std::all_of( m_nets.begin(), m_nets.end(),
-                            []( const NET_STATE& aNet )
-                            { return std::find( aNet.reached.begin(), aNet.reached.end(), false ) == aNet.reached.end(); } );
+        return allReached();
     }
 
     GRID_VARIANT_PROGRESS Progress() const
@@ -2241,8 +2259,18 @@ public:
 private:
     enum STAGE { STAGE_ROUNDS, STAGE_LEGALISE, STAGE_SHORT_AGAIN, STAGE_FEWER_VIAS, STAGE_PULL_TIGHT, STAGE_DONE };
 
+    bool allReached() const
+    {
+        return std::all_of( m_nets.begin(), m_nets.end(),
+                            []( const NET_STATE& aNet )
+                            { return std::find( aNet.reached.begin(), aNet.reached.end(), false ) == aNet.reached.end(); } );
+    }
+
     void at( STAGE aStage, int aTaken, int aOf )
     {
+        if( aStage != STAGE_ROUNDS && m_roundsWork < 0 )
+            m_roundsWork = m_expanded;
+
         m_stage = aStage;
         m_taken = aTaken;
         m_takenOf = aOf;
@@ -2732,7 +2760,7 @@ private:
     bool stopped() const
     {
         return m_stop.load( std::memory_order_relaxed ) || m_abandoned.load( std::memory_order_relaxed )
-               || m_diverged.load( std::memory_order_relaxed )
+               || m_diverged.load( std::memory_order_relaxed ) || OverCap()
                || ( m_params.cancel && m_params.cancel->load( std::memory_order_relaxed ) );
     }
 
@@ -4219,6 +4247,8 @@ private:
     int                    m_stepRound = -1;
     int                    m_stepStage = -1;
     std::atomic<bool>      m_abandoned{ false };
+    std::atomic<int64_t>   m_workCap{ INT64_MAX }, m_roundsCap{ INT64_MAX };
+    int64_t                m_roundsWork = -1;   // states expanded when its rounds ended
     std::atomic<int>       m_taken{ 0 };
     std::atomic<int>       m_takenOf{ 0 };
     std::atomic<int64_t>   m_expandedShown{ 0 };
@@ -5013,6 +5043,24 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
             finishedMs[k] = activeMs();
             --left;
 
+            if( aParams.raceByWork )
+            {
+                // the others' share counted from its work; one that joined everything caps the
+                // others' rounds at its work: both by work alone, so the winner is the same under any load
+                if( !runs[k]->Halted() && !runs[k]->Abandoned() )
+                {
+                    const int64_t w = runs[k]->Expanded();
+                    const int64_t cap = std::max( (int64_t) ( w * ( 1.0 + aParams.raceWait ) ),
+                                                  w + (int64_t) ( aParams.raceWaitMinS * aParams.raceWorkPerS ) );
+                    const int64_t roundsCap = runs[k]->Complete() ? w : INT64_MAX;
+
+                    for( auto& run : runs )
+                        run->CapWork( cap, roundsCap );
+                }
+
+                continue;
+            }
+
             if( firstMs < 0 && !runs[k]->Halted() )
                 firstMs = finishedMs[k];
 
@@ -5028,7 +5076,7 @@ GRID_RESULT RouteOnGrid( BOARD* aBoard, const std::vector<GRID_NET>& aNets, cons
             }
         }
 
-        if( firstMs >= 0 && left > 0 && activeMs() > firstMs + std::max( 1000.0 * aParams.raceWaitMinS, firstMs * aParams.raceWait ) )
+        if( !aParams.raceByWork && firstMs >= 0 && left > 0 && activeMs() > firstMs + std::max( 1000.0 * aParams.raceWaitMinS, firstMs * aParams.raceWait ) )
         {
             for( size_t j = 0; j < runs.size(); ++j )
             {

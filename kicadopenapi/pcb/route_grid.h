@@ -67,6 +67,8 @@ struct GRID_PARAMS
     bool                      coarse = false;  ///< cell 0: half the finest class's track pitch (rounded up), not a third (the global stage)
     float                     raceWait = 0.25f; ///< once the first variant is done, the others' time left: this share of its time (raceWaitMinS at least)
     float                     raceWaitMinS = 2.0f; ///< the least time left the others once the first variant is done (seconds)
+    bool                      raceByWork = false; ///< the race counted in work (states expanded), not time: the same winner under any load
+    double                    raceWorkPerS = 3e6; ///< raceByWork: states a second, raceWaitMinS in work
     int                       variants = 0;    ///< 0: half the cores, up to the built-ins, as many as the memory allows
     int64_t                   memoryBudget = 0; ///< bytes the lanes may take; 0: half the memory available now
     int                       maxRounds = 40;
