@@ -17266,6 +17266,464 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
         }
     }
 
+    // the repair pass: a connection still open is solved again with its neighbours in a window round its
+    // ends (repair_margin_mm): the movable copper there (this call's; any unlocked with rip_up_scope
+    // unlocked; never locked, a pair laid coupled or a zone net's) is taken up, cut at the window's edge, and
+    // pcb_route_oracle_joint solves the nets together; a net it cannot join again gets its copper back
+    // and the others are solved round it; converged paths are laid through the guard.  Kept only when
+    // the connection joins and no net there is left with more open connections, else all goes back
+    int            repairTried = 0, repairKept = 0;
+    nlohmann::json repairNotes = nlohmann::json::array();
+
+    if( aArgs.value( "repair", true ) && !KopenapiJobCancelled() && !plateauPassCut && !dryRun && !rail )
+    {
+        std::optional<KOPENAPI_METHOD> joint = KOPENAPI_REGISTRY::Get().Find( "pcb_route_oracle_joint" );
+        std::optional<KOPENAPI_METHOD> lay = KOPENAPI_REGISTRY::Get().Find( "pcb_track_add" );
+        const int                      margin = pcbIUScale.mmToIU( aArgs.value( "repair_margin_mm", 3.0 ) );
+        const int                      maxWindows = aArgs.value( "repair_max", 50 );
+        const bool                     anyUnlocked = ripScope == "unlocked";
+        std::set<int>                  zoneNets;
+
+        for( ZONE* zone : board->Zones() )
+        {
+            if( !zone->GetIsRuleArea() && zone->GetNetCode() > 0 )
+                zoneNets.insert( zone->GetNetCode() );
+        }
+
+        // a pair laid coupled stays; one routed side by side alone is single tracks
+        std::set<int> coupledNets;
+
+        for( size_t k = 0; k < jobs.size(); ++k )
+        {
+            if( !jobs[k].trunk || !done[k] )
+                continue;
+
+            if( PAD* from = dynamic_cast<PAD*>( board->ResolveItem( jobs[k].fromId, true ) ) )
+            {
+                coupledNets.insert( from->GetNetCode() );
+
+                if( NETINFO_ITEM* coupled = coupledNet( board, from->GetNet(), &explicitPairs ) )
+                    coupledNets.insert( coupled->GetNetCode() );
+            }
+        }
+
+        auto openOf = [&]( int aNet ) -> size_t
+        {
+            RN_NET* rn = board->GetConnectivity()->GetRatsnestForNet( aNet );
+            return rn ? rn->GetEdges().size() : 0;
+        };
+
+        auto netName = [&]( int aNet ) { return str( UnescapeString( board->FindNet( aNet )->GetNetname() ) ); };
+
+        for( size_t index = 0; joint && lay && index < jobs.size() && !KopenapiJobCancelled(); ++index )
+        {
+            JOB& job = jobs[index];
+
+            if( done[index] || rowOf[index] < 0 || job.trunk )
+                continue;
+
+            job.from = dynamic_cast<PAD*>( board->ResolveItem( job.fromId, true ) );
+            job.to = dynamic_cast<BOARD_CONNECTED_ITEM*>( board->ResolveItem( job.toId, true ) );
+
+            if( !job.from || !job.to || coupledNets.count( job.from->GetNetCode() ) )
+                continue;
+
+            nlohmann::json& row = results[rowOf[index]];
+            const int       netCode = job.from->GetNetCode();
+
+            {
+                const auto joined = board->GetConnectivity()->GetConnectedItems( job.from );
+
+                if( std::find( joined.begin(), joined.end(), job.to ) != joined.end() )
+                {
+                    done[index] = true;
+                    row["routed"] = true;
+                    row["joined_by_repair"] = true;
+
+                    for( const char* key : { "reason", "violations", "stopped_at_mm", "blocked_by", "blocked_end", "budget", "boxed_in" } )
+                        row.erase( key );
+
+                    continue;
+                }
+            }
+
+            if( repairTried >= maxWindows )
+            {
+                row["repair"] = "not tried: repair_max windows tried already";
+                continue;
+            }
+
+            BOX2I box( job.from->GetPosition(), VECTOR2I( 0, 0 ) );
+            box.Merge( job.toPos );
+            box.Inflate( margin );
+            box = box.Intersect( board->GetBoardEdgesBoundingBox() );
+
+            const std::set<KIID>    mine( added.begin(), added.end() );
+            std::set<int>           nets = { netCode };
+            std::vector<PCB_TRACK*> inBox;
+
+            for( PCB_TRACK* t : board->Tracks() )
+            {
+                const int n = t->GetNetCode();
+
+                if( t->IsLocked() || n <= 0 || zoneNets.count( n ) || coupledNets.count( n ) || ( !anyUnlocked && !mine.count( t->m_Uuid ) )
+                    || !t->HitTest( box, false, 0 ) )
+                {
+                    continue;
+                }
+
+                inBox.push_back( t );
+                nets.insert( n );
+            }
+
+            if( nets.size() < 2 )
+            {
+                row["repair"] = anyUnlocked ? "no movable copper of another net in the window"
+                                            : "no copper of another net of this call in the window (rip_up_scope unlocked moves earlier copper)";
+                continue;
+            }
+
+            if( profile.pass != "repair" )
+                profile.pass = "repair";
+
+            if( !KopenapiJobStep( "repair", (int) index, (int) jobs.size(), job.net, progressCounts( "repair" ) ) )
+                break;
+
+            repairTried++;
+            board->GetConnectivity()->RecalculateRatsnest();
+
+            std::map<int, size_t>                                  openBefore;
+            std::map<int, std::vector<std::unique_ptr<PCB_TRACK>>> saved;
+            std::set<KIID>                                         danglingBefore;
+            std::shared_ptr<CONNECTIVITY_DATA>                     conn = board->GetConnectivity();
+
+            for( int n : nets )
+                openBefore[n] = openOf( n );
+
+            for( PCB_TRACK* t : board->Tracks() )
+            {
+                if( !nets.count( t->GetNetCode() ) )
+                    continue;
+
+                saved[t->GetNetCode()].emplace_back( static_cast<PCB_TRACK*>( t->Clone() ) );
+
+                if( conn->TestTrackEndpointDangling( t, true ) )
+                    danglingBefore.insert( t->m_Uuid );
+            }
+
+            auto putBack = [&]( const std::set<int>& aNets )
+            {
+                BOARD_COMMIT back( context->GetToolManager() );
+
+                for( PCB_TRACK* t : board->Tracks() )
+                {
+                    if( aNets.count( t->GetNetCode() ) )
+                        back.Remove( t );
+                }
+
+                for( int n : aNets )
+                {
+                    for( const std::unique_ptr<PCB_TRACK>& t : saved[n] )
+                        back.Add( static_cast<PCB_TRACK*>( t->Clone() ) );
+                }
+
+                back.Push( _( "Repair undone (API)" ) );
+                board->BuildConnectivity();
+            };
+
+            // the window's copper taken up: a straight track crossing its edge keeps its parts outside
+            {
+                BOARD_COMMIT cut( context->GetToolManager() );
+
+                for( PCB_TRACK* t : inBox )
+                {
+                    if( t->Type() == PCB_TRACE_T && !box.Contains( t->GetBoundingBox() ) )
+                    {
+                        const VECTOR2D a = t->GetStart(), d = VECTOR2D( t->GetEnd() ) - a;
+                        double         t0 = 0, t1 = 1;
+                        const double   lo[2] = { (double) box.GetLeft(), (double) box.GetTop() };
+                        const double   hi[2] = { (double) box.GetRight(), (double) box.GetBottom() };
+                        const double   p0[2] = { a.x, a.y }, dd[2] = { d.x, d.y };
+
+                        for( int k = 0; k < 2; ++k )
+                        {
+                            if( dd[k] == 0 )
+                                continue;
+
+                            double e = ( lo[k] - p0[k] ) / dd[k], l = ( hi[k] - p0[k] ) / dd[k];
+
+                            if( e > l )
+                                std::swap( e, l );
+
+                            t0 = std::max( t0, e );
+                            t1 = std::min( t1, l );
+                        }
+
+                        auto at = [&]( double aT ) { return VECTOR2I( KiROUND( a.x + d.x * aT ), KiROUND( a.y + d.y * aT ) ); };
+                        std::vector<std::pair<VECTOR2I, VECTOR2I>> pieces;
+
+                        if( t0 >= t1 )
+                            pieces.emplace_back( t->GetStart(), t->GetEnd() );   // the box meets its width only
+
+                        else
+                        {
+                            if( t0 > 0 )
+                                pieces.emplace_back( t->GetStart(), at( t0 ) );
+
+                            if( t1 < 1 )
+                                pieces.emplace_back( at( t1 ), t->GetEnd() );
+                        }
+
+                        for( const auto& [s, e] : pieces )
+                        {
+                            if( s == e )
+                                continue;
+
+                            PCB_TRACK* piece = static_cast<PCB_TRACK*>( t->Duplicate( IGNORE_PARENT_GROUP ) );
+                            piece->SetStart( s );
+                            piece->SetEnd( e );
+                            cut.Add( piece );
+                            added.push_back( piece->m_Uuid );
+                        }
+                    }
+
+                    cut.Remove( t );
+                }
+
+                cut.Push( _( "Repair window taken up (API)" ) );
+                board->BuildConnectivity();
+            }
+
+            const nlohmann::json region = nlohmann::json::array(
+                    { nlohmann::json::array( { toMm( box.GetLeft() ), toMm( box.GetTop() ), toMm( box.GetRight() ), toMm( box.GetBottom() ) } ) } );
+            std::set<int>   solving = nets, held;
+            KOPENAPI_RESULT answer = KOPENAPI_RESULT::Error( 500, "not run" );
+            bool            solved = false;
+            std::string     why;
+            nlohmann::json  tries = nlohmann::json::array();
+
+            for( int round = 0; round < 4 && !solved; ++round )
+            {
+                nlohmann::json names = nlohmann::json::array();
+
+                for( int n : solving )
+                    names.push_back( netName( n ) );
+
+                nlohmann::json layerNames = nlohmann::json::array();
+
+                for( PCB_LAYER_ID l : layers )
+                    layerNames.push_back( str( board->GetLayerName( l ) ) );
+
+                nlohmann::json args = { { "nets", names },
+                                        { "region", region },
+                                        { "layers", layerNames },
+                                        { "vias", viasAllowed },
+                                        { "cell_mm", aArgs.value( "repair_cell_mm", 0.025 ) },
+                                        { "rounds", aArgs.value( "repair_rounds", 300 ) },
+                                        { "max_work_m", aArgs.value( "repair_max_work_m", 2000.0 ) },
+                                        { "claim_slack_mm", 0.0 },
+                                        { "cuts", false },
+                                        { "zones_yield", zoneMode == "refill" } };
+
+                answer = joint->handler( aCtx, args );
+
+                if( answer.status >= 400 )
+                {
+                    why = "the joint oracle: " + answer.body.value( "error", answer.body.dump() );
+                    break;
+                }
+
+                solved = answer.body.value( "converged", false );
+                std::set<int> back;
+                bool          shut = false;
+                nlohmann::json unjoined = nlohmann::json::array(), sharing = nlohmann::json::array();
+
+                for( const nlohmann::json& n : answer.body.value( "result", nlohmann::json::array() ) )
+                {
+                    if( !n.value( "joined", false ) )
+                        unjoined.push_back( n.value( "net", std::string() ) );
+                    else if( n.value( "cells_shared", 0 ) > 0 )
+                        sharing.push_back( n.value( "net", std::string() ) );
+                }
+
+                tries.push_back( { { "nets", solving.size() }, { "unjoined", unjoined }, { "sharing", sharing },
+                                   { "converged", solved } } );
+
+                for( const nlohmann::json& n : answer.body.value( "result", nlohmann::json::array() ) )
+                {
+                    NETINFO_ITEM* info = KopenapiFindNet( board, n.value( "net", std::string() ) );
+
+                    if( !info || n.value( "joined", false ) || n.value( "cells_shared", 0 ) > 0 )
+                        continue;
+
+                    solved = false;
+
+                    if( info->GetNetCode() == netCode )
+                        shut = true;
+                    else
+                        back.insert( info->GetNetCode() );
+                }
+
+                if( solved )
+                    break;
+
+                if( shut || back.empty() )
+                {
+                    why = shut ? "the joint oracle joins it in no way with the window's copper taken up"
+                               : "the window's nets do not converge (they still share room)";
+                    break;
+                }
+
+                // nets the oracle cannot join again (its pessimistic grid shuts a way they had) keep theirs
+                putBack( back );
+
+                for( int n : back )
+                {
+                    solving.erase( n );
+                    held.insert( n );
+                }
+            }
+
+            // the converged paths laid through the guard: at the rules' width, else at the oracle's
+            bool ok = solved;
+
+            for( const nlohmann::json& n : ok ? answer.body.value( "result", nlohmann::json::array() ) : nlohmann::json::array() )
+            {
+                for( const nlohmann::json& path : n.value( "paths", nlohmann::json::array() ) )
+                {
+                    if( !ok || path.size() < 2 )
+                        continue;
+
+                    std::string    layer = path[0].value( "layer", std::string() );
+                    nlohmann::json points = nlohmann::json::array( { path[0]["at"] } );
+
+                    for( size_t k = 1; k < path.size(); ++k )
+                    {
+                        const std::string at = path[k].value( "layer", std::string() );
+
+                        if( at != layer )
+                        {
+                            points.push_back( { { "at", path[k]["at"] }, { "via", at } } );
+                            layer = at;
+                        }
+                        else
+                        {
+                            points.push_back( path[k]["at"] );
+                        }
+                    }
+
+                    for( const nlohmann::json& p : path )
+                    {
+                        const PCB_LAYER_ID l = board->GetLayerID( wxString::FromUTF8( p.value( "layer", std::string() ) ) );
+
+                        if( std::find( layers.begin(), layers.end(), l ) == layers.end() )
+                            ok = false, why = "a path runs on a layer this call does not route on";
+                    }
+
+                    if( !ok )
+                        break;
+
+                    nlohmann::json args = { { "net", n["net"] }, { "layer", path[0]["layer"] }, { "points", points },
+                                            { "zones", zoneMode == "refill" ? "defer" : "keep" } };
+                    KOPENAPI_RESULT laid = lay->handler( aCtx, args );
+
+                    if( laid.status != 200 )
+                    {
+                        args["width_mm"] = n["width_mm"];
+                        laid = lay->handler( aCtx, args );
+                    }
+
+                    if( laid.status != 200 )
+                    {
+                        ok = false;
+                        why = "the guard refuses a path of " + n.value( "net", std::string() ) + ": "
+                              + laid.body.value( "error", nlohmann::json::object() ).value( "message", laid.body.dump().substr( 0, 200 ) );
+                        break;
+                    }
+
+                    for( const nlohmann::json& u : laid.body.value( "uuids", nlohmann::json::array() ) )
+                        added.push_back( KIID( wxString::FromUTF8( u.get<std::string>() ) ) );
+                }
+            }
+
+            // copper the new paths no longer use (a cut piece, what hung on it) goes
+            for( bool again = ok; again; )
+            {
+                again = false;
+                board->BuildConnectivity();
+                std::shared_ptr<CONNECTIVITY_DATA> now = board->GetConnectivity();
+                BOARD_COMMIT                       sweep( context->GetToolManager() );
+
+                for( PCB_TRACK* t : board->Tracks() )
+                {
+                    if( nets.count( t->GetNetCode() ) && !held.count( t->GetNetCode() ) && !t->IsLocked() && !danglingBefore.count( t->m_Uuid )
+                        && now->TestTrackEndpointDangling( t, true ) )
+                    {
+                        sweep.Remove( t );
+                        again = true;
+                    }
+                }
+
+                if( again )
+                    sweep.Push( _( "Remove dangling copper (API)" ) );
+                else
+                    sweep.Revert();
+            }
+
+            if( ok )
+            {
+                board->BuildConnectivity();
+                board->GetConnectivity()->RecalculateRatsnest();
+                const auto joined = board->GetConnectivity()->GetConnectedItems( job.from );
+                ok = std::find( joined.begin(), joined.end(), job.to ) != joined.end() && openOf( netCode ) < openBefore[netCode];
+
+                if( !ok )
+                    why = "laid, the connection is still open";
+
+                for( int n : nets )
+                {
+                    if( ok && n != netCode && openOf( n ) > openBefore[n] )
+                        ok = false, why = "laid, " + netName( n ) + " has more open connections";
+                }
+            }
+
+            nlohmann::json note = { { "net", job.net }, { "window_mm", region[0] }, { "nets", nets.size() }, { "held", held.size() },
+                                    { "tries", tries } };
+
+            if( answer.status < 400 )
+            {
+                const nlohmann::json& rounds = answer.body.value( "rounds", nlohmann::json::array() );
+                note["rounds"] = rounds.empty() ? 0 : rounds.back().value( "round", 0 ) + 1;
+            }
+
+            if( !ok )
+            {
+                putBack( nets );
+                note["kept"] = false;
+                note["reason"] = why;
+                row["repair"] = why;
+                row["repair_window"] = note;
+                repairNotes.push_back( note );
+                continue;
+            }
+
+            repairKept++;
+            boardVersion++;
+            done[index] = true;
+            row["routed"] = true;
+            row["retried"] = true;
+            row["engine"] = "repair";
+            row["repair_nets_moved"] = solving.size() - 1;
+
+            for( const char* key : { "reason", "violations", "stopped_at_mm", "blocked_by", "blocked_end", "budget", "boxed_in", "repair" } )
+                row.erase( key );
+
+            note["kept"] = true;
+            row["repair_window"] = note;
+            repairNotes.push_back( note );
+        }
+    }
+
     // a plateau that ran out with the pass's last turns (skipped ones try nothing) still counts
     plateauCheck( clockNow() );
     plateauInRipUp = false;
@@ -18032,6 +18490,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "rip_up", { { "tried", rippedTried }, { "won", rippedOk }, { "scope", ripScope },
                                             { "earlier_routes_movable", foreignJobs },
                                             { "earlier_routes_rerouted", foreignMoved } } },
+                              { "repair", { { "tried", repairTried }, { "kept", repairKept }, { "windows", repairNotes } } },
                               { "clean_up", { { "tried", cleanTried }, { "skipped", cleanSkipped }, { "kept", cleanKept }, { "vias_removed", viasRemoved }, { "via_ways", viaWays }, { "vias_added", viasAdded },
                                               { "shortened_mm", std::round( pcbIUScale.IUTomm( shortenedIU ) * 1000.0 ) / 1000.0 } } },
                               { "via_cost_mm", std::round( viaCostMm * 1000.0 ) / 1000.0 },
@@ -25380,6 +25839,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "variants":{"type":"integer","default":0,"description":"grid: how many of the built-in variants (pcb_route_strategies) run in parallel; 0 one per two cores, as many as half the available memory holds (grid.lane_mb, grid.lanes_memory_allows)"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
+                        "repair":{"type":"boolean","default":true,"description":"a connection still open after the oracle's pass is solved again with its neighbours: in a window round its ends (repair_margin_mm, default 3) the movable copper (this call's; any unlocked with rip_up_scope unlocked; never locked, a pair laid coupled or a zone net's) is taken up, cut at the window's edge, and pcb_route_oracle_joint solves those nets together (repair_cell_mm 0.025, repair_rounds 300, repair_max_work_m 2000, claim slack 0); a net it cannot join again gets its copper back and the rest is solved round it; the converged paths are laid through the guard (at the rules' width, else the oracle's), copper they leave dangling goes. Kept only when the connection joins and no net of the window has more open connections, else all goes back. Row engine repair, repair_nets_moved; or repair (why not); answer repair {tried, kept, windows[]}; at most repair_max windows (50); it writes, so a grid dry run has none"},
+                        "repair_margin_mm":{"type":"number","default":3},"repair_cell_mm":{"type":"number","default":0.025},"repair_rounds":{"type":"integer","default":300},"repair_max_work_m":{"type":"number","default":2000},"repair_max":{"type":"integer","default":50},
                         "oracle_pass":{"type":"boolean","default":true,"description":"a connection still open after every pass, the grid engine's too (not a differential pair's nets) gets a last try along the path pcb_route_oracle proves at the narrowest track the rules allow the net at either end (the class width with neck_down off): smoothed to lines at 0/45/90 degrees where the guard lets them, laid by the router through those corners and widened back as the narrowest try is (profile.pass oracle); the oracle's path has the fewest vias, on the call's layers, none in a chip's ring of pins (as the plan). The row says engine oracle when it routes; oracle_verdict (routable, unknown, unroutable) and oracle_reason when not; oracle_args, the arguments it asked pcb_route_oracle with; oracle_refused, why the guard refused the path's line on from where it stopped (walls_way_out_of a pad, or the guard's violations)"},
                         "oracle_exact":{"type":"boolean","default":false,"description":"the oracle's pass lays its smoothed path as it is (tracks through its corners, a through via at each layer change), not through the router first; the router's line is laid that way anyway when the guard rejects it"},
                         "oracle_via_cost_mm":{"type":"number","minimum":0,"default":2,"description":"the oracle's pass asks for the path of the least length plus this per via"},

@@ -2031,6 +2031,34 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         }
     }
 
+    // layers the paths may use: the rest shut to a track, a via still passes them
+    if( aArgs.contains( "layers" ) )
+    {
+        if( !aArgs["layers"].is_array() )
+            return KOPENAPI_RESULT::Error( 400, "layers: copper layer names" );
+
+        int open = 0;
+
+        for( int l = 0; l < L; ++l )
+        {
+            bool asked = false;
+
+            for( const nlohmann::json& name : aArgs["layers"] )
+                asked |= name.is_string() && board->GetLayerID( wxString::FromUTF8( name.get<std::string>() ) ) == layers[l];
+
+            open += asked;
+
+            if( asked )
+                continue;
+
+            for( size_t c = 0; c < classes.size(); ++c )
+                std::fill( ownTrack[c].begin() + (size_t) l * cells, ownTrack[c].begin() + (size_t) ( l + 1 ) * cells, (uint16_t) 0xFFFF );
+        }
+
+        if( !open )
+            return KOPENAPI_RESULT::Error( 400, "layers: copper layers of the board" );
+    }
+
     const double buildMs = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
 
     // per class: the largest clearance of its nets
@@ -3008,6 +3036,7 @@ KOPENAPI_REGISTER( "pcb_route_oracle_joint",
                         "nets":{"type":"array","items":{"type":"string"},"description":"only these nets (default every net with more than one island)"},
                         "region":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"description":"boxes [x0, y0, x1, y1] mm: the grid covers them only, the copper outside stays fixed; a net joins its islands that reach a box (result islands_outside: those that do not), its paths inside the boxes; answer region {boxes, cells}"},
                         "vias":{"type":"boolean","default":true},
+                        "layers":{"type":"array","items":{"type":"string"},"description":"copper layers the paths may run on (default all); a via still passes the others"},
                         "zones_yield":{"type":"boolean","default":true,"description":"zone fills shut no via (a refill clears round it); tracks keep out of them"},
                         "cell_mm":{"type":"number","default":0.05,"minimum":0.005},
                         "max_cells_m":{"type":"number","default":6,"description":"millions of cells per layer at most: the cell grows to fit"},
