@@ -15977,21 +15977,35 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
     // out; before each retry round too (aAll false: tracks only, a lane or a via laid ahead of its
     // route stays), where it would shut in a pin that nothing else does
     int stubs = 0;
+    // a round that leaves a net with more open connections (the tie rule of the dangling test on
+    // short pieces) is undone for that net, and the net is swept no more in this call
+    std::set<int>  stubsHeld;
+    nlohmann::json stubsUndone = nlohmann::json::array();
 
     auto sweepStubs = [&]( bool aAll )
     {
+        auto openOf = [&]( int aNet ) -> size_t
+        {
+            RN_NET* rn = board->GetConnectivity()->GetRatsnestForNet( aNet );
+            return rn ? rn->GetEdges().size() : 0;
+        };
+
         for( bool again = !dryRun; again; )
         {
             again = false;
             board->BuildConnectivity();
             std::shared_ptr<CONNECTIVITY_DATA> conn = board->GetConnectivity();
+            conn->RecalculateRatsnest();
             BOARD_COMMIT                       sweep( context->GetToolManager() );
+            std::map<int, size_t>              openThen;
+            std::map<int, std::vector<std::unique_ptr<PCB_TRACK>>>           taken;
+            std::map<int, std::vector<std::tuple<KIID, VECTOR2I, VECTOR2I>>> trimmed;
 
             for( const KIID& id : added )
             {
                 PCB_TRACK* track = dynamic_cast<PCB_TRACK*>( board->ResolveItem( id, true ) );
 
-                if( !track || track->IsLocked() || !callNets.count( track->GetNetCode() ) )
+                if( !track || track->IsLocked() || !callNets.count( track->GetNetCode() ) || stubsHeld.count( track->GetNetCode() ) )
                     continue;
 
                 if( !aAll && ( track->Type() == PCB_VIA_T || ringItems.count( track ) ) )
@@ -16001,12 +16015,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
                 if( conn->TestTrackEndpointDangling( track, true, &freeEnd ) )
                 {
+                    const int n = track->GetNetCode();
+
+                    if( !openThen.count( n ) )
+                        openThen[n] = openOf( n );
+
                     // copper of the net joins it between its ends: cut back to that joint, else out
                     const std::optional<VECTOR2I> joint = track->Type() == PCB_TRACE_T ? innerJoint( conn, track, freeEnd )
                                                                                        : std::nullopt;
 
                     if( joint )
                     {
+                        trimmed[n].emplace_back( track->m_Uuid, track->GetStart(), track->GetEnd() );
                         sweep.Modify( track );
 
                         if( track->GetStart() == freeEnd )
@@ -16016,6 +16036,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     }
                     else
                     {
+                        taken[n].emplace_back( static_cast<PCB_TRACK*>( track->Clone() ) );
                         sweep.Remove( track );
                     }
 
@@ -16024,10 +16045,48 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
             }
 
-            if( again )
-                sweep.Push( _( "Remove dangling copper (API)" ) );
-            else
+            if( !again )
+            {
                 sweep.Revert();
+                break;
+            }
+
+            sweep.Push( _( "Remove dangling copper (API)" ) );
+            board->BuildConnectivity();
+            board->GetConnectivity()->RecalculateRatsnest();
+            BOARD_COMMIT undo( context->GetToolManager() );
+            bool         undone = false;
+
+            for( auto& [n, before] : openThen )
+            {
+                const size_t after = openOf( n );
+
+                if( after <= before )
+                    continue;
+
+                for( std::unique_ptr<PCB_TRACK>& t : taken[n] )
+                    undo.Add( t.release() );
+
+                for( auto& [id, start, end] : trimmed[n] )
+                {
+                    if( PCB_TRACK* t = dynamic_cast<PCB_TRACK*>( board->ResolveItem( id, true ) ) )
+                    {
+                        undo.Modify( t );
+                        t->SetStart( start );
+                        t->SetEnd( end );
+                    }
+                }
+
+                stubsHeld.insert( n );
+                stubsUndone.push_back( { { "net", str( UnescapeString( board->FindNet( n )->GetNetname() ) ) },
+                                         { "open_before", before }, { "open_after", after }, { "final", aAll } } );
+                undone = true;
+            }
+
+            if( undone )
+                undo.Push( _( "Remove dangling copper undone (API)" ) );
+            else
+                undo.Revert();
         }
     };
 
@@ -17666,7 +17725,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                             points.push_back( { { "at", path[k]["at"] }, { "via", at } } );
                             layer = at;
                         }
-                        else
+                        else if( path[k]["at"] != path[k - 1]["at"] )
                         {
                             points.push_back( path[k]["at"] );
                         }
@@ -17741,30 +17800,68 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             // copper the new paths no longer use (a cut piece, what hung on it) goes
             nlohmann::json swept = nlohmann::json::object();
+            // a round that leaves a net with more open connections (the tie rule of the dangling test
+            // on short pieces) is undone for that net, and its sweep stops
+            std::set<int> sweepDone;
+
             for( bool again = ok; again; )
             {
                 again = false;
                 board->BuildConnectivity();
                 std::shared_ptr<CONNECTIVITY_DATA> now = board->GetConnectivity();
+                now->RecalculateRatsnest();
                 BOARD_COMMIT                       sweep( context->GetToolManager() );
+                std::map<int, std::vector<std::unique_ptr<PCB_TRACK>>> taken;
+                std::map<int, size_t>                                  openThen;
 
                 for( PCB_TRACK* t : board->Tracks() )
                 {
-                    if( nets.count( t->GetNetCode() ) && !held.count( t->GetNetCode() ) && !t->IsLocked() && !danglingBefore.count( t->m_Uuid )
+                    const int n = t->GetNetCode();
+
+                    if( nets.count( n ) && !held.count( n ) && !sweepDone.count( n ) && !t->IsLocked() && !danglingBefore.count( t->m_Uuid )
                         && now->TestTrackEndpointDangling( t, true ) )
                     {
+                        if( !openThen.count( n ) )
+                            openThen[n] = openOf( n );
+
+                        taken[n].emplace_back( static_cast<PCB_TRACK*>( t->Clone() ) );
                         sweep.Remove( t );
-                        swept[netName( t->GetNetCode() )].push_back(
+                        swept[netName( n )].push_back(
                                 { toMm( t->GetStart().x ), toMm( t->GetStart().y ), toMm( t->GetEnd().x ), toMm( t->GetEnd().y ),
                                   std::find( laidNow.begin(), laidNow.end(), t->m_Uuid ) != laidNow.end() } );
                         again = true;
                     }
                 }
 
-                if( again )
-                    sweep.Push( _( "Remove dangling copper (API)" ) );
-                else
+                if( !again )
+                {
                     sweep.Revert();
+                    break;
+                }
+
+                sweep.Push( _( "Remove dangling copper (API)" ) );
+                board->BuildConnectivity();
+                board->GetConnectivity()->RecalculateRatsnest();
+                BOARD_COMMIT undo( context->GetToolManager() );
+                bool         undone = false;
+
+                for( auto& [n, items] : taken )
+                {
+                    if( openOf( n ) <= openThen[n] )
+                        continue;
+
+                    for( std::unique_ptr<PCB_TRACK>& t : items )
+                        undo.Add( t.release() );
+
+                    sweepDone.insert( n );
+                    swept[netName( n )].push_back( "the round put back: it opened a connection" );
+                    undone = true;
+                }
+
+                if( undone )
+                    undo.Push( _( "Remove dangling copper undone (API)" ) );
+                else
+                    undo.Revert();
             }
 
             if( ok )
@@ -17800,6 +17897,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             if( !ok )
             {
+
                 putBack( nets );
                 note["kept"] = false;
                 note["reason"] = why;
@@ -18596,7 +18694,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               { "clean_up", { { "tried", cleanTried }, { "skipped", cleanSkipped }, { "kept", cleanKept }, { "vias_removed", viasRemoved }, { "via_ways", viaWays }, { "vias_added", viasAdded },
                                               { "shortened_mm", std::round( pcbIUScale.IUTomm( shortenedIU ) * 1000.0 ) / 1000.0 } } },
                               { "via_cost_mm", std::round( viaCostMm * 1000.0 ) / 1000.0 },
-                              { "stubs_removed", stubs },
+                              { "stubs_removed", stubs }, { "stubs_undone", stubsUndone },
                               { "doubled_removed", twins },
                               { "kept_out_under", keptOut },
                               { "grid", gridOut },
@@ -25849,7 +25947,7 @@ KOPENAPI_REGISTER( "pcb_route",
                    "connection rip_up_budget_s; a cancel or a spent budget stops a router try within its walkaround / shove "
                    "steps (the row's reason says so; profile tries_stopped); "
                    "every route passes the net-merge guard; copper of this call that ends nowhere is removed, or cut back "
-                   "to where other copper of its net joins it between its ends (stubs_removed counts both); copper of nets outside the call that shove pushed aside is listed "
+                   "to where other copper of its net joins it between its ends (stubs_removed counts both; a sweep that would open a connection of a net is undone for that net, stubs_undone); copper of nets outside the call that shove pushed aside is listed "
                    "(other_nets_moved: pieces and length before / after); a row still routed at the end is "
                    "joined by copper; per connection "
                    "routed / reason and ms (every try for it), via_list (the row's vias as laid, dry run too, either engine: at_mm, layers, "
