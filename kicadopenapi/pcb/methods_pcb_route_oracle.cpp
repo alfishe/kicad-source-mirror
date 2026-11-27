@@ -28,6 +28,7 @@
 #include <kicadopenapi_util.h>
 #include <pad.h>
 #include <pcb_track.h>
+#include <trigo.h>
 #include <zone.h>
 
 #include <algorithm>
@@ -1856,6 +1857,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         int                                             joined = 0;
         int                                             outside = 0;     // islands that reach no box of the region
         std::vector<std::string>                        noCells;         // islands with no cell a track centre of the net may take
+        std::map<size_t, std::pair<VECTOR2I, VECTOR2I>> exitEnds;       // island ends at an exact exit: state -> (pad, stub end)
         size_t                                          conflicts = 0;
     };
 
@@ -2058,6 +2060,130 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
 
         if( !open )
             return KOPENAPI_RESULT::Error( 400, "layers: copper layers of the board" );
+    }
+
+    // exact pad exits: a fine-pitch pin may have no cell a track centre of its net may take on the
+    // pessimistic grid while a track of the net's width enters it on its axis at exactly the clearance
+    // (as the router does): a stub along each of the pad's axes, checked on the true shapes, to the first
+    // cell the grid lets the net take is an end of its island there
+    struct EXIT
+    {
+        size_t   state;
+        int      island;
+        VECTOR2I pad, on;
+    };
+
+    std::vector<std::vector<EXIT>> exitsOf( jobs.size() );
+
+    {
+        const bool zonesYield = aArgs.value( "zones_yield", true );
+
+        for( size_t j = 0; j < jobs.size(); ++j )
+        {
+            JOB&                         job = jobs[j];
+            const std::vector<uint16_t>& own = ownTrack[job.cls];
+            const uint16_t               me = (uint16_t) job.net;
+            const int                    width = job.probe.width;
+
+            for( size_t k = 0; k < job.islands.size(); ++k )
+            {
+                for( BOARD_CONNECTED_ITEM* item : job.islands[k] )
+                {
+                    if( item->Type() != PCB_PAD_T )
+                        continue;
+
+                    PAD*        pad = static_cast<PAD*>( item );
+                    const int   reach = std::max( pad->GetSize( PADSTACK::ALL_LAYERS ).x, pad->GetSize( PADSTACK::ALL_LAYERS ).y ) / 2
+                                      + pcbIUScale.mmToIU( 1.0 );
+                    BOX2I       near = pad->GetBoundingBox();
+                    near.Inflate( reach + width + job.clearance * 2 );
+
+                    for( int l = 0; l < L; ++l )
+                    {
+                        const PCB_LAYER_ID layer = layers[l];
+
+                        if( !pad->FlashLayer( layer ) )
+                            continue;
+
+                        std::vector<std::pair<std::shared_ptr<SHAPE>, int>> walls;
+
+                        auto wall = [&]( BOARD_CONNECTED_ITEM* aItem )
+                        {
+                            if( aItem->GetNetCode() == job.net || !aItem->IsOnLayer( layer ) || !near.Intersects( aItem->GetBoundingBox() ) )
+                                return;
+
+                            if( aItem->Type() == PCB_PAD_T && !static_cast<PAD*>( aItem )->FlashLayer( layer ) )
+                                return;
+
+                            walls.emplace_back( aItem->GetEffectiveShape( layer ), std::max( job.clearance, aItem->GetOwnClearance( layer ) ) );
+                        };
+
+                        for( FOOTPRINT* fp : board->Footprints() )
+                        {
+                            if( !near.Intersects( fp->GetBoundingBox() ) )
+                                continue;
+
+                            for( PAD* other : fp->Pads() )
+                                wall( other );
+                        }
+
+                        for( PCB_TRACK* t : board->Tracks() )
+                            wall( t );
+
+                        if( !zonesYield )
+                        {
+                            for( ZONE* zone : board->Zones() )
+                            {
+                                if( zone->GetIsRuleArea() || zone->GetNetCode() == job.net || !zone->IsOnLayer( layer )
+                                    || !near.Intersects( zone->GetBoundingBox() ) || !zone->HasFilledPolysForLayer( layer ) )
+                                {
+                                    continue;
+                                }
+
+                                walls.emplace_back( std::make_shared<SHAPE_POLY_SET>( *zone->GetFilledPolysList( layer ) ),
+                                                    std::max( job.clearance, zone->GetLocalClearance().value_or( 0 ) ) );
+                            }
+                        }
+
+                        auto clear = [&]( const VECTOR2I& aA, const VECTOR2I& aB )
+                        {
+                            const SHAPE_SEGMENT seg( aA, aB, width );
+
+                            return std::none_of( walls.begin(), walls.end(),
+                                                 [&]( const auto& aWall ) { return aWall.first->Collide( &seg, aWall.second - 1 ); } );
+                        };
+
+                        const VECTOR2I c = pad->ShapePos( layer );
+
+                        for( const VECTOR2I& unit : { VECTOR2I( 1000000, 0 ), VECTOR2I( -1000000, 0 ), VECTOR2I( 0, 1000000 ), VECTOR2I( 0, -1000000 ) } )
+                        {
+                            VECTOR2I dir = unit;
+                            RotatePoint( dir, -pad->GetOrientation() );
+
+                            for( int step = 0; step <= reach; step += std::max( 1, grid.cell / 2 ) )
+                            {
+                                const VECTOR2I at = c + VECTOR2I( dir ).Resize( step );
+                                const int      x = ( at.x - grid.origin.x ) / grid.cell, y = ( at.y - grid.origin.y ) / grid.cell;
+
+                                if( at.x < grid.origin.x || at.y < grid.origin.y || x >= grid.nx || y >= grid.ny || !clear( c, at ) )
+                                    break;
+
+                                const size_t   state = (size_t) l * cells + (size_t) y * grid.nx + x;
+                                const uint16_t o = own[state];
+
+                                if( o != 0 && o != me )
+                                    continue;
+
+                                if( clear( at, grid.Centre( x, y ) ) )
+                                    exitsOf[j].push_back( { state, (int) k, c, at } );
+
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     const double buildMs = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - started ).count();
@@ -2305,6 +2431,32 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                     } );
                 }
             }
+        }
+
+        aJob.exitEnds.clear();
+
+        for( const EXIT& e : exitsOf[(size_t) ( &aJob - jobs.data() )] )
+        {
+            const size_t i = e.state % cells;
+            const int    l = (int) ( e.state / cells ), x = (int) ( i % grid.nx ), y = (int) ( i / grid.nx );
+
+            if( x < x0 || x > x1 || y < y0 || y > y1 )
+                continue;
+
+            int16_t& at = island[(size_t) l * wc + (size_t) ( y - y0 ) * wx + ( x - x0 )];
+
+            if( at != -1 )
+                continue;
+
+            at = (int16_t) e.island;
+
+            if( !hasCells[e.island] )
+                islandBox[e.island] = BOX2I( VECTOR2I( x - x0, y - y0 ), VECTOR2I( 0, 0 ) );
+            else
+                islandBox[e.island].Merge( VECTOR2I( x - x0, y - y0 ) );
+
+            hasCells[e.island] = 1;
+            aJob.exitEnds[e.state] = { e.pad, e.on };
         }
 
         aJob.noCells.clear();
@@ -2723,10 +2875,33 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     }
 
     // the paths as the single oracle gives them: corners where the step changes, a via where the layer does
-    auto points = [&]( const std::vector<size_t>& aPath )
+    auto points = [&]( const JOB& aJob, const std::vector<size_t>& aPath )
     {
         nlohmann::json pts = nlohmann::json::array();
         int64_t        lastDx = 9, lastDy = 9;
+
+        // an end at an exact exit: the stub to the pad's centre along its axis
+        auto stub = [&]( size_t aState, bool aFirst )
+        {
+            auto it = aJob.exitEnds.find( aState );
+
+            if( it == aJob.exitEnds.end() )
+                return;
+
+            const std::string layer = str( board->GetLayerName( layers[(int) ( aState / cells )] ) );
+            const VECTOR2I    order[2] = { aFirst ? it->second.first : it->second.second, aFirst ? it->second.second : it->second.first };
+
+            for( const VECTOR2I& at : order )
+            {
+                if( pts.size() && pts.back()["at"] == nlohmann::json( { pcbIUScale.IUTomm( at.x ), pcbIUScale.IUTomm( at.y ) } ) )
+                    continue;
+
+                pts.push_back( { { "at", { pcbIUScale.IUTomm( at.x ), pcbIUScale.IUTomm( at.y ) } }, { "layer", layer } } );
+            }
+        };
+
+        if( !aPath.empty() )
+            stub( aPath.front(), true );
 
         for( size_t j = 0; j < aPath.size(); ++j )
         {
@@ -2751,6 +2926,9 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                                  { "layer", str( board->GetLayerName( layers[l] ) ) } } );
             }
         }
+
+        if( !aPath.empty() )
+            stub( aPath.back(), false );
 
         return pts;
     };
@@ -2781,7 +2959,7 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
             nlohmann::json paths = nlohmann::json::array();
 
             for( const std::vector<size_t>& p : job.paths )
-                paths.push_back( points( p ) );
+                paths.push_back( points( job, p ) );
 
             n["paths"] = paths;
         }
