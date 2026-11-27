@@ -64,5 +64,8 @@ endif()
 
 find_package( nng ${NNG_VERSION} CONFIG REQUIRED PATHS ${NNG_INSTALL_DIR} NO_DEFAULT_PATH )
 
+# plain -I, ahead of every -isystem: a host nng 1.x header (Homebrew's /opt/homebrew/include) must not win
+set_target_properties( nng::nng PROPERTIES SYSTEM FALSE )
+
 set( NNG_LIBRARY nng::nng )
 set( NNG_INCLUDE_DIR ${NNG_INSTALL_DIR}/include )
