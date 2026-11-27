@@ -17383,6 +17383,12 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 continue;
             }
 
+            if( (int) nets.size() > aArgs.value( "repair_max_nets", 60 ) )
+            {
+                row["repair"] = "not tried: " + std::to_string( nets.size() ) + " nets in the window (repair_max_nets)";
+                continue;
+            }
+
             if( profile.pass != "repair" )
                 profile.pass = "repair";
 
@@ -17502,6 +17508,17 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             std::string     why;
             nlohmann::json  tries = nlohmann::json::array();
 
+            nlohmann::json  layerNames = nlohmann::json::array();
+
+            for( PCB_LAYER_ID l : layers )
+                layerNames.push_back( str( board->GetLayerName( l ) ) );
+
+            // claim slack 0 first (more converges; the guard judges the laid paths), the default slack
+            // (paths that keep the clearances as solved) when the guard refuses one
+            auto solve = [&]( bool aSlack ) -> bool
+            {
+            solved = false;
+
             for( int round = 0; round < 4 && !solved; ++round )
             {
                 nlohmann::json names = nlohmann::json::array();
@@ -17509,21 +17526,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 for( int n : solving )
                     names.push_back( netName( n ) );
 
-                nlohmann::json layerNames = nlohmann::json::array();
-
-                for( PCB_LAYER_ID l : layers )
-                    layerNames.push_back( str( board->GetLayerName( l ) ) );
-
                 nlohmann::json args = { { "nets", names },
                                         { "region", region },
                                         { "layers", layerNames },
                                         { "vias", viasAllowed },
                                         { "cell_mm", aArgs.value( "repair_cell_mm", 0.025 ) },
-                                        { "rounds", aArgs.value( "repair_rounds", 300 ) },
+                                        { "rounds", aArgs.value( "repair_rounds", 80 ) },
                                         { "max_work_m", aArgs.value( "repair_max_work_m", 2000.0 ) },
-                                        { "claim_slack_mm", 0.0 },
                                         { "cuts", false },
                                         { "zones_yield", zoneMode == "refill" } };
+
+                if( !aSlack )
+                    args["claim_slack_mm"] = 0.0;
 
                 answer = joint->handler( aCtx, args );
 
@@ -17552,7 +17566,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
 
                 tries.push_back( { { "nets", solving.size() }, { "unjoined", unjoined }, { "sharing", sharing },
-                                   { "ends_without_cells", blind }, { "converged", solved } } );
+                                   { "ends_without_cells", blind }, { "converged", solved }, { "slack", aSlack } } );
 
                 for( const nlohmann::json& n : answer.body.value( "result", nlohmann::json::array() ) )
                 {
@@ -17589,10 +17603,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
             }
 
-            // the converged paths laid through the guard: at the rules' width, else at the oracle's
-            bool ok = solved;
+            return solved;
+            };
 
-            for( const nlohmann::json& n : ok ? answer.body.value( "result", nlohmann::json::array() ) : nlohmann::json::array() )
+            // the converged paths laid through the guard: at the rules' width, else at the oracle's
+            std::vector<KIID> laidNow;
+            bool              refused = false;
+
+            auto layAll = [&]() -> bool
+            {
+            bool ok = true;
+
+            for( const nlohmann::json& n : answer.body.value( "result", nlohmann::json::array() ) )
             {
                 for( const nlohmann::json& path : n.value( "paths", nlohmann::json::array() ) )
                 {
@@ -17641,14 +17663,43 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     if( laid.status != 200 )
                     {
                         ok = false;
+                        refused = true;
                         why = "the guard refuses a path of " + n.value( "net", std::string() ) + ": "
                               + laid.body.value( "error", nlohmann::json::object() ).value( "message", laid.body.dump().substr( 0, 200 ) );
                         break;
                     }
 
                     for( const nlohmann::json& u : laid.body.value( "uuids", nlohmann::json::array() ) )
-                        added.push_back( KIID( wxString::FromUTF8( u.get<std::string>() ) ) );
+                    {
+                        laidNow.emplace_back( wxString::FromUTF8( u.get<std::string>() ) );
+                        added.push_back( laidNow.back() );
+                    }
                 }
+
+                if( !ok )
+                    break;
+            }
+
+            return ok;
+            };
+
+            bool ok = solve( false ) && layAll();
+
+            if( !ok && refused )
+            {
+                BOARD_COMMIT undo( context->GetToolManager() );
+
+                for( const KIID& id : laidNow )
+                {
+                    if( BOARD_ITEM* item = board->ResolveItem( id, true ) )
+                        undo.Remove( item );
+                }
+
+                undo.Push( _( "Repair paths taken out (API)" ) );
+                board->BuildConnectivity();
+                laidNow.clear();
+                refused = false;
+                ok = solve( true ) && layAll();
             }
 
             // copper the new paths no longer use (a cut piece, what hung on it) goes
@@ -25844,8 +25895,8 @@ KOPENAPI_REGISTER( "pcb_route",
                         "variants":{"type":"integer","default":0,"description":"grid: how many of the built-in variants (pcb_route_strategies) run in parallel; 0 one per two cores, as many as half the available memory holds (grid.lane_mb, grid.lanes_memory_allows)"},
                         "plane_layers":{"type":"boolean","default":false,"description":"route on plane layers too (type power in the stack-up, or an inner layer more than half of which one net's pours cover): skipped by default, a track would cut the plane; the answer lists plane_layers_skipped"},
                         "under_parts":{"type":"string","enum":["allow","avoid"],"default":"allow","description":"avoid: no track or via of this call (grid and pns) inside the ring of pads of a quad package (QFP / QFN / LGA, pads on four sides) on its side - tracks there can wall its other pins in (blocked_by names them); with an exposed pad the ring between the pad rows and the exposed pad is kept out (the exposed pad and its clearance stay open); BGAs stay open; the answer lists kept_out_under. Costs routes on a crowded board (TC-13: 77 -> 70 of 81)"},
-                        "repair":{"type":"boolean","default":true,"description":"a connection still open after the oracle's pass is solved again with its neighbours: in a window round its ends (repair_margin_mm, default 3) the movable copper (this call's; any unlocked with rip_up_scope unlocked; never locked, a pair laid coupled or a zone net's) is taken up, cut at the window's edge, and pcb_route_oracle_joint solves those nets together (repair_cell_mm 0.025, repair_rounds 300, repair_max_work_m 2000, claim slack 0); a net it cannot join again gets its copper back and the rest is solved round it; the converged paths are laid through the guard (at the rules' width, else the oracle's), copper they leave dangling goes. Kept only when the connection joins and no net of the window has more open connections, else all goes back. Row engine repair, repair_nets_moved; or repair (why not); answer repair {tried, kept, windows[]}; at most repair_max windows (50); it writes, so a grid dry run has none"},
-                        "repair_margin_mm":{"type":"number","default":3},"repair_cell_mm":{"type":"number","default":0.025},"repair_rounds":{"type":"integer","default":300},"repair_max_work_m":{"type":"number","default":2000},"repair_max":{"type":"integer","default":50},
+                        "repair":{"type":"boolean","default":true,"description":"a connection still open after the oracle's pass is solved again with its neighbours: in a window round its ends (repair_margin_mm, default 3) the movable copper (this call's; any unlocked with rip_up_scope unlocked; never locked, a pair laid coupled or a zone net's) is taken up, cut at the window's edge, and pcb_route_oracle_joint solves those nets together (repair_cell_mm 0.025, repair_rounds 80, repair_max_work_m 2000, claim slack 0; not tried with more than repair_max_nets 60 nets); a net it cannot join again gets its copper back and the rest is solved round it; the converged paths are laid through the guard (at the rules' width, else the oracle's), solved again at the default claim slack when the guard refuses one, copper they leave dangling goes. Kept only when the connection joins and no net of the window has more open connections, else all goes back. Row engine repair, repair_nets_moved; or repair (why not); answer repair {tried, kept, windows[]}; at most repair_max windows (50); it writes, so a grid dry run has none"},
+                        "repair_margin_mm":{"type":"number","default":3},"repair_cell_mm":{"type":"number","default":0.025},"repair_rounds":{"type":"integer","default":80},"repair_max_nets":{"type":"integer","default":60},"repair_max_work_m":{"type":"number","default":2000},"repair_max":{"type":"integer","default":50},
                         "oracle_pass":{"type":"boolean","default":true,"description":"a connection still open after every pass, the grid engine's too (not a differential pair's nets) gets a last try along the path pcb_route_oracle proves at the narrowest track the rules allow the net at either end (the class width with neck_down off): smoothed to lines at 0/45/90 degrees where the guard lets them, laid by the router through those corners and widened back as the narrowest try is (profile.pass oracle); the oracle's path has the fewest vias, on the call's layers, none in a chip's ring of pins (as the plan). The row says engine oracle when it routes; oracle_verdict (routable, unknown, unroutable) and oracle_reason when not; oracle_args, the arguments it asked pcb_route_oracle with; oracle_refused, why the guard refused the path's line on from where it stopped (walls_way_out_of a pad, or the guard's violations)"},
                         "oracle_exact":{"type":"boolean","default":false,"description":"the oracle's pass lays its smoothed path as it is (tracks through its corners, a through via at each layer change), not through the router first; the router's line is laid that way anyway when the guard rejects it"},
                         "oracle_via_cost_mm":{"type":"number","minimum":0,"default":2,"description":"the oracle's pass asks for the path of the least length plus this per via"},
