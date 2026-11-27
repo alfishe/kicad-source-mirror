@@ -2874,6 +2874,115 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         }
     }
 
+    // a net no other net shares with: each staircase of a path on one layer pulled into one straight and
+    // one diagonal leg, over cells the net may take and no other net's claim keeps it out of (the legs
+    // run through cell centres, so the claims stay exact)
+    auto pull = [&]( JOB& aJob )
+    {
+        const std::vector<uint16_t>& own = ownTrack[aJob.cls];
+        const std::vector<uint8_t>&  claimT = claimTrack[aJob.cls];
+        const uint16_t               me = (uint16_t) aJob.net;
+        const std::set<size_t>       before( aJob.trackStates.begin(), aJob.trackStates.end() );
+        std::set<size_t>             onPath;
+
+        for( const std::vector<size_t>& p : aJob.paths )
+            onPath.insert( p.begin(), p.end() );
+
+        auto free = [&]( size_t k ) { return onPath.count( k ) || ( ( own[k] == 0 || own[k] == me ) && claimT[k] == 0 ); };
+
+        auto legs = [&]( size_t aFrom, size_t aTo, bool aDiagonalFirst, std::vector<size_t>& aOut )
+        {
+            const size_t base = aFrom / cells * cells;
+            int          x = (int) ( aFrom % cells % grid.nx ), y = (int) ( aFrom % cells / grid.nx );
+            const int    tx = (int) ( aTo % cells % grid.nx ), ty = (int) ( aTo % cells / grid.nx );
+            const int    ax = std::abs( tx - x ), ay = std::abs( ty - y );
+            const int    sx = tx > x ? 1 : tx < x ? -1 : 0, sy = ty > y ? 1 : ty < y ? -1 : 0;
+            const int    diagonal = std::min( ax, ay ), straight = std::max( ax, ay ) - diagonal;
+            const int    lx = ax > ay ? sx : 0, ly = ax > ay ? 0 : sy;
+
+            aOut.clear();
+
+            auto run = [&]( int aSteps, int aDx, int aDy )
+            {
+                for( int s = 0; s < aSteps; ++s )
+                {
+                    x += aDx;
+                    y += aDy;
+                    const size_t k = base + (size_t) y * grid.nx + x;
+
+                    if( !free( k ) )
+                        return false;
+
+                    aOut.push_back( k );
+                }
+
+                return true;
+            };
+
+            return aDiagonalFirst ? run( diagonal, sx, sy ) && run( straight, lx, ly ) : run( straight, lx, ly ) && run( diagonal, sx, sy );
+        };
+
+        constexpr int       misses = 16;
+        std::vector<size_t> leg, best;
+
+        for( int pass = 0; pass < 2; ++pass )
+        for( std::vector<size_t>& p : aJob.paths )
+        {
+            if( p.size() < 3 )
+                continue;
+
+            std::vector<size_t> out = { p[0] };
+
+            for( size_t a = 0; a + 1 < p.size(); )
+            {
+                size_t end = a;
+
+                while( end + 1 < p.size() && p[end + 1] / cells == p[a] / cells )
+                    ++end;
+
+                size_t to = a + 1;
+                best = { p[a + 1] };
+
+                for( size_t b = a + 2, miss = 0; b <= end && (int) miss < misses; ++b )
+                {
+                    if( legs( p[a], p[b], true, leg ) || legs( p[a], p[b], false, leg ) )
+                        to = b, best = leg, miss = 0;
+                    else
+                        miss++;
+                }
+
+                out.insert( out.end(), best.begin(), best.end() );
+                a = to;
+            }
+
+            p = std::move( out );
+        }
+
+        aJob.trackStates.clear();
+
+        for( const std::vector<size_t>& p : aJob.paths )
+        {
+            for( size_t k : p )
+            {
+                if( before.count( k ) || !onPath.count( k ) )
+                    aJob.trackStates.push_back( k );
+            }
+        }
+    };
+
+    if( aArgs.value( "pull", true ) )
+    {
+        for( JOB& job : jobs )
+        {
+            if( conflicts( job, nullptr, nullptr ) )
+                continue;
+
+            claim( job, -1 );
+            pull( job );
+            claim( job, 1 );
+        }
+    }
+
     // the paths as the single oracle gives them: corners where the step changes, a via where the layer does
     auto points = [&]( const JOB& aJob, const std::vector<size_t>& aPath )
     {
@@ -3242,6 +3351,7 @@ KOPENAPI_REGISTER( "pcb_route_oracle_joint",
                         "reroute":{"type":"string","enum":["all","sharing"],"default":"all","description":"each round reroute every net, or only those that share"},
                         "max_work_m":{"type":"number","default":20000,"description":"millions of search steps at most"},
                         "paths":{"type":"boolean","default":true},
+                        "pull":{"type":"boolean","default":true,"description":"a path of a net no other net shares with: its staircases pulled into a straight and a diagonal leg over cells it may take"},
                         "claim_slack_mm":{"type":"number","minimum":0,"description":"the margin on each claim for centres off the true line (default a cell's diagonal: converged paths then keep the clearances; less: only DRC of the laid paths proves it)"},
                         "cuts":{"type":"boolean","default":true,"description":"when not converged: the rectangle round a hot square whose boundary most outnumbers the tracks that fit (cut.proves_impossible)"},
                         "cut_max_mm":{"type":"number","default":15}},
