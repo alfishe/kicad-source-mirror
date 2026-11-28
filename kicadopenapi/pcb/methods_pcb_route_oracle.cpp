@@ -19,6 +19,7 @@
 #include <drc/drc_engine.h>
 #include <drc/drc_rule.h>
 #include <footprint.h>
+#include <netclass.h>
 #include <convert_basic_shapes_to_polygon.h>
 #include <geometry/approximation.h>
 #include <geometry/corner_strategy.h>
@@ -28,6 +29,7 @@
 #include <kicadopenapi_util.h>
 #include <pad.h>
 #include <pcb_track.h>
+#include <project/net_settings.h>
 #include <trigo.h>
 #include <zone.h>
 
@@ -1833,6 +1835,85 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         edges.SetOrigin( a );
     }
 
+    const std::string gridAlign = aArgs.value( "grid_align", std::string( "board" ) );
+
+    if( gridAlign != "board" && gridAlign != "pads" )
+        return KOPENAPI_RESULT::Error( 400, "grid_align: board or pads" );
+
+    if( gridAlign == "pads" )
+    {
+        // the cells shifted so that the pins with no room to spare have their centre on a cell centre: two
+        // neighbours of other nets whose pitch leaves less than a cell over two tracks side by side (at the
+        // width the nets are solved at). Their tracks then run on the pins' axes, with no jog to a cell centre
+        // that takes from the neighbour's clearance; pins with room do not count
+        const BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+        const std::shared_ptr<NETCLASS> nc = bds.m_NetSettings->GetDefaultNetclass();
+        const int minWidth = bds.m_TrackMinWidth;
+        const int width = aArgs.value( "width", std::string( "min" ) ) == "opt" ? std::max( minWidth, nc->GetTrackWidth() ) : minWidth;
+        const int pair = width + std::max( bds.m_MinClearance, nc->GetClearance() );
+
+        std::map<int, int> byX, byY;
+        auto residue = [&]( int aAt, int aFrom ) { return ( ( aAt - aFrom - grid.cell / 2 ) % grid.cell + grid.cell ) % grid.cell; };
+        std::vector<PAD*> pads;
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            for( PAD* pad : fp->Pads() )
+            {
+                if( edges.Contains( pad->GetPosition() ) )
+                    pads.push_back( pad );
+            }
+        }
+
+        std::sort( pads.begin(), pads.end(), []( PAD* a, PAD* b ) { return a->GetPosition().x < b->GetPosition().x; } );
+
+        for( size_t i = 0; i < pads.size(); ++i )
+        {
+            const VECTOR2I a = pads[i]->GetPosition();
+
+            for( size_t k = i + 1; k < pads.size() && pads[k]->GetPosition().x - a.x < pair + grid.cell; ++k )
+            {
+                const VECTOR2I b = pads[k]->GetPosition();
+
+                if( pads[k]->GetNetCode() == pads[i]->GetNetCode() || !( pads[i]->GetLayerSet() & pads[k]->GetLayerSet() ).any() )
+                    continue;
+
+                const int dx = std::abs( b.x - a.x ), dy = std::abs( b.y - a.y );
+
+                if( dy <= grid.cell / 2 && dx > 0 && dx < pair + grid.cell )
+                {
+                    byX[residue( a.x, edges.GetX() )]++;
+                    byX[residue( b.x, edges.GetX() )]++;
+                }
+                else if( dx <= grid.cell / 2 && dy > 0 && dy < pair + grid.cell )
+                {
+                    byY[residue( a.y, edges.GetY() )]++;
+                    byY[residue( b.y, edges.GetY() )]++;
+                }
+            }
+        }
+
+        auto most = []( const std::map<int, int>& aCount )
+        {
+            int best = 0, count = 0;
+
+            for( const auto& [r, c] : aCount )
+            {
+                if( c > count )
+                {
+                    best = r;
+                    count = c;
+                }
+            }
+
+            return best;
+        };
+
+        const VECTOR2I shift( most( byX ), most( byY ) );
+        edges.SetOrigin( edges.GetOrigin() + shift - VECTOR2I( shift.x ? grid.cell : 0, shift.y ? grid.cell : 0 ) );
+        edges.SetSize( edges.GetWidth() + ( shift.x ? grid.cell : 0 ), edges.GetHeight() + ( shift.y ? grid.cell : 0 ) );
+    }
+
     grid.origin = edges.GetOrigin();
     grid.nx = edges.GetWidth() / grid.cell + 1;
     grid.ny = edges.GetHeight() / grid.cell + 1;
@@ -3348,6 +3429,7 @@ KOPENAPI_REGISTER( "pcb_route_oracle_joint",
                         "layers":{"type":"array","items":{"type":"string"},"description":"copper layers the paths may run on (default all); a via still passes the others"},
                         "zones_yield":{"type":"boolean","default":true,"description":"zone fills shut no via (a refill clears round it); tracks keep out of them"},
                         "cell_mm":{"type":"number","default":0.05,"minimum":0.005},
+                        "grid_align":{"type":"string","enum":["board","pads"],"default":"board","description":"board: the cells anchored at the board outline (a region's cells are the board's); pads: shifted so the pins with no room to spare (neighbours of other nets whose pitch leaves less than a cell over two tracks side by side) have their centre on a cell centre: their tracks run on the pins' axes"},
                         "width":{"type":"string","enum":["min","opt"],"default":"min","description":"the track width each net is solved at: the rules' minimum, or their preferred width (as pcb_track_add lays a track without width_mm)"},
                         "max_cells_m":{"type":"number","default":6,"description":"millions of cells per layer at most: the cell grows to fit"},
                         "margin_mm":{"type":"number","default":3,"description":"a net's search window round its copper (the whole board when it fails)"},

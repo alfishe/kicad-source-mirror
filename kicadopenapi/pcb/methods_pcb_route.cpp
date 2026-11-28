@@ -17663,7 +17663,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             // claim slack 0 first (more converges; the guard judges the laid paths), the default slack
             // (paths that keep the clearances as solved) when the guard refuses one
-            auto solve = [&]( bool aSlack, const char* aWidth ) -> bool
+            auto solve = [&]( bool aSlack, const char* aWidth, const char* aAlign ) -> bool
             {
             solved = false;
 
@@ -17683,6 +17683,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                         { "max_work_m", aArgs.value( "repair_max_work_m", 2000.0 ) },
                                         { "cuts", false },
                                         { "width", aWidth },
+                                        { "grid_align", aAlign },
                                         { "zones_yield", zoneMode == "refill" } };
 
                 if( !aSlack )
@@ -17715,7 +17716,20 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
 
                 tries.push_back( { { "nets", solving.size() }, { "unjoined", unjoined }, { "sharing", sharing },
-                                   { "ends_without_cells", blind }, { "converged", solved }, { "slack", aSlack }, { "width", aWidth } } );
+                                   { "ends_without_cells", blind }, { "converged", solved }, { "slack", aSlack }, { "width", aWidth }, { "grid_align", aAlign } } );
+
+                if( !solved )
+                {
+                    nlohmann::json hot = nlohmann::json::array();
+
+                    for( const nlohmann::json& h : answer.body.value( "hot", nlohmann::json::array() ) )
+                    {
+                        if( hot.size() < 4 )
+                            hot.push_back( h );
+                    }
+
+                    tries.back()["hot"] = hot;
+                }
 
                 for( const nlohmann::json& n : answer.body.value( "result", nlohmann::json::array() ) )
                 {
@@ -17843,16 +17857,29 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             };
 
             // at the rules' preferred width first; a window that does not fit at it at the minimum width; a
-            // solution the guard refuses solved again with the default claim slack
-            bool ok = false;
+            // solution the guard refuses solved again on cells on the tight pins (a jog to a cell centre takes
+            // from a neighbour's clearance), then with the default claim slack
+            bool ok = false, wasRefused = false;
 
-            for( auto [slack, width] : { std::pair( false, "opt" ), std::pair( false, "min" ), std::pair( true, "min" ) } )
+            struct TRY
             {
-                if( slack && !refused )
+                bool        slack;
+                const char* width;
+                const char* align;
+                bool        afterRefusal;
+            };
+
+            for( const TRY& t : { TRY{ false, "opt", "board", false }, TRY{ false, "min", "board", false },
+                                  TRY{ false, "min", "pads", true }, TRY{ true, "min", "board", true } } )
+            {
+                const bool slack = t.slack;
+
+                if( t.afterRefusal && !wasRefused )
                     break;
 
                 if( refused )
                 {
+                    wasRefused = true;
                     BOARD_COMMIT undo( context->GetToolManager() );
 
                     for( const KIID& id : laidNow )
@@ -17867,7 +17894,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     refused = false;
                 }
 
-                ok = solve( slack, width ) && layAll();
+                ok = solve( slack, t.width, t.align ) && layAll();
 
                 if( ok || answer.status >= 400 )
                     break;
@@ -17944,10 +17971,16 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 board->BuildConnectivity();
                 board->GetConnectivity()->RecalculateRatsnest();
                 const auto joined = board->GetConnectivity()->GetConnectedItems( job.from );
-                ok = std::find( joined.begin(), joined.end(), job.to ) != joined.end() && openOf( netCode ) < openBefore[netCode];
+                const bool ends = std::find( joined.begin(), joined.end(), job.to ) != joined.end();
+                const size_t openNow = openOf( netCode );
+                ok = ends && openNow < openBefore[netCode];
 
                 if( !ok )
-                    why = "laid, the connection is still open";
+                {
+                    why = ends ? "laid, the ends joined but the net has " + std::to_string( openNow ) + " open connections, "
+                                         + std::to_string( openBefore[netCode] ) + " before"
+                               : "laid, the connection is still open";
+                }
 
                 for( int n : nets )
                 {
