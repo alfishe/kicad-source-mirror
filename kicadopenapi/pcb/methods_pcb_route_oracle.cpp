@@ -2912,7 +2912,8 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     int            round = 0;
     size_t         lastShared = 0;
 
-    // the best round seen (fewest nets unjoined, then fewest cells shared): the answer when none converges
+    // the best round seen (fewest nets unjoined, then fewest cells shared plus its paths' length, a millimetre
+    // as one cell, so a long way round a neighbour's pads for a cell less loses): the answer when none converges
     struct KEPT
     {
         std::vector<std::vector<size_t>> paths;
@@ -2922,7 +2923,30 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     };
 
     std::vector<KEPT>             best;
-    std::pair<size_t, size_t>     bestScore{ SIZE_MAX, SIZE_MAX };
+    std::pair<size_t, double>     bestScore{ SIZE_MAX, 0.0 };
+
+    auto lengthMm = [&]()
+    {
+        double cellSteps = 0;
+
+        for( const JOB& job : jobs )
+        {
+            for( const std::vector<size_t>& p : job.paths )
+            {
+                for( size_t i = 1; i < p.size(); ++i )
+                {
+                    if( p[i] / cells != p[i - 1] / cells )
+                        continue;
+
+                    const size_t a = p[i - 1] % cells, b = p[i] % cells;
+                    cellSteps += std::hypot( (double) (int) ( b % grid.nx ) - (int) ( a % grid.nx ),
+                                             (double) (int) ( b / grid.nx ) - (int) ( a / grid.nx ) );
+                }
+            }
+        }
+
+        return pcbIUScale.IUTomm( grid.cell ) * cellSteps;
+    };
     int                           bestRound = -1;
 
     // the first round: every net alone in its window, the whole board where the window is too small
@@ -2973,12 +2997,14 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
         for( const JOB& job : jobs )
             unjoined += job.joined < (int) job.islands.size();
 
-        rounds.push_back( { { "round", round }, { "nets_sharing", nets }, { "cells_shared", shared }, { "nets_unjoined", unjoined },
-                            { "work_m", work / 1e6 } } );
+        const double length = lengthMm();
 
-        if( std::make_pair( unjoined, shared ) < bestScore )
+        rounds.push_back( { { "round", round }, { "nets_sharing", nets }, { "cells_shared", shared }, { "nets_unjoined", unjoined },
+                            { "length_mm", std::round( length * 1000 ) / 1000 }, { "work_m", work / 1e6 } } );
+
+        if( std::make_pair( unjoined, shared + length ) < bestScore )
         {
-            bestScore = { unjoined, shared };
+            bestScore = { unjoined, shared + length };
             bestRound = round;
             best.clear();
 
@@ -3494,7 +3520,7 @@ KOPENAPI_REGISTER( "pcb_route_oracle_joint",
                    "converged: every net joined and no cell shared, so the paths laid together keep the rules' "
                    "clearances (lay them and run DRC to prove it). Otherwise per net: joined, cells_shared. "
                    "result[]: net, islands, joined, cells_shared, islands_without_cells (an island with no cell a track centre of the net may take on the pessimistic grid, named by its pad: never joined at this cell), width_mm, via_mm, paths (per joined island: "
-                   "[{at, layer}], a layer change is a via); rounds[]: nets_sharing, cells_shared, nets_unjoined; "
+                   "[{at, layer}], a layer change is a via); rounds[]: nets_sharing, cells_shared, nets_unjoined, length_mm; "
                    "build_ms (the grids), negotiate_ms",
                    R"json({"type":"object","properties":{
                         "nets":{"type":"array","items":{"type":"string"},"description":"only these nets (default every net with more than one island)"},
