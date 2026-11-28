@@ -17663,7 +17663,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
 
             // claim slack 0 first (more converges; the guard judges the laid paths), the default slack
             // (paths that keep the clearances as solved) when the guard refuses one
-            auto solve = [&]( bool aSlack ) -> bool
+            auto solve = [&]( bool aSlack, const char* aWidth ) -> bool
             {
             solved = false;
 
@@ -17682,6 +17682,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                                         { "rounds", aArgs.value( "repair_rounds", 80 ) },
                                         { "max_work_m", aArgs.value( "repair_max_work_m", 2000.0 ) },
                                         { "cuts", false },
+                                        { "width", aWidth },
                                         { "zones_yield", zoneMode == "refill" } };
 
                 if( !aSlack )
@@ -17714,7 +17715,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                 }
 
                 tries.push_back( { { "nets", solving.size() }, { "unjoined", unjoined }, { "sharing", sharing },
-                                   { "ends_without_cells", blind }, { "converged", solved }, { "slack", aSlack } } );
+                                   { "ends_without_cells", blind }, { "converged", solved }, { "slack", aSlack }, { "width", aWidth } } );
 
                 for( const nlohmann::json& n : answer.body.value( "result", nlohmann::json::array() ) )
                 {
@@ -17754,7 +17755,7 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             return solved;
             };
 
-            // the converged paths laid through the guard: at the rules' width, else at the oracle's
+            // the converged paths laid through the guard
             std::vector<KIID> laidNow;
             bool              refused = false;
 
@@ -17798,15 +17799,10 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                     if( !ok )
                         break;
 
+                    // at the width the oracle solved the window for: its claims then hold for the laid copper
                     nlohmann::json args = { { "net", n["net"] }, { "layer", path[0]["layer"] }, { "points", points },
-                                            { "zones", zoneMode == "refill" ? "defer" : "keep" } };
+                                            { "width_mm", n["width_mm"] }, { "zones", zoneMode == "refill" ? "defer" : "keep" } };
                     KOPENAPI_RESULT laid = lay->handler( aCtx, args );
-
-                    if( laid.status != 200 )
-                    {
-                        args["width_mm"] = n["width_mm"];
-                        laid = lay->handler( aCtx, args );
-                    }
 
                     if( laid.status != 200 )
                     {
@@ -17816,7 +17812,18 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
                               + laid.body.value( "error", nlohmann::json::object() ).value( "message", laid.body.dump().substr( 0, 200 ) );
 
                         if( !tries.empty() )
+                        {
+                            nlohmann::json seen = nlohmann::json::array();
+
+                            for( const nlohmann::json& v : laid.body.value( "violations", nlohmann::json::array() ) )
+                            {
+                                if( seen.size() < 6 )
+                                    seen.push_back( v );
+                            }
+
                             tries.back()["refused"] = why;
+                            tries.back()["refused_violations"] = seen;
+                        }
 
                         break;
                     }
@@ -17835,23 +17842,35 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             return ok;
             };
 
-            bool ok = solve( false ) && layAll();
+            // at the rules' preferred width first; a window that does not fit at it at the minimum width; a
+            // solution the guard refuses solved again with the default claim slack
+            bool ok = false;
 
-            if( !ok && refused )
+            for( auto [slack, width] : { std::pair( false, "opt" ), std::pair( false, "min" ), std::pair( true, "min" ) } )
             {
-                BOARD_COMMIT undo( context->GetToolManager() );
+                if( slack && !refused )
+                    break;
 
-                for( const KIID& id : laidNow )
+                if( refused )
                 {
-                    if( BOARD_ITEM* item = board->ResolveItem( id, true ) )
-                        undo.Remove( item );
+                    BOARD_COMMIT undo( context->GetToolManager() );
+
+                    for( const KIID& id : laidNow )
+                    {
+                        if( BOARD_ITEM* item = board->ResolveItem( id, true ) )
+                            undo.Remove( item );
+                    }
+
+                    undo.Push( _( "Repair paths taken out (API)" ) );
+                    board->BuildConnectivity();
+                    laidNow.clear();
+                    refused = false;
                 }
 
-                undo.Push( _( "Repair paths taken out (API)" ) );
-                board->BuildConnectivity();
-                laidNow.clear();
-                refused = false;
-                ok = solve( true ) && layAll();
+                ok = solve( slack, width ) && layAll();
+
+                if( ok || answer.status >= 400 )
+                    break;
             }
 
             // copper the new paths no longer use (a cut piece, what hung on it) goes

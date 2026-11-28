@@ -1862,6 +1862,13 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
     };
 
     std::vector<JOB>                                          jobs;
+    // the track width each net is solved at: the rules' minimum, or their preferred width (opt) as pcb_track_add lays it
+    const std::string widthMode = aArgs.value( "width", std::string( "min" ) );
+
+    if( widthMode != "min" && widthMode != "opt" )
+        return KOPENAPI_RESULT::Error( 400, "width: min or opt" );
+
+    const bool optWidth = widthMode == "opt";
     std::map<std::tuple<std::string, int, int, int>, int>     classOf;
     std::vector<ORACLE_PROBE>                                 classes;
 
@@ -1947,7 +1954,8 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
                 continue;
 
             PAD* pad = static_cast<PAD*>( item );
-            job.probe.width = std::max( job.probe.width, KopenapiRuleTrack( board, code, pad->GetPosition(), pad->GetPrincipalLayer() ).min );
+            const KOPENAPI_RULE_TRACK rt = KopenapiRuleTrack( board, code, pad->GetPosition(), pad->GetPrincipalLayer() );
+            job.probe.width = std::max( job.probe.width, optWidth ? std::max( rt.min, rt.opt ) : rt.min );
 
             if( !viaSet )
             {
@@ -3340,6 +3348,7 @@ KOPENAPI_REGISTER( "pcb_route_oracle_joint",
                         "layers":{"type":"array","items":{"type":"string"},"description":"copper layers the paths may run on (default all); a via still passes the others"},
                         "zones_yield":{"type":"boolean","default":true,"description":"zone fills shut no via (a refill clears round it); tracks keep out of them"},
                         "cell_mm":{"type":"number","default":0.05,"minimum":0.005},
+                        "width":{"type":"string","enum":["min","opt"],"default":"min","description":"the track width each net is solved at: the rules' minimum, or their preferred width (as pcb_track_add lays a track without width_mm)"},
                         "max_cells_m":{"type":"number","default":6,"description":"millions of cells per layer at most: the cell grows to fit"},
                         "margin_mm":{"type":"number","default":3,"description":"a net's search window round its copper (the whole board when it fails)"},
                         "via_cost_mm":{"type":"number","default":1},
