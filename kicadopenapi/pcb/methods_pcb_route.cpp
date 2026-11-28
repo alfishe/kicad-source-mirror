@@ -17874,12 +17874,13 @@ static KOPENAPI_RESULT pcbRoute( KOPENAPI_CONTEXT& aCtx, const nlohmann::json& a
             {
                 const bool slack = t.slack;
 
+                wasRefused |= refused;
+
                 if( t.afterRefusal && !wasRefused )
                     break;
 
                 if( refused )
                 {
-                    wasRefused = true;
                     BOARD_COMMIT undo( context->GetToolManager() );
 
                     for( const KIID& id : laidNow )

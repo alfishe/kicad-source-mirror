@@ -45,6 +45,7 @@
 #include <functional>
 #include <queue>
 #include <set>
+#include <unordered_set>
 
 
 namespace
@@ -2293,21 +2294,23 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
 
     std::map<int, std::vector<std::pair<int, int>>> discs;
 
+    // the cells whose centre is nearer than aRadius: a centre at exactly the distance is legal (as in DRC)
     auto disc = [&]( int aRadius ) -> const std::vector<std::pair<int, int>>&
     {
-        const int r = ( aRadius + grid.cell - 1 ) / grid.cell;
-        auto      it = discs.find( r );
+        auto it = discs.find( aRadius );
 
         if( it != discs.end() )
             return it->second;
 
-        std::vector<std::pair<int, int>>& d = discs[r];
+        std::vector<std::pair<int, int>>& d = discs[aRadius];
+        const int     r = ( aRadius + grid.cell - 1 ) / grid.cell;
+        const int64_t c = grid.cell, R = aRadius;
 
         for( int dy = -r; dy <= r; ++dy )
         {
             for( int dx = -r; dx <= r; ++dx )
             {
-                if( (int64_t) dx * dx + (int64_t) dy * dy <= (int64_t) r * r )
+                if( ( (int64_t) dx * dx + (int64_t) dy * dy ) * c * c < R * R )
                     d.emplace_back( dx, dy );
             }
         }
@@ -2355,6 +2358,73 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
             }
         };
 
+        // a diagonal step's segment passes nearer the cells across its middle than its two ends do: those
+        // cells (on the anti-diagonal through the middle, at |2m - 1| / sqrt 2 cells) are claimed too, so
+        // tracks of nets that share no cell clear each other by the segments, not only by the centres
+        std::vector<std::pair<size_t, int>> diagonals;   // (state, dy) of a step to (x + 1, y + dy)
+
+        // the copper the paths lay: their new cells and the cells on the net's own copper they end in (a
+        // track end inside a pad near its edge sticks out of it by up to half its width)
+        std::vector<size_t> laid( aJob.trackStates );
+
+        {
+            std::unordered_set<size_t> on( aJob.trackStates.begin(), aJob.trackStates.end() );
+
+            for( const std::vector<size_t>& p : aJob.paths )
+            {
+                for( size_t k : p )
+                {
+                    if( on.insert( k ).second )
+                        laid.push_back( k );
+                }
+            }
+
+            for( size_t k : laid )
+            {
+                const size_t i = k % cells;
+                const int    x = (int) ( i % grid.nx ), y = (int) ( i / grid.nx );
+
+                for( int sy : { 1, -1 } )
+                {
+                    if( x + 1 < grid.nx && y + sy >= 0 && y + sy < grid.ny && on.count( k + 1 + (int64_t) sy * grid.nx ) )
+                        diagonals.emplace_back( k, sy );
+                }
+            }
+        }
+
+        auto stampAcross = [&]( std::vector<uint8_t>& aClaim, std::vector<uint32_t>& aStamp, int aRadius )
+        {
+            // |2m - 1| * cell / sqrt 2 < aRadius
+            const double limit = aRadius * M_SQRT2 / grid.cell;
+            const int    reach = (int) std::ceil( ( limit + 1 ) / 2 );
+
+            for( const auto& [k, sy] : diagonals )
+            {
+                const int    l = (int) ( k / cells );
+                const size_t i = k % cells;
+                const int    x = (int) ( i % grid.nx ), y = (int) ( i / grid.nx );
+
+                for( int m = 1 - reach; m <= reach; ++m )
+                {
+                    if( std::abs( 2 * m - 1 ) >= limit )
+                        continue;
+
+                    const int nx = x + m, ny = y + sy * ( 1 - m );
+
+                    if( nx < 0 || ny < 0 || nx >= grid.nx || ny >= grid.ny )
+                        continue;
+
+                    const size_t s = (size_t) l * cells + (size_t) ny * grid.nx + nx;
+
+                    if( aStamp[s] == epoch )
+                        continue;
+
+                    aStamp[s] = epoch;
+                    aClaim[s] = (uint8_t) std::clamp( (int) aClaim[s] + aDelta, 0, 255 );
+                }
+            }
+        };
+
         for( size_t c = 0; c < C; ++c )
         {
             const int oHalf = classes[c].width / 2, oVia = classes[c].viaDia / 2, oDrill = classes[c].viaDrill / 2;
@@ -2366,8 +2436,10 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
 
             ++epoch;
 
-            for( size_t k : aJob.trackStates )
+            for( size_t k : laid )
                 stampDisc( claimTrack[c], stamp, (int) ( k / cells ), k % cells, rTT );
+
+            stampAcross( claimTrack[c], stamp, rTT );
 
             for( size_t i : aJob.viaCells )
             {
@@ -2380,8 +2452,10 @@ static KOPENAPI_RESULT h_pcb_route_oracle_joint( KOPENAPI_CONTEXT& aCtx, const n
 
             ++epoch;
 
-            for( size_t k : aJob.trackStates )
+            for( size_t k : laid )
                 stampDisc( claimVia[c], stamp, (int) ( k / cells ), k % cells, rTV );
+
+            stampAcross( claimVia[c], stamp, rTV );
 
             for( size_t i : aJob.viaCells )
             {
